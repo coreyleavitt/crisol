@@ -1,0 +1,354 @@
+## test_cli_run.nim — A5 integration tests for the crisol CLI.
+##
+## Tests the observable CLI behavior via runMain() — the same proc the binary
+## calls.  This covers the real pipeline (discover→applyGates→plan→execute→
+## summarize→exitCode) through the public CLI surface.
+##
+## All tests use existing fixture files (tests/fixtures/*.nim) so no file
+## creation is required and discovery stays within the project root.
+##
+## Assertions:
+##   1. run <passing fixture>  → exit 0.
+##   2. run <failing fixture>  → exit 1.
+##   3. --jobs 1 and --jobs 2 produce the same verdict.
+##   4. --fail-fast with multiple failing entrypoints → non-zero exit.
+##   5. --fail-fast with all-passing → exit 0.
+##   6. Unknown subcommand → exit 3 (environment error).
+##   7. Unknown flag → exit 3.
+##   8. --jobs with invalid value → exit 3.
+##   9. --jobs with zero → exit 3.
+##  10. No args → exit 3.
+##  11. No entrypoints matched → exit 3.
+##
+## Run with:
+##   ./dev run nim r --hints:off --warnings:off --path:src \
+##         tests/integration/test_cli_run.nim
+
+import std/[json, monotimes, os, strutils, unittest]
+import std/posix as posix_mod2
+import crisol         # imports runMain
+import crisol/types
+import crisol/jsonout
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+proc fixtureDir(): string =
+  ## Return absolute path to tests/fixtures/ relative to this file's location.
+  let thisFile = currentSourcePath()
+  let testsDir = thisFile.parentDir.parentDir
+  testsDir / "fixtures"
+
+# ---------------------------------------------------------------------------
+# Suite
+# ---------------------------------------------------------------------------
+
+suite "crisol CLI — A5 wiring":
+
+  # -------------------------------------------------------------------------
+  # Test 1: passing fixture → exit 0
+  # -------------------------------------------------------------------------
+
+  test "run with passing entrypoint → exit 0":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "pass_always.nim", "--jobs", "1"])
+    check code == 0
+
+  # -------------------------------------------------------------------------
+  # Test 2: failing fixture → exit 1
+  # -------------------------------------------------------------------------
+
+  test "run with failing entrypoint → exit 1":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "fail_always.nim", "--jobs", "1"])
+    check code == 1
+
+  # -------------------------------------------------------------------------
+  # Test 3: compile-failing fixture → exit 1
+  # -------------------------------------------------------------------------
+
+  test "run with compile-failing entrypoint → exit 1":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "fail_compile.nim", "--jobs", "1"])
+    check code == 1
+
+  # -------------------------------------------------------------------------
+  # Test 4: --jobs 1 vs --jobs 2 — same verdict for passing
+  # -------------------------------------------------------------------------
+
+  test "--jobs 1 and --jobs 2 produce same exit 0 for passing fixture":
+    let fd = fixtureDir()
+    let code1 = runMain(@["run", fd / "pass_always.nim", "--jobs", "1"])
+    let code2 = runMain(@["run", fd / "pass_always.nim", "--jobs", "2"])
+    check code1 == 0
+    check code2 == 0
+
+  test "--jobs 1 and --jobs 2 produce same exit 1 for failing fixture":
+    let fd = fixtureDir()
+    let code1 = runMain(@["run", fd / "fail_always.nim", "--jobs", "1"])
+    let code2 = runMain(@["run", fd / "fail_always.nim", "--jobs", "2"])
+    check code1 == 1
+    check code2 == 1
+
+  # -------------------------------------------------------------------------
+  # Test 5: --fail-fast with multiple failing entrypoints → non-zero exit
+  # -------------------------------------------------------------------------
+
+  test "--fail-fast with multiple failing entrypoints → exit 1":
+    ## With --jobs 1 (serial) and --fail-fast, only the first entrypoint runs;
+    ## the rest are never dispatched.  Exit must be non-zero.
+    let fd = fixtureDir()
+    let code = runMain(@[
+      "run",
+      "--fail-fast",
+      "--jobs", "1",
+      fd / "fail_always.nim",
+      fd / "pass_always.nim",  # would pass; should not run under fail-fast
+      fd / "fail_compile.nim", # also skipped
+    ])
+    check code == 1
+
+  # -------------------------------------------------------------------------
+  # Test 6: --fail-fast does not affect an all-passing run
+  # -------------------------------------------------------------------------
+
+  test "--fail-fast with all passing → exit 0":
+    let fd = fixtureDir()
+    let code = runMain(@[
+      "run",
+      "--fail-fast",
+      "--jobs", "1",
+      fd / "pass_always.nim",
+    ])
+    check code == 0
+
+  # -------------------------------------------------------------------------
+  # Test 7: --fail-fast with mixed: first fails → stops early → exit 1
+  # -------------------------------------------------------------------------
+
+  test "--fail-fast mix: passing then failing → exit 1":
+    let fd = fixtureDir()
+    let code = runMain(@[
+      "run",
+      "--fail-fast",
+      "--jobs", "1",
+      fd / "fail_always.nim",
+      fd / "pass_always.nim",
+    ])
+    check code == 1
+
+  # -------------------------------------------------------------------------
+  # Test 8: bad usage → exit 3 (environment exit code)
+  # -------------------------------------------------------------------------
+
+  test "unknown subcommand → exit 3":
+    let code = runMain(@["frobnicate"])
+    check code == 3
+
+  test "unknown flag for run → exit 3":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "pass_always.nim", "--no-such-flag"])
+    check code == 3
+
+  test "no args → exit 3":
+    let code = runMain(@[])
+    check code == 3
+
+  test "--jobs with non-integer value → exit 3":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "pass_always.nim", "--jobs", "banana"])
+    check code == 3
+
+  test "--jobs with zero → exit 3":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "pass_always.nim", "--jobs", "0"])
+    check code == 3
+
+  # -------------------------------------------------------------------------
+  # Test 9: no entrypoints matched → exit 3
+  # -------------------------------------------------------------------------
+
+  test "no entrypoints matched → exit 3":
+    ## Pass a glob that matches no files in the project tree.
+    let code = runMain(@["run", "tests/fixtures/no_such_test_xyzzy_*.nim"])
+    check code == 3
+
+  # -------------------------------------------------------------------------
+  # Test 10: --timeout flag is accepted and overrides default
+  # -------------------------------------------------------------------------
+
+  test "--timeout is accepted and run completes normally":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "pass_always.nim", "--timeout", "60", "--jobs", "1"])
+    check code == 0
+
+  # -------------------------------------------------------------------------
+  # Test 11: --help is accepted → exit 0
+  # -------------------------------------------------------------------------
+
+  test "--help → exit 0":
+    let code = runMain(@["--help"])
+    check code == 0
+
+# ---------------------------------------------------------------------------
+# Suite 2 — B7: --failed flag
+# ---------------------------------------------------------------------------
+
+proc uniqueTmpDir(tag: string): string =
+  let mono = getMonoTime()
+  getTempDir() / ("crisol_b7_" & tag & "_" & $mono.ticks)
+
+proc makeCfg(projectRoot, stateDir: string): Config =
+  Config(
+    projectRoot:        projectRoot,
+    stateDir:           stateDir,
+    groups:             @[],
+    jobs:               1,
+    timeoutSecs:        30,
+    compileTimeoutSecs: 60,
+    maxOutputBytes:     65536,
+  )
+
+suite "crisol CLI — B7 --failed":
+
+  # -------------------------------------------------------------------------
+  # Absent lastrun.json → exit 3
+  # -------------------------------------------------------------------------
+
+  test "--failed with absent lastrun.json → exit 3":
+    ## loadConfig() roots at getCurrentDir(), so we must ensure that
+    ## .crisol/lastrun.json does NOT exist in the cwd during this test.
+    ## We move it aside temporarily if it exists, then restore it.
+    let realRoot   = getCurrentDir()
+    let stateDir   = realRoot / ".crisol"
+    let lrPath     = stateDir / "lastrun.json"
+    let backupPath = stateDir / "lastrun.json.b7bak"
+
+    let hadFile = fileExists(lrPath)
+    if hadFile:
+      moveFile(lrPath, backupPath)
+    defer:
+      if hadFile: moveFile(backupPath, lrPath)
+      else: (try: removeFile(lrPath) except: discard)
+
+    let fd   = fixtureDir()
+    let code = runMain(@["run", "--failed", fd / "pass_always.nim", "--jobs", "1"])
+    check code == 3
+
+  # -------------------------------------------------------------------------
+  # --failed + --dry-run: shows narrowed plan (only failed entrypoints)
+  # -------------------------------------------------------------------------
+
+  test "--failed + --dry-run: shows only previously-failed entrypoints":
+    ## Seed a lastrun.json marking fail_always as failed and pass_always as
+    ## passed.  With --dry-run + --failed, only fail_always should appear
+    ## in the plan (without actually running anything).
+    ##
+    ## We use a temp project root and copy the fixture files there so we can
+    ## control the state directory independently.  However, loadConfig() roots
+    ## at getCurrentDir(); to avoid that ambiguity we test through the
+    ## loadLastRun+buildPlanView path directly — but since we want to test
+    ## the runMain surface, we seed via persistLastRun and use the dry-run
+    ## stdout output to verify narrowing.
+    ##
+    ## Strategy: write a lastrun.json directly (v1 JSON string) into a temp
+    ## stateDir, then call runMain with --dry-run --failed pointing at
+    ## the fixture dir.  The loadConfig() will still root at cwd, so we must
+    ## use the current project root's .crisol/ dir.
+    ##
+    ## To keep this non-fragile we write the lastrun.json into the REAL
+    ## .crisol/ dir (current project root), then restore it afterward.
+
+    let fd       = fixtureDir()
+    let realRoot = fd.parentDir.parentDir  # tests/.. → project root
+    let stateDir = realRoot / ".crisol"
+    let lrPath   = stateDir / "lastrun.json"
+
+    # Compute root-relative paths for the two fixtures.
+    let failRelPath = relativePath(fd / "fail_always.nim", realRoot)
+    let passRelPath = relativePath(fd / "pass_always.nim", realRoot)
+
+    # Seed: fail_always failed, pass_always passed.
+    let results = @[
+      EntrypointResult(
+        ep:       Entrypoint(path: failRelPath, group: "paths", flags: @[]),
+        outcome:  oFailed, exitCode: 1, signal: 0, durationMs: 100, records: @[]),
+      EntrypointResult(
+        ep:       Entrypoint(path: passRelPath, group: "paths", flags: @[]),
+        outcome:  oPassed, exitCode: 0, signal: 0, durationMs: 50, records: @[]),
+    ]
+    let summary = Summary(total: 2, passed: 1, failed: 1)
+    let cfg = makeCfg(realRoot, ".crisol")
+
+    # Save old lastrun.json if present, restore on exit.
+    var oldContent: string = ""
+    let hadOld = fileExists(lrPath)
+    if hadOld:
+      oldContent = readFile(lrPath)
+
+    persistLastRun(results, summary, cfg)
+    defer:
+      if hadOld: writeFile(lrPath, oldContent)
+      else: (try: removeFile(lrPath) except: discard)
+
+    # --dry-run + --failed: capture stdout, check only fail_always in plan.
+    let outPath = getTempDir() / "crisol_b7_dryrun.txt"
+    defer: (try: removeFile(outPath) except: discard)
+
+    # We need to capture stdout to inspect the plan output.
+    let f = open(outPath, fmWrite)
+    let fileFd: cint  = f.getFileHandle.cint
+    let savedFd: cint = posix_mod2.dup(1.cint)
+    discard posix_mod2.dup2(fileFd, 1.cint)
+    f.close()
+
+    let code = runMain(@["run", fd / "fail_always.nim", fd / "pass_always.nim",
+                         "--dry-run", "--failed", "--jobs", "1"])
+
+    flushFile(stdout)
+    discard posix_mod2.dup2(savedFd, 1.cint)
+    discard posix_mod2.close(savedFd)
+
+    check code == 0
+    let planText = readFile(outPath)
+    # fail_always must appear in the plan; pass_always must NOT.
+    check strutils.contains(planText, "fail_always")
+    check not strutils.contains(planText, "pass_always")
+
+  # -------------------------------------------------------------------------
+  # All previously-failed now gone → exit 0, clear message
+  # -------------------------------------------------------------------------
+
+  test "--failed with all previously-failed gone → exit 0":
+    ## Seed a lastrun.json marking a non-existent file as failed.
+    ## Discovery finds nothing matching that path → narrowed set is empty.
+    ## Per RFC exit-code table analogy (--changed zero affected → exit 0),
+    ## crisol should exit 0 with a "nothing to re-run" message.
+
+    let fd       = fixtureDir()
+    let realRoot = fd.parentDir.parentDir
+    let lrPath   = realRoot / ".crisol" / "lastrun.json"
+
+    # Seed: a non-existent entrypoint as failed.
+    let results = @[
+      EntrypointResult(
+        ep:      Entrypoint(path: "tests/fixtures/nonexistent_xyzzy.nim",
+                            group: "paths", flags: @[]),
+        outcome: oFailed, exitCode: 1, signal: 0, durationMs: 10, records: @[]),
+    ]
+    let summary = Summary(total: 1, passed: 0, failed: 1)
+    let cfg = makeCfg(realRoot, ".crisol")
+
+    var oldContent = ""
+    let hadOld = fileExists(lrPath)
+    if hadOld: oldContent = readFile(lrPath)
+    persistLastRun(results, summary, cfg)
+    defer:
+      if hadOld: writeFile(lrPath, oldContent)
+      else: (try: removeFile(lrPath) except: discard)
+
+    # We must pass at least one path arg so discovery only scans that area.
+    # Pass a path that exists but doesn't contain the seeded (nonexistent) path.
+    let code = runMain(@["run", fd / "pass_always.nim", "--failed", "--jobs", "1"])
+    check code == 0

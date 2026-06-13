@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# crisol — host-side wrapper that invokes the podman dev image.
+# Mirrors the sibling-lib (fresco/amoxtli) Docker-for-tooling pattern, but
+# on podman. All toolchain ops run in the container; built binaries can run
+# on the host for smoke testing.
+#
+# Usage:
+#   ./dev image          (re)build the dev image
+#   ./dev check          nim check (fast type/syntax verification)
+#   ./dev test           nimble test (serial bootstrap suite)
+#   ./dev build          compile the package
+#   ./dev run <args…>    run an arbitrary toolchain command in the container
+#   ./dev shell          interactive shell inside the container
+#   ./dev clean          remove build artifacts + caches
+#   ./dev help           print this help
+
+set -euo pipefail
+
+IMAGE="crisol-dev:latest"
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DOCKER_HOME="${PROJECT_DIR}/.docker-home"
+# milpa vendors deps into _deps/ as symlinks into its content-addressed store
+# (~/.cache/milpa). Those symlinks use ABSOLUTE host paths, so the store must be
+# mounted into the container at that same absolute path for `import nkdl` (etc.)
+# to resolve. Read-only — the container never writes the CAS.
+MILPA_CACHE="${MILPA_CACHE:-${HOME}/.cache/milpa}"
+
+ensure_docker_home() { mkdir -p "${DOCKER_HOME}"; }
+
+# Echoes the --volume flag for the milpa CAS when it exists; nothing otherwise
+# (so the toolchain still works on a checkout that doesn't use milpa).
+milpa_mount() {
+    if [ -d "${MILPA_CACHE}" ]; then
+        printf '%s\n%s\n' "--volume" "${MILPA_CACHE}:${MILPA_CACHE}:ro"
+    fi
+}
+
+# Rootless podman maps the host user to root-in-container by default, so we do
+# NOT pass --user; files created in the bind mount come back owned by the host
+# user via the userns mapping. HOME points at a mounted dir so nimble/choosenim
+# state persists across runs.
+podman_run() {
+    ensure_docker_home
+    mapfile -t _milpa < <(milpa_mount)
+    podman run --rm \
+        --volume "${PROJECT_DIR}:/workspace" \
+        --volume "${DOCKER_HOME}:/dockerhome" \
+        "${_milpa[@]}" \
+        --env HOME=/dockerhome \
+        --workdir /workspace \
+        "${IMAGE}" "$@"
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "${cmd}" in
+    image)
+        podman build --tag "${IMAGE}" "${PROJECT_DIR}"
+        ;;
+    check)
+        podman_run nim check --hints:off src/crisol.nim
+        ;;
+    test)
+        podman_run nimble test
+        ;;
+    build)
+        podman_run nimble build
+        ;;
+    run)
+        podman_run "$@"
+        ;;
+    shell)
+        ensure_docker_home
+        mapfile -t _milpa < <(milpa_mount)
+        podman run --rm -it \
+            --volume "${PROJECT_DIR}:/workspace" \
+            --volume "${DOCKER_HOME}:/dockerhome" \
+            "${_milpa[@]}" \
+            --env HOME=/dockerhome \
+            --workdir /workspace \
+            "${IMAGE}" /bin/bash
+        ;;
+    clean)
+        rm -rf "${PROJECT_DIR}/nimcache" "${PROJECT_DIR}/bin" "${PROJECT_DIR}/.crisol"
+        ;;
+    help|*)
+        sed -n '4,18p' "$0"
+        ;;
+esac

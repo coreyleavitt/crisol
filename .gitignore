@@ -1,0 +1,19 @@
+nimcache/
+bin/
+*.exe
+.docker-home/
+testresults/
+.crisol/
+tests/fixtures/bin/
+tests/fixtures/nimcache/
+# milpa: manifest (milpa.kdl) + lock (milpa.lock) are committed; the vendored
+# deps (symlinks into ~/.cache/milpa) and the generated nim.cfg are not.
+_deps/
+nim.cfg
+# Built CLI binary (nimble `bin = @["crisol"]` → ./crisol at repo root).
+/crisol
+# Stray state-dir artifacts when crisol/tests run with stateDir defaulting to
+# cwd (the normal location is .crisol/, already ignored above).
+/cache/
+/bin/
+/depgraph
