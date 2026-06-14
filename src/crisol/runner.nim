@@ -30,9 +30,9 @@
 ##   • Output captured to per-entrypoint temp files; read atomically after
 ##     completion; bounded by maxOutputBytes.
 
-import std/[algorithm, monotimes, os, sequtils, sets, times]
+import std/[algorithm, monotimes, options, os, sequtils, sets, times]
 import std/posix
-import crisol/[types, spawn, signals, render, depgraph, closure, protocol, planner]
+import crisol/[types, spawn, signals, render, depgraph, closure, protocol, planner, scheduler, admission, memprobe]
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
                  # so consumers that `import crisol/runner` keep their symbols.
 
@@ -101,6 +101,10 @@ type
     pid:             Pid           # live child pid (== pgid)
     deadline:        MonoTime      # R11: monotonic deadline for current phase
     t0:              float         # epochTime() when slot was claimed (for durationMs)
+    runTimeoutMs:    int           # per-entrypoint run deadline (ms); set at slot setup
+                                   # from effectiveRunTimeoutMs(ep, config).  Consumed only
+                                   # at the spCompiling→spRunning transition in pollSlot to
+                                   # set the run deadline.  Never checked during spCompiling.
     tmpDir:          string        # per-slot temp dir to clean up after run (empty if none)
     compOut:         string        # path to compile output file (empty for cdSkipFresh)
     runOut:          string        # path to run output file
@@ -111,6 +115,7 @@ type
     slotBinDir:      string        # per-slot bin dir (separate from tmpDir for M15 cleanup)
     compiledThisRun: bool          # false for cdSkipFresh slots
     compileSkipped:  bool          # true for cdSkipFresh slots
+    token:           SlotToken     # S3: admission token; released on finish or spawn failure
 
 proc reapBlocking(pid: Pid) =
   ## Blocking waitpid that retries on EINTR — consistent with supervise's
@@ -244,6 +249,7 @@ proc spawnCompileStable(
   slot.pid             = pid
   slot.deadline        = getMonoTime() + initDuration(milliseconds = compileTimeoutMs)
   slot.t0              = epochTime()
+  slot.runTimeoutMs    = effectiveRunTimeoutMs(ep, config)  # S2b: per-entrypoint run budget
   slot.tmpDir          = tmpDir        # M8: temp dir holding output files
   slot.compOut         = compOut
   slot.runOut          = runOut
@@ -261,15 +267,17 @@ proc spawnRunDirect(
   pepIdx:       int;
   pep:          PlannedEntrypoint;
   config:       Config;
-  runTimeoutMs: int;
 ): bool =
   ## Fill slot directly with a run child (cdSkipFresh: compile skipped).
   ## Returns false on resource allocation failure.
   ## R1: injects CRISOL_SINK into the child environment via forkExecEnv.
   ## M8: uses mkdtemp for temp output files.
+  ## S2b: run deadline set from effectiveRunTimeoutMs(ep, config) — the
+  ## per-entrypoint budget — rather than a caller-supplied global value.
 
   let ep = pep.ep
   let binFull = binPath(ep, config) / binName(ep)
+  let rtMs = effectiveRunTimeoutMs(ep, config)  # S2b: per-entrypoint run budget
 
   # M8: use mkdtemp for temp output directory.
   var tmpDir: string
@@ -297,8 +305,9 @@ proc spawnRunDirect(
   slot.pepIdx          = pepIdx
   slot.phase           = spRunning
   slot.pid             = pid
-  slot.deadline        = getMonoTime() + initDuration(milliseconds = runTimeoutMs)
+  slot.deadline        = getMonoTime() + initDuration(milliseconds = rtMs)
   slot.t0              = epochTime()
+  slot.runTimeoutMs    = rtMs           # S2b: stored for reference (deadline already set)
   slot.tmpDir          = tmpDir        # M8: temp dir to clean up
   slot.compOut         = ""
   slot.runOut          = runOut
@@ -346,16 +355,20 @@ proc cleanupSlotTmp(slot: Slot) =
     try: removeFile(slot.sinkPath) except: discard
 
 proc pollSlot(
-  slot:          var Slot;
-  results:       var seq[EntrypointResult];
-  plan:          RunPlan;
-  onResult:      ResultCallback;
-  runTimeoutMs:  int;
+  slot:           var Slot;
+  results:        var seq[EntrypointResult];
+  plan:           RunPlan;
+  onResult:       ResultCallback;
   maxOutputBytes: int;
 ): bool =
   ## Poll a live slot with waitpid(WNOHANG).
   ## Returns true if the slot is now idle (completed or errored) — caller
   ## should clear slot.pepIdx and may fill it with a new entrypoint.
+  ##
+  ## S2b: the global runTimeoutMs parameter has been removed.  The per-
+  ## entrypoint run deadline is read from slot.runTimeoutMs (set at slot
+  ## setup time by spawnCompileStable / spawnRunDirect via
+  ## effectiveRunTimeoutMs) when transitioning spCompiling → spRunning.
   ##
   ## Records the result in `results[slot.pepIdx]` and calls onResult when done.
 
@@ -438,7 +451,8 @@ proc pollSlot(
       return true
     else:
       # Compile succeeded → transition to running phase.
-      let ok = spawnRun(slot, runTimeoutMs)
+      # S2b: use the per-entrypoint run budget stored at slot setup time.
+      let ok = spawnRun(slot, slot.runTimeoutMs)
       if not ok:
         # Run spawn failed.
         let elapsed = int64((epochTime() - slot.t0) * 1000)
@@ -504,15 +518,18 @@ proc execute*(
   failFast:         bool = false;
   showProgress:     bool = true;
   progressIntervalMs: int = 30_000;
+  memThrottledOut:  ptr int = nil;  ## S6b: if non-nil, written with ac.memThrottledSlots on return
 ): seq[EntrypointResult] =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
   ## scheduler honouring p.jobs (A4).  At most p.jobs child processes alive at
   ## once; continue-on-failure: one failure never stops the pool.
   ##
-  ## M1: Timeouts and output cap are derived from config internally:
-  ##   compileTimeoutMs = config.compileTimeoutSecs * 1000  (default 600 s)
-  ##   runTimeoutMs     = config.timeoutSecs         * 1000  (default 300 s)
-  ##   maxOutputBytes   = config.maxOutputBytes               (default 10 MiB)
+  ## M1/S2b: Timeouts and output cap are derived from config internally:
+  ##   compileTimeoutMs       = config.compileTimeoutSecs * 1000  (default 600 s)
+  ##   per-slot runTimeoutMs  = effectiveRunTimeoutMs(ep, config) — resolves
+  ##                            ep.runTimeoutSecs (group), then config.timeoutSecs
+  ##                            (global), then 300_000 ms (built-in default).
+  ##   maxOutputBytes         = config.maxOutputBytes              (default 10 MiB)
   ##
   ## For cdSkipFresh entrypoints: compile is skipped; the existing binary is
   ## run directly.  compileSkipped=true is set on the resulting EntrypointResult.
@@ -529,9 +546,9 @@ proc execute*(
   let compileTimeoutMs =
     if config.compileTimeoutSecs > 0: config.compileTimeoutSecs * 1000
     else: 600_000  # default 600 s
-  let runTimeoutMs =
-    if config.timeoutSecs > 0: config.timeoutSecs * 1000
-    else: 300_000  # default 300 s
+  # S2b: the global runTimeoutMs local is removed.  Each slot's run deadline is
+  # resolved per-entrypoint via effectiveRunTimeoutMs(ep, config) at slot setup
+  # time (spawnCompileStable / spawnRunDirect) and stored in slot.runTimeoutMs.
   let maxOutputBytes =
     if config.maxOutputBytes > 0: config.maxOutputBytes
     else: 10 * 1024 * 1024  # default 10 MiB
@@ -550,14 +567,39 @@ proc execute*(
   for s in slots.mitems:
     s.pepIdx = -1
 
-  var nextEp    = 0     # index of next entrypoint to dispatch
+  # S6b / M5b: build admission controller.
+  # The mem-aware truth table (kill-switch, force-on, auto) is resolved inside
+  # initAdmission, not here.  We pass the raw availableMemBytes proc as the
+  # candidate probe; initAdmission calls it once to test probe availability and
+  # applies cfg.memAware to decide whether to use it, suppress it, or force it on.
+  let candidateProbe: proc(): Option[int64] = proc(): Option[int64] = availableMemBytes()
+  var ac = initAdmission(config, p, probe = candidateProbe)
+
+  # H1 fix: scan-ahead fill.  Instead of a single monotone cursor that stalls
+  # on a cap-blocked head, each idle slot independently scans from the
+  # low-water mark (lwm) for the first undispatched entrypoint whose admit
+  # succeeds.  Blocked candidates are left pending and retried next pass.
+  #
+  #   dispatched[i] = true  once entrypoint i has been handed to a slot.
+  #   lwm            = smallest index that may still be undispatched; advanced
+  #                    eagerly when leading entries are confirmed dispatched, so
+  #                    the inner scan never re-walks already-dispatched prefixes.
+  var dispatched      = newSeq[bool](n)
+  var lwm             = 0   # low-water mark: start of undispatched scan
   var done      = 0     # count of completed entrypoints
   var anyFailed = false # tracks whether a failure has been seen (for failFast)
+  var passId: uint = 0  # epoch counter: incremented once per fill pass; threaded into ac.admit
 
   const pollIntervalMs = 25
 
   # Progress-line tracking: last time we emitted a progress line.
   var lastProgressAt = epochTime()
+
+  # M4: Memory-throttle signal tracking.
+  # throttledSince: Some(t) = when this continuous memory-throttled state began.
+  # Set when: idle slots exist, live slots exist, and memory gate blocked a candidate.
+  # Cleared when: a fill pass makes dispatch progress OR no longer idle+live+mem-blocked.
+  var throttledSince: Option[MonoTime] = none(MonoTime)
 
   # ---------------------------------------------------------------------------
   # R2/A6: Signal-interrupt helper — TERM→drain→KILL all live slots, cleanup
@@ -614,9 +656,6 @@ proc execute*(
   # M12: wrap entire dispatch loop in try/finally so any exception (e.g. from
   # an onResult callback) still group-kills + reaps + cleans all live slots.
   # ---------------------------------------------------------------------------
-  # M12: wrap entire dispatch loop in try/finally so any exception (e.g. from
-  # an onResult callback) still group-kills + reaps + cleans all live slots.
-  # ---------------------------------------------------------------------------
   try:
     while done < n:
       # -----------------------------------------------------------------------
@@ -629,42 +668,94 @@ proc execute*(
       # -----------------------------------------------------------------------
       # Fill idle slots from the queue.
       # Stop pulling new work when failFast and any failure has been recorded.
+      # The availability snapshot is refreshed lazily inside ac.admit on the
+      # first call of each fill pass (epoch tracked by passId).
       # -----------------------------------------------------------------------
+      # M4: capture throttle counter and live/idle counts before fill pass so
+      # we can detect whether memory was the specific blocker after the pass.
+      let throttleCountBefore = ac.memThrottledSlots
+      var idleCountBefore = 0
+      var liveCountBefore = 0
+      for s in slots:
+        if s.pepIdx == -1: inc idleCountBefore
+        else:              inc liveCountBefore
+      var dispatchedThisPass = false
+
+      inc passId  # new fill pass: admit will refresh the snapshot on its first call
       for i in 0 ..< nJobs:
         if slots[i].pepIdx != -1: continue  # slot busy
-        if nextEp >= n:           continue  # queue drained
-        if failFast and anyFailed: continue # fail-fast: drain only; no new work
+        if lwm >= n:               continue  # all entries dispatched
+        if failFast and anyFailed: continue  # fail-fast: drain only; no new work
 
-        let pepIdx = nextEp
-        inc nextEp
+        # H1 fix: scan from lwm for the first undispatched entry that admit accepts.
+        # Entries whose group is at cap (or memory-blocked) are skipped this pass
+        # and retried in a future pass — they are NOT dropped.
+        var pepIdx = -1
+        for j in lwm ..< n:
+          if dispatched[j]: continue
+          let candidate = p.entrypoints[j]
+          let tok = ac.admit(passId, candidate.ep.group, candidate.decision)
+          if tok.isNone:
+            continue  # blocked this pass; try next candidate
+          # Found an admissible candidate.
+          pepIdx = j
+          dispatched[j] = true
+          dispatchedThisPass = true  # M4: progress was made this pass
+          # Advance lwm past any leading run of dispatched entries.
+          while lwm < n and dispatched[lwm]:
+            inc lwm
 
-        let pep = p.entrypoints[pepIdx]
+          let pep = candidate
+          if pep.decision == cdSkipFresh:
+            # Skip compile: spawn run directly with the existing stable binary.
+            # S2b: runTimeoutMs is resolved inside spawnRunDirect from effectiveRunTimeoutMs.
+            let ok = spawnRunDirect(slots[i], pepIdx, pep, config)
+            if not ok:
+              ac.release(tok.get)  # S3: rollback admission on spawn failure
+              var res = EntrypointResult(ep: pep.ep, outcome: oSpawnError,
+                                         output: "fork or file-open failed for skip-fresh run",
+                                         durationMs: 0,
+                                         compileSkipped: true)
+              result[pepIdx] = res
+              onResult(res)
+              anyFailed = true
+              inc done
+            else:
+              slots[i].token = tok.get  # S3: store token for onSlotFinish
+          else:
+            # Normal compile + run using stable slug-keyed paths.
+            let ok = spawnCompileStable(slots[i], pepIdx, pep, config, compileTimeoutMs)
+            if not ok:
+              ac.release(tok.get)  # S3: rollback admission on spawn failure
+              # Fork/resource failure: record oSpawnError immediately.
+              var res = EntrypointResult(ep: pep.ep, outcome: oSpawnError,
+                                         output: "fork or file-open failed before compile",
+                                         durationMs: 0)
+              result[pepIdx] = res
+              onResult(res)
+              anyFailed = true
+              inc done
+              # Slot remains idle (pepIdx == -1); loop continues.
+            else:
+              slots[i].token = tok.get  # S3: store token for onSlotFinish
+          break  # this slot has been filled; move to next slot
 
-        if pep.decision == cdSkipFresh:
-          # Skip compile: spawn run directly with the existing stable binary.
-          let ok = spawnRunDirect(slots[i], pepIdx, pep, config, runTimeoutMs)
-          if not ok:
-            var res = EntrypointResult(ep: pep.ep, outcome: oSpawnError,
-                                       output: "fork or file-open failed for skip-fresh run",
-                                       durationMs: 0,
-                                       compileSkipped: true)
-            result[pepIdx] = res
-            onResult(res)
-            anyFailed = true
-            inc done
-        else:
-          # Normal compile + run using stable slug-keyed paths.
-          let ok = spawnCompileStable(slots[i], pepIdx, pep, config, compileTimeoutMs)
-          if not ok:
-            # Fork/resource failure: record oSpawnError immediately.
-            var res = EntrypointResult(ep: pep.ep, outcome: oSpawnError,
-                                       output: "fork or file-open failed before compile",
-                                       durationMs: 0)
-            result[pepIdx] = res
-            onResult(res)
-            anyFailed = true
-            inc done
-            # Slot remains idle (pepIdx == -1); loop continues.
+      # M4: Update memory-throttle tracking state after the fill pass.
+      # Throttled state: idle slots exist AND live slots exist AND memory gate
+      # specifically blocked a candidate this pass (counter incremented).
+      # Progress clears throttled state; so does becoming fully idle or fully busy.
+      let memBlockedThisPass = ac.memThrottledSlots > throttleCountBefore
+      let isMemThrottled =
+        not dispatchedThisPass and
+        idleCountBefore > 0 and
+        liveCountBefore > 0 and
+        memBlockedThisPass
+      if isMemThrottled:
+        if throttledSince.isNone:
+          throttledSince = some(getMonoTime())  # begin timing this throttle episode
+        # else: keep the existing start time (continuous throttle)
+      else:
+        throttledSince = none(MonoTime)  # progress made or not memory-blocked; clear
 
       # -----------------------------------------------------------------------
       # Poll all live slots.
@@ -677,13 +768,17 @@ proc execute*(
         let slotCacheDir    = slots[i].cacheDir       # capture before slot cleared
         let slotBinCompiled = slots[i].binCompiled    # capture before slot cleared
         let slotBinDir      = slots[i].slotBinDir     # per-slot bin dir (M15)
+        let slotToken       = slots[i].token          # S3: capture before slot cleared
+        let slotPid         = int(slots[i].pid)       # S6b: capture pid before slot cleared
 
         let finished = pollSlot(slots[i], result, p, onResult,
-                                 runTimeoutMs, maxOutputBytes)
+                                 maxOutputBytes)
         if finished:
           # Capture the completed pepIdx before clearing the slot.
           let completedIdx = slotPepIdx
           slots[i].pepIdx = -1
+          # S6b: feed real RSS into onSlotFinish so estJobPeak adapts.
+          ac.onSlotFinish(slotToken, procGroupRssBytes(slotPid))
           inc done
           # Track whether any failure has been recorded (for failFast).
           if failFast and result[completedIdx].outcome.isFailure:
@@ -735,7 +830,8 @@ proc execute*(
       # -----------------------------------------------------------------------
       # failFast early-exit: if no slots are live and we would not dispatch any
       # more work, break now — remaining entrypoints were never started.
-      # Return only results[0..<nextEp] so summarize sees only ran entrypoints.
+      # Return only entries from dispatched[] so summarize sees only ran
+      # entrypoints (dispatched indices may be non-contiguous with skip-ahead).
       # -----------------------------------------------------------------------
       if failFast and anyFailed:
         let anyLiveNow = block:
@@ -746,7 +842,12 @@ proc execute*(
               break
           found
         if not anyLiveNow:
-          result = result[0 ..< nextEp]
+          # H1: with skip-ahead, dispatched indices may be non-contiguous; emit only
+          # entries actually started (skipped-and-never-dispatched entries are omitted).
+          var ran: seq[EntrypointResult]
+          for j in 0 ..< n:
+            if dispatched[j]: ran.add(result[j])
+          result = ran
           return
 
       # Avoid busy-spinning when all slots are live.
@@ -774,7 +875,10 @@ proc execute*(
             if s.pepIdx != -1:
               let elapsed = int64((nowProgress - s.t0) * 1000)
               inFlight.add (p.entrypoints[s.pepIdx].ep.path, elapsed)
-          let line = formatProgressLine(inFlight)
+          # M4: compute whether the mem-throttle signal should appear.
+          let showThrottle = memThrottleActive(throttledSince, getMonoTime(),
+                                               MemThrottleSignalMs)
+          let line = formatProgressLine(inFlight, memThrottled = showThrottle)
           if line.len > 0:
             stderr.write(line & "\n")
             try: stderr.flushFile() except: discard
@@ -789,6 +893,9 @@ proc execute*(
     # The interrupt path (handleInterrupt) already killed, reaped, cleaned, and
     # cleared its slots before raising CrisolInterrupted, so every slot is idle
     # here and the loops below are no-ops for it (MED-1).
+    # S6b: always write memThrottledSlots (normal, early-return, and exception paths).
+    if memThrottledOut != nil:
+      memThrottledOut[] = ac.memThrottledSlots
     for s in slots:
       if s.pepIdx != -1:
         discard killpg(s.pid, SIGKILL)

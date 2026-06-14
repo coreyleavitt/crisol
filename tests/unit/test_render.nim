@@ -19,7 +19,7 @@
 ##  11. formatProgressLine — non-empty list → names + durations in output
 ##  12. formatProgressLine — empty list → ""
 
-import std/[options, os, strutils, unittest]
+import std/[monotimes, options, os, strutils, times, unittest]
 import crisol/types
 import crisol/render
 import crisol/terminal  # for shouldEnableColor
@@ -309,7 +309,7 @@ suite "render – formatProgressLine":
       ("tests/unit/test_foo.nim",         5_000'i64),
       ("tests/integration/test_bar.nim", 35_000'i64),
     ]
-    let line = formatProgressLine(inFlight)
+    let line = formatProgressLine(inFlight, memThrottled = false)
     check "test_foo.nim"  in line
     check "test_bar.nim"  in line
     # 5000ms → 5s; 35000ms → 35s
@@ -319,15 +319,69 @@ suite "render – formatProgressLine":
 
   test "durations under 1s shown in ms":
     let inFlight = @[("tests/unit/test_fast.nim", 500'i64)]
-    let line = formatProgressLine(inFlight)
+    let line = formatProgressLine(inFlight, memThrottled = false)
     check "500ms" in line
 
   test "empty inFlight returns empty string":
-    let line = formatProgressLine(@[])
+    let line = formatProgressLine(@[], memThrottled = false)
     check line == ""
 
   test "single entry line is well-formed":
     let inFlight = @[("tests/unit/test_only.nim", 62_000'i64)]
-    let line = formatProgressLine(inFlight)
+    let line = formatProgressLine(inFlight, memThrottled = false)
     check "test_only.nim" in line
     check "62s"           in line
+
+# ---------------------------------------------------------------------------
+# Suite 13 — formatProgressLine with memThrottled signal (M4)
+# ---------------------------------------------------------------------------
+
+suite "render – formatProgressLine memThrottled signal":
+  test "memThrottled=true appends the mem-throttled signal":
+    let inFlight = @[("tests/unit/test_foo.nim", 5_000'i64)]
+    let line = formatProgressLine(inFlight, memThrottled = true)
+    check "[mem-throttled]" in line
+
+  test "memThrottled=false omits the mem-throttled signal":
+    let inFlight = @[("tests/unit/test_foo.nim", 5_000'i64)]
+    let line = formatProgressLine(inFlight, memThrottled = false)
+    check "[mem-throttled]" notin line
+
+  test "memThrottled=true on empty inFlight still returns empty string":
+    # empty inFlight → "" regardless of memThrottled (no progress line to annotate)
+    let line = formatProgressLine(@[], memThrottled = true)
+    check line == ""
+
+# ---------------------------------------------------------------------------
+# Suite 14 — memThrottleActive pure decision function (M4)
+# ---------------------------------------------------------------------------
+
+suite "render – memThrottleActive":
+  test "none throttledSince → false regardless of threshold":
+    let now = getMonoTime()
+    check memThrottleActive(none(MonoTime), now, MemThrottleSignalMs) == false
+
+  test "throttledSince recent (below threshold) → false":
+    let t0  = getMonoTime()
+    let now = t0 + initDuration(milliseconds = 1000)  # only 1s elapsed
+    check memThrottleActive(some(t0), now, MemThrottleSignalMs) == false
+
+  test "throttledSince exactly at threshold → false (exclusive >)":
+    let t0  = getMonoTime()
+    let now = t0 + initDuration(milliseconds = MemThrottleSignalMs)
+    check memThrottleActive(some(t0), now, MemThrottleSignalMs) == false
+
+  test "throttledSince over threshold → true":
+    let t0  = getMonoTime()
+    let now = t0 + initDuration(milliseconds = MemThrottleSignalMs + 1)
+    check memThrottleActive(some(t0), now, MemThrottleSignalMs) == true
+
+  test "custom threshold: above custom threshold → true":
+    let t0  = getMonoTime()
+    let now = t0 + initDuration(milliseconds = 200)
+    check memThrottleActive(some(t0), now, 100) == true
+
+  test "custom threshold: below custom threshold → false":
+    let t0  = getMonoTime()
+    let now = t0 + initDuration(milliseconds = 50)
+    check memThrottleActive(some(t0), now, 100) == false

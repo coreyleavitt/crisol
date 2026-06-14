@@ -16,10 +16,13 @@
 ##     group + reason), and a summary (N entrypoints across M groups, K gated).
 ##     Color is injected via opts.color — renderPlan performs no I/O.
 ##
-##   planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry]): JsonNode
+##   planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
+##              warnings: seq[ConfigWarning] = @[]; config: Config = Config()): JsonNode
 ##     Pure: the crisol/plan/v1 document with stable decision strings.
+##     S2a: each entrypoint carries runTimeoutMs (resolved via effectiveRunTimeoutMs).
 ##
-##   planToJsonString*(plan: RunPlan; gatedOut: seq[GatedEntry]): string
+##   planToJsonString*(plan: RunPlan; gatedOut: seq[GatedEntry];
+##                    warnings: seq[ConfigWarning] = @[]; config: Config = Config()): string
 ##     Pure: compact JSON string of the crisol/plan/v1 document.
 ##
 ## Compile-decision labels (human, per RFC line ~290):
@@ -32,8 +35,8 @@
 ##   cdStale      -> "stale"
 ##   cdSkipFresh  -> "skipFresh"
 
-import std/[json, sets]
-import crisol/[types, render]
+import std/[json, options, sets, tables]
+import crisol/[types, render, scheduler]
 
 # GatedEntry is defined in types.nim and re-exported from there.
 
@@ -107,15 +110,50 @@ proc renderPlan*(plan: RunPlan; gatedOut: seq[GatedEntry];
 # planToJson — PURE
 # ---------------------------------------------------------------------------
 
-proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry]): JsonNode =
+proc warningsToJsonArray*(warns: seq[ConfigWarning]): JsonNode =
+  ## Serialize a seq[ConfigWarning] to a JSON array (the "warnings" field shape).
+  result = newJArray()
+  for w in warns:
+    let wNode = newJObject()
+    wNode["source"]  = newJString(w.source)
+    wNode["context"] = newJString(w.context)
+    wNode["key"]     = newJString(w.key)
+    wNode["message"] = newJString(w.message)
+    result.add wNode
+
+proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
+                 warnings: seq[ConfigWarning] = @[];
+                 config: Config = Config()): JsonNode =
   ## Pure: serialize the PLAN phase to the crisol/plan/v1 JsonNode.  No I/O.
+  ##
+  ## S2a: each entrypoint's resolved run timeout is emitted as
+  ## `runTimeoutMs` (milliseconds) via effectiveRunTimeoutMs(ep, config).
+  ## config defaults to Config() (all-zero) which yields the built-in
+  ## 300_000 ms fallback when neither ep nor global timeout is set.
+  ##
+  ## S3: each entrypoint also carries maxJobs (the per-group concurrency cap from
+  ## config, null/JNull when the group has no cap).  The value is looked up by
+  ## group name from config.groups so it is available at plan time.
+  ##
+  ## Build a group-name → maxJobs lookup once (avoid O(n*m) scanning).
+  var groupMaxJobs: Table[string, Option[int]]
+  for g in config.groups:
+    groupMaxJobs[g.name] = g.maxJobs
+
   let entrypointsNode = newJArray()
   for pep in plan.entrypoints:
     let epNode = newJObject()
-    epNode["path"]     = newJString(pep.ep.path)
-    epNode["group"]    = newJString(pep.ep.group)
-    epNode["decision"] = newJString(decisionString(pep.decision))
-    epNode["reason"]   = newJString(pep.reason)
+    epNode["path"]         = newJString(pep.ep.path)
+    epNode["group"]        = newJString(pep.ep.group)
+    epNode["decision"]     = newJString(decisionString(pep.decision))
+    epNode["reason"]       = newJString(pep.reason)
+    epNode["runTimeoutMs"] = newJInt(effectiveRunTimeoutMs(pep.ep, config))
+    # S3: emit maxJobs from the group config; null when the group has no cap.
+    let mj = groupMaxJobs.getOrDefault(pep.ep.group, none(int))
+    if mj.isSome:
+      epNode["maxJobs"] = newJInt(mj.get)
+    else:
+      epNode["maxJobs"] = newJNull()
     entrypointsNode.add epNode
 
   let gatedNode = newJArray()
@@ -131,7 +169,10 @@ proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry]): JsonNode =
   result["jobs"]        = newJInt(plan.jobs)
   result["entrypoints"] = entrypointsNode
   result["gatedOut"]    = gatedNode
+  result["warnings"]    = warningsToJsonArray(warnings)
 
-proc planToJsonString*(plan: RunPlan; gatedOut: seq[GatedEntry]): string =
+proc planToJsonString*(plan: RunPlan; gatedOut: seq[GatedEntry];
+                       warnings: seq[ConfigWarning] = @[];
+                       config: Config = Config()): string =
   ## Pure: compact JSON string of the crisol/plan/v1 document.
-  $planToJson(plan, gatedOut)
+  $planToJson(plan, gatedOut, warnings, config)

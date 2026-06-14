@@ -12,6 +12,11 @@ _deps/
 nim.cfg
 # Built CLI binary (nimble `bin = @["crisol"]` → ./crisol at repo root).
 /crisol
+# Stray compiled binaries from `nim c src/crisol/<mod>.nim` typecheck runs.
+# Only .nim sources are tracked under src/; ignore any extensionless artifact.
+/src/crisol/*
+!/src/crisol/*.nim
+!/src/crisol/*/
 # Stray state-dir artifacts when crisol/tests run with stateDir defaulting to
 # cwd (the normal location is .crisol/, already ignored above).
 /cache/

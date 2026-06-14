@@ -130,7 +130,17 @@ proc collectStrArgs(n: KdlNode; label: string): seq[string] =
 # Parse a single `group` node → Group  (globalFlags already collected)
 # ---------------------------------------------------------------------------
 
-proc parseGroup(n: KdlNode; globalFlags: seq[string]): Group =
+proc makeConfigWarning(source, context, key: string): ConfigWarning =
+  ## Compose a ConfigWarning with a pre-formatted human message.
+  ConfigWarning(
+    source:  source,
+    context: context,
+    key:     key,
+    message: "unknown config key '" & key & "' in " & context & " (ignored)",
+  )
+
+proc parseGroup(n: KdlNode; globalFlags: seq[string];
+                source: string; warns: var seq[ConfigWarning]): Group =
   ## Parse a `group` DOM node → crisol Group.
   ##
   ## The group node format is:
@@ -149,6 +159,7 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string]): Group =
 
   var optIn:       bool = false
   var timeoutSecs: int  = 0
+  var maxJobs:     Option[int]
   var globs:       seq[string]
   var groupFlags:  seq[string]
   var gate:        Option[Gate]
@@ -169,6 +180,17 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string]): Group =
       timeoutSecs = int(v.get.intVal)
       if timeoutSecs < 0:
         cfgErr("config: group '" & name & "': timeout-secs must be >= 0")
+    of "max-jobs":
+      # child node: max-jobs N  (N >= 1; 0 or negative is a config error)
+      # Absence → none (uncapped). some(1) = serial. some(N) = cap at N.
+      # 0 is NOT "uncapped" — absence is the only way to express uncapped.
+      let v = child.arg(0)
+      if v.isNone or v.get.kind != kvInt:
+        cfgErr("config: group '" & name & "': 'max-jobs' requires an integer argument")
+      let cap = int(v.get.intVal)
+      if cap <= 0:
+        cfgErr("config: group '" & name & "': max-jobs must be >= 1 (use absence to express uncapped)")
+      maxJobs = some(cap)
     of "globs":
       globs.add collectStrArgs(child, "globs (group '" & name & "')")
     of "flags":
@@ -183,7 +205,7 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string]): Group =
         cfgErr("config: group '" & name & "': gate env-var name must not be empty")
       gate = some(Gate(env: env))
     else:
-      discard   # unknown children → silently skipped (forward compat)
+      warns.add makeConfigWarning(source, name, child.name)
 
   if globs.len == 0:
     cfgErr("config: group '" & name & "' has no 'globs' — at least one glob is required")
@@ -196,6 +218,7 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string]): Group =
     optIn:       optIn,
     gate:        gate,
     timeoutSecs: timeoutSecs,
+    maxJobs:     maxJobs,
   )
 
 # ---------------------------------------------------------------------------
@@ -219,7 +242,8 @@ proc validate(cfg: Config) =
 # Walk a KdlDoc → Config
 # ---------------------------------------------------------------------------
 
-proc docToConfig(doc: KdlDoc; projectRoot: string): Config =
+proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
+                 warns: var seq[ConfigWarning]): Config =
   var
     jobs               = 0
     timeoutSecs        = DefaultTimeoutSecs
@@ -228,6 +252,12 @@ proc docToConfig(doc: KdlDoc; projectRoot: string): Config =
     stateDir           = DefaultStateDir
     globalFlags: seq[string]
     depRoots:   seq[string]
+    # Memory-aware scheduling seeds (Feature B, RFC-0002 §Config keys).
+    # All default to none; initAdmission resolves built-in fallbacks.
+    memBudgetMb: Option[int]  = none(int)
+    memPerJobMb: Option[int]  = none(int)
+    memPerRunMb: Option[int]  = none(int)
+    memAware:    Option[bool] = none(bool)
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -239,14 +269,36 @@ proc docToConfig(doc: KdlDoc; projectRoot: string): Config =
     of "state-dir":          stateDir           = requireStrArg(n, 0, "state-dir")
     of "flags":              globalFlags.add      collectStrArgs(n, "flags")
     of "dep-roots":          depRoots.add         collectStrArgs(n, "dep-roots")
+    of "mem-budget-mb":
+      let v = requireIntArg(n, "mem-budget-mb")
+      if v < 0:
+        cfgErr("config: 'mem-budget-mb' must be >= 0, got " & $v)
+      memBudgetMb = some(v)
+    of "mem-per-job-mb":
+      let v = requireIntArg(n, "mem-per-job-mb")
+      if v <= 0:
+        cfgErr("config: 'mem-per-job-mb' must be > 0, got " & $v)
+      memPerJobMb = some(v)
+    of "mem-per-run-mb":
+      let v = requireIntArg(n, "mem-per-run-mb")
+      if v <= 0:
+        cfgErr("config: 'mem-per-run-mb' must be > 0, got " & $v)
+      memPerRunMb = some(v)
+    of "mem-aware":
+      # bool node: mem-aware #true  or  mem-aware #false
+      let v = n.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: 'mem-aware' requires a boolean argument (#true/#false)")
+      memAware = some(v.get.boolVal)
     of "group":              discard
-    else:                    discard   # forward compat
+    else:
+      warns.add makeConfigWarning(source, "top-level", n.name)
 
   # Second pass: parse groups (globalFlags now complete for merge).
   var groups: seq[Group]
   for n in doc.rootNodes:
     if n.name == "group":
-      groups.add parseGroup(n, globalFlags)
+      groups.add parseGroup(n, globalFlags, source, warns)
 
   result = Config(
     groups:             groups,
@@ -257,6 +309,10 @@ proc docToConfig(doc: KdlDoc; projectRoot: string): Config =
     stateDir:           stateDir,
     projectRoot:        projectRoot,
     depRoots:           depRoots,
+    memBudgetMb:        memBudgetMb,
+    memPerJobMb:        memPerJobMb,
+    memPerRunMb:        memPerRunMb,
+    memAware:           memAware,
   )
   validate(result)
 
@@ -264,7 +320,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string): Config =
 # parseConfigFile — read + parse a crisol.kdl path → Config
 # ---------------------------------------------------------------------------
 
-proc parseConfigFile(path: string): Config =
+proc parseConfigFile(path: string): (Config, seq[ConfigWarning]) =
   let src =
     try: readFile(path)
     except IOError, OSError:
@@ -277,14 +333,20 @@ proc parseConfigFile(path: string): Config =
       "config: parse error in '" & path & "':\n" &
       r.getErr.formatError(src, path))
 
-  docToConfig(r.get, parentDir(absolutePath(path)))
+  var warns: seq[ConfigWarning]
+  let cfg = docToConfig(r.get, parentDir(absolutePath(path)), path, warns)
+  (cfg, warns)
 
 # ---------------------------------------------------------------------------
 # loadConfig — the stable public seam
 # ---------------------------------------------------------------------------
 
-proc loadConfig*(configPath: string = ""; startDir: string = ""): Config =
+proc loadConfig*(configPath: string = ""; startDir: string = ""):
+                (Config, seq[ConfigWarning]) =
   ## Resolve and load the crisol configuration.
+  ##
+  ## Returns a tuple of the parsed Config and any ConfigWarnings accumulated
+  ## while parsing (e.g. unrecognized keys for forward-compatibility).
   ##
   ## Resolution order:
   ##   1. `configPath` non-empty → use that path (must exist → cekEnvironment
@@ -303,6 +365,6 @@ proc loadConfig*(configPath: string = ""; startDir: string = ""): Config =
   if found.len > 0:
     return parseConfigFile(found)
 
-  # Convention fallback — not an error
+  # Convention fallback — not an error; no warnings (no file to have unknown keys)
   let gitRoot = findGitRoot(origin)
-  conventionConfig(if gitRoot.len > 0: gitRoot else: origin)
+  (conventionConfig(if gitRoot.len > 0: gitRoot else: origin), @[])

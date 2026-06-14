@@ -22,8 +22,17 @@
 ##     Pure: true iff no record across all entrypoints carries `tag`.
 ##     Zero-match detection predicate — testable without I/O.
 ##
-##   formatProgressLine*(inFlight: seq[(string, int64)]): string
+##   MemThrottleSignalMs*: int
+##     Threshold (ms) after which continuous memory-throttling is shown in the
+##     progress line.  Default 5000 (5 seconds).
+##
+##   memThrottleActive*(throttledSince, now, thresholdMs): bool
+##     Pure: true iff throttledSince.isSome AND (now - throttledSince.get) > thresholdMs.
+##     Pass synthetic MonoTime values for deterministic unit testing (no real sleep needed).
+##
+##   formatProgressLine*(inFlight: seq[(string, int64)]; memThrottled: bool): string
 ##     Pure: format one "still running" line from a list of (name, elapsedMs) pairs.
+##     When memThrottled=true, appends " [mem-throttled]" to the line.
 ##     Empty inFlight → returns "".
 ##
 ## Color gating (RFC B4):
@@ -46,7 +55,7 @@
 ##   PASSED/FAILED verdict; the exit code; the slowest-N section (computed on
 ##   ALL records, not filtered, so "slowest" is not a distorted filtered view).
 
-import std/[algorithm, os, options, sequtils, strutils]
+import std/[algorithm, monotimes, os, options, sequtils, strutils, times]
 import crisol/types
 
 # ---------------------------------------------------------------------------
@@ -103,12 +112,38 @@ proc col*(text: string; code: string; enabled: bool): string {.inline.} =
   if enabled: code & text & Ansi_Reset else: text
 
 # ---------------------------------------------------------------------------
-# formatProgressLine — PURE
+# formatProgressLine — PURE (M4: memThrottled signal)
 # ---------------------------------------------------------------------------
 
-proc formatProgressLine*(inFlight: seq[(string, int64)]): string =
+const
+  MemThrottleSignalMs* = 5000
+    ## Threshold (ms) of continuous memory-throttling before the progress line
+    ## shows the "[mem-throttled]" signal (M4 finding).  Named so it can be
+    ## referenced in tests without magic numbers.
+
+proc memThrottleActive*(throttledSince: Option[MonoTime]; now: MonoTime;
+                        thresholdMs: int): bool =
+  ## Pure: true iff memory-throttling has been continuously active longer than
+  ## thresholdMs milliseconds.
+  ##
+  ## throttledSince: Some(t) = the MonoTime when throttling became active;
+  ##                 None    = throttling is not currently active.
+  ## now:            the current MonoTime (injected by the caller — never read
+  ##                 from the clock here; keeps this function deterministically
+  ##                 testable with synthetic MonoTime values).
+  ## thresholdMs:    threshold in milliseconds (strictly greater than).
+  ##
+  ## Returns false immediately when throttledSince.isNone.
+  if throttledSince.isNone:
+    return false
+  let elapsedMs = (now - throttledSince.get).inMilliseconds
+  elapsedMs > int64(thresholdMs)
+
+proc formatProgressLine*(inFlight: seq[(string, int64)];
+                         memThrottled: bool = false): string =
   ## Pure: format one "still running" stderr progress line.
   ## inFlight is a list of (entrypoint path, elapsedMs) pairs.
+  ## memThrottled: when true, appends " [mem-throttled]" to the line.
   ## Returns "" when inFlight is empty.
   if inFlight.len == 0:
     return ""
@@ -122,7 +157,9 @@ proc formatProgressLine*(inFlight: seq[(string, int64)]): string =
         $(ms div 1000) & "s"
     parts.add name.extractFilename & " (" & secStr & ")"
 
-  "crisol: still running: " & parts.join(", ")
+  result = "crisol: still running: " & parts.join(", ")
+  if memThrottled:
+    result.add " [mem-throttled]"
 
 # ---------------------------------------------------------------------------
 # Outcome label helpers

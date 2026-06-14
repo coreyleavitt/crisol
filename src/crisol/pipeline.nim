@@ -41,8 +41,9 @@ type
     ## (for `run`) handed to execute() for execution.
     plan*:     RunPlan
     gatedOut*: seq[GatedEntry]
-    runnable*: int      ## count of runnable entrypoints AFTER narrowing
-    graph*:    DepGraph ## caller may mutate (depgraph recording)
+    runnable*: int                 ## count of runnable entrypoints AFTER narrowing
+    graph*:    DepGraph            ## caller may mutate (depgraph recording)
+    warnings*: seq[ConfigWarning]  ## config warnings (unknown keys etc.) from loadConfig
 
 # ---------------------------------------------------------------------------
 # buildRunPlan — the SHARED pure plan phase
@@ -57,6 +58,7 @@ proc buildRunPlan*(
   changed:      HashSet[string] = initHashSet[string]();
   nimVersion:   string = "";
   forceCompile: bool = false;
+  warnings:     seq[ConfigWarning] = @[];
 ): RunPlanView =
   ## Pure plan phase: discover → applyGates → [narrowing] → plan.
   ##
@@ -120,4 +122,5 @@ proc buildRunPlan*(
     gatedOut: gatedEntries,
     runnable: runnable.len,
     graph:    graph,
+    warnings: warnings,
   )

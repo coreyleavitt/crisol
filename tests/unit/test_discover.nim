@@ -354,6 +354,57 @@ suite "discover – symlink directories not followed":
 # Suite 10 — toDiscoveredSet test constructor
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Suite 11 — discover populates ep.runTimeoutSecs from group.timeoutSecs
+# ---------------------------------------------------------------------------
+
+suite "discover – runTimeoutSecs propagation":
+  test "ep.runTimeoutSecs is 0 when group.timeoutSecs is 0 (inherit global)":
+    let root = makeTempRoot("rts_zero")
+    defer: cleanupDir(root)
+    writeFixture(root, "tests/unit/test_a.nim")
+    let cfg = makeConfig(root, @[Group(
+      name:        "unit",
+      globs:       @["tests/unit/test_*.nim"],
+      timeoutSecs: 0,
+    )])
+    let ds  = discover(cfg)
+    let eps = applyGates(ds, cfg, initGateState([])).run
+    check eps.len == 1
+    check eps[0].runTimeoutSecs == 0
+
+  test "ep.runTimeoutSecs is copied from group.timeoutSecs when non-zero":
+    let root = makeTempRoot("rts_nonzero")
+    defer: cleanupDir(root)
+    writeFixture(root, "tests/unit/test_a.nim")
+    let cfg = makeConfig(root, @[Group(
+      name:        "unit",
+      globs:       @["tests/unit/test_*.nim"],
+      timeoutSecs: 42,
+    )])
+    let ds  = discover(cfg)
+    let eps = applyGates(ds, cfg, initGateState([])).run
+    check eps.len == 1
+    check eps[0].runTimeoutSecs == 42
+
+  test "two groups with different timeouts: each ep gets its group's timeout":
+    let root = makeTempRoot("rts_twogrp")
+    defer: cleanupDir(root)
+    writeFixture(root, "tests/unit/test_a.nim")
+    writeFixture(root, "tests/integration/test_b.nim")
+    let cfg = makeConfig(root, @[
+      Group(name: "unit",        globs: @["tests/unit/test_*.nim"],        timeoutSecs: 30),
+      Group(name: "integration", globs: @["tests/integration/test_*.nim"], timeoutSecs: 120),
+    ])
+    let ds  = discover(cfg)
+    let eps = applyGates(ds, cfg, initGateState([])).run
+    check eps.len == 2
+    # discover sorts by (path, group), so unit < integration alphabetically by path
+    let unit = eps.filterIt(it.group == "unit")[0]
+    let intg = eps.filterIt(it.group == "integration")[0]
+    check unit.runTimeoutSecs == 30
+    check intg.runTimeoutSecs == 120
+
 suite "toDiscoveredSet – test constructor":
   test "toDiscoveredSet builds a DiscoveredSet without file-tree walk":
     let eps = @[

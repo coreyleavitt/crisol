@@ -20,7 +20,21 @@ type
     flags*:       seq[string]         # compile flags injected for every entrypoint
     optIn*:       bool                # true = only runs when explicitly requested
     gate*:        Option[Gate]
-    timeoutSecs*: int                 # 0 = inherit global timeout
+    timeoutSecs*: int                 ## Per-group run timeout in seconds.
+                                      ## ``0`` = inherit from global ``config.timeoutSecs``.
+                                      ## Uses a 0-sentinel (not Option) because 0 is
+                                      ## meaningless as a timeout value — no test should
+                                      ## be allowed 0 seconds to run.
+    maxJobs*:     Option[int]         ## Per-group concurrency cap.
+                                      ## ``none`` = uncapped (inherit global ``plan.jobs``).
+                                      ## ``some(1)`` = serial (one slot at a time for this
+                                      ## group); ``some(N)`` = cap at N.
+                                      ## Encoded as ``Option[int]`` (not a 0-sentinel) because
+                                      ## 0 is a meaningful "uncapped" value — ``none`` is the
+                                      ## only way to express "no cap".  This deliberately
+                                      ## differs from ``timeoutSecs``'s 0-sentinel: a 0-second
+                                      ## timeout is nonsensical, but a 0-job cap would mean
+                                      ## "never run", not "uncapped".
 
   Config* = object
     ## Top-level runtime configuration parsed from the project config file or
@@ -36,6 +50,22 @@ type
     depRoots*:           seq[string]  # optional additional source roots beyond the project root
                                      # (e.g. a sibling library under co-development); stdlib and
                                      # nimble-package paths are always excluded regardless
+    ## Memory-aware scheduling seeds (Feature B, RFC-0002 §Config keys).
+    ## All are optional; none = unset (built-in defaults apply at wiring time).
+    ## Option[int] (not int with 0-sentinel) matches Group.maxJobs / memAware encoding.
+    memBudgetMb*:  Option[int]  ## CI determinism cap (MiB). none = use probe raw (no cap).
+                                ## Unit boundary: stored in MiB; converted to bytes where
+                                ## consumed (in initAdmission / refreshAvail).
+    memPerJobMb*:  Option[int]  ## estJobPeak seed (MiB). none = 512 MiB built-in.
+    memPerRunMb*:  Option[int]  ## cdSkipFresh run estimate seed (MiB). none = 64 MiB built-in.
+    memAware*:     Option[bool] ## Kill switch / force-on.
+                                ## none   = auto (probe-availability decides at wiring time, S6b).
+                                ## some(true)  = force mem-aware on.
+                                ## some(false) = force mem-aware off → today's fixed-pool behavior.
+                                ## Option[bool] (not plain bool) because "unset" is meaningfully
+                                ## different from "set to false": absence means auto-detect,
+                                ## not "disabled". A plain bool with a false default would
+                                ## conflate the two. Consistent with Group.maxJobs encoding.
 
   GroupSelectionKind* = enum
     gskDefault    ## run all non-opt-in groups
@@ -60,6 +90,10 @@ type
     path*:  string          # project-root-relative, '/' separated
     group*: string
     flags*: seq[string]     # group.flags (global flags merged at plan time)
+    runTimeoutSecs*: int    ## Per-entrypoint run timeout inherited from the group.
+                            ## 0 = inherit from global config.timeoutSecs.
+                            ## Does NOT participate in the depgraph key (path, flagHash);
+                            ## freshness/impact selection are unaffected.
 
   CompileDecision* = enum
     cdNeverBuilt   ## no binary exists at the keyed path
@@ -153,6 +187,15 @@ type
 
   SelectionResult* = tuple[ep: Entrypoint; reason: SelectionReason]
     ## A selected entrypoint annotated with why it was included.
+
+  ConfigWarning* = object
+    ## A diagnostic emitted when an unrecognized key is found in the config
+    ## file.  The human message is composed once at the warning site so neither
+    ## the CLI (stderr) nor the JSON schema need to duplicate the formatting.
+    source*:  string   ## config file path; "" = convention fallback
+    context*: string   ## "top-level" or the group name
+    key*:     string   ## the unrecognized node name
+    message*: string   ## fully composed: "unknown config key '<key>' in <context> (ignored)"
 
   CrisolErrorKind* = enum
     cekConfig       ## bad config, unknown group, overlapping identical-flag globs

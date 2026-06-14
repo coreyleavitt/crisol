@@ -288,9 +288,10 @@ proc discover*(
       if matched and relPath notin seen:
         seen.incl relPath
         entries.add Entrypoint(
-          path:  relPath,
-          group: group.name,
-          flags: group.flags,
+          path:           relPath,
+          group:          group.name,
+          flags:          group.flags,
+          runTimeoutSecs: group.timeoutSecs,  # 0 = inherit global (RFC-0002 Feature A)
         )
 
   # 4. Sort by (path, group) — stable ordering for deterministic output.

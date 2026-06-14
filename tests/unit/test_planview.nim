@@ -4,7 +4,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_planview.nim
 
-import std/[json, strutils, unittest]
+import std/[json, options, strutils, unittest]
 import crisol/types
 import crisol/render
 import crisol/planview
@@ -126,3 +126,124 @@ suite "planToJson — versioned stable schema":
     check j["schema"].getStr == "crisol/plan/v1"
     check j["entrypoints"].len == 3
     check j["gatedOut"].len == 1
+
+  test "plan/v1 has a top-level warnings array (empty when no warnings)":
+    let j = planToJson(samplePlan(), sampleGated())
+    check j.hasKey("warnings")
+    check j["warnings"].kind == JArray
+    check j["warnings"].len == 0
+
+  test "plan/v1 warnings array carries ConfigWarning fields":
+    let warn = ConfigWarning(
+      source:  "/path/to/crisol.kdl",
+      context: "top-level",
+      key:     "timeout-sec",
+      message: "unknown config key 'timeout-sec' in top-level (ignored)",
+    )
+    let j = planToJson(samplePlan(), sampleGated(), @[warn])
+    check j["warnings"].len == 1
+    let w = j["warnings"][0]
+    check w["source"].getStr  == "/path/to/crisol.kdl"
+    check w["context"].getStr == "top-level"
+    check w["key"].getStr     == "timeout-sec"
+    check "timeout-sec" in w["message"].getStr
+
+  test "plan/v1 each entrypoint carries runTimeoutSecs (ms) field":
+    ## S2a: planToJson exposes the resolved runTimeoutMs per entrypoint.
+    ## When ep.runTimeoutSecs == 0 and global config.timeoutSecs == 0,
+    ## the built-in default (300_000 ms) is used.
+    ## We use a zero-config so we can verify the fallback default.
+    let plan = RunPlan(
+      jobs: 1,
+      entrypoints: @[
+        PlannedEntrypoint(
+          ep:       Entrypoint(path: "tests/unit/test_a.nim", group: "unit",
+                               flags: @[], runTimeoutSecs: 0),
+          decision: cdNeverBuilt, reason: "r"),
+      ])
+    # Pass a zero Config so global timeout is also 0 → built-in default applies.
+    let cfg = Config(jobs: 1, timeoutSecs: 0, compileTimeoutSecs: 600,
+                     maxOutputBytes: 10 * 1024 * 1024, stateDir: ".crisol")
+    let j = planToJson(plan, @[], @[], cfg)
+    check j["entrypoints"][0].hasKey("runTimeoutMs")
+    check j["entrypoints"][0]["runTimeoutMs"].getInt == 300_000
+
+  test "plan/v1 runTimeoutMs reflects ep-level timeout when set":
+    let plan = RunPlan(
+      jobs: 1,
+      entrypoints: @[
+        PlannedEntrypoint(
+          ep:       Entrypoint(path: "tests/unit/test_a.nim", group: "unit",
+                               flags: @[], runTimeoutSecs: 42),
+          decision: cdNeverBuilt, reason: "r"),
+      ])
+    let cfg = Config(jobs: 1, timeoutSecs: 300, compileTimeoutSecs: 600,
+                     maxOutputBytes: 10 * 1024 * 1024, stateDir: ".crisol")
+    let j = planToJson(plan, @[], @[], cfg)
+    check j["entrypoints"][0]["runTimeoutMs"].getInt == 42_000
+
+  test "plan/v1 runTimeoutMs reflects global config timeout when ep is 0":
+    let plan = RunPlan(
+      jobs: 1,
+      entrypoints: @[
+        PlannedEntrypoint(
+          ep:       Entrypoint(path: "tests/unit/test_a.nim", group: "unit",
+                               flags: @[], runTimeoutSecs: 0),
+          decision: cdNeverBuilt, reason: "r"),
+      ])
+    let cfg = Config(jobs: 1, timeoutSecs: 120, compileTimeoutSecs: 600,
+                     maxOutputBytes: 10 * 1024 * 1024, stateDir: ".crisol")
+    let j = planToJson(plan, @[], @[], cfg)
+    check j["entrypoints"][0]["runTimeoutMs"].getInt == 120_000
+
+  test "plan/v1 each entrypoint carries maxJobs field (S3)":
+    ## When a group has max-jobs set, the entrypoint's maxJobs is that int.
+    ## When absent (none), maxJobs is null in the JSON.
+    let plan = RunPlan(
+      jobs: 4,
+      entrypoints: @[
+        PlannedEntrypoint(
+          ep:       Entrypoint(path: "tests/unit/test_a.nim", group: "serial",
+                               flags: @[], runTimeoutSecs: 0),
+          decision: cdNeverBuilt, reason: "r"),
+        PlannedEntrypoint(
+          ep:       Entrypoint(path: "tests/unit/test_b.nim", group: "free",
+                               flags: @[], runTimeoutSecs: 0),
+          decision: cdNeverBuilt, reason: "r"),
+      ])
+    let cfg = Config(
+      jobs:               4,
+      timeoutSecs:        300,
+      compileTimeoutSecs: 600,
+      maxOutputBytes:     10 * 1024 * 1024,
+      stateDir:           ".crisol",
+      groups: @[
+        Group(name: "serial", globs: @["tests/unit/*.nim"],
+              maxJobs: some(1), timeoutSecs: 0),
+        Group(name: "free",   globs: @["tests/unit/*.nim"],
+              maxJobs: none(int), timeoutSecs: 0),
+      ],
+    )
+    let j = planToJson(plan, @[], @[], cfg)
+    let eps = j["entrypoints"]
+    # serial group → maxJobs is 1
+    check eps[0].hasKey("maxJobs")
+    check eps[0]["maxJobs"].kind == JInt
+    check eps[0]["maxJobs"].getInt == 1
+    # free group → maxJobs is null
+    check eps[1].hasKey("maxJobs")
+    check eps[1]["maxJobs"].kind == JNull
+
+  test "plan/v1 maxJobs is null when group not present in config":
+    ## Entrypoints in groups not listed in config.groups get maxJobs = null.
+    let plan = RunPlan(
+      jobs: 1,
+      entrypoints: @[
+        PlannedEntrypoint(
+          ep:       Entrypoint(path: "tests/unit/test_a.nim", group: "unit",
+                               flags: @[], runTimeoutSecs: 0),
+          decision: cdNeverBuilt, reason: "r"),
+      ])
+    # Config with an empty Config() — no groups — group lookup returns none
+    let j = planToJson(plan, @[], @[], Config())
+    check j["entrypoints"][0]["maxJobs"].kind == JNull

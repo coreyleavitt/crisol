@@ -122,9 +122,9 @@ proc computeColorEnabled(): bool =
 # emitPlan — CLI display path for list and run --dry-run.
 # ---------------------------------------------------------------------------
 
-proc emitPlan(pv: RunPlanView; jsonMode, colorEnabled: bool) =
+proc emitPlan(pv: RunPlanView; jsonMode, colorEnabled: bool; cfg: Config) =
   if jsonMode:
-    stdout.write(planToJsonString(pv.plan, pv.gatedOut))
+    stdout.write(planToJsonString(pv.plan, pv.gatedOut, pv.warnings, cfg))
     stdout.write("\n")
   else:
     let opts = RenderOpts(color: colorEnabled, slowestN: 5)
@@ -176,7 +176,7 @@ proc runMain*(args: seq[string]): int =
         stderr.write("crisol: unknown flag for clean: '" & a & "'\n")
         return ExitEnvironment
 
-    let cfg = loadConfig(configPath = "")
+    let (cfg, _) = loadConfig(configPath = "")
     let stateDir = cfg.projectRoot / cfg.stateDir
 
     if doCleanAll:
@@ -384,8 +384,9 @@ proc runMain*(args: seq[string]): int =
     return ExitEnvironment
 
   var cfg: Config
+  var cfgWarnings: seq[ConfigWarning]
   try:
-    cfg = loadConfig(configPath = configPath)
+    (cfg, cfgWarnings) = loadConfig(configPath = configPath)
   except CrisolError as e:
     case e.kind
     of cekConfig:
@@ -397,6 +398,9 @@ proc runMain*(args: seq[string]): int =
     of cekInternal:
       stderr.write("crisol: internal error: " & e.msg & "\n")
       return ExitInternal
+  # Emit config warnings to stderr (forward-compat: warn, never fail).
+  for w in cfgWarnings:
+    stderr.write("warning: " & w.message & "\n")
   if jobs > 0:    cfg.jobs = jobs
   if timeout > 0: cfg.timeoutSecs = timeout
 
@@ -476,7 +480,8 @@ proc runMain*(args: seq[string]): int =
     pv = buildRunPlan(cfg, selection, failedKeys,
                       useFailed = useFailed, useChanged = useChanged,
                       changed = changedSet,
-                      nimVersion = "", forceCompile = forceCompile)
+                      nimVersion = "", forceCompile = forceCompile,
+                      warnings = cfgWarnings)
   except CrisolError as e:
     case e.kind
     of cekConfig:
@@ -492,7 +497,7 @@ proc runMain*(args: seq[string]): int =
   # `list` and `--dry-run`: render the plan and exit WITHOUT executing.
   # Read-only commands do NOT acquire the lock.
   if isList or dryRun:
-    emitPlan(pv, jsonMode, colorEnabled)
+    emitPlan(pv, jsonMode, colorEnabled, cfg)
     return ExitOk
 
   # -------------------------------------------------------------------------
@@ -546,6 +551,7 @@ proc runMain*(args: seq[string]): int =
   var runGraph         = pv.graph   # mutable copy for depgraph recording
 
   var results: seq[EntrypointResult]
+  var memThrottled = 0  # S6b: populated by execute via memThrottledOut
   try:
     # M1: timeouts and output cap are derived from cfg inside execute().
     results = execute(
@@ -557,6 +563,7 @@ proc runMain*(args: seq[string]): int =
       failFast         = failFast,
       showProgress     = not jsonMode,
       progressIntervalMs = 30_000,
+      memThrottledOut  = addr memThrottled,
     )
   except CrisolInterrupted as e:
     # R2/A6: SIGINT or SIGTERM interrupted the run.  Exit with 128 + signum
@@ -585,7 +592,8 @@ proc runMain*(args: seq[string]): int =
                  $skipped & " entrypoint(s) not started\n")
 
   let s = summarize(results)
-  persistLastRun(results, s, cfg)
+  persistLastRun(results, s, cfg, warnings = pv.warnings,
+                 memThrottledSlots = memThrottled)
 
   # C3: zero-match warning is emitted regardless of --json mode (always stderr).
   if filterTag.len > 0 and hasZeroTagMatches(results, filterTag):
@@ -593,7 +601,7 @@ proc runMain*(args: seq[string]): int =
                  filterTag & "\"\n")
 
   if jsonMode:
-    stdout.write(toJsonString(results, s, filterTag))
+    stdout.write(toJsonString(results, s, filterTag, pv.warnings, memThrottled))
     stdout.write("\n")
   else:
     let opts = RenderOpts(color: colorEnabled, slowestN: 5,

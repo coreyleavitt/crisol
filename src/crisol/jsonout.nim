@@ -59,6 +59,7 @@
 import std/[json, options, os, sets]
 import crisol/types
 import crisol/render  # for filterRecordsByTag
+import crisol/planview  # for warningsToJsonArray
 
 # ---------------------------------------------------------------------------
 # Stable string mappings
@@ -86,12 +87,17 @@ proc recordStatusString*(s: RecordStatus): string =
 # ---------------------------------------------------------------------------
 
 proc toJson*(results: seq[EntrypointResult]; summary: Summary;
-             filterTag: string = ""): JsonNode =
+             filterTag: string = "";
+             warnings: seq[ConfigWarning] = @[];
+             memThrottledSlots: int = 0): JsonNode =
   ## Pure: serialize to the crisol/run/v1 JsonNode.
   ## No I/O.
   ## C3: when filterTag is non-empty, each entrypoint's records array contains
   ## only records whose tags include filterTag.  The summary block always
   ## reflects the full unfiltered run (no re-counting from filtered records).
+  ## warnings: config warnings (unknown keys) threaded from loadConfig.
+  ## memThrottledSlots: count of slots that were memory-blocked (S2a schema
+  ## field; populated by AdmissionController in S6b).  Defaults to 0. # S6b
 
   # Build summary object (always full-run counts)
   let summaryNode = newJObject()
@@ -131,39 +137,49 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
 
     # Build entrypoint object
     let epNode = newJObject()
-    epNode["path"]       = newJString(r.ep.path)
-    epNode["group"]      = newJString(r.ep.group)
-    epNode["outcome"]    = newJString(outcomeString(r.outcome))
-    epNode["exitCode"]   = newJInt(r.exitCode)
+    epNode["path"]          = newJString(r.ep.path)
+    epNode["group"]         = newJString(r.ep.group)
+    epNode["outcome"]       = newJString(outcomeString(r.outcome))
+    epNode["exitCode"]      = newJInt(r.exitCode)
     if r.outcome == oSignal:
       epNode["signal"] = newJInt(r.signal)
     else:
       epNode["signal"] = newJNull()
-    epNode["durationMs"] = newJFloat(r.durationMs.float)
-    epNode["records"]    = recordsNode
+    epNode["durationMs"]    = newJFloat(r.durationMs.float)
+    epNode["compileSkipped"] = newJBool(r.compileSkipped)  # S2a: complete the schema
+    epNode["records"]       = recordsNode
     entrypointsNode.add epNode
 
   # Assemble top-level object
   result = newJObject()
-  result["schema"]      = newJString("crisol/run/v1")
-  result["summary"]     = summaryNode
-  result["entrypoints"] = entrypointsNode
+  result["schema"]           = newJString("crisol/run/v1")
+  result["summary"]          = summaryNode
+  result["entrypoints"]      = entrypointsNode
+  result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
+  result["warnings"]         = warningsToJsonArray(warnings)
 
 proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
-                   filterTag: string = ""): string =
+                   filterTag: string = "";
+                   warnings: seq[ConfigWarning] = @[];
+                   memThrottledSlots: int = 0): string =
   ## Pure: compact JSON string of the crisol/run/v1 document.
   ## C3: filterTag threads through to toJson.
-  $toJson(results, summary, filterTag)
+  $toJson(results, summary, filterTag, warnings, memThrottledSlots)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
 # ---------------------------------------------------------------------------
 
 proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
-                     config: Config) =
+                     config: Config;
+                     warnings: seq[ConfigWarning] = @[];
+                     memThrottledSlots: int = 0) =
   ## Write lastrun.json atomically to <projectRoot>/<stateDir>/lastrun.json.
   ## Creates the state directory if it does not exist.
   ## On any failure: prints a warning to stderr and returns -- never raises.
+  ##
+  ## warnings and memThrottledSlots are threaded through to toJsonString so
+  ## the persisted file matches the stdout JSON path exactly (M3 fix).
   let stateDir = config.projectRoot / config.stateDir
   let finalPath = stateDir / "lastrun.json"
 
@@ -177,7 +193,8 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   # Write to a temp file in the same directory, then rename (atomic on POSIX).
   let tmpPath = finalPath & ".tmp"
   try:
-    let jsonStr = toJsonString(results, summary)
+    let jsonStr = toJsonString(results, summary, warnings = warnings,
+                               memThrottledSlots = memThrottledSlots)
     writeFile(tmpPath, jsonStr)
     moveFile(tmpPath, finalPath)
   except OSError as e:

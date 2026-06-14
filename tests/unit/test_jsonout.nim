@@ -126,10 +126,31 @@ suite "jsonout - toJson schema":
     check node.hasKey("schema")
     check node["schema"].getStr == "crisol/run/v1"
 
-  test "top-level has summary and entrypoints keys":
+  test "top-level has summary, entrypoints, and warnings keys":
     let node = toJson(syntheticResults(), syntheticSummary())
     check node.hasKey("summary")
     check node.hasKey("entrypoints")
+    check node.hasKey("warnings")
+
+  test "run/v1 warnings array is empty when no warnings passed":
+    let node = toJson(syntheticResults(), syntheticSummary())
+    check node["warnings"].kind == JArray
+    check node["warnings"].len == 0
+
+  test "run/v1 warnings array carries ConfigWarning fields when provided":
+    let warn = ConfigWarning(
+      source:  "/proj/crisol.kdl",
+      context: "integration",
+      key:     "max-retries",
+      message: "unknown config key 'max-retries' in integration (ignored)",
+    )
+    let node = toJson(syntheticResults(), syntheticSummary(), warnings = @[warn])
+    check node["warnings"].len == 1
+    let w = node["warnings"][0]
+    check w["source"].getStr  == "/proj/crisol.kdl"
+    check w["context"].getStr == "integration"
+    check w["key"].getStr     == "max-retries"
+    check "max-retries" in w["message"].getStr
 
   test "summary counts match input Summary":
     let s    = syntheticSummary()
@@ -229,6 +250,36 @@ suite "jsonout - toJson schema":
     check s.len > 0
     let parsed = parseJson(s)   # throws if invalid
     check parsed["schema"].getStr == "crisol/run/v1"
+
+  # S2a: compileSkipped and memThrottledSlots schema fields
+
+  test "run/v1 each entrypoint carries compileSkipped boolean field":
+    ## S2a: EntrypointResult.compileSkipped already exists but toJson never
+    ## emitted it.  This completes the schema.
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"), outcome: oPassed,
+                       exitCode: 0, durationMs: 10, compileSkipped: true, records: @[]),
+      EntrypointResult(ep: makeEp("tests/unit/test_b.nim"), outcome: oPassed,
+                       exitCode: 0, durationMs: 10, compileSkipped: false, records: @[]),
+    ]
+    let node = toJson(results, Summary(total: 2, passed: 2))
+    check node["entrypoints"][0].hasKey("compileSkipped")
+    check node["entrypoints"][0]["compileSkipped"].getBool == true
+    check node["entrypoints"][1]["compileSkipped"].getBool == false
+
+  test "run/v1 has top-level memThrottledSlots integer field":
+    ## S2a: schema field for memory-throttled slot count.  The AdmissionController
+    ## (S6b) will populate this; for now it is always 0.  # S6b
+    let node = toJson(syntheticResults(), syntheticSummary())
+    check node.hasKey("memThrottledSlots")
+    check node["memThrottledSlots"].kind == JInt
+    check node["memThrottledSlots"].getInt == 0
+
+  test "run/v1 memThrottledSlots accepts a non-zero value when passed":
+    ## Verify the field is wired through the parameter, not hard-coded.
+    let node = toJson(syntheticResults(), syntheticSummary(),
+                      memThrottledSlots = 3)
+    check node["memThrottledSlots"].getInt == 3
 
   test "empty results sequence serializes cleanly":
     let s    = Summary(total: 0, passed: 0, noTestsRan: true)
@@ -592,6 +643,106 @@ suite "jsonout - loadLastRun (B7)":
       raised = true
       check e.kind == cekEnvironment
     check raised
+
+  # ---------------------------------------------------------------------------
+  # M3: persistLastRun must persist warnings and memThrottledSlots
+  # ---------------------------------------------------------------------------
+
+  test "persistLastRun preserves warnings in lastrun.json":
+    ## RED against old code: persistLastRun called toJsonString(results, summary)
+    ## without warnings, so warnings were always [] in the persisted file.
+    ## After the fix, warnings must appear in lastrun.json exactly as they do
+    ## in the stdout JSON path.
+    let tmpDir   = uniqueTmpDir("m3warn")
+    let stateDir = ".crisol_test"
+    let cfg      = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    let warn = ConfigWarning(
+      source:  "/proj/crisol.kdl",
+      context: "integration",
+      key:     "max-retries",
+      message: "unknown config key 'max-retries' in integration (ignored)",
+    )
+    persistLastRun(syntheticResults(), syntheticSummary(), cfg,
+                   warnings = @[warn], memThrottledSlots = 0)
+
+    let parsed = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
+    check parsed.hasKey("warnings")
+    check parsed["warnings"].kind == JArray
+    check parsed["warnings"].len == 1
+    check parsed["warnings"][0]["key"].getStr == "max-retries"
+
+  test "persistLastRun preserves memThrottledSlots in lastrun.json":
+    ## RED against old code: persistLastRun called toJsonString(results, summary)
+    ## without memThrottledSlots, so it was always 0 in the persisted file even
+    ## when the actual run throttled slots.
+    let tmpDir   = uniqueTmpDir("m3mem")
+    let stateDir = ".crisol_test"
+    let cfg      = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    persistLastRun(syntheticResults(), syntheticSummary(), cfg,
+                   warnings = @[], memThrottledSlots = 7)
+
+    let parsed = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
+    check parsed.hasKey("memThrottledSlots")
+    check parsed["memThrottledSlots"].getInt == 7
+
+  test "persistLastRun with warnings and memThrottledSlots matches toJsonString output":
+    ## The file written by persistLastRun must match what toJsonString would
+    ## produce with the same arguments — i.e., stdout and lastrun.json are
+    ## consistent for the new RFC-0002 fields.
+    let tmpDir   = uniqueTmpDir("m3match")
+    let stateDir = ".crisol_test"
+    let cfg      = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    let warn = ConfigWarning(
+      source:  "/proj/crisol.kdl",
+      context: "unit",
+      key:     "bad-key",
+      message: "unknown config key 'bad-key' in unit (ignored)",
+    )
+    let results = syntheticResults()
+    let summary = syntheticSummary()
+    persistLastRun(results, summary, cfg, warnings = @[warn], memThrottledSlots = 3)
+
+    let fromFile   = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
+    let fromStdout = parseJson(toJsonString(results, summary,
+                                            warnings = @[warn],
+                                            memThrottledSlots = 3))
+
+    check fromFile["warnings"].len          == fromStdout["warnings"].len
+    check fromFile["memThrottledSlots"].getInt == fromStdout["memThrottledSlots"].getInt
+    check fromFile["warnings"][0]["key"].getStr == fromStdout["warnings"][0]["key"].getStr
 
   test "loadLastRun via persistLastRun: round-trip extracts correct failed set":
     ## Use persistLastRun (B5) to write a real lastrun.json, then loadLastRun
