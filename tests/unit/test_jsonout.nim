@@ -771,3 +771,81 @@ suite "jsonout - loadLastRun (B7)":
     check lr.failed.len == 1
     check (path: "tests/unit/test_alpha.nim", group: "unit") in lr.failed
     check (path: "tests/unit/test_beta.nim",  group: "unit") notin lr.failed
+
+# ---------------------------------------------------------------------------
+# P3 — symlink write-through protection for temp file
+# ---------------------------------------------------------------------------
+
+suite "jsonout - P3 symlink-safe temp write":
+
+  test "persistLastRun with pre-planted .tmp symlink does not write through to symlink target":
+    ## A pre-existing lastrun.json.tmp symlink pointing to a sentinel file
+    ## must NOT cause persistLastRun to overwrite the sentinel.
+    ## After the fix, O_CREAT|O_EXCL|O_WRONLY rejects the open when a file
+    ## already exists at the temp path (the symlink is a pre-existing entry).
+    ## The stale .tmp is removed first, then opened exclusively — so the only
+    ## pre-existing .tmp that could interfere is one planted BETWEEN our
+    ## removeFile and open, which is a TOCTOU window but not the stated
+    ## symlink-pre-planting attack.  This test covers the simpler pre-planted
+    ## case: the stale file is cleaned up and the write succeeds into a fresh fd.
+    ##
+    ## More specifically: we verify that the FINAL write goes to lastrun.json
+    ## (not to some other path), and that the normal round-trip still works.
+    let tmpDir   = uniqueTmpDir("p3sym")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+    createDir(tmpDir / stateDir)
+
+    let finalPath = tmpDir / stateDir / "lastrun.json"
+    let tmpPath   = finalPath & ".tmp"
+
+    # Plant a sentinel file and a symlink pointing to it at the .tmp location.
+    let sentinel = tmpDir / "sentinel_must_not_be_overwritten.txt"
+    writeFile(sentinel, "ORIGINAL")
+    # Create a symlink: lastrun.json.tmp -> sentinel
+    discard posix_mod.symlink(sentinel.cstring, tmpPath.cstring)
+
+    let cfg = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+
+    # This must not crash. Whether it succeeds or warns, the sentinel must be intact.
+    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+
+    # The sentinel file must NOT have been overwritten with JSON.
+    let sentinelContent = readFile(sentinel)
+    check sentinelContent == "ORIGINAL"
+
+  test "persistLastRun normal round-trip still works after P3 fix":
+    ## Verify that the O_CREAT|O_EXCL write path produces a correct lastrun.json
+    ## when no stale .tmp exists (the happy path is preserved).
+    let tmpDir   = uniqueTmpDir("p3happy")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    let cfg = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+
+    let results = syntheticResults()
+    let summary = syntheticSummary()
+    persistLastRun(results, summary, cfg)
+    let lr = loadLastRun(cfg)
+
+    check lr.found == true
+    # syntheticResults has 5 failure outcomes out of 6 total
+    check lr.failed.len == 5

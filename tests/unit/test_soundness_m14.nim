@@ -82,4 +82,56 @@ block test_m14_clean_repo_no_phantom_untracked:
   assert "README.md" notin changed,
     "M14: clean tracked file must not appear as changed. Got: " & $changed
 
+block test_p2_dash_ref_rejected_before_git_invocation:
+  ## P2: a --base ref beginning with '-' must be rejected with cekEnvironment
+  ## before any git invocation, to prevent git flag-injection.
+  ## We use a real git repo so the path past the probe check is exercised,
+  ## but the rejection must happen before changedFiles ever calls `git diff`.
+  let repoDir = getTempDir() / "crisol_p2_a"
+  defer: removeDir(repoDir)
+  initGitRepo(repoDir)
+
+  var caught = false
+  var kind: CrisolErrorKind
+  var msg = ""
+  try:
+    discard changedFiles(repoDir, base = "--output=/tmp/evil")
+  except CrisolError as e:
+    caught = true
+    kind = e.kind
+    msg = e.msg
+
+  assert caught, "P2: dash-leading ref must raise CrisolError"
+  assert kind == cekEnvironment, "P2: kind must be cekEnvironment, got " & $kind
+  assert "--base" in msg or "ref" in msg,
+    "P2: error message must mention the flag, got: " & msg
+
+block test_p2_single_dash_also_rejected:
+  ## A single '-' is also a git flag prefix; must be rejected.
+  let repoDir = getTempDir() / "crisol_p2_b"
+  defer: removeDir(repoDir)
+  initGitRepo(repoDir)
+
+  var caught = false
+  try:
+    discard changedFiles(repoDir, base = "-p")
+  except CrisolError:
+    caught = true
+  assert caught, "P2: single-dash ref '-p' must raise CrisolError"
+
+block test_p2_normal_ref_still_accepted:
+  ## A normal SHA-like or branch-like ref must NOT be rejected.
+  ## Use "HEAD" which exists in our freshly-initialised repo.
+  let repoDir = getTempDir() / "crisol_p2_c"
+  defer: removeDir(repoDir)
+  initGitRepo(repoDir)
+
+  # Should not raise — HEAD is a valid ref, starts with 'H' not '-'.
+  var raised = false
+  try:
+    discard changedFiles(repoDir, base = "HEAD")
+  except CrisolError:
+    raised = true
+  assert not raised, "P2: normal ref 'HEAD' must not be rejected"
+
 echo "PASS test_soundness_m14"

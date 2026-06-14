@@ -57,9 +57,19 @@
 ##   rsSkip -> "skip"
 
 import std/[json, options, os, sets]
+import std/posix as posix_mod
 import crisol/types
 import crisol/render  # for filterRecordsByTag
 import crisol/planview  # for warningsToJsonArray
+
+# ---------------------------------------------------------------------------
+# Schema-version constant (single source of truth)
+# ---------------------------------------------------------------------------
+
+const RunV1Schema* = "crisol/run/v1"
+  ## Stable schema identifier embedded in every crisol/run/v1 JSON document.
+  ## Import crisol/api (or crisol/jsonout directly) to reference this constant
+  ## rather than duplicating the string literal.
 
 # ---------------------------------------------------------------------------
 # Stable string mappings
@@ -152,7 +162,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
 
   # Assemble top-level object
   result = newJObject()
-  result["schema"]           = newJString("crisol/run/v1")
+  result["schema"]           = newJString(RunV1Schema)
   result["summary"]          = summaryNode
   result["entrypoints"]      = entrypointsNode
   result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
@@ -191,17 +201,39 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
     return
 
   # Write to a temp file in the same directory, then rename (atomic on POSIX).
+  # Use O_CREAT|O_EXCL|O_WRONLY so the open fails if a file (or symlink) already
+  # exists at the temp path — prevents a pre-planted symlink from redirecting our
+  # write to an attacker-chosen path (symlink write-through attack on shared fs).
+  # If a stale .tmp from a previous crashed run exists, we remove it first.
   let tmpPath = finalPath & ".tmp"
+  try: removeFile(tmpPath) except: discard
+  let jsonStr = toJsonString(results, summary, warnings = warnings,
+                             memThrottledSlots = memThrottledSlots)
+  var tmpFd: cint = -1
   try:
-    let jsonStr = toJsonString(results, summary, warnings = warnings,
-                               memThrottledSlots = memThrottledSlots)
-    writeFile(tmpPath, jsonStr)
+    let flags = O_CREAT or O_EXCL or O_WRONLY or O_CLOEXEC
+    tmpFd = posix_mod.open(tmpPath.cstring, flags, Mode(0o600))
+    if tmpFd < 0:
+      let err = $strerror(errno)
+      stderr.write("crisol: warning: could not create temp file for lastrun.json: " &
+                   err & "\n")
+      return
+    let written = posix_mod.write(tmpFd, jsonStr.cstring, jsonStr.len)
+    discard posix_mod.close(tmpFd)
+    tmpFd = -1
+    if written < 0 or written != jsonStr.len:
+      stderr.write("crisol: warning: short write to lastrun.json temp file\n")
+      try: removeFile(tmpPath) except: discard
+      return
     moveFile(tmpPath, finalPath)
   except OSError as e:
+    if tmpFd >= 0:
+      discard posix_mod.close(tmpFd)
     stderr.write("crisol: warning: could not write lastrun.json: " & e.msg & "\n")
-    # Try to clean up tmp file; ignore errors.
     try: removeFile(tmpPath) except: discard
   except Exception as e:
+    if tmpFd >= 0:
+      discard posix_mod.close(tmpFd)
     stderr.write("crisol: warning: unexpected error writing lastrun.json: " &
                  e.msg & "\n")
     try: removeFile(tmpPath) except: discard
@@ -252,7 +284,7 @@ proc loadLastRun*(config: Config):
     raise newCrisolError(cekEnvironment,
       "lastrun.json is missing 'schema' field — run `crisol run` first")
   let schemaVal = node["schema"].getStr("")
-  if schemaVal != "crisol/run/v1":
+  if schemaVal != RunV1Schema:
     raise newCrisolError(cekEnvironment,
       "stale lastrun.json (schema '" & schemaVal &
       "') — run `crisol run` first")

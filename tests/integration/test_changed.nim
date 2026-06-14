@@ -216,9 +216,10 @@ suite "crisol D5 — --changed end-to-end":
     check r.output.contains("test_a")
     check r.output.contains("test_b")
 
-  test "--base without --changed warns and runs normally":
-    ## --base alone is meaningless: it must NOT enable narrowing and must NOT
-    ## error.  Use --dry-run + a fixture so we get a clean exit 0.
+  test "--base without --changed is an error (exit 3) — BREAKING REVERSAL":
+    ## BEHAVIORAL REVERSAL (S4.3): --base without --changed was previously a
+    ## warn-and-continue (exit 0).  It is now a CLI error (exit 3).
+    ## A base ref without impact selection is always a mistake; error is cleaner.
     let repo = uniqueTmpDir("baseonly")
     defer: removeDir(repo)
     initRepo(repo)
@@ -231,8 +232,7 @@ suite "crisol D5 — --changed end-to-end":
     defer: setCurrentDir(oldCwd)
 
     let r = captureRunMain(@["run", "--base", "HEAD", "--dry-run"])
-    check r.code == 0
-    check r.output.contains("test_a")
+    check r.code == 3
 
 # ---------------------------------------------------------------------------
 # Suite 3 — --failed --changed UNION (exercises buildPlanView narrowing)

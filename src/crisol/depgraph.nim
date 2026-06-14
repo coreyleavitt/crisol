@@ -47,6 +47,7 @@
 ## the old or the new file, never a torn write.
 
 import std/[algorithm, json, os, sequtils, sets, strutils, tables]
+import std/posix as posix_mod
 import crisol/types
 
 # ---------------------------------------------------------------------------
@@ -317,6 +318,11 @@ proc saveDepGraph*(graph: DepGraph; config: Config) =
   ## Write the graph to `<projectRoot>/<stateDir>/depgraph` atomically.
   ## Creates the state directory if absent.
   ## On any write failure: warns to stderr and returns — never raises.
+  ##
+  ## Uses O_CREAT|O_EXCL|O_WRONLY so the temp-file open fails if any file or
+  ## symlink already exists at the .tmp path — prevents a pre-planted symlink
+  ## from redirecting the write to an attacker-chosen target (P5).
+  ## A stale .tmp from a previous crashed run is removed first.
   let stateDir  = config.projectRoot / config.stateDir
   let finalPath = depgraphPath(config)
   let tmpPath   = finalPath & ".tmp"
@@ -328,14 +334,36 @@ proc saveDepGraph*(graph: DepGraph; config: Config) =
                  "': " & e.msg & "\n")
     return
 
+  let jsonStr = $toJson(graph)
+  # Best-effort removal of a stale .tmp from a prior crashed run.
+  try: removeFile(tmpPath) except: discard
+
+  var tmpFd: cint = -1
   try:
-    let jsonStr = $toJson(graph)
-    writeFile(tmpPath, jsonStr)
+    let flags = posix_mod.O_CREAT or posix_mod.O_EXCL or posix_mod.O_WRONLY or
+                posix_mod.O_CLOEXEC
+    tmpFd = posix_mod.open(tmpPath.cstring, flags, posix_mod.Mode(0o600))
+    if tmpFd < 0:
+      let err = $posix_mod.strerror(posix_mod.errno)
+      stderr.write("crisol: warning: could not create temp file for depgraph: " &
+                   err & "\n")
+      return
+    let written = posix_mod.write(tmpFd, jsonStr.cstring, jsonStr.len)
+    discard posix_mod.close(tmpFd)
+    tmpFd = -1
+    if written < 0 or written != jsonStr.len:
+      stderr.write("crisol: warning: short write to depgraph temp file\n")
+      try: removeFile(tmpPath) except: discard
+      return
     moveFile(tmpPath, finalPath)
   except OSError as e:
+    if tmpFd >= 0:
+      discard posix_mod.close(tmpFd)
     stderr.write("crisol: warning: could not write depgraph: " & e.msg & "\n")
     try: removeFile(tmpPath) except: discard
   except Exception as e:
+    if tmpFd >= 0:
+      discard posix_mod.close(tmpFd)
     stderr.write("crisol: warning: unexpected error writing depgraph: " &
                  e.msg & "\n")
     try: removeFile(tmpPath) except: discard

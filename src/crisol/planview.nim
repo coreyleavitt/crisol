@@ -17,12 +17,12 @@
 ##     Color is injected via opts.color — renderPlan performs no I/O.
 ##
 ##   planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
-##              warnings: seq[ConfigWarning] = @[]; config: Config = Config()): JsonNode
+##              warnings: seq[ConfigWarning] = @[]): JsonNode
 ##     Pure: the crisol/plan/v1 document with stable decision strings.
-##     S2a: each entrypoint carries runTimeoutMs (resolved via effectiveRunTimeoutMs).
+##     S2a/S3: runTimeoutMs and maxJobs are precomputed on PlannedEntrypoint.
 ##
 ##   planToJsonString*(plan: RunPlan; gatedOut: seq[GatedEntry];
-##                    warnings: seq[ConfigWarning] = @[]; config: Config = Config()): string
+##                    warnings: seq[ConfigWarning] = @[]): string
 ##     Pure: compact JSON string of the crisol/plan/v1 document.
 ##
 ## Compile-decision labels (human, per RFC line ~290):
@@ -35,10 +35,19 @@
 ##   cdStale      -> "stale"
 ##   cdSkipFresh  -> "skipFresh"
 
-import std/[json, options, sets, tables]
-import crisol/[types, render, scheduler]
+import std/[json, options, sets]
+import crisol/[types, render]
 
 # GatedEntry is defined in types.nim and re-exported from there.
+
+# ---------------------------------------------------------------------------
+# Schema-version constant (single source of truth)
+# ---------------------------------------------------------------------------
+
+const PlanV1Schema* = "crisol/plan/v1"
+  ## Stable schema identifier embedded in every crisol/plan/v1 JSON document.
+  ## Import crisol/api (or crisol/planview directly) to reference this constant
+  ## rather than duplicating the string literal.
 
 # ---------------------------------------------------------------------------
 # Stable string / label mappings
@@ -122,23 +131,11 @@ proc warningsToJsonArray*(warns: seq[ConfigWarning]): JsonNode =
     result.add wNode
 
 proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
-                 warnings: seq[ConfigWarning] = @[];
-                 config: Config = Config()): JsonNode =
+                 warnings: seq[ConfigWarning] = @[]): JsonNode =
   ## Pure: serialize the PLAN phase to the crisol/plan/v1 JsonNode.  No I/O.
   ##
-  ## S2a: each entrypoint's resolved run timeout is emitted as
-  ## `runTimeoutMs` (milliseconds) via effectiveRunTimeoutMs(ep, config).
-  ## config defaults to Config() (all-zero) which yields the built-in
-  ## 300_000 ms fallback when neither ep nor global timeout is set.
-  ##
-  ## S3: each entrypoint also carries maxJobs (the per-group concurrency cap from
-  ## config, null/JNull when the group has no cap).  The value is looked up by
-  ## group name from config.groups so it is available at plan time.
-  ##
-  ## Build a group-name → maxJobs lookup once (avoid O(n*m) scanning).
-  var groupMaxJobs: Table[string, Option[int]]
-  for g in config.groups:
-    groupMaxJobs[g.name] = g.maxJobs
+  ## S2a/S3: runTimeoutMs and maxJobs are precomputed fields on PlannedEntrypoint
+  ## (set by plan() in planner.nim); no config parameter needed here.
 
   let entrypointsNode = newJArray()
   for pep in plan.entrypoints:
@@ -147,11 +144,10 @@ proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
     epNode["group"]        = newJString(pep.ep.group)
     epNode["decision"]     = newJString(decisionString(pep.decision))
     epNode["reason"]       = newJString(pep.reason)
-    epNode["runTimeoutMs"] = newJInt(effectiveRunTimeoutMs(pep.ep, config))
-    # S3: emit maxJobs from the group config; null when the group has no cap.
-    let mj = groupMaxJobs.getOrDefault(pep.ep.group, none(int))
-    if mj.isSome:
-      epNode["maxJobs"] = newJInt(mj.get)
+    epNode["runTimeoutMs"] = newJInt(pep.runTimeoutMs)
+    # S3: emit maxJobs; null when the group has no cap.
+    if pep.maxJobs.isSome:
+      epNode["maxJobs"] = newJInt(pep.maxJobs.get)
     else:
       epNode["maxJobs"] = newJNull()
     entrypointsNode.add epNode
@@ -165,14 +161,13 @@ proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
     gatedNode.add gNode
 
   result = newJObject()
-  result["schema"]      = newJString("crisol/plan/v1")
+  result["schema"]      = newJString(PlanV1Schema)
   result["jobs"]        = newJInt(plan.jobs)
   result["entrypoints"] = entrypointsNode
   result["gatedOut"]    = gatedNode
   result["warnings"]    = warningsToJsonArray(warnings)
 
 proc planToJsonString*(plan: RunPlan; gatedOut: seq[GatedEntry];
-                       warnings: seq[ConfigWarning] = @[];
-                       config: Config = Config()): string =
+                       warnings: seq[ConfigWarning] = @[]): string =
   ## Pure: compact JSON string of the crisol/plan/v1 document.
-  $planToJson(plan, gatedOut, warnings, config)
+  $planToJson(plan, gatedOut, warnings)

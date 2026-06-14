@@ -1,8 +1,8 @@
-## pipeline.nim — crisol plan pipeline (R8: deep library API)
+## pipeline.nim — crisol plan pipeline (R8: internal plan-phase orchestration)
 ##
-## This module is the core library entry point for consumers: given a Config and
-## a GroupSelection it runs the full pure plan phase and returns a RunPlanView
-## that the caller can inspect, render, or feed into execute().
+## This module is an internal module; the public library entry point is api.nim.
+## Given a Config and a GroupSelection it runs the full pure plan phase and
+## returns a RunPlanView that api.nim can inspect and feed into execute().
 ##
 ## ## Pipeline invariant
 ##

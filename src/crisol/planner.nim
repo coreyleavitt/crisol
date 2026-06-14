@@ -15,9 +15,9 @@
 ##   decideCompile*(...): (CompileDecision, string)
 ##   plan*(config, eps, graph, nimVersion, forceCompile): RunPlan
 
-import std/[algorithm, os, sequtils, sets, strutils, tables]
+import std/[algorithm, options, os, sequtils, sets, strutils, tables]
 import std/cpuinfo
-import crisol/[types, depgraph]
+import crisol/[types, depgraph, scheduler]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -164,10 +164,19 @@ proc plan*(config: Config; eps: seq[Entrypoint]; graph: DepGraph;
   for ep in eps:
     let (decision, reason) = decideCompile(
       ep, graph, config, nimVersion, forceCompile, CrisolProtocolMajor)
+    let groupMaxJobs = block:
+      var mj: Option[int] = none(int)
+      for g in config.groups:
+        if g.name == ep.group:
+          mj = g.maxJobs
+          break
+      mj
     planned.add PlannedEntrypoint(
-      ep:       ep,
-      decision: decision,
-      reason:   reason,
+      ep:           ep,
+      decision:     decision,
+      reason:       reason,
+      runTimeoutMs: effectiveRunTimeoutMs(ep, config),
+      maxJobs:      groupMaxJobs,
     )
 
   let resolvedJobs =

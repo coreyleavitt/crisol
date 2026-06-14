@@ -213,6 +213,16 @@ proc gateSkipMessages*(gatedOut: seq[tuple[group: string; reason: string]]): seq
   for entry in gatedOut:
     result.add "skipped group \"" & entry.group & "\" — " & entry.reason
 
+proc gateSkipMessages*(gatedOut: seq[GatedEntry]): seq[string] =
+  ## Overload accepting GatedEntry (path+group+reason). Deduplicates by group.
+  var seen: seq[string]
+  var deduped: seq[tuple[group: string; reason: string]]
+  for g in gatedOut:
+    if g.group notin seen:
+      seen.add g.group
+      deduped.add (group: g.group, reason: g.reason)
+  gateSkipMessages(deduped)
+
 proc render*(results: seq[EntrypointResult]; summary: Summary;
              opts: RenderOpts): string =
   ## Pure: produce the full human-readable report string.

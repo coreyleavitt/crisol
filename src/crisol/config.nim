@@ -108,9 +108,28 @@ proc findGitRoot(startDir: string): string =
 proc cfgErr(msg: string) {.noReturn.} =
   raise newCrisolError(cekConfig, msg)
 
+proc validateStateDir(dir: string) =
+  ## Reject any state-dir that is absolute or contains ".." components.
+  ## Both forms can redirect crisol's entire state tree outside the project
+  ## root via os.joinPath's "absolute second operand replaces first" semantics.
+  if isAbsolute(dir):
+    cfgErr("config: 'state-dir' must be a relative path, got '" & dir & "'")
+  # Split on both / and \\ (portable) and scan for ".." components.
+  let parts = dir.replace("\\", "/").split("/")
+  for p in parts:
+    if p == "..":
+      cfgErr("config: 'state-dir' must not contain '..' path components, got '" & dir & "'")
+
 proc requireIntArg(n: KdlNode; label: string): int =
   let v = n.arg(0)
-  if v.isNone or v.get.kind != kvInt:
+  if v.isNone:
+    cfgErr("config: '" & label & "' requires an integer argument")
+  case v.get.kind
+  of kvBigInt:
+    cfgErr("config: '" & label & "' value is too large (overflows 64-bit integer)")
+  of kvInt:
+    discard
+  else:
     cfgErr("config: '" & label & "' requires an integer argument")
   int(v.get.intVal)
 
@@ -174,20 +193,14 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string];
       optIn = v.get.boolVal
     of "timeout-secs":
       # child node: timeout-secs 120
-      let v = child.arg(0)
-      if v.isNone or v.get.kind != kvInt:
-        cfgErr("config: group '" & name & "': 'timeout-secs' requires an integer argument")
-      timeoutSecs = int(v.get.intVal)
+      timeoutSecs = requireIntArg(child, "group '" & name & "': 'timeout-secs'")
       if timeoutSecs < 0:
         cfgErr("config: group '" & name & "': timeout-secs must be >= 0")
     of "max-jobs":
       # child node: max-jobs N  (N >= 1; 0 or negative is a config error)
       # Absence → none (uncapped). some(1) = serial. some(N) = cap at N.
       # 0 is NOT "uncapped" — absence is the only way to express uncapped.
-      let v = child.arg(0)
-      if v.isNone or v.get.kind != kvInt:
-        cfgErr("config: group '" & name & "': 'max-jobs' requires an integer argument")
-      let cap = int(v.get.intVal)
+      let cap = requireIntArg(child, "group '" & name & "': 'max-jobs'")
       if cap <= 0:
         cfgErr("config: group '" & name & "': max-jobs must be >= 1 (use absence to express uncapped)")
       maxJobs = some(cap)
@@ -266,7 +279,9 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     of "timeout-secs":       timeoutSecs        = requireIntArg(n, "timeout-secs")
     of "compile-timeout-secs": compileTimeoutSecs = requireIntArg(n, "compile-timeout-secs")
     of "max-output-bytes":   maxOutputBytes     = requireIntArg(n, "max-output-bytes")
-    of "state-dir":          stateDir           = requireStrArg(n, 0, "state-dir")
+    of "state-dir":
+      stateDir = requireStrArg(n, 0, "state-dir")
+      validateStateDir(stateDir)
     of "flags":              globalFlags.add      collectStrArgs(n, "flags")
     of "dep-roots":          depRoots.add         collectStrArgs(n, "dep-roots")
     of "mem-budget-mb":

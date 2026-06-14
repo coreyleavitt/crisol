@@ -247,7 +247,7 @@ suite "crisol advisory lock":
     defer: removeDir(root)
 
     let stateDir = root / ".crisol"
-    let h = acquireLock(stateDir)
+    var h = acquireLock(stateDir)
     check h.fd >= 0
     releaseLock(h)
 
@@ -261,7 +261,7 @@ suite "crisol advisory lock":
     let resultFile = root / "lock_result.txt"
 
     # Parent acquires first.
-    let h = acquireLock(stateDir)
+    var h = acquireLock(stateDir)
     check h.fd >= 0
 
     let childPid = fork()
@@ -269,7 +269,7 @@ suite "crisol advisory lock":
       # Child process: attempt second acquire — must fail.
       var gotContention = false
       try:
-        let h2 = acquireLock(stateDir)
+        var h2 = acquireLock(stateDir)
         releaseLock(h2)
       except CrisolError as e:
         if e.kind == cekEnvironment:
@@ -305,7 +305,7 @@ suite "crisol advisory lock":
       # Child is dead → lock must have been auto-released.
       var acquired = false
       try:
-        let h = acquireLock(stateDir)
+        var h = acquireLock(stateDir)
         acquired = h.fd >= 0
         releaseLock(h)
       except:

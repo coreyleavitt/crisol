@@ -35,6 +35,9 @@ import std/posix
 import crisol/[types, spawn, signals, render, depgraph, closure, protocol, planner, scheduler, admission, memprobe]
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
                  # so consumers that `import crisol/runner` keep their symbols.
+                 # ResultCallback was moved to types.nim; it is in scope here via
+                 # the types import above, and visible to consumers through the
+                 # execute() proc signature (Nim surfaces param/return types on use).
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,10 +79,10 @@ proc readCapped(path: string; maxBytes: int): string =
     result.add "\n[...output truncated at " & $maxBytes & " bytes...]"
 
 # ---------------------------------------------------------------------------
-# ResultCallback and noopResult
+# ResultCallback (defined in types.nim) and noopResult
 # ---------------------------------------------------------------------------
 
-type ResultCallback* = proc(r: EntrypointResult) {.closure.}
+# ResultCallback* is defined in types.nim and re-exported via the types import above.
 
 proc noopResult*(r: EntrypointResult) = discard
   ## Exported default for execute's onResult parameter — never nil, so

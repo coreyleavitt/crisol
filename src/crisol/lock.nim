@@ -74,9 +74,10 @@ proc acquireLock*(stateDir: string): LockHandle =
 
   result = LockHandle(fd: fd)
 
-proc releaseLock*(handle: LockHandle) =
+proc releaseLock*(handle: var LockHandle) =
   ## Release the advisory lock by closing the fd.
-  ## Safe to call more than once (subsequent calls are no-ops).
+  ## Idempotent: sets handle.fd = -1 after close so a double-release is a no-op.
   ## The lock also releases automatically on process death.
   if handle.fd >= 0:
     discard posix.close(handle.fd)
+    handle.fd = -1

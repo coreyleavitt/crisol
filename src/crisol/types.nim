@@ -102,9 +102,11 @@ type
 
   PlannedEntrypoint* = object
     ## A single entrypoint annotated with its compile decision and reason.
-    ep*:       Entrypoint
-    decision*: CompileDecision
-    reason*:   string         # human-readable detail; surfaced by list/--dry-run
+    ep*:          Entrypoint
+    decision*:    CompileDecision
+    reason*:      string         # human-readable detail; surfaced by list/--dry-run
+    runTimeoutMs*: int           ## precomputed; set by plan() in planner.nim
+    maxJobs*:      Option[int]   ## precomputed; set by plan() in planner.nim
 
   RunPlan* = object
     ## The output of plan(): a fully annotated, ready-to-execute list.
@@ -212,6 +214,11 @@ type
     ## Tests that call execute() without installing signal handlers never see
     ## this exception.
     signum*: cint
+
+  ResultCallback* = proc(r: EntrypointResult) {.closure.}
+    ## Per-entrypoint progress callback.  Called by execute() with the result
+    ## of each entrypoint as soon as it completes.  Exported here (types.nim)
+    ## so `import crisol/api` exposes the callback type without pulling in runner.
 
 proc newCrisolError*(kind: CrisolErrorKind; msg: string): ref CrisolError =
   ## Construct a CrisolError ready for `raise`.

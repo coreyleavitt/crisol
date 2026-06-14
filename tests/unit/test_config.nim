@@ -714,5 +714,196 @@ group "unit" {
     let (_, warns) = loadConfig(configPath = cfgPath)
     check warns.len == 0
 
+# ---------------------------------------------------------------------------
+# P1 — state-dir path traversal validation
+# ---------------------------------------------------------------------------
+
+suite "config — state-dir path validation (P1)":
+
+  test "absolute state-dir is rejected with cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+state-dir "/tmp/evil"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    var msg = ""
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+      msg = e.msg
+    check caught
+    check kind == cekConfig
+    check "state-dir" in msg
+    check "relative" in msg
+
+  test "state-dir with .. component is rejected with cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+state-dir "../../outside"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    var msg = ""
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+      msg = e.msg
+    check caught
+    check kind == cekConfig
+    check "state-dir" in msg
+    check ".." in msg
+
+  test "state-dir with nested .. component is rejected with cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+state-dir "a/../../../escape"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "normal relative state-dir loads successfully":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+state-dir ".crisol"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.stateDir == ".crisol"
+
+  test "nested relative state-dir without .. loads successfully":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+state-dir "build/state/crisol"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.stateDir == "build/state/crisol"
+
+# ---------------------------------------------------------------------------
+# P4 — kvBigInt produces a "too large" config error, not misleading "integer" message
+# ---------------------------------------------------------------------------
+
+suite "config — kvBigInt oversized integer (P4)":
+
+  test "integer value too large for int64 yields cekConfig with 'too large' message":
+    ## nkdl represents integers that exceed int64 bounds as kvBigInt.
+    ## The old requireIntArg check only tested kind != kvInt, so a kvBigInt
+    ## triggered the generic "requires an integer argument" message. After
+    ## the fix, kvBigInt must produce a "too large" message.
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    # 99999999999999999999999 is far beyond int64 max; nkdl will parse it as kvBigInt.
+    let kdl = """
+jobs 99999999999999999999999
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    var msg = ""
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+      msg = e.msg
+    check caught
+    check kind == cekConfig
+    # Must say "too large" — not just "requires an integer argument".
+    check "too large" in msg
+
+# ---------------------------------------------------------------------------
+# P6 — kvBigInt in group-level integer fields gives "too large" message
+# ---------------------------------------------------------------------------
+
+suite "config — kvBigInt in group integer fields (P6)":
+
+  test "oversized timeout-secs in group yields cekConfig with 'too large' message":
+    ## timeout-secs in a group block used to check `v.get.kind != kvInt` inline,
+    ## so a kvBigInt value produced the generic "requires an integer argument" message.
+    ## After routing through requireIntArg, it must produce a "too large" message.
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+group "unit" {
+    timeout-secs 99999999999999999999999
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    var msg = ""
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+      msg = e.msg
+    check caught
+    check kind == cekConfig
+    check "too large" in msg
+
+  test "oversized max-jobs in group yields cekConfig with 'too large' message":
+    ## max-jobs in a group block had the same inline kind-check issue.
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+group "unit" {
+    max-jobs 99999999999999999999999
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    var msg = ""
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+      msg = e.msg
+    check caught
+    check kind == cekConfig
+    check "too large" in msg
+
 when isMainModule:
   echo "All config tests passed."

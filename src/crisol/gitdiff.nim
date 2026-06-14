@@ -95,6 +95,13 @@ proc changedFiles*(projectRoot: string; base: string = ""): HashSet[string] =
 
   # Build the diff argv.
   let baseRef = base.strip()
+  # Reject refs that start with '-': although startProcess uses argv (no shell,
+  # so no shell injection), git itself interprets a leading '-' as a flag, e.g.
+  # `--output=/path` would silently redirect git's output to an attacker-chosen
+  # path with the user's permissions.
+  if baseRef.len > 0 and baseRef[0] == '-':
+    raise newCrisolError(cekEnvironment,
+      "--base: ref must not start with '-': '" & baseRef & "'")
   let diffArgs =
     if baseRef.len == 0:
       @["diff", "--no-renames", "--name-only", "--relative", "HEAD"]

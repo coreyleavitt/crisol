@@ -12,6 +12,7 @@
 ##   - Missing file → empty graph: loadDepGraph on missing depgraph → empty, no raise.
 
 import std/[os, sets, json, tables]
+import std/posix as posix_mod
 import crisol/types
 import crisol/depgraph
 
@@ -277,5 +278,60 @@ block test_updateEntry_upsert:
   let cl2 = toHashSet(["tests/unit/test_u.nim", "src/b.nim"])
   updateEntry(g, path, fh, cl2)
   assert g.entries[(path, fh)].closure == cl2, "upsert should overwrite old closure"
+
+# ---------------------------------------------------------------------------
+# P5 — symlink write-through protection for depgraph temp file
+# ---------------------------------------------------------------------------
+
+block test_saveDepGraph_symlink_write_through_protection:
+  ## A pre-existing <depgraph>.tmp symlink pointing to a sentinel file must NOT
+  ## cause saveDepGraph to overwrite the sentinel.
+  ## Mirror of the jsonout P3 test.
+  let root = getTempDir() / "crisol_depgraph_p5sym"
+  createDir(root)
+  defer: removeDir(root)
+  let stateDir = root / ".crisol"
+  createDir(stateDir)
+
+  let cfg        = makeTmpConfig(root)
+  let finalPath  = stateDir / "depgraph"
+  let tmpPath    = finalPath & ".tmp"
+
+  # Plant a sentinel and a symlink at the .tmp location.
+  let sentinel = root / "sentinel_must_not_be_overwritten.txt"
+  writeFile(sentinel, "ORIGINAL")
+  discard posix_mod.symlink(sentinel.cstring, tmpPath.cstring)
+
+  var g = initDepGraph("2.2.10")
+  let fh = flagHash(@[])
+  updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
+
+  # Must not crash; sentinel must remain untouched.
+  saveDepGraph(g, cfg)
+
+  let sentinelContent = readFile(sentinel)
+  assert sentinelContent == "ORIGINAL",
+    "P5: sentinel was overwritten through symlink (got: " & sentinelContent & ")"
+
+block test_saveDepGraph_normal_roundtrip_after_p5:
+  ## Verify the happy path (no stale .tmp) still works after the P5 fix.
+  let root = getTempDir() / "crisol_depgraph_p5happy"
+  createDir(root)
+  defer: removeDir(root)
+  ensureStateDirExists(root)
+
+  let cfg = makeTmpConfig(root)
+  var g = initDepGraph("2.2.10")
+  let fh = flagHash(@["-d:test"])
+  var cl = initHashSet[string]()
+  cl.incl "tests/unit/test_p5.nim"
+  updateEntry(g, "tests/unit/test_p5.nim", fh, cl)
+
+  saveDepGraph(g, cfg)
+
+  let g2 = loadDepGraph(cfg, "2.2.10")
+  let key = ("tests/unit/test_p5.nim", fh)
+  assert key in g2.entries, "P5 happy-path: entry not found after round-trip"
+  assert g2.entries[key].closure == cl, "P5 happy-path: closure mismatch"
 
 echo "PASS test_depgraph"
