@@ -17,6 +17,11 @@
 import std/[options, os, sequtils, strutils, tables, tempfiles, times, unittest]
 import crisol/types
 import crisol/runner
+import crisol/sandbox
+
+# A6: live run path is hermetic by default; allowlist the probe var.
+let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
+
 import crisol/config
 
 # ---------------------------------------------------------------------------
@@ -96,6 +101,13 @@ proc runWithCap(eps: seq[Entrypoint]; groupName: string;
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    # This suite verifies the per-group max-jobs CAP, not the memory-admission
+    # gate.  Since C5 (NSpgid fix) the gate's RSS feedback is real and AUTO mode
+    # could intermittently throttle a 2nd slot, suppressing the overlap the
+    # "uncapped … DO overlap" test asserts.  Disable mem-aware so the cap
+    # behaviour is isolated from the gate.  (test_mem_throttle keeps it on to
+    # exercise the gate; test_composition_s7 relies on the gate serialising.)
+    memAware:           some(false),
   )
 
   # Set the env var so the fixture knows where to write.
@@ -104,7 +116,7 @@ proc runWithCap(eps: seq[Entrypoint]; groupName: string;
 
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
-  discard execute(p, config = cfg, graph = g, showProgress = false)
+  discard execute(p, config = cfg, graph = g, showProgress = false, cache = cacheDisabled(overlapSpec))
 
   parseOverlapFile(tmpPath)
 

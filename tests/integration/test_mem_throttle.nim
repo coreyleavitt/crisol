@@ -25,6 +25,11 @@
 import std/[json, options, os, strutils, tables, tempfiles, unittest]
 import crisol/types
 import crisol/runner
+import crisol/sandbox
+
+# A6: live run path is hermetic by default; allowlist the probe var.
+let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
+
 import crisol/config
 import crisol/jsonout
 
@@ -102,7 +107,7 @@ proc runWithMemConfig(eps: seq[Entrypoint];
 
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
-  discard execute(p, config = cfg, graph = g, showProgress = false)
+  discard execute(p, config = cfg, graph = g, showProgress = false, cache = cacheDisabled(overlapSpec))
 
   parseOverlapFile(tmpPath)
 
@@ -127,6 +132,7 @@ proc runWithMemConfigThrottled(eps: seq[Entrypoint];
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
   result = execute(p, config = cfg, graph = g, showProgress = false,
+                   cache = cacheDisabled(overlapSpec),
                    memThrottledOut = addr throttledOut)
 
 # ---------------------------------------------------------------------------

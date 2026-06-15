@@ -32,14 +32,15 @@ suite "plan() — pure compile-decision annotation":
     let p = plan(Config(), @[], emptyDepGraph())
     check p.entrypoints.len == 0
 
-  test "single entrypoint → cdNeverBuilt with empty graph":
+  test "single entrypoint → edNeverBuilt with empty graph":
     let eps = @[mkEp("tests/unit/test_foo.nim")]
     let p = plan(Config(), eps, emptyDepGraph())
     check p.entrypoints.len == 1
-    check p.entrypoints[0].decision == cdNeverBuilt
+    check p.entrypoints[0].edecision == edNeverBuilt
+    check compileView(p.entrypoints[0]) == cdNeverBuilt  # M3: derived accessor
     check p.entrypoints[0].ep.path == "tests/unit/test_foo.nim"
 
-  test "multiple entrypoints → all cdNeverBuilt":
+  test "multiple entrypoints → all edNeverBuilt":
     let eps = @[
       mkEp("tests/unit/test_a.nim"),
       mkEp("tests/unit/test_b.nim"),
@@ -48,7 +49,8 @@ suite "plan() — pure compile-decision annotation":
     let p = plan(Config(), eps, emptyDepGraph())
     check p.entrypoints.len == 3
     for pep in p.entrypoints:
-      check pep.decision == cdNeverBuilt
+      check pep.edecision == edNeverBuilt
+      check compileView(pep) == cdNeverBuilt  # M3: derived accessor
 
   test "entrypoint identity is preserved (path, group, flags)":
     let ep = mkEp("tests/unit/test_x.nim", group = "mygroup", flags = @["-d:foo"])

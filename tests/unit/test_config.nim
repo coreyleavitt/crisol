@@ -475,6 +475,71 @@ group "unit" {
     check cfg.groups[0].maxJobs == none(int)
 
 # ---------------------------------------------------------------------------
+# B1 — retries config-key parsing
+# ---------------------------------------------------------------------------
+
+suite "config — retries (B1)":
+
+  test "global retries N → Config.retries == N":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+retries 2
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.retries == 2
+
+  test "group retries N → Group.retries == N":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+group "unit" {
+    retries 1
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.groups[0].retries == 1
+
+  test "absent retries → Config.retries == 0 and Group.retries == 0":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.retries == 0
+    check cfg.groups[0].retries == 0
+
+  test "retries -1 → cekConfig (negative not allowed)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+group "unit" {
+    retries -1
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+# ---------------------------------------------------------------------------
 # S6a (Feature B) — memory config-key parsing
 # ---------------------------------------------------------------------------
 

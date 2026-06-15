@@ -166,6 +166,32 @@ suite "crisol CLI — A5 wiring":
     check code == 3
 
   # -------------------------------------------------------------------------
+  # L14: --hermetic <none|isolated|network> level control
+  # -------------------------------------------------------------------------
+
+  test "--hermetic none is accepted (passing fixture → exit 0)":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "pass_always.nim", "--jobs", "1",
+                         "--hermetic", "none"])
+    check code == 0
+
+  test "--hermetic isolated is accepted (passing fixture → exit 0)":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "pass_always.nim", "--jobs", "1",
+                         "--hermetic", "isolated"])
+    check code == 0
+
+  test "--hermetic with invalid level → exit 3":
+    let fd = fixtureDir()
+    let code = runMain(@["run", fd / "pass_always.nim", "--hermetic", "banana"])
+    check code == 3
+
+  test "--hermetic is not valid for list → exit 3":
+    let fd = fixtureDir()
+    let code = runMain(@["list", fd / "pass_always.nim", "--hermetic", "none"])
+    check code == 3
+
+  # -------------------------------------------------------------------------
   # Test 9: no entrypoints matched → exit 3
   # -------------------------------------------------------------------------
 

@@ -1,0 +1,133 @@
+## test_c6_jsonout.nim — C6: regression serialization in run/v1 + render tag
+##
+## Coverage:
+##   1. RunV1Revision is 5.
+##   2. regressions array is present in output (empty when no regressions).
+##   3. regressed=false results do NOT appear in regressions array.
+##   4. regressed=true results appear in regressions array with correct fields.
+##   5. Per-entrypoint "regressed" field is emitted (false by default).
+##   6. Render: no [SLOW] tag when regressed=false.
+##   7. Render: [SLOW] tag appears when regressed=true.
+##
+## Run with:
+##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_c6_jsonout.nim
+
+import std/[json, strutils, unittest]
+import crisol/types
+import crisol/jsonout
+import crisol/render
+
+proc makeEp(path: string): Entrypoint =
+  Entrypoint(path: path, group: "unit", flags: @[])
+
+suite "C6 — run/v1 regressions + render":
+
+  test "RunV1Revision is 6":
+    ## M8: bumped from 5 to 6 for expanded CacheDecision wire vocabulary.
+    check RunV1Revision == 6
+
+  test "regressions array present and empty when no regressions":
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 100,
+                       regressed: false, records: @[]),
+    ]
+    let node = toJson(results, Summary(total: 1, passed: 1))
+    check node.hasKey("regressions")
+    check node["regressions"].kind == JArray
+    check node["regressions"].len == 0
+
+  test "regressed=false → not in regressions array":
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 200,
+                       regressed: false, perfBaselineUs: 0, perfThresholdUs: 0,
+                       records: @[]),
+    ]
+    let node = toJson(results, Summary(total: 1, passed: 1))
+    check node["regressions"].len == 0
+
+  test "regressed=true → entry in regressions array with correct fields":
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 500,
+                       regressed: true,
+                       perfBaselineUs: 100_000'i64,
+                       perfThresholdUs: 115_000'i64,
+                       records: @[]),
+    ]
+    let node = toJson(results, Summary(total: 1, passed: 1))
+    check node["regressions"].len == 1
+    let r = node["regressions"][0]
+    check r["path"].getStr == "tests/unit/test_slow.nim"
+    check r["currentUs"].getBiggestInt == 500_000   # durationMs * 1000
+    check r["baselineUs"].getBiggestInt == 100_000
+    check r["thresholdUs"].getBiggestInt == 115_000
+
+  test "per-entrypoint regressed field present (false by default)":
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_b.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 50,
+                       records: @[]),
+    ]
+    let node = toJson(results, Summary(total: 1, passed: 1))
+    let ep = node["entrypoints"][0]
+    check ep.hasKey("regressed")
+    check ep["regressed"].getBool == false
+
+  test "per-entrypoint regressed field true when regressed":
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 500,
+                       regressed: true,
+                       perfBaselineUs: 100_000'i64,
+                       perfThresholdUs: 115_000'i64,
+                       records: @[]),
+    ]
+    let node = toJson(results, Summary(total: 1, passed: 1))
+    check node["entrypoints"][0]["regressed"].getBool == true
+
+  test "multiple results: only regressed ones appear in regressions array":
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_fast.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 100,
+                       regressed: false, records: @[]),
+      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 900,
+                       regressed: true,
+                       perfBaselineUs: 200_000'i64,
+                       perfThresholdUs: 250_000'i64,
+                       records: @[]),
+      EntrypointResult(ep: makeEp("tests/unit/test_medium.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 300,
+                       regressed: false, records: @[]),
+    ]
+    let node = toJson(results, Summary(total: 3, passed: 3))
+    check node["regressions"].len == 1
+    check node["regressions"][0]["path"].getStr == "tests/unit/test_slow.nim"
+
+  test "render: no [SLOW] tag when regressed=false":
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_ok.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 100,
+                       regressed: false, records: @[]),
+    ]
+    let s = render(results, Summary(total: 1, passed: 1), defaultOpts())
+    check "[SLOW" notin s
+
+  test "render: [SLOW] tag present when regressed=true":
+    let results = @[
+      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"),
+                       outcome: oPassed, exitCode: 0, durationMs: 500,
+                       regressed: true,
+                       perfBaselineUs: 100_000'i64,
+                       perfThresholdUs: 115_000'i64,
+                       records: @[]),
+    ]
+    let s = render(results, Summary(total: 1, passed: 1), defaultOpts())
+    check "[SLOW:" in s
+    check "500000µs" in s   # currentUs = durationMs*1000
+    check "115000µs" in s   # thresholdUs
+
+when isMainModule:
+  echo "test_c6_jsonout: done"

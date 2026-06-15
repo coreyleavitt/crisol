@@ -78,6 +78,22 @@ proc emptyDepGraph*(): DepGraph =
   initDepGraph("")
 
 # ---------------------------------------------------------------------------
+# CompileDecision → EntrypointDecision mapping (RFC F3 — single sealed sum)
+# ---------------------------------------------------------------------------
+
+proc toEntrypointDecision*(cd: CompileDecision): EntrypointDecision =
+  ## Map the compile-freshness decision onto the F3 sealed sum.  edCached is NOT
+  ## produced here — it is promoted from edRunFresh by the plan-time cache lookup
+  ## (A6) once a soundness-key hit is confirmed.
+  ##   cdNeverBuilt → edNeverBuilt   (compile + run)
+  ##   cdStale      → edStale        (compile + run)
+  ##   cdSkipFresh  → edRunFresh     (skip compile, run; may become edCached)
+  case cd
+  of cdNeverBuilt: edNeverBuilt
+  of cdStale:      edStale
+  of cdSkipFresh:  edRunFresh
+
+# ---------------------------------------------------------------------------
 # decideCompile
 # ---------------------------------------------------------------------------
 
@@ -136,7 +152,7 @@ proc decideCompile*(ep: Entrypoint;
   var computedHash: string
   try:
     computedHash = closureContentHash(sortedClosure, config.projectRoot)
-  except:
+  except CatchableError:
     return (cdStale, "could not read closure files for content hash")
 
   if computedHash != entry.closureHash:
@@ -156,7 +172,10 @@ proc plan*(config: Config; eps: seq[Entrypoint]; graph: DepGraph;
   ## Pure — no subprocess.
   ##
   ## Annotates every entrypoint with a CompileDecision via decideCompile.
-  ## With an empty graph (or nimVersion=""), every entrypoint is cdNeverBuilt.
+  ## With an empty graph, every entrypoint is cdNeverBuilt.  The api boundary
+  ## supplies a real Nim version (api.crisolNimVersion = system.NimVersion); the
+  ## "" default here is for tests / cold-start callers only and disables the
+  ## nim-version staleness branch.
   ## The jobs field is resolved to at least 1; if config.jobs == 0 the A4
   ## default is max(1, cpuCount-2).
 
@@ -171,12 +190,30 @@ proc plan*(config: Config; eps: seq[Entrypoint]; graph: DepGraph;
           mj = g.maxJobs
           break
       mj
+    let groupCacheable = block:
+      var cs = csDefault
+      for g in config.groups:
+        if g.name == ep.group:
+          cs = g.cacheable
+          break
+      cs
+    # B1: effective retries = group retries if > 0, else global config retries.
+    let groupRetries = block:
+      var r = 0
+      for g in config.groups:
+        if g.name == ep.group:
+          r = g.retries
+          break
+      r
+    let effectiveRetries = if groupRetries > 0: groupRetries else: config.retries
     planned.add PlannedEntrypoint(
       ep:           ep,
-      decision:     decision,
+      edecision:    toEntrypointDecision(decision),
       reason:       reason,
       runTimeoutMs: effectiveRunTimeoutMs(ep, config),
       maxJobs:      groupMaxJobs,
+      cacheable:    groupCacheable,
+      retries:      effectiveRetries,
     )
 
   let resolvedJobs =

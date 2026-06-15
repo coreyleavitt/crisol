@@ -16,6 +16,7 @@ import crisol
 import crisol/types
 import crisol/jsonout
 import crisol/depgraph
+import crisol/api  # for crisolNimVersion (the version runMain seeds/reads with)
 import crisol/planner  # for CrisolProtocolMajor
 
 # ---------------------------------------------------------------------------
@@ -80,7 +81,10 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
     ## conservative full-run") AND the changed set must be empty (clean tree).
     ##
     ## We seed the dep graph manually before calling runMain.  The seed graph
-    ## uses nimVersion="" because runMain passes "" to loadDepGraph.
+    ## MUST use crisolNimVersion — the same version runMain now threads into
+    ## loadDepGraph — or the graph is treated as version-mismatched (cold-start
+    ## empty), the precise closure is lost, and the ep is force-run instead of
+    ## narrowed away.
     ##
     ## With a precise graph + empty changedSet, narrowByDiff excludes the ep
     ## (closure ∩ {} = ∅) → runnable == 0 → useChanged branch → exit 0.
@@ -95,12 +99,13 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
       "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n")
 
     # Seed the dep graph: one entry for test_a.nim, closure = {test_a.nim}.
-    # nimVersion="" matches what runMain passes to loadDepGraph.
+    # nimVersion=crisolNimVersion matches what runMain passes to loadDepGraph,
+    # so the seeded graph is read back as a precise (non-stale) match.
     let epPath = "tests/unit/test_a.nim"
     let fHash  = flagHash(@[])
     let closureSet = [epPath].toHashSet
     let cHash  = closureContentHash(@[epPath], repo)
-    var graph  = initDepGraph("")
+    var graph  = initDepGraph(crisolNimVersion)
     graph.updateEntry(
       epPath, fHash, closureSet,
       closureHash   = cHash,

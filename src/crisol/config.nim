@@ -14,6 +14,7 @@
 ## state-dir ".crisol"
 ## flags "-d:release" "--mm:orc"        // repeated node = more global flags
 ## dep-roots "../sibling/src"           // repeated node = more dep roots
+## quarantine "tests/integration/test_x.nim"  // B3: failure excluded from exit-1
 ##
 ## group "unit" {
 ##     globs "tests/unit/test_*.nim"
@@ -39,7 +40,7 @@
 ## - **Errors**: parse/validation failures raise `CrisolError(cekConfig)`.
 ##   A missing config (no `--config`, no file found) is NOT an error.
 
-import std/[os, options, strutils]
+import std/[os, options, sets, strutils]
 import nkdl
 import crisol/types
 
@@ -70,6 +71,7 @@ proc conventionConfig(root: string): Config =
     maxOutputBytes:     DefaultMaxOutputBytes,
     stateDir:           DefaultStateDir,
     projectRoot:        root,
+    perfCheck:          PerfCheckConfig(enabled: false),
   )
 
 # ---------------------------------------------------------------------------
@@ -133,6 +135,22 @@ proc requireIntArg(n: KdlNode; label: string): int =
     cfgErr("config: '" & label & "' requires an integer argument")
   int(v.get.intVal)
 
+proc requireFloatArg(n: KdlNode; label: string): float =
+  ## Like requireIntArg but accepts a float or integer KDL argument.
+  ## Returns a float64.  Malformed → cfgErr.
+  let v = n.arg(0)
+  if v.isNone:
+    cfgErr("config: '" & label & "' requires a numeric argument")
+  case v.get.kind
+  of kvFloat:
+    result = v.get.floatVal
+  of kvInt:
+    result = float(v.get.intVal)
+  of kvBigInt:
+    cfgErr("config: '" & label & "' value is too large")
+  else:
+    cfgErr("config: '" & label & "' requires a numeric argument")
+
 proc requireStrArg(n: KdlNode; idx: int; label: string): string =
   let v = n.arg(idx)
   if v.isNone or v.get.kind != kvString:
@@ -182,6 +200,8 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string];
   var globs:       seq[string]
   var groupFlags:  seq[string]
   var gate:        Option[Gate]
+  var cacheable:   CacheableState = csDefault
+  var retries:     int  = 0
 
   for child in n.children:
     case child.name
@@ -217,6 +237,18 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string];
       if env.len == 0:
         cfgErr("config: group '" & name & "': gate env-var name must not be empty")
       gate = some(Gate(env: env))
+    of "cacheable":
+      # child node: cacheable #true  or  cacheable #false  (absent = csDefault)
+      let v = child.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: group '" & name & "': 'cacheable' requires a boolean argument (#true/#false)")
+      cacheable = if v.get.boolVal: csTrue else: csFalse
+    of "retries":
+      # child node: retries N  (N >= 0)
+      let v = requireIntArg(child, "group '" & name & "': 'retries'")
+      if v < 0:
+        cfgErr("config: group '" & name & "': retries must be >= 0, got " & $v)
+      retries = v
     else:
       warns.add makeConfigWarning(source, name, child.name)
 
@@ -232,6 +264,83 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string];
     gate:        gate,
     timeoutSecs: timeoutSecs,
     maxJobs:     maxJobs,
+    cacheable:   cacheable,
+    retries:     retries,
+  )
+
+# ---------------------------------------------------------------------------
+# C6: Sensitivity presets → (k, sampleFloor, absFloorMs)
+# ---------------------------------------------------------------------------
+
+type PerfCheckPreset = tuple[k: float; sampleFloor: int; absFloorMs: int]
+
+proc sensitivityPreset(name: string): PerfCheckPreset =
+  ## Map a sensitivity string to its preset values.
+  ## "none" is handled at the call site (sets enabled=false); not reached here.
+  case name
+  of "conservative": result = (k: 4.0, sampleFloor: 20, absFloorMs: 10)
+  of "moderate":     result = (k: 3.0, sampleFloor: 10, absFloorMs: 5)
+  of "aggressive":   result = (k: 2.0, sampleFloor: 5,  absFloorMs: 2)
+  else:
+    cfgErr("config: 'perf-check': unknown sensitivity '" & name &
+           "' — must be none, conservative, moderate, or aggressive")
+
+proc parsePerfCheck(n: KdlNode; source: string;
+                    warns: var seq[ConfigWarning]): PerfCheckConfig =
+  ## Parse the `perf-check { … }` block.
+  ## Returns a PerfCheckConfig; enabled=false iff sensitivity="none".
+  ##
+  ## Schema:
+  ##   perf-check {
+  ##       sensitivity "moderate"   // none|conservative|moderate|aggressive
+  ##       k 3.0                    // optional: override MAD multiplier
+  ##       sample-floor 10          // optional: override minimum history count
+  ##       abs-floor-ms 5           // optional: override MAD floor in ms
+  ##   }
+  ##
+  ## sensitivity is required; individual overrides are applied after the preset.
+
+  var sensitivity = "moderate"  # default if absent
+  var kOverride:           float = -1.0  # -1.0 = not set
+  var sampleFloorOverride: int   = -1    # -1   = not set
+  var absFloorMsOverride:  int   = -1    # -1   = not set
+
+  for child in n.children:
+    case child.name
+    of "sensitivity":
+      let v = child.arg(0)
+      if v.isNone or v.get.kind != kvString:
+        cfgErr("config: 'perf-check': 'sensitivity' requires a string argument")
+      sensitivity = v.get.strVal
+    of "k":
+      let v = requireFloatArg(child, "perf-check.k")
+      if v <= 0.0:
+        cfgErr("config: 'perf-check': 'k' must be > 0, got " & $v)
+      kOverride = v
+    of "sample-floor":
+      let v = requireIntArg(child, "perf-check.sample-floor")
+      if v < 1:
+        cfgErr("config: 'perf-check': 'sample-floor' must be >= 1, got " & $v)
+      sampleFloorOverride = v
+    of "abs-floor-ms":
+      let v = requireIntArg(child, "perf-check.abs-floor-ms")
+      if v < 0:
+        cfgErr("config: 'perf-check': 'abs-floor-ms' must be >= 0, got " & $v)
+      absFloorMsOverride = v
+    else:
+      warns.add makeConfigWarning(source, "perf-check", child.name)
+
+  # "none" sensitivity → disabled; no further processing.
+  if sensitivity == "none":
+    return PerfCheckConfig(enabled: false)
+
+  # Resolve preset, then apply overrides.
+  let preset = sensitivityPreset(sensitivity)
+  PerfCheckConfig(
+    enabled:     true,
+    k:           if kOverride > 0.0: kOverride else: preset.k,
+    sampleFloor: if sampleFloorOverride >= 1: sampleFloorOverride else: preset.sampleFloor,
+    absFloorMs:  if absFloorMsOverride >= 0: absFloorMsOverride else: preset.absFloorMs,
   )
 
 # ---------------------------------------------------------------------------
@@ -271,6 +380,18 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     memPerJobMb: Option[int]  = none(int)
     memPerRunMb: Option[int]  = none(int)
     memAware:    Option[bool] = none(bool)
+    # B1: global retry count (default 0 = no retry).
+    retries: int = 0
+    # B3: entrypoint paths whose failures are excluded from exit-1.
+    # Paths are project-root-relative with '/' separators; matched by raw string
+    # equality against ep.path (which is also root-relative, '/' separated).
+    quarantine: HashSet[string]
+    # C6: perf-check policy block — parsed in second pass (block has children).
+    perfCheck: PerfCheckConfig   # default zero-value = disabled
+    # A1c: result-cache GC config.
+    maxCacheEntries: int = 0    # 0 = use DefaultMaxCacheEntries
+    cacheMaxAgeDays: int = 0    # 0 = disabled (no age eviction)
+    ledgerMaxAgeDays: int = 0   # 0 = disabled (keep all rows)
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -305,15 +426,45 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v.isNone or v.get.kind != kvBool:
         cfgErr("config: 'mem-aware' requires a boolean argument (#true/#false)")
       memAware = some(v.get.boolVal)
-    of "group":              discard
+    of "retries":
+      # global: retries N  (N >= 0)
+      let v = requireIntArg(n, "retries")
+      if v < 0:
+        cfgErr("config: 'retries' must be >= 0, got " & $v)
+      retries = v
+    of "quarantine":
+      # B3: `quarantine "path1" "path2" …` — zero or more string arguments.
+      # Paths are stored as-written; matched by raw string equality vs ep.path.
+      for p in collectStrArgs(n, "quarantine"):
+        quarantine.incl p
+    of "max-cache-entries":
+      let v = requireIntArg(n, "max-cache-entries")
+      if v < 0:
+        cfgErr("config: 'max-cache-entries' must be >= 0, got " & $v)
+      maxCacheEntries = v
+    of "cache-max-age-days":
+      let v = requireIntArg(n, "cache-max-age-days")
+      if v < 0:
+        cfgErr("config: 'cache-max-age-days' must be >= 0, got " & $v)
+      cacheMaxAgeDays = v
+    of "ledger-max-age-days":
+      let v = requireIntArg(n, "ledger-max-age-days")
+      if v < 0:
+        cfgErr("config: 'ledger-max-age-days' must be >= 0, got " & $v)
+      ledgerMaxAgeDays = v
+    of "group":        discard
+    of "perf-check":   discard  # C6: parsed in second pass (has children)
     else:
       warns.add makeConfigWarning(source, "top-level", n.name)
 
-  # Second pass: parse groups (globalFlags now complete for merge).
+  # Second pass: parse groups and the perf-check block
+  # (globalFlags now complete for merge; perf-check has children so needs its own pass).
   var groups: seq[Group]
   for n in doc.rootNodes:
     if n.name == "group":
       groups.add parseGroup(n, globalFlags, source, warns)
+    elif n.name == "perf-check":
+      perfCheck = parsePerfCheck(n, source, warns)
 
   result = Config(
     groups:             groups,
@@ -328,6 +479,12 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     memPerJobMb:        memPerJobMb,
     memPerRunMb:        memPerRunMb,
     memAware:           memAware,
+    retries:            retries,
+    quarantine:         quarantine,
+    perfCheck:          perfCheck,
+    maxCacheEntries:    maxCacheEntries,
+    cacheMaxAgeDays:    cacheMaxAgeDays,
+    ledgerMaxAgeDays:   ledgerMaxAgeDays,
   )
   validate(result)
 

@@ -53,7 +53,7 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    let tok  = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok  = ac.admit(passId, "unit", edNeverBuilt)
     check tok.isSome
     check tok.get.group == "unit"
 
@@ -63,8 +63,8 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)
     check tok1.isSome
     check tok2.isSome
 
@@ -74,9 +74,9 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "serial", edNeverBuilt)
     check tok1.isSome
-    let tok2 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "serial", edNeverBuilt)
     check tok2.isNone     # cap hit: exactly 1 in flight
 
   test "admit respects cap N=2: third admit returns none":
@@ -85,9 +85,9 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    discard ac.admit(passId, "g", cdNeverBuilt)
-    discard ac.admit(passId, "g", cdNeverBuilt)
-    let tok3 = ac.admit(passId, "g", cdNeverBuilt)
+    discard ac.admit(passId, "g", edNeverBuilt)
+    discard ac.admit(passId, "g", edNeverBuilt)
+    let tok3 = ac.admit(passId, "g", edNeverBuilt)
     check tok3.isNone
 
   test "release frees a slot — admit succeeds after release":
@@ -96,12 +96,12 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "serial", edNeverBuilt)
     check tok1.isSome
-    check ac.admit(passId, "serial", cdNeverBuilt).isNone  # at cap
+    check ac.admit(passId, "serial", edNeverBuilt).isNone  # at cap
     ac.release(tok1.get)
     inc passId
-    let tok2 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "serial", edNeverBuilt)
     check tok2.isSome                              # slot freed by release
 
   test "onSlotFinish frees a slot — admit succeeds after finish":
@@ -110,12 +110,12 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "serial", edNeverBuilt)
     check tok1.isSome
-    check ac.admit(passId, "serial", cdNeverBuilt).isNone  # at cap
+    check ac.admit(passId, "serial", edNeverBuilt).isNone  # at cap
     ac.onSlotFinish(tok1.get, none(int64))
     inc passId
-    let tok2 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "serial", edNeverBuilt)
     check tok2.isSome                              # slot freed by finish
 
   test "different groups are independent — cap on one does not block the other":
@@ -127,10 +127,10 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "serial",   cdNeverBuilt)  # serial now at cap
+    let tok1 = ac.admit(passId, "serial",   edNeverBuilt)  # serial now at cap
     check tok1.isSome
-    check ac.admit(passId, "serial", cdNeverBuilt).isNone  # serial blocked
-    let tokP = ac.admit(passId, "parallel", cdNeverBuilt)  # parallel unaffected
+    check ac.admit(passId, "serial", edNeverBuilt).isNone  # serial blocked
+    let tokP = ac.admit(passId, "parallel", edNeverBuilt)  # parallel unaffected
     check tokP.isSome
 
   test "uncapped group: no limit even at high concurrency":
@@ -140,7 +140,7 @@ suite "AdmissionController — group cap (S3)":
     var passId: uint = 0
     inc passId
     for _ in 0 ..< 10:
-      check ac.admit(passId, "free", cdNeverBuilt).isSome
+      check ac.admit(passId, "free", edNeverBuilt).isSome
 
   test "group not in config (no cap entry) is treated as uncapped":
     ## Groups without maxJobs do NOT get a cap entry — they are fully uncapped.
@@ -152,7 +152,7 @@ suite "AdmissionController — group cap (S3)":
     inc passId
     # "unknown" group has no cap → treated as uncapped
     for _ in 0 ..< 5:
-      check ac.admit(passId, "unknown", cdNeverBuilt).isSome
+      check ac.admit(passId, "unknown", edNeverBuilt).isSome
 
   test "cdSkipFresh decision is accepted (decision param accepted, not inspected this slice)":
     let cfg  = mkConfig(@[mkGroup("unit", some(2))])
@@ -160,7 +160,7 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    let tok  = ac.admit(passId, "unit", cdSkipFresh)
+    let tok  = ac.admit(passId, "unit", edRunFresh)
     check tok.isSome
     check tok.get.group == "unit"
 
@@ -173,7 +173,7 @@ suite "AdmissionController — group cap (S3)":
     var ac   = initAdmission(cfg, plan)
     var passId: uint = 0
     inc passId
-    let tok  = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok  = ac.admit(passId, "unit", edNeverBuilt)
     check tok.isSome
     # S5: reserved is estJobPeak (512 MiB) because probe is nil and B is inert,
     # but we still track the reservation for committed accounting.
@@ -219,10 +219,10 @@ suite "AdmissionController — memory predicate (S5)":
     var ac = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)   # liveCount==0 → override → admitted
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)   # liveCount==0 → override → admitted
     check tok1.isSome
     # Same passId → same snapshot; now liveCount==1
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)   # liveCount==1, over budget → NONE
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)   # liveCount==1, over budget → NONE
     check tok2.isNone  # RED until S5 implements the memory gate
 
   test "under-budget: avail > committed + safety + reserved → admits":
@@ -232,10 +232,10 @@ suite "AdmissionController — memory predicate (S5)":
     var passId: uint = 0
     inc passId
     # First admit: liveCount==0 → override (or memory admits — avail OK either way)
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)
     check tok1.isSome
     # Second admit: liveCount==1, committed=512MiB, avail=1024MiB → 1024-512-0=512>=512 → admits
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)
     check tok2.isSome
 
   test "over-budget: avail < committed + safety + reserved → refuses (liveCount>=1)":
@@ -245,9 +245,9 @@ suite "AdmissionController — memory predicate (S5)":
     var ac = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)   # override fires (liveCount==0)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)   # override fires (liveCount==0)
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)   # liveCount==1, over budget
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)   # liveCount==1, over budget
     check tok2.isNone
 
   test "progress override: liveCount==0 admits even when over-budget":
@@ -257,7 +257,7 @@ suite "AdmissionController — memory predicate (S5)":
     var ac = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId: uint = 0
     inc passId
-    let tok = ac.admit(passId, "unit", cdNeverBuilt)  # liveCount==0 → override
+    let tok = ac.admit(passId, "unit", edNeverBuilt)  # liveCount==0 → override
     check tok.isSome
 
   test "progress override does NOT bypass group cap":
@@ -267,10 +267,10 @@ suite "AdmissionController — memory predicate (S5)":
                              groups = @[mkGroup("serial", some(1))])
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "serial", cdNeverBuilt)  # liveCount==0, within cap → admitted
+    let tok1 = ac.admit(passId, "serial", edNeverBuilt)  # liveCount==0, within cap → admitted
     check tok1.isSome
     # liveCount==1, group at cap → cap must refuse (cap takes priority over override)
-    let tok2 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "serial", edNeverBuilt)
     check tok2.isNone
 
   test "committed reservation blocks a burst within one fill pass":
@@ -283,9 +283,9 @@ suite "AdmissionController — memory predicate (S5)":
     var ac = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId: uint = 0
     inc passId  # single pass
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)   # same snapshot, but committed grew
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)   # same snapshot, but committed grew
     check tok2.isNone
 
   test "cdSkipFresh uses memPerRunMb (64 MiB) not estJobPeak (512 MiB)":
@@ -308,14 +308,14 @@ suite "AdmissionController — memory predicate (S5)":
     var passId: uint = 0
     inc passId
     # First cdSkipFresh: liveCount==0 → override (or mem admits: 200-0-0=200>=64) → admitted
-    let tok1 = ac.admit(passId, "unit", cdSkipFresh)
+    let tok1 = ac.admit(passId, "unit", edRunFresh)
     check tok1.isSome
     check tok1.get.reserved == 64i64 * 1024 * 1024  # 64 MiB reserved
     # Second cdSkipFresh: liveCount==1, avail-committed-safety=200-64-0=136>=64 → admitted
-    let tok2 = ac.admit(passId, "unit", cdSkipFresh)
+    let tok2 = ac.admit(passId, "unit", edRunFresh)
     check tok2.isSome
     # cdNeverBuilt: avail-committed-safety=200-128-0=72 < 512 → refused
-    let tok3 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok3 = ac.admit(passId, "unit", edNeverBuilt)
     check tok3.isNone
 
   test "probe none AND memBudgetMb==0 → B inert (always admits up to jobsCap)":
@@ -325,7 +325,7 @@ suite "AdmissionController — memory predicate (S5)":
     var passId: uint = 0
     inc passId
     for _ in 0 ..< 10:
-      check ac.admit(passId, "unit", cdNeverBuilt).isSome
+      check ac.admit(passId, "unit", edNeverBuilt).isSome
 
   test "safety margin counts against available budget":
     ## avail = 600 MiB, estJobPeak = 200 MiB, safety = 100 MiB.
@@ -337,11 +337,11 @@ suite "AdmissionController — memory predicate (S5)":
                              memPerRunMb = 64)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)   # liveCount==0 → override
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)   # liveCount==0 → override
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)   # 600-200-100=300 >= 200 → admits
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)   # 600-200-100=300 >= 200 → admits
     check tok2.isSome
-    let tok3 = ac.admit(passId, "unit", cdNeverBuilt)   # 600-400-100=100 < 200 → refuses
+    let tok3 = ac.admit(passId, "unit", edNeverBuilt)   # 600-400-100=100 < 200 → refuses
     check tok3.isNone
 
   test "liveCount >= jobsCap refuses regardless of memory":
@@ -352,11 +352,11 @@ suite "AdmissionController — memory predicate (S5)":
                              jobsCap = 2)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)
     check tok2.isSome
-    let tok3 = ac.admit(passId, "unit", cdNeverBuilt)  # liveCount==jobsCap==2 → refused
+    let tok3 = ac.admit(passId, "unit", edNeverBuilt)  # liveCount==jobsCap==2 → refused
     check tok3.isNone
 
   test "release rolls back committed and liveCount":
@@ -365,13 +365,13 @@ suite "AdmissionController — memory predicate (S5)":
     var ac = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)  # override → committed=512
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)  # override → committed=512
     check tok1.isSome
-    check ac.admit(passId, "unit", cdNeverBuilt).isNone  # 600-512=88 < 512 → refused
+    check ac.admit(passId, "unit", edNeverBuilt).isNone  # 600-512=88 < 512 → refused
     ac.release(tok1.get)  # rolls back committed → 0, liveCount → 0
     # Now liveCount==0 again → override fires (new pass so snapshot refreshes)
     inc passId
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)
     check tok2.isSome
 
   test "onSlotFinish rolls back committed and liveCount":
@@ -379,12 +379,12 @@ suite "AdmissionController — memory predicate (S5)":
     var ac = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)  # override → committed=512
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)  # override → committed=512
     check tok1.isSome
-    check ac.admit(passId, "unit", cdNeverBuilt).isNone  # over budget
+    check ac.admit(passId, "unit", edNeverBuilt).isNone  # over budget
     ac.onSlotFinish(tok1.get, none(int64))  # rolls back committed → 0, liveCount → 0
     inc passId
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)
     check tok2.isSome
 
   test "onSlotFinish with rss updates estJobPeak monotonically":
@@ -399,18 +399,18 @@ suite "AdmissionController — memory predicate (S5)":
     var ac = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)   # override, committed=512
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)   # override, committed=512
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)   # 2000-512=1488>=512 → admits, committed=1024
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)   # 2000-512=1488>=512 → admits, committed=1024
     check tok2.isSome
     # Finish tok1 with 900 MiB RSS → estJobPeak ratchets to 900 MiB, committed=512
     ac.onSlotFinish(tok1.get, some(900i64 * 1024 * 1024))
     # New fill pass
     inc passId
     # Admit next cold: reserved=900 MiB now. committed=512. 2000-512-0=1488>=900 → admits
-    let tok3 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok3 = ac.admit(passId, "unit", edNeverBuilt)
     check tok3.isSome  # committed now 512+900=1412
-    let tok4 = ac.admit(passId, "unit", cdNeverBuilt)  # 2000-1412-0=588 < 900 → refuses
+    let tok4 = ac.admit(passId, "unit", edNeverBuilt)  # 2000-1412-0=588 < 900 → refuses
     check tok4.isNone
 
   test "onSlotFinish with rss=none does NOT update estJobPeak":
@@ -420,7 +420,7 @@ suite "AdmissionController — memory predicate (S5)":
     var ac = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId: uint = 0
     inc passId
-    let tok = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok = ac.admit(passId, "unit", edNeverBuilt)
     check tok.isSome
     # Finish with none (no observation) — estJobPeak should stay at 512 MiB
     ac.onSlotFinish(tok.get, none(int64))
@@ -430,17 +430,17 @@ suite "AdmissionController — memory predicate (S5)":
     var ac2 = mkAdmissionMem(some(availBytes), estJobPeakMb = 512, safetyMb = 0)
     var passId2: uint = 0
     inc passId2
-    let t1 = ac2.admit(passId2, "unit", cdNeverBuilt)
+    let t1 = ac2.admit(passId2, "unit", edNeverBuilt)
     check t1.isSome
     ac2.onSlotFinish(t1.get, some(1i64))  # tiny RSS — should NOT lower below 512 MiB
     # Now with tight avail: avail=513 MiB, estJobPeak should still be 512 MiB
     var ac3 = mkAdmissionMem(some(513i64 * 1024 * 1024), estJobPeakMb = 512, safetyMb = 0)
     var passId3: uint = 0
     inc passId3
-    let t2 = ac3.admit(passId3, "unit", cdNeverBuilt)  # liveCount==0 → override
+    let t2 = ac3.admit(passId3, "unit", edNeverBuilt)  # liveCount==0 → override
     check t2.isSome
     # committed=512, avail=513: 513-512-0=1 < 512 → second refuses (peak still 512)
-    let t3 = ac3.admit(passId3, "unit", cdNeverBuilt)
+    let t3 = ac3.admit(passId3, "unit", edNeverBuilt)
     check t3.isNone
 
 # ---------------------------------------------------------------------------
@@ -472,10 +472,10 @@ suite "AdmissionController — Config-sourced seeds (S6a)":
     var ac = initAdmission(cfg, plan, probe)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)  # liveCount==0 → override; committed=700 MiB
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)  # liveCount==0 → override; committed=700 MiB
     check tok1.isSome
     check tok1.get.reserved == 700i64 * 1024 * 1024  # seed reflects 700 MiB
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)  # 1050-700=350 < 700 → refuse
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)  # 1050-700=350 < 700 → refuse
     check tok2.isNone
 
   test "cfg.memPerRunMb 128 → initAdmission uses 128 MiB seed for cdSkipFresh":
@@ -501,10 +501,10 @@ suite "AdmissionController — Config-sourced seeds (S6a)":
     var ac = initAdmission(cfg, plan, probe)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdSkipFresh)  # override (liveCount=0); committed=128
+    let tok1 = ac.admit(passId, "unit", edRunFresh)  # override (liveCount=0); committed=128
     check tok1.isSome
     check tok1.get.reserved == 128i64 * 1024 * 1024
-    let tok2 = ac.admit(passId, "unit", cdSkipFresh)  # 200-128=72 < 128 → refuse
+    let tok2 = ac.admit(passId, "unit", edRunFresh)  # 200-128=72 < 128 → refuse
     check tok2.isNone
 
   test "cfg.memPerJobMb 0 (absent) → initAdmission falls back to 512 MiB built-in seed":
@@ -529,10 +529,10 @@ suite "AdmissionController — Config-sourced seeds (S6a)":
     var ac = initAdmission(cfg, plan, probe)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)  # override; committed=512 MiB
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)  # override; committed=512 MiB
     check tok1.isSome
     check tok1.get.reserved == 512i64 * 1024 * 1024  # default built-in
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)  # 1050-512=538>=512 → admit
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)  # 1050-512=538>=512 → admit
     check tok2.isSome
 
   test "injected estJobPeakMb param overrides cfg.memPerJobMb for test injectability":
@@ -558,7 +558,7 @@ suite "AdmissionController — Config-sourced seeds (S6a)":
     var ac = initAdmission(cfg, plan, probe, estJobPeakMb = 300)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)  # override; committed should be 300 MiB
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)  # override; committed should be 300 MiB
     check tok1.isSome
     check tok1.get.reserved == 300i64 * 1024 * 1024  # injected param wins
 
@@ -602,9 +602,9 @@ suite "AdmissionController — mem-aware truth table in initAdmission (M9)":
     var passId: uint = 0
     inc passId
     # Both admits must succeed: gate is fully inert (probe suppressed, budget suppressed)
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)
     check tok2.isSome   # inert → no memory refusal
 
   test "some(true) = force ON: gate active even when probe candidate would return none":
@@ -632,9 +632,9 @@ suite "AdmissionController — mem-aware truth table in initAdmission (M9)":
     var ac = initAdmission(cfg, plan, probe = nil)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)   # liveCount==0 → override → admitted
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)   # liveCount==0 → override → admitted
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)   # 100-512=-412 < 512 → NONE (gate active)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)   # 100-512=-412 < 512 → NONE (gate active)
     check tok2.isNone
 
   test "none + probe available → auto ON: gate active (probe used)":
@@ -660,9 +660,9 @@ suite "AdmissionController — mem-aware truth table in initAdmission (M9)":
     var ac = initAdmission(cfg, plan, probe)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)   # override fires (liveCount==0)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)   # override fires (liveCount==0)
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)   # 100-512<0 → NONE (gate active)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)   # 100-512<0 → NONE (gate active)
     check tok2.isNone
 
   test "none + probe unavailable → auto OFF: gate inert (no serialization)":
@@ -688,7 +688,7 @@ suite "AdmissionController — mem-aware truth table in initAdmission (M9)":
     inc passId
     # All 5 admits must succeed: gate inert (probe returned none → OFF).
     for _ in 0 ..< 5:
-      check ac.admit(passId, "unit", cdNeverBuilt).isSome
+      check ac.admit(passId, "unit", edNeverBuilt).isSome
 
   test "some(true) with live probe: gate ON, probe drives admission (not budget-only)":
     ## some(true) with a working probe → probe is used directly.
@@ -713,9 +713,9 @@ suite "AdmissionController — mem-aware truth table in initAdmission (M9)":
     var ac = initAdmission(cfg, plan, probe)
     var passId: uint = 0
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)
     check tok1.isSome
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)   # gate active → refused
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)   # gate active → refused
     check tok2.isNone
 
 # ---------------------------------------------------------------------------
@@ -767,11 +767,11 @@ suite "AdmissionController — epoch / snapshot contract (M5a)":
     var passId: uint = 0
     inc passId  # pass 1
 
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)
     check tok1.isSome  # override (liveCount==0); snapshot refreshed: probe call #1 = 2000 MiB
     check callCount == 1
 
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)
     # Same passId → snapshot NOT refreshed (probe NOT called again).
     # Snapshot is still 2000 MiB. committed=512. 2000-512-0=1488>=512 → admitted.
     check tok2.isSome  # if snapshot were re-read, 100-512<0 → would be none
@@ -812,16 +812,16 @@ suite "AdmissionController — epoch / snapshot contract (M5a)":
 
     # Pass 1
     inc passId
-    let tok1 = ac.admit(passId, "unit", cdNeverBuilt)  # probe call #1 → 2000 MiB; override → ok
+    let tok1 = ac.admit(passId, "unit", edNeverBuilt)  # probe call #1 → 2000 MiB; override → ok
     check tok1.isSome
     check callCount == 1
-    let tok2 = ac.admit(passId, "unit", cdNeverBuilt)  # same pass → 2000-512=1488>=512 → ok
+    let tok2 = ac.admit(passId, "unit", edNeverBuilt)  # same pass → 2000-512=1488>=512 → ok
     check tok2.isSome
     check callCount == 1  # still only one probe call
 
     # Pass 2: new passId triggers a fresh snapshot.
     inc passId
-    let tok3 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tok3 = ac.admit(passId, "unit", edNeverBuilt)
     # Probe call #2 returns 100 MiB. committed=1024 (tok1+tok2 still live).
     # 100-1024-0 < 512 → refused (liveCount=2, no override).
     check tok3.isNone
@@ -882,16 +882,16 @@ suite "AdmissionController — release decrements groupInflight (Gap 1 non-vacuo
 
     # Step 1: Admit "extra" to keep liveCount > 0.
     inc passId
-    let tokExtra = ac.admit(passId, "extra", cdNeverBuilt)
+    let tokExtra = ac.admit(passId, "extra", edNeverBuilt)
     check tokExtra.isSome  # uncapped → admitted; liveCount = 1
 
     # Step 2: Admit "serial" (first slot, within cap).
     inc passId
-    let tokSerial1 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tokSerial1 = ac.admit(passId, "serial", edNeverBuilt)
     check tokSerial1.isSome  # cap=1, in-flight=0 → admitted; now serial at cap
 
     # Step 3: Refuse second "serial" admit (liveCount=2, no override; serial at cap).
-    let tokSerial2 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tokSerial2 = ac.admit(passId, "serial", edNeverBuilt)
     check tokSerial2.isNone  # cap hit + no override → refused
 
     # Step 4: Release the first serial token.
@@ -902,7 +902,7 @@ suite "AdmissionController — release decrements groupInflight (Gap 1 non-vacuo
     # Step 5: New pass — admit "serial" again.
     # liveCount > 0 → no progress override.  Cap must now be free (groupInflight=0).
     inc passId
-    let tokSerial3 = ac.admit(passId, "serial", cdNeverBuilt)
+    let tokSerial3 = ac.admit(passId, "serial", edNeverBuilt)
     check tokSerial3.isSome  # cap freed by release → admitted (NOT by override)
     ## If groupInflight["serial"] was not decremented in release, groupInflight
     ## would still be 1 (== cap), and this admit would return none → RED.
@@ -950,7 +950,7 @@ suite "AdmissionController — cdSkipFresh RSS does not lower estJobPeak (Gap 2)
 
     # Step 1: Admit cdSkipFresh (reserves 64 MiB, not 512 MiB).
     inc passId
-    let tokFresh = ac.admit(passId, "unit", cdSkipFresh)
+    let tokFresh = ac.admit(passId, "unit", edRunFresh)
     check tokFresh.isSome
     check tokFresh.get.reserved == 64i64 * 1024 * 1024  # memPerRun, not estJobPeak
 
@@ -960,12 +960,12 @@ suite "AdmissionController — cdSkipFresh RSS does not lower estJobPeak (Gap 2)
 
     # Step 3 + 4: New pass — cold compiles use estJobPeak (must still be 512 MiB).
     inc passId
-    let tokCold1 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tokCold1 = ac.admit(passId, "unit", edNeverBuilt)
     check tokCold1.isSome       # 600-0-0=600 >= 512 → admitted (liveCount=0, override fires)
     check tokCold1.get.reserved == 512i64 * 1024 * 1024  # estJobPeak still 512 MiB
 
     # liveCount=1 now, committed=512. No override.
-    let tokCold2 = ac.admit(passId, "unit", cdNeverBuilt)
+    let tokCold2 = ac.admit(passId, "unit", edNeverBuilt)
     check tokCold2.isNone       # 600-512-0=88 < 512 → refused
     ## If estJobPeak had wrongly dropped to 1 byte, tokCold2 would be admitted
     ## (88 >= 1 is true), and this check would fail → RED.

@@ -283,7 +283,27 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
         of oFailed:        " (exit " & $r.exitCode & ")"
         of oSpawnError:    " (spawn error)"
 
-    buf.add "  " & labelCol & "  " & epPath & countsSuffix & "\n"
+    # A8: mark results served from the ExecutionCache.  The [CACHED] tag sits
+    # after the outcome label so a cached pass reads "[OK] … [CACHED]".  Cached
+    # results report their HISTORICAL duration (carried on the synthesized
+    # EntrypointResult), not the current invocation time.
+    let cachedTag =
+      if r.cached: "  " & col("[CACHED]", Ansi_Cyan, color)
+      else: ""
+    # B3: mark quarantined entrypoints.  [QUARANTINED] appears after [CACHED]
+    # so the line reads "[FAIL] … [QUARANTINED]" or "[OK] … [CACHED] [QUARANTINED]".
+    # Yellow matches the "degraded but not fatal" semantic (mirrors compile-fail color).
+    let quarantinedTag =
+      if r.quarantined: "  " & col("[QUARANTINED]", Ansi_Yellow, color)
+      else: ""
+    # C6: mark regressed entrypoints with [SLOW: <cur>µs > <threshold>µs].
+    # Appears after [QUARANTINED]; uses yellow (warning, not fatal).
+    let slowTag =
+      if r.regressed:
+        "  " & col("[SLOW: " & $(r.durationMs * 1000) & "µs > " &
+                   $r.perfThresholdUs & "µs]", Ansi_Yellow, color)
+      else: ""
+    buf.add "  " & labelCol & "  " & epPath & countsSuffix & cachedTag & quarantinedTag & slowTag & "\n"
 
     # -----------------------------------------------------------------------
     # Failure / compile-fail / signal detail block

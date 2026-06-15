@@ -37,7 +37,7 @@
 
 import std/[options, os, strutils]
 import std/posix
-import crisol/[clean, terminal, api, config, lock]
+import crisol/[clean, terminal, api, config, lock, junit, shard, order]
 
 # O_NOFOLLOW is a Linux extension not declared in Nim's std/posix.
 # Pull it from <fcntl.h> via the emit+importc pattern.
@@ -144,6 +144,9 @@ Usage:
               [--dry-run] [--json] [--force-compile]
               [--failed] [--changed [--base <ref>]]
               [--filter-tag <tag>]
+              [--retries <N>] [--fail-on-flaky]
+              [--order <recent-fail|duration|none>]
+              [--hermetic <none|isolated|network>]
   crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
   crisol clean [--all] [--config <path>]
 
@@ -185,6 +188,15 @@ Additional options for 'run':
                   Entrypoints still run in full; only the report is filtered.
                   Emits a warning to stderr when no records match the tag.
                   Exit code is unchanged by the filter.
+  --order <mode>  History-based execution order: recent-fail (surface recently-
+                  failing tests first for minimum time-to-first-failure),
+                  duration (longest-running first for best parallelism),
+                  or none (default: no reorder).
+  --hermetic <L>  Hermeticity level for child sandboxes: none (no env scrub /
+                  no rlimits / inherit parent env), isolated (default: env
+                  allowlist + isolated tmpdir + config-declared rlimits), or
+                  network (superset of isolated + net-ns isolation; currently
+                  degrades — net-ns not wired — so such runs are not cached).
 
 Additional options for 'list':
   --json          Emit the crisol/plan/v1 JSON document instead of human output.
@@ -292,7 +304,10 @@ proc runMain*(args: seq[string]): int =
       stdout.write("crisol clean: pruned " & $r.cacheDeleted &
                    " cache dir(s), " & $r.binDeleted &
                    " bin dir(s), " & $r.graphEntriesDropped &
-                   " depgraph entry(ies)\n")
+                   " depgraph entry(ies); evicted " & $r.cacheEvicted &
+                   " result-cache entry(ies); compacted " &
+                   $r.shardsRemoved & " ledger shard(s) (" &
+                   $r.ledgerRowsKept & " row(s) kept)\n")
     except CrisolError as e:
       stderr.write("crisol: clean error: " & e.msg & "\n")
       return ExitEnvironment
@@ -394,7 +409,16 @@ proc runMain*(args: seq[string]): int =
     useChanged:   bool = false  # D5: impact selection via git diff
     baseRef:      string = ""   # D5: --base <ref>; "" means diff vs HEAD
     forceCompile: bool = false
+    noCache:      bool = false  # A9: --no-cache: do NOT read/write the result cache
     filterTag:    string = ""   # C3: reporting-level record filter
+    retries:      int  = -1     # B1: --retries N; -1 = not specified (use config)
+    failOnFlaky:  bool = false  # B1: --fail-on-flaky: flaky-passes → exit 1
+    junitPath:    string = ""   # C1: --junit <path> JUnit XML report output path
+    shardK:       int  = 0      # C2: shard index (1-indexed); 0 = no sharding
+    shardN:       int  = 1      # C2: total shard count; only used when shardK > 0
+    orderMode:    OrderMode = omNone  # C4: history-based prioritization
+    perfCheck:    bool = false  # C6: --perf-check: force perf-regression detection ON
+    hermeticLevel: HermeticLevel = hlIsolated  # RFC-0004: --hermetic none|isolated|network
 
   let runArgs = args[1..^1]
   var i = 0
@@ -421,7 +445,9 @@ proc runMain*(args: seq[string]): int =
 
       # Flags valid only for `run`.
       if key in ["jobs", "timeout", "fail-fast", "dry-run", "failed", "changed",
-                 "base", "force-compile", "filter-tag"] and isList:
+                 "base", "force-compile", "no-cache", "filter-tag",
+                 "retries", "fail-on-flaky", "junit", "shard", "order",
+                 "perf-check", "hermetic"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
         stderr.write(usage())
         return ExitEnvironment
@@ -481,12 +507,70 @@ proc runMain*(args: seq[string]): int =
         baseRef = raw
       of "force-compile":
         forceCompile = true
+      of "no-cache":
+        noCache = true
+      of "retries":
+        let raw = nextVal("retries")
+        if raw == "":
+          stderr.write(usage()); return ExitEnvironment
+        try:
+          retries = parseInt(raw)
+          if retries < 0:
+            stderr.write("crisol: --retries must be >= 0\n"); return ExitEnvironment
+        except ValueError:
+          stderr.write("crisol: --retries: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
+      of "fail-on-flaky":
+        failOnFlaky = true
+      of "junit":
+        let raw = nextVal("junit")
+        if raw == "":
+          stderr.write("crisol: --junit requires a file path\n")
+          return ExitEnvironment
+        junitPath = raw
       of "filter-tag":
         let raw = nextVal("filter-tag")
         if raw == "":
           stderr.write("crisol: --filter-tag requires a tag name\n")
           return ExitEnvironment
         filterTag = raw
+      of "shard":
+        let raw = nextVal("shard")
+        if raw == "":
+          stderr.write("crisol: --shard requires a k/n value (e.g. --shard 1/3)\n")
+          return ExitEnvironment
+        try:
+          let parsed = parseShardSpec(raw)
+          shardK = parsed.k
+          shardN = parsed.n
+        except ValueError as e:
+          stderr.write("crisol: " & e.msg & "\n")
+          return ExitEnvironment
+      of "order":
+        let raw = nextVal("order")
+        if raw == "":
+          stderr.write("crisol: --order requires a mode (recent-fail, duration, none)\n")
+          return ExitEnvironment
+        try:
+          orderMode = parseOrderMode(raw)
+        except ValueError as e:
+          stderr.write("crisol: " & e.msg & "\n")
+          return ExitEnvironment
+      of "perf-check":
+        perfCheck = true
+      of "hermetic":
+        let raw = nextVal("hermetic")
+        if raw == "":
+          stderr.write("crisol: --hermetic requires a level (none, isolated, network)\n")
+          return ExitEnvironment
+        case raw
+        of "none":     hermeticLevel = hlNone
+        of "isolated": hermeticLevel = hlIsolated
+        of "network":  hermeticLevel = hlNetwork
+        else:
+          stderr.write("crisol: --hermetic: invalid level '" & raw &
+                       "' (expected none, isolated, or network)\n")
+          return ExitEnvironment
       else:
         stderr.write("crisol: unknown flag '--" & key & "'\n\n")
         stderr.write(usage())
@@ -583,6 +667,7 @@ proc runMain*(args: seq[string]): int =
     narrowing:           narrowing,
     forceCompile:        forceCompile,
     failFast:            failFast,
+    noCache:             noCache,
     jobs:                jobs,
     timeoutSecs:         timeout,
     showProgress:        not jsonMode,
@@ -590,6 +675,13 @@ proc runMain*(args: seq[string]): int =
     manageLock:          true,
     installSignals:      true,
     persist:             true,
+    retries:             retries,       # B1: -1 = use config; >= 0 = override
+    failOnFlaky:         failOnFlaky,   # B1: flaky-pass → exit 1
+    shardK:              shardK,        # C2: shard index (0 = no sharding)
+    shardN:              shardN,        # C2: total shard count
+    order:               orderMode,     # C4: history-based prioritization
+    perfCheckForce:      perfCheck,     # C6: --perf-check: force detection ON
+    hermeticLevel:       hermeticLevel, # RFC-0004: --hermetic level control
   )
 
   # -------------------------------------------------------------------------
@@ -681,6 +773,19 @@ proc runMain*(args: seq[string]): int =
     if rr.plan.gatedOut.len > 0:
       for line in gateSkipMessages(rr.plan.gatedOut):
         stdout.write(line & "\n")
+
+  # C1: --junit <path> — write JUnit XML report as an additional output sink.
+  # Composes with normal stdout reporting (--json or human render still runs).
+  if junitPath.len > 0:
+    let xmlStr = toJunitXml(rr.results, rr.summary)
+    try:
+      writeFile(junitPath, xmlStr)
+    except IOError as e:
+      stderr.write("crisol: warning: could not write junit report to '" &
+                   junitPath & "': " & e.msg & "\n")
+    except OSError as e:
+      stderr.write("crisol: warning: could not write junit report to '" &
+                   junitPath & "': " & e.msg & "\n")
 
   return rr.exitCode
 

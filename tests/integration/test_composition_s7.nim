@@ -33,6 +33,12 @@ import std/[math, options, os, sequtils, strutils, tables, tempfiles, times, uni
 import crisol/types
 import crisol/runner
 import crisol/config
+import crisol/sandbox
+
+# A6: the live run path is now hermetic by default (env scrub).  These tests
+# spawn overlap_probe, which reads CRISOL_TEST_OVERLAP_FILE from its env — so we
+# allowlist that var via the spec passed to execute().
+let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -147,7 +153,8 @@ proc testCapAndMemoryCompose() =
   putEnv("CRISOL_TEST_OVERLAP_FILE", serialPath)
   let pSerial = plan(cfgSerial, epsSerial, emptyDepGraph())
   var gSerial = emptyDepGraph()
-  discard execute(pSerial, config = cfgSerial, graph = gSerial, showProgress = false)
+  discard execute(pSerial, config = cfgSerial, graph = gSerial, showProgress = false,
+                  cache = cacheDisabled(overlapSpec))
   delEnv("CRISOL_TEST_OVERLAP_FILE")
 
   let serialIntervals = parseOverlapFile(serialPath)
@@ -180,7 +187,8 @@ proc testCapAndMemoryCompose() =
   putEnv("CRISOL_TEST_OVERLAP_FILE", memPath)
   let pMem = plan(cfgMem, epsMem, emptyDepGraph())
   var gMem = emptyDepGraph()
-  discard execute(pMem, config = cfgMem, graph = gMem, showProgress = false)
+  discard execute(pMem, config = cfgMem, graph = gMem, showProgress = false,
+                  cache = cacheDisabled(overlapSpec))
   delEnv("CRISOL_TEST_OVERLAP_FILE")
 
   let memIntervals = parseOverlapFile(memPath)
@@ -259,7 +267,7 @@ proc testFailFastDrains() =
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
   let results = execute(p, config = cfg, graph = g,
-                        failFast = true, showProgress = false)
+                        failFast = true, showProgress = false, cache = cacheDisabled(overlapSpec))
   let elapsed = epochTime() - t0
   delEnv("CRISOL_TEST_OVERLAP_FILE")
 

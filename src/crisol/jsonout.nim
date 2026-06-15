@@ -61,6 +61,11 @@ import std/posix as posix_mod
 import crisol/types
 import crisol/render  # for filterRecordsByTag
 import crisol/planview  # for warningsToJsonArray
+import crisol/outcomestrings  # re-exports FailureOutcomeStrings (the only symbol
+                              # used from this module); imported separately from
+                              # types so the dependency on the wire-string set is
+                              # explicit rather than hidden inside a bulk import.
+import crisol/ioutils  # R2-a: writeAllFd replaces bare write() (EINTR/short-write safe)
 
 # ---------------------------------------------------------------------------
 # Schema-version constant (single source of truth)
@@ -71,19 +76,33 @@ const RunV1Schema* = "crisol/run/v1"
   ## Import crisol/api (or crisol/jsonout directly) to reference this constant
   ## rather than duplicating the string literal.
 
+const RunV1Revision* = 6
+  ## Integer minor revision of the crisol/run/v1 schema (A8).  Additive only:
+  ## the `schema` STRING stays "crisol/run/v1"; this integer is bumped each time
+  ## additive optional fields land, so a consumer can gate on feature presence
+  ## (`schemaRevision >= 6`) without substring-parsing the string.
+  ##   rev 1 (implicit) — B5/S2a fields (compileSkipped, memThrottledSlots, …).
+  ##   rev 2           — per-entrypoint cached / inputHash / cacheDecision (A6).
+  ##   rev 3 (B3)      — per-entrypoint quarantined (bool), flaky (bool), attempts (int);
+  ##                     summary quarantined (int).
+  ##   rev 4 (C5)      — per-entrypoint peakRssBytes (int64); 0 for cached/unmeasured.
+  ##   rev 5 (C6)      — top-level regressions array (path, currentUs, baselineUs,
+  ##                     thresholdUs); per-entrypoint regressed (bool). Empty when
+  ##                     perf-check is disabled (additive default).
+  ##   rev 6 (M8)      — cacheDecision vocabulary expanded: "stored" (miss+stored),
+  ##                     "groupOptOut" (cacheable #false config), legacy "keyMiss"
+  ##                     now means ran-but-not-stored; "policyDisabled" is --no-cache only.
+  ## A reader seeing `schemaRevision > RunV1Revision` treats the file as no-data
+  ## (safe cold-start) — it was written by a newer crisol.
+
 # ---------------------------------------------------------------------------
 # Stable string mappings
 # ---------------------------------------------------------------------------
 
-proc outcomeString*(o: Outcome): string =
-  ## Returns the stable JSON string for an Outcome enum value.
-  case o
-  of oPassed:        "passed"
-  of oFailed:        "exitNonZero"
-  of oCompileFailed: "compileFailed"
-  of oTimeout:       "timedOut"
-  of oSignal:        "signaled"
-  of oSpawnError:    "spawnError"
+proc outcomeString*(o: Outcome): string {.inline.} =
+  ## Returns the stable JSON wire string for an Outcome enum value.
+  ## Delegates to types.outcomeString — single source of truth lives there.
+  types.outcomeString(o)
 
 proc recordStatusString*(s: RecordStatus): string =
   ## Returns the stable JSON string for a RecordStatus enum value.
@@ -91,6 +110,26 @@ proc recordStatusString*(s: RecordStatus): string =
   of rsPass: "pass"
   of rsFail: "fail"
   of rsSkip: "skip"
+
+proc cacheDecisionString*(d: CacheDecision): string =
+  ## Returns the stable JSON string for a CacheDecision enum value (A8).
+  ## These answer "why did this entrypoint cache or not?" in run/v1 output.
+  ## M8 additions (rev 6):
+  ##   "stored"      — cdmStored: fresh run on a miss; result written to cache.
+  ##   "groupOptOut" — cdmGroupOptOut: per-group cacheable #false config opt-out.
+  ## M8 refined meanings:
+  ##   "keyMiss"        — ran live on a miss but was NOT stored (non-pass, degraded
+  ##                      hermeticity, flaky, or intermediate failure path).
+  ##   "policyDisabled" — invocation --no-cache flag only (not config cacheable #false).
+  case d
+  of cdmNotEligible:    "notEligible"
+  of cdmHit:            "hit"
+  of cdmStored:         "stored"
+  of cdmKeyMiss:        "keyMiss"
+  of cdmHermeticityDeg: "hermeticityDegraded"
+  of cdmGroupOptOut:    "groupOptOut"
+  of cdmPolicyDisabled: "policyDisabled"
+  of cdmFlaky:          "flaky"
 
 # ---------------------------------------------------------------------------
 # toJson -- pure serializer
@@ -118,6 +157,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   summaryNode["timedOut"]      = newJInt(summary.timedOut)
   summaryNode["signaled"]      = newJInt(summary.signaled)
   summaryNode["spawnErrors"]   = newJInt(summary.spawnErrors)
+  # B3: quarantined failure count — failures excluded from exit-1 decision.
+  summaryNode["quarantined"]   = newJInt(summary.quarantined)
   summaryNode["noTestsRan"]    = newJBool(summary.noTestsRan)
 
   # Build entrypoints array
@@ -157,16 +198,50 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
       epNode["signal"] = newJNull()
     epNode["durationMs"]    = newJFloat(r.durationMs.float)
     epNode["compileSkipped"] = newJBool(r.compileSkipped)  # S2a: complete the schema
+    # A8 (run/v1 rev 2): cache observability.  `cached` absence-default false;
+    # `inputHash` is the soundnessKey string ("" when caching not consulted);
+    # `cacheDecision` is the stable string form of the always-populated enum.
+    epNode["cached"]        = newJBool(r.cached)
+    epNode["inputHash"]     = newJString(r.inputHash)
+    epNode["cacheDecision"] = newJString(cacheDecisionString(r.cacheDecision))
+    # B1 (rev 3): per-entrypoint retry observability.  `flaky` absence-default false;
+    # `attempts` is 0 for cached results (no live run), 1 for a clean first-pass, >1 if retried.
+    epNode["flaky"]         = newJBool(r.flaky)
+    epNode["attempts"]      = newJInt(r.attempts)
+    # B3 (rev 3): quarantine overlay — true iff ep.path ∈ Config.quarantine.
+    # Absence-default false; only quarantined entrypoints carry true.
+    epNode["quarantined"]   = newJBool(r.quarantined)
+    # C5 (rev 4): per-entrypoint peak RSS in bytes.  0 for cached results or
+    # when RSS sampling was unavailable.  Absence-default 0.
+    epNode["peakRssBytes"]  = newJInt(r.peakRssBytes)
+    # C6 (rev 5): per-entrypoint regression flag.  Absence-default false.
+    # Only true when perf-check is enabled AND this run exceeded median+k·MAD.
+    epNode["regressed"]     = newJBool(r.regressed)
     epNode["records"]       = recordsNode
     entrypointsNode.add epNode
+
+  # C6 (rev 5): build the regressions array from regressed results.
+  # Each entry: { path, currentUs (durationMs*1000), baselineUs, thresholdUs }.
+  # Array is always present; empty when perf-check is disabled or no regressions.
+  let regressionsNode = newJArray()
+  for r in results:
+    if r.regressed:
+      let rn = newJObject()
+      rn["path"]        = newJString(r.ep.path)
+      rn["currentUs"]   = newJInt(r.durationMs * 1000)
+      rn["baselineUs"]  = newJInt(r.perfBaselineUs)
+      rn["thresholdUs"] = newJInt(r.perfThresholdUs)
+      regressionsNode.add rn
 
   # Assemble top-level object
   result = newJObject()
   result["schema"]           = newJString(RunV1Schema)
+  result["schemaRevision"]   = newJInt(RunV1Revision)  # A8: additive minor revision
   result["summary"]          = summaryNode
   result["entrypoints"]      = entrypointsNode
   result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
   result["warnings"]         = warningsToJsonArray(warnings)
+  result["regressions"]      = regressionsNode  # C6: empty when perf-check disabled
 
 proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    filterTag: string = "";
@@ -218,10 +293,12 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
       stderr.write("crisol: warning: could not create temp file for lastrun.json: " &
                    err & "\n")
       return
-    let written = posix_mod.write(tmpFd, jsonStr.cstring, jsonStr.len)
+    # R2-a: use writeAllFd (EINTR-safe, short-write-retry loop) instead of a
+    # bare write() call — matches the same pattern used in resultcache/ledger.
+    let ok = writeAllFd(tmpFd, jsonStr)
     discard posix_mod.close(tmpFd)
     tmpFd = -1
-    if written < 0 or written != jsonStr.len:
+    if not ok:
       stderr.write("crisol: warning: short write to lastrun.json temp file\n")
       try: removeFile(tmpPath) except: discard
       return
@@ -242,11 +319,11 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
 # loadLastRun -- B7: read back the failed (path,group) set
 # ---------------------------------------------------------------------------
 
-const FailureOutcomeStrings* = ["exitNonZero", "compileFailed", "timedOut",
-                                 "signaled", "spawnError"]
+const FailureOutcomeStrings* = failureOutcomeStrings
   ## The set of outcome JSON strings that count as "failed" for --failed.
   ## "passed" and "noTestsRan" are NOT in this set (noTestsRan is a summary
   ## flag, not an outcome string; outcome "passed" is success).
+  ## Re-exported from crisol/outcomestrings for backward compatibility.
 
 proc loadLastRun*(config: Config):
     tuple[found: bool; failed: HashSet[tuple[path, group: string]]] =
@@ -288,6 +365,17 @@ proc loadLastRun*(config: Config):
     raise newCrisolError(cekEnvironment,
       "stale lastrun.json (schema '" & schemaVal &
       "') — run `crisol run` first")
+
+  # A8 forward tolerance: an absent schemaRevision is an old (rev-1) document and
+  # is fully readable.  A revision GREATER than what we know is from a future
+  # crisol whose additive fields we cannot interpret — treat as no-data (safe
+  # cold-start), symmetric with loadLastPlan.  Caller handles found=false (exit 3).
+  let rev = node.getOrDefault("schemaRevision").getInt(0)
+  if rev > RunV1Revision:
+    stderr.write("crisol: warning: lastrun.json schemaRevision " & $rev &
+                 " is newer than this crisol understands (max " &
+                 $RunV1Revision & "); ignoring it as cold-start\n")
+    return (found: false, failed: initHashSet[tuple[path, group: string]]())
 
   # Parse entrypoints array.
   if not node.hasKey("entrypoints") or node["entrypoints"].kind != JArray:

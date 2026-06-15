@@ -103,7 +103,7 @@ proc readInt64(path: string; read: proc(p: string): string): Option[int64] =
       return none(int64)  # literal "max" → no limit → none
     let v = parseBiggestInt(raw)
     return some(int64(v))
-  except:
+  except CatchableError:
     return none(int64)
 
 proc cgroupBudget(read: proc(p: string): string): Option[int64] =
@@ -133,7 +133,7 @@ proc cgroupBudget(read: proc(p: string): string): Option[int64] =
     else:
       # Current unreadable but limit is known; return limit as conservative budget.
       return some(limit)
-  except:
+  except CatchableError:
     discard  # v2 absent or unreadable — fall through to v1
 
   # --- Fallback: cgroup v1 ---
@@ -150,7 +150,7 @@ proc cgroupBudget(read: proc(p: string): string): Option[int64] =
       return some(max(0'i64, limit - usageOpt.get))
     else:
       return some(limit)
-  except:
+  except CatchableError:
     return none(int64)
 
 # ---------------------------------------------------------------------------
@@ -172,13 +172,13 @@ proc availableMemBytes*(read: proc(path: string): string = realReadFile): Option
     let kbOpt = parseMemAvailKb(content)
     if kbOpt.isSome:
       memAvailBytes = some(kbOpt.get * 1024'i64)
-  except:
+  except CatchableError:
     discard
 
   # --- (b) cgroup budget ---
   try:
     cgroupBytes = cgroupBudget(read)
-  except:
+  except CatchableError:
     discard
 
   # Return the minimum of the two sources.
@@ -211,15 +211,30 @@ proc parseVmRssKb(content: string): Option[int64] =
   none(int64)
 
 proc parsePgrp(content: string): int =
-  ## Extract Pgrp from /proc/<pid>/status content. Returns -1 on failure.
-  ## /proc/<pid>/status uses tab separators; splitWhitespace handles both.
+  ## Extract Pgrp (or NSpgid, the namespace-local equivalent) from
+  ## /proc/<pid>/status content.  Returns -1 on failure.
+  ##
+  ## Kernel note: in a PID namespace (e.g. inside a Docker/Podman container),
+  ## /proc/<pid>/status shows namespace-relative IDs under keys like NSpgid,
+  ## NSpid, NStgid — NOT the global Pgrp field.  We look for both forms so
+  ## that procGroupRssBytes works correctly both on bare Linux and inside
+  ## containers.  If both exist, the FIRST match wins (Pgrp is typically
+  ## listed first in older kernels, NSpgid first in namespace-aware kernels).
+  ##
+  ## NSpgid ordering: the kernel writes values outermost→innermost (host pgid
+  ## first, innermost namespace pgid last).  We want the INNERMOST (last) value
+  ## because that is the pgid visible within our container.  For single-level
+  ## containers (only one value) parts[^1] == parts[1], so this is correct in
+  ## both the single-level and nested cases.
   for line in content.splitLines():
-    if line.startsWith("Pgrp:"):
+    if line.startsWith("Pgrp:") or line.startsWith("NSpgid:"):
       let parts = line.splitWhitespace()
-      # Format: "Pgrp:\tN"  → ["Pgrp:", "N"]
+      # Format: "Pgrp:\tN"        → ["Pgrp:", "N"]
+      # Format: "NSpgid:\tN M ..."→ ["NSpgid:", "outermost", ..., "innermost"]
+      # Use parts[^1] (last = innermost namespace value).
       if parts.len >= 2:
         try:
-          return parseInt(parts[1])
+          return parseInt(parts[^1])
         except ValueError:
           return -1
   -1
@@ -257,7 +272,7 @@ proc procGroupRssBytes*(pid: int;
             pids.add parseInt(name)
           except ValueError:
             discard  # skip non-numeric entries (e.g. "self", "sys", etc.)
-    except:
+    except CatchableError:
       return some(0'i64)  # /proc unreadable — safe degradation
 
   # --- Sum VmRSS for pgroup members ---
@@ -271,7 +286,7 @@ proc procGroupRssBytes*(pid: int;
         if rssKbOpt.isSome:
           totalRssBytes += rssKbOpt.get * 1024'i64  # kB → bytes
         # If rssKbOpt is none (no VmRSS line), skip this process silently.
-    except:
+    except CatchableError:
       discard  # process vanished or read error — skip it
 
   some(totalRssBytes)

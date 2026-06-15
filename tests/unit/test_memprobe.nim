@@ -193,6 +193,26 @@ suite "procGroupRssBytes — sums VmRSS across pgroup members":
     check r.isSome
     check r.get == 0
 
+  test "NSpgid multi-value line: innermost (last) value selected":
+    ## Linux writes NSpgid outermost→innermost.
+    ## A nested-namespace /proc/<pid>/status shows e.g. "NSpgid:\t9000 5000"
+    ## where 9000 is the host pgid and 5000 is the container-local pgid.
+    ## parsePgrp must choose 5000 (innermost = last).
+    let pgid = 5000   # innermost (container-local) pgid we spawned with setpgid
+    let rssKb = 32 * 1024'i64  # 32 MiB in kB
+    # Two-level NSpgid: host=9000 outer=7000 inner=5000 — innermost wins.
+    let statusNested = "Name:\tnim\nPid:\t5000\nNSpgid:\t9000 7000 5000\nVmRSS:\t" &
+                       $rssKb & " kB\n"
+    let statusOutsider = "Name:\tbash\nPid:\t9000\nNSpgid:\t9000\nVmRSS:\t999 kB\n"
+    let files = {
+      "/proc/5000/status": statusNested,
+      "/proc/9000/status": statusOutsider,
+    }.toTable
+    let r = procGroupRssBytes(pgid, makeReader(files),
+                              proc(): seq[int] = @[5000, 9000])
+    check r.isSome
+    check r.get == rssKb * 1024  # only pid 5000 matched pgid 5000
+
   test "member process status has no VmRSS line → skipped silently, sum excludes it":
     ## M9: A process whose /proc/<pid>/status exists but lacks VmRSS is skipped.
     ## The sum excludes that process without crashing or returning none.

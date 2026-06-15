@@ -18,6 +18,7 @@ import std/[json, monotimes, options, os, sequtils, sets, strutils, unittest]
 import std/posix as posix_mod
 import crisol/types
 import crisol/jsonout
+import crisol/render
 import crisol
 
 # ---------------------------------------------------------------------------
@@ -287,6 +288,83 @@ suite "jsonout - toJson schema":
     check node["schema"].getStr == "crisol/run/v1"
     check node["entrypoints"].len == 0
     check node["summary"]["noTestsRan"].getBool == true
+
+# ---------------------------------------------------------------------------
+# A8 — cached / inputHash / cacheDecision / schemaRevision
+# ---------------------------------------------------------------------------
+
+suite "jsonout A8 — cache reporting fields":
+
+  proc cachedResult(): EntrypointResult =
+    EntrypointResult(
+      ep: makeEp("tests/unit/test_cached.nim"), outcome: oPassed,
+      exitCode: 0, durationMs: 999, records: @[],
+      cached: true, inputHash: "deadbeefcafef00d", cacheDecision: cdmHit)
+
+  proc liveResult(): EntrypointResult =
+    EntrypointResult(
+      ep: makeEp("tests/unit/test_live.nim"), outcome: oPassed,
+      exitCode: 0, durationMs: 12, records: @[],
+      cached: false, inputHash: "0011223344556677", cacheDecision: cdmKeyMiss)
+
+  test "run/v1 carries an integer schemaRevision alongside schema string":
+    let node = toJson(syntheticResults(), syntheticSummary())
+    check node["schema"].getStr == "crisol/run/v1"
+    check node.hasKey("schemaRevision")
+    check node["schemaRevision"].kind == JInt
+    check node["schemaRevision"].getInt == RunV1Revision
+    check RunV1Revision >= 2
+
+  test "each entrypoint carries cached boolean (absence-default false)":
+    let node = toJson(@[cachedResult(), liveResult()], Summary(total: 2, passed: 2))
+    check node["entrypoints"][0]["cached"].getBool == true
+    check node["entrypoints"][1]["cached"].getBool == false
+
+  test "cached defaults to false for a default-constructed result":
+    ## syntheticResults never set `cached`; field must serialize as false.
+    let node = toJson(syntheticResults(), syntheticSummary())
+    for ep in node["entrypoints"]:
+      check ep.hasKey("cached")
+      check ep["cached"].getBool == false
+
+  test "each entrypoint carries inputHash string":
+    let node = toJson(@[cachedResult(), liveResult()], Summary(total: 2, passed: 2))
+    check node["entrypoints"][0]["inputHash"].getStr == "deadbeefcafef00d"
+    check node["entrypoints"][1]["inputHash"].getStr == "0011223344556677"
+
+  test "each entrypoint carries cacheDecision stable string":
+    let node = toJson(@[cachedResult(), liveResult()], Summary(total: 2, passed: 2))
+    check node["entrypoints"][0]["cacheDecision"].getStr == "hit"
+    check node["entrypoints"][1]["cacheDecision"].getStr == "keyMiss"
+
+  test "cacheDecisionString maps every enum value to a stable distinct string":
+    ## M8 rev 6: cdmStored and cdmGroupOptOut added; all 8 variants covered.
+    check cacheDecisionString(cdmNotEligible)    == "notEligible"
+    check cacheDecisionString(cdmHit)            == "hit"
+    check cacheDecisionString(cdmStored)         == "stored"
+    check cacheDecisionString(cdmKeyMiss)        == "keyMiss"
+    check cacheDecisionString(cdmHermeticityDeg) == "hermeticityDegraded"
+    check cacheDecisionString(cdmGroupOptOut)    == "groupOptOut"
+    check cacheDecisionString(cdmPolicyDisabled) == "policyDisabled"
+    check cacheDecisionString(cdmFlaky)          == "flaky"
+
+  test "default-constructed result reports notEligible cacheDecision":
+    let node = toJson(syntheticResults(), syntheticSummary())
+    # syntheticResults leave cacheDecision at its default (cdmNotEligible, ord 0)
+    for ep in node["entrypoints"]:
+      check ep["cacheDecision"].getStr == "notEligible"
+
+  test "render shows [CACHED] label for a cached entrypoint":
+    let s = render(@[cachedResult(), liveResult()],
+                   Summary(total: 2, passed: 2), defaultOpts())
+    check "[CACHED]" in s
+    # The live (non-cached) pass must NOT carry [CACHED].
+    let cachedLineIdx = s.find("test_cached.nim")
+    let liveLineIdx   = s.find("test_live.nim")
+    check cachedLineIdx >= 0
+    check liveLineIdx >= 0
+    # [CACHED] appears once (only for the cached entrypoint).
+    check s.count("[CACHED]") == 1
 
 # ---------------------------------------------------------------------------
 # Helpers -- unique temp dir for each persist test
@@ -743,6 +821,46 @@ suite "jsonout - loadLastRun (B7)":
     check fromFile["warnings"].len          == fromStdout["warnings"].len
     check fromFile["memThrottledSlots"].getInt == fromStdout["memThrottledSlots"].getInt
     check fromFile["warnings"][0]["key"].getStr == fromStdout["warnings"][0]["key"].getStr
+
+  # ---------------------------------------------------------------------------
+  # A8: loadLastRun forward/backward tolerance for schemaRevision
+  # ---------------------------------------------------------------------------
+
+  test "loadLastRun tolerates an old doc with no schemaRevision and no new fields":
+    let tmpDir   = uniqueTmpDir("a8old")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir); createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+    # An old document: no schemaRevision, entrypoint has no cached/inputHash.
+    let doc = """{"schema":"crisol/run/v1","summary":{"total":1,"passed":0,"failed":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnErrors":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","exitCode":1,"signal":null,"durationMs":1.0,"records":[]}]}"""
+    writeFile(tmpDir / stateDir / "lastrun.json", doc)
+    let lr = loadLastRun(makeCfg(tmpDir, stateDir))
+    check lr.found == true
+    check (path: "a.nim", group: "g") in lr.failed
+
+  test "loadLastRun tolerates a new doc carrying cached/inputHash/cacheDecision":
+    let tmpDir   = uniqueTmpDir("a8new")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir); createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+    let doc = """{"schema":"crisol/run/v1","schemaRevision":2,"summary":{"total":1,"passed":1,"failed":0,"compileFailed":0,"timedOut":0,"signaled":0,"spawnErrors":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"passed","exitCode":0,"signal":null,"durationMs":1.0,"cached":true,"inputHash":"abc","cacheDecision":"hit","records":[]}]}"""
+    writeFile(tmpDir / stateDir / "lastrun.json", doc)
+    let lr = loadLastRun(makeCfg(tmpDir, stateDir))
+    check lr.found == true
+    check lr.failed.len == 0
+
+  test "loadLastRun treats schemaRevision > CURRENT_MAX as safe cold-start":
+    ## A future crisol wrote this file; we must NOT trust its fields.  Per RFC
+    ## this is a safe cold-start (no data) — found=false — symmetric with plans.
+    let tmpDir   = uniqueTmpDir("a8future")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir); createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+    let doc = """{"schema":"crisol/run/v1","schemaRevision":9999,"summary":{"total":1,"passed":0,"failed":1},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","records":[]}]}"""
+    writeFile(tmpDir / stateDir / "lastrun.json", doc)
+    let lr = loadLastRun(makeCfg(tmpDir, stateDir))
+    check lr.found == false
+    check lr.failed.len == 0
 
   test "loadLastRun via persistLastRun: round-trip extracts correct failed set":
     ## Use persistLastRun (B5) to write a real lastrun.json, then loadLastRun

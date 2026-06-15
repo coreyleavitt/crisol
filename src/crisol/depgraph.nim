@@ -18,7 +18,7 @@
 ##       "path":          "<string>",       -- entrypoint path (project-root-relative)
 ##       "flagHash":      "<16 hex chars>", -- 64-bit FNV-1a over sorted flags
 ##       "closure":       ["<string>", ...] -- project-root-relative source paths
-##       "closureHash":   "<16 hex chars>", -- 64-bit FNV-1a XOR over sorted closure file CONTENTS
+##       "closureHash":   "<16 hex chars>", -- 64-bit chained FNV-1a over sorted closure file CONTENTS
 ##       "protocolMajor": <int>             -- crisol protocol major at build time
 ##     },
 ##     ...
@@ -70,7 +70,7 @@ type
 
   DepGraphEntry* = object
     closure*:       HashSet[string]  ## project-root-relative closure paths
-    closureHash*:   string           ## 64-bit FNV-1a XOR over sorted closure file CONTENTS (16 hex)
+    closureHash*:   string           ## 64-bit chained FNV-1a over sorted closure file CONTENTS (16 hex)
     protocolMajor*: int              ## crisol protocol major at build time
 
   DepGraph* = object
@@ -83,7 +83,9 @@ type
 # FNV-1a 64-bit hash (stable across Nim versions; never std/hashes)
 # ---------------------------------------------------------------------------
 
-const fnvOffset64 = 0xcbf29ce484222325'u64
+const fnvOffset64* = 0xcbf29ce484222325'u64
+  ## FNV-1a 64-bit offset basis.  Exported so ``keys.nim`` can seed its chain
+  ## from the same basis without re-declaring the constant.
 const fnvPrime64  = 0x00000100000001b3'u64
 
 proc fnv1a64*(data: string): uint64 =

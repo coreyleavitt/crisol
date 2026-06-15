@@ -266,7 +266,7 @@ proc refreshAvailImpl(ac: var AdmissionController) =
 # ---------------------------------------------------------------------------
 
 proc admit*(ac: var AdmissionController; passId: uint; group: string;
-            decision: CompileDecision): Option[SlotToken] =
+            decision: EntrypointDecision): Option[SlotToken] =
   ## Returns some(token) iff:
   ##   (a) group-not-at-cap (groupInflight[group] < groupCap[group], or no cap), AND
   ##   (b) liveCount < jobsCap (CPU hard upper limit), AND
@@ -274,7 +274,11 @@ proc admit*(ac: var AdmissionController; passId: uint; group: string;
   ##
   ## Memory-admits (when availSnapshot.isSome):
   ##   availSnapshot - committed - safety >= reserved
-  ##   where reserved = estJobPeak for cold/stale, memPerRun for cdSkipFresh.
+  ##   where reserved = estJobPeak for cold/stale, memPerRun for edRunFresh/edCached.
+  ##
+  ## M3: takes EntrypointDecision (the F3 sealed sum) instead of CompileDecision.
+  ## edRunFresh / edCached → lower memPerRun estimate (binary already built).
+  ## edNeverBuilt / edStale → estJobPeak (compile + run).
   ##
   ## Progress-override: liveCount == 0 globally.
   ##   Bypasses ONLY the memory gate — never the group cap or jobsCap.
@@ -312,9 +316,11 @@ proc admit*(ac: var AdmissionController; passId: uint; group: string;
     return none(SlotToken)
 
   # (c) Memory gate
+  # M3: edRunFresh and edCached both have a pre-built binary; they skip compilation
+  # and need only a run-phase estimate.  edNeverBuilt / edStale require compile+run.
   let reserved =
-    if decision == cdSkipFresh: ac.memPerRun
-    else:                       ac.estJobPeak
+    if decision in {edRunFresh, edCached}: ac.memPerRun
+    else:                                  ac.estJobPeak
 
   let memAdmits =
     if ac.availSnapshot.isNone:

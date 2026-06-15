@@ -32,6 +32,11 @@
 import std/[options, os, strutils, tables, tempfiles, times, unittest]
 import crisol/types
 import crisol/runner
+import crisol/sandbox
+
+# A6: live run path is hermetic by default; allowlist the probe var.
+let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
+
 import crisol/config
 
 # ---------------------------------------------------------------------------
@@ -140,7 +145,7 @@ suite "H1 — head-of-line blocking regression":
     putEnv("CRISOL_TEST_OVERLAP_FILE", path1)
     let p1 = plan(cfg, eps, emptyDepGraph())
     var g1 = emptyDepGraph()
-    discard execute(p1, config = cfg, graph = g1, showProgress = false)
+    discard execute(p1, config = cfg, graph = g1, showProgress = false, cache = cacheDisabled(overlapSpec))
     delEnv("CRISOL_TEST_OVERLAP_FILE")
 
     let warm = parseOverlapFile(path1)
@@ -155,7 +160,7 @@ suite "H1 — head-of-line blocking regression":
     let p2 = plan(cfg, eps, g1)   # all cdSkipFresh now
     var g2 = g1
     let t0 = epochTime()
-    discard execute(p2, config = cfg, graph = g2, showProgress = false)
+    discard execute(p2, config = cfg, graph = g2, showProgress = false, cache = cacheDisabled(overlapSpec))
     let elapsedMs = int64((epochTime() - t0) * 1000)
     delEnv("CRISOL_TEST_OVERLAP_FILE")
 

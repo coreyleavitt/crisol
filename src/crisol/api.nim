@@ -43,10 +43,11 @@
 ##   SelectionReason, SelectionResult, RunPlan, persistLastRun, loadLastRun,
 ##   newCrisolError, newCrisolInterrupted, ANSI internals (col, Ansi_*, etc.),
 ##   memThrottleActive, formatProgressLine, planview internals (planToJson,
-##   decisionLabel, decisionString, warningsToJsonArray)
+##   decisionStringEd, decisionLabelEd, warningsToJsonArray)
 
-import std/[os, sets]
-import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals]
+import std/[os, sequtils, sets, strutils, times]
+import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals,
+               sandbox, cachedispatch, ccprobe, planner, order, ledger, keys, depgraph, stats]
 
 # ---------------------------------------------------------------------------
 # Selective re-exports (H1)
@@ -68,11 +69,14 @@ export types.Summary
 export types.GatedEntry
 export types.ConfigWarning
 export types.CompileDecision
+export types.EntrypointDecision
+export types.CacheDecision
 export types.CrisolError
 export types.CrisolErrorKind
 export types.CrisolInterrupted
 export types.ResultCallback
 export types.EntrypointResult
+export types.HermeticLevel
 export types.isFailure
 export types.exitCode
 
@@ -90,6 +94,29 @@ export jsonout.RunV1Schema
 
 # From planview — schema constant only; PlanReport-typed facades are defined below
 export planview.PlanV1Schema
+
+# From order — C4: OrderMode enum + parse (CLI/consumer surface)
+export order.OrderMode
+export order.parseOrderMode
+
+# ---------------------------------------------------------------------------
+# Nim-version fingerprint (High finding — soundness seam)
+# ---------------------------------------------------------------------------
+#
+# crisol must fingerprint the Nim compiler so that (1) the depgraph staleness
+# check invalidates stale binaries after a compiler upgrade and (2) the
+# soundness key invalidates cached test RESULTS after a compiler upgrade.
+#
+# `system.NimVersion` is the version of the Nim that compiled crisol.  In the
+# single-toolchain podman container this is the SAME nim that compiles the test
+# entrypoints, so it correctly fingerprints the compiler.  This value is
+# threaded into buildRunPlan → loadDepGraph / plan → execute → realSeams so BOTH
+# the staleness check (planner.decideCompile) AND the soundness key
+# (keys.soundnessKey) observe a real version instead of the empty string.
+
+const crisolNimVersion* = NimVersion
+  ## The Nim compiler version crisol was built with (e.g. "2.2.0"), used as the
+  ## nim-version fingerprint for depgraph staleness and result-cache soundness.
 
 # ---------------------------------------------------------------------------
 # Public types (F1 — api-owned)
@@ -128,17 +155,44 @@ type
     narrowing*:    RunNarrowing   ## default-constructed = noNarrowing()
     forceCompile*: bool = false
     failFast*:     bool = false
+    noCache*:      bool = false  ## RFC-0004 F3: --no-cache → do NOT read and do NOT
+                                 ## write the result cache (full bypass).  Caching is
+                                 ## ON by default.
+    retries*:      int  = -1     ## B1: global retry count override.  -1 = use config.
+                                 ## 0 = no retry (override to no-retry regardless of config).
+                                 ## N >= 1 = retry up to N times (maxAttempts = N+1).
+    failOnFlaky*:  bool = false  ## B1: when true, a flaky-pass (passed after attempt > 1)
+                                 ## contributes to exit 1 instead of exit 0.
     ## Tier 2 — tuning
     jobs*:         int = 0        ## <= 0 → config/built-in default (no error,
                                   ## unlike CLI which rejects --jobs < 1)
     timeoutSecs*:  int = 0        ## <= 0 → config/built-in default
     onResult*:     ResultCallback = nil ## per-entrypoint callback; nil = noop
+    ## C2: Shard selection (last step of selection, after narrowing).
+    ## shardK == 0 means no sharding.  When > 0, must satisfy 1 <= shardK <= shardN.
+    shardK*:       int = 0   ## shard index (1-indexed); 0 = no sharding
+    shardN*:       int = 1   ## total shard count; only used when shardK > 0
+    ## C4: History-based execution order (applied after shard, before plan).
+    ## omNone (default) = no reorder; pipeline parity with pre-C4 behavior.
+    order*:        OrderMode = omNone
     ## Tier 3 — host-lifecycle
     manageLock*:         bool = true   ## advisory inter-process lock
     installSignals*:     bool = false  ## LIBRARY DEFAULT OFF; true replaces host handlers
     persist*:            bool = true   ## write lastrun.json
     showProgress*:       bool = false  ## stderr-only progress line
     progressIntervalMs*: int  = 30_000
+    ## C6: --perf-check CLI override.
+    ## Precedence (highest wins):
+    ##   1. perfCheckForce=true → force perf-check ON (use config policy or moderate preset).
+    ##   2. Config block present with sensitivity≠none → enabled (parsed into cfg.perfCheck).
+    ##   3. perfCheckForce=false AND no config block (or sensitivity=none) → disabled.
+    perfCheckForce*:     bool = false  ## CLI --perf-check: force perf-check ON
+    ## RFC-0004 hermeticity-level control (--hermetic none|isolated|network).
+    ## Default hlIsolated preserves prior behavior (env allowlist + isolated tmpdir
+    ## + config-declared rlimits, no net isolation).  hlNone disables the hermetic
+    ## scrub/rlimits entirely; hlNetwork requests net-ns isolation (currently
+    ## DEGRADES — net-ns unshare is not wired — so such runs are not cached).
+    hermeticLevel*:      HermeticLevel = hlIsolated
 
   ResolvedSettings* = object
     ## Slim projection of the resolved Config (NOT the full Config).
@@ -260,9 +314,10 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   var (cfg, cfgWarnings) = loadConfig(configPath = opts.configPath,
                                       startDir   = opts.startDir)
 
-  # 2. Apply jobs / timeout overrides.
+  # 2. Apply jobs / timeout / retries overrides.
   if opts.jobs > 0:        cfg.jobs        = opts.jobs
   if opts.timeoutSecs > 0: cfg.timeoutSecs = opts.timeoutSecs
+  if opts.retries >= 0:    cfg.retries     = opts.retries  # B1: -1 = use config
 
   # 3. Assemble narrowing inputs.
   let useFailed  = opts.narrowing.kind in {nkFailed, nkFailedOrChanged}
@@ -289,9 +344,12 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     useFailed    = useFailed,
     useChanged   = useChanged,
     changed      = changedSet,
-    nimVersion   = "",
+    nimVersion   = crisolNimVersion,
     forceCompile = opts.forceCompile,
     warnings     = cfgWarnings,
+    shardK       = opts.shardK,
+    shardN       = opts.shardN,
+    order        = opts.order,   # C4: history-based prioritization
   )
 
   # 5. Project into PlanReport.
@@ -423,17 +481,60 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   var results: seq[EntrypointResult]
   var memThrottled = 0
 
+  # C6: Resolve the effective PerfCheckConfig.
+  #   Precedence: perfCheckForce > config block > absent/disabled.
+  #   If perfCheckForce is set AND the config block has no enabled policy,
+  #   fall back to the "moderate" preset so the CLI flag is never a no-op.
+  let effectivePerfCheck: PerfCheckConfig =
+    if cfg.perfCheck.enabled:
+      # Config block says enabled (sensitivity ≠ none): use it.
+      # perfCheckForce can only strengthen, not weaken, so this wins too.
+      cfg.perfCheck
+    elif opts.perfCheckForce:
+      # CLI --perf-check forces ON; config block absent/none → moderate preset.
+      PerfCheckConfig(enabled: true, k: 3.0, sampleFloor: 10, absFloorMs: 5)
+    else:
+      PerfCheckConfig(enabled: false)
+
+  # C6: Capture run-start timestamp (unix epoch µs) BEFORE execute() appends
+  # current-run rows to the ledger.  The detection step will exclude any ledger
+  # row whose timestamp >= runStart, ensuring we compare against PRIOR history only.
+  let runStartUs: int64 = int64(epochTime() * 1_000_000.0)
+
+  # F2/F3 (A6): resolve hermeticity once (default hlIsolated) and build the
+  # result-cache policy + seams.  The seams read the LIVE graph (ptr) so a
+  # store-key derived after a compile reflects the fresh closureHash.
+  # M4: bundle spec+policy+seams into a CacheContext so the invariant
+  # (active iff keyOf!=nil AND policy.enabled) is enforced structurally.
+  let spec = resolveSandbox(level = opts.hermeticLevel)
+  let cacheCtx =
+    if opts.noCache:
+      cacheDisabled(spec)   # fully off; spec still governs sandbox hermeticity
+    else:
+      cacheEnabled(spec,
+        CachePolicy(enabled: true),
+        realSeams(
+          stateDir      = pr.settings.stateDir,
+          graph         = addr graph,
+          nimVersion    = crisolNimVersion,
+          ccVersion     = cachedCcVersion(),
+          spec          = spec,
+          parentEnv     = toSeq(envPairs()),
+          protocolMajor = CrisolProtocolMajor,
+        ))
+
   try:
     results = execute(
       pv.plan,
       config             = cfg,
       graph              = graph,
-      nimVersion         = "",
+      nimVersion         = crisolNimVersion,
       onResult           = cb,
       failFast           = opts.failFast,
       showProgress       = opts.showProgress,
       progressIntervalMs = opts.progressIntervalMs,
       memThrottledOut    = addr memThrottled,
+      cache              = cacheCtx,
     )
   except CrisolInterrupted as e:
     # SIGINT/SIGTERM: release lock and report rsInterrupted.
@@ -454,6 +555,45 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
 
   let s = summarize(results)
 
+  # C6: Annotate results with regression info (if perf-check is enabled).
+  # edCached results are excluded (no fresh measurement; never flag a cache hit).
+  # For each fresh result, historyUs = prior durationUs rows from the ledger,
+  # filtering out compileFailed rows and rows from the current run (timestamp >= runStart).
+  if effectivePerfCheck.enabled:
+    let resolvedStateDir = pr.settings.stateDir
+    for i in 0 ..< results.len:
+      let r = results[i]
+      # Skip cached results — no fresh measurement, never flag.
+      if r.cached:
+        continue
+      # Skip compile-failed — no run duration to compare.
+      if r.outcome == oCompileFailed:
+        continue
+      # Build identity key for this entrypoint.
+      let ikey = identityKey(r.ep.path, flagHash(r.ep.flags))
+      # Scan the ledger for PRIOR rows (exclude current run by timestamp).
+      let allRows = scanLedger(resolvedStateDir, ikey)
+      var historyUs: seq[int64]
+      for row in allRows:
+        # Exclude current-run rows (appended during execute()).
+        if row.timestamp >= runStartUs:
+          continue
+        # Exclude compileFailed rows (their durationUs reflects the compiler, not the run).
+        if row.outcome.startsWith("compileFailed"):
+          continue
+        historyUs.add row.durationUs
+      # Run the pure predicate.
+      let verdict = isRegression(
+        currentUs   = r.durationMs * 1000,  # convert ms → µs for comparison
+        historyUs   = historyUs,
+        k           = effectivePerfCheck.k,
+        sampleFloor = effectivePerfCheck.sampleFloor,
+        absFloorMs  = effectivePerfCheck.absFloorMs,
+      )
+      results[i].regressed      = verdict.regressed
+      results[i].perfBaselineUs = verdict.baselineUs
+      results[i].perfThresholdUs = verdict.thresholdUs
+
   # Persist lastrun.json if requested.
   if opts.persist:
     persistLastRun(results, s, cfg, warnings = pr.warnings,
@@ -467,5 +607,5 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     results:           results,
     memThrottledSlots: memThrottled,
     status:            rsOk,
-    exitCode:          exitCode(s),
+    exitCode:          exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
   )

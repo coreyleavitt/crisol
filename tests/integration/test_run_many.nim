@@ -46,7 +46,7 @@ suite "plan — pure annotation of compile decisions":
     let p = plan(cfg, eps, emptyDepGraph())
     check p.entrypoints.len == 2
     for pep in p.entrypoints:
-      check pep.decision == cdNeverBuilt
+      check pep.edecision == edNeverBuilt
     check p.jobs >= 1   # 0 resolved to at least 1 (A4: max(1, cpu-2))
 
   test "plan is pure — does not run any process":
@@ -59,7 +59,7 @@ suite "plan — pure annotation of compile decisions":
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     check p.entrypoints.len == 1
-    check p.entrypoints[0].decision == cdNeverBuilt
+    check p.entrypoints[0].edecision == edNeverBuilt
     check p.jobs == 2
 
   test "jobs resolved: config.jobs > 0 is preserved":

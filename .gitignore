@@ -22,3 +22,13 @@ nim.cfg
 /cache/
 /bin/
 /depgraph
+# Compiled test binaries from `nim r` runs (extensionless, sit next to the
+# tracked *.nim sources).  Only .nim sources / subdirs are tracked.
+/tests/integration/*
+!/tests/integration/*.nim
+!/tests/integration/*/
+/tests/unit/*
+!/tests/unit/*.nim
+!/tests/unit/*/
+# Scratch tmp dir some fixtures write into.
+tests/fixtures/tmp/

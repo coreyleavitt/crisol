@@ -56,7 +56,7 @@ suite "skip-fresh — compile avoidance integration":
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, "", false)
     check p.entrypoints.len == 1
-    check p.entrypoints[0].decision == cdNeverBuilt
+    check p.entrypoints[0].edecision == edNeverBuilt
 
     let results = execute(p, config = cfg, graph = graph,
                           nimVersion = "",
@@ -97,7 +97,7 @@ suite "skip-fresh — compile avoidance integration":
     var graph2Mut = graph2
     let p2 = plan(cfg, @[ep], graph2Mut, "", false)
     check p2.entrypoints.len == 1
-    check p2.entrypoints[0].decision == cdSkipFresh
+    check p2.entrypoints[0].edecision == edRunFresh
 
     let results2 = execute(p2, config = cfg, graph = graph2Mut,
                            nimVersion = "",
@@ -127,7 +127,7 @@ suite "skip-fresh — compile avoidance integration":
     var graph2Mut = graph2
     let p2 = plan(cfg, @[ep], graph2Mut, "", true)   # forceCompile=true
     check p2.entrypoints.len == 1
-    check p2.entrypoints[0].decision == cdStale
+    check p2.entrypoints[0].edecision == edStale
 
     let results2 = execute(p2, config = cfg, graph = graph2Mut,
                            nimVersion = "",
@@ -161,8 +161,8 @@ suite "skip-fresh — compile avoidance integration":
     let graph2 = loadDepGraph(cfg, "")
     var graph2Mut = graph2
     let p2 = plan(cfg, @[ep1, ep2], graph2Mut, "", false)
-    check p2.entrypoints[0].decision == cdSkipFresh
-    check p2.entrypoints[1].decision == cdNeverBuilt
+    check p2.entrypoints[0].edecision == edRunFresh
+    check p2.entrypoints[1].edecision == edNeverBuilt
 
     let r2 = execute(p2, config = cfg, graph = graph2Mut,
                      nimVersion = "", showProgress = false)

@@ -4,7 +4,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_planview.nim
 
-import std/[json, options, strutils, unittest]
+import std/[json, monotimes, options, os, strutils, unittest]
 import crisol/types
 import crisol/render
 import crisol/planview
@@ -16,10 +16,23 @@ import crisol/planview
 
 proc mkPep(path: string; group: string; d: CompileDecision;
            reason = "r"; runTimeoutMs = 0; maxJobs = none(int)): PlannedEntrypoint =
+  ## M3: `decision` field removed; derive edecision from d.
   PlannedEntrypoint(
     ep: Entrypoint(path: path, group: group, flags: @[]),
-    decision: d, reason: reason,
+    reason: reason,
+    edecision: (case d
+                of cdNeverBuilt: edNeverBuilt
+                of cdStale: edStale
+                of cdSkipFresh: edRunFresh),
     runTimeoutMs: runTimeoutMs, maxJobs: maxJobs)
+
+proc mkPepEd(path: string; group: string; ed: EntrypointDecision;
+             reason = "r"): PlannedEntrypoint =
+  ## Build a PlannedEntrypoint by EntrypointDecision directly (A8 — for edCached
+  ## which has no CompileDecision counterpart).  M3: `decision` field removed.
+  PlannedEntrypoint(
+    ep: Entrypoint(path: path, group: group, flags: @[]),
+    edecision: ed, reason: reason)
 
 proc samplePlan(): RunPlan =
   RunPlan(
@@ -58,10 +71,11 @@ suite "renderPlan — pure human listing":
     check "would compile" in s
     check "binary fresh — would skip compile" in s
 
-  test "decision labels are distinct per variant":
-    check decisionLabel(cdNeverBuilt) != decisionLabel(cdStale)
-    check decisionLabel(cdStale) != decisionLabel(cdSkipFresh)
-    check decisionLabel(cdNeverBuilt) != decisionLabel(cdSkipFresh)
+  test "decision labels are distinct per variant (Ed variants)":
+    ## R2-c: decisionLabel(CompileDecision) removed; use decisionLabelEd.
+    check decisionLabelEd(edNeverBuilt) != decisionLabelEd(edStale)
+    check decisionLabelEd(edStale) != decisionLabelEd(edRunFresh)
+    check decisionLabelEd(edNeverBuilt) != decisionLabelEd(edRunFresh)
 
   test "gated-out entries appear WITH their reason":
     let opts = RenderOpts(color: false, slowestN: 5)
@@ -117,10 +131,11 @@ suite "planToJson — versioned stable schema":
     check g[0]["group"].getStr == "smoke"
     check g[0]["reason"].getStr == "env AMOXTLI_OPENROUTER_API_KEY not set"
 
-  test "decision strings are stable enums, not ordinals":
-    check decisionString(cdNeverBuilt) == "neverBuilt"
-    check decisionString(cdStale) == "stale"
-    check decisionString(cdSkipFresh) == "skipFresh"
+  test "decision strings are stable enums, not ordinals (Ed variants)":
+    ## R2-c: decisionString(CompileDecision) removed; use decisionStringEd.
+    check decisionStringEd(edNeverBuilt) == "neverBuilt"
+    check decisionStringEd(edStale) == "stale"
+    check decisionStringEd(edRunFresh) == "skipFresh"
 
   test "round-trips: planToJsonString parses back to identical structure":
     let s = planToJsonString(samplePlan(), sampleGated())
@@ -218,3 +233,136 @@ suite "planToJson — versioned stable schema":
       ])
     let j = planToJson(plan, @[])
     check j["entrypoints"][0]["maxJobs"].kind == JNull
+
+# ---------------------------------------------------------------------------
+# A8 — edCached decision, schemaRevision, decision migration to edecision
+# ---------------------------------------------------------------------------
+
+suite "planview A8 — edCached + schemaRevision":
+
+  test "plan/v1 carries an integer schemaRevision alongside the schema string":
+    let j = planToJson(samplePlan(), sampleGated())
+    check j.hasKey("schema")
+    check j["schema"].getStr == "crisol/plan/v1"
+    check j.hasKey("schemaRevision")
+    check j["schemaRevision"].kind == JInt
+    check j["schemaRevision"].getInt == PlanV1Revision
+    # The current revision is at least 2 (bumped for the additive edCached field).
+    check PlanV1Revision >= 2
+
+  test "decisionStringEd maps edCached to stable 'cached' string":
+    check decisionStringEd(edNeverBuilt) == "neverBuilt"
+    check decisionStringEd(edStale)      == "stale"
+    check decisionStringEd(edRunFresh)   == "skipFresh"
+    check decisionStringEd(edCached)     == "cached"
+
+  test "decisionLabelEd gives a distinct human label for edCached":
+    check decisionLabelEd(edCached) != decisionLabelEd(edRunFresh)
+    check decisionLabelEd(edCached) != decisionLabelEd(edNeverBuilt)
+    check decisionLabelEd(edCached) != decisionLabelEd(edStale)
+    check "cached" in decisionLabelEd(edCached).toLowerAscii
+
+  test "plan/v1 decision string reflects edCached when promoted":
+    let plan = RunPlan(
+      jobs: 1,
+      entrypoints: @[
+        mkPepEd("tests/unit/test_cached.nim", "unit", edCached),
+      ])
+    let j = planToJson(plan, @[])
+    check j["entrypoints"][0]["decision"].getStr == "cached"
+
+  test "plan/v1 decision strings for non-cached entries stay stable":
+    ## Migration to edecision must not change output for the existing decisions.
+    let j = planToJson(samplePlan(), sampleGated())
+    let eps = j["entrypoints"]
+    check eps[0]["decision"].getStr == "neverBuilt"
+    check eps[1]["decision"].getStr == "stale"
+    check eps[2]["decision"].getStr == "skipFresh"
+
+  test "renderPlan shows a cached label for an edCached entrypoint":
+    let plan = RunPlan(
+      jobs: 1,
+      entrypoints: @[
+        mkPepEd("tests/unit/test_cached.nim", "unit", edCached),
+      ])
+    let s = renderPlan(plan, @[], RenderOpts(color: false, slowestN: 5))
+    check "tests/unit/test_cached.nim" in s
+    check "cached" in s.toLowerAscii
+
+  test "renderPlan human output for non-cached decisions stays stable":
+    let s = renderPlan(samplePlan(), sampleGated(),
+                       RenderOpts(color: false, slowestN: 5))
+    check "never built (would compile)" in s
+    check "would compile" in s
+    check "binary fresh — would skip compile" in s
+
+# ---------------------------------------------------------------------------
+# A8 — loadLastPlan forward/backward tolerance (symmetric with loadLastRun)
+# ---------------------------------------------------------------------------
+
+suite "planview A8 — loadLastPlan tolerance":
+
+  proc uniqueTmpDir(tag: string): string =
+    getTempDir() / ("crisol_pv_" & tag & "_" & $getMonoTime().ticks)
+
+  proc makeCfg(projectRoot, stateDir: string): Config =
+    Config(projectRoot: projectRoot, stateDir: stateDir, groups: @[],
+           jobs: 1, timeoutSecs: 30, compileTimeoutSecs: 60,
+           maxOutputBytes: 65536)
+
+  test "absent lastplan.json → found=false, supported=true (cold start)":
+    let tmpDir = uniqueTmpDir("absent")
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+    let lp = loadLastPlan(makeCfg(tmpDir, ".crisol"))
+    check lp.found == false
+    check lp.supported == true
+
+  test "old plan doc without schemaRevision is tolerated (found, supported)":
+    let tmpDir   = uniqueTmpDir("old")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir); createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+    # No schemaRevision, no edCached fields — an old document.
+    let doc = """{"schema":"crisol/plan/v1","jobs":1,"entrypoints":[],"gatedOut":[]}"""
+    writeFile(tmpDir / stateDir / "lastplan.json", doc)
+    let lp = loadLastPlan(makeCfg(tmpDir, stateDir))
+    check lp.found == true
+    check lp.supported == true
+
+  test "new plan doc with schemaRevision == CURRENT is tolerated":
+    let tmpDir   = uniqueTmpDir("cur")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir); createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+    let doc = planToJsonString(samplePlan(), sampleGated())
+    writeFile(tmpDir / stateDir / "lastplan.json", doc)
+    let lp = loadLastPlan(makeCfg(tmpDir, stateDir))
+    check lp.found == true
+    check lp.supported == true
+
+  test "schemaRevision > CURRENT_MAX is safe cold-start (found=false, supported=false)":
+    let tmpDir   = uniqueTmpDir("future")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir); createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+    let doc = """{"schema":"crisol/plan/v1","schemaRevision":9999,"jobs":1,"entrypoints":[],"gatedOut":[]}"""
+    writeFile(tmpDir / stateDir / "lastplan.json", doc)
+    let lp = loadLastPlan(makeCfg(tmpDir, stateDir))
+    # Treated as no-data: a future crisol wrote it; we cannot trust the fields.
+    check lp.found == false
+    check lp.supported == false
+
+  test "wrong schema string raises CrisolError(cekEnvironment)":
+    let tmpDir   = uniqueTmpDir("badschema")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir); createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+    writeFile(tmpDir / stateDir / "lastplan.json",
+              """{"schema":"crisol/plan/v99","entrypoints":[]}""")
+    var raised = false
+    try: discard loadLastPlan(makeCfg(tmpDir, stateDir))
+    except CrisolError as e:
+      raised = true
+      check e.kind == cekEnvironment
+    check raised

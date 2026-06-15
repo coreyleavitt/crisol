@@ -20,6 +20,11 @@ import crisol/types
 import crisol/runner
 import crisol/depgraph
 import crisol/signals
+import crisol/sandbox
+
+# A6: live run path is hermetic by default; allowlist HANG_PID_FILE so the
+# hang_with_pid fixture can announce its grandchild PID to the parent.
+let hangSpec = resolveSandbox(passthroughs = @["HANG_PID_FILE"])
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,7 +113,7 @@ suite "signal handling — SIGINT kills pool and exits 130":
 
       try:
         var g = emptyDepGraph()
-        discard execute(p, config = cfg, graph = g)
+        discard execute(p, config = cfg, graph = g, cache = cacheDisabled(hangSpec))
         # If execute returned normally (shouldn't happen with a hung fixture),
         # exit 0 — parent will see this as a test failure.
         exitnow(0)

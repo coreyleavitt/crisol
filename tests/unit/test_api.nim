@@ -503,3 +503,20 @@ suite "api type surface":
     let rr = RunReport()
     check pr.entrypoints.len == 0
     check rr.status == rsOk
+
+# ---------------------------------------------------------------------------
+# Nim-version soundness seam (High finding): api MUST supply a REAL Nim
+# version, never "".  A "" version makes the depgraph staleness check and the
+# soundness-key nimVersion component both no-ops, so a Nim compiler upgrade
+# does not invalidate stale binaries or stale cached results.
+# ---------------------------------------------------------------------------
+
+suite "nim-version soundness seam":
+  test "api exposes a real Nim version (not the empty-string no-op)":
+    # The version threaded into buildRunPlan/loadDepGraph/plan/execute/realSeams
+    # must fingerprint the compiler.  It is sourced from system.NimVersion.
+    check crisolNimVersion.len > 0
+    check crisolNimVersion != ""
+    check crisolNimVersion == NimVersion
+    # Sanity: looks like a dotted version (e.g. "2.2.0").
+    check '.' in crisolNimVersion

@@ -283,9 +283,10 @@ suite "crisol D5 — --failed --changed union":
     check r.output.contains("test_a")
 
   test "union semantics with a PRECISE graph (mirrors buildPlanView)":
-    ## runMain passes nimVersion="" to loadDepGraph, so a seeded real graph is
-    ## always treated as mismatched (empty) inside runMain — which means the
-    ## end-to-end path can only exercise the graph-absent fallback union.
+    ## This test reproduces buildPlanView's exact narrowing algorithm in-process
+    ## against a hand-built precise graph (initDepGraph with a fixed version),
+    ## rather than round-tripping through runMain.  That keeps it independent of
+    ## which version runMain threads into loadDepGraph.
     ##
     ## To prove the PRECISE union (failed-only ∪ changed-only, NOT intersection)
     ## we reproduce buildPlanView's exact narrowing algorithm here against a
