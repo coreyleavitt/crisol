@@ -45,6 +45,27 @@ import nkdl
 import crisol/types
 
 # ---------------------------------------------------------------------------
+# stateDirOf — single authoritative resolver for crisol's on-disk state dir
+# ---------------------------------------------------------------------------
+
+proc stateDirOf*(cfg: Config): string =
+  ## Single source of truth for crisol's on-disk state directory (absolute).
+  ## CRISOL_STATE_DIR, when set, OVERRIDES the config's project-root-relative
+  ## `state-dir` — this is how a sandboxed container redirects crisol's build
+  ## cache onto a mounted volume (e.g. /cache/crisol) that lives outside the
+  ## project tree. Resolution order:
+  ##   1. CRISOL_STATE_DIR set (non-empty) -> absolutePath(env)
+  ##   2. cfg.stateDir empty -> "" (caller signalled "no state dir"; e.g. some
+  ##      runEntrypoint callers leave it unset and want the ledger disabled)
+  ##   3. cfg.stateDir absolute -> use as-is
+  ##   4. otherwise -> absolutePath(cfg.projectRoot / cfg.stateDir)
+  let env = getEnv("CRISOL_STATE_DIR")
+  if env.len > 0: return absolutePath(env)
+  if cfg.stateDir.len == 0: return ""
+  if cfg.stateDir.isAbsolute: return cfg.stateDir
+  absolutePath(cfg.projectRoot / cfg.stateDir)
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 

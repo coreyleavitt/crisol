@@ -359,7 +359,7 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   )
 
   # 5. Project into PlanReport.
-  let resolvedStateDir = absolutePath(cfg.projectRoot / cfg.stateDir)
+  let resolvedStateDir = stateDirOf(cfg)
   let settings = ResolvedSettings(
     projectRoot: cfg.projectRoot,
     stateDir:    resolvedStateDir,

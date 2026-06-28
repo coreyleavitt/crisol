@@ -29,7 +29,7 @@
 ##     mapping, stdout writing) are NOT present here.
 
 import std/[os, sequtils, sets]
-import crisol/[types, discover, depgraph, planner, narrow, shard, order]
+import crisol/[types, config, discover, depgraph, planner, narrow, shard, order]
 
 # ---------------------------------------------------------------------------
 # Public result type
@@ -142,7 +142,7 @@ proc buildRunPlan*(
   # Uses ledger-aware balanced sharding (LPT bin-pack) when history exists;
   # falls back to C2 path-hash partition on cold start (no ledger rows).
   if shardK > 0:
-    let resolvedStateDir = cfg.projectRoot / cfg.stateDir
+    let resolvedStateDir = stateDirOf(cfg)
     runnable = shardWithHistory(runnable, shardK, shardN, resolvedStateDir)
 
   # C4: Order step — AFTER shard (shard membership is stable), BEFORE plan.
@@ -151,7 +151,7 @@ proc buildRunPlan*(
   # The ordering step always runs after shard assignment so shard membership
   # is stable regardless of the --order fallback (RFC §F5 line 159).
   if order != omNone:
-    let resolvedStateDir = cfg.projectRoot / cfg.stateDir
+    let resolvedStateDir = stateDirOf(cfg)
     runnable = orderByHistory(runnable, order, resolvedStateDir)
 
   let runPlan = plan(cfg, runnable, graph, nimVersion, forceCompile)

@@ -32,7 +32,7 @@
 
 import std/[algorithm, monotimes, options, os, sequtils, sets, times]
 import std/posix
-import crisol/[types, spawn, signals, render, depgraph, closure, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys]
+import crisol/[types, config, spawn, signals, render, depgraph, closure, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys]
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
 # M4: re-export the CacheContext bundle + constructors so callers of execute()
 # don't need a separate `import crisol/cachedispatch`.
@@ -760,10 +760,7 @@ proc execute*(
   # Resolve to absolute path using projectRoot so the ledger dir is co-located
   # with the rest of the state (resultcache, lastrun.json, etc.) regardless of CWD.
   var led: Ledger
-  let resolvedLedgerStateDir =
-    if config.stateDir.len == 0: ""
-    elif config.stateDir.isAbsolute: config.stateDir
-    else: absolutePath(config.projectRoot / config.stateDir)
+  let resolvedLedgerStateDir = stateDirOf(config)
   let ledgerActive = resolvedLedgerStateDir.len > 0
   if ledgerActive:
     led = openLedger(resolvedLedgerStateDir)

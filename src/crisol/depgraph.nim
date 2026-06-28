@@ -49,6 +49,7 @@
 import std/[algorithm, json, os, sequtils, sets, strutils, tables]
 import std/posix as posix_mod
 import crisol/types
+import crisol/config  # for stateDirOf
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -314,7 +315,7 @@ proc fromJson(node: JsonNode; nimVersion: string): DepGraph =
 
 proc depgraphPath(config: Config): string =
   ## Absolute path to the depgraph file.
-  config.projectRoot / config.stateDir / "depgraph"
+  stateDirOf(config) / "depgraph"
 
 proc saveDepGraph*(graph: DepGraph; config: Config) =
   ## Write the graph to `<projectRoot>/<stateDir>/depgraph` atomically.
@@ -325,7 +326,7 @@ proc saveDepGraph*(graph: DepGraph; config: Config) =
   ## symlink already exists at the .tmp path — prevents a pre-planted symlink
   ## from redirecting the write to an attacker-chosen target (P5).
   ## A stale .tmp from a previous crashed run is removed first.
-  let stateDir  = config.projectRoot / config.stateDir
+  let stateDir  = stateDirOf(config)
   let finalPath = depgraphPath(config)
   let tmpPath   = finalPath & ".tmp"
 

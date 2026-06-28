@@ -59,6 +59,7 @@
 import std/[json, options, os, sets]
 import std/posix as posix_mod
 import crisol/types
+import crisol/config  # for stateDirOf
 import crisol/render  # for filterRecordsByTag
 import crisol/planview  # for warningsToJsonArray
 import crisol/outcomestrings  # re-exports FailureOutcomeStrings (the only symbol
@@ -265,7 +266,7 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   ##
   ## warnings and memThrottledSlots are threaded through to toJsonString so
   ## the persisted file matches the stdout JSON path exactly (M3 fix).
-  let stateDir = config.projectRoot / config.stateDir
+  let stateDir = stateDirOf(config)
   let finalPath = stateDir / "lastrun.json"
 
   try:
@@ -336,7 +337,7 @@ proc loadLastRun*(config: Config):
   ##
   ## Raises CrisolError(cekEnvironment) if the file exists but is malformed
   ## or carries an unrecognized schema version.
-  let path = config.projectRoot / config.stateDir / "lastrun.json"
+  let path = stateDirOf(config) / "lastrun.json"
 
   if not fileExists(path):
     return (found: false, failed: initHashSet[tuple[path, group: string]]())

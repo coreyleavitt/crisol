@@ -28,7 +28,7 @@
 ##   that state.  `--all` does not need the lock (it just nukes the dir).
 
 import std/[os, sets, strutils, tables, times]
-import crisol/[types, discover, planner, runner, depgraph, resultcache, ledger]
+import crisol/[types, config, discover, planner, runner, depgraph, resultcache, ledger]
   # `planner` imported explicitly for `slug` (forward-computed expected-slug set
   # below) rather than leaning on runner's re-export — keeps the dependency
   # visible in the import list.
@@ -95,7 +95,7 @@ proc pruneDir(parentDir: string; expectedSlugs: HashSet[string]): int =
 
 proc cleanAll*(config: Config) =
   ## Remove the entire stateDir (`<projectRoot>/<stateDir>/`) recursively.
-  let stateDir = config.projectRoot / config.stateDir
+  let stateDir = stateDirOf(config)
   if dirExists(stateDir):
     removeDir(stateDir)
   stdout.write("crisol clean --all: removed " & stateDir & "\n")
@@ -129,7 +129,7 @@ proc cleanOrphans*(config: Config): tuple[
   ##
   ## Returns counts of what was pruned/evicted/compacted.
 
-  let stateDir = config.projectRoot / config.stateDir
+  let stateDir = stateDirOf(config)
 
   # Step 1: Discover ALL entrypoints, ALL groups, gates IGNORED.
   # applyGates is deliberately NOT called here — a closed gate must not

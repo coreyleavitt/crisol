@@ -44,7 +44,7 @@
 ## symmetric with jsonout.loadLastRun.
 
 import std/[json, options, os, sets]
-import crisol/[types, render]
+import crisol/[types, config, render]
 
 # GatedEntry is defined in types.nim and re-exported from there.
 
@@ -236,7 +236,7 @@ proc loadLastPlan*(config: Config):
   ##
   ## Raises CrisolError(cekEnvironment) if the file exists but is malformed JSON
   ## or carries an unrecognized `schema` string — symmetric with loadLastRun.
-  let path = config.projectRoot / config.stateDir / "lastplan.json"
+  let path = stateDirOf(config) / "lastplan.json"
 
   if not fileExists(path):
     return (found: false, supported: true)

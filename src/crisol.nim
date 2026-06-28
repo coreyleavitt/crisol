@@ -278,7 +278,7 @@ proc runMain*(args: seq[string]): int =
       inc ci
 
     let (cfg, _) = loadConfig(configPath = cleanCfgPath)
-    let stateDir = cfg.projectRoot / cfg.stateDir
+    let stateDir = stateDirOf(cfg)
 
     if doCleanAll:
       # --all: remove the whole state dir — no lock needed.

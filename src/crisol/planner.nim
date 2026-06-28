@@ -17,7 +17,7 @@
 
 import std/[algorithm, options, os, sequtils, sets, strutils, tables]
 import std/cpuinfo
-import crisol/[types, depgraph, scheduler]
+import crisol/[types, config, depgraph, scheduler]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -62,11 +62,11 @@ proc binName*(ep: Entrypoint): string =
 
 proc binPath*(ep: Entrypoint; config: Config): string =
   ## Absolute path to the directory containing the stable compiled binary.
-  config.projectRoot / config.stateDir / "bin" / slug(ep.path, ep.flags)
+  stateDirOf(config) / "bin" / slug(ep.path, ep.flags)
 
 proc cachePath*(ep: Entrypoint; config: Config): string =
   ## Absolute path to the stable nimcache directory for this entrypoint.
-  config.projectRoot / config.stateDir / "cache" / slug(ep.path, ep.flags)
+  stateDirOf(config) / "cache" / slug(ep.path, ep.flags)
 
 # ---------------------------------------------------------------------------
 # emptyDepGraph convenience wrapper
