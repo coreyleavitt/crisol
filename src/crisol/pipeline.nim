@@ -28,7 +28,7 @@
 ##     dep graph and gate env vars. CLI-only concerns (arg parsing, exit code
 ##     mapping, stdout writing) are NOT present here.
 
-import std/[os, sequtils, sets]
+import std/[sequtils, sets]
 import crisol/[types, config, discover, depgraph, planner, narrow, shard, order]
 
 # ---------------------------------------------------------------------------
