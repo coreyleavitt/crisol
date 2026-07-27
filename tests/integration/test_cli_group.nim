@@ -42,6 +42,19 @@ proc captureStdoutToFile(path: string; body: proc()): void =
     discard posix_mod3.dup2(savedFd, 1.cint)
     discard posix_mod3.close(savedFd)
 
+proc captureStderrToFile(path: string; body: proc()): void =
+  let f = open(path, fmWrite)
+  let fileFd: cint = f.getFileHandle.cint
+  let savedFd: cint = posix_mod3.dup(2.cint)
+  discard posix_mod3.dup2(fileFd, 2.cint)
+  f.close()
+  try:
+    body()
+  finally:
+    flushFile(stderr)
+    discard posix_mod3.dup2(savedFd, 2.cint)
+    discard posix_mod3.close(savedFd)
+
 # ---------------------------------------------------------------------------
 # Suite 1 — --group / --all-groups flag parsing
 # ---------------------------------------------------------------------------
@@ -73,13 +86,15 @@ suite "crisol CLI — C2 --group / --all-groups":
   # -------------------------------------------------------------------------
 
   test "--group unit with path args → exit 0 (passing fixture runs)":
-    ## When paths are given, group selection is overridden by the path-to-cli-group
-    ## rewrite.  But --group still gets validated.  This test uses a valid group.
-    ## The important thing: it doesn't exit 3 for an unknown group.
+    ## Fix for issue #3: --group is threaded into GroupSelection.withinGroups
+    ## alongside the path, not dropped.  This fixture path (tests/fixtures/) is
+    ## outside "unit"'s configured globs (tests/unit/test_*.nim), so it does
+    ## NOT match "unit" — per RFC-0001:409 it becomes an ad-hoc "paths"
+    ## entrypoint with global flags, with a warning on stderr.  An ad-hoc
+    ## entrypoint still compiles and runs normally, so this passes (exit 0).
     let fd   = fixtureDir()
     let code = runMain(@["run", "--group", "unit", fd / "pass_always.nim",
                          "--jobs", "1"])
-    ## paths override group selection → cli group; run succeeds
     check code == 0
 
   # -------------------------------------------------------------------------
@@ -93,8 +108,8 @@ suite "crisol CLI — C2 --group / --all-groups":
     var code = 0
     captureStdoutToFile(outPath, proc () =
       code = runMain(@["list", fd / "pass_always.nim", "--group", "unit"]))
-    ## --group unit with explicit path: path wins, group flags are ignored for
-    ## selection purposes (path creates synthetic "paths" group).  Should still exit 0.
+    ## Same ad-hoc case as above (fixture path is outside "unit"'s globs), via
+    ## `list`/dry-run instead of `run`.  Should still exit 0 and list the path.
     check code == 0
     let txt = readFile(outPath)
     check "pass_always.nim" in txt
@@ -165,3 +180,67 @@ suite "crisol CLI — C2 --group / --all-groups":
     let code = runMain(@["list", "--group", "unit", "--all-groups",
                          fd / "pass_always.nim"])
     check code == 3
+
+  # -------------------------------------------------------------------------
+  # 9. Issue #3 regression: --group <name> + a path that MATCHES that group's
+  #    globs must resolve to the named group (and its flags) — not be
+  #    silently downgraded to the ad-hoc "paths" group.  This is the CLI-level
+  #    proof that giving both a path and --group no longer drops the group.
+  # -------------------------------------------------------------------------
+
+  test "issue #3: --group narrows an ambiguous path to the NAMED group, not the first-declared one":
+    ## Two groups share an overlapping glob so the same path matches both.
+    ## "special" is declared FIRST (would win discover()'s first-match rule
+    ## with no narrowing); "unit" is declared second and is what --group asks
+    ## for. If crisol.nim silently drops --group when a path is also given
+    ## (the issue #3 bug), the plan reports group "special" (wrong). Threading
+    ## --group into GroupSelection.withinGroups must make it report "unit".
+    let root = getTempDir() / ("crisol_c2_issue3_" & $getpid())
+    createDir(root)
+    defer: removeDir(root)
+
+    let cfgPath = root / "crisol.kdl"
+    writeFile(cfgPath, """
+group "special" {
+    globs "tests/unit/test_*.nim"
+    flags "-d:specialmarker"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+    flags "-d:unitmarker"
+}
+""")
+
+    let unitDir = root / "tests" / "unit"
+    createDir(unitDir)
+    let epPath = unitDir / "test_a.nim"
+    writeFile(epPath, "quit(0)\n")
+
+    let outPath = getTempDir() / ("crisol_c2_issue3_out_" & $getpid() & ".json")
+    defer: (try: removeFile(outPath) except: discard)
+
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      code = runMain(@["list", "--config", cfgPath, "--group", "unit", epPath, "--json"]))
+    check code == 0
+    let j = parseJson(readFile(outPath).strip())
+    check j["entrypoints"].len == 1
+    check j["entrypoints"][0]["group"].getStr == "unit"
+
+  # -------------------------------------------------------------------------
+  # 10. Issue #3 regression: an ad-hoc path (matches no configured group)
+  #     prints the RFC-0001:409 warning on stderr.
+  # -------------------------------------------------------------------------
+
+  test "issue #3: ad-hoc path (no matching group) prints an RFC-0001:409 warning on stderr":
+    let fd = fixtureDir()
+    let outPath = getTempDir() / "crisol_c2_issue3_adhoc.txt"
+    defer: (try: removeFile(outPath) except: discard)
+
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["list", fd / "pass_always.nim"]))
+    check code == 0
+    let errText = readFile(outPath)
+    check "pass_always.nim" in errText
+    check "matched no configured group" in errText

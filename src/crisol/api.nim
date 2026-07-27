@@ -34,8 +34,8 @@
 ##   Outcome (+ oPassed/oFailed/etc values), TestRecord, RecordStatus, Summary,
 ##   GatedEntry, ConfigWarning, CompileDecision, CrisolError, CrisolErrorKind,
 ##   CrisolInterrupted, ResultCallback, EntrypointResult, isFailure, exitCode
-## From render: render, gateSkipMessages, filterRecordsByTag, hasZeroTagMatches,
-##   RenderOpts, defaultOpts
+## From render: render, gateSkipMessages, pathFlagsWarnings, filterRecordsByTag,
+##   hasZeroTagMatches, RenderOpts, defaultOpts
 ## From jsonout: toJsonString, RunV1Schema
 ## From planview: PlanV1Schema (+ PlanReport-typed facade overloads defined here)
 ##
@@ -83,6 +83,7 @@ export types.exitCode
 # From render — public rendering surface only (NOT ANSI internals, col, etc.)
 export render.render
 export render.gateSkipMessages
+export render.pathFlagsWarnings
 export render.filterRecordsByTag
 export render.hasZeroTagMatches
 export render.RenderOpts
@@ -213,6 +214,11 @@ type
     gatedOut*:    seq[GatedEntry]
     warnings*:    seq[ConfigWarning]
     settings*:    ResolvedSettings
+    adHocPaths*:     seq[string]   ## Issue #3 / RFC-0001:409: gskFiles paths that
+                                   ## matched no candidate group (ran ad-hoc, global flags).
+    ambiguousPaths*: seq[tuple[path: string; groups: seq[string]]]
+                                   ## Issue #3: gskFiles paths that matched more than one
+                                   ## candidate group; the first (config order) was used.
 
   ZeroRunnableReason* = enum
     zrkNone           ## not a zero-runnable outcome (normal run)
@@ -366,6 +372,8 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     gatedOut:    pv.gatedOut,
     warnings:    pv.warnings,
     settings:    settings,
+    adHocPaths:     pv.adHocPaths,
+    ambiguousPaths: pv.ambiguousPaths,
   )
   PlanImplResult(pr: pr, cfg: cfg, pv: pv, useFailed: useFailed, useChanged: useChanged)
 

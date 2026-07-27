@@ -633,9 +633,15 @@ proc runMain*(args: seq[string]): int =
   let colorEnabled = computeColorEnabled()
 
   # Build GroupSelection from parsed flags.
+  #
+  # Issue #3 / RFC-0001:409: paths and --group are NOT mutually exclusive — a
+  # path narrows WHICH files run, --group narrows WHICH configured groups are
+  # candidate owners for those paths.  withinGroups carries --group through so
+  # discover() still validates/attributes against the named group(s) instead
+  # of silently dropping --group whenever a path is also given.
   var selection: GroupSelection
   if paths.len > 0:
-    selection = GroupSelection(kind: gskFiles, paths: paths)
+    selection = GroupSelection(kind: gskFiles, paths: paths, withinGroups: groupNames)
   elif allGroups:
     selection = GroupSelection(kind: gskAll)
   elif groupNames.len > 0:
@@ -708,6 +714,10 @@ proc runMain*(args: seq[string]): int =
     for w in pr.warnings:
       stderr.write("warning: " & w.message & "\n")
 
+    # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles paths.
+    for line in pathFlagsWarnings(pr.adHocPaths, pr.ambiguousPaths, groupNames):
+      stderr.write("crisol: " & line & "\n")
+
     if jsonMode:
       stdout.write(planToJsonString(pr))
       stdout.write("\n")
@@ -725,6 +735,10 @@ proc runMain*(args: seq[string]): int =
   # Emit config warnings to stderr.
   for w in rr.plan.warnings:
     stderr.write("warning: " & w.message & "\n")
+
+  # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles paths.
+  for line in pathFlagsWarnings(rr.plan.adHocPaths, rr.plan.ambiguousPaths, groupNames):
+    stderr.write("crisol: " & line & "\n")
 
   if rr.status == rsStructural:
     stderr.write("crisol: " & rr.error & "\n")

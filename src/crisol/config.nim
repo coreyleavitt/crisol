@@ -468,6 +468,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
 
   result = Config(
     groups:             groups,
+    flags:              globalFlags,
     jobs:               jobs,
     timeoutSecs:        timeoutSecs,
     compileTimeoutSecs: compileTimeoutSecs,

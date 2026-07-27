@@ -138,6 +138,24 @@ group "unit" {
     let (cfg, _) = loadConfig(configPath = cfgPath)
     check cfg.groups[0].flags == @["-d:only"]
 
+  test "issue #3: Config.flags retains the RAW global set (not pre-merged with any group)":
+    ## Group.flags is globalFlags & groupFlags (pre-merged, per group). Config.flags
+    ## is the separate raw global set — the fallback for an ad-hoc gskFiles path
+    ## that matches no configured group (RFC-0001:409).
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+flags "-d:global1" "-d:global2"
+
+group "a" {
+    flags "-d:group1"
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.flags == @["-d:global1", "-d:global2"]
+
 # ---------------------------------------------------------------------------
 # Walk-up discovery
 # ---------------------------------------------------------------------------

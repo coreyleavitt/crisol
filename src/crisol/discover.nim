@@ -18,7 +18,7 @@
 ##   • Uses a hand-rolled recursive walker (os.walkDir per level) so both
 ##     prune conditions are enforced cleanly without relying on walkDirRec flags.
 
-import std/[algorithm, os, options, sets, strutils, tables]
+import std/[algorithm, os, options, sequtils, sets, strutils, tables]
 import crisol/types
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ proc applyGates*(
 
   var run: seq[Entrypoint]
   var gatedOut: seq[GatedEntry]
-  for ep in seq[Entrypoint](eps):   # raw cast is valid here: we are implementing the gate
+  for ep in eps.entries:
     if ep.group in gatedReason:
       gatedOut.add (path: ep.path, group: ep.group, reason: gatedReason[ep.group])
     else:
@@ -184,7 +184,9 @@ proc walkNimFiles(root: string; result: var seq[string]) =
 proc toDiscoveredSet*(eps: seq[Entrypoint]): DiscoveredSet =
   ## Exported test constructor — lets unit tests build a DiscoveredSet without
   ## going through discover().  This is the only bypass constructor.
-  DiscoveredSet(eps)
+  ## adHocPaths/ambiguousPaths are empty — this constructor bypasses gskFiles
+  ## resolution entirely.
+  DiscoveredSet(entries: eps)
 
 proc unsafeToSeq*(ds: DiscoveredSet): seq[Entrypoint] =
   ## Narrow, documented escape hatch: unwraps DiscoveredSet WITHOUT calling
@@ -195,7 +197,60 @@ proc unsafeToSeq*(ds: DiscoveredSet): seq[Entrypoint] =
   ##      rendering (e.g. building the gatedEntries list in pipeline.nim).
   ##   3. Tests that need the raw sequence after construction.
   ## DO NOT use this to skip gate enforcement in production run paths.
-  seq[Entrypoint](ds)
+  ds.entries
+
+# ---------------------------------------------------------------------------
+# resolveFilesGroups — gskFiles path→group attribution (issue #3, RFC-0001:409)
+# ---------------------------------------------------------------------------
+
+proc normalizeRootRelative(p, root: string): string =
+  ## Make an absolute path root-relative; leave a relative path as-is.
+  ## Falls back to the original string if relativePath ever raises.
+  if isAbsolute(p):
+    try: relativePath(p, root)
+    except: p
+  else: p
+
+proc resolveFilesGroups(
+  config:    Config;
+  selection: GroupSelection;
+  root:      string;
+): tuple[active: seq[Group]; adHocPaths: seq[string];
+         ambiguousPaths: seq[tuple[path: string; groups: seq[string]]]] =
+  ## PURE: resolve each gskFiles path/glob to a synthesised single-path Group
+  ## carrying its owning group's name+flags (or the ad-hoc "paths" group +
+  ## global flags when no candidate matches).  See discover()'s gskFiles
+  ## doc comment for the full attribution rule.
+  var candidates: seq[Group]
+  if selection.withinGroups.len > 0:
+    for g in config.groups:
+      if g.name in selection.withinGroups:
+        candidates.add g
+  else:
+    candidates = config.groups
+
+  for p in selection.paths:
+    let np = normalizeRootRelative(p, root)
+
+    # Collect EVERY candidate group whose globs match, in config-declaration
+    # order — not just the first — so a multi-match can be reported as
+    # ambiguous even though the first match still wins (RFC-0001:409).
+    var matches: seq[Group]
+    for g in candidates:
+      for glob in g.globs:
+        if matchGlob(glob, np):
+          matches.add g
+          break
+
+    if matches.len > 0:
+      let owner = matches[0]
+      result.active.add Group(name: owner.name, globs: @[np], flags: owner.flags,
+                               optIn: false, timeoutSecs: owner.timeoutSecs)
+      if matches.len > 1:
+        result.ambiguousPaths.add (path: np, groups: matches.mapIt(it.name))
+    else:
+      result.active.add Group(name: "paths", globs: @[np], flags: config.flags, optIn: false)
+      result.adHocPaths.add np
 
 # ---------------------------------------------------------------------------
 # discover — main entry point
@@ -213,7 +268,14 @@ proc discover*(
   ##   gskDefault → exclude groups where optIn == true.
   ##   gskNamed   → include only groups in selection.names; unknown name → cekConfig.
   ##   gskAll     → all groups (opt-in flag ignored).
-  ##   gskFiles   → synthesise a transient "paths" group from the given paths/globs;
+  ##   gskFiles   → for each given path/glob, find its owning group (a candidate
+  ##                group — every configured group, or only those named in
+  ##                `selection.withinGroups` when non-empty — whose globs match
+  ##                it) so it inherits that group's name and flags. A path
+  ##                matching no candidate is ad-hoc: synthesised "paths" group,
+  ##                global flags only (RFC-0001:409; recorded in adHocPaths). A
+  ##                path matching more than one candidate uses the FIRST in
+  ##                config-declaration order (recorded in ambiguousPaths).
   ##                Config is NOT mutated (RFC: "naming a file is the strongest opt-in").
   ##
   ## Dedup: within a group a file matched by multiple globs yields ONE entry.
@@ -224,6 +286,8 @@ proc discover*(
 
   # 1. Resolve active groups (selection only — no gate logic).
   var active: seq[Group]
+  var adHocPaths: seq[string]
+  var ambiguousPaths: seq[tuple[path: string; groups: seq[string]]]
 
   case selection.kind
   of gskDefault:
@@ -245,20 +309,10 @@ proc discover*(
   of gskAll:
     active = config.groups
   of gskFiles:
-    # Synthesise a transient "paths" group from the positional paths/globs.
-    # Absolute paths are made root-relative; relative paths are used as-is.
-    # No global flags — CLI positional args bypass group flag inheritance.
-    var globs: seq[string]
-    for p in selection.paths:
-      if isAbsolute(p):
-        try:
-          globs.add relativePath(p, root)
-        except:
-          globs.add p
-      else:
-        globs.add p
-    if globs.len > 0:
-      active.add Group(name: "paths", globs: globs, optIn: false)
+    let resolved = resolveFilesGroups(config, selection, root)
+    active         = resolved.active
+    adHocPaths     = resolved.adHocPaths
+    ambiguousPaths = resolved.ambiguousPaths
 
   # 2. Collect .nim files under root (one pass; re-used across groups).
   var allNims: seq[string]
@@ -300,4 +354,4 @@ proc discover*(
     if cmp1 != 0: cmp1 else: cmp(a.group, b.group)
   )
 
-  DiscoveredSet(entries)
+  DiscoveredSet(entries: entries, adHocPaths: adHocPaths, ambiguousPaths: ambiguousPaths)

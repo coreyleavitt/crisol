@@ -206,6 +206,12 @@ type
     perfCheck*:    PerfCheckConfig
                                 ## C6: perf-regression detection policy.  Default = disabled
                                 ## (PerfCheckConfig zero-value has enabled=false).
+    flags*:        seq[string] ## Issue #3 / RFC-0001:409: the raw global `flags` set, kept
+                                ## separately from `Group.flags` (which is already
+                                ## globalFlags & groupFlags, pre-merged per group). Used ONLY
+                                ## as the fallback for an ad-hoc entrypoint — an explicit CLI
+                                ## path matching no configured group runs with global flags
+                                ## only, not a configured group's flags.
 
   GroupSelectionKind* = enum
     gskDefault    ## run all non-opt-in groups
@@ -220,7 +226,14 @@ type
     ## synthesises a transient "paths" group from them (no mutation of Config).
     case kind*: GroupSelectionKind
     of gskNamed: names*: seq[string]
-    of gskFiles: paths*: seq[string]
+    of gskFiles:
+      paths*: seq[string]
+      withinGroups*: seq[string]
+        ## Issue #3: the `--group` names given ALONGSIDE positional paths.
+        ## Empty (the common case) = every configured group is a candidate
+        ## owner for each path.  Non-empty = only these named groups are
+        ## candidates; a path outside all of them is ad-hoc (RFC-0001:409),
+        ## not silently dropped.
     else: discard
 
   Entrypoint* = object
@@ -421,10 +434,23 @@ type
     ## API (loadGateState, initGateState, applyGates).
     vars*: seq[GateStateEntry]
 
-  DiscoveredSet* = distinct seq[Entrypoint]
+  DiscoveredSet* = object
     ## Returned exclusively by discover(); consumed exclusively by applyGates().
-    ## The distinct type enforces gate-application by type — silently skipping
-    ## applyGates() is a compile error, not a runtime surprise.
+    ## Wrapping `entries` in a dedicated (non-seq-compatible) type enforces
+    ## gate-application by type — silently skipping applyGates() is a compile
+    ## error, not a runtime surprise.
+    entries*:        seq[Entrypoint]
+    adHocPaths*:      seq[string]
+      ## Issue #3 / RFC-0001:409: gskFiles paths that matched no configured
+      ## group (or none of `GroupSelection.withinGroups` when given) — they
+      ## ran as an ad-hoc "paths" entrypoint with global flags only.  discover()
+      ## stays pure (no stderr writes); the CLI layer reads this to print the
+      ## RFC-0001:409 warning.  Always empty outside a gskFiles selection.
+    ambiguousPaths*:  seq[tuple[path: string; groups: seq[string]]]
+      ## gskFiles paths that matched MORE THAN ONE candidate group.  `groups`
+      ## lists every matching group name in config-declaration order; the
+      ## entrypoint uses the FIRST one.  The CLI layer reads this to warn
+      ## about the ambiguity.  Always empty outside a gskFiles selection.
 
   GatedEntry* = tuple[path: string; group: string; reason: string]
     ## One discovered-but-gated-out entrypoint with its gate reason.
