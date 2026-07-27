@@ -234,3 +234,54 @@ suite "pathFlagsWarnings – pure helper":
 
   test "no ad-hoc, no ambiguous → empty result":
     check pathFlagsWarnings(adHocPaths = @[], ambiguousPaths = @[]).len == 0
+
+# ---------------------------------------------------------------------------
+# Behavior 10 (follow-up): an UNKNOWN --group name alongside a positional path
+# must raise cekConfig (same as a bare `--group typo`), not silently degrade to
+# an ad-hoc entrypoint with global flags. Closes the withinGroups validation
+# gap left by the initial issue #3 fix.
+# ---------------------------------------------------------------------------
+
+suite "gskFiles – unknown --group name is validated":
+  test "unknown --group name with a path raises cekConfig, not silent ad-hoc":
+    let root = makeTempRoot("unknown_group")
+    defer: cleanupDir(root)
+
+    writeFixture(root, "tests/unit/test_a.nim")
+
+    let cfg = makeConfig(root, @[Group(
+      name:  "unit",
+      globs: @["tests/unit/test_*.nim"],
+      flags: @["-d:someDefine"],
+    )])
+
+    let sel = GroupSelection(kind: gskFiles, paths: @["tests/unit/test_a.nim"],
+                              withinGroups: @["typodypo"])
+
+    var raised = false
+    try:
+      discard discover(cfg, sel)
+    except CrisolError as e:
+      raised = true
+      check e.kind == cekConfig
+      check "typodypo" in e.msg
+    check raised
+
+  test "a KNOWN --group name with a path still resolves (no false positive)":
+    let root = makeTempRoot("known_group_ok")
+    defer: cleanupDir(root)
+
+    writeFixture(root, "tests/unit/test_a.nim")
+
+    let cfg = makeConfig(root, @[Group(
+      name:  "unit",
+      globs: @["tests/unit/test_*.nim"],
+      flags: @["-d:someDefine"],
+    )])
+
+    let sel = GroupSelection(kind: gskFiles, paths: @["tests/unit/test_a.nim"],
+                              withinGroups: @["unit"])
+    let ds  = discover(cfg, sel)
+    let eps = applyGates(ds, cfg, initGateState([])).run
+    check eps.len == 1
+    check eps[0].group == "unit"

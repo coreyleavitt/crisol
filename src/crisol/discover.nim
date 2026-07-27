@@ -223,6 +223,16 @@ proc resolveFilesGroups(
   ## doc comment for the full attribution rule.
   var candidates: seq[Group]
   if selection.withinGroups.len > 0:
+    # Validate every --group name exists (mirror gskNamed): an unknown group
+    # name combined with a positional path must error, not silently degrade to
+    # an ad-hoc entrypoint with global flags.
+    let configNames = block:
+      var s: HashSet[string]
+      for g in config.groups: s.incl g.name
+      s
+    for wanted in selection.withinGroups:
+      if wanted notin configNames:
+        raise newCrisolError(cekConfig, "unknown group: " & wanted)
     for g in config.groups:
       if g.name in selection.withinGroups:
         candidates.add g
