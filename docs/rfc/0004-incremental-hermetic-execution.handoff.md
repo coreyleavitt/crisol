@@ -1,9 +1,12 @@
 # RFC-0004 — Incremental hermetic execution — handoff
 
-- **Stage:** 🧹 4 code-review FLOOR HIT (3 rounds, all Crit/High/Med fixed, 1007 [OK]). NOW clearing the remaining Lows at Corey's request, then COMMIT + PUSH. Lows in 3 serial units: L-A (systems: spawn/memprobe/planner/ccprobe/ledger) IN FLIGHT; L-B (cache layer); L-C (junit/types/sandbox/api/crisol + --hermetic facade). NOTHING committed yet.
-- **Resume:** after L-A/B/C land + clean verify → commit on a branch (msg ends `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`; verify hook strips it: `git log -1 --format=%B | grep -i Co-Authored-By` empty) + push. Then cross-repo amoxtli `milpa.kdl` pin bump. Serial subagents = one `./dev` builder at a time ([[dev-test-verification-gotchas]]).
-- **Resume (stage 4):** `/code-review docs/rfc/0004-incremental-hermetic-execution.md` — PhD-CS bar, 2-3 rounds, ship when a round finds 0 critical/high. Review ledger lives in this doc. See the "Carry into Stage-4 review" list below.
-- **Verification method (IMPORTANT):** `./dev test` EXIT code is unreliable — grep the captured log for `\[FAILED\]`/nimble-exception, excluding expected `fail_always`/`fail_compile` fixtures. test_mem_throttle is load-flaky (passes in isolation). See [[dev-test-verification-gotchas]].
+- **Stage:** 🏁 **CLOSED** — RFC-0004 implemented (27 slices), reviewed (3 rounds to floor, 0 critical/high), MERGED to `main`, PR resolved, amoxtli repinned. All follow-on issues (#3) closed and the `rfc-0016-c1b-state-dir` divergence reconciled. Nothing blocking remains.
+- **Landed on `main` (linear):** `87994fc` (RFC-0004) → `e36b7ea`/`b8ccb13` (issue #3 fixes) → `891058b` (CRISOL_STATE_DIR) → `1c0b475` (import cleanup). Full suite **1052 [OK]**, `./dev check` clean, all commit messages trailer-clean.
+- **Deferred, non-blocking (future work, NOT RFC-0004):**
+  - **Remaining Lows** — the R1/R3 Low batch documented in the review ledger below, left intentionally per the fix-through-Medium mandate.
+  - **Issue #1** — explicit `SlotState` enum to replace the `pepIdx == -1` idle-sentinel (R3-1 deferred; pre-existing, core-dispatch-wide, out of review scope). A future `/architect` candidate.
+- **Verification method (IMPORTANT, still applies repo-wide):** `./dev test` EXIT code is unreliable — grep the captured log for `\[FAILED\]`/nimble-exception, excluding expected `fail_always`/`fail_compile` fixtures. test_mem_throttle is load-flaky (passes in isolation). See [[dev-test-verification-gotchas]].
+- **Everything below is the historical implementation + review record, retained for reference.**
 
 ## Slice progress (26 active slices; A1c deferred to after C5)
 Order: A2-pre → A3 → A5 → A2 → A1a → A1b → A4a → A4b → A4c → A4d → **A6 ✓ → A7 ✓** → A8 → A9 → B0 → B1 → B2 → B3 → B4 → C0 → C1 → C2 → C3 → C4 → C5 → C6.
