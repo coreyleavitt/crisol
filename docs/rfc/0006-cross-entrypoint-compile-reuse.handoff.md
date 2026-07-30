@@ -1,5 +1,11 @@
 # RFC-0006 — Cross-entrypoint compile reuse — handoff
 
+## ✅✅ RFC-0006 SHIPPED & COMMITTED (2026-07-29). Review + lows complete; committed on `main`.
+- Commits on `main`: **`bfda648`** (RFC-0006 implementation, 75 files) + **`5dff9ad`** (low-severity review fixes, 10 files). Both clean (verified: no Co-Authored-By/claude trailer).
+- ALL review findings resolved: 1 Crit + 2 High + 16 Medium (R1–R16 + RS1/RC1/RS2/RD1) + 6 Lows (L1–L6). icbaseline.nim kept (empirical IC-broken-under-ORC record); TOCTOU S3 = confirmed non-issue.
+- objcache DEFAULT-ON (Corey's call); `--no-objcache` opts out; measurement takes precedence over caching (inverts RFC's old "objCache precedence" wording — deliberate consequence of default-on, flagged to Corey).
+- Nothing left pending. RFC-0004/0005 design docs also committed in bfda648.
+
 ## ✅ STAGE 4 CODE-REVIEW COMPLETE (2026-07-29) — 0 Critical/High/Medium; SHIPPABLE
 3 review rounds. Round-1: 1 Critical + 2 High + 12 Medium (R1–R16). Round-2: objcache DEFAULT-ON flip (Corey's request) + 2 flip-fallout regressions. Round-3 re-review: 4 more Medium (RS1/RC1/RS2/RD1) + Lows. ALL Crit/High/Medium fixed & verified. **Final ship-gate: 127 files, 118 pass + 9 known-benign, test_mem_throttle passed, `./dev check`+`./dev build` clean, RunV1Revision=11.** Only LOWS remain (deferred by mandate — listed below). Refactors landed: shardedledger.nim (−35% ledger dup), measureworker split (workerplan/measureworker/cacheworker). NEXT = Corey's commit decision (all uncommitted on `main`).
 
