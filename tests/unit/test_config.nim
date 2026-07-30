@@ -798,6 +798,416 @@ group "unit" {
     check warns.len == 0
 
 # ---------------------------------------------------------------------------
+# RFC-0006 M-artifact-identity PASS (b2) — measure-compile-reuse gate
+# ---------------------------------------------------------------------------
+
+suite "config — measure-compile-reuse gate (RFC-0006 M-artifact-identity b2)":
+
+  test "absent measure-compile-reuse -> cfg.measureCompileReuse == false (default off)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.measureCompileReuse == false
+
+  test "measure-compile-reuse #true round-trips to cfg.measureCompileReuse == true":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+measure-compile-reuse #true
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.measureCompileReuse == true
+
+  test "measure-compile-reuse #false round-trips to cfg.measureCompileReuse == false":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+measure-compile-reuse #false
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.measureCompileReuse == false
+
+  test "no config file (convention fallback) -> cfg.measureCompileReuse == false":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check cfg.measureCompileReuse == false
+
+# ---------------------------------------------------------------------------
+# RFC-0006 Stage R, R2b2 — objcache gate (default ON; opt-out via
+# --no-objcache / `objcache #false`)
+# ---------------------------------------------------------------------------
+
+suite "config — objcache gate (RFC-0006 Stage R R2b2, default-on flip)":
+
+  test "absent objcache -> cfg.objCache == true (default on)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objCache == true
+
+  test "objcache #true round-trips to cfg.objCache == true":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache #true
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objCache == true
+
+  test "objcache #false round-trips to cfg.objCache == false (explicit opt-out still honored)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache #false
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objCache == false
+
+  test "no config file (convention fallback) -> cfg.objCache == true (default on)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check cfg.objCache == true
+
+# ---------------------------------------------------------------------------
+# RFC-0006 review R14-T2 — objcache-max-* KDL parse round-trip coverage
+# (previously ZERO coverage: max-cache-entries/cache-max-age-days-shaped
+# keys existed in config.nim but no test exercised the objcache-max-*
+# variants at all).
+# ---------------------------------------------------------------------------
+
+suite "config — objcache-max-entries (RFC-0006 review R14-T2)":
+
+  test "absent objcache-max-entries -> cfg.objcacheMaxEntries == 0 (default)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objcacheMaxEntries == 0
+
+  test "objcache-max-entries 5000 round-trips to cfg.objcacheMaxEntries":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache-max-entries 5000
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objcacheMaxEntries == 5000
+
+  test "objcache-max-entries 0 round-trips to cfg.objcacheMaxEntries == 0":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache-max-entries 0
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objcacheMaxEntries == 0
+
+  test "objcache-max-entries -1 -> cekConfig (negative not allowed)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache-max-entries -1
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+suite "config — objcache-max-age-days (RFC-0006 review R14-T2)":
+
+  test "absent objcache-max-age-days -> cfg.objcacheMaxAgeDays == 0 (default)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objcacheMaxAgeDays == 0
+
+  test "objcache-max-age-days 30 round-trips to cfg.objcacheMaxAgeDays":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache-max-age-days 30
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objcacheMaxAgeDays == 30
+
+  test "objcache-max-age-days -1 -> cekConfig (negative not allowed)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache-max-age-days -1
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+suite "config — objcache-max-bytes (RFC-0006 review R6/R14-T2)":
+
+  test "absent objcache-max-bytes -> cfg.objcacheMaxBytes == 0 (unbounded, default)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objcacheMaxBytes == 0
+
+  test "objcache-max-bytes 1073741824 round-trips to cfg.objcacheMaxBytes":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache-max-bytes 1073741824
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objcacheMaxBytes == 1073741824
+
+  test "objcache-max-bytes 0 round-trips to cfg.objcacheMaxBytes == 0 (explicit unbounded)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache-max-bytes 0
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.objcacheMaxBytes == 0
+
+  test "objcache-max-bytes -1 -> cekConfig (negative not allowed)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+objcache-max-bytes -1
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "no config file (convention fallback) -> cfg.objcacheMaxBytes == 0":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check cfg.objcacheMaxBytes == 0
+
+# ---------------------------------------------------------------------------
+# M-report PASS (b1) — reuse-check alerting policy block
+# ---------------------------------------------------------------------------
+
+suite "config — reuse-check alerting policy (M-report b1)":
+
+  test "absent reuse-check block -> disabled":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check not cfg.reuseCheck.enabled
+
+  test "reuse-check block present with alert-below -> enabled, alertBelow round-trips":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+reuse-check {
+    alert-below 0.4
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.reuseCheck.enabled
+    check cfg.reuseCheck.alertBelow == 0.4
+
+  test "reuse-check block present without alert-below -> enabled, default 0.5":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+reuse-check {
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.reuseCheck.enabled
+    check cfg.reuseCheck.alertBelow == 0.5
+
+  test "no config file (convention fallback) -> cfg.reuseCheck disabled":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check not cfg.reuseCheck.enabled
+
+  test "unknown child key in reuse-check -> warning, not error":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+reuse-check {
+    alert-below 0.5
+    bogus-key 1
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, warns) = loadConfig(configPath = cfgPath)
+    check cfg.reuseCheck.enabled
+    check warns.len == 1
+    check warns[0].key == "bogus-key"
+
+  # -------------------------------------------------------------------------
+  # RFC-0006 review R14-T4 — alert-below range validation ([0.0, 1.0])
+  # -------------------------------------------------------------------------
+
+  test "alert-below 1.5 -> cekConfig (above the [0.0, 1.0] range)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+reuse-check {
+    alert-below 1.5
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "alert-below -0.1 -> cekConfig (below the [0.0, 1.0] range)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+reuse-check {
+    alert-below -0.1
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "alert-below 0.0 (lower boundary) -> accepted":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+reuse-check {
+    alert-below 0.0
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.reuseCheck.enabled
+    check cfg.reuseCheck.alertBelow == 0.0
+
+  test "alert-below 1.0 (upper boundary) -> accepted":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+reuse-check {
+    alert-below 1.0
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.reuseCheck.enabled
+    check cfg.reuseCheck.alertBelow == 1.0
+
+# ---------------------------------------------------------------------------
 # P1 — state-dir path traversal validation
 # ---------------------------------------------------------------------------
 

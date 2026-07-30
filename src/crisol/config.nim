@@ -93,6 +93,12 @@ proc conventionConfig(root: string): Config =
     stateDir:           DefaultStateDir,
     projectRoot:        root,
     perfCheck:          PerfCheckConfig(enabled: false),
+    reuseCheck:         ReuseCheckConfig(enabled: false),
+    workerBinary:       "",
+    # RFC-0006 Stage R, R2b2: default ON, mirrors docToConfig's local
+    # `objCache` default below — no config file at all is the SAME "absent"
+    # case as a config file with no `objcache` node.
+    objCache:           true,
   )
 
 # ---------------------------------------------------------------------------
@@ -365,6 +371,37 @@ proc parsePerfCheck(n: KdlNode; source: string;
   )
 
 # ---------------------------------------------------------------------------
+# M-report PASS (b1): reuse-check alerting policy block
+# ---------------------------------------------------------------------------
+
+proc parseReuseCheck(n: KdlNode; source: string;
+                     warns: var seq[ConfigWarning]): ReuseCheckConfig =
+  ## Parse the `reuse-check { … }` block.
+  ##
+  ##   reuse-check {
+  ##       alert-below 0.5   // optional: rTime threshold below which to alert
+  ##   }
+  ##
+  ## Unlike perf-check, there is no "none" sensitivity sentinel: presence of
+  ## the block alone means enabled=true; alertBelow defaults to 0.5 when
+  ## 'alert-below' is absent. Absence of the whole block (never called) means
+  ## disabled — the caller leaves the Config field at its zero-value default.
+
+  var alertBelow = 0.5  # default when absent
+
+  for child in n.children:
+    case child.name
+    of "alert-below":
+      let v = requireFloatArg(child, "reuse-check.alert-below")
+      if v < 0.0 or v > 1.0:
+        cfgErr("config: 'reuse-check': 'alert-below' must be within [0.0, 1.0], got " & $v)
+      alertBelow = v
+    else:
+      warns.add makeConfigWarning(source, "reuse-check", child.name)
+
+  ReuseCheckConfig(enabled: true, alertBelow: alertBelow)
+
+# ---------------------------------------------------------------------------
 # Validate a completed Config
 # ---------------------------------------------------------------------------
 
@@ -409,10 +446,30 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     quarantine: HashSet[string]
     # C6: perf-check policy block — parsed in second pass (block has children).
     perfCheck: PerfCheckConfig   # default zero-value = disabled
+    # M-report PASS (b1): reuse-check policy block — parsed in second pass
+    # (block has children), same shape as perf-check.
+    reuseCheck: ReuseCheckConfig # default zero-value = disabled
     # A1c: result-cache GC config.
     maxCacheEntries: int = 0    # 0 = use DefaultMaxCacheEntries
     cacheMaxAgeDays: int = 0    # 0 = disabled (no age eviction)
     ledgerMaxAgeDays: int = 0   # 0 = disabled (keep all rows)
+    # RFC-0006 Stage R, R4: object-cache GC config (mirrors A1c above exactly).
+    objcacheMaxEntries: int = 0  # 0 = use DefaultMaxObjCacheEntries
+    objcacheMaxAgeDays: int = 0  # 0 = disabled (no age eviction)
+    # RFC-0006 review R6: aggregate-byte cap (mirrors objcacheMaxAgeDays'
+    # 0=disabled convention, not objcacheMaxEntries' 0=use-default one).
+    objcacheMaxBytes: int = 0    # 0 = unbounded (no byte-based eviction)
+    # RFC-0006 M-artifact-identity PASS (b2): gate the measurement worker into
+    # the compile slot. Default false (unlike mem-aware's Option[bool] tristate,
+    # this is a plain bool — there is no "auto" mode, only explicit opt-in).
+    measureCompileReuse: bool = false
+    # RFC-0006 Stage R, R2b2: gate the cache worker into the compile slot.
+    # DEFAULT ON (soundness prerequisites R1/R2/R4 fixed and verified green;
+    # deliberate opt-out product decision, not opt-in) — same plain-bool
+    # shape as measureCompileReuse (no "auto" mode). An explicit
+    # `objcache #false` config block, or --no-objcache at the RunOptions
+    # layer (see api.resolveObjCache), still wins and turns it off.
+    objCache: bool = true
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -473,19 +530,50 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v < 0:
         cfgErr("config: 'ledger-max-age-days' must be >= 0, got " & $v)
       ledgerMaxAgeDays = v
+    of "objcache-max-entries":
+      let v = requireIntArg(n, "objcache-max-entries")
+      if v < 0:
+        cfgErr("config: 'objcache-max-entries' must be >= 0, got " & $v)
+      objcacheMaxEntries = v
+    of "objcache-max-age-days":
+      let v = requireIntArg(n, "objcache-max-age-days")
+      if v < 0:
+        cfgErr("config: 'objcache-max-age-days' must be >= 0, got " & $v)
+      objcacheMaxAgeDays = v
+    of "objcache-max-bytes":
+      let v = requireIntArg(n, "objcache-max-bytes")
+      if v < 0:
+        cfgErr("config: 'objcache-max-bytes' must be >= 0, got " & $v)
+      objcacheMaxBytes = v
+    of "measure-compile-reuse":
+      # bool node: measure-compile-reuse #true  or  measure-compile-reuse #false
+      let v = n.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: 'measure-compile-reuse' requires a boolean argument (#true/#false)")
+      measureCompileReuse = v.get.boolVal
+    of "objcache":
+      # bool node: objcache #true  or  objcache #false
+      let v = n.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: 'objcache' requires a boolean argument (#true/#false)")
+      objCache = v.get.boolVal
     of "group":        discard
     of "perf-check":   discard  # C6: parsed in second pass (has children)
+    of "reuse-check":  discard  # M-report (b1): parsed in second pass (has children)
     else:
       warns.add makeConfigWarning(source, "top-level", n.name)
 
-  # Second pass: parse groups and the perf-check block
-  # (globalFlags now complete for merge; perf-check has children so needs its own pass).
+  # Second pass: parse groups, the perf-check block, and the reuse-check block
+  # (globalFlags now complete for merge; both blocks have children so need
+  # their own pass).
   var groups: seq[Group]
   for n in doc.rootNodes:
     if n.name == "group":
       groups.add parseGroup(n, globalFlags, source, warns)
     elif n.name == "perf-check":
       perfCheck = parsePerfCheck(n, source, warns)
+    elif n.name == "reuse-check":
+      reuseCheck = parseReuseCheck(n, source, warns)
 
   result = Config(
     groups:             groups,
@@ -504,9 +592,17 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     retries:            retries,
     quarantine:         quarantine,
     perfCheck:          perfCheck,
+    reuseCheck:         reuseCheck,
     maxCacheEntries:    maxCacheEntries,
     cacheMaxAgeDays:    cacheMaxAgeDays,
     ledgerMaxAgeDays:   ledgerMaxAgeDays,
+    objcacheMaxEntries: objcacheMaxEntries,
+    objcacheMaxAgeDays: objcacheMaxAgeDays,
+    objcacheMaxBytes:   objcacheMaxBytes,
+    measureCompileReuse: measureCompileReuse,
+    objCache:           objCache,
+    workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
+                             # caller sets this post-load (see api.planImpl / crisol.nim).
   )
   validate(result)
 

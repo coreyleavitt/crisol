@@ -1,0 +1,58 @@
+{
+  "cacheVersion": "D20240927T193831",
+  "outputFile": "/workspace/tests/fixtures/golden_reuse/generated/ep_b/bin/ep_b",
+  "outputLastModificationTime": "",
+  "compile": [
+    [
+      "/workspace/tests/fixtures/golden_reuse/fixture.c",
+      "gcc -c  -w -fmax-errors=3 -fno-strict-aliasing -pthread -I/workspace/tests/fixtures/golden_reuse/include   -I/opt/nim/2.2.10-patched/lib -I/workspace/tests/fixtures/golden_reuse -o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@mfixture.c.o /workspace/tests/fixtures/golden_reuse/fixture.c"
+    ],
+    [
+      "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sexceptions.nim.c",
+      "gcc -c  -w -fmax-errors=3 -fno-strict-aliasing -pthread -I/workspace/tests/fixtures/golden_reuse/include   -I/opt/nim/2.2.10-patched/lib -I/workspace/tests/fixtures/golden_reuse -o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sexceptions.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sexceptions.nim.c"
+    ],
+    [
+      "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@pstd@sprivate@sdigitsutils.nim.c",
+      "gcc -c  -w -fmax-errors=3 -fno-strict-aliasing -pthread -I/workspace/tests/fixtures/golden_reuse/include   -I/opt/nim/2.2.10-patched/lib -I/workspace/tests/fixtures/golden_reuse -o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@pstd@sprivate@sdigitsutils.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@pstd@sprivate@sdigitsutils.nim.c"
+    ],
+    [
+      "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sdollars.nim.c",
+      "gcc -c  -w -fmax-errors=3 -fno-strict-aliasing -pthread -I/workspace/tests/fixtures/golden_reuse/include   -I/opt/nim/2.2.10-patched/lib -I/workspace/tests/fixtures/golden_reuse -o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sdollars.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sdollars.nim.c"
+    ],
+    [
+      "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem.nim.c",
+      "gcc -c  -w -fmax-errors=3 -fno-strict-aliasing -pthread -I/workspace/tests/fixtures/golden_reuse/include   -I/opt/nim/2.2.10-patched/lib -I/workspace/tests/fixtures/golden_reuse -o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem.nim.c"
+    ],
+    [
+      "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@mfixture_substrate.nim.c",
+      "gcc -c  -w -fmax-errors=3 -fno-strict-aliasing -pthread -I/workspace/tests/fixtures/golden_reuse/include   -I/opt/nim/2.2.10-patched/lib -I/workspace/tests/fixtures/golden_reuse -o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@mfixture_substrate.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@mfixture_substrate.nim.c"
+    ],
+    [
+      "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@mep_b.nim.c",
+      "gcc -c  -w -fmax-errors=3 -fno-strict-aliasing -pthread -I/workspace/tests/fixtures/golden_reuse/include   -I/opt/nim/2.2.10-patched/lib -I/workspace/tests/fixtures/golden_reuse -o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@mep_b.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@mep_b.nim.c"
+    ]
+  ],
+  "link": [
+    "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@mfixture.c.o",
+    "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sexceptions.nim.c.o",
+    "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@pstd@sprivate@sdigitsutils.nim.c.o",
+    "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sdollars.nim.c.o",
+    "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem.nim.c.o",
+    "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@mfixture_substrate.nim.c.o",
+    "/workspace/tests/fixtures/golden_reuse/generated/ep_b/@mep_b.nim.c.o"
+  ],
+  "linkcmd": "gcc   -o /workspace/tests/fixtures/golden_reuse/generated/ep_b/bin/ep_b /workspace/tests/fixtures/golden_reuse/generated/ep_b/@mfixture.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sexceptions.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@pstd@sprivate@sdigitsutils.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem@sdollars.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@psystem.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@mfixture_substrate.nim.c.o /workspace/tests/fixtures/golden_reuse/generated/ep_b/@mep_b.nim.c.o  -pthread -pthread   -ldl",
+  "extraCmds": [],
+  "configFiles": [
+    "/opt/nim/2.2.10-patched/config/nim.cfg",
+    "/opt/nim/2.2.10-patched/config/config.nims",
+    "/workspace/nim.cfg"
+  ],
+  "stdinInput": false,
+  "projectIsCmd": false,
+  "cmdInput": "",
+  "currentDir": "/workspace",
+  "cmdline": "",
+  "depfiles": [],
+  "nimexe": ""
+}

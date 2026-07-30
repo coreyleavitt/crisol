@@ -28,12 +28,25 @@
 ##   that state.  `--all` does not need the lock (it just nukes the dir).
 
 import std/[os, sets, strutils, tables, times]
-import crisol/[types, config, discover, planner, runner, depgraph, resultcache, ledger]
+import crisol/[types, config, discover, planner, runner, depgraph, resultcache, ledger,
+               artifactledger, compilecost, objcachestats, objcache]
   # `planner` imported explicitly for `slug` (forward-computed expected-slug set
   # below) rather than leaning on runner's re-export — keeps the dependency
   # visible in the import list.
   # `resultcache` imported for `isResultCacheRootName` and `gcResultCache`.
   # `ledger` imported for `compactLedger`.
+  # `artifactledger` imported for `compactArtifactLedger` (RFC-0006 M0) — a
+  # SEPARATE stream/pass from `ledger`'s; never touches the exec-row path.
+  # `compilecost` imported for `compactCompileCostLedger` (RFC-0006
+  # M-cost-split) — a THIRD, independent stream/pass; never touches the
+  # exec-row or artifact-stream paths.
+  # `objcachestats` imported for `compactObjCacheStatsLedger` (RFC-0006
+  # Stage R, R5a) — a FOURTH, independent stream/pass over the realized
+  # objcache hit/miss telemetry stream; never touches the exec-row,
+  # artifact-stream, or compile-cost paths.
+  # `objcache` imported for `gcObjCache` (RFC-0006 Stage R, R4) — a FIFTH,
+  # independent GC pass over the object cache; never touches the result-cache
+  # or ledger/artifact/compile-cost/objcachestats streams.
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -106,9 +119,16 @@ proc cleanAll*(config: Config) =
 
 proc cleanOrphans*(config: Config): tuple[
     cacheDeleted, binDeleted, graphEntriesDropped,
-    cacheEvicted, shardsRemoved, ledgerRowsKept: int] =
+    cacheEvicted, shardsRemoved, ledgerRowsKept,
+    artifactShardsRemoved, artifactRowsKept,
+    compileCostShardsRemoved, compileCostRowsKept,
+    objCacheStatsShardsRemoved, objCacheStatsRowsKept,
+    objCacheEvicted, objCacheTmpSwept: int] =
   ## Prune orphan cache/bin dirs, stale depgraph entries, and GC the
-  ## result-cache + ledger stores.
+  ## result-cache + object-cache + ledger stores (the exec RunLedger, the
+  ## RFC-0006 artifact-identity stream, the RFC-0006 M-cost-split
+  ## compile-cost stream, and the RFC-0006 Stage R R5a objcache-stats
+  ## stream).
   ##
   ## Steps:
   ##   1. Discover ALL entrypoints (gskAll, gates ignored — no applyGates call).
@@ -117,6 +137,20 @@ proc cleanOrphans*(config: Config): tuple[
   ##   4. GC the depgraph (drop entries not in discovered set).
   ##   5. GC the result-cache (size + age LRU via gcResultCache).
   ##   6. Compact the ledger (merge shards via compactLedger).
+  ##   7. Compact the artifact-identity stream (merge shards via
+  ##      compactArtifactLedger — a SEPARATE pass, own directory, own report;
+  ##      mirrors step 6 but never touches the exec-row path).
+  ##   8. Compact the compile-cost stream (merge shards via
+  ##      compactCompileCostLedger — a THIRD, independent pass, own
+  ##      directory, own report; mirrors steps 6/7 but never touches the
+  ##      exec-row or artifact-stream paths).
+  ##   9. Compact the objcache-stats stream (merge shards via
+  ##      compactObjCacheStatsLedger — a FOURTH, independent pass, own
+  ##      directory, own report; mirrors steps 6/7/8 but never touches the
+  ##      exec-row, artifact-stream, or compile-cost paths).
+  ##   10. GC the object cache (size + age LRU via gcObjCache — RFC-0006
+  ##      Stage R, R4 — a FIFTH, independent pass, own directory, own
+  ##      report; mirrors step 5 but for objcache's two-artifact entries).
   ##
   ## Lock:
   ##   The caller (crisol clean in crisol.nim) acquires the stateDir lock
@@ -181,11 +215,51 @@ proc cleanOrphans*(config: Config): tuple[
     else: 0
   let compactReport = compactLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
 
+  # Step 7: Compact the artifact-identity stream (RFC-0006 M0).  Reuses the
+  # same `ledgerMaxAgeSecs`/`nowSecs` as step 6 — the artifact stream has no
+  # separate retention knob; it is part of the same "ledger" retention
+  # surface conceptually, just a different shard directory/schema.
+  let artifactCompactReport = compactArtifactLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
+
+  # Step 8: Compact the compile-cost stream (RFC-0006 M-cost-split).  Reuses
+  # the same `ledgerMaxAgeSecs`/`nowSecs` as steps 6/7 — no separate
+  # retention knob; same "ledger" retention surface, different shard
+  # directory/schema.
+  let compileCostCompactReport = compactCompileCostLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
+
+  # Step 9: Compact the objcache-stats stream (RFC-0006 Stage R, R5a). Reuses
+  # the same `ledgerMaxAgeSecs`/`nowSecs` as steps 6/7/8 — no separate
+  # retention knob; same "ledger" retention surface, different shard
+  # directory/schema.
+  let objCacheStatsCompactReport = compactObjCacheStatsLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
+
+  # Step 10: GC object cache (size + age LRU). Reuses the same `nowSecs` as
+  # steps 5-9 — a single injected clock for the whole cleanOrphans call.
+  let objMaxEntries = if config.objcacheMaxEntries > 0: config.objcacheMaxEntries
+                       else: DefaultMaxObjCacheEntries
+  let objMaxAgeSecs: int64 =
+    if config.objcacheMaxAgeDays > 0: int64(config.objcacheMaxAgeDays) * 86_400
+    else: 0
+  # RFC-0006 review R6: aggregate-byte cap, threaded straight from config;
+  # 0 = unbounded (gcObjCache's default), same "0 = disabled" convention as
+  # objMaxAgeSecs above.
+  let objMaxBytes: int64 = int64(config.objcacheMaxBytes)
+  let objGcReport = gcObjCache(stateDir, objMaxEntries, objMaxAgeSecs, nowSecs,
+                                objMaxBytes)
+
   result = (
-    cacheDeleted:      cacheDeleted,
-    binDeleted:        binDeleted,
-    graphEntriesDropped: dropped,
-    cacheEvicted:      gcReport.evicted,
-    shardsRemoved:     compactReport.shardsRemoved,
-    ledgerRowsKept:    compactReport.rowsKept,
+    cacheDeleted:             cacheDeleted,
+    binDeleted:               binDeleted,
+    graphEntriesDropped:      dropped,
+    cacheEvicted:             gcReport.evicted,
+    shardsRemoved:            compactReport.shardsRemoved,
+    ledgerRowsKept:           compactReport.rowsKept,
+    artifactShardsRemoved:    artifactCompactReport.shardsRemoved,
+    artifactRowsKept:         artifactCompactReport.rowsKept,
+    compileCostShardsRemoved: compileCostCompactReport.shardsRemoved,
+    compileCostRowsKept:      compileCostCompactReport.rowsKept,
+    objCacheStatsShardsRemoved: objCacheStatsCompactReport.shardsRemoved,
+    objCacheStatsRowsKept:      objCacheStatsCompactReport.rowsKept,
+    objCacheEvicted:          objGcReport.evicted,
+    objCacheTmpSwept:         objGcReport.tmpSwept,
   )

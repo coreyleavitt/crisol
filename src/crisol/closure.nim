@@ -139,25 +139,23 @@ proc resolveMangledAll(cFilePath: string;
 # Public API
 # ---------------------------------------------------------------------------
 
-proc extractClosure*(nimcacheDir: string;
-                     binaryName: string;
-                     entrypoint: string;
-                     config: Config): HashSet[string] =
-  ## Extract the source-dependency closure for one compiled entrypoint.
+proc parseCompileManifest*(jsonPath: string):
+    tuple[compile: seq[tuple[cPath, ccCmd: string]]; linkcmd: string] =
+  ## Low-level nimcache-JSON reader (RFC-0006 §File scoping / "Manifest
+  ## access") — the SINGLE JSON-reading implementation shared by
+  ## `extractClosure` (below, a filter over this) and RFC-0006's M/R stages
+  ## (which need the raw shape `extractClosure` deliberately discards).
   ##
-  ## Parameters:
-  ##   `nimcacheDir`  — the `--nimcache` directory used to compile `entrypoint`.
-  ##   `binaryName`   — the basename of the `-o:` binary (used to locate the
-  ##                    JSON: `<nimcacheDir>/<binaryName>.json`).
-  ##   `entrypoint`   — absolute (or project-root-relative) path to the `.nim`
-  ##                    source file.
-  ##   `config`       — must have `projectRoot` set; may have `depRoots`.
+  ## Returns the RAW, UNFILTERED `compile` array as `(cPath, ccCmd)` pairs —
+  ## stdlib/nimble paths INCLUDED, cc commands INCLUDED — plus the `linkcmd`
+  ## string. Does no path resolution, no under-root filtering, no @m/@p
+  ## decoding: that is `extractClosure`'s job, not this proc's.
   ##
-  ## Returns a `HashSet[string]` of projectRoot-relative, forward-slash paths.
+  ## An entry whose `cPath` is empty is skipped (matches the historical
+  ## `extractClosure` guard — such an entry cannot name a compile unit).
   ##
-  ## Raises `CrisolError(cekEnvironment)` if the JSON is missing or unparseable.
-
-  let jsonPath = nimcacheDir / binaryName & ".json"
+  ## Raises `CrisolError(cekEnvironment)` if the JSON is missing, unparseable,
+  ## or has no `compile` array.
   if not fileExists(jsonPath):
     raise newCrisolError(cekEnvironment,
       "nimcache JSON not found: " & jsonPath &
@@ -176,6 +174,41 @@ proc extractClosure*(nimcacheDir: string;
     raise newCrisolError(cekEnvironment,
       "nimcache JSON at " & jsonPath & " has no 'compile' array")
 
+  var pairs: seq[tuple[cPath, ccCmd: string]] = @[]
+  for pair in compileArr:
+    if pair.kind != JArray or pair.len < 1: continue
+    let cPath = pair[0].getStr("")
+    if cPath == "": continue
+    let ccCmd = if pair.len >= 2: pair[1].getStr("") else: ""
+    pairs.add (cPath: cPath, ccCmd: ccCmd)
+
+  result = (compile: pairs, linkcmd: jnode{"linkcmd"}.getStr(""))
+
+proc extractClosure*(nimcacheDir: string;
+                     binaryName: string;
+                     entrypoint: string;
+                     config: Config): HashSet[string] =
+  ## Extract the source-dependency closure for one compiled entrypoint.
+  ##
+  ## Parameters:
+  ##   `nimcacheDir`  — the `--nimcache` directory used to compile `entrypoint`.
+  ##   `binaryName`   — the basename of the `-o:` binary (used to locate the
+  ##                    JSON: `<nimcacheDir>/<binaryName>.json`).
+  ##   `entrypoint`   — absolute (or project-root-relative) path to the `.nim`
+  ##                    source file.
+  ##   `config`       — must have `projectRoot` set; may have `depRoots`.
+  ##
+  ## Returns a `HashSet[string]` of projectRoot-relative, forward-slash paths.
+  ##
+  ## Raises `CrisolError(cekEnvironment)` if the JSON is missing or unparseable.
+  ##
+  ## A FILTER over `parseCompileManifest`'s raw output (RFC-0006 §File
+  ## scoping): stdlib/nimble paths and the cc command are deliberately
+  ## dropped here — `parseCompileManifest` is the shape that keeps them.
+
+  let jsonPath = nimcacheDir / binaryName & ".json"
+  let manifest = parseCompileManifest(jsonPath)
+
   let roots      = trackedRoots(config)
   let epAbs      = entrypoint.absolutePath.normalizedPath
   let prAbs      = config.projectRoot.absolutePath.normalizedPath
@@ -188,10 +221,8 @@ proc extractClosure*(nimcacheDir: string;
 
   result = initHashSet[string]()
 
-  for pair in compileArr:
-    if pair.kind != JArray or pair.len < 1: continue
-    let cPath = pair[0].getStr("")
-    if cPath == "": continue
+  for pair in manifest.compile:
+    let cPath = pair.cPath
 
     # R5+R7 fix: resolveMangledAll returns ALL candidate paths (possibly multiple
     # for ambiguous @p entries, possibly non-existent for deleted deps).

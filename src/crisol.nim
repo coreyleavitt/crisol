@@ -35,9 +35,9 @@
 ##   3   environment/configuration error: bad args, zero entrypoints discovered,
 ##       --failed with no prior run (lastrun.json absent)
 
-import std/[options, os, strutils]
+import std/[json, options, os, strutils]
 import std/posix
-import crisol/[clean, terminal, api, config, lock, junit, shard, order]
+import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, cacheworker]
 
 # O_NOFOLLOW is a Linux extension not declared in Nim's std/posix.
 # Pull it from <fcntl.h> via the emit+importc pattern.
@@ -197,6 +197,11 @@ Additional options for 'run':
                   allowlist + isolated tmpdir + config-declared rlimits), or
                   network (superset of isolated + net-ns isolation; currently
                   degrades — net-ns not wired — so such runs are not cached).
+  --objcache      Gate the cross-entrypoint object cache into the compile
+                  slot (default: on; this flag is an explicit, now-redundant
+                  request -- harmless to pass, kept for scripts/clarity).
+  --no-objcache   Force the object cache off, overriding the default and
+                  --objcache/config `objcache #true`.
 
 Additional options for 'list':
   --json          Emit the crisol/plan/v1 JSON document instead of human output.
@@ -221,9 +226,28 @@ proc computeColorEnabled(): bool =
 # runMain — testable entry; returns the process exit code
 # ---------------------------------------------------------------------------
 
-proc runMain*(args: seq[string]): int =
+proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
   ## Parse `args` (argv without the program name), execute the pipeline,
   ## and return the exit code.  Does NOT call quit().
+  ##
+  ## `selfWorkerBinary` becomes `RunOptions.workerBinary` (see below) and
+  ## therefore the self-reexec target for RFC-0006's objCache /
+  ## measureCompileReuse compile-slot workers.  It defaults to "" (no
+  ## worker) rather than resolving `getAppFilename()` itself, because
+  ## `getAppFilename()` returns whatever process is CURRENTLY RUNNING —
+  ## sound only when that process is genuinely the crisol CLI binary (which
+  ## dispatches InternalCompileWorkerToken / InternalMeasureCompileToken,
+  ## below).  `runMain` is also called IN-PROCESS by crisol's own test
+  ## suite and by any library embedder that links against `crisol` as a
+  ## module — for those callers `getAppFilename()` would point at the TEST
+  ## or HOST binary, whose entrypoint does NOT dispatch either internal
+  ## token, so a self-reexec would just re-run that whole program (unsound,
+  ## up to an unbounded recursive fork). The real CLI binary's own
+  ## `when isMainModule` entrypoint (bottom of this file) is the ONLY
+  ## caller that passes `getAppFilename()` here — it alone can prove it IS
+  ## that sound target. Every other caller gets the safe default: an empty
+  ## workerBinary degrades spawnCompileStable to the monolithic compile
+  ## path (see runner.nim / types.Config.workerBinary's own doc).
 
   if args.len == 0:
     stderr.write(usage())
@@ -238,6 +262,31 @@ proc runMain*(args: seq[string]): int =
   if sub in ["--version", "-V", "version"]:
     stdout.write("crisol " & CrisolVersion & "\n")
     return ExitOk
+
+  # RFC-0006 M-artifact-identity (pass (b1)): the internal measurement-worker
+  # re-exec surface (`crisol --internal-measure-compile <plan.json>`).
+  # Deliberately routed here, before subcommand validation, and NOT listed in
+  # usage() — this is an internal re-exec token, not a user-facing
+  # subcommand. See crisol/measureworker.nim for the worker pipeline.
+  if sub == InternalMeasureCompileToken:
+    if args.len < 2:
+      stderr.write("crisol: " & InternalMeasureCompileToken &
+                   " requires a <plan.json> path\n")
+      return ExitEnvironment
+    return runMeasureCompileWorker(args[1])
+
+  # RFC-0006 Stage R (R2b1): the internal cache-mode compile-worker re-exec
+  # surface (`crisol --internal-compile-worker <plan.json>`). Mirrors
+  # InternalMeasureCompileToken's dispatch immediately above — same
+  # before-subcommand-validation placement, same NOT-in-usage() internal
+  # status. See crisol/measureworker.nim for the worker pipeline + escape
+  # hatch.
+  if sub == InternalCompileWorkerToken:
+    if args.len < 2:
+      stderr.write("crisol: " & InternalCompileWorkerToken &
+                   " requires a <plan.json> path\n")
+      return ExitEnvironment
+    return runCompileCacheWorker(args[1])
 
   if sub notin ["run", "list", "clean", "init"]:
     stderr.write("crisol: unknown subcommand '" & sub & "'\n\n")
@@ -307,7 +356,15 @@ proc runMain*(args: seq[string]): int =
                    " depgraph entry(ies); evicted " & $r.cacheEvicted &
                    " result-cache entry(ies); compacted " &
                    $r.shardsRemoved & " ledger shard(s) (" &
-                   $r.ledgerRowsKept & " row(s) kept)\n")
+                   $r.ledgerRowsKept & " row(s) kept); compacted " &
+                   $r.artifactShardsRemoved & " artifact shard(s) (" &
+                   $r.artifactRowsKept & " row(s) kept); compacted " &
+                   $r.compileCostShardsRemoved & " compile-cost shard(s) (" &
+                   $r.compileCostRowsKept & " row(s) kept); compacted " &
+                   $r.objCacheStatsShardsRemoved & " objcache-stats shard(s) (" &
+                   $r.objCacheStatsRowsKept & " row(s) kept); evicted " &
+                   $r.objCacheEvicted & " object-cache entry(ies) (" &
+                   $r.objCacheTmpSwept & " tmp file(s) swept)\n")
     except CrisolError as e:
       stderr.write("crisol: clean error: " & e.msg & "\n")
       return ExitEnvironment
@@ -419,6 +476,19 @@ proc runMain*(args: seq[string]): int =
     orderMode:    OrderMode = omNone  # C4: history-based prioritization
     perfCheck:    bool = false  # C6: --perf-check: force perf-regression detection ON
     hermeticLevel: HermeticLevel = hlIsolated  # RFC-0004: --hermetic none|isolated|network
+    measureCompileReuse: bool = false  # RFC-0006: --measure-compile-reuse: gate the
+                                        # measurement worker into the compile slot
+    objCache:     bool = false  # RFC-0006 Stage R R2b2: --objcache: explicit-on flag.
+                                 # Object cache is ON BY DEFAULT (see config.docToConfig /
+                                 # conventionConfig); this local var only carries an
+                                 # explicit --objcache, which is now redundant with the
+                                 # default but harmless (resolveObjCache: optIn OR
+                                 # configValue). Kept so `crisol run --objcache` still
+                                 # works exactly as documented.
+    noObjCache:   bool = false  # RFC-0006 Stage R R2b2: --no-objcache: the opt-OUT flag.
+                                 # Wins over the default-on state and over --objcache/config
+                                 # (independent of --no-cache, which gates the unrelated
+                                 # result cache).
 
   let runArgs = args[1..^1]
   var i = 0
@@ -447,7 +517,8 @@ proc runMain*(args: seq[string]): int =
       if key in ["jobs", "timeout", "fail-fast", "dry-run", "failed", "changed",
                  "base", "force-compile", "no-cache", "filter-tag",
                  "retries", "fail-on-flaky", "junit", "shard", "order",
-                 "perf-check", "hermetic"] and isList:
+                 "perf-check", "hermetic", "measure-compile-reuse",
+                 "objcache", "no-objcache"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
         stderr.write(usage())
         return ExitEnvironment
@@ -558,6 +629,12 @@ proc runMain*(args: seq[string]): int =
           return ExitEnvironment
       of "perf-check":
         perfCheck = true
+      of "measure-compile-reuse":
+        measureCompileReuse = true
+      of "objcache":
+        objCache = true
+      of "no-objcache":
+        noObjCache = true
       of "hermetic":
         let raw = nextVal("hermetic")
         if raw == "":
@@ -688,6 +765,12 @@ proc runMain*(args: seq[string]): int =
     order:               orderMode,     # C4: history-based prioritization
     perfCheckForce:      perfCheck,     # C6: --perf-check: force detection ON
     hermeticLevel:       hermeticLevel, # RFC-0004: --hermetic level control
+    measureCompileReuse: measureCompileReuse,  # RFC-0006: gate measurement worker into compile slot
+    objCache:            objCache,    # RFC-0006 Stage R R2b2: --objcache
+    noObjCache:          noObjCache,  # RFC-0006 Stage R R2b2: --no-objcache (wins)
+    workerBinary:        selfWorkerBinary,  # "" unless the real CLI entrypoint (below) passed
+                                             # its own getAppFilename() — see runMain's doc above
+                                             # for why this must never be resolved in here.
   )
 
   # -------------------------------------------------------------------------
@@ -787,6 +870,17 @@ proc runMain*(args: seq[string]): int =
     if rr.plan.gatedOut.len > 0:
       for line in gateSkipMessages(rr.plan.gatedOut):
         stdout.write(line & "\n")
+    # RFC-0006 Stage R R5b: one-line objcache hit-rate summary, only when the
+    # objcache stream actually ran this run (rr.compileBlock carries an
+    # "objcache" key — see compilereport.buildCompileBlock's doc).
+    if rr.compileBlock != nil and rr.compileBlock.hasKey("objcache"):
+      let oc = rr.compileBlock["objcache"]
+      stdout.write("crisol: objcache: " & $oc["hits"].getInt & " hit(s), " &
+                   $oc["misses"].getInt & " miss(es) (hitRate=" &
+                   formatFloat(oc["hitRate"].getFloat, ffDecimal, 2) &
+                   "), " & $oc["reusedBytes"].getBiggestInt &
+                   " byte(s) reused, cache size " &
+                   $oc["cacheSizeBytes"].getBiggestInt & " byte(s)\n")
 
   # C1: --junit <path> — write JUnit XML report as an additional output sink.
   # Composes with normal stdout reporting (--json or human render still runs).
@@ -808,5 +902,11 @@ proc runMain*(args: seq[string]): int =
 # ---------------------------------------------------------------------------
 
 when isMainModule:
-  let code = runMain(commandLineParams())
+  # This IS the real crisol CLI binary: it dispatches
+  # InternalCompileWorkerToken / InternalMeasureCompileToken (above, before
+  # subcommand validation), so its own getAppFilename() is a sound
+  # self-reexec target for RFC-0006's compile-slot workers. This is the
+  # ONLY call site allowed to pass a non-empty selfWorkerBinary — see
+  # runMain's doc.
+  let code = runMain(commandLineParams(), selfWorkerBinary = getAppFilename())
   quit(code)

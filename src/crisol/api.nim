@@ -45,9 +45,10 @@
 ##   memThrottleActive, formatProgressLine, planview internals (planToJson,
 ##   decisionStringEd, decisionLabelEd, warningsToJsonArray)
 
-import std/[os, sequtils, sets, strutils, times]
+import std/[json, os, sequtils, sets, strutils, times]
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals,
-               sandbox, cachedispatch, ccprobe, planner, order, ledger, keys, depgraph, stats]
+               sandbox, cachedispatch, ccprobe, planner, order, ledger, keys, depgraph, stats,
+               compilereport]
 
 # ---------------------------------------------------------------------------
 # Selective re-exports (H1)
@@ -194,6 +195,53 @@ type
     ## scrub/rlimits entirely; hlNetwork requests net-ns isolation (currently
     ## DEGRADES — net-ns unshare is not wired — so such runs are not cached).
     hermeticLevel*:      HermeticLevel = hlIsolated
+    ## RFC-0006 M-artifact-identity PASS (b2): --measure-compile-reuse.
+    ## false (default) → compile slots run plain `nim c`, byte-for-byte
+    ## unchanged from before this pass. true → compile slots run the
+    ## `--internal-measure-compile` measurement worker instead (same
+    ## runnable binary produced; additionally writes ArtifactRows). This
+    ## can only strengthen (opt IN), never override a config-file `false`
+    ## with `false` — see planImpl.
+    measureCompileReuse*: bool = false
+    ## Absolute path to a binary whose `main()` dispatches the
+    ## `--internal-measure-compile` token — required for measureCompileReuse's
+    ## self-reexec worker to be sound (see Config.workerBinary in types.nim
+    ## for the full rationale). "" (default) = no sound worker; the CLI sets
+    ## this to its own getAppFilename(); a library consumer embedding crisol
+    ## (e.g. calling runTests()/planTests() from its own binary) MUST set
+    ## this explicitly to get measurement — leaving it unset is always safe
+    ## (degrades to monolithic compile, never fork-bombs).
+    workerBinary*:        string = ""
+    ## RFC-0006 Stage R, R2b2: --objcache / --no-objcache.
+    ## Object cache is ON BY DEFAULT (RFC-0006 review R1/R2/R4 soundness
+    ## fixes — object-cache key completeness + fail-safe degradation —
+    ## landed and verified green; deliberate opt-OUT decision). This
+    ## `objCache*: bool = false` field is the CLI-flag-shaped override
+    ## (`--objcache`), independent from the default: it can only STRENGTHEN
+    ## an already-true default, never represent it (its false default means
+    ## "the flag was not passed", not "objcache is off"). The actual
+    ## default-on value lives in the loaded Config (config.docToConfig /
+    ## conventionConfig), fed into `configValue` below. Precedence (highest
+    ## wins):
+    ##   1. noObjCache=true (--no-objcache) → OFF, unconditionally.
+    ##   2. objCache=true (--objcache) OR the config-file/default value
+    ##      (`objcache #true`, or absent-KDL default) → ON.
+    ##   3. otherwise (only reachable via an explicit `objcache #false`
+    ##      config block with no CLI override) → OFF.
+    ## See `resolveObjCache` (the pure precedence formula, unit-tested
+    ## directly) and planImpl, which applies it to cfg.objCache. noObjCache
+    ## is INDEPENDENT of noCache (that gates the unrelated result cache).
+    ##
+    ## measureCompileReuse ALWAYS wins over objCache, regardless of the
+    ## precedence above: measurement is an explicit diagnostic that REPLACES
+    ## caching for the run it's requested on (a compile slot has exactly one
+    ## worker child; the two are mutually exclusive). planImpl suppresses
+    ## the resolved objCache value to false whenever measureCompileReuse
+    ## ends up true, so spawnCompileStable's own objCache-first branch order
+    ## never actually observes both flags on at once — see planImpl and
+    ## resolveObjCache's doc for the exact formula.
+    objCache*:            bool = false
+    noObjCache*:          bool = false
 
   ResolvedSettings* = object
     ## Slim projection of the resolved Config (NOT the full Config).
@@ -237,6 +285,12 @@ type
     exitCode*:          int   ## ALWAYS set: 0/1 (rsOk), 3 (rsStructural; 2 internal), 128+n (rsInterrupted)
     error*:             string ## non-empty iff status == rsStructural
     zeroRunnableReason*: ZeroRunnableReason
+    compileBlock*:      JsonNode  ## Stage R R5b: the SAME `compile` block persisted to
+                                  ## lastrun.json (compilereport.readCompileBlock), exposed here
+                                  ## so a caller (e.g. the CLI) can print a human-readable
+                                  ## compile/objcache summary line without re-scanning the
+                                  ## ledgers. nil when opts.persist is false, or when neither
+                                  ## measureCompileReuse nor objCache is enabled (no telemetry).
 
 # ---------------------------------------------------------------------------
 # Selection constructors — hide the GroupSelection discriminated-union syntax
@@ -312,6 +366,49 @@ type PlanImplResult = object
   useFailed:   bool            ## surfaced to avoid recomputation in runTests
   useChanged:  bool
 
+proc shouldReportCompileBlock*(measureCompileReuse, objCache: bool): bool =
+  ## R14-T6 (code review): the pure predicate gating whether runTests() even
+  ## ATTEMPTS to read/report the `compile` block at all (extracted so the
+  ## exact boolean expression is independently unit-testable without a real
+  ## compile — a regression flipping `or` -> `and` here would silently drop
+  ## the report whenever only ONE of the two flags is set, e.g. a plain
+  ## `--objcache` run with measureCompileReuse off). R5b's own fix widened
+  ## this from a narrower `measureCompileReuse`-only gate: objCache alone is
+  ## enough, because the objcache-stats stream is written independently of
+  ## measureCompileReuse (the two compile-slot WORKERS are mutually
+  ## exclusive, but the two FEATURES are not — see types.Config.objCache's
+  ## doc). Even when this returns true, the actual `compile` field can still
+  ## end up absent if no telemetry was ever written this run (see
+  ## compilereport.buildCompileBlock's own nil-when-empty contract) — this
+  ## predicate only answers "should we even look", not "is there data".
+  measureCompileReuse or objCache
+
+proc resolveObjCache*(configValue, optIn, optOut: bool): bool =
+  ## RFC-0006 Stage R, R2b2: pure precedence resolution for Config.objCache
+  ## from a config-file value (`configValue`) plus RunOptions overrides
+  ## (`optIn` = --objcache, `optOut` = --no-objcache). Extracted as a pure
+  ## function (rather than inlined in planImpl) so the precedence formula is
+  ## independently unit-testable without going through config loading or a
+  ## real compile. Precedence (highest wins):
+  ##   1. optOut → false, unconditionally (--no-objcache always wins).
+  ##   2. optIn or configValue → true (either strengthens ON).
+  ##   3. otherwise → false.
+  ## This formula is UNCHANGED by the RFC-0006 default-on flip. What changed
+  ## is the caller: `configValue` is now `true` by default (config.loadConfig
+  ## resolves it that way whenever the KDL `objcache` node is absent — see
+  ## config.docToConfig / conventionConfig), so case 2 above is the common
+  ## path and case 3 is reachable only via an explicit `objcache #false`
+  ## config block with no CLI override.
+  ##
+  ## NOTE: this formula alone does NOT know about measureCompileReuse.
+  ## planImpl (the sole caller) additionally suppresses the result to false
+  ## whenever measureCompileReuse resolved true — see planImpl for why
+  ## measurement always wins over caching, and this comment for why that
+  ## suppression is NOT folded into this function's own signature (kept
+  ## pure and single-purpose; the two flags are combined exactly once, at
+  ## the call site, where both resolved values already exist).
+  (optIn or configValue) and not optOut
+
 proc planImpl(opts: RunOptions): PlanImplResult =
   ## Internal plan phase shared by planTests and runTests.
   ## Raises CrisolError on any structural problem.
@@ -324,6 +421,27 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   if opts.jobs > 0:        cfg.jobs        = opts.jobs
   if opts.timeoutSecs > 0: cfg.timeoutSecs = opts.timeoutSecs
   if opts.retries >= 0:    cfg.retries     = opts.retries  # B1: -1 = use config
+  # RFC-0006 M-artifact-identity PASS (b2): CLI/library --measure-compile-reuse
+  # can only strengthen a config-file setting (true wins), mirroring perfCheckForce.
+  if opts.measureCompileReuse: cfg.measureCompileReuse = true
+  if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
+  # RFC-0006 Stage R, R2b2: resolve objCache precedence (--no-objcache wins).
+  #
+  # Issue-1 fix: measureCompileReuse ALWAYS suppresses objCache. Before this,
+  # objCache defaulting true (the RFC-0006 default-on flip) meant a run that
+  # asked ONLY for --measure-compile-reuse still resolved cfg.objCache=true,
+  # and runner.spawnCompileStable's branch order (objCache > measure >
+  # monolithic) starved measurement of its own worker entirely -- the CACHE
+  # worker ran instead, which never writes ArtifactRows/compile.segments.
+  # Measurement is an explicit diagnostic that REPLACES caching for the run
+  # it's requested on (a compile slot has exactly one worker child), so it
+  # must take precedence. Suppressing HERE -- at the resolution layer, before
+  # cfg ever reaches spawnCompileStable -- means the two flags are never both
+  # "on" by the time the runner looks at them, so runner.nim's own branch
+  # order (objCache-first) needs no change and remains correct for the case
+  # it now always sees: objCache and measureCompileReuse mutually exclusive.
+  cfg.objCache = resolveObjCache(cfg.objCache, opts.objCache, opts.noObjCache) and
+                 not cfg.measureCompileReuse
 
   # 3. Assemble narrowing inputs.
   let useFailed  = opts.narrowing.kind in {nkFailed, nkFailedOrChanged}
@@ -358,6 +476,70 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     order        = opts.order,   # C4: history-based prioritization
   )
 
+  # Code-review R13: an explicit --objcache / --measure-compile-reuse request
+  # that will silently degrade to the monolithic compile path (no
+  # workerBinary configured) must be visible in the STRUCTURED warnings
+  # channel, not merely runner.nim's one-shot stderr write
+  # (warnObjCacheNoWorkerOnce / warnMeasureCompileReuseNoWorkerOnce) — a CI
+  # consumer whose stderr is swallowed sees a completely silent no-op of a
+  # feature it explicitly asked for (compileBlock simply absent from the
+  # report, indistinguishable from "nobody asked"). Reuses the EXISTING
+  # ConfigWarning shape (no types.nim change): its fields (source/context/
+  # key/message) are generic enough to carry a resolved-config runtime
+  # warning, not only a config-file-parse warning. Only ONE of these two
+  # fires per run: by this point cfg.objCache has already been suppressed to
+  # false whenever cfg.measureCompileReuse is true (Issue-1 fix, above), so
+  # the two conditions below are mutually exclusive by construction — computed
+  # here from the SAME resolved `cfg` fields runner.nim gates on, so this can
+  # never diverge from what actually happens per compile slot.
+  var warnings = pv.warnings
+  if cfg.workerBinary.len == 0:
+    if cfg.objCache:
+      warnings.add ConfigWarning(
+        source:  "",
+        context: "objcache",
+        key:     "workerBinary",
+        message: "objcache requested (--objcache / config `objcache #true`) " &
+                 "but no worker binary is configured; not honored this run " &
+                 "-- compiling monolithically (cache skipped). Set " &
+                 "RunOptions.workerBinary to a binary that dispatches " &
+                 "--internal-compile-worker to get cache reuse.",
+      )
+    elif cfg.measureCompileReuse:
+      warnings.add ConfigWarning(
+        source:  "",
+        context: "measure-compile-reuse",
+        key:     "workerBinary",
+        message: "measure-compile-reuse requested but no worker binary is " &
+                 "configured; not honored this run -- compiling " &
+                 "monolithically (measurement skipped). Set " &
+                 "RunOptions.workerBinary to a binary that dispatches " &
+                 "--internal-measure-compile to get measurement.",
+      )
+
+  # Issue-1 fix: BOTH --objcache and --measure-compile-reuse explicitly
+  # requested on the SAME run is a contradictory request (a compile slot has
+  # exactly one worker child) — measurement wins (see cfg.objCache's
+  # suppression above), but the caller who explicitly asked for objcache
+  # should be told it was ignored, not left to infer that from an absent
+  # "objcache" key in compile.* / an absent objcache/v1 directory. Gated on
+  # `opts.objCache`/`opts.measureCompileReuse` (the CALLER'S explicit
+  # request), not `cfg.objCache`/`cfg.measureCompileReuse` (the resolved
+  # values) — objCache defaulting on (no explicit --objcache) plus an
+  # explicit --measure-compile-reuse is NOT a contradiction the caller
+  # asked for; it's just the default quietly stepping aside, already covered
+  # by the workerBinary warnings above when applicable.
+  if opts.objCache and opts.measureCompileReuse:
+    warnings.add ConfigWarning(
+      source:  "",
+      context: "objcache",
+      key:     "measure-compile-reuse",
+      message: "both --objcache and --measure-compile-reuse were explicitly " &
+               "requested; measurement takes precedence for this run -- " &
+               "objcache is ignored (measurement is a diagnostic that " &
+               "replaces caching, not a mode that composes with it).",
+    )
+
   # 5. Project into PlanReport.
   let resolvedStateDir = stateDirOf(cfg)
   let settings = ResolvedSettings(
@@ -370,7 +552,7 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     entrypoints: pv.plan.entrypoints,
     jobs:        pv.plan.jobs,
     gatedOut:    pv.gatedOut,
-    warnings:    pv.warnings,
+    warnings:    warnings,
     settings:    settings,
     adHocPaths:     pv.adHocPaths,
     ambiguousPaths: pv.ambiguousPaths,
@@ -603,9 +785,32 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       results[i].perfThresholdUs = verdict.thresholdUs
 
   # Persist lastrun.json if requested.
+  var compileBlock: JsonNode = nil
   if opts.persist:
+    # RFC-0006 M-report pass (a) / Stage R R5b: the segmented `compile` block
+    # only carries data when EITHER telemetry stream was actually written
+    # this run -- avoids a needless ledger disk scan on every ordinary
+    # (measurement- and objcache-off) run. R5b: cfg.objCache alone is enough
+    # to populate compile.objcache (objcache stats are written independently
+    # of measureCompileReuse -- see types.Config.objCache's doc: the two
+    # workers are mutually exclusive compile-slot children, not mutually
+    # exclusive FEATURES, so a plain --objcache run must still surface its
+    # own realized hit/miss telemetry in the report, not just on disk).
+    compileBlock =
+      if shouldReportCompileBlock(cfg.measureCompileReuse, cfg.objCache):
+        # M-report PASS (b2): thread the SAME runStartUs perf-check captured
+        # above (before execute() appended this run's rows) into the
+        # compile-cost stream's own current/history split.
+        compilereport.readCompileBlock(pr.settings.stateDir, runStartUs)
+      else: nil
+    # M-report pass (b1): reuse-check alerting is a SEPARATE, default-OFF
+    # surface from the (unconditional) `compile` measurement block itself --
+    # buildReuseAlerts naturally yields an empty array when cfg.reuseCheck is
+    # disabled or compileBlock is nil (measurement off / no telemetry yet).
+    let reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
     persistLastRun(results, s, cfg, warnings = pr.warnings,
-                   memThrottledSlots = memThrottled)
+                   memThrottledSlots = memThrottled, compileBlock = compileBlock,
+                   reuseAlerts = reuseAlerts)
 
   releaseLock(lockHandle)
 
@@ -616,4 +821,5 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     memThrottledSlots: memThrottled,
     status:            rsOk,
     exitCode:          exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
+    compileBlock:      compileBlock,
   )

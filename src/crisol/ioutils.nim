@@ -24,7 +24,41 @@
 ##
 ## Both ledger.nim and resultcache.nim replace their write calls with this
 ## helper so that there is exactly ONE correct implementation.
+##
+## ## atomicPutFile
+##
+## The atomic "write a whole file into place" mechanic that resultcache.nim
+## implemented inline for its per-key JSON entries: write `data` to a
+## PID-suffixed temp path with `O_CREAT|O_EXCL` (fails closed on a planted
+## symlink/file), `writeAllFd` the bytes, then `moveFile`/`rename(2)` into
+## place.  Lifted here (RFC-0006 R1) so resultcache.nim AND objcache.nim share
+## exactly one correct implementation instead of hand-copying it a second time.
+##
+## Never raises: any open/write/rename failure returns `ok=false` (with a
+## non-empty `error` naming the failing step and the underlying OS reason —
+## see RFC-0006 review R10 below) and best-effort cleans up the temp file.  A
+## pre-existing temp file at the SAME (finalPath, pid) is best-effort removed
+## before the open — it can only be a leftover from an earlier attempt in
+## this same process (a different process has a different pid, hence a
+## different temp path; see resultcache's L10 note).
+##
+## ## RFC-0006 review R10 — the specific OS error is no longer swallowed
+##
+## Before the R1 factor-out, `resultcache.storeCached` logged the specific
+## OSError message on a failed write (`"could not write cache entry '…': " &
+## e.msg`).  Returning a bare `bool` regressed that diagnostic for both
+## `resultcache.storeCached` and `objcache.storeObject` — exactly the detail
+## an operator needs to tell "permission denied" from "disk full" from
+## "EXDEV" from "a planted symlink" apart.  `atomicPutFile` now returns
+## `tuple[ok: bool; error: string]`: `error` is `""` on success, and on
+## failure names the step (create temp / write temp / rename into place) and
+## carries the OS reason — `strerror(errno)` for the raw posix open/write
+## calls (captured immediately after the failing syscall, before any other
+## call can clobber `errno`, mirroring the idiom already used by
+## `ledger.openLedger`/`ledger.append`), or the `OSError.msg` from
+## `moveFile`'s rename(2).
 
+import std/os
 import std/posix as posix_mod
 
 proc writeAllFd*(fd: cint; data: string): bool =
@@ -52,3 +86,65 @@ proc writeAllFd*(fd: cint; data: string): bool =
     offset    += n
     remaining -= n
   true
+
+proc atomicPutFile*(finalPath: string; data: string): tuple[ok: bool; error: string] =
+  ## Atomically write `data` into `finalPath`.
+  ##
+  ## Mechanic (identical to resultcache.storeCached's former inline block):
+  ##   1. Best-effort remove any leftover `<finalPath>.<ourPid>.tmp` from a
+  ##      previous attempt in this same process.
+  ##   2. Open `<finalPath>.<ourPid>.tmp` with O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC,
+  ##      mode 0o600 — O_EXCL fails closed on a planted symlink/file.
+  ##   3. `writeAllFd` the bytes (handles EINTR + short writes).
+  ##   4. `moveFile` (rename(2)) the tmp into `finalPath`.
+  ##
+  ## Returns `(true, "")` iff the file is fully in place at `finalPath`.
+  ## Returns `(false, <reason>)` — and NEVER raises — on any open/write/rename
+  ## failure, cleaning up the tmp file first.  `<reason>` names the failing
+  ## step and the underlying OS error text (see module docs, RFC-0006 review
+  ## R10) so callers can log a diagnostic that actually explains a production
+  ## failure (permission denied, disk full, EXDEV, a planted symlink, …)
+  ## instead of a bare "could not write" with no cause.  This helper is
+  ## reused for both JSON entries (resultcache) and raw object bytes
+  ## (objcache); it does not itself write to stderr — callers log using the
+  ## returned `error`.
+  let tmpPath = finalPath & "." & $posix_mod.getpid() & ".tmp"
+
+  # Best-effort removal of our own PID-specific leftover .tmp (a retry within
+  # this same process).  A different process has a different pid, hence a
+  # different tmpPath, so this never races another live writer.
+  try: removeFile(tmpPath) except CatchableError: discard
+
+  var tmpFd: cint = -1
+  try:
+    let flags = posix_mod.O_CREAT or posix_mod.O_EXCL or posix_mod.O_WRONLY or
+                posix_mod.O_CLOEXEC
+    tmpFd = posix_mod.open(tmpPath.cstring, flags, posix_mod.Mode(0o600))
+    if tmpFd < 0:
+      # Capture errno IMMEDIATELY — no other posix call happens between the
+      # failing open(2) and this read, mirroring ledger.openLedger's idiom.
+      let err = $posix_mod.strerror(posix_mod.errno)
+      return (false, "could not create temp file '" & tmpPath & "': " & err)
+
+    let writeOk = writeAllFd(tmpFd, data)
+    if not writeOk:
+      # Same immediate-errno-capture idiom: writeAllFd's own failing write(2)
+      # is the last posix call before we read errno here.
+      let err = $posix_mod.strerror(posix_mod.errno)
+      discard posix_mod.close(tmpFd)
+      tmpFd = -1
+      try: removeFile(tmpPath) except CatchableError: discard
+      return (false, "could not write temp file '" & tmpPath & "': " & err)
+
+    discard posix_mod.close(tmpFd)
+    tmpFd = -1
+    moveFile(tmpPath, finalPath)
+    return (true, "")
+  except OSError as e:
+    if tmpFd >= 0: discard posix_mod.close(tmpFd)
+    try: removeFile(tmpPath) except CatchableError: discard
+    return (false, "could not rename temp file to '" & finalPath & "': " & e.msg)
+  except Exception as e:
+    if tmpFd >= 0: discard posix_mod.close(tmpFd)
+    try: removeFile(tmpPath) except CatchableError: discard
+    return (false, e.msg)

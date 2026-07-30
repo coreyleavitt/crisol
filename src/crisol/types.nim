@@ -152,6 +152,20 @@ type
     sampleFloor*:  int    ## minimum history rows required to flag (below → always false)
     absFloorMs*:   int    ## minimum MAD expressed in ms (converted to µs in isRegression)
 
+  ReuseCheckConfig* = object
+    ## M-report PASS (b1): compile-reuse alerting policy, derived from the
+    ## `reuse-check` KDL block. SEPARATE surface from the (unconditional)
+    ## `compile` measurement block itself — per RFC-0006, the alerting
+    ## policy's default-on-ness is gated on Stage R (objcache) being
+    ## adopted. Stage R is NOT adopted, so this stays OFF BY DEFAULT; only
+    ## an explicit `reuse-check { … }` config block enables it (mirrors
+    ## PerfCheckConfig's enabled-gate shape, but with no preset system —
+    ## presence of the block alone turns it on).
+    enabled*:    bool   ## false = no alerting (default; block absent)
+    alertBelow*: float  ## rTime threshold: segments with rTime below this
+                        ## value produce a reuseAlerts entry. Default 0.5
+                        ## when the block is present without 'alert-below'.
+
   Config* = object
     ## Top-level runtime configuration parsed from the project config file or
     ## built by the consuming library / CLI.
@@ -197,6 +211,33 @@ type
     ledgerMaxAgeDays*: int      ## A1c: drop ledger rows older than this many days during
                                 ## compaction.  0 = disabled (keep all rows).
                                 ## Consistent with cacheMaxAgeDays: opt-in, 0=disabled.
+    objcacheMaxEntries*: int    ## RFC-0006 Stage R, R4: max object-cache entries before GC
+                                ## evicts oldest (LRU by `.o` mtime).  0 = use
+                                ## DefaultMaxObjCacheEntries (10 000).  Mirrors maxCacheEntries:
+                                ## the soft-cap in storeObject uses this at write time
+                                ## (backstop); cleanOrphans uses it at GC time (real eviction).
+    objcacheMaxAgeDays*: int    ## RFC-0006 Stage R, R4: evict object-cache entries older than
+                                ## this many days.  0 = disabled (no age-based eviction).
+                                ## Mirrors cacheMaxAgeDays: opt-in, 0=disabled.
+    objcacheMaxBytes*: int      ## RFC-0006 review R6: aggregate-BYTE cap on the object cache
+                                ## (counting BOTH a pair's `.o` AND `.meta` sizes — the `.meta`
+                                ## carries the full key preimage, which embeds the entire
+                                ## normalized `.c` content, so it is not negligible). 0 =
+                                ## unbounded (no byte-based eviction) — same "0 = disabled"
+                                ## convention as objcacheMaxAgeDays. gcObjCache evicts oldest
+                                ## (age-then-size-LRU, same ordering as objcacheMaxEntries)
+                                ## until BOTH this bound and objcacheMaxEntries are satisfied;
+                                ## whichever bound is tighter drives more eviction. An
+                                ## entry-count cap alone cannot bound on-disk growth because
+                                ## per-entry size varies widely (tens to hundreds of KB), so
+                                ## this is a genuine circuit breaker, not a redundant knob.
+                                ## Review Finding 3: ALSO enforced at write time (not just at
+                                ## `crisol clean`'s GC pass) — threaded via `MeasurePlan.
+                                ## objcacheMaxBytes` (runner.buildCompileWorkerPlan) into
+                                ## `objcache.storeObject`'s soft cap (cacheworker.
+                                ## runCompileCacheWorker), so the DEFAULT `crisol run` path
+                                ## (objcache is default-on) gets an automatic, configured byte
+                                ## bound without a separate manual GC invocation.
     quarantine*:   HashSet[string]
                                 ## B3: set of entrypoint paths whose failures are EXCLUDED from
                                 ## the exit-1 decision.  Paths are project-root-relative, '/'
@@ -206,12 +247,78 @@ type
     perfCheck*:    PerfCheckConfig
                                 ## C6: perf-regression detection policy.  Default = disabled
                                 ## (PerfCheckConfig zero-value has enabled=false).
+    reuseCheck*:   ReuseCheckConfig
+                                ## M-report PASS (b1): compile-reuse alerting policy.  Default
+                                ## = disabled (ReuseCheckConfig zero-value has enabled=false) —
+                                ## OFF regardless of measureCompileReuse until an explicit
+                                ## `reuse-check` config block opts in (Stage R not yet adopted).
     flags*:        seq[string] ## Issue #3 / RFC-0001:409: the raw global `flags` set, kept
                                 ## separately from `Group.flags` (which is already
                                 ## globalFlags & groupFlags, pre-merged per group). Used ONLY
                                 ## as the fallback for an ad-hoc entrypoint — an explicit CLI
                                 ## path matching no configured group runs with global flags
                                 ## only, not a configured group's flags.
+    measureCompileReuse*: bool ## RFC-0006 M-artifact-identity PASS (b2): when true, a compile
+                                ## slot's child is the `--internal-measure-compile` measurement
+                                ## worker (split-compile measurement, writes ArtifactRows)
+                                ## instead of a plain `nim c` invocation. The worker produces the
+                                ## SAME runnable binary at the same path either way, so the run
+                                ## phase is unaffected; a measurement-layer failure never fails
+                                ## the compile (see measureworker.nim). Default false: the
+                                ## monolithic `nim c` path is byte-for-byte unchanged until an
+                                ## operator opts in (`--measure-compile-reuse` / `measure-compile-
+                                ## reuse #true` in crisol.kdl).
+    workerBinary*: string       ## INTERNAL plumbing (not user-facing; no KDL node). Absolute path
+                                ## to a binary whose `main()` dispatches the
+                                ## `--internal-measure-compile` token (see measureworker.nim /
+                                ## crisol.nim's runMain). Required for measureCompileReuse's
+                                ## self-reexec worker to be sound: `getAppFilename()` returns the
+                                ## CURRENTLY RUNNING process's binary, which is only the right
+                                ## worker host when that process IS such a binary (i.e. the crisol
+                                ## CLI). A library consumer's host process is NOT that binary, so
+                                ## crisol must never call getAppFilename() on its behalf — doing so
+                                ## makes the "worker" re-exec the host program itself (unbounded
+                                ## recursive fork, only stopped by the compile watchdog). Default
+                                ## "" = no sound worker available; spawnCompileStable degrades to
+                                ## the monolithic `nim c` path (measurement skipped) instead of
+                                ## guessing. The crisol CLI populates this with its own
+                                ## `getAppFilename()`; library callers set it via
+                                ## `RunOptions.workerBinary`.
+    objCache*: bool             ## RFC-0006 Stage R, R2b2: when true, a compile slot's child is
+                                ## the `--internal-compile-worker` cache worker (objcache.nim's
+                                ## cross-entrypoint object store) instead of a plain `nim c`
+                                ## invocation. DEFAULT ON as of the RFC-0006 review R1/R2/R4
+                                ## soundness fixes (object-cache key completeness + fail-safe
+                                ## degradation) landing green — a deliberate opt-OUT product
+                                ## decision now, not opt-in. This bare type-level field itself
+                                ## still zero-values to false (Nim object default); the ON
+                                ## default is applied where Config is actually built from a
+                                ## project's configuration — config.docToConfig's local
+                                ## `objCache` default (KDL `objcache` node absent) and
+                                ## config.conventionConfig (no crisol.kdl file at all) — NOT
+                                ## here, so that low-level/manual `Config(...)` construction
+                                ## elsewhere (e.g. runner.runEntrypoint's temporary Config) is
+                                ## unaffected by the product-level default. An explicit
+                                ## `objcache #false` config block, or `--no-objcache` /
+                                ## RunOptions.noObjCache at the resolveObjCache layer, still
+                                ## turns it off. **Review Finding 4:** `objCache` and
+                                ## `measureCompileReuse` are MUTUALLY EXCLUSIVE BY CONSTRUCTION,
+                                ## not by one "taking precedence" over the other at the runner
+                                ## branch-order level — `api.planImpl` suppresses `cfg.objCache`
+                                ## to `false` whenever `cfg.measureCompileReuse` resolves `true`
+                                ## (`cfg.objCache = resolveObjCache(...) and not
+                                ## cfg.measureCompileReuse`), BEFORE `Config` ever reaches
+                                ## `runner.spawnCompileStable` — so by the time the runner's own
+                                ## `if config.objCache ... elif config.measureCompileReuse ...`
+                                ## branch order is evaluated, a real caller (the CLI, `api.
+                                ## runTests`/`planTests`) has already made the two conditions
+                                ## non-overlapping. (`runner.spawnCompileStable`'s literal branch
+                                ## order is itself unspecified/never exercised with both true by
+                                ## any real caller — only a low-level test that constructs
+                                ## `Config` directly and bypasses `api.planImpl` can observe it.)
+                                ## Same self-reexec soundness requirement as measureCompileReuse:
+                                ## requires `workerBinary` to be set or this degrades to the
+                                ## monolithic path (never guesses via getAppFilename()).
 
   GroupSelectionKind* = enum
     gskDefault    ## run all non-opt-in groups

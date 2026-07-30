@@ -14,7 +14,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_jsonout.nim
 
-import std/[json, monotimes, options, os, sequtils, sets, strutils, unittest]
+import std/[json, monotimes, options, os, sequtils, sets, strutils, times, unittest]
 import std/posix as posix_mod
 import crisol/types
 import crisol/jsonout
@@ -517,6 +517,41 @@ proc captureStdoutToFile(path: string; body: proc()): void =
     discard posix_mod.close(savedFd)
 
 # ---------------------------------------------------------------------------
+# Fresh CRISOL_STATE_DIR helper (RFC-0006 Issue-2 regression coverage)
+# ---------------------------------------------------------------------------
+#
+# `runMain()` below is called IN-PROCESS: this unittest binary itself is the
+# "currently running process." Before the Issue-2 fix, runMain UNCONDITIONALLY
+# set RunOptions.workerBinary = getAppFilename(), which here resolves to THIS
+# TEST BINARY -- not crisol. With objCache now default-on, that made
+# spawnCompileStable self-reexec this test binary as the "cache worker": the
+# re-invoked process doesn't dispatch --internal-compile-worker at all (its
+# entrypoint is the unittest runner, not crisol.runMain), so it just re-runs
+# the whole test suite -- unsound, and a potential unbounded recursive fork
+# (see crisol.nim's runMain doc / RFC-0006 handoff for the full mechanism).
+#
+# Two independent hazards must both be ruled out for a genuinely COLD proof:
+#   1. workerBinary must stay "" for an in-process runMain() call (the actual
+#      Issue-2 fix, verified structurally by the assertions below).
+#   2. crisol's OWN result cache must not mark pass_always.nim "fresh" and
+#      skip compiling it -- if compile is skipped entirely, the workerBinary
+#      bug never gets exercised, silently masking a regression (see the
+#      standing verification rules on cache-masked failures). A FRESH
+#      CRISOL_STATE_DIR per test forces a genuinely cold compile every time.
+template withFreshCrisolStateDir(tag: string, body: untyped) =
+  block:
+    let stateDirTmp = getTempDir() / "crisol_test_jsonout_" & tag & "_" &
+                       $getCurrentProcessId()
+    removeDir(stateDirTmp)
+    createDir(stateDirTmp)
+    putEnv("CRISOL_STATE_DIR", stateDirTmp)
+    try:
+      body
+    finally:
+      delEnv("CRISOL_STATE_DIR")
+      removeDir(stateDirTmp)
+
+# ---------------------------------------------------------------------------
 # Suite 3 -- --json CLI flag
 # ---------------------------------------------------------------------------
 
@@ -528,19 +563,68 @@ suite "jsonout - --json CLI flag":
     testsDir / "fixtures"
 
   test "--json flag: stdout is valid parseable JSON":
-    let outPath = getTempDir() / "crisol_json_stdout.json"
-    defer: (try: removeFile(outPath) except: discard)
+    ## RFC-0006 Issue-2 regression: this test used to flake because runMain
+    ## (in-process, this test binary) set workerBinary = getAppFilename()
+    ## unconditionally; with objCache default-on that self-reexec'd THIS
+    ## test binary as an unsound "cache worker." Fixed structurally (runMain
+    ## now only wires workerBinary from an explicit `selfWorkerBinary` param
+    ## that ONLY the real crisol CLI's own top-level entrypoint passes) --
+    ## this test proves the fix deterministically with a fresh, genuinely
+    ## COLD stateDir so the compile step is never skipped/masked by cache
+    ## state (see the standing verification rules).
+    withFreshCrisolStateDir("stdout_json"):
+      let outPath = getTempDir() / "crisol_json_stdout.json"
+      defer: (try: removeFile(outPath) except: discard)
 
-    let fd   = fixtureDir()
-    var code = 0
-    captureStdoutToFile(outPath, proc () =
-      code = runMain(@["run", fd / "pass_always.nim", "--jobs", "1", "--json"]))
+      let fd   = fixtureDir()
+      var code = 0
+      captureStdoutToFile(outPath, proc () =
+        code = runMain(@["run", fd / "pass_always.nim", "--jobs", "1", "--json"]))
 
-    check code == 0
-    let raw    = readFile(outPath)
-    check raw.strip().len > 0
-    let parsed = parseJson(raw.strip())
-    check parsed["schema"].getStr == "crisol/run/v1"
+      check code == 0
+      let raw    = readFile(outPath)
+      check raw.strip().len > 0
+      let parsed = parseJson(raw.strip())
+      check parsed["schema"].getStr == "crisol/run/v1"
+
+  test "RFC-0006 Issue-2 regression: in-process runMain() with default-on objcache and no selfWorkerBinary never self-reexecs; compiles monolithically and succeeds (cold stateDir)":
+    ## Direct proof of the fix's soundness invariant. Before the fix,
+    ## runMain(args) called in-process (no selfWorkerBinary argument, as
+    ## every caller here does) would still set RunOptions.workerBinary =
+    ## getAppFilename() = THIS test binary; with objCache default-on,
+    ## spawnCompileStable would self-reexec this test binary as the "cache
+    ## worker" -- which doesn't dispatch --internal-compile-worker and so
+    ## just re-runs the whole unittest suite (unsound; a bounded elapsed-time
+    ## check below is the observable guard against that never terminating
+    ## quickly). After the fix, runMain's default `selfWorkerBinary = ""`
+    ## means RunOptions.workerBinary stays "" here, so spawnCompileStable
+    ## degrades to the safe monolithic `nim c` path (with an R13
+    ## ConfigWarning about objcache having no worker binary, expected and
+    ## harmless -- it goes to stderr, never stdout).
+    withFreshCrisolStateDir("issue2_regress"):
+      let outPath = getTempDir() / "crisol_issue2_regress_stdout.json"
+      defer: (try: removeFile(outPath) except: discard)
+
+      let fd = fixtureDir()
+      var code = 0
+      let t0 = getMonoTime()
+      captureStdoutToFile(outPath, proc () =
+        code = runMain(@["run", fd / "pass_always.nim", "--jobs", "1", "--json"]))
+      let elapsedMs = (getMonoTime() - t0).inMilliseconds
+
+      # A self-reexec of this test binary would re-run the ENTIRE unittest
+      # suite (recursively) instead of a single trivial compile+run -- this
+      # would take dramatically longer than a genuine cold single-fixture
+      # compile, which completes in well under this bound.
+      check elapsedMs < 60_000
+
+      check code == 0
+      let raw = readFile(outPath).strip()
+      check raw.len > 0
+      let parsed = parseJson(raw)
+      check parsed["schema"].getStr == "crisol/run/v1"
+      check parsed["summary"]["passed"].getInt == 1
+      check parsed["summary"]["total"].getInt == 1
 
   test "--json flag: output has no human-render lines (no [OK], PASSED:)":
     let outPath = getTempDir() / "crisol_json_nohuman.json"
@@ -967,3 +1051,310 @@ suite "jsonout - P3 symlink-safe temp write":
     check lr.found == true
     # syntheticResults has 5 failure outcomes out of 6 total
     check lr.failed.len == 5
+
+# ---------------------------------------------------------------------------
+# M-report pass (a) — optional `compile` block, additive/back-compat
+# ---------------------------------------------------------------------------
+
+suite "jsonout M-report (a) — compile block threading":
+
+  test "compileBlock=nil (default): document is byte-identical to before this slice -- no 'compile' key":
+    let withDefault = toJson(syntheticResults(), syntheticSummary())
+    let withExplicitNil = toJson(syntheticResults(), syntheticSummary(), compileBlock = nil)
+    check not withDefault.hasKey("compile")
+    check not withExplicitNil.hasKey("compile")
+    check $withDefault == $withExplicitNil
+
+  test "RunV1Revision was bumped for the additive compile field":
+    check RunV1Revision >= 7
+
+  test "a non-nil compileBlock is threaded through toJson as the top-level 'compile' key, well-formed":
+    var blk = newJObject()
+    var segments = newJArray()
+    var seg = newJObject()
+    seg["groupId"] = newJString("g1")
+    seg["configHash"] = newJString("c1")
+    seg["rTime"] = newJFloat(0.5)
+    segments.add seg
+    blk["segments"] = segments
+
+    let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
+    check node.hasKey("compile")
+    check node["compile"]["segments"].kind == JArray
+    check node["compile"]["segments"].len == 1
+    check node["compile"]["segments"][0]["groupId"].getStr == "g1"
+    check node["compile"]["segments"][0]["rTime"].getFloat == 0.5
+
+  test "toJsonString threads compileBlock through to the serialized string":
+    var blk = newJObject()
+    blk["segments"] = newJArray()
+    let str = toJsonString(syntheticResults(), syntheticSummary(), compileBlock = blk)
+    let node = parseJson(str)
+    check node.hasKey("compile")
+    check node["compile"]["segments"].len == 0
+
+  test "persistLastRun threads compileBlock through to the persisted lastrun.json":
+    let tmpDir   = uniqueTmpDir("compileblock")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    let cfg = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+
+    var blk = newJObject()
+    var segments = newJArray()
+    var seg = newJObject()
+    seg["groupId"] = newJString("unit")
+    seg["configHash"] = newJString("cfg0")
+    seg["rTime"] = newJFloat(0.25)
+    segments.add seg
+    blk["segments"] = segments
+
+    persistLastRun(syntheticResults(), syntheticSummary(), cfg, compileBlock = blk)
+
+    let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
+    check persisted.hasKey("compile")
+    check persisted["compile"]["segments"][0]["groupId"].getStr == "unit"
+
+  test "persistLastRun with compileBlock=nil (default) omits 'compile' from the persisted file":
+    let tmpDir   = uniqueTmpDir("compileblocknil")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    let cfg = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+
+    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+
+    let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
+    check not persisted.hasKey("compile")
+
+# ---------------------------------------------------------------------------
+# M-report PASS (b1) — reuseAlerts array threading, additive/back-compat
+# ---------------------------------------------------------------------------
+
+suite "jsonout M-report (b1) — reuseAlerts threading":
+
+  test "reuseAlerts omitted (default): 'reuseAlerts' is present and empty -- matches 'regressions' present-but-empty convention":
+    let node = toJson(syntheticResults(), syntheticSummary())
+    check node.hasKey("reuseAlerts")
+    check node["reuseAlerts"].kind == JArray
+    check node["reuseAlerts"].len == 0
+
+  test "reuseAlerts omitted: document is byte-identical to explicit empty array (back-compat default)":
+    let withDefault = toJson(syntheticResults(), syntheticSummary())
+    let withExplicitEmpty = toJson(syntheticResults(), syntheticSummary(), reuseAlerts = newJArray())
+    check $withDefault == $withExplicitEmpty
+
+  test "RunV1Revision was bumped again for the additive reuseAlerts/ambientCcacheDetected/topUnits fields":
+    check RunV1Revision >= 8
+
+  test "a non-empty reuseAlerts array is threaded through toJson as the top-level 'reuseAlerts' key, well-formed":
+    var alerts = newJArray()
+    var a = newJObject()
+    a["groupId"]    = newJString("g1")
+    a["configHash"] = newJString("c1")
+    a["rTime"]      = newJFloat(0.1)
+    a["alertBelow"] = newJFloat(0.5)
+    alerts.add a
+
+    let node = toJson(syntheticResults(), syntheticSummary(), reuseAlerts = alerts)
+    check node.hasKey("reuseAlerts")
+    check node["reuseAlerts"].len == 1
+    check node["reuseAlerts"][0]["groupId"].getStr == "g1"
+    check node["reuseAlerts"][0]["rTime"].getFloat == 0.1
+
+  test "toJsonString threads reuseAlerts through to the serialized string":
+    var alerts = newJArray()
+    var a = newJObject()
+    a["groupId"]    = newJString("g1")
+    a["configHash"] = newJString("c1")
+    a["rTime"]      = newJFloat(0.1)
+    a["alertBelow"] = newJFloat(0.5)
+    alerts.add a
+
+    let str = toJsonString(syntheticResults(), syntheticSummary(), reuseAlerts = alerts)
+    let node = parseJson(str)
+    check node["reuseAlerts"].len == 1
+
+  test "persistLastRun threads reuseAlerts through to the persisted lastrun.json":
+    let tmpDir   = uniqueTmpDir("reusealerts")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    let cfg = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+
+    var alerts = newJArray()
+    var a = newJObject()
+    a["groupId"]    = newJString("unit")
+    a["configHash"] = newJString("cfg0")
+    a["rTime"]      = newJFloat(0.2)
+    a["alertBelow"] = newJFloat(0.5)
+    alerts.add a
+
+    persistLastRun(syntheticResults(), syntheticSummary(), cfg, reuseAlerts = alerts)
+
+    let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
+    check persisted.hasKey("reuseAlerts")
+    check persisted["reuseAlerts"][0]["groupId"].getStr == "unit"
+
+  test "persistLastRun with reuseAlerts omitted: 'reuseAlerts' persisted as an empty array":
+    let tmpDir   = uniqueTmpDir("reusealertsdefault")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    let cfg = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+
+    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+
+    let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
+    check persisted.hasKey("reuseAlerts")
+    check persisted["reuseAlerts"].len == 0
+
+# ---------------------------------------------------------------------------
+# M-report PASS (b2) — compile.compileRegressions, additive/back-compat
+# ---------------------------------------------------------------------------
+
+suite "jsonout M-report (b2) — compile.compileRegressions threading":
+
+  test "RunV1Revision was bumped again for the additive compile.compileRegressions field":
+    check RunV1Revision >= 9
+
+  test "a compileBlock carrying a non-empty compileRegressions array threads through toJson opaquely":
+    var blk = newJObject()
+    blk["segments"] = newJArray()
+    var regressions = newJArray()
+    var r = newJObject()
+    r["entrypointIdentity"] = newJString("ep_a|flaghash")
+    r["groupId"]            = newJString("g1")
+    r["configHash"]         = newJString("c1")
+    r["currentUs"]          = newJInt(500_000)
+    r["baselineUs"]         = newJInt(100_000)
+    r["thresholdUs"]        = newJInt(200_000)
+    regressions.add r
+    blk["compileRegressions"] = regressions
+
+    let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
+    check node["compile"]["compileRegressions"].len == 1
+    check node["compile"]["compileRegressions"][0]["entrypointIdentity"].getStr == "ep_a|flaghash"
+    check node["compile"]["compileRegressions"][0]["currentUs"].getBiggestInt == 500_000
+
+  test "compileBlock with an empty compileRegressions array (the default) -> present and empty, document otherwise byte-identical":
+    var blkEmpty = newJObject()
+    blkEmpty["segments"] = newJArray()
+    blkEmpty["compileRegressions"] = newJArray()
+
+    var blkOmitted = newJObject()
+    blkOmitted["segments"] = newJArray()
+    blkOmitted["compileRegressions"] = newJArray()
+
+    let withEmpty   = toJson(syntheticResults(), syntheticSummary(), compileBlock = blkEmpty)
+    let withOmitted = toJson(syntheticResults(), syntheticSummary(), compileBlock = blkOmitted)
+    check withEmpty["compile"]["compileRegressions"].len == 0
+    check $withEmpty == $withOmitted
+
+# ---------------------------------------------------------------------------
+# Stage R, R5b — compile.objcache, additive/back-compat
+# ---------------------------------------------------------------------------
+
+suite "jsonout Stage R R5b — compile.objcache threading":
+
+  test "RunV1Revision was bumped again for the additive compile.objcache field":
+    check RunV1Revision >= 10
+
+  test "a compileBlock carrying a non-empty objcache sub-block threads through toJson opaquely":
+    var blk = newJObject()
+    blk["segments"] = newJArray()
+    var oc = newJObject()
+    oc["hits"]           = newJInt(5)
+    oc["misses"]         = newJInt(3)
+    oc["stored"]         = newJInt(2)
+    oc["disabled"]       = newJInt(0)
+    oc["hitRate"]        = newJFloat(5.0 / 8.0)
+    oc["reusedBytes"]    = newJInt(500)
+    oc["cacheSizeBytes"] = newJInt(10_000)
+    oc["segments"]       = newJArray()
+    oc["note"]           = newJString("net-impact caveat")
+    blk["objcache"] = oc
+
+    let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
+    check node["compile"]["objcache"]["hits"].getInt == 5
+    check node["compile"]["objcache"]["hitRate"].getFloat == 5.0 / 8.0
+    check node["compile"]["objcache"]["cacheSizeBytes"].getBiggestInt == 10_000
+    check node["compile"]["objcache"]["note"].getStr == "net-impact caveat"
+
+  test "a compileBlock with no 'objcache' key (measurement-only run, objcache never ran) is otherwise unaffected apart from the rev bump":
+    var blk = newJObject()
+    blk["segments"] = newJArray()
+
+    let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
+    check node.hasKey("compile")
+    check not node["compile"].hasKey("objcache")
+    check node["schemaRevision"].getInt == RunV1Revision
+
+  test "compileBlock=nil (objcache and measurement both off): document is byte-identical to before this slice apart from the rev bump":
+    let withDefault = toJson(syntheticResults(), syntheticSummary())
+    check not withDefault.hasKey("compile")
+    check withDefault["schemaRevision"].getInt == RunV1Revision
+
+# ---------------------------------------------------------------------------
+# Code review R7 — compile.segments[] gains currentRunEntrypoints/
+# sampleEntrypoints/lowConfidence, additive/back-compat (RunV1Revision 10->11)
+# ---------------------------------------------------------------------------
+
+suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
+
+  test "RunV1Revision was bumped again for the additive segment-level low-confidence-gate fields":
+    check RunV1Revision == 11
+
+  test "a compileBlock carrying the new per-segment fields threads through toJson opaquely (jsonout never inspects compile's internal shape)":
+    var blk = newJObject()
+    var seg = newJObject()
+    seg["groupId"]              = newJString("g1")
+    seg["configHash"]           = newJString("c1")
+    seg["rTime"]                = newJFloat(0.0)
+    seg["currentRunEntrypoints"] = newJInt(1)
+    seg["sampleEntrypoints"]     = newJInt(9)
+    seg["lowConfidence"]         = newJBool(true)
+    var segments = newJArray()
+    segments.add seg
+    blk["segments"] = segments
+
+    let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
+    check node["compile"]["segments"][0]["currentRunEntrypoints"].getInt == 1
+    check node["compile"]["segments"][0]["sampleEntrypoints"].getInt == 9
+    check node["compile"]["segments"][0]["lowConfidence"].getBool == true

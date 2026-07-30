@@ -1,7 +1,7 @@
 ## test_c6_jsonout.nim — C6: regression serialization in run/v1 + render tag
 ##
 ## Coverage:
-##   1. RunV1Revision is 5.
+##   1. RunV1Revision is 11.
 ##   2. regressions array is present in output (empty when no regressions).
 ##   3. regressed=false results do NOT appear in regressions array.
 ##   4. regressed=true results appear in regressions array with correct fields.
@@ -22,9 +22,17 @@ proc makeEp(path: string): Entrypoint =
 
 suite "C6 — run/v1 regressions + render":
 
-  test "RunV1Revision is 6":
-    ## M8: bumped from 5 to 6 for expanded CacheDecision wire vocabulary.
-    check RunV1Revision == 6
+  test "RunV1Revision is 11":
+    ## M8 bumped 5->6 for expanded CacheDecision wire vocabulary;
+    ## M-report pass (a) bumped 6->7 for the additive top-level `compile` field;
+    ## M-report pass (b1) bumped 7->8 for the additive top-level `reuseAlerts`
+    ## array and the compile block's `ambientCcacheDetected`/`topUnits` fields;
+    ## M-report pass (b2) bumped 8->9 for the compile block's
+    ## `compileRegressions` array; Stage R pass R5b bumped 9->10 for the
+    ## compile block's additive `objcache` sub-block; code-review R7 bumped
+    ## 10->11 for each segment's additive `currentRunEntrypoints`/
+    ## `sampleEntrypoints`/`lowConfidence` low-confidence-gate fields.
+    check RunV1Revision == 11
 
   test "regressions array present and empty when no regressions":
     let results = @[

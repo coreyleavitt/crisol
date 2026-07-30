@@ -62,10 +62,9 @@
 ## entries) until the real LRU GC lands in A1c.
 
 import std/[algorithm, json, options, os, strutils]
-import std/posix as posix_mod
 import crisol/types
 import crisol/depgraph   # re-uses fnv1a64, toHex16; never reimplement the hash
-import crisol/ioutils    # writeAllFd: robust partial-write + EINTR-retry loop
+import crisol/ioutils    # atomicPutFile: shared O_EXCL-tmp + writeAllFd + rename(2)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -315,11 +314,11 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
   ## is best-effort and never aborts a run.
   let verDir    = cacheVersionDir(stateDir)
   let finalPath = keyFilePath(stateDir, key)
-  # L10: include the writer's PID in the tmp filename so concurrent writers for
-  # the same key each operate on their own tmp file — no collision on the stale-tmp
-  # removal or the O_EXCL open.  Each writer renames its own `<key>.<pid>.tmp` to
-  # `<key>.json`; rename(2) is atomic, so last-writer-wins on identical content.
-  let tmpPath   = finalPath & "." & $posix_mod.getpid() & ".tmp"
+  # L10: atomicPutFile (ioutils) writes to `<finalPath>.<pid>.tmp` — the
+  # writer's PID in the tmp filename means concurrent writers for the same
+  # key each operate on their own tmp file, no collision on the stale-tmp
+  # removal or the O_EXCL open.  Each writer's tmp is renamed to `<key>.json`;
+  # rename(2) is atomic, so last-writer-wins on identical content.
 
   # Soft cap: only blocks growth (a NEW key past the cap), never a replacement.
   if not fileExists(finalPath):
@@ -351,44 +350,18 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
 
   let jsonStr = $fileNode
 
-  # Best-effort removal of our own PID-specific .tmp if it exists (leftover from
-  # a previous attempt in the same process, e.g. a retry loop).  Different PIDs
-  # have different tmpPaths so this never races another live writer.  Stale .tmp
-  # files from different crashed writers are cleaned by gcResultCache (L8).
-  try: removeFile(tmpPath) except CatchableError: discard
-
-  var tmpFd: cint = -1
-  try:
-    let flags = posix_mod.O_CREAT or posix_mod.O_EXCL or posix_mod.O_WRONLY or
-                posix_mod.O_CLOEXEC
-    tmpFd = posix_mod.open(tmpPath.cstring, flags, posix_mod.Mode(0o600))
-    if tmpFd < 0:
-      let err = $posix_mod.strerror(posix_mod.errno)
-      stderr.write("crisol: warning: could not create temp file for cache entry '" &
-                   tmpPath & "': " & err & "\n")
-      return false
-    let writeOk = writeAllFd(tmpFd, jsonStr)
-    discard posix_mod.close(tmpFd)
-    tmpFd = -1
-    if not writeOk:
-      stderr.write("crisol: warning: short/interrupted write to cache temp file '" &
-                   tmpPath & "'\n")
-      try: removeFile(tmpPath) except CatchableError: discard
-      return false
-    moveFile(tmpPath, finalPath)
-    return true
-  except OSError as e:
-    if tmpFd >= 0: discard posix_mod.close(tmpFd)
+  # RFC-0006 R1: the O_EXCL-tmp + writeAllFd + rename(2) mechanic is factored
+  # into ioutils.atomicPutFile (shared with objcache.nim) — this call is
+  # behaviorally identical to the block it replaces. RFC-0006 review R10:
+  # atomicPutFile now reports the specific OS failure reason instead of a
+  # bare bool, restoring the diagnostic this module logged before the R1
+  # factor-out.
+  let (ok, err) = atomicPutFile(finalPath, jsonStr)
+  if not ok:
     stderr.write("crisol: warning: could not write cache entry '" & finalPath &
-                 "': " & e.msg & "\n")
-    try: removeFile(tmpPath) except CatchableError: discard
+                 "': " & err & "\n")
     return false
-  except Exception as e:
-    if tmpFd >= 0: discard posix_mod.close(tmpFd)
-    stderr.write("crisol: warning: unexpected error writing cache entry '" &
-                 finalPath & "': " & e.msg & "\n")
-    try: removeFile(tmpPath) except CatchableError: discard
-    return false
+  return true
 
 # ---------------------------------------------------------------------------
 # A1c: Result-cache GC (size-bounded LRU + age eviction)

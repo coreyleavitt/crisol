@@ -40,6 +40,26 @@
 ##         signal (int|null), durationMs (float),
 ##         records: [{ name, status (string), durationUs (int),
 ##                     msg (string|null), tags ([string]) }] }
+##     ],
+##     "compile": {   // OPTIONAL (rev 7): present only when telemetry exists
+##       "segments": [
+##         { groupId, configHash, rTime, rSize, ccPct, codegenPct, linkPct,
+##           reproducible (bool), artifactsTotal, artifactsShared,
+##           bytesTotal, bytesShared }
+##       ],
+##       "ambientCcacheDetected": bool,  // rev 8
+##       "topUnits": [ { basename, sizeBytes, ccTimeUs }, ... ],  // rev 8, top-10
+##       "compileRegressions": [   // rev 9: ALWAYS PRESENT (once compile exists); empty by default
+##         { entrypointIdentity, groupId, configHash, currentUs, baselineUs, thresholdUs }
+##       ],
+##       "objcache": {   // rev 10: OPTIONAL; present only when the objcache stream ran
+##         hits, misses, stored, disabled, hitRate, reusedBytes, cacheSizeBytes,
+##         "segments": [ { groupId, configHash, hits, misses, stored, hitRate, reusedBytes } ],
+##         "note"
+##       }
+##     },
+##     "reuseAlerts": [   // rev 8: ALWAYS PRESENT; empty when reuse-check disabled
+##       { groupId, configHash, rTime, alertBelow }
 ##     ]
 ##   }
 ##
@@ -77,7 +97,7 @@ const RunV1Schema* = "crisol/run/v1"
   ## Import crisol/api (or crisol/jsonout directly) to reference this constant
   ## rather than duplicating the string literal.
 
-const RunV1Revision* = 6
+const RunV1Revision* = 11
   ## Integer minor revision of the crisol/run/v1 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v1"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -93,6 +113,61 @@ const RunV1Revision* = 6
   ##   rev 6 (M8)      — cacheDecision vocabulary expanded: "stored" (miss+stored),
   ##                     "groupOptOut" (cacheable #false config), legacy "keyMiss"
   ##                     now means ran-but-not-stored; "policyDisabled" is --no-cache only.
+  ##   rev 7 (M-report a) — top-level `compile` object: segmented per
+  ##                     (groupId, configHash) reuse/cost-split summary
+  ##                     (segments[].{groupId, configHash, rTime, rSize, ccPct,
+  ##                     codegenPct, linkPct, reproducible, artifactsTotal,
+  ##                     artifactsShared, bytesTotal, bytesShared}).  FIELD IS
+  ##                     ABSENT (not merely empty) when measureCompileReuse is
+  ##                     off — additive/back-compat with pre-rev-7 documents.
+  ##   rev 8 (M-report b1) — top-level `reuseAlerts` array (groupId, configHash,
+  ##                     rTime, alertBelow); ALWAYS PRESENT, empty when
+  ##                     reuse-check is disabled (default) or no segment
+  ##                     qualifies — mirrors the `regressions` array's
+  ##                     present-but-possibly-empty convention (unlike
+  ##                     `compile`, which is absent entirely when there is no
+  ##                     telemetry). Also: `compile.ambientCcacheDetected`
+  ##                     (bool) and `compile.topUnits` (top-10 per-basename
+  ##                     {basename, sizeBytes, ccTimeUs}, both additive
+  ##                     siblings of `compile.segments`.
+  ##   rev 9 (M-report b2) — `compile.compileRegressions` array (entrypointIdentity,
+  ##                     groupId, configHash, currentUs, baselineUs,
+  ##                     thresholdUs): the compile-wall-time analog of the
+  ##                     top-level `regressions` array, but nested inside
+  ##                     `compile` (only meaningful when measureCompileReuse
+  ##                     is on). ALWAYS PRESENT once `compile` exists, empty
+  ##                     when no entrypoint regressed or history is
+  ##                     insufficient — mirrors `regressions`' own
+  ##                     present-but-possibly-empty convention.
+  ##   rev 10 (Stage R R5b) — `compile.objcache` object: realized objcache
+  ##                     hit/miss/store telemetry aggregated across the run
+  ##                     (hits, misses, stored, disabled, hitRate,
+  ##                     reusedBytes, cacheSizeBytes) plus a per-(groupId,
+  ##                     configHash) `segments` breakdown and a `note` net-
+  ##                     impact caveat. ABSENT (not merely empty) when the
+  ##                     objcache stream never ran (objCache off, or no
+  ##                     cache-mode compiles this run) — additive/back-compat
+  ##                     with pre-rev-10 documents, mirroring `compile`
+  ##                     itself. `compile.objcache.segments[].hitRate` (the
+  ##                     REALIZED reuse rate) is keyed identically to
+  ##                     `compile.segments[].rTime` (the POTENTIAL reuse
+  ##                     rate) so the two can be compared per segment — see
+  ##                     compilereport.nim's "Drift tie-in" doc.
+  ##   rev 11 (code review R7) — each `compile.segments[]` entry gains
+  ##                     `currentRunEntrypoints` (int: distinct entrypoints
+  ##                     THIS run itself contributed artifact rows for to
+  ##                     this segment), `sampleEntrypoints` (int: distinct
+  ##                     entrypoints contributing ANY row, all history
+  ##                     included), and `lowConfidence` (bool: true iff
+  ##                     `currentRunEntrypoints` is below
+  ##                     compilereport.LowConfidenceMinEntrypoints). A
+  ##                     `--changed`-narrowed run touching only 1-2
+  ##                     entrypoints now marks its segments low-confidence,
+  ##                     and `reuseAlerts` SKIPS low-confidence segments
+  ##                     regardless of rTime (matches the RFC's own "marked
+  ##                     low-confidence (and reuse-check suppressed)"
+  ##                     commitment). Purely additive per-segment fields —
+  ##                     no existing field's meaning changes.
   ## A reader seeing `schemaRevision > RunV1Revision` treats the file as no-data
   ## (safe cold-start) — it was written by a newer crisol.
 
@@ -139,7 +214,9 @@ proc cacheDecisionString*(d: CacheDecision): string =
 proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              filterTag: string = "";
              warnings: seq[ConfigWarning] = @[];
-             memThrottledSlots: int = 0): JsonNode =
+             memThrottledSlots: int = 0;
+             compileBlock: JsonNode = nil;
+             reuseAlerts: JsonNode = nil): JsonNode =
   ## Pure: serialize to the crisol/run/v1 JsonNode.
   ## No I/O.
   ## C3: when filterTag is non-empty, each entrypoint's records array contains
@@ -148,6 +225,14 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## warnings: config warnings (unknown keys) threaded from loadConfig.
   ## memThrottledSlots: count of slots that were memory-blocked (S2a schema
   ## field; populated by AdmissionController in S6b).  Defaults to 0. # S6b
+  ## compileBlock: M-report pass (a) segmented compile-reuse/cost-split block
+  ## (crisol/compilereport.readCompileBlock), or nil when no telemetry exists
+  ## (measureCompileReuse off). nil -> the "compile" field is OMITTED entirely
+  ## (additive/back-compat) rather than emitted as an empty object.
+  ## reuseAlerts: M-report pass (b1) alert array
+  ## (crisol/compilereport.buildReuseAlerts). Unlike compileBlock, this field
+  ## is ALWAYS PRESENT (mirrors `regressions`) -- nil/omitted is treated as an
+  ## empty JArray, never omitted from the document.
 
   # Build summary object (always full-run counts)
   let summaryNode = newJObject()
@@ -243,14 +328,20 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
   result["warnings"]         = warningsToJsonArray(warnings)
   result["regressions"]      = regressionsNode  # C6: empty when perf-check disabled
+  if compileBlock != nil:
+    result["compile"] = compileBlock  # M-report pass (a): additive; absent when nil
+  # M-report pass (b1): always present, empty by default (mirrors `regressions`).
+  result["reuseAlerts"] = if reuseAlerts != nil: reuseAlerts else: newJArray()
 
 proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    filterTag: string = "";
                    warnings: seq[ConfigWarning] = @[];
-                   memThrottledSlots: int = 0): string =
+                   memThrottledSlots: int = 0;
+                   compileBlock: JsonNode = nil;
+                   reuseAlerts: JsonNode = nil): string =
   ## Pure: compact JSON string of the crisol/run/v1 document.
   ## C3: filterTag threads through to toJson.
-  $toJson(results, summary, filterTag, warnings, memThrottledSlots)
+  $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock, reuseAlerts)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
@@ -259,13 +350,19 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
 proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
                      config: Config;
                      warnings: seq[ConfigWarning] = @[];
-                     memThrottledSlots: int = 0) =
+                     memThrottledSlots: int = 0;
+                     compileBlock: JsonNode = nil;
+                     reuseAlerts: JsonNode = nil) =
   ## Write lastrun.json atomically to <projectRoot>/<stateDir>/lastrun.json.
   ## Creates the state directory if it does not exist.
   ## On any failure: prints a warning to stderr and returns -- never raises.
   ##
   ## warnings and memThrottledSlots are threaded through to toJsonString so
   ## the persisted file matches the stdout JSON path exactly (M3 fix).
+  ## compileBlock: M-report pass (a) segmented compile block, or nil (default)
+  ## when there is no telemetry to report -- threads through unchanged.
+  ## reuseAlerts: M-report pass (b1) alert array, or nil (default; persisted
+  ## as an empty array) -- threads through unchanged.
   let stateDir = stateDirOf(config)
   let finalPath = stateDir / "lastrun.json"
 
@@ -284,7 +381,9 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   let tmpPath = finalPath & ".tmp"
   try: removeFile(tmpPath) except: discard
   let jsonStr = toJsonString(results, summary, warnings = warnings,
-                             memThrottledSlots = memThrottledSlots)
+                             memThrottledSlots = memThrottledSlots,
+                             compileBlock = compileBlock,
+                             reuseAlerts = reuseAlerts)
   var tmpFd: cint = -1
   try:
     let flags = O_CREAT or O_EXCL or O_WRONLY or O_CLOEXEC

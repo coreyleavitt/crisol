@@ -30,9 +30,9 @@
 ##   • Output captured to per-entrypoint temp files; read atomically after
 ##     completion; bounded by maxOutputBytes.
 
-import std/[algorithm, monotimes, options, os, sequtils, sets, times]
+import std/[algorithm, json, monotimes, options, os, sequtils, sets, times]
 import std/posix
-import crisol/[types, config, spawn, signals, render, depgraph, closure, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys]
+import crisol/[types, config, spawn, signals, render, depgraph, closure, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan]
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
 # M4: re-export the CacheContext bundle + constructors so callers of execute()
 # don't need a separate `import crisol/cachedispatch`.
@@ -317,6 +317,65 @@ proc classifyRunResult(
                      output: output, durationMs: elapsed,
                      compileSkipped: compileSkipped)
 
+proc warnMeasureCompileReuseNoWorkerOnce() =
+  ## One-shot (per process, not per entrypoint) warning for the degraded-mode
+  ## fallback in spawnCompileStable: measureCompileReuse was requested but no
+  ## workerBinary is configured. spawnCompileStable runs once per compile
+  ## slot — potentially hundreds of times in a single invocation — so this
+  ## must not spam; the `{.global.}` var idiom (matching ledger.nim's
+  ## bootId/shardSeq pattern) gives it process-lifetime-once semantics.
+  var warned {.global.}: bool = false
+  if not warned:
+    stderr.write("crisol: warning: measure-compile-reuse requested but no " &
+                 "worker binary configured; compiling monolithically " &
+                 "(measurement skipped)\n")
+    warned = true
+
+proc warnObjCacheNoWorkerOnce() =
+  ## RFC-0006 Stage R, R2b2: the objCache sibling of
+  ## warnMeasureCompileReuseNoWorkerOnce above — same one-shot-per-process
+  ## rationale, degraded-mode fallback when objCache is requested but no
+  ## workerBinary is configured (a library host that never set
+  ## RunOptions.workerBinary).
+  var warned {.global.}: bool = false
+  if not warned:
+    stderr.write("crisol: warning: objcache requested but no worker " &
+                 "binary configured; compiling monolithically " &
+                 "(cache skipped)\n")
+    warned = true
+
+proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string;
+                             config: Config): MeasurePlan =
+  ## Shared plan construction for BOTH compile-slot worker children — the
+  ## RFC-0006 Stage R cache worker (`config.objCache`) and the
+  ## M-artifact-identity measurement worker (`config.measureCompileReuse`).
+  ## Both dispatch the SAME `MeasurePlan` schema — measureworker.nim's own
+  ## documented contract for `--internal-compile-worker` is "no schema
+  ## change: R2b1's plan carries exactly what measure mode's plan carries" —
+  ## so one constructor is the single source of truth for both workers'
+  ## plan.json inputs, instead of two copies that could silently drift.
+  ##
+  ## configHash = flagHash(ep.flags), computed PER-ENTRYPOINT — this MUST
+  ## collide with appendAttemptRow's identityKey(ep.path, flagHash(ep.flags))
+  ## (this file, ~line 156) or ArtifactRows silently orphan from the
+  ## RunLedger's IdentityKey (measureworker.nim's own documented contract).
+  MeasurePlan(
+    entrypointPath:    ep.path,
+    entrypointAbsPath: epAbs,
+    flags:             ep.flags,
+    nimcacheDir:       cacheDir,
+    outputBinPath:     binCompiled,
+    groupId:           ep.group,
+    configHash:        flagHash(ep.flags),
+    stateDir:          stateDirOf(config),
+    # review Finding 3: thread the configured objcache write-time soft-cap
+    # inputs through to the cache worker (see workerplan.MeasurePlan's own
+    # doc for the 0-means-what convention of each). The measure-mode worker
+    # never reads either field.
+    objcacheMaxEntries: config.objcacheMaxEntries,
+    objcacheMaxBytes:   int64(config.objcacheMaxBytes),
+  )
+
 proc spawnCompileStable(
   slot:             var Slot;
   pepIdx:           int;
@@ -372,16 +431,91 @@ proc spawnCompileStable(
   let runOut  = tmpDir / "run_out.txt"
   let sinkFile = tmpDir / "sink.ndjson"
 
-  var compArgs = @[
-    "nim", "c",
-    "--mm:orc",
-    "--hints:off",
-    "--nimcache:" & cacheDir,
-    "-o:" & binCompiled,
-  ]
-  for flag in ep.flags:
-    compArgs.add flag
-  compArgs.add epAbs  # R3: absolute path
+  # config.workerBinary (NOT getAppFilename()) is always the worker's argv[0]
+  # below, for BOTH worker branches: getAppFilename() returns the CURRENTLY
+  # RUNNING process's binary, which is only a sound worker host when that
+  # process itself dispatches the relevant internal token (true of the
+  # crisol CLI, never guaranteed of an arbitrary library host — see
+  # Config.workerBinary's doc in types.nim). An empty workerBinary always
+  # falls through to the monolithic path rather than guessing with
+  # getAppFilename().
+  template monolithicCompArgs(): seq[string] =
+    var args = @[
+      "nim", "c",
+      "--mm:orc",
+      "--hints:off",
+      "--nimcache:" & cacheDir,
+      "-o:" & binCompiled,
+    ]
+    for flag in ep.flags:
+      args.add flag
+    args.add epAbs  # R3: absolute path
+    args
+
+  var compArgs: seq[string]
+  if config.objCache and config.workerBinary.len > 0:
+    # RFC-0006 Stage R, R2b2: the slot's ONE compile child becomes the
+    # cache-mode compile worker (`<workerBinary> --internal-compile-worker
+    # <plan.json>`) instead of a direct `nim c` invocation. Highest
+    # precedence of the three compile-slot strategies (objCache > measure >
+    # monolithic — v1's default-off, opt-in decision). The worker produces
+    # the SAME runnable binary at `binCompiled` either way, so everything
+    # downstream of this branch (phase=spCompiling, pid tracking, deadline,
+    # the spCompiling→spRunning transition that runs slot.binCompiled) is
+    # unaffected — see measureworker.nim's `runCompileCacheWorker` doc for
+    # the worker-side pipeline and its own monolithic escape hatch.
+    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config)
+    let planPath = tmpDir / "compile_plan.json"
+    try:
+      writeFile(planPath, $toJson(mplan))
+    except:
+      try: removeDir(tmpDir)     except: discard
+      try: removeDir(cacheDir)   except: discard  # M15
+      try: removeDir(binDirSlot) except: discard  # M15
+      return false
+    compArgs = @[config.workerBinary, InternalCompileWorkerToken, planPath]
+  elif config.objCache:
+    # objCache was requested but no sound worker binary is configured (a
+    # library host that never set RunOptions.workerBinary). NEVER call
+    # getAppFilename() here — same unbounded-recursive-fork hazard
+    # measureCompileReuse's own no-worker fallback below guards against.
+    # Degrade to the monolithic `nim c` path (cache skipped); warn once per
+    # process, not once per entrypoint (this runs per compile slot,
+    # potentially hundreds of times per invocation).
+    warnObjCacheNoWorkerOnce()
+    compArgs = monolithicCompArgs()
+  elif config.measureCompileReuse and config.workerBinary.len > 0:
+    # RFC-0006 M-artifact-identity PASS (b2): the slot's ONE compile child
+    # becomes the measurement worker (`<workerBinary> --internal-measure-compile
+    # <plan.json>`) instead of a direct `nim c` invocation. The worker
+    # produces the SAME runnable binary at `binCompiled` either way, so
+    # everything downstream of this branch is unaffected. Only reached when
+    # objCache is off — objCache (cache worker) takes precedence over
+    # measureCompileReuse (measure worker) when both are set, since the two
+    # workers are mutually exclusive compile-slot children.
+    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config)
+    let planPath = tmpDir / "measure_plan.json"
+    try:
+      writeFile(planPath, $toJson(mplan))
+    except:
+      try: removeDir(tmpDir)     except: discard
+      try: removeDir(cacheDir)   except: discard  # M15
+      try: removeDir(binDirSlot) except: discard  # M15
+      return false
+    compArgs = @[config.workerBinary, InternalMeasureCompileToken, planPath]
+  else:
+    if config.measureCompileReuse:
+      # measureCompileReuse was requested but no sound worker binary is
+      # configured (library host that never set RunOptions.workerBinary).
+      # NEVER call getAppFilename() here — that would re-exec the CURRENTLY
+      # RUNNING process (the library host's own binary, not crisol), which
+      # ignores --internal-measure-compile and just re-runs the host program
+      # again → unbounded recursive fork, only stopped by the compile
+      # watchdog. Degrade to the monolithic `nim c` path instead (measurement
+      # skipped); warn once per process, not once per entrypoint (this runs
+      # per compile slot, potentially hundreds of times per invocation).
+      warnMeasureCompileReuseNoWorkerOnce()
+    compArgs = monolithicCompArgs()
 
   let fd = openOutputFile(compOut)
   if fd < 0:
