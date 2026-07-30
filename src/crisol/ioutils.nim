@@ -31,8 +31,8 @@
 ## implemented inline for its per-key JSON entries: write `data` to a
 ## PID-suffixed temp path with `O_CREAT|O_EXCL` (fails closed on a planted
 ## symlink/file), `writeAllFd` the bytes, then `moveFile`/`rename(2)` into
-## place.  Lifted here (RFC-0006 R1) so resultcache.nim AND objcache.nim share
-## exactly one correct implementation instead of hand-copying it a second time.
+## place.  Lifted here (RFC-0006 R1) so resultcache.nim has exactly one
+## correct implementation instead of an inline copy.
 ##
 ## Never raises: any open/write/rename failure returns `ok=false` (with a
 ## non-empty `error` naming the failing step and the underlying OS reason —
@@ -46,9 +46,8 @@
 ##
 ## Before the R1 factor-out, `resultcache.storeCached` logged the specific
 ## OSError message on a failed write (`"could not write cache entry '…': " &
-## e.msg`).  Returning a bare `bool` regressed that diagnostic for both
-## `resultcache.storeCached` and `objcache.storeObject` — exactly the detail
-## an operator needs to tell "permission denied" from "disk full" from
+## e.msg`).  Returning a bare `bool` regressed that diagnostic —
+## exactly the detail an operator needs to tell "permission denied" from "disk full" from
 ## "EXDEV" from "a planted symlink" apart.  `atomicPutFile` now returns
 ## `tuple[ok: bool; error: string]`: `error` is `""` on success, and on
 ## failure names the step (create temp / write temp / rename into place) and
@@ -105,9 +104,8 @@ proc atomicPutFile*(finalPath: string; data: string): tuple[ok: bool; error: str
   ## R10) so callers can log a diagnostic that actually explains a production
   ## failure (permission denied, disk full, EXDEV, a planted symlink, …)
   ## instead of a bare "could not write" with no cause.  This helper is
-  ## reused for both JSON entries (resultcache) and raw object bytes
-  ## (objcache); it does not itself write to stderr — callers log using the
-  ## returned `error`.
+  ## reused for resultcache's JSON entries; it does not itself write to
+  ## stderr — callers log using the returned `error`.
   let tmpPath = finalPath & "." & $posix_mod.getpid() & ".tmp"
 
   # Best-effort removal of our own PID-specific leftover .tmp (a retry within

@@ -1,6 +1,15 @@
 # RFC-0006 — Cross-entrypoint compile reuse — handoff
 
-## ✅✅ RFC-0006 SHIPPED & COMMITTED (2026-07-29). Review + lows complete; committed on `main`.
+## ⛔ STAGE R (object cache) REMOVED — NEGATIVE RESULT (2026-07-30). Stage M (measurement) RETAINED.
+A real end-to-end A/B on amoxtli (the actual consumer, full-suite `--force-compile`) proved the object cache does NOT pay off:
+- No objcache (baseline): 1316s · Objcache warm: 1335s (+1.4%, noise), hitRate 0.88 / 2.13 GB reused · Objcache cold: ~1817s (~+38% SLOWER).
+- Root cause (structural, foreseen by the RFC's own cost-split caveat): amoxtli's compile is Nim-**codegen**-bound (~55%); Stage R only accelerates the **cc** half (~44%), which in a PARALLEL compile overlaps behind codegen — so 0.88 hitRate lands OFF the critical path, and key/preimage/worker overhead cancels the cc saving. The RFC-0004 result cache already skips unchanged entrypoints, so objcache barely engages in the dev loop anyway.
+- **Process lesson:** the decision gate greenlit R on `r_time` (POTENTIAL cc reuse), not realized wall-clock. The authoritative gate is an end-to-end A/B on the real consumer — run BEFORE flipping default-on. See memory [[rfc-0006-objcache-benchmark-negative]].
+- **Decision (Corey):** strip Stage R entirely (it's a correctness-critical, result-cache-tainting path with no beneficiary in crisol's Nim-codegen-bound audience); KEEP Stage M — it's measurement-only (no soundness surface) and is the diagnostic for the real lever (codegen). DO NOT re-chase substrate/.o reuse: the ceiling is ORC whole-program DCE making codegen program-specific.
+- **Removed (2026-07-30):** objcache.nim/objkey.nim/cacheworker.nim/objcachestats.nim + their tests; cache-mode amputated from runner/api/config/types/clean/compiledriver/compilereport/jsonout/workerplan/crisol.nim. RFC-0004 KeyInputs tripwire preserved (moved to test_keys.nim). **RunV1Revision 11→12.** Verified: `./dev check`/`build` clean; Stage M works end-to-end; result cache untouched (cdSkipFresh confirmed).
+- **The real lever (next):** Nim codegen, not cc. Measure amboxtli's per-entrypoint codegen distribution + saturation (Stage M emits this) → the crisol-side wins are scheduling headroom or the consumer reducing generic instantiation; the only lever that kills codegen redundancy is bin-packing (deliberately off-limits per crisol identity) or Nim IC (broken under ORC here).
+
+## (historical, now partly superseded) ✅✅ RFC-0006 SHIPPED & COMMITTED (2026-07-29). Review + lows complete; committed on `main`.
 - Commits on `main`: **`bfda648`** (RFC-0006 implementation, 75 files) + **`5dff9ad`** (low-severity review fixes, 10 files). Both clean (verified: no Co-Authored-By/claude trailer).
 - ALL review findings resolved: 1 Crit + 2 High + 16 Medium (R1–R16 + RS1/RC1/RS2/RD1) + 6 Lows (L1–L6). icbaseline.nim kept (empirical IC-broken-under-ORC record); TOCTOU S3 = confirmed non-issue.
 - objcache DEFAULT-ON (Corey's call); `--no-objcache` opts out; measurement takes precedence over caching (inverts RFC's old "objCache precedence" wording — deliberate consequence of default-on, flagged to Corey).

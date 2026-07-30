@@ -284,7 +284,7 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     let lastRunPath = stateDir / "lastrun.json"
     check fileExists(lastRunPath)
     let doc = parseJson(readFile(lastRunPath))
-    check doc["schemaRevision"].getInt == 11
+    check doc["schemaRevision"].getInt == 12
 
     check doc.hasKey("compile")
     let segments = doc["compile"]["segments"]
@@ -400,7 +400,7 @@ reuse-check {
     if exitCode2 != 0: echo "crisol run 2 output:\n", output2
 
     let doc = parseJson(readFile(stateDir / "lastrun.json"))
-    check doc["schemaRevision"].getInt == 11
+    check doc["schemaRevision"].getInt == 12
     check doc.hasKey("compile")
     let compileBlock = doc["compile"]
 

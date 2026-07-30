@@ -523,12 +523,12 @@ proc captureStdoutToFile(path: string; body: proc()): void =
 # `runMain()` below is called IN-PROCESS: this unittest binary itself is the
 # "currently running process." Before the Issue-2 fix, runMain UNCONDITIONALLY
 # set RunOptions.workerBinary = getAppFilename(), which here resolves to THIS
-# TEST BINARY -- not crisol. With objCache now default-on, that made
-# spawnCompileStable self-reexec this test binary as the "cache worker": the
-# re-invoked process doesn't dispatch --internal-compile-worker at all (its
-# entrypoint is the unittest runner, not crisol.runMain), so it just re-runs
-# the whole test suite -- unsound, and a potential unbounded recursive fork
-# (see crisol.nim's runMain doc / RFC-0006 handoff for the full mechanism).
+# TEST BINARY -- not crisol. Had a measure/cache worker been requested, that
+# would have made spawnCompileStable self-reexec this test binary as the
+# "worker": the re-invoked process doesn't dispatch the internal token at all
+# (its entrypoint is the unittest runner, not crisol.runMain), so it just
+# re-runs the whole test suite -- unsound, and a potential unbounded
+# recursive fork (see crisol.nim's runMain doc for the full mechanism).
 #
 # Two independent hazards must both be ruled out for a genuinely COLD proof:
 #   1. workerBinary must stay "" for an in-process runMain() call (the actual
@@ -565,13 +565,14 @@ suite "jsonout - --json CLI flag":
   test "--json flag: stdout is valid parseable JSON":
     ## RFC-0006 Issue-2 regression: this test used to flake because runMain
     ## (in-process, this test binary) set workerBinary = getAppFilename()
-    ## unconditionally; with objCache default-on that self-reexec'd THIS
-    ## test binary as an unsound "cache worker." Fixed structurally (runMain
-    ## now only wires workerBinary from an explicit `selfWorkerBinary` param
-    ## that ONLY the real crisol CLI's own top-level entrypoint passes) --
-    ## this test proves the fix deterministically with a fresh, genuinely
-    ## COLD stateDir so the compile step is never skipped/masked by cache
-    ## state (see the standing verification rules).
+    ## unconditionally; had a worker been requested that would have
+    ## self-reexec'd THIS test binary as an unsound worker. Fixed
+    ## structurally (runMain now only wires workerBinary from an explicit
+    ## `selfWorkerBinary` param that ONLY the real crisol CLI's own
+    ## top-level entrypoint passes) -- this test proves the fix
+    ## deterministically with a fresh, genuinely COLD stateDir so the
+    ## compile step is never skipped/masked by cache state (see the
+    ## standing verification rules).
     withFreshCrisolStateDir("stdout_json"):
       let outPath = getTempDir() / "crisol_json_stdout.json"
       defer: (try: removeFile(outPath) except: discard)
@@ -587,20 +588,18 @@ suite "jsonout - --json CLI flag":
       let parsed = parseJson(raw.strip())
       check parsed["schema"].getStr == "crisol/run/v1"
 
-  test "RFC-0006 Issue-2 regression: in-process runMain() with default-on objcache and no selfWorkerBinary never self-reexecs; compiles monolithically and succeeds (cold stateDir)":
+  test "RFC-0006 Issue-2 regression: in-process runMain() with no selfWorkerBinary never self-reexecs; compiles monolithically and succeeds (cold stateDir)":
     ## Direct proof of the fix's soundness invariant. Before the fix,
     ## runMain(args) called in-process (no selfWorkerBinary argument, as
     ## every caller here does) would still set RunOptions.workerBinary =
-    ## getAppFilename() = THIS test binary; with objCache default-on,
-    ## spawnCompileStable would self-reexec this test binary as the "cache
-    ## worker" -- which doesn't dispatch --internal-compile-worker and so
+    ## getAppFilename() = THIS test binary; had a compile-slot worker been
+    ## requested, spawnCompileStable would self-reexec this test binary as
+    ## the "worker" -- which doesn't dispatch the internal token and so
     ## just re-runs the whole unittest suite (unsound; a bounded elapsed-time
     ## check below is the observable guard against that never terminating
     ## quickly). After the fix, runMain's default `selfWorkerBinary = ""`
     ## means RunOptions.workerBinary stays "" here, so spawnCompileStable
-    ## degrades to the safe monolithic `nim c` path (with an R13
-    ## ConfigWarning about objcache having no worker binary, expected and
-    ## harmless -- it goes to stderr, never stdout).
+    ## always degrades to the safe monolithic `nim c` path.
     withFreshCrisolStateDir("issue2_regress"):
       let outPath = getTempDir() / "crisol_issue2_regress_stdout.json"
       defer: (try: removeFile(outPath) except: discard)
@@ -1288,58 +1287,14 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
     check $withEmpty == $withOmitted
 
 # ---------------------------------------------------------------------------
-# Stage R, R5b — compile.objcache, additive/back-compat
-# ---------------------------------------------------------------------------
-
-suite "jsonout Stage R R5b — compile.objcache threading":
-
-  test "RunV1Revision was bumped again for the additive compile.objcache field":
-    check RunV1Revision >= 10
-
-  test "a compileBlock carrying a non-empty objcache sub-block threads through toJson opaquely":
-    var blk = newJObject()
-    blk["segments"] = newJArray()
-    var oc = newJObject()
-    oc["hits"]           = newJInt(5)
-    oc["misses"]         = newJInt(3)
-    oc["stored"]         = newJInt(2)
-    oc["disabled"]       = newJInt(0)
-    oc["hitRate"]        = newJFloat(5.0 / 8.0)
-    oc["reusedBytes"]    = newJInt(500)
-    oc["cacheSizeBytes"] = newJInt(10_000)
-    oc["segments"]       = newJArray()
-    oc["note"]           = newJString("net-impact caveat")
-    blk["objcache"] = oc
-
-    let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
-    check node["compile"]["objcache"]["hits"].getInt == 5
-    check node["compile"]["objcache"]["hitRate"].getFloat == 5.0 / 8.0
-    check node["compile"]["objcache"]["cacheSizeBytes"].getBiggestInt == 10_000
-    check node["compile"]["objcache"]["note"].getStr == "net-impact caveat"
-
-  test "a compileBlock with no 'objcache' key (measurement-only run, objcache never ran) is otherwise unaffected apart from the rev bump":
-    var blk = newJObject()
-    blk["segments"] = newJArray()
-
-    let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
-    check node.hasKey("compile")
-    check not node["compile"].hasKey("objcache")
-    check node["schemaRevision"].getInt == RunV1Revision
-
-  test "compileBlock=nil (objcache and measurement both off): document is byte-identical to before this slice apart from the rev bump":
-    let withDefault = toJson(syntheticResults(), syntheticSummary())
-    check not withDefault.hasKey("compile")
-    check withDefault["schemaRevision"].getInt == RunV1Revision
-
-# ---------------------------------------------------------------------------
 # Code review R7 — compile.segments[] gains currentRunEntrypoints/
 # sampleEntrypoints/lowConfidence, additive/back-compat (RunV1Revision 10->11)
 # ---------------------------------------------------------------------------
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunV1Revision was bumped again for the additive segment-level low-confidence-gate fields":
-    check RunV1Revision == 11
+  test "RunV1Revision was bumped again for RFC-0006 Stage R removal (compile.objcache no longer appears)":
+    check RunV1Revision == 12
 
   test "a compileBlock carrying the new per-segment fields threads through toJson opaquely (jsonout never inspects compile's internal shape)":
     var blk = newJObject()

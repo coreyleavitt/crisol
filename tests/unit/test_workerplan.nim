@@ -1,6 +1,6 @@
 ## test_workerplan.nim — unit tests for crisol/workerplan.nim (RFC-0006
-## M-artifact-identity, PASS (b1) + review Finding 3): the MeasurePlan schema
-## shared by the measure-mode and cache-mode compile workers.
+## M-artifact-identity, PASS (b1)): the MeasurePlan schema used by the
+## measurement compile worker.
 ##
 ## No real `nim`/`cc` invocation anywhere in this file. This file covers:
 ##
@@ -34,8 +34,6 @@ proc samplePlan(): MeasurePlan =
     groupId:           "unit",
     configHash:        "deadbeefcafef00d",
     stateDir:          "/workspace/.crisol",
-    objcacheMaxEntries: 42,
-    objcacheMaxBytes:   123_456_789'i64,
   )
 
 # ===========================================================================
@@ -59,23 +57,6 @@ suite "MeasurePlan — toJson / parseMeasurePlan round-trip":
     check parsed.groupId           == plan.groupId
     check parsed.configHash        == plan.configHash
     check parsed.stateDir          == plan.stateDir
-    check parsed.objcacheMaxEntries == plan.objcacheMaxEntries
-    check parsed.objcacheMaxBytes   == plan.objcacheMaxBytes
-
-  test "review Finding 3: objcacheMaxEntries/objcacheMaxBytes absent from the JSON default to 0 (unconfigured), not a parse failure":
-    let path = tmpPlanPath()
-    var n = newJObject()
-    n["entrypointPath"]    = newJString("tests/fixtures/pass_always.nim")
-    n["entrypointAbsPath"] = newJString("/workspace/tests/fixtures/pass_always.nim")
-    n["nimcacheDir"]       = newJString("/workspace/.crisol/cache/x")
-    n["outputBinPath"]     = newJString("/workspace/.crisol/bin/x/pass_always")
-    n["stateDir"]          = newJString("/workspace/.crisol")
-    writeFile(path, $n)
-    defer: removeFile(path)
-
-    let parsed = parseMeasurePlan(path)
-    check parsed.objcacheMaxEntries == 0
-    check parsed.objcacheMaxBytes   == 0'i64
 
   test "an empty flags array round-trips as an empty seq (not a parse failure)":
     var plan = samplePlan()
@@ -102,26 +83,6 @@ suite "MeasurePlan — toJson / parseMeasurePlan round-trip":
     check parsed.groupId == ""
     check parsed.configHash == ""
     check parsed.flags.len == 0
-
-  test "the SAME plan schema round-trips for the compile-cache worker (RFC-0006 R2b1: no schema change)":
-    ## `runCompileCacheWorker` (the R2b1 cache-mode worker) reuses
-    ## `MeasurePlan`/`parseMeasurePlan` verbatim — no separate "cache plan"
-    ## schema. This test pins that: a plan authored for cache-mode dispatch
-    ## parses identically to a measure-mode plan.
-    let plan = samplePlan()
-    let path = tmpPlanPath()
-    writeFile(path, $toJson(plan))
-    defer: removeFile(path)
-
-    let parsed = parseMeasurePlan(path)
-    check parsed.entrypointPath    == plan.entrypointPath
-    check parsed.entrypointAbsPath == plan.entrypointAbsPath
-    check parsed.flags             == plan.flags
-    check parsed.nimcacheDir       == plan.nimcacheDir
-    check parsed.outputBinPath     == plan.outputBinPath
-    check parsed.groupId           == plan.groupId
-    check parsed.configHash        == plan.configHash
-    check parsed.stateDir          == plan.stateDir
 
 # ===========================================================================
 # Behavior 2 — malformed plan -> clear CrisolError, never a bare exception

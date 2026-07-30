@@ -89,10 +89,11 @@
 ## `artifactledger.nim` makes for its `bootId` duplication).
 ##
 ## The RFC states Stage M must measure "on the exact key material Stage R
-## would use" — `stageRKey` (objkey.nim) additionally folds `nimVersion`/
-## `ccVersion` (toolchain fingerprint, constant within one run — irrelevant
-## to cross-entrypoint sharing WITHIN that run) and `normalize(ccCmd)` (a
-## REAL per-unit flag delta that two entrypoints can genuinely differ on).
+## would use" — Stage R's own key (removed with the object cache; see the
+## RFC's §Soundness) additionally folded `nimVersion`/`ccVersion` (toolchain
+## fingerprint, constant within one run — irrelevant to cross-entrypoint
+## sharing WITHIN that run) and `normalize(ccCmd)` (a REAL per-unit flag
+## delta that two entrypoints can genuinely differ on).
 ## Omitting `ccCmd` here let M over-count sharing: two units with identical
 ## `.c` + closure but a real cc-flag delta would count as SHARED under M's
 ## ratio while genuinely MISSING under R's key. Folding `normalizedCcCmd`
@@ -256,16 +257,11 @@ proc normalize*(content: string; knownStrings: openArray[string];
 # ---------------------------------------------------------------------------
 
 proc shellSplit*(s: string): tuple[toks: seq[string]; ok: bool] =
-  ## **Exported (review Finding 2).** Originally module-private, but two
-  ## other call sites tokenize this SAME manifest `ccCmd` shape and MUST
-  ## tokenize identically to `deriveCcMInvocation`'s own use below, or a
+  ## **Exported (review Finding 2).** Tokenizes a manifest `ccCmd` string
+  ## shell-AWARE, for `deriveCcMInvocation`'s own use below — a
   ## whitespace-containing path (realistic under WSL2 — the RFC itself calls
-  ## this out) silently corrupts their derivation instead of failing loudly:
-  ## `compiledriver.parseCcOutputObj` (extracting `-o <obj>`) and
-  ## `cacheworker.buildCacheKeyOf` (deriving the `.c` source path). Before
-  ## this export both used a plain `splitWhitespace()`, which — unlike this
-  ## tokenizer — has no concept of quoting at all, so it silently mis-splits
-  ## a shell-quoted space-containing argument instead of degrading via `ok`.
+  ## this out) would otherwise silently corrupt a naive `splitWhitespace()`
+  ## derivation instead of failing loudly.
   ##
   ## Minimal POSIX-shell-like tokenizer: single-quoted segments (literal, no
   ## escapes inside — matches `sh`), double-quoted segments (backslash

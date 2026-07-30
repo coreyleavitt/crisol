@@ -156,9 +156,11 @@ type
     ## M-report PASS (b1): compile-reuse alerting policy, derived from the
     ## `reuse-check` KDL block. SEPARATE surface from the (unconditional)
     ## `compile` measurement block itself — per RFC-0006, the alerting
-    ## policy's default-on-ness is gated on Stage R (objcache) being
-    ## adopted. Stage R is NOT adopted, so this stays OFF BY DEFAULT; only
-    ## an explicit `reuse-check { … }` config block enables it (mirrors
+    ## policy's default-on-ness is gated on Stage R (the object cache) being
+    ## adopted. Stage R was built, measured, and subsequently REMOVED (A/B
+    ## proved it didn't pay off on the target consumer), so this stays OFF
+    ## BY DEFAULT; only an explicit `reuse-check { … }` config block enables
+    ## it (mirrors
     ## PerfCheckConfig's enabled-gate shape, but with no preset system —
     ## presence of the block alone turns it on).
     enabled*:    bool   ## false = no alerting (default; block absent)
@@ -211,33 +213,6 @@ type
     ledgerMaxAgeDays*: int      ## A1c: drop ledger rows older than this many days during
                                 ## compaction.  0 = disabled (keep all rows).
                                 ## Consistent with cacheMaxAgeDays: opt-in, 0=disabled.
-    objcacheMaxEntries*: int    ## RFC-0006 Stage R, R4: max object-cache entries before GC
-                                ## evicts oldest (LRU by `.o` mtime).  0 = use
-                                ## DefaultMaxObjCacheEntries (10 000).  Mirrors maxCacheEntries:
-                                ## the soft-cap in storeObject uses this at write time
-                                ## (backstop); cleanOrphans uses it at GC time (real eviction).
-    objcacheMaxAgeDays*: int    ## RFC-0006 Stage R, R4: evict object-cache entries older than
-                                ## this many days.  0 = disabled (no age-based eviction).
-                                ## Mirrors cacheMaxAgeDays: opt-in, 0=disabled.
-    objcacheMaxBytes*: int      ## RFC-0006 review R6: aggregate-BYTE cap on the object cache
-                                ## (counting BOTH a pair's `.o` AND `.meta` sizes — the `.meta`
-                                ## carries the full key preimage, which embeds the entire
-                                ## normalized `.c` content, so it is not negligible). 0 =
-                                ## unbounded (no byte-based eviction) — same "0 = disabled"
-                                ## convention as objcacheMaxAgeDays. gcObjCache evicts oldest
-                                ## (age-then-size-LRU, same ordering as objcacheMaxEntries)
-                                ## until BOTH this bound and objcacheMaxEntries are satisfied;
-                                ## whichever bound is tighter drives more eviction. An
-                                ## entry-count cap alone cannot bound on-disk growth because
-                                ## per-entry size varies widely (tens to hundreds of KB), so
-                                ## this is a genuine circuit breaker, not a redundant knob.
-                                ## Review Finding 3: ALSO enforced at write time (not just at
-                                ## `crisol clean`'s GC pass) — threaded via `MeasurePlan.
-                                ## objcacheMaxBytes` (runner.buildCompileWorkerPlan) into
-                                ## `objcache.storeObject`'s soft cap (cacheworker.
-                                ## runCompileCacheWorker), so the DEFAULT `crisol run` path
-                                ## (objcache is default-on) gets an automatic, configured byte
-                                ## bound without a separate manual GC invocation.
     quarantine*:   HashSet[string]
                                 ## B3: set of entrypoint paths whose failures are EXCLUDED from
                                 ## the exit-1 decision.  Paths are project-root-relative, '/'
@@ -284,46 +259,6 @@ type
                                 ## guessing. The crisol CLI populates this with its own
                                 ## `getAppFilename()`; library callers set it via
                                 ## `RunOptions.workerBinary`.
-                                ## Equally required by `objCache` below (default ON): the
-                                ## `--internal-compile-worker` cache worker dispatches through
-                                ## this SAME binary. An empty workerBinary degrades objCache to
-                                ## monolithic compile too (one-shot warn + structured
-                                ## ConfigWarning), independent of measureCompileReuse.
-    objCache*: bool             ## RFC-0006 Stage R, R2b2: when true, a compile slot's child is
-                                ## the `--internal-compile-worker` cache worker (objcache.nim's
-                                ## cross-entrypoint object store) instead of a plain `nim c`
-                                ## invocation. DEFAULT ON as of the RFC-0006 review R1/R2/R4
-                                ## soundness fixes (object-cache key completeness + fail-safe
-                                ## degradation) landing green — a deliberate opt-OUT product
-                                ## decision now, not opt-in. This bare type-level field itself
-                                ## still zero-values to false (Nim object default); the ON
-                                ## default is applied where Config is actually built from a
-                                ## project's configuration — config.docToConfig's local
-                                ## `objCache` default (KDL `objcache` node absent) and
-                                ## config.conventionConfig (no crisol.kdl file at all) — NOT
-                                ## here, so that low-level/manual `Config(...)` construction
-                                ## elsewhere (e.g. runner.runEntrypoint's temporary Config) is
-                                ## unaffected by the product-level default. An explicit
-                                ## `objcache #false` config block, or `--no-objcache` /
-                                ## RunOptions.noObjCache at the resolveObjCache layer, still
-                                ## turns it off. **Review Finding 4:** `objCache` and
-                                ## `measureCompileReuse` are MUTUALLY EXCLUSIVE BY CONSTRUCTION,
-                                ## not by one "taking precedence" over the other at the runner
-                                ## branch-order level — `api.planImpl` suppresses `cfg.objCache`
-                                ## to `false` whenever `cfg.measureCompileReuse` resolves `true`
-                                ## (`cfg.objCache = resolveObjCache(...) and not
-                                ## cfg.measureCompileReuse`), BEFORE `Config` ever reaches
-                                ## `runner.spawnCompileStable` — so by the time the runner's own
-                                ## `if config.objCache ... elif config.measureCompileReuse ...`
-                                ## branch order is evaluated, a real caller (the CLI, `api.
-                                ## runTests`/`planTests`) has already made the two conditions
-                                ## non-overlapping. (`runner.spawnCompileStable`'s literal branch
-                                ## order is itself unspecified/never exercised with both true by
-                                ## any real caller — only a low-level test that constructs
-                                ## `Config` directly and bypasses `api.planImpl` can observe it.)
-                                ## Same self-reexec soundness requirement as measureCompileReuse:
-                                ## requires `workerBinary` to be set or this degrades to the
-                                ## monolithic path (never guesses via getAppFilename()).
 
   GroupSelectionKind* = enum
     gskDefault    ## run all non-opt-in groups

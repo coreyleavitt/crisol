@@ -51,12 +51,7 @@
 ##       "topUnits": [ { basename, sizeBytes, ccTimeUs }, ... ],  // rev 8, top-10
 ##       "compileRegressions": [   // rev 9: ALWAYS PRESENT (once compile exists); empty by default
 ##         { entrypointIdentity, groupId, configHash, currentUs, baselineUs, thresholdUs }
-##       ],
-##       "objcache": {   // rev 10: OPTIONAL; present only when the objcache stream ran
-##         hits, misses, stored, disabled, hitRate, reusedBytes, cacheSizeBytes,
-##         "segments": [ { groupId, configHash, hits, misses, stored, hitRate, reusedBytes } ],
-##         "note"
-##       }
+##       ]
 ##     },
 ##     "reuseAlerts": [   // rev 8: ALWAYS PRESENT; empty when reuse-check disabled
 ##       { groupId, configHash, rTime, alertBelow }
@@ -97,7 +92,7 @@ const RunV1Schema* = "crisol/run/v1"
   ## Import crisol/api (or crisol/jsonout directly) to reference this constant
   ## rather than duplicating the string literal.
 
-const RunV1Revision* = 11
+const RunV1Revision* = 12
   ## Integer minor revision of the crisol/run/v1 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v1"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -139,20 +134,12 @@ const RunV1Revision* = 11
   ##                     when no entrypoint regressed or history is
   ##                     insufficient — mirrors `regressions`' own
   ##                     present-but-possibly-empty convention.
-  ##   rev 10 (Stage R R5b) — `compile.objcache` object: realized objcache
-  ##                     hit/miss/store telemetry aggregated across the run
-  ##                     (hits, misses, stored, disabled, hitRate,
-  ##                     reusedBytes, cacheSizeBytes) plus a per-(groupId,
-  ##                     configHash) `segments` breakdown and a `note` net-
-  ##                     impact caveat. ABSENT (not merely empty) when the
-  ##                     objcache stream never ran (objCache off, or no
-  ##                     cache-mode compiles this run) — additive/back-compat
-  ##                     with pre-rev-10 documents, mirroring `compile`
-  ##                     itself. `compile.objcache.segments[].hitRate` (the
-  ##                     REALIZED reuse rate) is keyed identically to
-  ##                     `compile.segments[].rTime` (the POTENTIAL reuse
-  ##                     rate) so the two can be compared per segment — see
-  ##                     compilereport.nim's "Drift tie-in" doc.
+  ##   rev 10 (Stage R R5b, REMOVED in rev 12) — formerly `compile.objcache`,
+  ##                     realized object-cache hit/miss/store telemetry. The
+  ##                     RFC-0006 Stage R object cache was removed after an
+  ##                     end-to-end A/B showed it didn't pay off on the target
+  ##                     consumer (codegen-bound, not cc-bound; cold runs were
+  ##                     slower) — see rev 12.
   ##   rev 11 (code review R7) — each `compile.segments[]` entry gains
   ##                     `currentRunEntrypoints` (int: distinct entrypoints
   ##                     THIS run itself contributed artifact rows for to
@@ -168,6 +155,15 @@ const RunV1Revision* = 11
   ##                     low-confidence (and reuse-check suppressed)"
   ##                     commitment). Purely additive per-segment fields —
   ##                     no existing field's meaning changes.
+  ##   rev 12 — RFC-0006 Stage R (the object cache) removed entirely: the
+  ##                     `compile.objcache` sub-block (rev 10) no longer
+  ##                     appears in any document. Stage M (measurement:
+  ##                     `compile.segments`, `topUnits`, `compileRegressions`,
+  ##                     `ambientCcacheDetected`) and the RFC-0004 result
+  ##                     cache are UNCHANGED. A reader that only reads
+  ##                     `compile.objcache` optionally (as rev 10 always
+  ##                     documented it) is unaffected by its permanent
+  ##                     absence.
   ## A reader seeing `schemaRevision > RunV1Revision` treats the file as no-data
   ## (safe cold-start) — it was written by a newer crisol.
 

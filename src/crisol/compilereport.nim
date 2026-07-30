@@ -1,16 +1,13 @@
-## compilereport.nim — RFC-0006 M-report PASS (a)+(b1)+(b2), Stage R PASS
-## R5b: segmented `compile` block for the crisol/run/v1 JSON document, plus
-## PASS (b1)'s three additive durable-report surfaces (reuse-check alerting,
-## ambient-ccache detection, per-basename top-N) and R5b's realized-objcache
-## aggregation.
+## compilereport.nim — RFC-0006 M-report PASS (a)+(b1)+(b2): segmented
+## `compile` block for the crisol/run/v1 JSON document, plus PASS (b1)'s
+## three additive durable-report surfaces (reuse-check alerting,
+## ambient-ccache detection, per-basename top-N).
 ##
-## Aggregates THREE measurement telemetry streams already written per-compile
-## by the measurement/cache workers — the artifact stream (`artifactledger.
-## scanArtifactLedger`: one `ArtifactRow` per reusable compile unit), the
+## Aggregates TWO measurement telemetry streams already written per-compile
+## by the measurement worker — the artifact stream (`artifactledger.
+## scanArtifactLedger`: one `ArtifactRow` per reusable compile unit) and the
 ## compile-cost stream (`compilecost.scanCompileCostLedger`: one
-## `CompileCostRow` per compile), and the objcache-stats stream
-## (`objcachestats.scanObjCacheStatsLedger`: one `ObjCacheStatsRow` per
-## cache-mode compile) — into a single `compile` JSON block, per
+## `CompileCostRow` per compile) — into a single `compile` JSON block, per
 ## `(groupId, configHash)` segment:
 ##
 ##   { "segments": [
@@ -23,16 +20,7 @@
 ##     "compileRegressions": [   // PASS (b2): ALWAYS PRESENT; empty by default
 ##       { "entrypointIdentity", "groupId", "configHash", "currentUs",
 ##         "baselineUs", "thresholdUs" }, ...
-##     ],
-##     "objcache": {   // R5b: ABSENT when the objcache stream never ran
-##       "hits", "misses", "stored", "disabled",       // Σ across the run
-##       "hitRate",       // hits / (hits+misses); 0.0 when hits+misses==0
-##       "reusedBytes",   // Σ .o bytes served from cache -- benefit proxy
-##       "cacheSizeBytes", // on-disk objcache/ dir size -- CI-shuttle cost proxy
-##       "segments": [ { "groupId", "configHash", "hits", "misses", "stored",
-##                       "hitRate", "reusedBytes" }, ... ],
-##       "note": "<net-impact caveat, see ObjCacheNetImpactNote>"
-##     }
+##     ]
 ##   }
 ##
 ## `rTime`/`rSize` are NEVER reinvented here — `artifactid.reuseRatios` is the
@@ -40,66 +28,22 @@
 ## `artifactledger.ArtifactRow` to `artifactid.ArtifactRecord` (the two shapes
 ## are mirrored deliberately, per both modules' docstrings) and calls it.
 ##
-## The three streams are segmented INDEPENDENTLY on disk — a segment may
+## The two streams are segmented INDEPENDENTLY on disk — a segment may
 ## exist in one stream but not another (e.g. a group's compiles all failed
-## before producing artifact rows, but a cost row was still recorded; or a
-## run used `--objcache` for a slot that never produced artifact/cost rows
-## at all, since the cache worker and the measurement worker are mutually
-## exclusive compile-slot children — see `types.Config.objCache`'s doc).
-## `segments[]` (artifact+cost) and `objcache.segments[]` (objcache stats)
-## are therefore built and keyed INDEPENDENTLY of each other; this module
-## never requires a segment to appear in both.
-##
-## ## Drift tie-in (R5b) — a CROSS-RUN comparison, not a within-run one (R16)
-##
-## `segments[].rTime` is the POTENTIAL reuse ratio computed from the
-## artifact-identity stream — written ONLY by the MEASURE-mode worker
-## (`measureworker.runMeasureCompileWorker`), which drives a real, uncached
-## compile so every unit's `ccTimeUs` is genuine. `objcache.segments[].
-## hitRate` is the REALIZED hit rate from the objcache stream — written ONLY
-## by the CACHE-mode worker (`measureworker.runCompileCacheWorker`), which
-## drives cache lookups instead of measuring true per-unit cost. A cache HIT
-## does no compilation at all, so the cache worker deliberately never writes
-## ArtifactRows (R16: an earlier pass, R9, had it do so, and a HIT's
-## necessarily-zero `ccTimeUs` both skewed the cc-time-weighted `rTime` and
-## permanently polluted the append-only artifact ledger, since it is scanned
-## cumulatively across every future run).
-##
-## Consequently `segments[].rTime` and `objcache.segments[].hitRate` can
-## never both be freshly populated by ONE run — the two worker modes are
-## mutually exclusive per compile slot (`types.Config.objCache`'s doc). The
-## comparison this section enables is a CROSS-RUN correlation: a reader takes
-## a MEASURE-mode run's report (potential `rTime`, per segment) and a LATER
-## CACHE-mode run's report (realized `hitRate`, per segment) and joins them
-## by the SAME `(groupId, configHash)` key — e.g. "yesterday's measure run
-## says this segment COULD share 80% by cc time; today's cache run says we
-## actually served 30% from cache" is a real, actionable cold-cache /
-## first-wave-dedup gap, even though the two numbers came from different
-## report documents. This is sound specifically BECAUSE each report's
-## scope/as-of is transparent: the R7 provenance fields on each segment
-## (`currentRunEntrypoints`, `sampleEntrypoints`, `lowConfidence`) tell the
-## reader how many entrypoints THAT report's numbers actually reflect and how
-## stale/thin the sample is, so a cross-run join is a deliberate correlation
-## a reader can trust, not an implied same-run coincidence. No extra drift
-## computation is performed here; `buildCompileBlock` still emits both
-## `segments[]` and `objcache.segments[]` (independently, from whatever rows
-## exist under `stateDir` at report time — RFC-0006 M-artifact-identity does
-## not force ledger contents), it is simply on the reader to correlate across
-## report documents rather than within a single one.
+## before producing artifact rows, but a cost row was still recorded).
 ##
 ## Entry points:
 ##   buildCompileBlock*(artifactRows, costRows, ambientCcacheDetected = false,
-##                      compileRegressions = nil, objCacheStatsRows = @[],
-##                      cacheSizeBytes = 0): JsonNode
-##     PURE core — no I/O. Returns `nil` when ALL of artifactRows/costRows/
-##     objCacheStatsRows are empty (no telemetry at all), so the caller can
-##     omit the `compile` field entirely (additive/back-compat: measurement-
-##     and objcache-off runs get byte-identical output to before PASS (a)).
+##                      compileRegressions = nil): JsonNode
+##     PURE core — no I/O. Returns `nil` when BOTH artifactRows/costRows are
+##     empty (no telemetry at all), so the caller can omit the `compile`
+##     field entirely (additive/back-compat: measurement-off runs get
+##     byte-identical output to before PASS (a)).
 ##   readCompileBlock*(stateDir, currentRunStartUs): JsonNode
-##     Effectful wrapper: scans all three ledgers, resolves
+##     Effectful wrapper: scans both ledgers, resolves
 ##     ambientCcacheDetected via detectAmbientCcache(), computes
-##     compileRegressions via computeCompileRegressions(), best-effort sums
-##     the on-disk objcache directory size, and calls buildCompileBlock.
+##     compileRegressions via computeCompileRegressions(), and calls
+##     buildCompileBlock.
 ##   detectAmbientCcache*(): bool
 ##     Effectful, never-throwing: best-effort detection of an ambient ccache
 ##     wrapper around THIS (parent) process — env `CCACHE_*` vars or a `cc`/
@@ -123,8 +67,6 @@ import crisol/artifactledger
 import crisol/compilecost
 import crisol/artifactid
 import crisol/stats       # for median/mad/isRegression — M-report PASS (b2)
-import crisol/objcachestats  # R5b: realized objcache hit/miss telemetry stream
-import crisol/objcache    # R5b: objCacheDirName() — on-disk cache dir size (cost proxy)
 
 type
   SegmentKey = tuple[groupId, configHash: string]
@@ -384,98 +326,20 @@ proc detectAmbientCcache*(): bool =
     discard
   false
 
-const ObjCacheNetImpactNote* =
-  "reusedBytes is the compile-time benefit proxy (bytes served from the " &
-  "cache this run); cacheSizeBytes is the on-disk cost a network-backed CI " &
-  "cache must save/restore every run. crisol cannot measure actual CI " &
-  "save/restore wall-time, so net benefit must weigh reusedBytes (and the " &
-  "compile time it saved) against cacheSizeBytes' shuttle cost -- a large " &
-  "cache with a low hit rate can be a NET LOSS on network-backed CI even " &
-  "though reusedBytes alone looks like a win."
-  ## R5b: honest net-impact caveat embedded verbatim as `compile.objcache.
-  ## note`. See this module's docstring for the full drift/net-impact
-  ## rationale (RFC-0006 R5, "round-2 requirement that a benefit-only report
-  ## can hide a net loss on network CI").
-
-proc buildObjCacheNode(rows: seq[ObjCacheStatsRow]; cacheSizeBytes: int64): JsonNode =
-  ## R5b: aggregate the REALIZED objcache hit/miss/store telemetry stream
-  ## (`objcachestats.ObjCacheStatsRow`) into the `compile.objcache` sub-block.
-  ## Pure. Per-segment breakdown is keyed by the SAME (groupId, configHash)
-  ## as the artifact-stream's `segments[]` entries so a reader can line up
-  ## realized `hitRate` against potential `rTime` for the same segment —
-  ## see this module's docstring, "Drift tie-in".
-  var totalHits, totalMisses, totalStored, totalDisabled: int
-  var totalReusedBytes: int64
-  var bySegment: Table[SegmentKey, tuple[hits, misses, stored: int; reusedBytes: int64]]
-
-  for r in rows:
-    totalHits += r.hits
-    totalMisses += r.misses
-    totalStored += r.stored
-    totalDisabled += r.disabled
-    totalReusedBytes += r.reusedBytes
-
-    let key = segKeyOf(r.groupId, r.configHash)
-    var acc = bySegment.getOrDefault(key)
-    acc.hits += r.hits
-    acc.misses += r.misses
-    acc.stored += r.stored
-    acc.reusedBytes += r.reusedBytes
-    bySegment[key] = acc
-
-  result = newJObject()
-  result["hits"]           = newJInt(totalHits)
-  result["misses"]         = newJInt(totalMisses)
-  result["stored"]         = newJInt(totalStored)
-  result["disabled"]       = newJInt(totalDisabled)
-  result["hitRate"]        = newJFloat(
-    if totalHits + totalMisses == 0: 0.0
-    else: totalHits.float / (totalHits + totalMisses).float)
-  result["reusedBytes"]    = newJInt(totalReusedBytes)
-  result["cacheSizeBytes"] = newJInt(cacheSizeBytes)
-
-  var segKeys: HashSet[SegmentKey]
-  for k in bySegment.keys: segKeys.incl k
-  let segsNode = newJArray()
-  for key in sortedSegmentKeys(segKeys):
-    let acc = bySegment[key]
-    let segNode = newJObject()
-    segNode["groupId"]    = newJString(key.groupId)
-    segNode["configHash"] = newJString(key.configHash)
-    segNode["hits"]       = newJInt(acc.hits)
-    segNode["misses"]     = newJInt(acc.misses)
-    segNode["stored"]     = newJInt(acc.stored)
-    segNode["hitRate"]    = newJFloat(
-      if acc.hits + acc.misses == 0: 0.0
-      else: acc.hits.float / (acc.hits + acc.misses).float)
-    segNode["reusedBytes"] = newJInt(acc.reusedBytes)
-    segsNode.add segNode
-  result["segments"] = segsNode
-  result["note"] = newJString(ObjCacheNetImpactNote)
-
 proc buildCompileBlock*(artifactRows: seq[ArtifactRow];
                         costRows: seq[CompileCostRow];
                         ambientCcacheDetected: bool = false;
                         compileRegressions: JsonNode = nil;
-                        objCacheStatsRows: seq[ObjCacheStatsRow] = @[];
-                        cacheSizeBytes: int64 = 0;
                         currentRunStartUs: int64 = 0;
                         lowConfidenceMinEntrypoints: int = LowConfidenceMinEntrypoints): JsonNode =
   ## Pure. No I/O beyond the caller-supplied rows/flag/pre-built regressions
-  ## array. Returns `nil` when ALL THREE streams (artifactRows, costRows,
-  ## objCacheStatsRows) are empty — the caller then omits the `compile`
-  ## field entirely.
+  ## array. Returns `nil` when BOTH streams (artifactRows, costRows) are
+  ## empty — the caller then omits the `compile` field entirely.
   ## compileRegressions: M-report PASS (b2) — a pre-built JArray (normally
   ## from computeCompileRegressions), embedded verbatim as
   ## `compile.compileRegressions`. nil (the default) -> emitted as an EMPTY
   ## JArray (present-but-possibly-empty; mirrors `regressions`/`reuseAlerts`'
   ## own convention), never omitted once the `compile` block itself exists.
-  ## objCacheStatsRows / cacheSizeBytes: R5b — the REALIZED objcache
-  ## hit/miss/store telemetry stream and the on-disk objcache directory
-  ## size. objCacheStatsRows.len == 0 (the default; objcache never ran) ->
-  ## `compile.objcache` is ABSENT entirely (not an empty object) — additive/
-  ## back-compat, mirroring `compile` itself being absent when there is no
-  ## telemetry at all.
   ## currentRunStartUs / lowConfidenceMinEntrypoints: R7 (code review) — the
   ## low-confidence gate. Each segment gains `currentRunEntrypoints`
   ## (DISTINCT entrypoints THIS run itself contributed rows for, i.e. rows
@@ -487,7 +351,7 @@ proc buildCompileBlock*(artifactRows: seq[ArtifactRow];
   ## caller that never passes it gets `currentRunEntrypoints ==
   ## sampleEntrypoints` (every row's timestamp is >= 0) — back-compat for
   ## existing callers/tests that predate this gate.
-  if artifactRows.len == 0 and costRows.len == 0 and objCacheStatsRows.len == 0:
+  if artifactRows.len == 0 and costRows.len == 0:
     return nil
 
   # Reuse ratios — delegated entirely to artifactid.reuseRatios.
@@ -556,53 +420,25 @@ proc buildCompileBlock*(artifactRows: seq[ArtifactRow];
   # M-report PASS (b2): always present, empty by default (mirrors `regressions`).
   result["compileRegressions"] =
     if compileRegressions != nil: compileRegressions else: newJArray()
-  # R5b: `compile.objcache` — ABSENT (not an empty object) when the objcache
-  # stream never ran, mirroring `compile` itself being absent for no-telemetry
-  # runs (additive/back-compat).
-  if objCacheStatsRows.len > 0:
-    result["objcache"] = buildObjCacheNode(objCacheStatsRows, cacheSizeBytes)
-
-proc objCacheDirSize(stateDir: string): int64 =
-  ## R5b: best-effort total size (bytes) of files directly under
-  ## `<stateDir>/objcache/<objCacheDirName()>/` — the "what CI would have to
-  ## shuttle" cost proxy for `compile.objcache.cacheSizeBytes`. Never raises:
-  ## an absent directory or any I/O error yields 0.
-  result = 0
-  try:
-    let dir = stateDir / "objcache" / objCacheDirName()
-    if not dirExists(dir): return
-    for kind, path in walkDir(dir):
-      if kind == pcFile:
-        try: result += getFileSize(path)
-        except CatchableError: discard
-  except CatchableError:
-    discard
 
 proc readCompileBlock*(stateDir: string; currentRunStartUs: int64): JsonNode =
-  ## Effectful: scan all THREE telemetry streams under `stateDir` and build
-  ## the `compile` block. Returns `nil` when none of them has any rows.
+  ## Effectful: scan both telemetry streams under `stateDir` and build
+  ## the `compile` block. Returns `nil` when neither has any rows.
   ## ambientCcacheDetected is resolved here (report time, in the parent
   ## process) via the never-throwing detectAmbientCcache() helper.
   ## currentRunStartUs: the SAME run-start timestamp api.nim's perf-check
   ## captures (before execute() appends this run's rows) — threaded through
   ## to computeCompileRegressions() so the compile-cost stream's
   ## current/history split matches perf-check's exec-ledger split exactly.
-  ## R5b: additionally scans the objcache-stats stream and best-effort sums
-  ## the on-disk objcache directory size, threading both into
-  ## buildCompileBlock's `objCacheStatsRows`/`cacheSizeBytes`.
   ## R7: `currentRunStartUs` is ALSO threaded into buildCompileBlock itself
   ## (not just computeCompileRegressions) — it is the "this run's scope"
   ## signal the low-confidence gate needs to tell THIS run's own
   ## contributing-entrypoint count apart from the aggregate.
   let costRows = scanCompileCostLedger(stateDir)
   let compileRegressions = computeCompileRegressions(costRows, currentRunStartUs)
-  let objCacheStatsRows = scanObjCacheStatsLedger(stateDir)
-  let cacheSizeBytes = objCacheDirSize(stateDir)
   buildCompileBlock(scanArtifactLedger(stateDir), costRows,
                     ambientCcacheDetected = detectAmbientCcache(),
                     compileRegressions = compileRegressions,
-                    objCacheStatsRows = objCacheStatsRows,
-                    cacheSizeBytes = cacheSizeBytes,
                     currentRunStartUs = currentRunStartUs)
 
 # ---------------------------------------------------------------------------

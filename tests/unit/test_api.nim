@@ -522,120 +522,21 @@ suite "nim-version soundness seam":
     check '.' in crisolNimVersion
 
 # ---------------------------------------------------------------------------
-# resolveObjCache — RFC-0006 Stage R, R2b2: pure precedence resolution for
-# Config.objCache from a config-file value plus RunOptions overrides.
-# Precedence (highest wins): --no-objcache > --objcache/config-true > configValue.
-#
-# The formula itself, `(optIn or configValue) and not optOut`, is UNCHANGED
-# by the default-on flip -- re-verified below, cell by cell. What changed is
-# the CALLER: config.loadConfig now feeds this function configValue=true
-# when the KDL `objcache` node is absent (docToConfig's local default flipped
-# true; see test_config.nim's "absent objcache -> cfg.objCache == true"). So
-# the case previously labeled "the default" (all-false) is now just one
-# valid data point -- an explicit `objcache #false` config block with no CLI
-# overrides -- and "configValue alone -> true" is now the scenario that
-# actually reflects the NEW default (absent config -> configValue=true).
+# R13 (code review, RFC-0006) — an explicit --measure-compile-reuse request
+# that will silently degrade to the monolithic compile path (no workerBinary
+# configured) must be visible in the STRUCTURED warnings channel, not just
+# runner.nim's one-shot stderr write. A CI consumer whose stderr is
+# swallowed would otherwise see a complete, silent no-op of a feature it
+# explicitly asked for -- compileBlock simply absent from the report,
+# indistinguishable from "nobody asked".
 # ---------------------------------------------------------------------------
 
-suite "resolveObjCache — objcache precedence (RFC-0006 Stage R R2b2, re-verified for default-on)":
-
-  test "configValue=false (explicit objcache #false), no CLI overrides -> false":
-    check resolveObjCache(configValue = false, optIn = false, optOut = false) == false
-
-  test "optIn alone -> true":
-    check resolveObjCache(configValue = false, optIn = true, optOut = false) == true
-
-  test "configValue=true (the NEW default when KDL objcache node is absent, or explicit objcache #true), no CLI overrides -> true":
-    check resolveObjCache(configValue = true, optIn = false, optOut = false) == true
-
-  test "optOut overrides optIn -> false":
-    check resolveObjCache(configValue = false, optIn = true, optOut = true) == false
-
-  test "optOut overrides configValue -> false (--no-objcache wins even against the new default-on configValue)":
-    check resolveObjCache(configValue = true, optIn = false, optOut = true) == false
-
-  test "optOut overrides BOTH optIn and configValue -> false":
-    check resolveObjCache(configValue = true, optIn = true, optOut = true) == false
-
-  test "optOut alone (configValue and optIn both false) -> false":
-    check resolveObjCache(configValue = false, optIn = false, optOut = true) == false
-
-# ---------------------------------------------------------------------------
-# Issue-1 fix — effective objCache (as planImpl actually computes it):
-# `resolveObjCache(configValue, optIn, optOut) and not measureCompileReuse`.
-# resolveObjCache itself stays measureCompileReuse-agnostic (single-purpose,
-# unit-tested above); the composed formula below is planImpl's ACTUAL line
-# (api.nim, `cfg.objCache = resolveObjCache(...) and not cfg.measureCompileReuse`),
-# mirrored here as a pure function so the suppression is independently
-# unit-testable without going through config loading or a real compile --
-# same rationale resolveObjCache itself was extracted for.
-# ---------------------------------------------------------------------------
-
-suite "effective objCache — measure-compile-reuse suppression (Issue-1 fix)":
-
-  proc effectiveObjCache(configValue, optIn, optOut, measureCompileReuse: bool): bool =
-    ## Mirrors planImpl's exact composition (api.nim): resolveObjCache's
-    ## precedence formula, then suppressed to false whenever measurement is
-    ## requested. Kept LOCAL to this test (not exported from api.nim) --
-    ## it's a one-line composition of an already-tested pure function, not a
-    ## new public seam.
-    resolveObjCache(configValue, optIn, optOut) and not measureCompileReuse
-
-  test "measureCompileReuse=true suppresses an otherwise-true objCache (default-on config, no explicit flags)":
-    check effectiveObjCache(configValue = true, optIn = false, optOut = false,
-                            measureCompileReuse = true) == false
-
-  test "measureCompileReuse=true suppresses an explicit --objcache too":
-    check effectiveObjCache(configValue = false, optIn = true, optOut = false,
-                            measureCompileReuse = true) == false
-
-  test "measureCompileReuse=false leaves resolveObjCache's result untouched (true case)":
-    check effectiveObjCache(configValue = true, optIn = false, optOut = false,
-                            measureCompileReuse = false) == true
-
-  test "measureCompileReuse=false leaves resolveObjCache's result untouched (false case)":
-    check effectiveObjCache(configValue = false, optIn = false, optOut = false,
-                            measureCompileReuse = false) == false
-
-  test "measureCompileReuse=true over an already-false objCache stays false (no-op suppression)":
-    check effectiveObjCache(configValue = false, optIn = false, optOut = true,
-                            measureCompileReuse = true) == false
-
-# ---------------------------------------------------------------------------
-# R13 (code review, RFC-0006) — an explicit --objcache / --measure-compile-
-# reuse request that will silently degrade to the monolithic compile path
-# (no workerBinary configured) must be visible in the STRUCTURED warnings
-# channel, not just runner.nim's one-shot stderr write. A CI consumer whose
-# stderr is swallowed would otherwise see a complete, silent no-op of a
-# feature it explicitly asked for -- compileBlock simply absent from the
-# report, indistinguishable from "nobody asked".
-# ---------------------------------------------------------------------------
-
-suite "R13 — objcache/measure-compile-reuse requested with no workerBinary surfaces a structured warning":
-
-  test "planTests: objCache=true, workerBinary unset -> structured warning (context=objcache, key=workerBinary)":
-    withTempProject:
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", objCache: true)
-      let pr = planTests(opts)
-      var found = false
-      for w in pr.warnings:
-        if w.context == "objcache" and w.key == "workerBinary":
-          found = true
-          check "no worker binary" in w.message.toLowerAscii or
-                "not honored" in w.message.toLowerAscii
-      check found
+suite "R13 — measure-compile-reuse requested with no workerBinary surfaces a structured warning":
 
   test "planTests: measureCompileReuse=true, workerBinary unset -> structured warning (context=measure-compile-reuse, key=workerBinary)":
     withTempProject:
-      # Issue-1 fix (default-on objCache starving --measure-compile-reuse):
-      # planImpl now suppresses cfg.objCache to false whenever
-      # cfg.measureCompileReuse resolves true, so measureCompileReuse alone
-      # is ENOUGH to isolate this test from objCache's now-default-on state
-      # -- noObjCache is kept anyway as belt-and-suspenders documentation of
-      # intent (explicitly, not just implicitly, off), not because it's
-      # load-bearing anymore.
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
-                            measureCompileReuse: true, noObjCache: true)
+                            measureCompileReuse: true)
       let pr = planTests(opts)
       var found = false
       for w in pr.warnings:
@@ -646,93 +547,23 @@ suite "R13 — objcache/measure-compile-reuse requested with no workerBinary sur
   test "planTests: workerBinary SET -> no workerBinary warning (sound path, nothing to warn about)":
     withTempProject:
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
-                            objCache: true, workerBinary: "/usr/bin/true")
+                            measureCompileReuse: true, workerBinary: "/usr/bin/true")
       let pr = planTests(opts)
       for w in pr.warnings:
         check w.key != "workerBinary"
 
-  test "planTests: neither objCache nor measureCompileReuse explicitly requested, workerBinary unset -> objCache's now-default-on state STILL surfaces the workerBinary warning (RFC-0006 default-on flip: 'not set' no longer means 'off')":
+  test "planTests: measureCompileReuse not requested, workerBinary unset -> no workerBinary warning at all":
     withTempProject:
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       let pr = planTests(opts)
-      var found = false
-      for w in pr.warnings:
-        if w.context == "objcache" and w.key == "workerBinary":
-          found = true
-      check found
-
-  test "planTests: --no-objcache (genuine opt-out), measureCompileReuse also unset, workerBinary unset -> no workerBinary warning at all":
-    withTempProject:
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", noObjCache: true)
-      let pr = planTests(opts)
       for w in pr.warnings:
         check w.key != "workerBinary"
 
-  test "planTests: BOTH objCache and measureCompileReuse true, workerBinary unset -> exactly ONE workerBinary warning, now carrying measure-compile-reuse's context (Issue-1 fix: measurement wins, not objcache)":
-    ## Precedence INVERTED by the Issue-1 fix: cfg.objCache is suppressed to
-    ## false whenever cfg.measureCompileReuse is true (planImpl, above), so
-    ## by the time the no-workerBinary check runs, only the
-    ## measure-compile-reuse branch can ever fire -- objcache's own
-    ## no-workerBinary warning is structurally unreachable when both flags
-    ## are requested together. The "exactly ONE" invariant survives the
-    ## precedence flip (still only one of the two mutually-exclusive workers
-    ## can be the slot's compile child), but WHICH one now differs.
-    withTempProject:
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
-                            objCache: true, measureCompileReuse: true)
-      let pr = planTests(opts)
-      var count = 0
-      var sawMeasureContext = false
-      for w in pr.warnings:
-        if w.key == "workerBinary":
-          inc count
-          if w.context == "measure-compile-reuse": sawMeasureContext = true
-      check count == 1
-      check sawMeasureContext
-
-  test "planTests: BOTH --objcache and --measure-compile-reuse EXPLICITLY requested (contradictory) -> a distinct ConfigWarning says objcache is ignored during measurement":
-    ## New warning (Issue-1 fix): distinct from the workerBinary-absent
-    ## warnings above -- fires purely because the CALLER explicitly asked
-    ## for both mutually-exclusive modes on the same run, independent of
-    ## whether a sound workerBinary is configured.
-    withTempProject:
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
-                            objCache: true, measureCompileReuse: true)
-      let pr = planTests(opts)
-      var found = false
-      for w in pr.warnings:
-        if w.context == "objcache" and w.key == "measure-compile-reuse":
-          found = true
-          check "ignored" in w.message.toLowerAscii or
-                "precedence" in w.message.toLowerAscii
-      check found
-
-  test "planTests: --objcache explicit + --measure-compile-reuse explicit + workerBinary SET -> only the contradictory-flags warning fires (no workerBinary warning; the sound path)":
-    withTempProject:
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
-                            objCache: true, measureCompileReuse: true,
-                            workerBinary: "/usr/bin/true")
-      let pr = planTests(opts)
-      var sawContradiction = false
-      for w in pr.warnings:
-        check w.key != "workerBinary"   # sound worker -> that class never fires
-        if w.context == "objcache" and w.key == "measure-compile-reuse":
-          sawContradiction = true
-      check sawContradiction
-
-  test "planTests: objCache NOT explicitly requested (default-on only) + --measure-compile-reuse explicit -> NO contradictory-flags warning (the default silently steps aside, not a user contradiction)":
-    withTempProject:
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
-                            measureCompileReuse: true,
-                            workerBinary: "/usr/bin/true")
-      let pr = planTests(opts)
-      for w in pr.warnings:
-        check not (w.context == "objcache" and w.key == "measure-compile-reuse")
-
-  test "runTests: objCache=true, workerBinary unset -> run still succeeds monolithically AND the warning is present on RunReport.plan.warnings":
+  test "runTests: measureCompileReuse=true, workerBinary unset -> run still succeeds monolithically AND the warning is present on RunReport.plan.warnings":
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "echo \"ok\"\n")
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", objCache: true)
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
+                            measureCompileReuse: true)
       let rr = runTests(opts)
       check rr.status == rsOk
       check rr.exitCode == 0
@@ -740,71 +571,35 @@ suite "R13 — objcache/measure-compile-reuse requested with no workerBinary sur
       check rr.results[0].outcome == oPassed
       var found = false
       for w in rr.plan.warnings:
-        if w.context == "objcache" and w.key == "workerBinary":
-          found = true
-      check found
-
-  test "LIBRARY-SAFETY (RFC-0006 default-on flip): runTests() with NO objCache/noObjCache/workerBinary set at all still succeeds monolithically (no fork-bomb, no hard-fail); the default-on request is visible via the structured warning":
-    ## The most important regression the default-on flip introduces: a
-    ## library consumer that never touches RunOptions.objCache/workerBinary
-    ## at all (the overwhelming common case pre-flip) now gets objCache=true
-    ## from the config default rather than false. spawnCompileStable's
-    ## no-worker degrade path (never calling getAppFilename() on the host's
-    ## behalf — see types.Config.workerBinary's doc) must still apply: this
-    ## run must compile and run normally, monolithically, exactly as it did
-    ## before the flip, and must NOT hang/fork-bomb/hard-fail. The one
-    ## observable difference is the new R13 structured warning, present here
-    ## specifically because objCache is now ON by default with no worker
-    ## configured.
-    withTempProject:
-      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "echo \"ok\"\n")
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
-      let t0 = epochTime()
-      let rr = runTests(opts)
-      let elapsed = epochTime() - t0
-      check rr.status == rsOk
-      check rr.exitCode == 0
-      check rr.results.len == 1
-      check rr.results[0].outcome == oPassed
-      check elapsed < 30.0  # a fork-bomb would hang until the compile watchdog fires
-      var found = false
-      for w in rr.plan.warnings:
-        if w.context == "objcache" and w.key == "workerBinary":
+        if w.context == "measure-compile-reuse" and w.key == "workerBinary":
           found = true
       check found
 
 # ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.
-# api.nim gates the compile block on `measureCompileReuse or objCache` (R5b
-# fixed this from a narrower gate once already). A regression flipping
-# `or` -> `and` would silently drop the report whenever only ONE flag is
-# set (e.g. a plain --objcache run) -- covered here both as a cheap pure
-# predicate test and as a real end-to-end proof across flag combinations.
+# api.nim gates the compile block on `measureCompileReuse` alone. A
+# regression that hardcoded this to `false` would silently drop the report
+# whenever measurement is requested -- covered here both as a cheap pure
+# predicate test and as a real end-to-end proof.
 # ---------------------------------------------------------------------------
 
 suite "shouldReportCompileBlock — pure gate (R14-T6)":
 
-  test "both false -> false":
-    check shouldReportCompileBlock(false, false) == false
+  test "false -> false":
+    check shouldReportCompileBlock(false) == false
 
   test "measureCompileReuse alone -> true":
-    check shouldReportCompileBlock(true, false) == true
+    check shouldReportCompileBlock(true) == true
 
-  test "objCache alone -> true (the EXACT case an or->and regression would break)":
-    check shouldReportCompileBlock(false, true) == true
-
-  test "both true -> true":
-    check shouldReportCompileBlock(true, true) == true
-
-suite "RunReport.compileBlock presence — R14-T6 end-to-end across flag combinations":
+suite "RunReport.compileBlock presence — R14-T6 end-to-end":
 
   proc buildCrisolBinaryForApiTest(): string =
     ## Mirrors tests/integration/test_measure_compile_gate.nim's
-    ## buildCrisolBinary(): --objcache/--measure-compile-reuse's self-reexec
-    ## worker is only sound when the currently running process dispatches
-    ## the internal token, which is true of the real crisol CLI binary,
-    ## never of an arbitrary unittest binary (see that file's module doc for
-    ## the full fork-bomb-hazard rationale) -- so proving "telemetry exists"
+    ## buildCrisolBinary(): --measure-compile-reuse's self-reexec worker is
+    ## only sound when the currently running process dispatches the
+    ## internal token, which is true of the real crisol CLI binary, never of
+    ## an arbitrary unittest binary (see that file's module doc for the full
+    ## fork-bomb-hazard rationale) -- so proving "telemetry exists"
     ## end-to-end needs the real binary as RunOptions.workerBinary, exactly
     ## as the integration gate tests already do.
     let crisolRoot = currentSourcePath().parentDir.parentDir.parentDir
@@ -818,78 +613,31 @@ suite "RunReport.compileBlock presence — R14-T6 end-to-end across flag combina
 
   let crisolBinForApi = buildCrisolBinaryForApiTest()
 
-  test "neither flag set -> compileBlock absent (nil)":
-    ## objCache now defaults ON (RFC-0006 Stage R flip), so
-    ## shouldReportCompileBlock's gate is actually TRUE here -- but no
-    ## workerBinary is configured, so the cache worker never dispatches, no
-    ## telemetry stream is ever written, and buildCompileBlock's own
-    ## nil-when-empty contract still yields nil. The gate answering "should
-    ## we look" and there being data to find are independent, exactly as
-    ## shouldReportCompileBlock's doc comment says.
+  test "measureCompileReuse not set -> compileBlock absent (nil)":
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "echo \"ok\"\n")
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl"))
       check rr.status == rsOk
       check rr.compileBlock == nil
 
-  test "measureCompileReuse=true alone, sound worker -> compileBlock present":
+  test "measureCompileReuse=true, sound worker -> compileBlock present":
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "echo \"ok\"\n")
-      # noObjCache=true kept as explicit documentation of intent; no longer
-      # load-bearing after the Issue-1 fix (measureCompileReuse now suppresses
-      # the now-default-on objCache automatically -- see the "effective
-      # objCache" suite above).
       let rr = runTests(RunOptions(
         configPath:          projectRoot / "crisol.kdl",
         measureCompileReuse: true,
-        noObjCache:          true,
         workerBinary:        crisolBinForApi,
       ))
       check rr.status == rsOk
       check rr.compileBlock != nil
       check rr.compileBlock.hasKey("segments")
 
-  test "objCache=true ALONE (measureCompileReuse false), sound worker -> compileBlock present (the exact or->and regression case)":
-    withTempProject:
-      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "echo \"ok\"\n")
-      let rr = runTests(RunOptions(
-        configPath:   projectRoot / "crisol.kdl",
-        objCache:     true,
-        workerBinary: crisolBinForApi,
-      ))
-      check rr.status == rsOk
-      check rr.compileBlock != nil
-      check rr.compileBlock.hasKey("objcache")
-
-  test "both flags true, sound worker -> compileBlock present, and it's the MEASURE worker's shape (Issue-1 fix: measurement wins over objcache)":
+  test "measureCompileReuse=true but workerBinary UNSET -> gate true but degrades monolithically -> no telemetry written -> compileBlock absent (nil)":
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "echo \"ok\"\n")
       let rr = runTests(RunOptions(
         configPath:          projectRoot / "crisol.kdl",
-        objCache:            true,
         measureCompileReuse: true,
-        workerBinary:        crisolBinForApi,
-      ))
-      check rr.status == rsOk
-      check rr.compileBlock != nil
-      # The measure worker's own telemetry (compilecost -> segments) is
-      # present; the cache worker's telemetry (objcachestats -> "objcache")
-      # is absent -- the observable proof that measurement, not caching, was
-      # the slot's compile child when both were explicitly requested.
-      check rr.compileBlock.hasKey("segments")
-      check not rr.compileBlock.hasKey("objcache")
-      var sawContradiction = false
-      for w in rr.plan.warnings:
-        if w.context == "objcache" and w.key == "measure-compile-reuse":
-          sawContradiction = true
-      check sawContradiction
-
-  test "flag set but workerBinary UNSET -> gate true but degrades monolithically -> no telemetry written -> compileBlock absent (nil)":
-    withTempProject:
-      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "echo \"ok\"\n")
-      let rr = runTests(RunOptions(
-        configPath: projectRoot / "crisol.kdl",
-        objCache:   true,
       ))
       check rr.status == rsOk
       check rr.compileBlock == nil

@@ -201,9 +201,9 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
 
   test "R4: a ccCmd too short to derive a cc -M invocation degrades to ok=false, never raises":
     ## Previously `doAssert toks.len >= 2` — an AssertionDefect, a `Defect`
-    ## NOT caught by `runCompileCacheWorker`'s `except CatchableError`
-    ## escape hatch. A malformed/degenerate manifest entry must degrade
-    ## gracefully like every other per-unit oddity in this module.
+    ## NOT caught by a worker's `except CatchableError` escape hatch. A
+    ## malformed/degenerate manifest entry must degrade gracefully like
+    ## every other per-unit oddity in this module.
     let inv = deriveCcMInvocation("gcc")   # single token — no source file
     check not inv.ok
     check inv.cmd == ""

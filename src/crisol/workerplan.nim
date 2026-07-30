@@ -1,24 +1,18 @@
-## workerplan.nim — RFC-0006: the plan.json schema + helpers SHARED by both
-## RFC-0006 compile-slot workers (crisol/measureworker.nim's MEASURE-mode
-## worker and crisol/cacheworker.nim's CACHE-mode worker).
+## workerplan.nim — RFC-0006: the plan.json schema + helpers for the
+## measurement compile-slot worker (crisol/measureworker.nim).
 ##
-## Split out of the original fused measureworker.nim (RFC-0006 review R8,
-## structural-only): this module owns the plan schema + cross-cutting
-## helpers both workers, AND both external authors (crisol.nim's internal-
-## token dispatch; runner.nim's `buildCompileWorkerPlan`/`spawnCompileStable`)
-## depend on — so neither worker module needs to import the other's
-## internals just to share a type, and crisol.nim/runner.nim don't need to
-## pick one worker module arbitrarily to get the schema.
+## This module owns the plan schema + cross-cutting helpers the measurement
+## worker, crisol.nim's internal-token dispatch, and runner.nim's
+## `buildCompileWorkerPlan`/`spawnCompileStable` all depend on. (The
+## RFC-0006 Stage R object cache and its cache-mode compile worker were
+## removed after an end-to-end A/B showed the cache didn't pay off; this
+## module now serves the measurement path only.)
 ##
 ## Contents:
 ##
 ##   `MeasurePlan` / `toJson` / `parseMeasurePlan` — the plan.json schema.
 ##     Authored by the parent (runner.nim's `buildCompileWorkerPlan`) and
-##     read by whichever worker the parent dispatches to
-##     (`--internal-measure-compile` or `--internal-compile-worker`) — NO
-##     schema difference between the two modes (RFC-0006 R2b1: "no schema
-##     change: R2b1's plan carries exactly what measure mode's plan
-##     carries" — pinned by test_measureworker.nim's round-trip test).
+##     read by the measurement worker (`--internal-measure-compile`).
 ##
 ##     Two entrypoint-path fields are DELIBERATE, not redundant:
 ##
@@ -46,31 +40,9 @@
 ##     this is exactly what `configHash` is), and `stateDir` (artifact-
 ##     ledger root).
 ##
-##     `objcacheMaxEntries` / `objcacheMaxBytes` (review Finding 3) — the
-##     CACHE-mode worker's own write-time soft-cap inputs, threaded from
-##     `Config.objcacheMaxEntries`/`Config.objcacheMaxBytes` at plan-build
-##     time (`runner.buildCompileWorkerPlan`) so `cacheworker.
-##     runCompileCacheWorker` can pass the user's CONFIGURED caps into
-##     `objcache.realObjCacheSeams`/`storeObject`, instead of that call
-##     silently falling back to the hardcoded `DefaultMaxObjCacheEntries`
-##     (10 000) and an unbounded byte cap regardless of `crisol.kdl`. Both
-##     default to `0` in an unset/default-constructed `MeasurePlan` — the
-##     SAME "0" a fresh `Config` carries for these fields — and are resolved
-##     to their real meaning at the point they're actually consulted
-##     (`cacheworker.nim`), mirroring `clean.cleanOrphans`'s own resolution
-##     of the identical `Config` fields for `gcObjCache`: `objcacheMaxEntries
-##     == 0` means "use the `DefaultMaxObjCacheEntries` backstop" (an
-##     unconfigured cap is not the same as "no cap" — the write path must
-##     still have SOME bound), while `objcacheMaxBytes == 0` means "no byte
-##     bound" (an unconfigured byte cap genuinely means unbounded — there
-##     was never an automatic byte bound before this fields existed, so "0"
-##     preserves that as the explicit default rather than inventing one).
-##     The measure-mode worker never reads either field (it never calls
-##     `objcache.storeObject`).
-##
 ##   `entryUnitBasename` — the entry unit's generated basename
 ##     ("@m<entrypointBasename>.nim.c"), the soundness-critical
-##     discriminator BOTH workers use to keep the per-entrypoint entry unit
+##     discriminator used to keep the per-entrypoint entry unit
 ##     out of any cross-entrypoint reuse accounting (RFC-0006 §File
 ##     scoping: the entry unit carries NimMain/whole-program init and stays
 ##     private, never keyed).
@@ -81,34 +53,32 @@
 ##     `os.startProcess` (compiledriver's `realCompileOnly`/`defaultRunCc`/
 ##     `realLink`, all called without an explicit `env` table) inherits the
 ##     calling process's environment, so this single `putEnv` reaches every
-##     `nim`/`cc`/link child either worker's driver spawns for the rest of
-##     this process's lifetime. Called by BOTH workers before driving their
-##     respective `CompileDriver`.
+##     `nim`/`cc`/link child the measurement worker's driver spawns for the
+##     rest of this process's lifetime. Called by
+##     `measureworker.runMeasureCompileWorker` before driving its
+##     `CompileDriver`.
 ##
-##   `InternalMeasureCompileToken` / `InternalCompileWorkerToken` — the two
-##     internal re-exec dispatch tokens crisol.nim's `runMain` special-cases
-##     before subcommand validation (see crisol.nim's `runMain` doc).
-##     Deliberately NOT listed in crisol.nim's `usage()` text: these are
-##     internal re-exec surfaces, not user-facing subcommands (RFC-0006
-##     §Stage R "Mechanism").
+##   `InternalMeasureCompileToken` — the internal re-exec dispatch token
+##     crisol.nim's `runMain` special-cases before subcommand validation
+##     (see crisol.nim's `runMain` doc). Deliberately NOT listed in
+##     crisol.nim's `usage()` text: this is an internal re-exec surface, not
+##     a user-facing subcommand.
 ##
 ## See docs/rfc/0006-cross-entrypoint-compile-reuse.md ("Mechanism — a
-## crisol compile-worker child") and each worker module's own doc
-## (measureworker.nim / cacheworker.nim) for the per-mode pipeline this
-## schema feeds.
+## crisol compile-worker child") and measureworker.nim's own doc for the
+## pipeline this schema feeds.
 
 import std/[json, os]
 import crisol/types
 
 # ---------------------------------------------------------------------------
-# The internal dispatch tokens (crisol.nim routes these before normal
+# The internal dispatch token (crisol.nim routes this before normal
 # subcommand validation — see crisol.nim's runMain). Deliberately NOT listed
-# in crisol.nim's usage() text: these are internal re-exec surfaces, not
-# user-facing subcommands (RFC-0006 §Stage R "Mechanism").
+# in crisol.nim's usage() text: this is an internal re-exec surface, not a
+# user-facing subcommand.
 # ---------------------------------------------------------------------------
 
 const InternalMeasureCompileToken* = "--internal-measure-compile"
-const InternalCompileWorkerToken* = "--internal-compile-worker"
 
 # ---------------------------------------------------------------------------
 # MeasurePlan — plan.json schema
@@ -124,18 +94,10 @@ type
     groupId*:            string      ## ep.group — segmentation
     configHash*:         string      ## flagHash(ep.flags) rendered — segmentation
     stateDir*:           string      ## artifact-ledger root
-    objcacheMaxEntries*: int         ## review Finding 3: Config.objcacheMaxEntries,
-                                      ## threaded to the cache worker's write-time soft
-                                      ## cap. 0 = use DefaultMaxObjCacheEntries backstop
-                                      ## (matches clean.cleanOrphans's resolution).
-    objcacheMaxBytes*:   int64       ## review Finding 3: Config.objcacheMaxBytes,
-                                      ## threaded to the cache worker's write-time soft
-                                      ## cap. 0 = unbounded (matches gcObjCache's own
-                                      ## maxBytes convention).
 
 proc toJson*(plan: MeasurePlan): JsonNode =
-  ## Serialize a MeasurePlan to plan.json's JSON shape. Exported so a
-  ## worker's parent (`runner.nim`) and both workers' own tests can author a
+  ## Serialize a MeasurePlan to plan.json's JSON shape. Exported so the
+  ## worker's parent (`runner.nim`) and the worker's own tests can author a
   ## `plan.json` without hand-building JSON.
   result = newJObject()
   result["entrypointPath"]    = newJString(plan.entrypointPath)
@@ -149,8 +111,6 @@ proc toJson*(plan: MeasurePlan): JsonNode =
   result["groupId"]       = newJString(plan.groupId)
   result["configHash"]    = newJString(plan.configHash)
   result["stateDir"]      = newJString(plan.stateDir)
-  result["objcacheMaxEntries"] = newJInt(plan.objcacheMaxEntries)
-  result["objcacheMaxBytes"]   = newJInt(plan.objcacheMaxBytes)
 
 proc parseMeasurePlan*(jsonPath: string): MeasurePlan =
   ## Parse `jsonPath` into a MeasurePlan. Mirrors `closure.
@@ -189,10 +149,6 @@ proc parseMeasurePlan*(jsonPath: string): MeasurePlan =
   result.stateDir          = reqStr("stateDir")
   result.groupId    = node{"groupId"}.getStr("")
   result.configHash = node{"configHash"}.getStr("")
-  # review Finding 3: absent -> 0 (legitimately "unconfigured", the SAME
-  # meaning a fresh Config carries for these fields — not malformed).
-  result.objcacheMaxEntries = node{"objcacheMaxEntries"}.getInt(0)
-  result.objcacheMaxBytes   = node{"objcacheMaxBytes"}.getBiggestInt(0)
 
   result.flags = @[]
   let flagsNode = node{"flags"}
@@ -210,11 +166,11 @@ proc forceMeasurementCcEnv*() =
   ## compiler child is spawned. `os.startProcess` (compiledriver's
   ## `realCompileOnly`/`defaultRunCc`/`realLink`, all called without an
   ## explicit `env` table) inherits the calling process's environment, so
-  ## this single `putEnv` reaches every `nim`/`cc`/link child either
-  ## worker's driver spawns for the rest of this process's lifetime —
-  ## without threading an env parameter through `compiledriver.nim`. Called
-  ## by BOTH `measureworker.runMeasureCompileWorker` and
-  ## `cacheworker.runCompileCacheWorker`. Exported as a focused,
+  ## this single `putEnv` reaches every `nim`/`cc`/link child the
+  ## measurement worker's driver spawns for the rest of this process's
+  ## lifetime — without threading an env parameter through
+  ## `compiledriver.nim`. Called by
+  ## `measureworker.runMeasureCompileWorker`. Exported as a focused,
   ## independently-testable seam.
   putEnv("CCACHE_DISABLE", "1")
 
@@ -228,8 +184,6 @@ proc entryUnitBasename*(entrypointAbsPath: string): string =
   ## extension stripped. Mirrors tests/unit/test_golden_reuse.nim's
   ## `entryBasenameFor` — the RFC's own anchor for this rule (RFC-0006
   ## §File scoping: "the one whose basename matches the entrypoint's own
-  ## filename"). Used by BOTH workers: `measureworker.recordArtifactRows`
-  ## (to exclude the entry unit from artifact-identity recording) and
-  ## `cacheworker.buildCacheKeyOf`/`recordObjCacheStatsRow` (to keep the
-  ## entry unit non-cacheable).
+  ## filename"). Used by `measureworker.recordArtifactRows` to exclude the
+  ## entry unit from artifact-identity recording.
   "@m" & entrypointAbsPath.extractFilename.changeFileExt("") & ".nim.c"

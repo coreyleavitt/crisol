@@ -331,29 +331,10 @@ proc warnMeasureCompileReuseNoWorkerOnce() =
                  "(measurement skipped)\n")
     warned = true
 
-proc warnObjCacheNoWorkerOnce() =
-  ## RFC-0006 Stage R, R2b2: the objCache sibling of
-  ## warnMeasureCompileReuseNoWorkerOnce above — same one-shot-per-process
-  ## rationale, degraded-mode fallback when objCache is requested but no
-  ## workerBinary is configured (a library host that never set
-  ## RunOptions.workerBinary).
-  var warned {.global.}: bool = false
-  if not warned:
-    stderr.write("crisol: warning: objcache requested but no worker " &
-                 "binary configured; compiling monolithically " &
-                 "(cache skipped)\n")
-    warned = true
-
 proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string;
                              config: Config): MeasurePlan =
-  ## Shared plan construction for BOTH compile-slot worker children — the
-  ## RFC-0006 Stage R cache worker (`config.objCache`) and the
-  ## M-artifact-identity measurement worker (`config.measureCompileReuse`).
-  ## Both dispatch the SAME `MeasurePlan` schema — measureworker.nim's own
-  ## documented contract for `--internal-compile-worker` is "no schema
-  ## change: R2b1's plan carries exactly what measure mode's plan carries" —
-  ## so one constructor is the single source of truth for both workers'
-  ## plan.json inputs, instead of two copies that could silently drift.
+  ## Plan construction for the compile-slot measurement worker
+  ## (`config.measureCompileReuse`).
   ##
   ## configHash = flagHash(ep.flags), computed PER-ENTRYPOINT — this MUST
   ## collide with appendAttemptRow's identityKey(ep.path, flagHash(ep.flags))
@@ -368,12 +349,6 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
     groupId:           ep.group,
     configHash:        flagHash(ep.flags),
     stateDir:          stateDirOf(config),
-    # review Finding 3: thread the configured objcache write-time soft-cap
-    # inputs through to the cache worker (see workerplan.MeasurePlan's own
-    # doc for the 0-means-what convention of each). The measure-mode worker
-    # never reads either field.
-    objcacheMaxEntries: config.objcacheMaxEntries,
-    objcacheMaxBytes:   int64(config.objcacheMaxBytes),
   )
 
 proc spawnCompileStable(
@@ -452,12 +427,11 @@ proc spawnCompileStable(
     args.add epAbs  # R3: absolute path
     args
 
-  # review Q6: the objCache and measureCompileReuse worker branches below
-  # both build a MeasurePlan, write it to a per-slot plan.json, and launch
-  # `<workerBinary> <token> <planPath>` — identical except for the plan's
-  # filename and the internal dispatch token. Shared here (same hygienic-
-  # template pattern as `monolithicCompArgs` above) instead of two
-  # copy-pasted write+cleanup blocks that could silently drift.
+  # review Q6: the measureCompileReuse worker branch below builds a
+  # MeasurePlan, writes it to a per-slot plan.json, and launches
+  # `<workerBinary> <token> <planPath>`. Kept as a hygienic template (same
+  # pattern as `monolithicCompArgs` above) so the write+cleanup logic has a
+  # single home.
   template writeWorkerPlan(planFilename: string; token: string): seq[string] =
     let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config)
     let planPath = tmpDir / planFilename
@@ -471,37 +445,12 @@ proc spawnCompileStable(
     @[config.workerBinary, token, planPath]
 
   var compArgs: seq[string]
-  if config.objCache and config.workerBinary.len > 0:
-    # RFC-0006 Stage R, R2b2: the slot's ONE compile child becomes the
-    # cache-mode compile worker (`<workerBinary> --internal-compile-worker
-    # <plan.json>`) instead of a direct `nim c` invocation. Highest
-    # precedence of the three compile-slot strategies (objCache > measure >
-    # monolithic — v1's default-off, opt-in decision). The worker produces
-    # the SAME runnable binary at `binCompiled` either way, so everything
-    # downstream of this branch (phase=spCompiling, pid tracking, deadline,
-    # the spCompiling→spRunning transition that runs slot.binCompiled) is
-    # unaffected — see measureworker.nim's `runCompileCacheWorker` doc for
-    # the worker-side pipeline and its own monolithic escape hatch.
-    compArgs = writeWorkerPlan("compile_plan.json", InternalCompileWorkerToken)
-  elif config.objCache:
-    # objCache was requested but no sound worker binary is configured (a
-    # library host that never set RunOptions.workerBinary). NEVER call
-    # getAppFilename() here — same unbounded-recursive-fork hazard
-    # measureCompileReuse's own no-worker fallback below guards against.
-    # Degrade to the monolithic `nim c` path (cache skipped); warn once per
-    # process, not once per entrypoint (this runs per compile slot,
-    # potentially hundreds of times per invocation).
-    warnObjCacheNoWorkerOnce()
-    compArgs = monolithicCompArgs()
-  elif config.measureCompileReuse and config.workerBinary.len > 0:
+  if config.measureCompileReuse and config.workerBinary.len > 0:
     # RFC-0006 M-artifact-identity PASS (b2): the slot's ONE compile child
     # becomes the measurement worker (`<workerBinary> --internal-measure-compile
     # <plan.json>`) instead of a direct `nim c` invocation. The worker
     # produces the SAME runnable binary at `binCompiled` either way, so
-    # everything downstream of this branch is unaffected. Only reached when
-    # objCache is off — objCache (cache worker) takes precedence over
-    # measureCompileReuse (measure worker) when both are set, since the two
-    # workers are mutually exclusive compile-slot children.
+    # everything downstream of this branch is unaffected.
     compArgs = writeWorkerPlan("measure_plan.json", InternalMeasureCompileToken)
   else:
     if config.measureCompileReuse:

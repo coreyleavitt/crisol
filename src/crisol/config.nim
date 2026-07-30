@@ -95,10 +95,6 @@ proc conventionConfig(root: string): Config =
     perfCheck:          PerfCheckConfig(enabled: false),
     reuseCheck:         ReuseCheckConfig(enabled: false),
     workerBinary:       "",
-    # RFC-0006 Stage R, R2b2: default ON, mirrors docToConfig's local
-    # `objCache` default below — no config file at all is the SAME "absent"
-    # case as a config file with no `objcache` node.
-    objCache:           true,
   )
 
 # ---------------------------------------------------------------------------
@@ -453,23 +449,10 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     maxCacheEntries: int = 0    # 0 = use DefaultMaxCacheEntries
     cacheMaxAgeDays: int = 0    # 0 = disabled (no age eviction)
     ledgerMaxAgeDays: int = 0   # 0 = disabled (keep all rows)
-    # RFC-0006 Stage R, R4: object-cache GC config (mirrors A1c above exactly).
-    objcacheMaxEntries: int = 0  # 0 = use DefaultMaxObjCacheEntries
-    objcacheMaxAgeDays: int = 0  # 0 = disabled (no age eviction)
-    # RFC-0006 review R6: aggregate-byte cap (mirrors objcacheMaxAgeDays'
-    # 0=disabled convention, not objcacheMaxEntries' 0=use-default one).
-    objcacheMaxBytes: int = 0    # 0 = unbounded (no byte-based eviction)
     # RFC-0006 M-artifact-identity PASS (b2): gate the measurement worker into
     # the compile slot. Default false (unlike mem-aware's Option[bool] tristate,
     # this is a plain bool — there is no "auto" mode, only explicit opt-in).
     measureCompileReuse: bool = false
-    # RFC-0006 Stage R, R2b2: gate the cache worker into the compile slot.
-    # DEFAULT ON (soundness prerequisites R1/R2/R4 fixed and verified green;
-    # deliberate opt-out product decision, not opt-in) — same plain-bool
-    # shape as measureCompileReuse (no "auto" mode). An explicit
-    # `objcache #false` config block, or --no-objcache at the RunOptions
-    # layer (see api.resolveObjCache), still wins and turns it off.
-    objCache: bool = true
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -530,33 +513,12 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v < 0:
         cfgErr("config: 'ledger-max-age-days' must be >= 0, got " & $v)
       ledgerMaxAgeDays = v
-    of "objcache-max-entries":
-      let v = requireIntArg(n, "objcache-max-entries")
-      if v < 0:
-        cfgErr("config: 'objcache-max-entries' must be >= 0, got " & $v)
-      objcacheMaxEntries = v
-    of "objcache-max-age-days":
-      let v = requireIntArg(n, "objcache-max-age-days")
-      if v < 0:
-        cfgErr("config: 'objcache-max-age-days' must be >= 0, got " & $v)
-      objcacheMaxAgeDays = v
-    of "objcache-max-bytes":
-      let v = requireIntArg(n, "objcache-max-bytes")
-      if v < 0:
-        cfgErr("config: 'objcache-max-bytes' must be >= 0, got " & $v)
-      objcacheMaxBytes = v
     of "measure-compile-reuse":
       # bool node: measure-compile-reuse #true  or  measure-compile-reuse #false
       let v = n.arg(0)
       if v.isNone or v.get.kind != kvBool:
         cfgErr("config: 'measure-compile-reuse' requires a boolean argument (#true/#false)")
       measureCompileReuse = v.get.boolVal
-    of "objcache":
-      # bool node: objcache #true  or  objcache #false
-      let v = n.arg(0)
-      if v.isNone or v.get.kind != kvBool:
-        cfgErr("config: 'objcache' requires a boolean argument (#true/#false)")
-      objCache = v.get.boolVal
     of "group":        discard
     of "perf-check":   discard  # C6: parsed in second pass (has children)
     of "reuse-check":  discard  # M-report (b1): parsed in second pass (has children)
@@ -596,11 +558,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     maxCacheEntries:    maxCacheEntries,
     cacheMaxAgeDays:    cacheMaxAgeDays,
     ledgerMaxAgeDays:   ledgerMaxAgeDays,
-    objcacheMaxEntries: objcacheMaxEntries,
-    objcacheMaxAgeDays: objcacheMaxAgeDays,
-    objcacheMaxBytes:   objcacheMaxBytes,
     measureCompileReuse: measureCompileReuse,
-    objCache:           objCache,
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).
   )

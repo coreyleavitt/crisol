@@ -351,7 +351,7 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
   let jsonStr = $fileNode
 
   # RFC-0006 R1: the O_EXCL-tmp + writeAllFd + rename(2) mechanic is factored
-  # into ioutils.atomicPutFile (shared with objcache.nim) — this call is
+  # into ioutils.atomicPutFile — this call is
   # behaviorally identical to the block it replaces. RFC-0006 review R10:
   # atomicPutFile now reports the specific OS failure reason instead of a
   # bare bool, restoring the diagnostic this module logged before the R1

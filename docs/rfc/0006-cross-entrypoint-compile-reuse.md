@@ -1,5 +1,7 @@
 # RFC-0006 — Cross-entrypoint compile reuse: measure first, recover the redundant substrate
 
+> **⛔ OUTCOME (2026-07-30): Stage R (object cache) BUILT, MEASURED, and REMOVED — negative result.** A real end-to-end A/B on amoxtli showed no warm benefit (+1.4%) and a ~38% cold-run regression: the compile is Nim-**codegen**-bound (~55%), Stage R only accelerates the **cc** half (~44%) which overlaps behind codegen (off the critical path), and the result cache already owns the dev loop. Stage R code was stripped; **Stage M (measurement) was retained** as the codegen diagnostic. Do NOT re-implement `.o`/substrate reuse — the ceiling is ORC whole-program DCE making codegen program-specific. See `0006-…handoff.md` and memory `rfc-0006-objcache-benchmark-negative`.
+
 **Status:** Draft (stage 2 — architect rounds 1 & 2 applied; **one non-blocking open fork: FORK-R = the object-cache mechanism, native vs ccache vs sccache — only reached if Stage M greenlights Stage R**). Research-gated: Stage M's measurement is the decision gate for Stages R/S.
 **Depends on:** RFC-0004 (incremental hermetic execution — reuses its `RunLedger`, telemetry/`run/v1` schema, `<stateDir>` + GC/`clean` machinery, the `ccprobe.ccVersion` toolchain probe, the hermeticity model, `closure.nim`'s nimcache-JSON parser, and the `spawnCompileStable` compile path this RFC instruments and extends). Independent of RFC-0005.
 **Scope owner:** Corey

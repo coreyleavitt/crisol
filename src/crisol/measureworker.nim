@@ -10,9 +10,8 @@
 ## modules:
 ##
 ##   `workerplan.{MeasurePlan, parseMeasurePlan, forceMeasurementCcEnv,
-##   entryUnitBasename}` — the plan schema + helpers SHARED with this
-##   module's cache-mode sibling (`cacheworker.nim`) — see workerplan.nim's
-##   own doc.
+##   entryUnitBasename}` — the plan schema + helpers this worker uses — see
+##   workerplan.nim's own doc.
 ##   `compiledriver.runMeasured`  — split-compile measurement driver (M-driver)
 ##   `closure.parseCompileManifest` / `artifactid.{normalize,ccIncludeClosure,
 ##   artifactKeyHash}` — the pure identity core (pass (a))
@@ -23,16 +22,16 @@
 ## hand-authored `plan.json`. Wiring it as a slot's compile CHILD —
 ## `runner.nim`'s `spCompiling`→`spRunning` transition spawning THIS worker
 ## via the existing argv-array `forkExec`, measurement-mode-gated — landed in
-## PASS (b2): `runner.nim` now authors `plan.json` and dispatches both this
-## measurement worker and (Stage R) `cacheworker.runCompileCacheWorker`.
+## PASS (b2): `runner.nim` now authors `plan.json` and dispatches this
+## measurement worker.
 ##
 ## Split out of the original fused measureworker.nim (RFC-0006 review R8,
-## structural-only — no behavior change): this module now owns ONLY the
-## measure-mode worker (`runMeasureCompileWorker` + `recordArtifactRows` +
-## `recordCompileCostRow`). The plan schema + shared helpers moved to
-## `workerplan.nim`; the cache-mode worker (`runCompileCacheWorker` +
-## `buildCacheKeyOf` + its monolithic escape hatch) moved to
-## `cacheworker.nim`. See those modules' own docs for their scope.
+## structural-only — no behavior change): this module owns the measure-mode
+## worker (`runMeasureCompileWorker` + `recordArtifactRows` +
+## `recordCompileCostRow`). The plan schema + shared helpers live in
+## `workerplan.nim`. (RFC-0006 Stage R's cache-mode worker, formerly in
+## `cacheworker.nim`, was removed entirely — an end-to-end A/B showed the
+## object cache didn't pay off on the target consumer.)
 ##
 ## ## Pipeline (`runMeasureCompileWorker`)
 ##
@@ -57,8 +56,7 @@
 ##    caught, logged to stderr, and does NOT change the exit code — a
 ##    measurement-layer failure must never fail a compile that actually
 ##    produced a runnable binary (RFC-0006's escape-hatch philosophy; this
-##    describes the MEASURE-mode worker above — Stage R's own cache-mode
-##    worker and its escape hatch live in `cacheworker.nim`).
+##    describes the MEASURE-mode worker above).
 ## 5. Also on a successful compile, attempt to RECORD ONE compile-cost row
 ##    (`recordCompileCostRow`, RFC-0006 M-cost-split): the raw codegen/cc/link
 ##    µs split already computed by `runMeasured` into `spans`, appended to the

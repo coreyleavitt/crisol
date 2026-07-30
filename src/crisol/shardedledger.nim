@@ -1,19 +1,20 @@
 ## shardedledger.nim — RFC-0006 code-review R3 (subsumes R12): generic
 ## sharded-NDJSON ledger substrate.
 ##
-## `artifactledger.nim`, `compilecost.nim`, and `objcachestats.nim` each
-## independently reimplemented an IDENTICAL sharded-NDJSON pattern (~400
-## lines each): bootId read (with `/dev/urandom` fallback), a per-process
-## shard-sequence counter, `<pid>-<bootId>-<seq>.ndjson` naming, a
-## format-version header line + NDJSON row framing, corruption-tolerant
-## parsing (malformed row -> skip+warn; header-version mismatch -> discard
-## the whole shard), `scanX` (concatenate all shards + sort by timestamp),
-## and `compactX` (merge -> age-filter -> write-one-shard ->
-## remove-originals, crash-safe by write-then-remove ordering). This module
-## is the extracted, parameterized substrate; each of the three streams now
-## instantiates it with a small per-row codec (see `ShardedLedgerSpec`) and
-## re-exposes the SAME public proc names/signatures it had before (thin
-## typed wrappers — see each module's own file).
+## `artifactledger.nim` and `compilecost.nim` (originally also
+## `objcachestats.nim`, removed with RFC-0006 Stage R — see that stream's own
+## history if resurrecting) each independently reimplemented an IDENTICAL
+## sharded-NDJSON pattern (~400 lines each): bootId read (with
+## `/dev/urandom` fallback), a per-process shard-sequence counter,
+## `<pid>-<bootId>-<seq>.ndjson` naming, a format-version header line +
+## NDJSON row framing, corruption-tolerant parsing (malformed row ->
+## skip+warn; header-version mismatch -> discard the whole shard), `scanX`
+## (concatenate all shards + sort by timestamp), and `compactX` (merge ->
+## age-filter -> write-one-shard -> remove-originals, crash-safe by
+## write-then-remove ordering). This module is the extracted, parameterized
+## substrate; each stream instantiates it with a small per-row codec (see
+## `ShardedLedgerSpec`) and re-exposes the SAME public proc names/signatures
+## it had before (thin typed wrappers — see each module's own file).
 ##
 ## `ledger.nim` (the pre-existing EXEC ledger) is DELIBERATELY not
 ## reimplemented over this substrate and stays untouched. The reason is a
@@ -29,8 +30,8 @@
 ##
 ## ## Common row shape (why the codec seam is small)
 ##
-## All three consumer row types (`ArtifactRow`, `CompileCostRow`,
-## `ObjCacheStatsRow`) share FIVE fields with identical semantics:
+## Both consumer row types (`ArtifactRow`, `CompileCostRow`) share FIVE
+## fields with identical semantics:
 ## `entrypointIdentity` (`IdentityKey`), `groupId`/`configHash`
 ## (segmentation strings), `timestamp` (unix epoch microseconds), and
 ## `rowVersion` (row-schema version, checked against a `currentRowVersion`
@@ -85,10 +86,10 @@
 ## and its OWN shard-sequence counter, independent of the other streams'.
 ## This module preserves that exactly via `{.global.}` vars declared INSIDE
 ## generic procs: Nim monomorphizes a generic proc per unique type
-## argument, so `streamBootId[ArtifactRow]`, `streamBootId[CompileCostRow]`,
-## and `streamBootId[ObjCacheStatsRow]` are three separate proc bodies, each
-## with its OWN `{.global.}` state — i.e. one independent bootId read and
-## one independent shard-sequence counter per STREAM (row type), exactly as
+## argument, so `streamBootId[ArtifactRow]` and
+## `streamBootId[CompileCostRow]` are separate proc bodies, each with its
+## OWN `{.global.}` state — i.e. one independent bootId read and one
+## independent shard-sequence counter per STREAM (row type), exactly as
 ## before, with no shared/cross-stream state and no change in the number of
 ## `/proc/sys/kernel/random/boot_id` reads.
 

@@ -14,7 +14,7 @@
 ##     alias the NUL separator between components.
 ##   - Empty-fixture sentinel produces a stable key distinct from a non-empty hash.
 
-import std/options
+import std/[options, strutils]
 import crisol/keys
 import crisol/types
 
@@ -198,5 +198,56 @@ block test_soundness_key_empty_fixture_differs_from_real:
 
   assert soundnessKey(a) != soundnessKey(b),
     "empty-fixture sentinel must differ from a real fixtureHash"
+
+# ---------------------------------------------------------------------------
+# Structural tripwire: KeyInputs has exactly the 9 documented RFC-0004
+# components, none shaped like a compile-cache/object-cache signal.
+#
+# Preserved from the now-deleted RFC-0006 objcache-independence guard
+# (test_soundness_key_objcache_independence.nim, removed with Stage R):
+# object/compile-cache reuse must stay OUTSIDE the result-soundness key.
+# Enumerated at runtime via `fieldPairs` (not a hardcoded copy of keys.nim's
+# field list) so a future PR that adds a 10th field trips this test red,
+# forcing the change to be reviewed rather than silently landing.
+# ---------------------------------------------------------------------------
+
+const ExpectedRfc0004Fields = [
+  "closureContentHash",
+  "flagHash",
+  "nimVersion",
+  "ccVersion",
+  "fixtureHash",
+  "argv",
+  "rlimitConfig",
+  "hermeticEnvHash",
+  "protocolMajor",
+]
+  ## The 9 components documented in keys.nim's module doc, in KeyInputs
+  ## declaration order.
+
+const CacheShapedSubstrings = ["obj", "compilecache", "objcache"]
+  ## Case-insensitive substrings that would flag a field name as a
+  ## compile-cache/object-cache signal (e.g. "objCacheHit", "objHash").
+
+block test_key_inputs_has_no_cache_shaped_field:
+  var fieldNames: seq[string] = @[]
+  let inp = baseInputs()
+  for name, _ in inp.fieldPairs:
+    fieldNames.add name
+
+  assert fieldNames == @ExpectedRfc0004Fields,
+    "KeyInputs field set changed from the documented RFC-0004 9-component " &
+    "baseline -- if this is an intentional new soundness input, update " &
+    "ExpectedRfc0004Fields; if it is a compile-cache field being folded " &
+    "into the result-soundness key, STOP: object/compile reuse is supposed " &
+    "to stay provably outside this key"
+
+  for name in fieldNames:
+    let lower = name.toLowerAscii
+    for bad in CacheShapedSubstrings:
+      assert bad notin lower,
+        "KeyInputs field '" & name & "' looks compile-cache-shaped " &
+        "(matched substring '" & bad & "') -- object/compile reuse must " &
+        "stay OUTSIDE the result-soundness key"
 
 echo "test_keys: all assertions passed"

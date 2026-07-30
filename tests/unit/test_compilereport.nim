@@ -15,7 +15,6 @@ import std/[json, os, unittest]
 import crisol/types
 import crisol/artifactledger
 import crisol/compilecost
-import crisol/objcachestats
 import crisol/compilereport
 
 # ---------------------------------------------------------------------------
@@ -66,28 +65,6 @@ proc mkCostRowAt(identity: string; groupId, configHash: string;
 
 proc findSegment(node: JsonNode; groupId, configHash: string): JsonNode =
   for seg in node["segments"]:
-    if seg["groupId"].getStr == groupId and seg["configHash"].getStr == configHash:
-      return seg
-  result = nil
-
-proc mkObjCacheStatsRow(identity: string; groupId, configHash: string;
-                        hits, misses, stored, disabled: int;
-                        reusedBytes: int64): ObjCacheStatsRow =
-  ObjCacheStatsRow(
-    rowVersion:         1,
-    entrypointIdentity: IdentityKey(identity),
-    groupId:            groupId,
-    configHash:         configHash,
-    hits:               hits,
-    misses:             misses,
-    stored:             stored,
-    disabled:           disabled,
-    reusedBytes:        reusedBytes,
-    timestamp:          1000,
-  )
-
-proc findOcSegment(ocNode: JsonNode; groupId, configHash: string): JsonNode =
-  for seg in ocNode["segments"]:
     if seg["groupId"].getStr == groupId and seg["configHash"].getStr == configHash:
       return seg
   result = nil
@@ -450,137 +427,6 @@ suite "buildCompileBlock — compileRegressions threading (M-report b2)":
     check $withDefault == $withExplicitEmpty
 
 # ---------------------------------------------------------------------------
-# 9. objcache aggregation -- RFC-0006 Stage R, R5b: realized objcache
-#    hit/miss/stored/disabled counts + reusedBytes/cacheSizeBytes aggregated
-#    into compile.objcache, per (groupId, configHash) segment.
-# ---------------------------------------------------------------------------
-
-suite "buildCompileBlock — objcache aggregation (RFC-0006 R5b)":
-
-  test "two segments: correct sum hits/misses/stored/disabled, hitRate, reusedBytes, per-segment breakdown, cacheSizeBytes echoed, note present":
-    let ocRows = @[
-      mkObjCacheStatsRow("ep_a", "g1", "c1", hits = 3, misses = 1, stored = 1, disabled = 0, reusedBytes = 300),
-      mkObjCacheStatsRow("ep_b", "g1", "c1", hits = 2, misses = 2, stored = 1, disabled = 1, reusedBytes = 200),
-      mkObjCacheStatsRow("ep_c", "g2", "c2", hits = 1, misses = 0, stored = 0, disabled = 0, reusedBytes = 50),
-    ]
-    let node = buildCompileBlock(@[], @[], objCacheStatsRows = ocRows, cacheSizeBytes = 10_000)
-    check node != nil
-    check node.hasKey("objcache")
-    let oc = node["objcache"]
-
-    check oc["hits"].getInt == 6
-    check oc["misses"].getInt == 3
-    check oc["stored"].getInt == 2
-    check oc["disabled"].getInt == 1
-    check abs(oc["hitRate"].getFloat - (6.0 / 9.0)) < 1e-9
-    check oc["reusedBytes"].getBiggestInt == 550
-    check oc["cacheSizeBytes"].getBiggestInt == 10_000
-    check oc.hasKey("note")
-    check oc["note"].getStr.len > 0
-
-    check oc["segments"].len == 2
-    let seg1 = findOcSegment(oc, "g1", "c1")
-    check seg1 != nil
-    check seg1["hits"].getInt == 5
-    check seg1["misses"].getInt == 3
-    check seg1["stored"].getInt == 2
-    check abs(seg1["hitRate"].getFloat - (5.0 / 8.0)) < 1e-9
-    check seg1["reusedBytes"].getBiggestInt == 500
-
-    let seg2 = findOcSegment(oc, "g2", "c2")
-    check seg2 != nil
-    check seg2["hits"].getInt == 1
-    check seg2["misses"].getInt == 0
-    check abs(seg2["hitRate"].getFloat - 1.0) < 1e-9
-    check seg2["reusedBytes"].getBiggestInt == 50
-
-  test "hits+misses == 0 -> hitRate is 0.0, not NaN or a crash":
-    let ocRows = @[mkObjCacheStatsRow("ep_a", "g1", "c1", hits = 0, misses = 0, stored = 0, disabled = 3, reusedBytes = 0)]
-    let node = buildCompileBlock(@[], @[], objCacheStatsRows = ocRows)
-    check node["objcache"]["hitRate"].getFloat == 0.0
-    check node["objcache"]["hits"].getInt == 0
-    check node["objcache"]["disabled"].getInt == 3
-
-# ---------------------------------------------------------------------------
-# 10. objcache absence -- back-compat: no rows -> no 'objcache' key at all
-# ---------------------------------------------------------------------------
-
-suite "buildCompileBlock — objcache absence (RFC-0006 R5b, back-compat)":
-
-  test "no objcachestats rows -> the compile block has no 'objcache' key":
-    let artifactRows = @[mkArtifactRow("ep_a", "g1", "c1", "u.c", "K1", 100, 100)]
-    let node = buildCompileBlock(artifactRows, @[])
-    check node != nil
-    check not node.hasKey("objcache")
-
-  test "objCacheStatsRows alone (no artifact/cost rows at all) is enough to produce a non-nil block with an empty segments array":
-    let ocRows = @[mkObjCacheStatsRow("ep_a", "g1", "c1", 1, 0, 0, 0, 100)]
-    let node = buildCompileBlock(@[], @[], objCacheStatsRows = ocRows)
-    check node != nil
-    check node.hasKey("objcache")
-    check node["segments"].len == 0
-
-  test "omitted vs explicit empty objCacheStatsRows -> byte-identical document (additive/back-compat)":
-    let artifactRows = @[mkArtifactRow("ep_a", "g1", "c1", "u.c", "K1", 100, 100)]
-    let withDefault = buildCompileBlock(artifactRows, @[])
-    let withExplicitEmpty = buildCompileBlock(artifactRows, @[], objCacheStatsRows = @[])
-    check $withDefault == $withExplicitEmpty
-
-# ---------------------------------------------------------------------------
-# 11. drift visibility -- potential rTime (segments[]) vs realized hitRate
-#     (objcache.segments[]), same (groupId, configHash) key (RFC-0006 R5b,
-#     reworded honest per R16/R9-revert)
-#
-# R16: the cache-mode worker no longer writes ArtifactRows (see
-# measureworker.nim's R16 doc) -- a cache HIT does no compilation, so its
-# ArtifactRow would necessarily carry ccTimeUs=0, skewing the cc-time-
-# weighted rTime and permanently polluting the append-only artifact ledger.
-# So `segments[].rTime` and `objcache.segments[].hitRate` can never both be
-# freshly populated by ONE worker run in the real system: `rTime` comes
-# ONLY from a MEASURE-mode run's artifact rows; `hitRate` comes ONLY from a
-# LATER CACHE-mode run's objcache-stats rows, scanned from the SAME
-# on-disk `stateDir` at report time. `buildCompileBlock` itself is a PURE
-# function that just aggregates whatever rows it's handed -- it doesn't
-# know or care which worker/run produced them -- so this test constructs
-# `artifactRows` and `ocRows` as the two INDEPENDENT on-disk streams a real
-# `readCompileBlock(stateDir, ...)` would scan after a measure-run followed
-# by a cache-run against the same stateDir, and asserts the drift numbers
-# line up per (groupId, configHash) once both are aggregated into one block.
-# ---------------------------------------------------------------------------
-
-suite "buildCompileBlock — objcache/segments drift visibility (RFC-0006 R5b, cross-run per R16)":
-
-  test "a MEASURE-run's potential rTime and a LATER CACHE-run's realized hitRate, both scanned from the same stateDir, are keyed identically for drift comparison":
-    # Stands in for `scanArtifactLedger(stateDir)` after a MEASURE-mode run
-    # (runMeasureCompileWorker) -- the only worker that writes artifact rows.
-    let artifactRows = @[
-      # fully shared -> rTime == 1.0 (high POTENTIAL reuse)
-      mkArtifactRow("ep_a", "g1", "c1", "u.c", "K1", 100, 100),
-      mkArtifactRow("ep_b", "g1", "c1", "u.c", "K1", 100, 100),
-    ]
-    # Stands in for `scanObjCacheStatsLedger(stateDir)` after a LATER
-    # CACHE-mode run (runCompileCacheWorker) against the SAME stateDir.
-    let ocRows = @[
-      # cold cache that run -> hitRate == 0.0 (low REALIZED reuse)
-      mkObjCacheStatsRow("ep_a", "g1", "c1", hits = 0, misses = 2, stored = 1, disabled = 0, reusedBytes = 0),
-    ]
-    let node = buildCompileBlock(artifactRows, @[], objCacheStatsRows = ocRows)
-
-    let seg = findSegment(node, "g1", "c1")
-    check seg != nil
-    check seg["rTime"].getFloat == 1.0
-
-    let ocSeg = findOcSegment(node["objcache"], "g1", "c1")
-    check ocSeg != nil
-    check ocSeg["hitRate"].getFloat == 0.0
-
-    # Drift: potential (rTime, from the measure-run) far exceeds realized
-    # (hitRate, from the later cache-run) for the SAME (groupId, configHash)
-    # -- the cold-cache / first-wave-dedup gap, visible across the two runs'
-    # reports because both are keyed consistently.
-    check seg["rTime"].getFloat - ocSeg["hitRate"].getFloat > 0.5
-
-# ---------------------------------------------------------------------------
 # 12. R7 (code review) — low-confidence gate: THIS run's own contributing-
 #     entrypoint count vs the aggregate, and reuse-check suppression on thin
 #     (e.g. --changed-narrowed) runs. RFC-0006 §Wire/schema touchpoints:
@@ -713,13 +559,13 @@ suite "buildReuseAlerts — R7: low-confidence segments are suppressed regardles
 # ---------------------------------------------------------------------------
 # 13. R14-T5 (code review, test gap) — readCompileBlock adversarial on-disk
 #     state: the individual per-stream scans are corruption-resilient and
-#     tested per-stream, but the AGGREGATOR that joins all three streams had
+#     tested per-stream, but the AGGREGATOR that joins both streams had
 #     no test of its own. This exercises readCompileBlock (the effectful
-#     entry point) against malformed/partial rows across ALL three ledgers
+#     entry point) against malformed/partial rows across BOTH ledgers
 #     simultaneously.
 # ---------------------------------------------------------------------------
 
-suite "readCompileBlock — R14-T5: adversarial on-disk state across all three telemetry streams":
+suite "readCompileBlock — R14-T5: adversarial on-disk state across both telemetry streams":
 
   proc freshStateDir(tag: string): string =
     result = getTempDir() / "crisol_test_compilereport_readblock_" & tag &
@@ -727,9 +573,8 @@ suite "readCompileBlock — R14-T5: adversarial on-disk state across all three t
     removeDir(result)
     createDir(result / "ledger" / "artifacts")
     createDir(result / "ledger" / "compilecost")
-    createDir(result / "ledger" / "objcachestats")
 
-  test "malformed/partial rows across all three streams -> readCompileBlock tolerates them (no crash, sane block, surviving good rows visible)":
+  test "malformed/partial rows across both streams -> readCompileBlock tolerates them (no crash, sane block, surviving good rows visible)":
     let stateDir = freshStateDir("adversarial")
     defer: removeDir(stateDir)
 
@@ -755,15 +600,6 @@ suite "readCompileBlock — R14-T5: adversarial on-disk state across all three t
       "{{{garbage" & "\n"
     )
 
-    # Objcache-stats stream: valid header + one good row + a blank line +
-    # a non-JSON line.
-    writeFile(stateDir / "ledger" / "objcachestats" / "a.ndjson",
-      """{"objCacheStatsLedgerFormatVersion":1}""" & "\n" &
-      """{"rowVersion":1,"entrypointIdentity":"ep_a","groupId":"g1","configHash":"c1","hits":1,"misses":1,"stored":1,"disabled":0,"reusedBytes":50,"timestamp":1000}""" & "\n" &
-      "\n" &
-      "not json at all" & "\n"
-    )
-
     var node: JsonNode
     var raised = false
     try:
@@ -779,8 +615,6 @@ suite "readCompileBlock — R14-T5: adversarial on-disk state across all three t
     let seg = findSegment(node, "g1", "c1")
     check seg != nil
     check seg["artifactsTotal"].getInt == 1   # b.ndjson's whole shard was discarded
-    check node.hasKey("objcache")
-    check node["objcache"]["hits"].getInt == 1
 
   test "totally empty ledger subdirectories and a never-created stateDir -> readCompileBlock returns nil, no crash":
     let stateDir = freshStateDir("empty")

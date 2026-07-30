@@ -16,22 +16,23 @@
 ##
 ## It records OVERLAP-AWARE spans (codegen, cc-as-real-wall-clock-of-the-
 ## parallel-phase, link) plus PER-UNIT cc wall-time. `newMeasureDriver`
-## (measure mode) does NO caching; `newCacheDriver` (Stage R, below) is the
-## CACHE-mode driver over the same seam. Both are MEASUREMENT/CACHE-GATED:
-## the default production compile path (runner.nim's spawnCompileStable)
-## stays the monolithic `nim c` unless measurement or `--objcache` is
-## explicitly opted into.
+## (measure mode) does NO caching. It is MEASUREMENT-GATED: the default
+## production compile path (runner.nim's spawnCompileStable) stays the
+## monolithic `nim c` unless measurement is explicitly opted into.
 ##
-## ## The CompileDriver seam (one seam, two modes — RFC-0006 §Stage R)
+## (RFC-0006 Stage R — a content-keyed cross-entrypoint object cache built
+## on top of this same driver seam — was implemented, measured end-to-end
+## against a real consumer, and subsequently REMOVED: an A/B showed the
+## cache didn't pay off there (codegen-bound, not cc-bound; cold runs were
+## slower). This module now serves the measurement path only.)
+##
+## ## The CompileDriver seam
 ##
 ## Every effectful step is an injectable proc field, mirroring ccprobe.nim's
 ## `RunProc` idiom: the seam never raises, failure surfaces via an `ok` flag,
 ## and tests inject synthetic procs so the span-accounting/orchestration logic
 ## in `runMeasured` is exercised without a slow real `nim c` invocation.
-## `newMeasureDriver` builds the real MEASURE-mode seam; `newCacheDriver`
-## (Stage R, below) builds the real CACHE-mode seam over the SAME
-## `CompileDriver` shape — `runCc` becomes objcache-lookup-or-compile-and-
-## store — reusing this driver, not reinventing it.
+## `newMeasureDriver` builds the real MEASURE-mode seam.
 ##
 ## ## Concurrency (matching Nim's own compiler — verified against vendored
 ## source, Nim 2.2.10)
@@ -58,10 +59,8 @@
 ## phases that DID complete before the failure are preserved (e.g. a link
 ## failure still reports real codegen/cc spans).
 
-import std/[monotimes, options, os, osproc, sequtils, streams, strutils, tables, times]
+import std/[monotimes, os, osproc, sequtils, streams, tables, times]
 import crisol/closure
-import crisol/objcache
-import crisol/artifactid   # shellSplit — review Finding 2: shell-aware, not splitWhitespace
 
 # ---------------------------------------------------------------------------
 # Seam types
@@ -91,19 +90,10 @@ type
     ccSpanUs*:  int64        ## overlap-aware wall time of the WHOLE cc phase
                               ## (max end - min start across all units) — NOT
                               ## the sum of per-unit ccTimeUs.
-    decisions*: seq[tuple[basename: string; decision: ObjCacheDecision]]
-      ## ADDITIVE (Stage R, R2a): per-unit objcache decision. Empty in
-      ## measure mode (`defaultRunCc`/`newMeasureDriver` never populate this —
-      ## there is no cache to decide against). Only `newCacheDriver`'s runCc
-      ## populates it. A unit whose underlying compile itself FAILED gets no
-      ## entry here (no cache decision was ever made for it — see
-      ## `newCacheDriver`'s doc); order is not guaranteed to match `units`,
-      ## look up by `basename`.
 
   RunCcProc* = proc(units: seq[CompileUnit]): RunCcResult {.closure.}
     ## Runs every unit's cc command. Real measure-mode impl (`defaultRunCc`,
-    ## below): never caches. Stage R's cache mode implements this as
-    ## objcache-lookup-or-compile-and-store — see `newCacheDriver`, below.
+    ## below): never caches.
 
   LinkProc* = proc(linkCmd: string): tuple[ok: bool; output: string] {.closure.}
     ## Runs the manifest's `linkcmd`. Real impl (`realLink`): shell-evaluates
@@ -111,8 +101,7 @@ type
 
   CompileDriver* = object
     ## Closure-field seam object (crisol idiom — mirrors ccprobe.RunProc).
-    ## ONE seam, TWO modes: measure (`newMeasureDriver`) and Stage R's cache
-    ## mode (`newCacheDriver`, below). Never two abstractions.
+    ## `newMeasureDriver` builds the real measure-mode implementation.
     compileOnly*: CompileOnlyProc
     runCc*:       RunCcProc
     link*:        LinkProc
@@ -125,48 +114,6 @@ type
     ccSpanUs*:       int64
     linkSpanUs*:     int64
     ccUnitTimesUs*:  Table[string, int64]   ## basename -> ccTimeUs
-    decisions*:      seq[tuple[basename: string; decision: ObjCacheDecision]]
-      ## ADDITIVE (Stage R, R5a): `RunCcResult.decisions` copied through
-      ## verbatim. Empty for measure-mode callers (`defaultRunCc`/
-      ## `newMeasureDriver` never populate `RunCcResult.decisions`) — only
-      ## `newCacheDriver`'s runCc populates it. Copied on both the cc-phase
-      ## failure early-return and the normal-completion path (same places
-      ## `ccUnitTimesUs` is populated), so a cache-mode caller sees whatever
-      ## decisions were made even for units processed before a later unit's
-      ## compile failed.
-
-# ---------------------------------------------------------------------------
-# Cache-mode helper: parseCcOutputObj
-# ---------------------------------------------------------------------------
-
-proc parseCcOutputObj*(ccCmd: string): string =
-  ## Extract the cc `-o <path>` object-output argument from a manifest
-  ## `ccCmd` string — the `.o` the compile writes and `linkcmd` later
-  ## references. Handles both the space-separated `-o <path>` form (the one
-  ## real Nim-generated cc commands use — see `artifactid.nim`'s test
-  ## fixtures) and the concatenated `-o<path>` form. Returns "" if no `-o`
-  ## flag is present, if `-o` is the final token with nothing after it, or if
-  ## `ccCmd` cannot be cleanly shell-tokenized (an unterminated quote — same
-  ## fail-safe degrade as `artifactid.deriveCcMInvocation`). Never raises.
-  ##
-  ## **Review Finding 2:** tokenizes via `artifactid.shellSplit` — shell-AWARE
-  ## (matching `deriveCcMInvocation`'s own tokenization of the SAME `ccCmd`
-  ## shape), not a naive `splitWhitespace()`. A plain whitespace split
-  ## silently corrupts a shell-quoted `-o <path>` whose path contains a space
-  ## (realistic under WSL2 — a mounted toolchain's nimcache/bin dir inherits
-  ## the space, and Nim shell-quotes the argument before this string is ever
-  ## generated), truncating the extracted object path at the embedded space —
-  ## which made objcache silently no-op under a whitespace stateDir/project
-  ## path (every unit's `-o` extraction failed to find its real target).
-  let (toks, ok) = artifactid.shellSplit(ccCmd)
-  if not ok: return ""
-  for i, t in toks:
-    if t == "-o":
-      if i + 1 < toks.len: return toks[i + 1]
-      else: return ""
-    elif t.startsWith("-o") and t.len > 2:
-      return t[2 .. ^1]
-  ""
 
 # ---------------------------------------------------------------------------
 # Real (measure-mode) seam implementations
@@ -257,145 +204,6 @@ proc newMeasureDriver*(concurrency: int = countProcessors()): CompileDriver =
   )
 
 # ---------------------------------------------------------------------------
-# Cache-mode driver (Stage R, R2a)
-# ---------------------------------------------------------------------------
-
-type
-  ObjKeyOfProc* = proc(unit: CompileUnit):
-    tuple[keyHash, preimage, objOutPath: string] {.closure.}
-    ## Derives the `(keyHash, preimage, objOutPath)` a compile unit maps to.
-    ## Real production wiring (R2b) closes over `objkey.stageRKey` plus
-    ## `parseCcOutputObj` (for `objOutPath`) and the manifest's `.c` content;
-    ## R2a's tests inject a synthetic proc — this module never computes a key
-    ## itself, it only consumes one (mirroring how `objcache.nim` takes
-    ## `keyHash`/`keyPreimage` as given).
-    ##
-    ## An EMPTY `keyHash` (R2b1) is a deliberate signal, not an error: it
-    ## marks the unit as NON-CACHEABLE — `newCacheDriver`'s `runCc` skips
-    ## both `seams.lookup` and `seams.store` for it entirely and simply
-    ## compiles it via `ccRunner` (decision `ocdDisabled`). This is how the
-    ## entry unit (`@m<entrypoint>.nim.c`) stays PRIVATE — RFC-0006: "the
-    ## entry .c + link stay private" — without `newCacheDriver` itself
-    ## needing to know what an "entry unit" is; the caller's `keyOf`
-    ## encodes that decision.
-
-proc newCacheDriver*(seams: ObjCacheSeams; keyOf: ObjKeyOfProc;
-                     concurrency: int = countProcessors();
-                     ccRunner: RunCcProc = nil): CompileDriver =
-  ## The cache-mode `CompileDriver`: same `compileOnly`/`link` as measure mode
-  ## (`realCompileOnly`/`realLink` — caching only touches the cc phase), but
-  ## `runCc` becomes objcache-lookup-or-compile-and-store, per unit:
-  ##
-  ##   1. `(keyHash, preimage, objOut) = keyOf(unit)`.
-  ##   2. `seams.lookup(keyHash, preimage)`:
-  ##      - `some(cachedPath)` — a HIT: copy `cachedPath` -> `objOut` (so
-  ##        `linkcmd` finds it there, matching what a real compile would have
-  ##        produced), record `ocdHit`, `ok = (copy succeeded)`,
-  ##        `ccTimeUs = 0` (no compile ran). The underlying compiler is NEVER
-  ##        invoked for a hit unit.
-  ##      - `none` — a MISS: the unit is handed to `ccRunner` (defaults to
-  ##        the same `defaultRunCc` primitive measure mode uses, bound to
-  ##        `concurrency` — so MISS units of one `runCc` call still overlap
-  ##        exactly like measure mode's cc phase; tests inject a synthetic
-  ##        `ccRunner` so no real subprocess runs). `ccRunner` is gated on
-  ##        exit status: a nonzero/killed compile means `ok = false` and
-  ##        NOTHING is written to the cache — a failed/partial compile must
-  ##        never be stored (no truncated `.o`). On success, `objOut`'s bytes
-  ##        are handed to `seams.store(keyHash, preimage, objOut)` (store
-  ##        itself reads the file — same contract as `objcache.storeObject`);
-  ##        the decision is `ocdStored` if `store` returned true, else
-  ##        `ocdMissCompiled`.
-  ##
-  ## Preserves `RunCcResult.ok` (true iff every unit — hit or miss — is ok)
-  ## and overlap-aware `ccSpanUs` (the MISS-phase span alone; hit units cost
-  ## ~0 wall time and contribute nothing to it — mirrors `defaultRunCc`'s own
-  ## overlap-aware accounting, just over the miss subset). Populates
-  ## `RunCcResult.decisions`.
-  ##
-  ## `ccRunner`'s contract mirrors `RunCcProc`/`defaultRunCc` EXACTLY,
-  ## including 1:1 index-order correspondence between its input `units` and
-  ## its returned `RunCcResult.units` — required so this driver can map each
-  ## miss result back to the `(keyHash, preimage, objOut)` `keyOf` computed
-  ## for it.
-  let runner: RunCcProc =
-    if ccRunner == nil:
-      proc(units: seq[CompileUnit]): RunCcResult = defaultRunCc(units, concurrency)
-    else:
-      ccRunner
-
-  let cacheRunCc = proc(units: seq[CompileUnit]): RunCcResult =
-    type KeyInfo = tuple[keyHash, preimage, objOutPath: string]
-    var keyInfos = newSeq[KeyInfo](units.len)
-    for i, u in units:
-      keyInfos[i] = keyOf(u)
-
-    var unitResults = newSeq[CcUnitResult](units.len)
-    var decisions: seq[tuple[basename: string; decision: ObjCacheDecision]]
-    var missUnits: seq[CompileUnit]
-    var missOrigIdx: seq[int]   # units[] index for each entry in missUnits, in order
-    var nonCacheable = newSeq[bool](units.len)
-      ## R2b1: units whose `keyOf` returned an empty keyHash — never looked
-      ## up, never stored (see `ObjKeyOfProc`'s doc); tracked by index so the
-      ## post-ccRunner pass below can route them to `ocdDisabled` instead of
-      ## the normal store-gate logic.
-
-    for i, u in units:
-      let k = keyInfos[i]
-      if k.keyHash.len == 0:
-        # Non-cacheable (R2b1): skip lookup AND store entirely, just compile.
-        nonCacheable[i] = true
-        missUnits.add u
-        missOrigIdx.add i
-        continue
-      let cached = seams.lookup(k.keyHash, k.preimage)
-      if cached.isSome:
-        var copyOk = true
-        try:
-          copyFile(cached.get, k.objOutPath)
-        except OSError as e:
-          copyOk = false
-          stderr.write("crisol: warning: objcache hit copy to '" & k.objOutPath &
-                       "' failed for '" & u.basename & "': " & e.msg & "\n")
-        unitResults[i] = CcUnitResult(basename: u.basename, ok: copyOk, ccTimeUs: 0)
-        decisions.add (basename: u.basename, decision: ocdHit)
-      else:
-        missUnits.add u
-        missOrigIdx.add i
-
-    let missRes =
-      if missUnits.len > 0: runner(missUnits)
-      else: RunCcResult(ok: true, units: @[], ccSpanUs: 0)
-
-    # 1:1 index correspondence with missUnits (RunCcProc's contract — see
-    # defaultRunCc, which fills result.units by input index).
-    for j, mu in missRes.units:
-      let origIdx = missOrigIdx[j]
-      unitResults[origIdx] = mu
-      if mu.ok:
-        if nonCacheable[origIdx]:
-          decisions.add (basename: mu.basename, decision: ocdDisabled)
-        else:
-          let k = keyInfos[origIdx]
-          let stored = seams.store(k.keyHash, k.preimage, k.objOutPath)
-          decisions.add (basename: mu.basename,
-                         decision: (if stored: ocdStored else: ocdMissCompiled))
-      # else: the compile itself failed — no cache decision is made, store is
-      # NOT called (see module doc: never cache a failed/truncated compile).
-
-    var allOk = true
-    for r in unitResults:
-      if not r.ok: allOk = false
-
-    result = RunCcResult(ok: allOk, units: unitResults,
-                         ccSpanUs: missRes.ccSpanUs, decisions: decisions)
-
-  CompileDriver(
-    compileOnly: realCompileOnly,
-    runCc: cacheRunCc,
-    link: realLink,
-  )
-
-# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -424,7 +232,6 @@ proc runMeasured*(driver: CompileDriver; entrypoint: string; flags: seq[string];
     result.codegenSpanUs = (t1 - t0).inMicroseconds
     result.ccSpanUs      = ccResult.ccSpanUs
     for u in ccResult.units: result.ccUnitTimesUs[u.basename] = u.ccTimeUs
-    result.decisions     = ccResult.decisions
     return result
 
   let t2 = getMonoTime()
@@ -435,7 +242,6 @@ proc runMeasured*(driver: CompileDriver; entrypoint: string; flags: seq[string];
   result.codegenSpanUs = (t1 - t0).inMicroseconds
   result.ccSpanUs      = ccResult.ccSpanUs
   for u in ccResult.units: result.ccUnitTimesUs[u.basename] = u.ccTimeUs
-  result.decisions     = ccResult.decisions
   if not linkOk:
     result.errorMsg = "link failed: " & linkOut
   else:
