@@ -233,10 +233,10 @@ block test_cleanorphans_compacts_artifact_stream:
   let r = cleanOrphans(cfg)
 
   # Artifact stream compacted: 2 shards merged into 1, 2 rows kept.
-  assert r.artifactShardsRemoved == 2,
-    "cleanOrphans: expected 2 artifact shards removed, got " & $r.artifactShardsRemoved
-  assert r.artifactRowsKept == 2,
-    "cleanOrphans: expected 2 artifact rows kept, got " & $r.artifactRowsKept
+  assert r.artifactReport.shardsRemoved == 2,
+    "cleanOrphans: expected 2 artifact shards removed, got " & $r.artifactReport.shardsRemoved
+  assert r.artifactReport.rowsKept == 2,
+    "cleanOrphans: expected 2 artifact rows kept, got " & $r.artifactReport.rowsKept
 
   let artRows = scanArtifactLedger(stateDir)
   assert artRows.len == 2, "cleanOrphans: artifact scan expected 2 rows, got " & $artRows.len

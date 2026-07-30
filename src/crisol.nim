@@ -202,6 +202,10 @@ Additional options for 'run':
                   request -- harmless to pass, kept for scripts/clarity).
   --no-objcache   Force the object cache off, overriding the default and
                   --objcache/config `objcache #true`.
+  --measure-compile-reuse
+                  Diagnostic: run compile slots through the measurement
+                  worker and emit the `compile` block's segmented cc%/
+                  r_time/r_size stats to the run report (no caching).
 
 Additional options for 'list':
   --json          Emit the crisol/plan/v1 JSON document instead of human output.
@@ -357,12 +361,12 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                    " result-cache entry(ies); compacted " &
                    $r.shardsRemoved & " ledger shard(s) (" &
                    $r.ledgerRowsKept & " row(s) kept); compacted " &
-                   $r.artifactShardsRemoved & " artifact shard(s) (" &
-                   $r.artifactRowsKept & " row(s) kept); compacted " &
-                   $r.compileCostShardsRemoved & " compile-cost shard(s) (" &
-                   $r.compileCostRowsKept & " row(s) kept); compacted " &
-                   $r.objCacheStatsShardsRemoved & " objcache-stats shard(s) (" &
-                   $r.objCacheStatsRowsKept & " row(s) kept); evicted " &
+                   $r.artifactReport.shardsRemoved & " artifact shard(s) (" &
+                   $r.artifactReport.rowsKept & " row(s) kept); compacted " &
+                   $r.compileCostReport.shardsRemoved & " compile-cost shard(s) (" &
+                   $r.compileCostReport.rowsKept & " row(s) kept); compacted " &
+                   $r.objCacheStatsReport.shardsRemoved & " objcache-stats shard(s) (" &
+                   $r.objCacheStatsReport.rowsKept & " row(s) kept); evicted " &
                    $r.objCacheEvicted & " object-cache entry(ies) (" &
                    $r.objCacheTmpSwept & " tmp file(s) swept)\n")
     except CrisolError as e:

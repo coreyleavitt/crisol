@@ -225,25 +225,25 @@ block test_cleanorphans_compacts_objcachestats_stream:
   let r = cleanOrphans(cfg)
 
   # ObjCache-stats stream compacted: 2 shards merged into 1, 2 rows kept.
-  assert r.objCacheStatsShardsRemoved == 2,
-    "cleanOrphans: expected 2 objcachestats shards removed, got " & $r.objCacheStatsShardsRemoved
-  assert r.objCacheStatsRowsKept == 2,
-    "cleanOrphans: expected 2 objcachestats rows kept, got " & $r.objCacheStatsRowsKept
+  assert r.objCacheStatsReport.shardsRemoved == 2,
+    "cleanOrphans: expected 2 objcachestats shards removed, got " & $r.objCacheStatsReport.shardsRemoved
+  assert r.objCacheStatsReport.rowsKept == 2,
+    "cleanOrphans: expected 2 objcachestats rows kept, got " & $r.objCacheStatsReport.rowsKept
 
   let ocsRows = scanObjCacheStatsLedger(stateDir)
   assert ocsRows.len == 2, "cleanOrphans: objcachestats scan expected 2 rows, got " & $ocsRows.len
 
   # Compile-cost stream compaction in the SAME call is unaffected.
-  assert r.compileCostShardsRemoved == 1,
-    "cleanOrphans: expected 1 compile-cost shard removed, got " & $r.compileCostShardsRemoved
-  assert r.compileCostRowsKept == 1,
-    "cleanOrphans: expected 1 compile-cost row kept, got " & $r.compileCostRowsKept
+  assert r.compileCostReport.shardsRemoved == 1,
+    "cleanOrphans: expected 1 compile-cost shard removed, got " & $r.compileCostReport.shardsRemoved
+  assert r.compileCostReport.rowsKept == 1,
+    "cleanOrphans: expected 1 compile-cost row kept, got " & $r.compileCostReport.rowsKept
 
   # Artifact stream compaction in the SAME call is unaffected.
-  assert r.artifactShardsRemoved == 1,
-    "cleanOrphans: expected 1 artifact shard removed, got " & $r.artifactShardsRemoved
-  assert r.artifactRowsKept == 1,
-    "cleanOrphans: expected 1 artifact row kept, got " & $r.artifactRowsKept
+  assert r.artifactReport.shardsRemoved == 1,
+    "cleanOrphans: expected 1 artifact shard removed, got " & $r.artifactReport.shardsRemoved
+  assert r.artifactReport.rowsKept == 1,
+    "cleanOrphans: expected 1 artifact row kept, got " & $r.artifactReport.rowsKept
 
   # Exec ledger compaction in the SAME call is unaffected.
   assert r.shardsRemoved == 2,

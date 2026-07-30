@@ -452,6 +452,24 @@ proc spawnCompileStable(
     args.add epAbs  # R3: absolute path
     args
 
+  # review Q6: the objCache and measureCompileReuse worker branches below
+  # both build a MeasurePlan, write it to a per-slot plan.json, and launch
+  # `<workerBinary> <token> <planPath>` — identical except for the plan's
+  # filename and the internal dispatch token. Shared here (same hygienic-
+  # template pattern as `monolithicCompArgs` above) instead of two
+  # copy-pasted write+cleanup blocks that could silently drift.
+  template writeWorkerPlan(planFilename: string; token: string): seq[string] =
+    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config)
+    let planPath = tmpDir / planFilename
+    try:
+      writeFile(planPath, $toJson(mplan))
+    except:
+      try: removeDir(tmpDir)     except: discard
+      try: removeDir(cacheDir)   except: discard  # M15
+      try: removeDir(binDirSlot) except: discard  # M15
+      return false
+    @[config.workerBinary, token, planPath]
+
   var compArgs: seq[string]
   if config.objCache and config.workerBinary.len > 0:
     # RFC-0006 Stage R, R2b2: the slot's ONE compile child becomes the
@@ -464,16 +482,7 @@ proc spawnCompileStable(
     # the spCompiling→spRunning transition that runs slot.binCompiled) is
     # unaffected — see measureworker.nim's `runCompileCacheWorker` doc for
     # the worker-side pipeline and its own monolithic escape hatch.
-    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config)
-    let planPath = tmpDir / "compile_plan.json"
-    try:
-      writeFile(planPath, $toJson(mplan))
-    except:
-      try: removeDir(tmpDir)     except: discard
-      try: removeDir(cacheDir)   except: discard  # M15
-      try: removeDir(binDirSlot) except: discard  # M15
-      return false
-    compArgs = @[config.workerBinary, InternalCompileWorkerToken, planPath]
+    compArgs = writeWorkerPlan("compile_plan.json", InternalCompileWorkerToken)
   elif config.objCache:
     # objCache was requested but no sound worker binary is configured (a
     # library host that never set RunOptions.workerBinary). NEVER call
@@ -493,16 +502,7 @@ proc spawnCompileStable(
     # objCache is off — objCache (cache worker) takes precedence over
     # measureCompileReuse (measure worker) when both are set, since the two
     # workers are mutually exclusive compile-slot children.
-    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config)
-    let planPath = tmpDir / "measure_plan.json"
-    try:
-      writeFile(planPath, $toJson(mplan))
-    except:
-      try: removeDir(tmpDir)     except: discard
-      try: removeDir(cacheDir)   except: discard  # M15
-      try: removeDir(binDirSlot) except: discard  # M15
-      return false
-    compArgs = @[config.workerBinary, InternalMeasureCompileToken, planPath]
+    compArgs = writeWorkerPlan("measure_plan.json", InternalMeasureCompileToken)
   else:
     if config.measureCompileReuse:
       # measureCompileReuse was requested but no sound worker binary is

@@ -16,10 +16,15 @@
 ## typed wrappers — see each module's own file).
 ##
 ## `ledger.nim` (the pre-existing EXEC ledger) is DELIBERATELY not
-## reimplemented over this substrate and stays untouched: its `scanLedger`
-## filters by a single `IdentityKey` for per-entrypoint history queries,
-## where every other stream's scan returns everything unfiltered — a
-## genuine behavioral difference (not incidental duplication), out of scope
+## reimplemented over this substrate and stays untouched. The reason is a
+## FIELD-SHAPE mismatch, not a behavioral one: `scanLedger`'s post-decode
+## identity filter is not itself the obstacle (it runs after full decode,
+## same cost as every other consumer's own post-scan filtering — an
+## `identity`-filter rationale doesn't hold up). The real mismatch is that
+## `LedgerRow` uses `identity` (not `entrypointIdentity`) and carries no
+## `groupId`/`configHash` at all, so it doesn't fit this module's
+## five-common-field assumption (see "Common row shape" below) without
+## loosening the seam into awkward per-stream field-mapping — out of scope
 ## per the RFC-0006 review finding this module resolves.
 ##
 ## ## Common row shape (why the codec seam is small)

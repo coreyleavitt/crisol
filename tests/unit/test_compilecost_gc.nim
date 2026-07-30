@@ -240,19 +240,19 @@ block test_cleanorphans_compacts_compilecost_stream:
   let r = cleanOrphans(cfg)
 
   # Compile-cost stream compacted: 2 shards merged into 1, 2 rows kept.
-  assert r.compileCostShardsRemoved == 2,
-    "cleanOrphans: expected 2 compile-cost shards removed, got " & $r.compileCostShardsRemoved
-  assert r.compileCostRowsKept == 2,
-    "cleanOrphans: expected 2 compile-cost rows kept, got " & $r.compileCostRowsKept
+  assert r.compileCostReport.shardsRemoved == 2,
+    "cleanOrphans: expected 2 compile-cost shards removed, got " & $r.compileCostReport.shardsRemoved
+  assert r.compileCostReport.rowsKept == 2,
+    "cleanOrphans: expected 2 compile-cost rows kept, got " & $r.compileCostReport.rowsKept
 
   let ccRows = scanCompileCostLedger(stateDir)
   assert ccRows.len == 2, "cleanOrphans: compile-cost scan expected 2 rows, got " & $ccRows.len
 
   # Artifact stream compaction in the SAME call is unaffected.
-  assert r.artifactShardsRemoved == 1,
-    "cleanOrphans: expected 1 artifact shard removed, got " & $r.artifactShardsRemoved
-  assert r.artifactRowsKept == 1,
-    "cleanOrphans: expected 1 artifact row kept, got " & $r.artifactRowsKept
+  assert r.artifactReport.shardsRemoved == 1,
+    "cleanOrphans: expected 1 artifact shard removed, got " & $r.artifactReport.shardsRemoved
+  assert r.artifactReport.rowsKept == 1,
+    "cleanOrphans: expected 1 artifact row kept, got " & $r.artifactReport.rowsKept
 
   # Exec ledger compaction in the SAME call is unaffected.
   assert r.shardsRemoved == 2,

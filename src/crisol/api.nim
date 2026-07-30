@@ -211,6 +211,10 @@ type
     ## (e.g. calling runTests()/planTests() from its own binary) MUST set
     ## this explicitly to get measurement — leaving it unset is always safe
     ## (degrades to monolithic compile, never fork-bombs).
+    ## The SAME field equally gates the `objCache` cache-worker path below
+    ## (`--internal-compile-worker` dispatches through this same binary) —
+    ## an empty workerBinary degrades EITHER path to monolithic compile
+    ## (one-shot warn + a structured ConfigWarning), not just measurement.
     workerBinary*:        string = ""
     ## RFC-0006 Stage R, R2b2: --objcache / --no-objcache.
     ## Object cache is ON BY DEFAULT (RFC-0006 review R1/R2/R4 soundness

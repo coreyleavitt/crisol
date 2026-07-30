@@ -29,7 +29,7 @@
 
 import std/[os, sets, strutils, tables, times]
 import crisol/[types, config, discover, planner, runner, depgraph, resultcache, ledger,
-               artifactledger, compilecost, objcachestats, objcache]
+               artifactledger, compilecost, objcachestats, objcache, shardedledger]
   # `planner` imported explicitly for `slug` (forward-computed expected-slug set
   # below) rather than leaning on runner's re-export — keeps the dependency
   # visible in the import list.
@@ -120,10 +120,8 @@ proc cleanAll*(config: Config) =
 proc cleanOrphans*(config: Config): tuple[
     cacheDeleted, binDeleted, graphEntriesDropped,
     cacheEvicted, shardsRemoved, ledgerRowsKept,
-    artifactShardsRemoved, artifactRowsKept,
-    compileCostShardsRemoved, compileCostRowsKept,
-    objCacheStatsShardsRemoved, objCacheStatsRowsKept,
-    objCacheEvicted, objCacheTmpSwept: int] =
+    objCacheEvicted, objCacheTmpSwept: int,
+    artifactReport, compileCostReport, objCacheStatsReport: CompactReport] =
   ## Prune orphan cache/bin dirs, stale depgraph entries, and GC the
   ## result-cache + object-cache + ledger stores (the exec RunLedger, the
   ## RFC-0006 artifact-identity stream, the RFC-0006 M-cost-split
@@ -248,18 +246,20 @@ proc cleanOrphans*(config: Config): tuple[
                                 objMaxBytes)
 
   result = (
-    cacheDeleted:             cacheDeleted,
-    binDeleted:               binDeleted,
-    graphEntriesDropped:      dropped,
-    cacheEvicted:             gcReport.evicted,
-    shardsRemoved:            compactReport.shardsRemoved,
-    ledgerRowsKept:           compactReport.rowsKept,
-    artifactShardsRemoved:    artifactCompactReport.shardsRemoved,
-    artifactRowsKept:         artifactCompactReport.rowsKept,
-    compileCostShardsRemoved: compileCostCompactReport.shardsRemoved,
-    compileCostRowsKept:      compileCostCompactReport.rowsKept,
-    objCacheStatsShardsRemoved: objCacheStatsCompactReport.shardsRemoved,
-    objCacheStatsRowsKept:      objCacheStatsCompactReport.rowsKept,
-    objCacheEvicted:          objGcReport.evicted,
-    objCacheTmpSwept:         objGcReport.tmpSwept,
+    cacheDeleted:        cacheDeleted,
+    binDeleted:          binDeleted,
+    graphEntriesDropped: dropped,
+    cacheEvicted:        gcReport.evicted,
+    shardsRemoved:       compactReport.shardsRemoved,
+    ledgerRowsKept:      compactReport.rowsKept,
+    objCacheEvicted:     objGcReport.evicted,
+    objCacheTmpSwept:    objGcReport.tmpSwept,
+    # review L6: these three are exactly shardedledger's CompactReport
+    # {shardsRemoved, rowsKept} shape — nested instead of six more flat
+    # int fields (the pre-existing exec-ledger pair above stays flat
+    # since ledger.nim was deliberately not migrated onto CompactReport,
+    # see shardedledger.nim's module doc).
+    artifactReport:       artifactCompactReport,
+    compileCostReport:    compileCostCompactReport,
+    objCacheStatsReport:  objCacheStatsCompactReport,
   )

@@ -284,6 +284,11 @@ type
                                 ## guessing. The crisol CLI populates this with its own
                                 ## `getAppFilename()`; library callers set it via
                                 ## `RunOptions.workerBinary`.
+                                ## Equally required by `objCache` below (default ON): the
+                                ## `--internal-compile-worker` cache worker dispatches through
+                                ## this SAME binary. An empty workerBinary degrades objCache to
+                                ## monolithic compile too (one-shot warn + structured
+                                ## ConfigWarning), independent of measureCompileReuse.
     objCache*: bool             ## RFC-0006 Stage R, R2b2: when true, a compile slot's child is
                                 ## the `--internal-compile-worker` cache worker (objcache.nim's
                                 ## cross-entrypoint object store) instead of a plain `nim c`

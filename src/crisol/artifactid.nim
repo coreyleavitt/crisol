@@ -215,6 +215,17 @@ proc eraseKnownString(s, known: string): string =
   ## erase (leaving the known string present) rather than risk corrupting a
   ## different token: a false negative here only under-counts reuse, never
   ## falsely claims it.
+  ##
+  ## CAVEAT: only the TRAILING boundary is guarded (the char immediately
+  ## after the match). This is sound today only because every production
+  ## `knownStrings` value is an absolute (`/`-anchored) path (see callers:
+  ## `nimcacheDir`/`outputBinPath.parentDir()`) — `/` is never an
+  ## `IdentChars` char, so a leading identifier prefix can never fuse with
+  ## an absolute-path match into one token. A future caller passing a
+  ## non-`/`-anchored known string (e.g. a bare basename) could hit a
+  ## leading-boundary false-erase (stripping it out of a larger identifier
+  ## it's merely a suffix of). Guard both boundaries if this is ever reused
+  ## outside the current absolute-path call sites.
   if known.len == 0: return s
   result = newStringOfCap(s.len)
   var i = 0
