@@ -47,7 +47,7 @@
 
 import std/[json, options, os, sequtils, sets, strutils, times]
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals,
-               sandbox, cachedispatch, ccprobe, planner, order, ledger, keys, depgraph, stats,
+               sandbox, cachedispatch, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
 
 # ---------------------------------------------------------------------------
@@ -109,16 +109,24 @@ export order.parseOrderMode
 # check invalidates stale binaries after a compiler upgrade and (2) the
 # soundness key invalidates cached test RESULTS after a compiler upgrade.
 #
-# `system.NimVersion` is the version of the Nim that compiled crisol.  In the
-# single-toolchain podman container this is the SAME nim that compiles the test
-# entrypoints, so it correctly fingerprints the compiler.  This value is
-# threaded into buildRunPlan → loadDepGraph / plan → execute → realSeams so BOTH
-# the staleness check (planner.decideCompile) AND the soundness key
-# (keys.soundnessKey) observe a real version instead of the empty string.
+# CACHE IDENTITY now uses `nimprobe.cachedNimFingerprint()` — a RUNTIME probe
+# of the nim binary crisol's own compile invocations resolve via PATH (mirrors
+# `ccprobe.cachedCcVersion()` for the C compiler) — NOT `crisolNimVersion`
+# below. `crisolNimVersion` (= `system.NimVersion`, crisol's OWN compile-time
+# Nim version, e.g. "2.2.10") is just a version STRING: two builds of Nim can
+# share it while differing in codegen (a stock vs. a locally-patched build),
+# which a cache/staleness check keyed on the string alone cannot detect. This
+# value is threaded into buildRunPlan → loadDepGraph / plan → execute →
+# realSeams so BOTH the staleness check (planner.decideCompile) AND the
+# soundness key (keys.soundnessKey) observe the binary-distinguishing
+# fingerprint instead of the compile-time string.
 
 const crisolNimVersion* = NimVersion
-  ## The Nim compiler version crisol was built with (e.g. "2.2.0"), used as the
-  ## nim-version fingerprint for depgraph staleness and result-cache soundness.
+  ## The Nim compiler version crisol was built with (e.g. "2.2.0").
+  ## DISPLAY/METADATA ONLY — kept for consumers wanting the human-readable
+  ## version string (e.g. logs). NOT fed into cache identity; see
+  ## `nimprobe.cachedNimFingerprint()` for the runtime, binary-distinguishing
+  ## fingerprint used by depgraph staleness / SoundnessKey / toolchainFingerprint.
 
 # ---------------------------------------------------------------------------
 # Public types (F1 — api-owned)
@@ -406,7 +414,7 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     useFailed    = useFailed,
     useChanged   = useChanged,
     changed      = changedSet,
-    nimVersion   = crisolNimVersion,
+    nimVersion   = cachedNimFingerprint(),
     forceCompile = opts.forceCompile,
     warnings     = cfgWarnings,
     shardK       = opts.shardK,
@@ -597,11 +605,15 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   # (active iff keyOf!=nil AND policy.enabled) is enforced structurally.
   let spec  = resolveSandbox(level = opts.hermeticLevel,
                               rlimits = rlimitOverridesFrom(cfg))
-  # nimcache-persistence (RFC-0006): the SAME ccVersion probe already used by
-  # RFC-0004's SoundnessKey (via realSeams below) is reused here — folded
-  # with nimVersion into execute()'s toolchain fingerprint, which keys the
-  # persistent nimcache path. One probe, two consumers; never diverge.
-  let ccVer = cachedCcVersion()
+  # nimcache-persistence (RFC-0006): the SAME ccVersion/nimVersion probes
+  # already used by RFC-0004's SoundnessKey (via realSeams below) are reused
+  # here — folded into execute()'s toolchain fingerprint, which keys the
+  # persistent nimcache path. One probe each, two consumers; never diverge.
+  # nimVer is the RUNTIME fingerprint (nimprobe.cachedNimFingerprint) — not
+  # crisolNimVersion — so a stock->patched compiler swap at the same version
+  # STRING is soundly distinguished; see the module-doc note above.
+  let ccVer  = cachedCcVersion()
+  let nimVer = cachedNimFingerprint()
   let cacheCtx =
     if opts.noCache:
       cacheDisabled(spec)   # fully off; spec still governs sandbox hermeticity
@@ -611,7 +623,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
         realSeams(
           stateDir      = pr.settings.stateDir,
           graph         = addr graph,
-          nimVersion    = crisolNimVersion,
+          nimVersion    = nimVer,
           ccVersion     = ccVer,
           spec          = spec,
           parentEnv     = toSeq(envPairs()),
@@ -623,7 +635,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       pv.plan,
       config             = cfg,
       graph              = graph,
-      nimVersion         = crisolNimVersion,
+      nimVersion         = nimVer,
       ccVersion          = ccVer,
       onResult           = cb,
       failFast           = opts.failFast,

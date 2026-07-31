@@ -77,9 +77,12 @@ proc buildRunPlan*(
   ##   useFailed    — when true, keep only entrypoints in failedKeys.
   ##   useChanged   — when true, keep only entrypoints whose closure ∩ changed ≠ ∅.
   ##   changed      — set of changed file paths (relative); required when useChanged.
-  ##   nimVersion   — Nim version string for freshness checks; the api boundary
-  ##                  threads the real compiler version (api.crisolNimVersion =
-  ##                  system.NimVersion).  "" disables (test/cold-start only).
+  ##   nimVersion   — Nim compiler fingerprint for freshness checks; the api
+  ##                  boundary threads the RUNTIME probe
+  ##                  (nimprobe.cachedNimFingerprint()), not the compile-time
+  ##                  api.crisolNimVersion string — see api.nim's module-doc
+  ##                  note on why a version STRING alone is not a sound
+  ##                  discriminator.  "" disables (test/cold-start only).
   ##   forceCompile — when true, skip freshness checks (recompile everything).
   ##   shardK       — C2: shard index (1-indexed, 1..shardN); 0 = no sharding.
   ##   shardN       — C2: total shard count; only used when shardK > 0.

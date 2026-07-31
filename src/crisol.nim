@@ -37,7 +37,7 @@
 
 import std/[options, os, strutils]
 import std/posix
-import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe]
+import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe]
 
 # O_NOFOLLOW is a Linux extension not declared in Nim's std/posix.
 # Pull it from <fcntl.h> via the emit+importc pattern.
@@ -344,8 +344,10 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     try:
       # RFC-0006 nimcache-persistence GC: real toolchain probe so cache/
       # pruning correctly orphans dirs left over from an old cc/nim
-      # fingerprint (see cleanOrphans' doc).
-      let r = cleanOrphans(cfg, nimVersion = crisolNimVersion, ccVersion = cachedCcVersion())
+      # fingerprint (see cleanOrphans' doc). nimVersion uses the RUNTIME
+      # nim fingerprint (nimprobe.cachedNimFingerprint), not crisolNimVersion —
+      # same soundness rule as api.nim's cache-identity feeds.
+      let r = cleanOrphans(cfg, nimVersion = cachedNimFingerprint(), ccVersion = cachedCcVersion())
       stdout.write("crisol clean: pruned " & $r.cacheDeleted &
                    " cache dir(s), " & $r.binDeleted &
                    " bin dir(s), " & $r.graphEntriesDropped &

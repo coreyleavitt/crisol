@@ -230,9 +230,10 @@ proc plan*(config: Config; eps: seq[Entrypoint]; graph: DepGraph;
   ##
   ## Annotates every entrypoint with a CompileDecision via decideCompile.
   ## With an empty graph, every entrypoint is cdNeverBuilt.  The api boundary
-  ## supplies a real Nim version (api.crisolNimVersion = system.NimVersion); the
-  ## "" default here is for tests / cold-start callers only and disables the
-  ## nim-version staleness branch.
+  ## supplies the RUNTIME nim fingerprint (nimprobe.cachedNimFingerprint()),
+  ## not the compile-time api.crisolNimVersion string; the "" default here is
+  ## for tests / cold-start callers only and disables the nim-version
+  ## staleness branch.
   ## The jobs field is resolved to at least 1; if config.jobs == 0 the A4
   ## default is max(1, cpuCount-2).
 
