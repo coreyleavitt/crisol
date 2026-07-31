@@ -82,7 +82,7 @@ suite "B0 — CRISOL_ATTEMPT injection":
     # Use hlNone so output capture works without env-scrub complexity in the test.
     let spec = resolveSandbox(level = hlNone)
 
-    let results = execute(p, cfg, graph, "", cb, false, false, 30_000,
+    let results = execute(p, cfg, graph, "", "", cb, false, false, 30_000,
                           cache = cacheDisabled(spec))
 
     require results.len == 1

@@ -577,7 +577,12 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   # store-key derived after a compile reflects the fresh closureHash.
   # M4: bundle spec+policy+seams into a CacheContext so the invariant
   # (active iff keyOf!=nil AND policy.enabled) is enforced structurally.
-  let spec = resolveSandbox(level = opts.hermeticLevel)
+  let spec  = resolveSandbox(level = opts.hermeticLevel)
+  # nimcache-persistence (RFC-0006): the SAME ccVersion probe already used by
+  # RFC-0004's SoundnessKey (via realSeams below) is reused here — folded
+  # with nimVersion into execute()'s toolchain fingerprint, which keys the
+  # persistent nimcache path. One probe, two consumers; never diverge.
+  let ccVer = cachedCcVersion()
   let cacheCtx =
     if opts.noCache:
       cacheDisabled(spec)   # fully off; spec still governs sandbox hermeticity
@@ -588,7 +593,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
           stateDir      = pr.settings.stateDir,
           graph         = addr graph,
           nimVersion    = crisolNimVersion,
-          ccVersion     = cachedCcVersion(),
+          ccVersion     = ccVer,
           spec          = spec,
           parentEnv     = toSeq(envPairs()),
           protocolMajor = CrisolProtocolMajor,
@@ -600,6 +605,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       config             = cfg,
       graph              = graph,
       nimVersion         = crisolNimVersion,
+      ccVersion          = ccVer,
       onResult           = cb,
       failFast           = opts.failFast,
       showProgress       = opts.showProgress,

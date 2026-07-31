@@ -12,14 +12,18 @@
 ##
 ## ## normalize() — EXACT known-string erasure, not regex/heuristic
 ##
-## crisol *constructs* the per-slot `cacheDir`/`binDir` strings itself
-## (`runner.nim`: `cachePath(ep, config) & "_" & $pepIdx` /
-## `binPath(ep, config) & "_" & $pepIdx`), so normalization is a literal
-## substring-erase of those KNOWN strings — never a regex that guesses which
-## paths "look like" slot paths (that risks over-stripping a real project
-## `-I`). `normalize()` runs the same three steps on BOTH the `.c` file's
-## content and the `ccCmd` string (the caller passes whichever it has; each
-## step is a no-op where it does not apply to that content's shape):
+## crisol *constructs* the `cacheDir`/`binDir` strings itself (`runner.nim`:
+## `cachePath(ep, config, toolchainFp)` for the common case — RFC-0006
+## nimcache-persistence made this STABLE per-entrypoint, dropping the old
+## volatile `_<pepIdx>` (plan-position) suffix; that suffix survives only as
+## a rare same-entrypoint-twice-in-plan fallback, see runner.duplicateSlugs —
+## and `binPath(ep, config) & "_" & $pepIdx` for the always-per-slot binary
+## dir), so normalization is a literal substring-erase of those KNOWN
+## strings — never a regex that guesses which paths "look like" slot paths
+## (that risks over-stripping a real project `-I`). `normalize()` runs the
+## same three steps on BOTH the `.c` file's content and the `ccCmd` string
+## (the caller passes whichever it has; each step is a no-op where it does
+## not apply to that content's shape):
 ##
 ##   1. Strip the fixed 4-line Nim-generated header comment block — but ONLY
 ##      when the content actually starts with Nim's own generated-header

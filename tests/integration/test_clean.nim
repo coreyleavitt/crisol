@@ -136,6 +136,72 @@ suite "crisol clean — orphan pruning":
     check r.cacheDeleted >= 1
 
 # ---------------------------------------------------------------------------
+# Suite 1b — RFC-0006 nimcache-persistence GC: toolchain-fingerprinted dirs
+# ---------------------------------------------------------------------------
+
+suite "crisol clean — nimcache-persistence toolchain-fingerprint GC":
+
+  test "current-toolchain cache dir is KEPT; stale-toolchain cache dir is PRUNED":
+    let root = makeTempRoot()
+    defer: removeDir(root)
+
+    let unitDir = root / "tests" / "unit"
+    createDir(unitDir)
+    writeFile(unitDir / "test_tc.nim", "# stub\n")
+
+    let cfg      = makeConfig(root)
+    let stateDir = root / ".crisol"
+    let cacheDir = stateDir / "cache"
+    createDir(cacheDir)
+
+    let relPath   = "tests/unit/test_tc.nim"
+    let baseSlug  = slugFor(relPath, @[])
+    let currentFp = toolchainFingerprint("2.2.10", "gcc-current|ldd-current")
+    let staleFp   = toolchainFingerprint("2.2.10", "gcc-OLD|ldd-OLD")
+    check currentFp != staleFp  ## precondition
+
+    let currentDir = cacheDir / (baseSlug & "-" & currentFp)
+    let staleDir   = cacheDir / (baseSlug & "-" & staleFp)
+    createDir(currentDir)
+    createDir(staleDir)
+
+    let r = cleanOrphans(cfg, nimVersion = "2.2.10", ccVersion = "gcc-current|ldd-current")
+
+    # The dir matching the CURRENT toolchain fingerprint survives.
+    check dirExists(currentDir)
+    # The dir left over from an OLD (stale) toolchain fingerprint is an
+    # orphan and gets pruned — this is the GC half of nimcache-persistence:
+    # a cc/nim upgrade must not accumulate cache dirs forever.
+    check not dirExists(staleDir)
+    check r.cacheDeleted >= 1
+
+  test "no toolchain probe supplied (defaults) ⇒ falls back to bare-slug expected set":
+    ## Back-compat: cleanOrphans(cfg) with no nimVersion/ccVersion (as called
+    ## by every OTHER test in this file, and by any pre-fingerprint caller)
+    ## must behave exactly as before — retaining the bare `<slug>` dir with
+    ## no toolchain suffix.
+    let root = makeTempRoot()
+    defer: removeDir(root)
+
+    let unitDir = root / "tests" / "unit"
+    createDir(unitDir)
+    writeFile(unitDir / "test_bare.nim", "# stub\n")
+
+    let cfg      = makeConfig(root)
+    let stateDir = root / ".crisol"
+    let cacheDir = stateDir / "cache"
+    createDir(cacheDir)
+
+    let relPath  = "tests/unit/test_bare.nim"
+    let baseSlug = slugFor(relPath, @[])
+    createDir(cacheDir / baseSlug)  ## bare, no toolchain suffix
+
+    let r = cleanOrphans(cfg)  ## no nimVersion/ccVersion — the "" default
+
+    check dirExists(cacheDir / baseSlug)
+    check r.cacheDeleted == 0
+
+# ---------------------------------------------------------------------------
 # Suite 2 — clean ignores gates (gated-group caches are KEPT)
 # ---------------------------------------------------------------------------
 

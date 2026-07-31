@@ -64,9 +64,66 @@ proc binPath*(ep: Entrypoint; config: Config): string =
   ## Absolute path to the directory containing the stable compiled binary.
   stateDirOf(config) / "bin" / slug(ep.path, ep.flags)
 
-proc cachePath*(ep: Entrypoint; config: Config): string =
-  ## Absolute path to the stable nimcache directory for this entrypoint.
-  stateDirOf(config) / "cache" / slug(ep.path, ep.flags)
+proc toolchainFingerprint*(nimVersion: string; ccVersion: string): string =
+  ## Short, stable fingerprint of the compiler toolchain (RFC-0006 nimcache-
+  ## persistence soundness rule).
+  ##
+  ## Nim's own nimcache invalidation tracks source content + compile flags but
+  ## NOT the cc/ldd binary version (crisol's `SoundnessKey` DOES track both —
+  ## see keys.nim). Folding this fingerprint into the PERSISTENT nimcache path
+  ## (`cachePath`, below) means a toolchain upgrade lands on a fresh directory
+  ## automatically — a persistent cache can never silently reuse an object
+  ## file built by a different compiler; the old directory is simply orphaned
+  ## for GC (clean.cleanOrphans).
+  ##
+  ## Both inputs empty ⇒ "" (the sentinel meaning "no fingerprint known" —
+  ## callers that don't have a toolchain probe get the pre-fingerprint bare
+  ## path shape from `cachePath`/`cleanOrphans`; this is the same "" =
+  ## disable-this-check convention `plan(nimVersion="")` already uses).
+  if nimVersion.len == 0 and ccVersion.len == 0:
+    return ""
+  toHex16(fnv1a64(nimVersion & "\x00" & ccVersion))
+
+proc cachePath*(ep: Entrypoint; config: Config; toolchainFp: string = ""): string =
+  ## Absolute path to the STABLE, PERSISTENT nimcache directory for this
+  ## entrypoint.
+  ##
+  ## Stability: a pure function of (ep.path, ep.flags, toolchainFp) — NOT plan
+  ## position. This is the fix for the RFC-0006 nimcache-persistence bug:
+  ## previously runner.nim suffixed this path with the entrypoint's index in
+  ## the plan (`_<pepIdx>`), so `--changed`/subset runs (where the affected
+  ## set shifts run-to-run) gave the SAME entrypoint a DIFFERENT nimcache dir
+  ## every run, defeating Nim's own incremental compile. Two calls with the
+  ## same arguments always return the same path, regardless of what plan or
+  ## what position the entrypoint occupies in it.
+  ##
+  ## toolchainFp (see `toolchainFingerprint`) is folded into the path so a
+  ## cc/nim upgrade lands on a fresh directory rather than reusing a
+  ## potentially-stale object. Default "" preserves the pre-fingerprint bare
+  ## path shape (used by callers with no toolchain probe, e.g. `crisol clean`
+  ## invoked without real nimVersion/ccVersion, and existing tests).
+  let suffix = if toolchainFp.len > 0: "-" & toolchainFp else: ""
+  stateDirOf(config) / "cache" / (slug(ep.path, ep.flags) & suffix)
+
+proc duplicateSlugs*(p: RunPlan): HashSet[string] =
+  ## Return the set of slugs that appear MORE THAN ONCE across `p`'s
+  ## entrypoints — i.e. the same (path, flags) pair scheduled at ≥ 2 distinct
+  ## plan positions in a single run.
+  ##
+  ## This is the rare "same entrypoint twice in one plan" case the old
+  ## `_<pepIdx>` suffix incidentally guarded (two slots compiling the same
+  ## slug concurrently → nimcache write race). With `cachePath` now stable,
+  ## DIFFERENT entrypoints are already isolated by distinct slugs; only a
+  ## genuine duplicate needs a fallback (runner.nim falls back to a
+  ## pepIdx-suffixed dir for slugs in this set, preserving the old
+  ## concurrency-safe behavior ONLY where it's still needed).
+  var seen = initHashSet[string]()
+  for pep in p.entrypoints:
+    let s = slug(pep.ep.path, pep.ep.flags)
+    if s in seen:
+      result.incl s
+    else:
+      seen.incl s
 
 # ---------------------------------------------------------------------------
 # emptyDepGraph convenience wrapper

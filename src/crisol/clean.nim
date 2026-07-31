@@ -110,7 +110,7 @@ proc cleanAll*(config: Config) =
 # Public: cleanOrphans
 # ---------------------------------------------------------------------------
 
-proc cleanOrphans*(config: Config): tuple[
+proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = ""): tuple[
     cacheDeleted, binDeleted, graphEntriesDropped,
     cacheEvicted, shardsRemoved, ledgerRowsKept: int,
     artifactReport, compileCostReport: CompactReport] =
@@ -119,9 +119,20 @@ proc cleanOrphans*(config: Config): tuple[
   ## RFC-0006 artifact-identity stream, and the RFC-0006 M-cost-split
   ## compile-cost stream).
   ##
+  ## `nimVersion`/`ccVersion` (RFC-0006 nimcache-persistence GC): when both
+  ## are supplied (the real `crisol clean` CLI path), cache/ pruning expects
+  ## the CURRENT-toolchain-fingerprinted dir name for each live entrypoint —
+  ## `<slug>-<toolchainFingerprint(nimVersion,ccVersion)>` — so a dir left
+  ## over from an OLD toolchain fingerprint (a cc/nim upgrade) is pruned as
+  ## an orphan, same as a dir for a deleted entrypoint. Left at the "" default
+  ## (no real probe available — tests, cold-start), the expected set falls
+  ## back to the bare `<slug>` shape with no toolchain suffix, preserving
+  ## pre-fingerprint behavior exactly.
+  ##
   ## Steps:
   ##   1. Discover ALL entrypoints (gskAll, gates ignored — no applyGates call).
-  ##   2. Build the expected slug set via slug(ep.path, ep.flags).
+  ##   2. Build the expected slug set via slug(ep.path, ep.flags); the cache/
+  ##      variant additionally folds in the current toolchain fingerprint.
   ##   3. Prune <stateDir>/cache/ and <stateDir>/bin/.
   ##   4. GC the depgraph (drop entries not in discovered set).
   ##   5. GC the result-cache (size + age LRU via gcResultCache).
@@ -157,14 +168,30 @@ proc cleanOrphans*(config: Config): tuple[
   let eps        = unsafeToSeq(discovered)
 
   # Step 2: Compute expected slug set (forward-computation, no slug decoding).
+  # bin/ has no toolchain fingerprint (binPath is unaffected by nimcache-
+  # persistence) so it always uses the bare slug set.
   var expectedSlugs = initHashSet[string]()
   for ep in eps:
     expectedSlugs.incl slug(ep.path, ep.flags)
 
+  # cache/ additionally folds in the CURRENT toolchain fingerprint (RFC-0006
+  # nimcache-persistence GC): a dir for the same entrypoint but an OLD
+  # fingerprint (or no fingerprint at all, pre-fix) is correctly excluded
+  # from this set and pruned as an orphan by the existing pruneDir logic —
+  # no new deletion mechanism needed, just a toolchain-aware expected set.
+  let toolchainFp = toolchainFingerprint(nimVersion, ccVersion)
+  var expectedCacheSlugs = initHashSet[string]()
+  for ep in eps:
+    let baseSlug = slug(ep.path, ep.flags)
+    if toolchainFp.len > 0:
+      expectedCacheSlugs.incl(baseSlug & "-" & toolchainFp)
+    else:
+      expectedCacheSlugs.incl(baseSlug)
+
   # Step 3: Prune cache/ and bin/.
   let cacheParent = stateDir / "cache"
   let binParent   = stateDir / "bin"
-  let cacheDeleted = pruneDir(cacheParent, expectedSlugs)
+  let cacheDeleted = pruneDir(cacheParent, expectedCacheSlugs)
   let binDeleted   = pruneDir(binParent,   expectedSlugs)
 
   # Step 4: GC depgraph entries.

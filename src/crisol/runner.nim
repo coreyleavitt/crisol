@@ -292,7 +292,13 @@ proc teardownLiveSlots(slots: var seq[Slot]) =
       try: removeDir(slots[i].testScratchDir) except: discard
     if slots[i].slotBinDir.len > 0:
       try: removeDir(slots[i].slotBinDir) except: discard
-    if slots[i].cacheDir.len > 0:
+    # nimcache-persistence: only wipe cacheDir when the slot was interrupted
+    # WHILE COMPILING — nim's own process was killed mid-write and may have
+    # left a partial/corrupt nimcache. A slot interrupted during spRunning
+    # already has a complete, valid, persistent nimcache from its (already
+    # successful) compile phase; wiping it on every Ctrl-C would silently
+    # defeat persistence for the common "interrupt a long test run" case.
+    if slots[i].phase == spCompiling and slots[i].cacheDir.len > 0:
       try: removeDir(slots[i].cacheDir) except: discard
     slots[i].pepIdx = -1  # mark idle so a second call is a no-op
 
@@ -358,12 +364,31 @@ proc spawnCompileStable(
   config:           Config;
   compileTimeoutMs: int;
   spec:             SandboxSpec;
+  toolchainFp:      string;
+  dupSlugs:         HashSet[string];
 ): bool =
-  ## Fill slot with a compile child using per-slot isolated paths.
+  ## Fill slot with a compile child.
   ##
-  ## Both nimcache and the compiled binary go into per-slot (pepIdx-suffixed)
-  ## directories to prevent ORC link collisions and write races when the same
-  ## entrypoint appears multiple times in one plan.
+  ## nimcache (RFC-0006 nimcache-persistence): the COMMON case (this
+  ## entrypoint's slug appears exactly once in the plan) uses the STABLE,
+  ## toolchain-fingerprinted `cachePath(ep, config, toolchainFp)` — a pure
+  ## function of (ep.path, ep.flags, toolchainFp), never of plan position —
+  ## so Nim's own incremental compile can reuse it run-to-run (this is the
+  ## fix: previously every cacheDir was suffixed with `_<pepIdx>`, the
+  ## entrypoint's POSITION in the plan, which shifts on `--changed`/subset
+  ## runs and forced a cold recompile every time). It is never deleted on a
+  ## successful (or run-phase-failed) compile — only on a compile FAILURE or
+  ## timeout, where Nim's own output may be partial/corrupt (see pollSlot).
+  ##
+  ## The RARE case — this slug is scheduled at ≥2 positions in the SAME plan
+  ## (duplicateSlugs) — falls back to the OLD pepIdx-suffixed dir, which is
+  ## deliberately volatile: it exists only to prevent two concurrent slots
+  ## from racing on one nimcache write, never to persist.
+  ##
+  ## The compiled binary always goes into a per-slot (pepIdx-suffixed)
+  ## directory (binDirSlot) — this is pure scratch, always cleaned up after
+  ## the stable slug-keyed copy (binPath) is made by the execute main loop,
+  ## and is unaffected by the nimcache-persistence change.
   ##
   ## The slot runs the binary from its per-slot location (binCompiled == binFull
   ## during this run).  After the run completes, the execute main loop copies
@@ -374,7 +399,11 @@ proc spawnCompileStable(
   ## name) instead of PID-predictable paths.
   ## R3: ep path is resolved to absolute before passing to nim c.
   ## M15: cacheDir and binDirSlot are tracked in slot so they can be cleaned on
-  ## compile-fail and spawn-fail paths.
+  ## compile-fail and spawn-fail paths (see pollSlot for the precise rules
+  ## under nimcache-persistence: cacheDir is wiped ONLY when nim's own compile
+  ## process actually ran and failed/timed out — never on a pre-compile setup
+  ## failure or a post-compile run-spawn failure, both of which leave a prior
+  ## persistent nimcache untouched-and-valid).
 
   let ep = pep.ep
   # R3: resolve entrypoint to absolute path before passing to nim c.
@@ -382,7 +411,17 @@ proc spawnCompileStable(
     if ep.path.isAbsolute: ep.path
     else: config.projectRoot / ep.path
 
-  let cacheDir    = cachePath(ep, config) & "_" & $pepIdx
+  let epSlug = slug(ep.path, ep.flags)
+  let cacheDir =
+    if epSlug in dupSlugs:
+      # Rare: same (path, flags) scheduled twice in this plan — keep the old
+      # volatile per-slot suffix so two concurrent slots never race on one
+      # nimcache write. Also toolchain-keyed for consistency, though this
+      # dir is transient and never meant to persist.
+      cachePath(ep, config, toolchainFp) & "_" & $pepIdx
+    else:
+      # Common case: stable, persistent nimcache — the fix.
+      cachePath(ep, config, toolchainFp)
   let binDirSlot  = binPath(ep, config) & "_" & $pepIdx
   let bname       = binName(ep)
   let binCompiled = binDirSlot / bname     # compile output + run source
@@ -398,8 +437,12 @@ proc spawnCompileStable(
   try:
     tmpDir = makeTmpDir("crisol_slot_")
   except:
-    try: removeDir(cacheDir)   except: discard  # M15: clean on failure
-    try: removeDir(binDirSlot) except: discard  # M15: clean on failure
+    # M15: clean up the scratch bin dir. cacheDir is deliberately left alone:
+    # nim c never ran this attempt (mkdtemp failed before forkExec), so any
+    # content in cacheDir is a valid PERSISTENT nimcache from a prior run —
+    # wiping it here would destroy good state over an unrelated tmp-dir
+    # allocation failure.
+    try: removeDir(binDirSlot) except: discard
     return false
 
   let compOut = tmpDir / "compile_out.txt"
@@ -438,9 +481,12 @@ proc spawnCompileStable(
     try:
       writeFile(planPath, $toJson(mplan))
     except:
+      # M15: cacheDir intentionally NOT wiped — nim c never ran this attempt
+      # (plan write failed before forkExec); see the mkdtemp-failure comment
+      # above for why a persistent nimcache must survive an unrelated
+      # pre-compile I/O error.
       try: removeDir(tmpDir)     except: discard
-      try: removeDir(cacheDir)   except: discard  # M15
-      try: removeDir(binDirSlot) except: discard  # M15
+      try: removeDir(binDirSlot) except: discard
       return false
     @[config.workerBinary, token, planPath]
 
@@ -468,18 +514,21 @@ proc spawnCompileStable(
 
   let fd = openOutputFile(compOut)
   if fd < 0:
+    # M15: cacheDir intentionally NOT wiped — nim c never ran this attempt
+    # (compile-output fd open failed before forkExec); see the mkdtemp-
+    # failure comment above.
     try: removeDir(tmpDir)     except: discard
-    try: removeDir(cacheDir)   except: discard  # M15
-    try: removeDir(binDirSlot) except: discard  # M15
+    try: removeDir(binDirSlot) except: discard
     return false
 
   let pid = forkExec(compArgs, fd)
   discard posix.close(fd)
 
   if int(pid) < 0:
+    # M15: cacheDir intentionally NOT wiped — forkExec itself failed, so
+    # nim c never ran this attempt; see the mkdtemp-failure comment above.
     try: removeDir(tmpDir)     except: discard
-    try: removeDir(cacheDir)   except: discard  # M15
-    try: removeDir(binDirSlot) except: discard  # M15
+    try: removeDir(binDirSlot) except: discard
     return false
 
   slot.pepIdx          = pepIdx
@@ -680,6 +729,13 @@ proc pollSlot(
     # M15: clean up per-slot bin dir on timeout during compile.
     if slot.phase == spCompiling and slot.slotBinDir.len > 0:
       try: removeDir(slot.slotBinDir) except: discard
+    # nimcache-persistence: a compile killed mid-run (SIGKILL on timeout) can
+    # leave a partial/corrupt nimcache (interrupted .c/.json manifest write) —
+    # the same "corrupt partial cache must not persist" rule as an outright
+    # compile failure below, so wipe it here too. A run-phase timeout leaves
+    # cacheDir alone: the compile that produced it already succeeded.
+    if slot.phase == spCompiling and slot.cacheDir.len > 0:
+      try: removeDir(slot.cacheDir) except: discard
     cleanupSlotTmp(slot)
     results[slot.pepIdx] = res
     return true  # execute loop calls onResult after retry decision
@@ -733,9 +789,12 @@ proc pollSlot(
         var res = EntrypointResult(ep: pep.ep, outcome: oSpawnError,
                                    output: "fork failed during run phase",
                                    durationMs: elapsed)
-        # M15: clean up on run-spawn failure too.
-        if slot.cacheDir.len > 0:
-          try: removeDir(slot.cacheDir) except: discard
+        # M15: clean up the scratch bin dir only. cacheDir is intentionally
+        # LEFT ALONE here — the compile that produced it already succeeded
+        # (we are past the exitedCode/sigNum check above); this is a run-
+        # phase fork failure, unrelated to the nimcache's validity. Wiping a
+        # good persistent nimcache over an unrelated run-spawn failure would
+        # defeat nimcache-persistence for no reason.
         if slot.slotBinDir.len > 0:
           try: removeDir(slot.slotBinDir) except: discard
         cleanupSlotTmp(slot)
@@ -789,6 +848,11 @@ proc execute*(
   config:           Config = Config();
   graph:            var DepGraph;
   nimVersion:       string = "";
+  ccVersion:        string = "";  ## nimcache-persistence: folded with nimVersion into
+                                  ## the toolchain fingerprint (planner.toolchainFingerprint)
+                                  ## that keys the persistent nimcache path — see spawnCompileStable.
+                                  ## "" (default, same convention as nimVersion) disables the
+                                  ## fingerprint suffix — used by tests / cold-start callers.
   onResult:         ResultCallback = noopResult;
   failFast:         bool = false;
   showProgress:     bool = true;
@@ -834,6 +898,17 @@ proc execute*(
 
   if n == 0:
     return @[]
+
+  # nimcache-persistence (RFC-0006): computed ONCE per execute() call, not
+  # per slot/compile — both are pure functions of the plan/toolchain, never
+  # of a slot's runtime state.
+  #   toolchainFp — folds nimVersion+ccVersion into the persistent nimcache
+  #     path (planner.cachePath) so a toolchain upgrade lands on a fresh dir.
+  #   dupSlugs    — the rare set of slugs scheduled ≥2× in THIS plan; those
+  #     fall back to the old volatile pepIdx-suffixed dir in spawnCompileStable
+  #     to avoid two concurrent slots racing on one nimcache write.
+  let toolchainFp = toolchainFingerprint(nimVersion, ccVersion)
+  let dupSlugs    = duplicateSlugs(p)
 
   # Pre-allocate result slots so we can fill them by index (plan order).
   result = newSeq[EntrypointResult](n)
@@ -1062,7 +1137,8 @@ proc execute*(
               slots[i].token = tok.get  # S3: store token for onSlotFinish
           else:
             # Normal compile + run using stable slug-keyed paths.
-            let ok = spawnCompileStable(slots[i], pepIdx, pep, config, compileTimeoutMs, cache.spec)
+            let ok = spawnCompileStable(slots[i], pepIdx, pep, config, compileTimeoutMs,
+                                        cache.spec, toolchainFp, dupSlugs)
             if not ok:
               ac.release(tok.get)  # S3: rollback admission on spawn failure
               # Fork/resource failure: record oSpawnError immediately.
@@ -1385,7 +1461,9 @@ proc runEntrypoint*(
   if cfg.maxOutputBytes == 0:     cfg.maxOutputBytes = 65_536
   let p = plan(cfg, @[ep], emptyDepGraph())
   var g = emptyDepGraph()
-  let results = execute(p, cfg, g, "", noopResult, false, false, 30_000,
+  let results = execute(p, config = cfg, graph = g, onResult = noopResult,
+                        failFast = false, showProgress = false,
+                        progressIntervalMs = 30_000,
                         cache = cacheDisabled(resolveSandbox()))
   if results.len > 0:
     result = results[0]
