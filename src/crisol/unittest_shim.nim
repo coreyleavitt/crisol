@@ -64,13 +64,24 @@ method failureOccurred*(f: CrisolFormatter; checkpoints: seq[string];
                         stackTrace: string) =
   ## Stash failure detail — this is the ONLY hook that carries the failure
   ## message; TestResult in testEnded has no such field.
+  ##
+  ## std/unittest's `check` template calls `fail()` — and therefore this
+  ## method — ONCE PER FAILING CHECK within a single test body, resetting its
+  ## `checkpoints` accumulator after each call (see std/unittest's `fail`
+  ## template). So a test with two failing `check`s invokes this method
+  ## twice, each time with only that check's checkpoints. APPEND each call's
+  ## detail to `pendingMsg` (reset once per test in testStarted) rather than
+  ## overwriting it, so a multi-failure test surfaces every failed check
+  ## instead of only the last one.
   let cpText = checkpoints.join("\n")
-  if stackTrace.len > 0:
-    f.pendingMsg = cpText & "\n" & stackTrace
-  elif cpText.len > 0:
-    f.pendingMsg = cpText
-  else:
-    f.pendingMsg = ""
+  let thisMsg =
+    if stackTrace.len > 0: cpText & "\n" & stackTrace
+    else: cpText
+  if thisMsg.len > 0:
+    if f.pendingMsg.len > 0:
+      f.pendingMsg = f.pendingMsg & "\n" & thisMsg
+    else:
+      f.pendingMsg = thisMsg
 
 method testEnded*(f: CrisolFormatter; r: TestResult) =
   let elapsed    = getMonoTime() - f.startTime

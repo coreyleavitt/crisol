@@ -14,7 +14,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_shim.nim
 
-import std/[options, os, osproc, strtabs, unittest]
+import std/[options, os, osproc, strtabs, strutils, unittest]
 import crisol/protocol
 import crisol/types
 
@@ -63,6 +63,36 @@ proc compileFixture() =
     shimBin = outBin
 
 compileFixture()
+
+# ---------------------------------------------------------------------------
+# One-time fixture compilation — Fix 2 multi-failure fixture
+# ---------------------------------------------------------------------------
+
+var multifailBin    = ""   ## path to the compiled shim_multifail binary
+var multifailErr    = ""   ## non-empty if compilation failed
+
+proc compileMultifailFixture() =
+  ## Compile shim_multifail.nim once for the whole suite.
+  let root   = projectRoot()
+  let src    = fixtureDir() / "shim_multifail.nim"
+  let outBin = binDir() / "shim_multifail"
+  let cache  = fixtureDir() / "nimcache" / "shim_multifail"
+
+  createDir(binDir())
+  createDir(cache)
+
+  let cmd = "nim c --mm:orc --hints:off --warnings:off" &
+            " --path:" & (root / "src") &
+            " --nimcache:" & cache &
+            " -o:" & outBin &
+            " " & src
+  let (output, rc) = execCmdEx(cmd)
+  if rc != 0:
+    multifailErr = "fixture compilation failed (exit " & $rc & "):\n" & output
+  else:
+    multifailBin = outBin
+
+compileMultifailFixture()
 
 # ---------------------------------------------------------------------------
 # Suite 1 — with CRISOL_SINK set: structured records emitted correctly
@@ -216,3 +246,48 @@ suite "shim — CRISOL_SINK unset (standalone)":
 
     discard execCmdEx(shimBin, env = env)
     check not fileExists(neverPath)
+
+# ---------------------------------------------------------------------------
+# Suite 3 — Fix 2: a test with TWO failing checks surfaces BOTH messages
+# ---------------------------------------------------------------------------
+#
+# Regression coverage for CrisolFormatter.failureOccurred previously
+# overwriting pendingMsg on each failing check, so only the LAST failure
+# survived into the record's msg. shim_multifail.nim has one test with two
+# failing checks (markers 999 and 888); both must appear in the emitted msg.
+
+suite "shim — Fix 2: multiple failing checks in one test":
+
+  test "multifail fixture compiles successfully":
+    if multifailErr.len > 0:
+      fail()
+      echo multifailErr
+    else:
+      check multifailBin.len > 0
+      check fileExists(multifailBin)
+
+  test "emitted record's msg contains BOTH failing checks, not just the last":
+    if multifailErr.len > 0: skip()
+    let sinkPath = getTempDir() / "crisol_shim_multifail_test" / "sink.ndjson"
+    createDir(sinkPath.parentDir)
+    defer:
+      try: removeDir(sinkPath.parentDir) except: discard
+
+    let env = newStringTable(modeCaseSensitive)
+    for k, v in envPairs(): env[k] = v
+    env["CRISOL_SINK"] = sinkPath
+
+    discard execCmdEx(multifailBin, env = env)
+
+    let data = readSink(sinkPath)
+    check data.hasProtocol
+    check data.records.len == 1
+
+    let rec = data.records[0]
+    check rec.status == rsFail
+    check rec.msg.isSome
+    let msg = rec.msg.get
+    # Both failure markers must be present — proves neither failing check's
+    # detail was dropped/overwritten by the other.
+    check "999" in msg   # first failing check: `first == 999`
+    check "888" in msg   # second failing check: `second == 888`
