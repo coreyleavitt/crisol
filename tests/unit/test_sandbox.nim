@@ -219,5 +219,31 @@ suite "sandbox — RunOptions.hermeticLevel wiring":
     check spec.envScrub == false
     check spec.rlimits  == false
 
+# ---------------------------------------------------------------------------
+# 11. Fix 1 — RLIMIT_NOFILE default raised to 1024; Config override honored
+# ---------------------------------------------------------------------------
+
+suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
+
+  test "DefaultRlimitNofile is 1024 (raised from the old 256, which starved real workloads)":
+    check DefaultRlimitNofile == 1024'i64
+
+  test "resolveSandbox with no override applies the new 1024 default":
+    let spec = resolveSandbox(level = hlIsolated)
+    check spec.rlimitConfig.limitNofile == some(1024'i64)
+
+  test "Config.rlimitNofile override is honored by the sandbox spec":
+    ## Proves the Config -> RlimitOverrides -> SandboxSpec wiring end to end
+    ## via the same rlimitOverridesFrom() helper production code (api.runTests)
+    ## uses at its resolveSandbox call site.
+    let cfg  = Config(rlimitNofile: some(4096'i64))
+    let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
+    check spec.rlimitConfig.limitNofile == some(4096'i64)
+
+  test "Config.rlimitNofile unset (none) falls back to the built-in 1024 default":
+    let cfg  = Config()   # rlimitNofile defaults to none(int64)
+    let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
+    check spec.rlimitConfig.limitNofile == some(1024'i64)
+
 when isMainModule:
   echo "All sandbox tests passed."

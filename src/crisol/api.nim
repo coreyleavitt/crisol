@@ -45,7 +45,7 @@
 ##   memThrottleActive, formatProgressLine, planview internals (planToJson,
 ##   decisionStringEd, decisionLabelEd, warningsToJsonArray)
 
-import std/[json, os, sequtils, sets, strutils, times]
+import std/[json, options, os, sequtils, sets, strutils, times]
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals,
                sandbox, cachedispatch, ccprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
@@ -195,6 +195,13 @@ type
     ## scrub/rlimits entirely; hlNetwork requests net-ns isolation (currently
     ## DEGRADES — net-ns unshare is not wired — so such runs are not cached).
     hermeticLevel*:      HermeticLevel = hlIsolated
+    ## Fix 1: per-run override for RLIMIT_NOFILE (max open fds) in the hermetic
+    ## sandbox. none (default) = use Config.rlimitNofile if set, else
+    ## sandbox.DefaultRlimitNofile (1024). Set explicitly can only strengthen
+    ## a config-file value (wins when some), mirroring jobs/timeoutSecs/retries
+    ## precedence below in planImpl — lets a library caller raise the ceiling
+    ## for one run without editing crisol.kdl.
+    rlimitNofile*:       Option[int64] = none(int64)
     ## RFC-0006 M-artifact-identity PASS (b2): --measure-compile-reuse.
     ## false (default) → compile slots run plain `nim c`, byte-for-byte
     ## unchanged from before this pass. true → compile slots run the
@@ -346,6 +353,15 @@ proc shouldReportCompileBlock*(measureCompileReuse: bool): bool =
   ## predicate only answers "should we even look", not "is there data".
   measureCompileReuse
 
+proc rlimitOverridesFrom*(cfg: Config): RlimitOverrides =
+  ## Fix 1: pure projection of Config's rlimit-override fields into the
+  ## RlimitOverrides bundle resolveSandbox expects. Extracted (like
+  ## shouldReportCompileBlock above) so the Config → SandboxSpec wiring is
+  ## independently unit-testable without a real run. Currently only
+  ## limitNofile is config-plumbed; the other RlimitOverrides fields stay
+  ## none here (resolveSandbox applies its own safe built-in defaults).
+  RlimitOverrides(limitNofile: cfg.rlimitNofile)
+
 proc planImpl(opts: RunOptions): PlanImplResult =
   ## Internal plan phase shared by planTests and runTests.
   ## Raises CrisolError on any structural problem.
@@ -362,6 +378,8 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   # can only strengthen a config-file setting (true wins), mirroring perfCheckForce.
   if opts.measureCompileReuse: cfg.measureCompileReuse = true
   if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
+  # Fix 1: RunOptions.rlimitNofile, when set, overrides Config.rlimitNofile.
+  if opts.rlimitNofile.isSome: cfg.rlimitNofile = opts.rlimitNofile
 
   # 3. Assemble narrowing inputs.
   let useFailed  = opts.narrowing.kind in {nkFailed, nkFailedOrChanged}
@@ -577,7 +595,8 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   # store-key derived after a compile reflects the fresh closureHash.
   # M4: bundle spec+policy+seams into a CacheContext so the invariant
   # (active iff keyOf!=nil AND policy.enabled) is enforced structurally.
-  let spec  = resolveSandbox(level = opts.hermeticLevel)
+  let spec  = resolveSandbox(level = opts.hermeticLevel,
+                              rlimits = rlimitOverridesFrom(cfg))
   # nimcache-persistence (RFC-0006): the SAME ccVersion probe already used by
   # RFC-0004's SoundnessKey (via realSeams below) is reused here — folded
   # with nimVersion into execute()'s toolchain fingerprint, which keys the

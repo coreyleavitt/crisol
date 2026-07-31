@@ -15,6 +15,7 @@
 ## flags "-d:release" "--mm:orc"        // repeated node = more global flags
 ## dep-roots "../sibling/src"           // repeated node = more dep roots
 ## quarantine "tests/integration/test_x.nim"  // B3: failure excluded from exit-1
+## rlimit-nofile 2048                   // Fix 1: override sandbox RLIMIT_NOFILE (default 1024)
 ##
 ## group "unit" {
 ##     globs "tests/unit/test_*.nim"
@@ -453,6 +454,9 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # the compile slot. Default false (unlike mem-aware's Option[bool] tristate,
     # this is a plain bool — there is no "auto" mode, only explicit opt-in).
     measureCompileReuse: bool = false
+    # Fix 1 (RLIMIT_NOFILE plumbing): config-declared override for the
+    # sandbox's max-open-fds ceiling. none = use sandbox.DefaultRlimitNofile.
+    rlimitNofile: Option[int64] = none(int64)
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -519,6 +523,11 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v.isNone or v.get.kind != kvBool:
         cfgErr("config: 'measure-compile-reuse' requires a boolean argument (#true/#false)")
       measureCompileReuse = v.get.boolVal
+    of "rlimit-nofile":
+      let v = requireIntArg(n, "rlimit-nofile")
+      if v < 1:
+        cfgErr("config: 'rlimit-nofile' must be >= 1, got " & $v)
+      rlimitNofile = some(int64(v))
     of "group":        discard
     of "perf-check":   discard  # C6: parsed in second pass (has children)
     of "reuse-check":  discard  # M-report (b1): parsed in second pass (has children)
@@ -559,6 +568,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     cacheMaxAgeDays:    cacheMaxAgeDays,
     ledgerMaxAgeDays:   ledgerMaxAgeDays,
     measureCompileReuse: measureCompileReuse,
+    rlimitNofile:       rlimitNofile,
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).
   )

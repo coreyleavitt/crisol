@@ -1183,5 +1183,58 @@ group "unit" {
     check kind == cekConfig
     check "too large" in msg
 
+# ---------------------------------------------------------------------------
+# Fix 1 — rlimit-nofile config plumbing
+# ---------------------------------------------------------------------------
+
+suite "config — rlimit-nofile (Fix 1: RLIMIT_NOFILE override plumbing)":
+
+  test "absent rlimit-nofile -> cfg.rlimitNofile == none (sandbox applies its own default)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitNofile == none(int64)
+
+  test "rlimit-nofile N round-trips to cfg.rlimitNofile == some(N)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-nofile 4096
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitNofile == some(4096'i64)
+
+  test "no config file (convention fallback) -> cfg.rlimitNofile == none":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check cfg.rlimitNofile == none(int64)
+
+  test "rlimit-nofile 0 is rejected (must be >= 1)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-nofile 0
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
 when isMainModule:
   echo "All config tests passed."

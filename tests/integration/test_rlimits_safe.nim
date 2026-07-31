@@ -150,7 +150,7 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
     doAssert spec.rlimitConfig.limitCore.isSome
     doAssert spec.rlimitConfig.limitCore.get() == 0
 
-    let r = runFixture(nofileBin, spec)  # exits 0 normally (no limit here — default nofile is 256)
+    let r = runFixture(nofileBin, spec)  # exits 0 normally (no limit here — default nofile is 1024)
     if r.scratchDir.len > 0:
       # Check for core files before cleanup
       var coreFound = false

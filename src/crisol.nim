@@ -147,6 +147,7 @@ Usage:
               [--retries <N>] [--fail-on-flaky]
               [--order <recent-fail|duration|none>]
               [--hermetic <none|isolated|network>]
+              [--rlimit-nofile <N>]
   crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
   crisol clean [--all] [--config <path>]
 
@@ -197,6 +198,12 @@ Additional options for 'run':
                   allowlist + isolated tmpdir + config-declared rlimits), or
                   network (superset of isolated + net-ns isolation; currently
                   degrades — net-ns not wired — so such runs are not cached).
+  --rlimit-nofile N
+                  Override RLIMIT_NOFILE (max open fds) for hermetic sandbox
+                  children.  Default: 1024 (or crisol.kdl's `rlimit-nofile`,
+                  if set).  Raise this for fd-heavy consumer workloads (e.g.
+                  one eventfd per in-flight async call) without patching
+                  crisol.
   --measure-compile-reuse
                   Diagnostic: run compile slots through the measurement
                   worker and emit the `compile` block's segmented cc%/
@@ -463,6 +470,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     hermeticLevel: HermeticLevel = hlIsolated  # RFC-0004: --hermetic none|isolated|network
     measureCompileReuse: bool = false  # RFC-0006: --measure-compile-reuse: gate the
                                         # measurement worker into the compile slot
+    rlimitNofile: int = 0        # Fix 1: --rlimit-nofile N; 0 = not specified (use config/built-in)
 
   let runArgs = args[1..^1]
   var i = 0
@@ -491,7 +499,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       if key in ["jobs", "timeout", "fail-fast", "dry-run", "failed", "changed",
                  "base", "force-compile", "no-cache", "filter-tag",
                  "retries", "fail-on-flaky", "junit", "shard", "order",
-                 "perf-check", "hermetic", "measure-compile-reuse"] and isList:
+                 "perf-check", "hermetic", "measure-compile-reuse",
+                 "rlimit-nofile"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
         stderr.write(usage())
         return ExitEnvironment
@@ -617,6 +626,17 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
           stderr.write("crisol: --hermetic: invalid level '" & raw &
                        "' (expected none, isolated, or network)\n")
           return ExitEnvironment
+      of "rlimit-nofile":
+        let raw = nextVal("rlimit-nofile")
+        if raw == "":
+          stderr.write(usage()); return ExitEnvironment
+        try:
+          rlimitNofile = parseInt(raw)
+          if rlimitNofile < 1:
+            stderr.write("crisol: --rlimit-nofile must be >= 1\n"); return ExitEnvironment
+        except ValueError:
+          stderr.write("crisol: --rlimit-nofile: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
       else:
         stderr.write("crisol: unknown flag '--" & key & "'\n\n")
         stderr.write(usage())
@@ -734,6 +754,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     order:               orderMode,     # C4: history-based prioritization
     perfCheckForce:      perfCheck,     # C6: --perf-check: force detection ON
     hermeticLevel:       hermeticLevel, # RFC-0004: --hermetic level control
+    rlimitNofile:        if rlimitNofile > 0: some(int64(rlimitNofile)) else: none(int64),
+                                         # Fix 1: --rlimit-nofile override
     measureCompileReuse: measureCompileReuse,  # RFC-0006: gate measurement worker into compile slot
     workerBinary:        selfWorkerBinary,  # "" unless the real CLI entrypoint (below) passed
                                              # its own getAppFilename() — see runMain's doc above

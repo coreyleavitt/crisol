@@ -243,6 +243,14 @@ type
                                 ## monolithic `nim c` path is byte-for-byte unchanged until an
                                 ## operator opts in (`--measure-compile-reuse` / `measure-compile-
                                 ## reuse #true` in crisol.kdl).
+    rlimitNofile*: Option[int64]
+                                ## Config-declared override for RLIMIT_NOFILE (max open fds) in the
+                                ## hermetic sandbox. none = use sandbox.DefaultRlimitNofile (1024).
+                                ## Populated from the top-level `rlimit-nofile N` KDL node, and/or
+                                ## strengthened per-run by `RunOptions.rlimitNofile` (RunOptions wins
+                                ## when set, mirroring jobs/timeoutSecs precedence in planImpl).
+                                ## Lets a consumer with an fd-heavy workload (e.g. one eventfd per
+                                ## in-flight async call) raise the ceiling without patching crisol.
     workerBinary*: string       ## INTERNAL plumbing (not user-facing; no KDL node). Absolute path
                                 ## to a binary whose `main()` dispatches the
                                 ## `--internal-measure-compile` token (see measureworker.nim /

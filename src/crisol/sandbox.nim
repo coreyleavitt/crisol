@@ -48,7 +48,29 @@ const DefaultEnvAllowlistPrefixes*: seq[string] = @["LC_"]
 # safe deterministic defaults when rlimits are active.
 
 const DefaultRlimitFsize*:  int64 = 256 * 1024 * 1024  # 256 MiB max file write
-const DefaultRlimitNofile*: int64 = 256                 # 256 open fds (conservative)
+const DefaultRlimitNofile*: int64 = 1024
+  ## Default RLIMIT_NOFILE (max open file descriptors) for a sandboxed child.
+  ##
+  ## WHY 1024 (was 256):
+  ##   256 starved legitimate consumer workloads — e.g. a DB layer that
+  ##   allocates one eventfd per in-flight async call exhausted 256 fds under
+  ##   normal (non-pathological) concurrency and failed spuriously inside the
+  ##   hermetic sandbox. 256 is also not a meaningful hermeticity guarantee:
+  ##   it does not detect a "real" fd leak any better than a higher ceiling
+  ##   does, since a legitimate test opening a few dozen files/sockets/eventfds
+  ##   can plausibly approach it.
+  ##
+  ##   1024 is the conventional Linux soft `ulimit -n` default (matches
+  ##   `/etc/security/limits.conf` defaults and systemd's DefaultLimitNOFILE
+  ##   on most distros), so raising crisol's ceiling to 1024 makes the sandbox
+  ##   behave like an ordinary shell session rather than an artificially tight
+  ##   cage — it still catches unbounded fd leaks (a real leak blows past 1024
+  ##   quickly) without punishing normal fan-out (event loops, connection
+  ##   pools, async I/O) that a production-shaped test may exercise.
+  ##
+  ##   Consumers with unusual fd needs can still raise this further via
+  ##   ``Config.rlimitNofile`` (crisol.kdl `rlimit-nofile N`) or
+  ##   ``RunOptions.rlimitNofile`` without patching crisol.
 const DefaultRlimitCore*:   int64 = 0                   # disable core dumps
 
 const MinSafeRlimitAs*: int64 = 3 * 1024 * 1024 * 1024  # 3 GiB
