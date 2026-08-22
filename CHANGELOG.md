@@ -184,8 +184,8 @@ one-time recompile of entrypoints whose closure gained members.
   nothing but the JSON document is written to stdout.
 - **security:** untrusted-origin diagnostic text reaching stdout/stderr is
   now sanitized through ONE shared primitive,
-  `ioutils.sanitizeControlBytes` (`render.sanitizeForTerminal` is now a thin
-  alias; `depgraph.nim`'s `sanitizeOneSegment` also delegates to it).
+  `ioutils.sanitizeControlBytes` (`depgraph.nim`'s `sanitizeOneSegment`
+  delegates to it as well).
   Coverage is broadened well past `ConfigWarning.message` and the ad-hoc /
   ambiguous-path warning lines (already covered) to every other DIAGNOSTIC
   write of untrusted-origin text: every `CrisolError.msg` (including config
