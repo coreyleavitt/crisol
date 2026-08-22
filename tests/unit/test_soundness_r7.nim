@@ -30,6 +30,7 @@ proc writeNimcacheJson(dir: string; bname: string; pairs: seq[(string, string)])
   let node = newJObject()
   node["compile"] = compileArr
   node["link"]    = linkArr
+  node["depfiles"] = newJArray()
   createDir(dir)
   writeFile(dir / bname & ".json", $node)
 

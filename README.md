@@ -334,6 +334,31 @@ emit(TestRecord(
 
 See [`docs/rfc/`](docs/rfc/) for the full design, architecture, and decision records.
 
+### What a closure tracks
+
+`--changed` selection and compile avoidance both work from each entrypoint's
+**source closure**, derived from the Nim compiler's own build manifest (never
+from a hand-rolled import parser) and filtered to files under the project
+root or a configured `dep-roots` entry. Per (path, effective flags) leg, the
+closure contains:
+
+- every Nim module the compile reached (imports, including `when defined(...)`-gated ones, resolved through any `--path`);
+- every `include`d file, every `staticRead`/`slurp` target, and the
+  `nim.cfg`/`config.nims` files the compiler read (crisol compiles with
+  `-d:nimBetterRun` so Nim records them; the define is not part of the
+  entrypoint's flags or identity);
+- every `{.compile: "file.c".}` C/C++/ObjC source and every `{.link: "file.o".}` prebuilt object.
+
+Editing any tracked file recompiles the entrypoint on the next run and
+selects it under `--changed`. Two shapes cannot be tracked and are handled
+**fail-closed** — crisol warns on stderr and recompiles + force-selects the
+entrypoint on every run until fixed: the tuple form
+`{.compile: ("pattern*.c", "$1.o").}` (Nim erases the source path from the
+object name; use the single-path form), and object paths that are not
+absolute (`--noAbsolutePaths`). Not tracked by design: `gorge` (a shell
+command, not a file) and the C headers a `{.compile.}`d source `#include`s
+(Nim's own external-object cache ignores headers as well).
+
 ## License
 
 MIT

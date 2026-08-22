@@ -1,8 +1,8 @@
 ## closure.nim — source-dependency closure extractor for one entrypoint (D1).
 ##
 ## Reads the per-build nimcache JSON produced by `nim c` and extracts the
-## transitive set of `.nim` source files the entrypoint depends on, filtered
-## to files that live under a *tracked root* (projectRoot or a configured
+## transitive set of source files the entrypoint depends on, filtered to
+## files that live under a *tracked root* (projectRoot or a configured
 ## depRoot).  Stdlib, nimble-package paths, and anything that cannot be
 ## resolved to a tracked root are silently excluded.
 ##
@@ -14,10 +14,11 @@
 ## source-tree index finds it regardless of which `--path` produced it
 ## (project `nim.cfg`/`config.nims`, a dep's own config, …).
 ##
-## ## Algorithm (RFC-0001 §Dependency Source, verified decode algorithm)
+## ## Algorithm (RFC-0001 §Dependency Source, verified decode algorithm;
+## depfiles union added for issue #11)
 ##
-## The nimcache JSON at `<nimcacheDir>/<binaryName>.json` contains two
-## arrays that name compile units:
+## The nimcache JSON at `<nimcacheDir>/<binaryName>.json` contains three
+## arrays that matter here:
 ##
 ## - `compile` — `[cFilePath, gccCmd]` pairs: the C-compile WORK LIST for
 ##   this invocation.  Complete only on a cold nimcache; on a warm recompile
@@ -25,7 +26,29 @@
 ##   nothing did (a comment-only edit).  NOT a closure source (issue #5).
 ## - `link`    — object-file paths: everything the linker consumes.  Built
 ##   from ALL of the compiler's `toCompile` plus external objects, so it is
-##   complete on every compile by construction.  THIS is the closure source.
+##   complete on every compile by construction.  A closure source: `@m`/
+##   `@p`/`@n`-mangled MODULE objects decode to source paths, and so do
+##   `@m`/`@p`/`@n`-mangled EXTERNAL objects — a `{.compile: "x.c".}`d
+##   C/C++/ObjC/asm source in single-path form (D3c, issue #11) — via the
+##   same decode.  An external's object has no module of its own, so it is
+##   invisible to `depfiles`; `link` is the only manifest array that names
+##   it.  An entry that is neither a module object nor a mangled single-path
+##   external is classified further (D8/D9, issue #11 slices 8-9 — see the
+##   4-way classification paragraph below): a tuple-form
+##   `{.compile: (pattern, format).}` object is unattributable (raises), a
+##   `{.link.}`d prebuilt object/archive is tracked like any other source
+##   when absolute and rooted, and a non-absolute foreign entry is
+##   unattributable (raises).
+## - `depfiles` — `[absPath, hash]` pairs, written only under
+##   `-d:nimBetterRun` (`compiledriver.nimCompileArgs` injects it on every
+##   crisol-driven compile): EVERY file the compiler opened for this
+##   invocation — the main module, every import, every `include`d file,
+##   every `staticRead`/`slurp` target, and `nim.cfg`/`config.nims`.  A
+##   closure source, and the ONLY one that sees `include`d files and
+##   `staticRead`/`slurp` inputs: `link` only ever names compiled MODULE
+##   objects, so a file pulled in via `include` (which has no module object
+##   of its own — it is textually merged into its includer) is invisible to
+##   `link` alone.  Already-absolute paths, no @m/@p/@n decoding needed.
 ##
 ## A Nim MODULE object's basename is always `<mangled>.nim.{c,cpp,m}.o` — the
 ## literal `.nim` component before the backend extension is what distinguishes
@@ -67,8 +90,9 @@
 ##   depRoots, depRoots/src) misses any root added by a config file rather
 ##   than by crisol's own config, silently dropping that module from the
 ##   closure.  Instead, `body` is resolved against a once-per-run
-##   `SourceIndex` (`buildSourceIndex`, below): every `.nim` file under
-##   projectRoot or a depRoot, indexed by basename.  A candidate is kept iff
+##   `SourceIndex` (`buildSourceIndex`, below): every regular file under
+##   projectRoot or a depRoot — module or `{.compile.}`d external alike (D4,
+##   issue #11) — indexed by basename.  A candidate is kept iff
 ##   its indexed absolute path equals `body` or ends with `DirSep & body` —
 ##   exactly the semantics of "some search-path root resolved this suffix".
 ##   Ambiguous matches (the body suffix matches under multiple indexed
@@ -97,21 +121,65 @@
 ## but must be tracked because excluding it breaks both `narrowByDiff` and
 ## compile-avoidance.  This is the D1a soundness fix.
 ##
+## ## `link`'s 4-way classification (D8/D9, issue #11 slices 8-9)
+##
+## Every `link` entry falls into exactly one of four buckets, decided in
+## order by `extractClosure`'s link loop (`classifyForeignLinkEntry`, below,
+## covers the last two once `moduleMangledNameOf`/`externalMangledNameOf`
+## rule out the first two):
+##
+## 1. **Module object** (`moduleMangledNameOf`) — `<mangled>.nim.{c,cpp,m}.o`.
+##    Resolved via `resolveMangledAll` and root-filtered.
+## 2. **Mangled single-path external** (`externalMangledNameOf`) — a
+##    `{.compile: "file.c".}`d source, `<@m|@p|@n><mangled-path>.o` (D3c).
+##    Resolved via the same `resolveMangledAll` and root-filtered.
+## 3. **Tuple-form `{.compile.}` object** (D8) — absolute, and lives IN the
+##    nimcache directory (`objPath.parentDir` equals `nimcacheDir`, both
+##    normalized).  Nim's `{.compile: (pattern, format).}` form
+##    (`compiler/pragmas.nim processCompile`, verified Nim 2.2.10) names the
+##    output object from the FORMAT STRING via
+##    `completeCfilePath(dest % extractFilename(f))` — the source path is
+##    erased from the object's own basename, so nothing in the manifest maps
+##    it back to a source file, cold or warm alike.  `extractClosure` raises
+##    `CrisolError(cekEnvironment)`, naming the object and explaining the
+##    tuple-form limitation; the caller (`depgraph.recordClosure`)
+##    invalidates the entry, so the entrypoint is recompiled and
+##    force-selected on the next run (with the runner's existing warning) —
+##    fail-closed by design, not "works cold, silently breaks warm".
+## 4. **`{.link.}`d prebuilt object/archive** (D9) — absolute, and does NOT
+##    live in the nimcache directory.  Nim 2.2.10's `processLink` /
+##    `addExternalFileToLink` (verified) record such an entry as a raw
+##    ABSOLUTE path (with `.o` appended if missing; a bare basename only
+##    under `--noAbsolutePaths`).  Treated exactly like a source: tracked
+##    when it lives under a tracked root (the same `underAnyRoot` gate every
+##    other candidate passes through), silently excluded otherwise (e.g. a
+##    system library).  A NON-absolute entry here (only possible under
+##    `--noAbsolutePaths` or an equivalent path-stripping flag) cannot be
+##    resolved or attributed to anything — `extractClosure` raises
+##    `CrisolError(cekEnvironment)` naming it.
+##
 ## ## Return value
 ##
 ## A `HashSet[string]` of paths relative to `projectRoot`, using forward
 ## slashes, matching the scheme used by `Entrypoint.path` and future
 ## dep-graph keys.  The entrypoint's own file is included (its object is in
-## `link`).  External objects (`{.compile.}`d C/C++ files and foreign
-## libraries) are excluded by `moduleMangledNameOf`'s `.nim.{c,cpp,m}.o` filter —
-## they may be `@m`-mangled too, but never end in `.nim.c.o` / `.nim.cpp.o` /
-## `.nim.m.o`, so they never name a Nim module in the first place.
+## `link`).  A `{.compile.}`d external in single-path (`@m`/`@p`/`@n`) form is
+## included too (D3c, issue #11) — `moduleMangledNameOf`'s
+## `.nim.{c,cpp,m}.o` filter correctly identifies it as NOT a module object
+## (it never ends in `.nim.c.o` / `.nim.cpp.o` / `.nim.m.o`), and
+## `externalMangledNameOf` then decodes its mangled basename the same way. A
+## `{.link.}`d prebuilt object/archive is included too (D9, bucket 4 above)
+## when it lives under a tracked root.
 ##
 ## ## Error handling
 ##
 ## A missing or unparse­able JSON raises `CrisolError(kind: cekEnvironment)`.
 ## The caller (D2/D6) decides recovery policy; the conservative fallback
-## (run the entrypoint regardless) is a later-slice concern.
+## (run the entrypoint regardless) is a later-slice concern.  Two more
+## conditions raise the same error kind (D8/D9, issue #11 slices 8-9,
+## bucket 3 and the non-absolute case of bucket 4 above): a tuple-form
+## `{.compile.}` object, and a non-absolute `{.link.}` entry — both name a
+## `link` member `extractClosure` cannot attribute to any source file.
 
 import std/[json, os, sets, strutils, tables]
 import crisol/types
@@ -123,17 +191,19 @@ import crisol/config  # for stateDirOf — the source-index walk prunes it
 
 type
   IndexedFile = object
-    ## One indexed `.nim` file, recorded under both the LEXICAL path
-    ## (project/depRoot-relative walk path — what we report and record in
-    ## the closure) and the REALPATH (symlinks resolved) — see `lookup`'s
-    ## doc comment for why both are needed.
+    ## One indexed file — every regular file under a tracked root (D4, issue
+    ## #11): Nim modules, `{.compile.}`d C/C++/ObjC/asm sources, and anything
+    ## else the compiler may consume, not only `.nim` files — recorded under
+    ## both the LEXICAL path (project/depRoot-relative walk path — what we
+    ## report and record in the closure) and the REALPATH (symlinks
+    ## resolved) — see `lookup`'s doc comment for why both are needed.
     lexical: string
     real:    string
 
   SourceIndex* = object
-    ## basename ("foo.nim") -> every indexed file under projectRoot or a
-    ## depRoot whose file has that basename.  Built once per run
-    ## (`buildSourceIndex`) and threaded through `extractClosure` for ALL
+    ## basename (e.g. "foo.nim", "add.c") -> every indexed file under
+    ## projectRoot or a depRoot whose file has that basename.  Built once per
+    ## run (`buildSourceIndex`) and threaded through `extractClosure` for ALL
     ## entrypoints in the run — never rebuilt per entrypoint.
     byBasename: Table[string, seq[IndexedFile]]
     byReal: Table[string, seq[string]]
@@ -164,9 +234,14 @@ proc addToIndex(index: var SourceIndex; lexical: string; real: string) =
 
 proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
                   index: var SourceIndex) =
-  ## Recursively index `.nim` files under `dir`, RECORDING each file's LEXICAL
-  ## path as `recordRoot / <relative path from the original walk root>` rather
-  ## than whatever `os.walkDir` hands back — this matters for depRoots
+  ## Recursively index every regular file under `dir` — Nim modules,
+  ## `{.compile.}`d C/C++/ObjC/asm sources, and anything else the compiler
+  ## may consume, not only `.nim` files (D4, issue #11: `link`'s `@m`/`@p`/
+  ## `@n`-mangled external-object entries decode to sources of any
+  ## extension, and `SourceIndex.lookup` must be able to find them) —
+  ## RECORDING each file's LEXICAL path as `recordRoot / <relative path from
+  ## the original walk root>` rather than whatever `os.walkDir` hands back —
+  ## this matters for depRoots
   ## (`buildSourceIndex` passes `recordRoot == dir` at the top so recorded
   ## paths are lexically `<depRootAbs>/<rel>`, matching what the
   ## under-tracked-root filter and `toProjectRelative` expect) — AND each
@@ -214,18 +289,18 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
       if stateDirAbs.len > 0 and entryAbs == stateDirAbs: continue
       walkForIndex(entry.path, recordRoot / name, stateDirAbs, index)
     of pcFile:
-      if entry.path.endsWith(".nim"):
-        index.addToIndex(recordRoot / name, realDir / name)
+      index.addToIndex(recordRoot / name, realDir / name)
     of pcLinkToFile:
-      if entry.path.endsWith(".nim"):
-        let real =
-          try: expandFilename(entry.path)
-          except OSError: recordRoot / name
-        index.addToIndex(recordRoot / name, real)
+      let real =
+        try: expandFilename(entry.path)
+        except OSError: recordRoot / name
+      index.addToIndex(recordRoot / name, real)
 
 proc buildSourceIndex*(config: Config): SourceIndex =
   ## Walk `config.projectRoot` and each `config.depRoots[i]` once, indexing
-  ## every `.nim` file by basename.  See `walkForIndex`'s doc comment for
+  ## every regular file by basename — Nim modules, `{.compile.}`d
+  ## C/C++/ObjC/asm sources, and anything else the compiler may consume, not
+  ## only `.nim` files (D4, issue #11).  See `walkForIndex`'s doc comment for
   ## the exact pruning rules.  Meant to be built ONCE per run (by the
   ## caller — `runner.execute`) and passed to every `extractClosure` call
   ## in that run, never rebuilt per entrypoint.
@@ -419,13 +494,99 @@ proc moduleMangledNameOf(objPath: string): string =
       return base[0 ..< base.len - (suffix.len - 4)]   # keep through ".nim"
   ""
 
+proc externalMangledNameOf(objPath: string): string =
+  ## Maps one `link` object-file path that names NO Nim module
+  ## (`moduleMangledNameOf` returned `""` for it) to the mangled name
+  ## `resolveMangledAll` expects for a `{.compile.}`d external source in
+  ## single-path (`@m`/`@p`/`@n`) form (D3c, issue #11), or `""` if `objPath`
+  ## does not fit that shape.
+  ##
+  ## Contract: such an external's basename is `<@m|@p|@n><mangled-path>.o` —
+  ## Nim's `mangleModuleName` result for the external's OWN source path
+  ## (e.g. `native/add.c`), plus the single `.o` the linker consumes, and NO
+  ## `.nim` component (`moduleMangledNameOf` already ruled that shape out).
+  ## Stripping exactly the trailing `.o` — never a backend extension too,
+  ## unlike `moduleMangledNameOf`'s module case, since an external's own
+  ## extension (`.c`, `.cpp`, …) IS part of its real filename, not a
+  ## synthetic `.nim.c` suffix — leaves `<@m|@p|@n><mangled-path>`: the same
+  ## `"<@m|@p|@n><body>"` shape `resolveMangledAll` already decodes for
+  ## module objects, so it is resolved by the identical proc.
+  ##
+  ## Any other non-module `link` entry — an unmangled basename (a tuple-form
+  ## `{.compile.}` object or a `{.link.}`d prebuilt object/archive) — does
+  ## not match this shape and yields `""`; `extractClosure` classifies such
+  ## an entry further via `classifyForeignLinkEntry` (below) rather than
+  ## skipping it outright.
+  let base = objPath.extractFilename
+  if not (base.startsWith("@m") or base.startsWith("@p") or base.startsWith("@n")):
+    return ""
+  if not base.endsWith(".o"):
+    return ""
+  base[0 ..< base.len - 2]                             # strip trailing ".o"
+
+type
+  ForeignLinkKind = enum
+    flkTupleCompile
+      ## An unattributable compiled object (D8): absolute, and lives IN the
+      ## nimcache directory — the shape a tuple-form
+      ## `{.compile: (pattern, format).}` external produces
+      ## (`compiler/pragmas.nim processCompile`'s
+      ## `completeCfilePath(dest % extractFilename(f))`, verified Nim
+      ## 2.2.10): the object's basename comes from the FORMAT STRING, not
+      ## the source path, so nothing in the manifest maps it back to a
+      ## source file — cold or warm, this is permanently unattributable, not
+      ## merely "not yet resolved".
+    flkPrebuiltAbs
+      ## A `{.link.}`d prebuilt object/archive (D9): absolute, and does NOT
+      ## live in the nimcache directory — genuinely foreign content (built
+      ## by something other than this compile) that `extractClosure` treats
+      ## as a source, subject to the ordinary under-tracked-root filter.
+    flkPrebuiltRel
+      ## A `{.link.}`d entry with a non-absolute path (D9) — per Nim 2.2.10
+      ## `processLink`/`addExternalFileToLink` (verified), `link` entries
+      ## are ordinarily raw absolute paths; a relative one here means the
+      ## compile ran under `--noAbsolutePaths` (or an equivalent path-
+      ## stripping flag), so crisol has no directory to resolve it against.
+
+proc classifyForeignLinkEntry(objPath: string; nimcacheDir: string): ForeignLinkKind =
+  ## Classifies one `link` entry that is NEITHER a module object
+  ## (`moduleMangledNameOf`) NOR a mangled single-path external
+  ## (`externalMangledNameOf`) — i.e. everything `extractClosure`'s link
+  ## loop still has left to handle after those two return `""` (D8/D9,
+  ## issue #11 slices 8-9).
+  ##
+  ## Absolute-ness is checked first because it is the only reliable signal:
+  ## a tuple-form `{.compile.}` object's path is always absolute (it is
+  ## built from `completeCfilePath`, itself rooted at the absolute nimcache
+  ## directory), so `flkTupleCompile` vs `flkPrebuiltAbs` is decided by
+  ## comparing `objPath`'s parent directory against `nimcacheDir` — an
+  ## object living IN the nimcache dir but bearing no module/external
+  ## mangling can only be the tuple-form shape; anything absolute living
+  ## OUTSIDE the nimcache dir is foreign, prebuilt content.  A non-absolute
+  ## entry is `flkPrebuiltRel` unconditionally: without an absolute path
+  ## there is no directory to compare against the nimcache dir in the first
+  ## place, so the tuple-form/prebuilt distinction cannot even be posed.
+  if objPath.isAbsolute:
+    let objDir  = objPath.parentDir.absolutePath.normalizedPath
+    let cacheDir = nimcacheDir.absolutePath.normalizedPath
+    if objDir == cacheDir:
+      flkTupleCompile
+    else:
+      flkPrebuiltAbs
+  else:
+    flkPrebuiltRel
+
 proc resolveMangledAll(mangledName: string;
                        entrypointPath: string;
                        index: SourceIndex): seq[string] =
-  ## Decode one mangled module name (`moduleMangledNameOf`'s output — the
-  ## compile-unit basename with the backend extension and `.o` already
-  ## stripped, e.g. `@mfoo.nim`) to zero or more absolute `.nim` candidate
-  ## paths.
+  ## Decode one mangled name — either a module's (`moduleMangledNameOf`'s
+  ## output: the compile-unit basename with the backend extension and `.o`
+  ## already stripped, e.g. `@mfoo.nim`) or a `{.compile.}`d external's
+  ## (`externalMangledNameOf`'s output: the basename with only `.o` stripped,
+  ## e.g. `@mnative@sadd.c`, still `@`-escaped) — to zero or more absolute
+  ## candidate paths. Nothing below inspects the trailing extension, so both
+  ## inputs decode identically; `body`, once `@s`/`@@` decoded, is simply
+  ## whatever path the compiler mangled, `.nim` or otherwise.
   ##
   ## For `@m`: `body` is Nim's SHORTEST-relative-path candidate measured
   ##           from the entrypoint's own directory — the mangler's default
@@ -657,7 +818,9 @@ proc resolveMangledAll(mangledName: string;
 proc parseCompileManifest*(jsonPath: string):
     tuple[compile: seq[tuple[cPath, ccCmd: string]];
           link: seq[string];
-          linkcmd: string] =
+          linkcmd: string;
+          depfiles: seq[tuple[path, hash: string]];
+          hasDepfiles: bool] =
   ## Low-level nimcache-JSON reader (RFC-0006 §File scoping / "Manifest
   ## access") — the SINGLE JSON-reading implementation shared by
   ## `extractClosure` (below, a filter over this) and RFC-0006's M/R stages
@@ -666,12 +829,27 @@ proc parseCompileManifest*(jsonPath: string):
   ## Returns the RAW, UNFILTERED `compile` array as `(cPath, ccCmd)` pairs —
   ## stdlib/nimble paths INCLUDED, cc commands INCLUDED — plus the RAW `link`
   ## array (every object path the linker consumes, external objects INCLUDED;
-  ## empty if the manifest has no `link` array) and the `linkcmd` string.
+  ## empty if the manifest has no `link` array), the `linkcmd` string, and
+  ## the RAW `depfiles` array as `(path, hash)` pairs (issue #11).
+  ##
+  ## `depfiles` is written by Nim only when compiled with `-d:nimBetterRun`
+  ## (`compiledriver.nimCompileArgs` injects it on every crisol-driven
+  ## compile) — it names EVERY file the compiler opened for this
+  ## invocation: the main module, every import, every `include`d file,
+  ## every `staticRead`/`slurp` target, and `nim.cfg`/`config.nims`.
+  ## `hasDepfiles` distinguishes "manifest has no `depfiles` key at all"
+  ## (`false`; compiled without `-d:nimBetterRun`) from "manifest has an
+  ## empty `depfiles` array" (`true`, `depfiles.len == 0`) — a distinction
+  ## `depfiles.len` alone cannot make, but `extractClosure` needs: it raises
+  ## on the former (closure cannot be derived soundly) and accepts the
+  ## latter (the `link` array still supplies module objects).
+  ##
   ## Does no path resolution, no under-root filtering, no @m/@p decoding:
   ## that is `extractClosure`'s job, not this proc's.
   ##
   ## An entry whose `cPath` is empty is skipped (matches the historical
   ## `extractClosure` guard — such an entry cannot name a compile unit).
+  ## A `depfiles` entry whose `path` is empty is likewise skipped.
   ##
   ## Raises `CrisolError(cekEnvironment)` if the JSON is missing, unparseable,
   ## or has no `compile` array.
@@ -708,7 +886,19 @@ proc parseCompileManifest*(jsonPath: string):
       let oPath = o.getStr("")
       if oPath != "": link.add oPath
 
-  result = (compile: pairs, link: link, linkcmd: jnode{"linkcmd"}.getStr(""))
+  let depfilesArr = jnode{"depfiles"}
+  let hasDepfiles = depfilesArr != nil and depfilesArr.kind == JArray
+  var depfiles: seq[tuple[path, hash: string]] = @[]
+  if hasDepfiles:
+    for pair in depfilesArr:
+      if pair.kind != JArray or pair.len < 1: continue
+      let p = pair[0].getStr("")
+      if p == "": continue
+      let h = if pair.len >= 2: pair[1].getStr("") else: ""
+      depfiles.add (path: p, hash: h)
+
+  result = (compile: pairs, link: link, linkcmd: jnode{"linkcmd"}.getStr(""),
+           depfiles: depfiles, hasDepfiles: hasDepfiles)
 
 proc extractClosure*(nimcacheDir: string;
                      binaryName: string;
@@ -734,9 +924,28 @@ proc extractClosure*(nimcacheDir: string;
   ##
   ## Raises `CrisolError(cekEnvironment)` if the JSON is missing or unparseable.
   ##
-  ## A FILTER over `parseCompileManifest`'s raw `link` array (RFC-0006 §File
-  ## scoping): stdlib/nimble paths and external objects are deliberately
-  ## dropped here — `parseCompileManifest` is the shape that keeps them.
+  ## Unions TWO classes of manifest entry, both filtered through the SAME
+  ## under-tracked-root soundness gate:
+  ##
+  ## - `link` (RFC-0006 §File scoping): every entry falls into one of FOUR
+  ##   buckets (D8/D9, issue #11 slices 8-9 — see the module doc comment's
+  ##   "`link`'s 4-way classification" section for the full case analysis):
+  ##   (1) a module OBJECT, (2) a single-path (`@m`/`@p`/`@n`-mangled)
+  ##   EXTERNAL (`{.compile.}`d) object (D3c, issue #11) — both decoded via
+  ##   `resolveMangledAll` (see `externalMangledNameOf`'s doc comment for how
+  ##   an external's mangled name is derived once `moduleMangledNameOf` rules
+  ##   out a module) and root-filtered; (3) a tuple-form `{.compile.}` object
+  ##   (D8) — unattributable, raises; (4) a `{.link.}`d prebuilt
+  ##   object/archive (D9) — tracked like a source when absolute and rooted,
+  ##   silently excluded when absolute but outside every root, and raises
+  ##   when non-absolute.  `parseCompileManifest` is the shape that keeps the
+  ##   raw, unfiltered array for callers that need it.
+  ##
+  ## - `depfiles` (issue #11): every file the compiler opened for this
+  ##   entrypoint — modules, `include`d files, `staticRead`/`slurp` inputs,
+  ##   and config files (`nim.cfg`/`config.nims`) — already absolute paths,
+  ##   so no `@m`/`@p`/`@n` decoding is needed; only the under-tracked-root
+  ##   filter applies.
   ##
   ## Reads `link`, NEVER `compile` (issue #5): `compile` is the per-invocation
   ## C work list and is partial/empty on a warm nimcache, so a closure built
@@ -746,6 +955,24 @@ proc extractClosure*(nimcacheDir: string;
   ## Raises `CrisolError(cekEnvironment)` if `link` is empty: a linked binary
   ## has at least its main module's object, so an empty `link` is a malformed
   ## manifest, never a real (empty) closure.
+  ##
+  ## Raises `CrisolError(cekEnvironment)` if the manifest has NO `depfiles`
+  ## key at all (issue #11): that means the entrypoint was compiled without
+  ## `-d:nimBetterRun` (`compiledriver.nimCompileArgs` injects it on every
+  ## crisol-driven compile), so `include`d files, `staticRead`/`slurp`
+  ## inputs, and config files cannot be derived soundly — a closure that
+  ## silently omitted them would be UNDER-selecting. An empty `depfiles`
+  ## array (key present, zero entries) is allowed: the `link` array still
+  ## supplies module objects.
+  ##
+  ## Raises `CrisolError(cekEnvironment)` for a tuple-form
+  ## `{.compile: (pattern, format).}` object (D8, bucket 3 above): the
+  ## object's basename comes from the format string, not the source path, so
+  ## crisol cannot attribute it to any C/C++ source — cold or warm alike.
+  ##
+  ## Raises `CrisolError(cekEnvironment)` for a `{.link.}` entry whose path
+  ## is not absolute (D9, bucket 4 above, non-absolute case): without an
+  ## absolute path there is nothing to resolve or attribute it to.
 
   let jsonPath = nimcacheDir / binaryName & ".json"
   let manifest = parseCompileManifest(jsonPath)
@@ -753,6 +980,11 @@ proc extractClosure*(nimcacheDir: string;
     raise newCrisolError(cekEnvironment,
       "nimcache JSON at " & jsonPath & " has no 'link' entries" &
       " — cannot derive the source closure")
+  if not manifest.hasDepfiles:
+    raise newCrisolError(cekEnvironment,
+      "nimcache JSON at " & jsonPath & " has no 'depfiles' array" &
+      " — was the entrypoint compiled without -d:nimBetterRun?" &
+      " cannot derive the source closure soundly")
 
   let epAbs = entrypoint.absolutePath.normalizedPath
   let prAbs = config.projectRoot.absolutePath.normalizedPath
@@ -762,9 +994,50 @@ proc extractClosure*(nimcacheDir: string;
   for objPath in manifest.link:
     # moduleMangledNameOf applies the ".nim.{c,cpp,m}.o" module-object contract:
     # only Nim-generated module objects satisfy it — a `{.compile.}`d C/C++
-    # external or foreign object/archive names no Nim module and yields "".
-    let mangledName = moduleMangledNameOf(objPath)
-    if mangledName == "": continue
+    # external or foreign object/archive yields "" here.
+    var mangledName = moduleMangledNameOf(objPath)
+    if mangledName == "":
+      # Not a module object. D3c (issue #11): a `{.compile.}`d external in
+      # single-path (@m/@p/@n) form still names a real source file — decode
+      # it via the SAME resolveMangledAll a module object uses below.
+      mangledName = externalMangledNameOf(objPath)
+      if mangledName == "":
+        # Neither a module object nor a mangled single-path external — D8/D9
+        # (issue #11 slices 8-9): classify what remains via
+        # classifyForeignLinkEntry's doc comment for the full case analysis.
+        case classifyForeignLinkEntry(objPath, nimcacheDir)
+        of flkTupleCompile:
+          # D8: a tuple-form `{.compile: (pattern, format).}` object. Nim's
+          # own format string names the object, not the source path, so
+          # nothing in the manifest maps this object back to a source file —
+          # fail closed (invalidates the entry: recompiled + force-selected
+          # next run, with the runner's existing warning) rather than
+          # silently recording an incomplete closure, cold or warm alike.
+          raise newCrisolError(cekEnvironment,
+            "cannot track the compiled object '" & objPath.extractFilename &
+            "': it was produced by a tuple-form {.compile: (pattern, format).} " &
+            "pragma. Nim's (pattern, format) compile-pragma form erases the " &
+            "source path from the object name, so crisol cannot determine " &
+            "which C/C++ source produced it — use the single-path form " &
+            "{.compile: \"file.c\".} instead, which crisol can track")
+        of flkPrebuiltAbs:
+          # D9: a `{.link.}`d prebuilt object/archive, not produced by this
+          # compile. Treated exactly like a source: tracked when it lives
+          # under a tracked root, silently excluded otherwise (e.g. a system
+          # library) — same under-tracked-root gate applied below to every
+          # resolved candidate.
+          let absObj = objPath.absolutePath.normalizedPath
+          if index.underAnyRoot(absObj):
+            result.incl toProjectRelative(absObj, prAbs)
+          continue
+        of flkPrebuiltRel:
+          # D9: a `{.link.}` entry with a non-absolute path — cannot be
+          # resolved or attributed to a tracked source without a directory
+          # to resolve it against.
+          raise newCrisolError(cekEnvironment,
+            "cannot track the linked object '" & objPath & "': its path is " &
+            "not absolute, so crisol cannot resolve it to a tracked source " &
+            "(was this compiled with --noAbsolutePaths?)")
 
     # R5+R7 fix: resolveMangledAll returns ALL candidate paths (possibly multiple
     # for ambiguous @p/@n entries, possibly none for deps no longer on disk).
@@ -782,6 +1055,23 @@ proc extractClosure*(nimcacheDir: string;
 
       # Convert to projectRoot-relative, forward slashes.
       result.incl toProjectRelative(resolved, prAbs)
+
+  for df in manifest.depfiles:
+    # depfiles entries are already absolute paths (no @m/@p/@n mangling) —
+    # normalize only. Existence is NOT checked (R5 policy, same as `link`).
+    let abs = df.path.absolutePath.normalizedPath
+    if index.underAnyRoot(abs):
+      result.incl toProjectRelative(abs, prAbs)
+    else:
+      # Fallback for a depfiles path recorded relative to something other
+      # than the tracked lexical root (e.g. reached through a symlink into
+      # the tracked tree) — same recovery `resolveMangledAll`'s `@m` branch
+      # uses: an exact realpath match against the index, keeping every
+      # lexical candidate that is itself under-tracked-root.
+      for cand in index.lookupByReal(abs):
+        let candAbs = cand.absolutePath.normalizedPath
+        if index.underAnyRoot(candAbs):
+          result.incl toProjectRelative(candAbs, prAbs)
 
 proc extractClosure*(nimcacheDir: string;
                      binaryName: string;

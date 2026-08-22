@@ -112,6 +112,7 @@ proc writeManifest(dir, bname: string; link: seq[string]) =
   for o in link: linkArr.add newJString(o)
   node["link"]    = linkArr
   node["linkcmd"] = newJString("")
+  node["depfiles"] = newJArray()
   createDir(dir)
   writeFile(dir / bname & ".json", $node)
 

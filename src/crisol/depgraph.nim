@@ -60,11 +60,23 @@ import crisol/ioutils  # for sanitizeControlBytes — the shared control/ANSI-by
 # Constants
 # ---------------------------------------------------------------------------
 
-const DepGraphFormatVersion* = 3
+const DepGraphFormatVersion* = 4
   ## Increment this when the JSON schema changes in an incompatible way.
   ## A loaded file with a different formatVersion is treated as absent.
   ##
   ## History:
+  ##   4 — issue #11: closures also cover non-module compile inputs —
+  ##       `include`d files, `staticRead`/`slurp` targets, `nim.cfg`/
+  ##       `config.nims` (from the manifest's `depfiles`, written under the
+  ##       `-d:nimBetterRun` define crisol now injects), `{.compile.}`d
+  ##       C/C++/ObjC sources and `{.link.}`ed prebuilt objects (from the
+  ##       `link` array). Every v3 closure is incomplete in a way that
+  ##       cannot be healed in place: a closure missing an input
+  ##       hash-matches itself forever, so the entrypoint would stay fresh
+  ##       across edits to that input, and its stable nimcache manifest
+  ##       (compiled without the define) carries no `depfiles` to re-derive
+  ##       from. The bump discards the graph once — a one-time full
+  ##       recompile under the new define — rather than serve it.
   ##   3 — issue #5: closures are derived from the nimcache `link` array.
   ##       Every v2 entry is suspect (any entry rewritten after a warm
   ##       recompile is truncated or empty — see DepGraphEntry.closure,

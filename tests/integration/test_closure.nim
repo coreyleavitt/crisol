@@ -39,6 +39,10 @@ proc compileFixture(sourceFile: string;
   var cmd = "nim c --mm:orc --hints:off --warnings:off"
   cmd.add " --nimcache:" & nimcacheDir
   cmd.add " -o:" & binPath
+  # issue #11: extractClosure now requires the manifest's `depfiles` array
+  # (only written under -d:nimBetterRun) — matches what crisol's own
+  # compile paths inject (compiledriver.nimCompileArgs).
+  cmd.add " -d:nimBetterRun"
   for f in extraFlags:
     cmd.add " " & f
   cmd.add " " & sourceFile
@@ -114,6 +118,18 @@ suite "extractClosure — warm recompile yields the same closure as cold (issue 
     let cold = extractClosure(nc, bn, src, config)
     check cold.len >= 3                              # main + dep + dep2
     check parseCompileManifest(nc / bn & ".json").compile.len > 0
+
+    # Delete the `-o:` binary before the warm recompile, mirroring crisol's
+    # own runner (which always removes the per-slot scratch bin dir after
+    # copying the produced binary out). With -d:nimBetterRun now on every
+    # compile (issue #11), leaving a stale-but-still-present `-o:` binary in
+    # place would let the compiler's own "nothing changed at all, skip the
+    # whole compile" short-circuit fire (changeDetectedViaJsonBuildInstructions
+    # requires the output binary to exist) — which would leave the manifest
+    # UNTOUCHED from the cold compile (still full) rather than exercising
+    # the warm-recompile path this test is about. See
+    # compiledriver.nimCompileArgs's doc comment for the same reasoning.
+    removeFile(parent / bn)
 
     # Warm: SAME nimcache, source unchanged → Nim marks every module Cached
     # and emits an EMPTY `compile` array (the issue #5 trigger); `link` is

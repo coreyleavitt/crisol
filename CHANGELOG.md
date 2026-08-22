@@ -6,6 +6,54 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### BREAKING CHANGE — dependency graph format 4: closures cover every compile input; one-time full recompile (issue #11)
+
+**Prior behaviour:** the per-entrypoint source closure named Nim *module*
+sources only (decoded from the nimcache manifest's `link` array).  Three
+classes of real compile inputs never produce a module object and were
+therefore invisible: files pulled in with `include`, `staticRead`/`slurp`
+targets, and `{.compile.}`d C/C++/ObjC sources (plus `{.link.}`ed prebuilt
+objects and the entrypoint's `nim.cfg`/`config.nims`).  Editing any of them
+neither recompiled the entrypoint (the closure content hash never saw the
+file) nor selected it under `--changed` — false-fresh plus under-selection,
+the same class of hole as issue #5 through a different door.
+
+**New behaviour:** crisol compiles every entrypoint with `-d:nimBetterRun`
+(injected by the single argv builder `compiledriver.nimCompileArgs`; not part
+of the entrypoint's flags, so identities, slugs and `--failed`/`--changed`
+keys are unchanged).  Under that define Nim writes a `depfiles` array into
+the nimcache manifest — every file the compiler opened: modules, `include`d
+files, `staticRead`/`slurp` targets, `nim.cfg`/`config.nims` — and
+`extractClosure` unions it into the closure under the same tracked-root gate
+as modules.  `{.compile.}`d sources are recovered from their `link` object
+(Nim mangles the full source path into the object name, so this survives
+warm recompiles where the `compile` array omits cached externals) and
+`{.link.}`ed prebuilt objects by their raw path.  The per-run source index
+now covers every regular file under a tracked root, not only `.nim`, so a
+C source reached through `--path` resolves like a module.
+
+`DepGraphFormatVersion` is now 4: an existing `.crisol/depgraph` is discarded
+on first load and the **next run recompiles every entrypoint once** under
+the new define.  A v3 closure cannot be healed in place — a closure missing
+an input hash-matches itself forever, and its persisted nimcache manifest
+(compiled without the define) carries no `depfiles` to re-derive from.
+
+**Fail-closed cases (reported on stderr; the entry is invalidated so the
+entrypoint is recompiled and force-selected every run until fixed):** the
+tuple form `{.compile: ("pattern*.c", "$1.o").}` — Nim erases the source
+path from the object name, so the source cannot be tracked; use the
+single-path `{.compile: "file.c".}` form.  A `link` entry that is not an
+absolute path (`--noAbsolutePaths`) is likewise unattributable.  A manifest
+with no `depfiles` key at all (an entrypoint compiled by a Nim that does not
+honour the define) is refused rather than trusted.
+
+**Not covered (by design):** `gorge` runs a shell command, not a file input.
+The C headers `#include`d by a `{.compile.}`d source are not tracked — Nim's
+own external-object cache ignores headers too, so crisol cannot make the
+recompile half sound without forcing; tracked as a follow-up issue.
+
+**Migration:** nothing to do; budget one full-suite compile after upgrading.
+
 ### Fixed — report bodies no longer print raw control bytes from config/binary-origin text (issue #14)
 
 Diagnostics were already routed through `sanitizeControlBytes`; the human

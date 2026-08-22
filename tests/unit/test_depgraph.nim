@@ -335,3 +335,34 @@ block test_saveDepGraph_normal_roundtrip_after_p5:
   assert g2.entries[key].closure == cl, "P5 happy-path: closure mismatch"
 
 echo "PASS test_depgraph"
+
+# ---------------------------------------------------------------------------
+# Test: format version pin (issue #11)
+# ---------------------------------------------------------------------------
+
+block test_format_version_pin:
+  ## DepGraphFormatVersion is 4 as of issue #11: closures now cover
+  ## non-module compile inputs (include'd files, staticRead/slurp targets,
+  ## nim.cfg/config.nims, {.compile.}d sources, {.link.}ed objects). A v3
+  ## closure missing one of those inputs hash-matches itself forever and
+  ## its nimcache manifest (compiled without -d:nimBetterRun) carries no
+  ## `depfiles` to re-derive from, so the graph must be discarded once.
+  ## Bump this pin only together with a History entry in depgraph.nim and a
+  ## CHANGELOG "BREAKING CHANGE — dependency graph format N" section.
+  assert DepGraphFormatVersion == 4,
+    "DepGraphFormatVersion pin: expected 4 (issue #11), got " & $DepGraphFormatVersion
+
+  # A v3 graph on disk is treated as absent (discarded, not migrated).
+  let root = getTempDir() / ("crisol_depgraph_v3pin_" & $getpid())
+  removeDir(root)
+  ensureStateDirExists(root)
+  defer: removeDir(root)
+  let v3 = %*{
+    "header": {"nimVersion": "", "formatVersion": 3},
+    "entries": [{"path": "tests/unit/test_x.nim", "flagHash": "cbf29ce484222325",
+                 "closure": ["tests/unit/test_x.nim"], "closureHash": "00",
+                 "protocolMajor": 1}]}
+  writeFile(root / ".crisol" / "depgraph", $v3)
+  let loaded = loadDepGraph(makeTmpConfig(root), "")
+  assert loaded.entries.len == 0,
+    "a format-3 depgraph must be discarded on load (got " & $loaded.entries.len & " entries)"

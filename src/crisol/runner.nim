@@ -32,7 +32,7 @@
 
 import std/[json, monotimes, options, os, sets, times]
 import std/posix
-import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure]
+import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver]
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
 # M4: re-export the CacheContext bundle + constructors so callers of execute()
 # don't need a separate `import crisol/cachedispatch`.
@@ -429,6 +429,16 @@ proc spawnCompileStable(
   try:
     createDir(cacheDir)
     createDir(binDirSlot)
+    # Issue #11: the compiler runs with -d:nimBetterRun (see
+    # compiledriver.nimCompileArgs), which also enables Nim's own
+    # "nothing changed, skip the compile" short-circuit. That short-circuit
+    # requires the `-o:` target to already exist — and its change detection
+    # does NOT cover `{.compile.}`d C sources, so a surviving per-slot binary
+    # (e.g. left behind by a crash before the post-copy cleanup below) could
+    # be served stale after a C-source edit. Remove any pre-existing target
+    # here so the short-circuit's precondition is false by construction at
+    # the moment the compiler is spawned, not by a distant cleanup.
+    removeFile(binCompiled)
   except:
     return false
 
@@ -458,17 +468,11 @@ proc spawnCompileStable(
   # falls through to the monolithic path rather than guessing with
   # getAppFilename().
   template monolithicCompArgs(): seq[string] =
-    var args = @[
-      "nim", "c",
-      "--mm:orc",
-      "--hints:off",
-      "--nimcache:" & cacheDir,
-      "-o:" & binCompiled,
-    ]
-    for flag in ep.flags:
-      args.add flag
-    args.add epAbs  # R3: absolute path
-    args
+    # R3: epAbs is the absolute entrypoint path. compiledriver.nimCompileArgs
+    # is the single argv-assembly proc shared with the measure-mode compile
+    # path (issue #11: it also injects -d:nimBetterRun so the nimcache
+    # manifest carries `depfiles`, which closure.extractClosure needs).
+    @["nim"] & nimCompileArgs(epAbs, ep.flags, cacheDir, binCompiled)
 
   # review Q6: the measureCompileReuse worker branch below builds a
   # MeasurePlan, writes it to a per-slot plan.json, and launches

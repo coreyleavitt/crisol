@@ -37,6 +37,7 @@ proc writeManifest(dir, bname: string;
   node["compile"] = compileArr
   node["link"]    = linkArr
   node["linkcmd"] = newJString("gcc -o bin " & link.join(" "))
+  node["depfiles"] = newJArray()
   createDir(dir)
   writeFile(dir / bname & ".json", $node)
 
@@ -69,31 +70,43 @@ suite "extractClosure — warm recompile (issue #5)":
     let cl = extractClosure(nc, "test_ep", ep, cfg)
     check cl == toHashSet(["tests/test_ep.nim", "tests/dep.nim", "src/proj.nim"])
 
-  test "a {.compile.}d C external (@m-mangled, .c.o but not .nim.c.o) yields no phantom entry (R1)":
+  test "a {.compile.}d C/C++ external (@m-mangled, .c.o/.cpp.o but not .nim.*.o) is tracked, not misread as a module (D3c, issue #11)":
     ## Real evidence: tests/fixtures/golden_reuse/generated/ep_a/ep_a.json's
     ## `link` array contains `.../@mfixture.c.o` for `fixture_ffi.nim`'s
     ## `{.compile: "fixture.c".}`.  Only a Nim module object is named
-    ## `<mangled>.nim.c.o`; an external C/C++ file compiled via `{.compile.}`
-    ## is `@m`-mangled too but never carries the `.nim` component, so it must
-    ## be excluded — not misread as a module named "fixture".
+    ## `<mangled>.nim.{c,cpp,m}.o`; an external C/C++ file compiled via
+    ## `{.compile.}` is `@m`-mangled too but never carries the `.nim`
+    ## component, so `moduleMangledNameOf` correctly does not misread it as a
+    ## module named "fixture" or "weird" — but (D3c, issue #11) it IS still a
+    ## real closure member: `externalMangledNameOf` decodes it via the SAME
+    ## `resolveMangledAll` a module uses, preserving its real extension
+    ## rather than the pre-D3c policy of excluding it outright.
     let root = freshRoot("extcompile")
     defer: removeDir(root)
     createDir(root / "tests")
     let ep = root / "tests" / "main.nim"
     writeFile(ep, "# main\n")
     writeFile(root / "tests" / "fixture.c", "// vendor C\n")
+    writeFile(root / "tests" / "weird.cpp", "// vendor C++\n")
     let nc = root / "nimcache"
     writeManifest(nc, "main", compile = @[], link = @[
-      nc / "@mfixture.c.o",        # {.compile.}d external — must be excluded
+      nc / "@mfixture.c.o",        # {.compile.}d C external — tracked
       nc / "@mmain.nim.c.o",       # the entrypoint's own module — must be kept
-      nc / "@mweird.cpp.o",        # non-Nim, no .nim component — excluded
-      "libfoo.a",                  # foreign archive — excluded
-      "/opt/x.o",                  # foreign object — excluded
+      nc / "@mweird.cpp.o",        # {.compile.}d C++ external — tracked too
+      # Real `link` entries for a {.link.}d/foreign object are always
+      # ABSOLUTE (Nim 2.2.10 processLink/addExternalFileToLink, verified;
+      # D9, issue #11 slice 9) — a bare relative basename like the old
+      # "libfoo.a" here doesn't model real Nim output and now raises
+      # (unattributable, not silently excluded) under D9's classification,
+      # so both foreign entries below are absolute and outside every
+      # tracked root, matching what Nim itself would actually emit.
+      "/usr/lib/libfoo.a",         # foreign archive, absolute — excluded
+      "/opt/x.o",                  # foreign object, absolute — excluded
     ])
     let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     let cl = extractClosure(nc, "main", ep, cfg)
-    check cl == toHashSet(["tests/main.nim"])
-    check "tests/fixture" notin cl
+    check cl == toHashSet(["tests/main.nim", "tests/fixture.c", "tests/weird.cpp"])
+    check "tests/fixture" notin cl     # never truncated to a bogus extensionless path
 
   test "a module compiled to .cpp or .m (sfCompileToCpp/importobjc) is not silently dropped":
     ## Nim 2.2.10 cgen's `getCFile` picks the module's C file extension
@@ -119,7 +132,6 @@ suite "extractClosure — warm recompile (issue #5)":
       nc / "@mmain.nim.c.o",         # ordinary module
       nc / "@mcppmod.nim.cpp.o",     # sfCompileToCpp module
       nc / "@mobjcmod.nim.m.o",      # importobjc module
-      nc / "@mfixture.c.o",          # {.compile.}d external — still excluded
       nc / "@pproj.nim.cpp.o",       # @p-mangled cpp module (--path:src)
     ])
     let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])

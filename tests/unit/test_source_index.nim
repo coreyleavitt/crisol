@@ -30,6 +30,7 @@ proc writeManifest(dir, bname: string;
   node["compile"] = compileArr
   node["link"]    = linkArr
   node["linkcmd"] = newJString("gcc -o bin " & link.join(" "))
+  node["depfiles"] = newJArray()
   createDir(dir)
   writeFile(dir / bname & ".json", $node)
 
@@ -215,8 +216,10 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
   test "decoy sanity: a leading-.. body still enforces the basename boundary":
     ## Stripping leading ".."/"."/""'" components from the body must not
     ## loosen the basename match: a decoy with a different basename
-    ## (zx.nim) or a different extension (x.nims — not even indexed) must
-    ## never resolve for body "../x.nim"; only the real src/x.nim match does.
+    ## (zx.nim) or a different extension (x.nims — indexed under the
+    ## basename "x.nims" since D4/issue #11, but that is a DIFFERENT
+    ## basename than "x.nim") must never resolve for body "../x.nim"; only
+    ## the real src/x.nim match does.
     let root = freshRoot("decoy")
     defer: removeDir(root)
     createDir(root / "tests")
@@ -226,7 +229,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     let ep = root / "tests" / "t.nim"
     writeFile(ep, "# ep\n")
     writeFile(root / "lib" / "zx.nim", "# decoy basename\n")
-    writeFile(root / "other" / "x.nims", "# decoy extension, not even indexed\n")
+    writeFile(root / "other" / "x.nims", "# decoy extension, indexed under a different basename\n")
     writeFile(root / "src" / "x.nim", "# real\n")
     let nc = root / "nimcache"
     writeManifest(nc, "t", compile = @[], link = @[
