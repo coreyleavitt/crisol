@@ -96,6 +96,36 @@ suite "extractClosure — @m relative import chain":
       check fileExists(abs)
 
 # ---------------------------------------------------------------------------
+# Test 1b — issue #5 acceptance: cold closure == warm-recompile closure
+# ---------------------------------------------------------------------------
+
+suite "extractClosure — warm recompile yields the same closure as cold (issue #5)":
+
+  test "cold == warm, and the warm manifest really had an empty compile array":
+    let src    = fixtureDir / "deptest_main.nim"
+    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let parent = getTempDir() / "crisol_closure_coldwarm_" & $getCurrentProcessId()
+    removeDir(parent)
+    createDir(parent)
+    defer: removeDir(parent)
+
+    # Cold: fresh nimcache → every module is in `compile`.
+    let (nc, bn) = compileFixture(src, nimcacheParent = parent)
+    let cold = extractClosure(nc, bn, src, config)
+    check cold.len >= 3                              # main + dep + dep2
+    check parseCompileManifest(nc / bn & ".json").compile.len > 0
+
+    # Warm: SAME nimcache, source unchanged → Nim marks every module Cached
+    # and emits an EMPTY `compile` array (the issue #5 trigger); `link` is
+    # still complete. The closure must not shrink.
+    discard compileFixture(src, nimcacheParent = parent)
+    let warmManifest = parseCompileManifest(nc / bn & ".json")
+    check warmManifest.compile.len == 0
+    check warmManifest.link.len > 0
+    let warm = extractClosure(nc, bn, src, config)
+    check warm == cold
+
+# ---------------------------------------------------------------------------
 # Test 2 — flag-sensitive closure (with -d:extraDep)
 # ---------------------------------------------------------------------------
 
