@@ -386,6 +386,43 @@ suite "render – memThrottleActive":
     let now = t0 + initDuration(milliseconds = 50)
     check memThrottleActive(some(t0), now, 100) == false
 
+suite "render — issue #14: report bodies carry no raw control bytes":
+
+  proc rawControlBytes(s: string): int =
+    for c in s:
+      if (c.ord < 0x20 and c != '\n') or c.ord == 0x7f: inc result
+
+  test "run report: entrypoint path, group and protocol record names/messages are sanitized":
+    ## Paths/groups are config-origin; record names and messages come from
+    ## the test binary's protocol stream.  All are identifiers meant for one
+    ## line of terminal output, so each is sanitized at the render layer.
+    var failing = failedResult("tests/unit/test_\x1b[2Jx.nim", records = @[
+      failRecord("suite\tone\x1b[31m", 1200, "boom\x1bm"),
+      skipRecord("sk\x7fip", "why\x1b"),
+      passRecord("fast\x1bname", 10),
+    ])
+    failing.ep.group = "grp\x1b[0m"
+    let results = @[failing, passedResult("tests/unit/test_ok.nim", records = @[
+      passRecord("slow\x1bone", 900_000)])]
+    let rendered = render(results, summarize(results), noColorOpts())
+    check rawControlBytes(rendered) == 0
+    check "tests/unit/test_?[2Jx.nim" in rendered
+    check "suite?one?[31m" in rendered
+    check "boom?m" in rendered
+    check "sk?ip" in rendered
+    check "slow?one" in rendered   # slowest-tests section
+
+  test "closure listing: path, group and closure file paths are sanitized":
+    let report = ClosureReport(entries: @[
+      ClosureEntry(path: "tests/unit/test_\x1bx.nim", group: "g\tr\x1b[2Jp",
+                   flagHash: "0123456789abcdef", recorded: true,
+                   closure: @["lib/de\x7fp.nim", "tests/unit/test_\x1bx.nim"],
+                   closureHash: "fedcba9876543210")])
+    let rendered = renderClosure(report)
+    check rawControlBytes(rendered) == 0
+    check "tests/unit/test_?x.nim  [g?r?[2Jp]  0123456789abcdef  recorded  (2 files)" in rendered
+    check "  lib/de?p.nim" in rendered
+
 suite "render — renderClosure":
 
   test "renders path, group, flagHash, closure files, and a distinct recorded/unrecorded marker":

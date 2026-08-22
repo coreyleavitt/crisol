@@ -57,6 +57,7 @@
 
 import std/[algorithm, monotimes, os, options, sequtils, strutils, times]
 import crisol/types
+import crisol/ioutils  # sanitizeControlBytes — issue #14: report-body field sanitization
 
 # ---------------------------------------------------------------------------
 # C3 pure filter predicates
@@ -272,7 +273,13 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
   for r in results:
     let label     = outcomeLabel(r.outcome)
     let labelCol  = col(label, outcomeColor(r.outcome), color)
-    let epPath    = r.ep.path
+    # Issue #14: entrypoint paths (config/disk-origin) and protocol record
+    # names/messages (test-binary-origin) are one-line identifiers headed for
+    # a terminal or CI log — sanitize each at the render layer (the stdout
+    # sink must pass crisol's own ANSI color codes through).  The raw
+    # captured `output` tail is deliberately NOT sanitized: it is the
+    # binary's own output and may legitimately be colored.
+    let epPath    = sanitizeControlBytes(r.ep.path)
 
     # C3: apply filter to the records used for display and counts.
     # The filter only affects what is SHOWN — the outcome label is unchanged.
@@ -341,10 +348,11 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
       if failedRecords.len > 0:
         for rec in failedRecords:
           let indent = "           "
-          buf.add indent & col("FAIL", Ansi_Red, color) & ": " & rec.name & "\n"
+          buf.add indent & col("FAIL", Ansi_Red, color) & ": " &
+                  sanitizeControlBytes(rec.name) & "\n"
           if rec.msg.isSome:
             # Indent multi-line messages
-            for line in rec.msg.get.splitLines:
+            for line in sanitizeControlBytes(rec.msg.get).splitLines:
               buf.add indent & "     " & line & "\n"
       elif r.output.len > 0 and not hasTag:
         # Opaque binary: show captured output (bounded display).
@@ -392,8 +400,9 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
       if skipRecords.len > 0:
         for rec in skipRecords:
           let reason = if rec.msg.isSome: rec.msg.get else: "(no reason)"
-          buf.add "           " & col("SKIP", Ansi_Dim, color) & ": " & rec.name &
-                  " — " & reason & "\n"
+          buf.add "           " & col("SKIP", Ansi_Dim, color) & ": " &
+                  sanitizeControlBytes(rec.name) & " — " &
+                  sanitizeControlBytes(reason) & "\n"
 
     of oSpawnError:
       if r.output.len > 0:
@@ -411,7 +420,8 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     var allTests: seq[(string, int64, string)]  # (testName, durationUs, epPath)
     for r in results:
       for rec in r.records:
-        allTests.add (rec.name, rec.durationUs, r.ep.path)
+        allTests.add (sanitizeControlBytes(rec.name), rec.durationUs,
+                      sanitizeControlBytes(r.ep.path))
 
     if allTests.len > 0:
       # Sort descending by durationUs
@@ -432,7 +442,7 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     # Entrypoint-level slowest-N (fallback for opaque binaries).
     var allEps: seq[(string, int64)]  # (path, durationMs)
     for r in results:
-      allEps.add (r.ep.path, r.durationMs)
+      allEps.add (sanitizeControlBytes(r.ep.path), r.durationMs)
     if allEps.len > 0:
       allEps.sort(proc(a, b: (string, int64)): int = cmp(b[1], a[1]))
       let topN = allEps[0 ..< min(n, allEps.len)]
@@ -506,8 +516,10 @@ proc renderClosure*(r: ClosureReport): string =
   var buf = newStringOfCap(1024)
   for e in r.entries:
     let status = if e.recorded: "recorded" else: "unrecorded"
-    buf.add e.path & "  [" & e.group & "]  " & e.flagHash & "  " &
-            status & "  (" & $e.closure.len & " files)\n"
+    # Issue #14: path/group (config-origin) and closure paths (depgraph-origin,
+    # on-disk state) are sanitized at the render layer.
+    buf.add sanitizeControlBytes(e.path) & "  [" & sanitizeControlBytes(e.group) &
+            "]  " & e.flagHash & "  " & status & "  (" & $e.closure.len & " files)\n"
     for f in e.closure:
-      buf.add "  " & f & "\n"
+      buf.add "  " & sanitizeControlBytes(f) & "\n"
   result = buf

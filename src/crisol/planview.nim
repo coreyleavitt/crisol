@@ -44,7 +44,7 @@
 ## symmetric with jsonout.loadLastRun.
 
 import std/[json, options, os, sets, strutils]
-import crisol/[types, config, render]
+import crisol/[types, config, render, ioutils]
 
 # GatedEntry is defined in types.nim and re-exported from there.
 
@@ -133,11 +133,16 @@ proc renderPlan*(plan: RunPlan; gatedOut: seq[GatedEntry];
       # Issue #10: the same path under two groups with different flags is two
       # legs; the row carries the leg's effective flags (compile order) so the
       # two are distinguishable without the config.  Omitted when empty.
+      # Issue #14: path/group/flags are config-origin text — sanitize each
+      # field here (not at the stdout sink, which must pass crisol's own
+      # ANSI color codes through) so no raw control byte reaches a terminal
+      # or CI log.
       let flagsCol =
-        if pep.ep.flags.len > 0: col("  " & pep.ep.flags.join(" "), Ansi_Dim, color)
+        if pep.ep.flags.len > 0:
+          col("  " & sanitizeControlBytes(pep.ep.flags.join(" ")), Ansi_Dim, color)
         else: ""
-      buf.add "  " & pep.ep.path &
-              col("  [" & pep.ep.group & "]", Ansi_Dim, color) &
+      buf.add "  " & sanitizeControlBytes(pep.ep.path) &
+              col("  [" & sanitizeControlBytes(pep.ep.group) & "]", Ansi_Dim, color) &
               flagsCol &
               "  " & labelCol & "\n"
   else:
@@ -147,9 +152,9 @@ proc renderPlan*(plan: RunPlan; gatedOut: seq[GatedEntry];
   if gatedOut.len > 0:
     buf.add "\n" & col("Gated out (will not run):", Ansi_Bold, color) & "\n"
     for g in gatedOut:
-      buf.add "  " & g.path &
-              col("  [" & g.group & "]", Ansi_Dim, color) &
-              "  " & col("gate-skip: " & g.reason, Ansi_Yellow, color) & "\n"
+      buf.add "  " & sanitizeControlBytes(g.path) &
+              col("  [" & sanitizeControlBytes(g.group) & "]", Ansi_Dim, color) &
+              "  " & col("gate-skip: " & sanitizeControlBytes(g.reason), Ansi_Yellow, color) & "\n"
 
   # 3. Summary.
   buf.add "\n"

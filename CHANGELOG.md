@@ -6,6 +6,19 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### Fixed — report bodies no longer print raw control bytes from config/binary-origin text (issue #14)
+
+Diagnostics were already routed through `sanitizeControlBytes`; the human
+report BODIES were not. `crisol list` / `run --dry-run` plan rows (path,
+group, flags, gate reason), the `run` report (entrypoint path, protocol
+record names and messages, slowest-N sections) and `crisol closure` (path,
+group, closure file paths) now sanitize each such field at the render layer,
+so a group named `"x\u{1b}[2Jy"` or a test named with a TAB can no longer
+emit ANSI/control bytes on stdout. The sink is deliberately not the place:
+crisol's own color codes must pass through. The raw captured output tail of
+a failing/opaque binary is not sanitized — it is the binary's own output and
+may legitimately be colored. JSON output was already safe (std/json escapes).
+
 ### BREAKING CHANGE — an explicit path owned by several groups now runs every leg (issue #10)
 
 **Prior behaviour:** `crisol run <path>` / `crisol list <path>` where `<path>`

@@ -305,6 +305,18 @@ suite "planview A8 — edCached + schemaRevision":
     check "  tests/unit/test_probe.nim  [unit-b]  -d:common -d:legB  would compile\n" in s
     check "  tests/unit/test_plain.nim  [unit]  binary fresh — would skip compile\n" in s
 
+  test "issue #14: plan and gated-out rows sanitize config-origin path/group/flags/reason":
+    var leg = mkPep("tests/unit/test_\x1bx.nim", "g\trp", cdNeverBuilt)
+    leg.ep.flags = @["-d:a\x1b[31m"]
+    let gated = @[("tests/unit/test_\x7fg.nim", "sm\x1boke",
+                   "env K\x1bEY not set").GatedEntry]
+    let s = renderPlan(RunPlan(jobs: 1, entrypoints: @[leg]), gated,
+                       RenderOpts(color: false, slowestN: 5))
+    for c in s:
+      check not ((c.ord < 0x20 and c != '\n') or c.ord == 0x7f)
+    check "  tests/unit/test_?x.nim  [g?rp]  -d:a?[31m  never built (would compile)\n" in s
+    check "  tests/unit/test_?g.nim  [sm?oke]  gate-skip: env K?EY not set\n" in s
+
   test "renderPlan human output for non-cached decisions stays stable":
     let s = renderPlan(samplePlan(), sampleGated(),
                        RenderOpts(color: false, slowestN: 5))
