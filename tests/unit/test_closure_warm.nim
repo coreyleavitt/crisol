@@ -95,6 +95,39 @@ suite "extractClosure — warm recompile (issue #5)":
     check cl == toHashSet(["tests/main.nim"])
     check "tests/fixture" notin cl
 
+  test "a module compiled to .cpp or .m (sfCompileToCpp/importobjc) is not silently dropped":
+    ## Nim 2.2.10 cgen's `getCFile` picks the module's C file extension
+    ## per-module: `.nim.c` ordinarily, `.nim.cpp` when the module has
+    ## `{.importcpp.}` symbols (sfCompileToCpp — even under plain `nim c`),
+    ## `.nim.m` for `{.importobjc.}`.  `link` then carries `@m<mod>.nim.cpp.o`
+    ## / `@m<mod>.nim.m.o` for such modules.  If moduleCPathOf only recognised
+    ## `.nim.c.o`, these modules would be silently excluded from the closure:
+    ## a non-empty closure still results (so the NONEMPTY-CLOSURE guard never
+    ## fires), but edits to the dropped module never change closureHash —
+    ## a stale binary is served fresh and `--changed` never selects it.
+    let root = freshRoot("cppobjc")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "src")
+    let ep = root / "tests" / "main.nim"
+    writeFile(ep, "# main\n")
+    writeFile(root / "tests" / "cppmod.nim", "# cpp module\n")
+    writeFile(root / "tests" / "objcmod.nim", "# objc module\n")
+    writeFile(root / "src" / "proj.nim", "# proj via --path:src\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "main", compile = @[], link = @[
+      nc / "@mmain.nim.c.o",         # ordinary module
+      nc / "@mcppmod.nim.cpp.o",     # sfCompileToCpp module
+      nc / "@mobjcmod.nim.m.o",      # importobjc module
+      nc / "@mfixture.c.o",          # {.compile.}d external — still excluded
+      nc / "@pproj.nim.cpp.o",       # @p-mangled cpp module (--path:src)
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "main", ep, cfg)
+    check cl == toHashSet([
+      "tests/main.nim", "tests/cppmod.nim", "tests/objcmod.nim", "src/proj.nim",
+    ])
+
   test "raises cekEnvironment when link is present but empty (R3)":
     let root = freshRoot("emptylink")
     defer: removeDir(root)

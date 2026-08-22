@@ -19,16 +19,21 @@
 ##   from ALL of the compiler's `toCompile` plus external objects, so it is
 ##   complete on every compile by construction.  THIS is the closure source.
 ##
-## A Nim MODULE object's basename is always `<mangled>.nim.c.o` — the
-## literal `.nim` component is what distinguishes a module object from an
-## external.  An entry may ALSO be `@m`- or `@p`-mangled without naming a
-## Nim module at all: a `{.compile: "foo.c".}`d external, for instance,
-## appears as `@mfoo.c.o` — `@m`-prefixed, but no `.nim` component, so it
-## names no source module.  `moduleCPathOf` (below) is the single place that
-## applies this `.nim.c.o` contract.  For an entry that IS a module object,
-## strip `.o` and the mangled `.c` name encodes the source location:
+## A Nim MODULE object's basename is always `<mangled>.nim.{c,cpp,m}.o` — the
+## literal `.nim` component before the backend extension is what distinguishes
+## a module object from an external.  The backend extension is `.c` for an
+## ordinary module, `.cpp` when the module has `{.importcpp.}` symbols
+## (sfCompileToCpp — Nim 2.2.10 cgen's `getCFile` picks this per-module, even
+## under plain `nim c`), and `.m` for `{.importobjc.}` symbols.  An entry may
+## ALSO be `@m`- or `@p`-mangled without naming a Nim module at all: a
+## `{.compile: "foo.c".}`d external, for instance, appears as `@mfoo.c.o` —
+## `@m`-prefixed, but no `.nim` component, so it names no source module.
+## `moduleCPathOf` (below) is the single place that applies this
+## `.nim.{c,cpp,m}.o` contract.  For an entry that IS a module object, strip
+## `.o` and the backend extension and the mangled name encodes the source
+## location:
 ##
-##   basename: strip `.c` → strip leading prefix → decode body (@s→/, @@→@)
+##   basename: strip `.{c,cpp,m}.o` → strip leading prefix → decode body (@s→/, @@→@)
 ##
 ## Two prefixes matter:
 ##
@@ -53,9 +58,9 @@
 ## slashes, matching the scheme used by `Entrypoint.path` and future
 ## dep-graph keys.  The entrypoint's own file is included (its object is in
 ## `link`).  External objects (`{.compile.}`d C/C++ files and foreign
-## libraries) are excluded by `moduleCPathOf`'s `.nim.c.o` filter — they may
-## be `@m`-mangled too, but never end in `.nim.c.o`, so they never name a
-## Nim module in the first place.
+## libraries) are excluded by `moduleCPathOf`'s `.nim.{c,cpp,m}.o` filter —
+## they may be `@m`-mangled too, but never end in `.nim.c.o` / `.nim.cpp.o` /
+## `.nim.m.o`, so they never name a Nim module in the first place.
 ##
 ## ## Error handling
 ##
@@ -110,24 +115,36 @@ proc decodeBody(raw: string): string =
     .replace("\x00", "@")    # restore literal @
 
 proc moduleCPathOf(objPath: string): string =
-  ## Maps one `link` object-file path to the mangled `.c` compile-unit path
-  ## `resolveMangledAll` expects, or `""` if `objPath` names no Nim module.
+  ## Maps one `link` object-file path to the mangled module name
+  ## `resolveMangledAll` expects (the compile-unit basename with the backend
+  ## extension and trailing `.o` already stripped, e.g. `@mfoo.nim`), or
+  ## `""` if `objPath` names no Nim module.
   ##
   ## Contract (the single place it is stated): a Nim MODULE object's
-  ## basename is ALWAYS `<mangled>.nim.c.o` — strip `.o` and the mangled
-  ## `.c` name decodes to that module's source location. An external (a
+  ## basename is `<mangled>.nim.{c,cpp,m}.o` — `.nim.c.o` for an ordinary
+  ## module, `.nim.cpp.o` for a module with `{.importcpp.}` symbols
+  ## (sfCompileToCpp — Nim 2.2.10 cgen's `getCFile` picks this per-module,
+  ## even under plain `nim c`), `.nim.m.o` for `{.importobjc.}` symbols.
+  ## Strip `.o` and the backend extension — what remains, `<mangled>.nim`,
+  ## is the module name `resolveMangledAll` decodes. An external (a
   ## `{.compile.}`d C/C++ file, a foreign `.o`/`.a`) may ALSO be `@m`- or
   ## `@p`-mangled (e.g. `@mfixture.c.o` for `{.compile: "fixture.c".}`), but
-  ## never carries the `.nim` component, so it never satisfies this filter —
-  ## checking the `@m`/`@p` prefix alone is NOT sufficient to identify a
-  ## module object.
-  if not objPath.endsWith(".nim.c.o"): return ""
-  objPath[0 .. ^3]                     # strip ".o" → the generated .c path
+  ## never carries the `.nim` component before the backend extension, so it
+  ## never satisfies this filter — checking the `@m`/`@p` prefix alone is
+  ## NOT sufficient to identify a module object.
+  let base = objPath.extractFilename
+  for suffix in [".nim.c.o", ".nim.cpp.o", ".nim.m.o"]:
+    if base.endsWith(suffix):
+      return base[0 ..< base.len - (suffix.len - 4)]   # keep through ".nim"
+  ""
 
-proc resolveMangledAll(cFilePath: string;
+proc resolveMangledAll(mangledName: string;
                        entrypointPath: string;
                        roots: seq[string]): seq[string] =
-  ## Decode one `.c` path to zero or more absolute `.nim` candidate paths.
+  ## Decode one mangled module name (`moduleCPathOf`'s output — the
+  ## compile-unit basename with the backend extension and `.o` already
+  ## stripped, e.g. `@mfoo.nim`) to zero or more absolute `.nim` candidate
+  ## paths.
   ##
   ## For `@m`: exactly one candidate (entrypointDir/body), existence not checked
   ##           (R5: record deleted deps too).
@@ -140,18 +157,17 @@ proc resolveMangledAll(cFilePath: string;
   ##             ALL are recorded (over-selection) so a change to any copy triggers
   ##             re-selection.
   ## For anything else: empty list (conservative).
-  let base = cFilePath.extractFilename        # e.g. "@mdeptest_dep.nim.c"
-  if not (base.startsWith("@m") or base.startsWith("@p")):
+  # `mangledName` is `moduleCPathOf`'s output — already ".nim.{c,cpp,m}.o"
+  # filtered, backend extension and ".o" stripped — so it is always
+  # "<@m|@p><body>.nim" here; see that proc's doc comment for the
+  # module-object contract this relies on.
+  if not (mangledName.startsWith("@m") or mangledName.startsWith("@p")):
     return @[]                               # unknown prefix — exclude
 
-  # `cFilePath` is `moduleCPathOf`'s output (already ".nim.c.o"-filtered, "
-  # .o" stripped), so `base` is always "<mangled>.nim.c" here — see that
-  # proc's doc comment for the module-object contract this relies on.
-  let noExt    = base[0 .. ^3]               # strip ".c"
-  let noPrefix = noExt[2 .. ^1]              # strip "@m" or "@p"
+  let noPrefix = mangledName[2 .. ^1]        # strip "@m" or "@p"
   let body     = decodeBody(noPrefix)        # decode @s/@@ escapes
 
-  if base.startsWith("@m"):
+  if mangledName.startsWith("@m"):
     # Relative to the entrypoint's source directory.
     # Single candidate; do NOT check existence (R5: record deleted deps).
     let epDir = entrypointPath.absolutePath.parentDir
@@ -283,15 +299,15 @@ proc extractClosure*(nimcacheDir: string;
   result = initHashSet[string]()
 
   for objPath in manifest.link:
-    # moduleCPathOf applies the ".nim.c.o" module-object contract: only
-    # Nim-generated module objects satisfy it — a `{.compile.}`d C/C++
+    # moduleCPathOf applies the ".nim.{c,cpp,m}.o" module-object contract:
+    # only Nim-generated module objects satisfy it — a `{.compile.}`d C/C++
     # external or foreign object/archive names no Nim module and yields "".
-    let cPath = moduleCPathOf(objPath)
-    if cPath == "": continue
+    let mangledName = moduleCPathOf(objPath)
+    if mangledName == "": continue
 
     # R5+R7 fix: resolveMangledAll returns ALL candidate paths (possibly multiple
     # for ambiguous @p entries, possibly non-existent for deleted deps).
-    let candidates = resolveMangledAll(cPath, epAbs, roots)
+    let candidates = resolveMangledAll(mangledName, epAbs, roots)
     for resolved in candidates:
       if resolved == "": continue            # (shouldn't occur, but be defensive)
 
