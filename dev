@@ -24,6 +24,9 @@ DOCKER_HOME="${PROJECT_DIR}/.docker-home"
 # ../../../../../.cache/milpa/cas/...), so BOTH the project and the store must
 # be mounted into the container at their host paths for `import nkdl` (etc.)
 # to resolve. The store is read-only — the container never writes the CAS.
+# The project is ALSO mounted at /workspace: committed golden fixtures
+# (tests/fixtures/golden_reuse/generated/*.json) carry /workspace paths in
+# their real cc commands, and the real-cc tests replay them verbatim.
 MILPA_CACHE="${MILPA_CACHE:-${HOME}/.cache/milpa}"
 
 ensure_docker_home() { mkdir -p "${DOCKER_HOME}"; }
@@ -45,6 +48,7 @@ podman_run() {
     mapfile -t _milpa < <(milpa_mount)
     podman run --rm \
         --volume "${PROJECT_DIR}:${PROJECT_DIR}" \
+        --volume "${PROJECT_DIR}:/workspace" \
         --volume "${DOCKER_HOME}:/dockerhome" \
         "${_milpa[@]}" \
         --env HOME=/dockerhome \
@@ -76,6 +80,7 @@ case "${cmd}" in
         mapfile -t _milpa < <(milpa_mount)
         podman run --rm -it \
             --volume "${PROJECT_DIR}:${PROJECT_DIR}" \
+            --volume "${PROJECT_DIR}:/workspace" \
             --volume "${DOCKER_HOME}:/dockerhome" \
             "${_milpa[@]}" \
             --env HOME=/dockerhome \
