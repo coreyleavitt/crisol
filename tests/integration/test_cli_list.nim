@@ -55,9 +55,13 @@ suite "crisol list / run --dry-run — B6 (no execution)":
     check code == 0
     let txt = readFile(outPath)
     check "pass_always.nim" in txt
-    # The entrypoint may be "never built" (first run / cache absent) or
-    # "binary fresh" (D6: depgraph recorded from a prior run).  Accept either.
-    check ("never built (would compile)" in txt or "binary fresh" in txt)
+    # The entrypoint may be "never built" (first run / cache absent), "binary
+    # fresh" (D6: depgraph recorded from a prior run), or stale — binary present
+    # but no/invalid depgraph record, rendered as plain "would compile" (e.g.
+    # after a depgraph format bump or an invalidated record).  All are valid
+    # plan decisions for a dry listing; accept any.
+    check ("never built (would compile)" in txt or "binary fresh" in txt or
+           "would compile" in txt)
     check "Planned entrypoints:" in txt
     check "entrypoint(s) across" in txt
 
