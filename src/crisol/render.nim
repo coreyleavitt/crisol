@@ -57,7 +57,6 @@
 
 import std/[algorithm, monotimes, os, options, sequtils, strutils, times]
 import crisol/types
-import crisol/ioutils
 
 # ---------------------------------------------------------------------------
 # C3 pure filter predicates
