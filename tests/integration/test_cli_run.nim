@@ -508,3 +508,36 @@ suite "crisol CLI — stale depgraph nimVersion is a visible, once-only diagnost
       if w["key"].getStr == "nimVersion":
         found = true
     check found
+
+# ---------------------------------------------------------------------------
+# A gated group's own NAME can carry untrusted-origin control bytes (config
+# file text) — the gate-skip line printed for `run` must sanitize it the same
+# way `closure`'s analogous gate-skip line does (see
+# test_cli_closure.nim's TAB-in-group-name test for the same fixture shape).
+# ---------------------------------------------------------------------------
+
+suite "crisol CLI — gate-skip line sanitizes a control byte in the group name":
+
+  test "run <path> whose only match is gated out, group name containing a TAB byte, renders sanitized on stdout":
+    let root = uniqueTmpDirD("gate_tab")
+    defer: removeDir(root)
+    writeFD(root, "tests/unit/test_a.nim", "doAssert true\n")
+    writeFile(root / "crisol.kdl", "group \"un\\tit\" {\n" &
+      "    globs \"tests/unit/test_*.nim\"\n" &
+      "    gate \"CRISOL_CLI_RUN_GATED_TEST_UNSET_XYZ_12345\"\n" &
+      "}\n")
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_cli_run_gate_tab_out.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStdoutToFileD(outPath, proc () =
+      code = runMain(@["run", "tests/unit/test_a.nim"]))
+    check code == 0
+
+    let outText = readFile(outPath)
+    check "skipped group \"un?it\"" in outText   # TAB sanitized to '?'
+    check '\t' notin outText

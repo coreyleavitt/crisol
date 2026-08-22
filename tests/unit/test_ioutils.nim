@@ -20,6 +20,10 @@
 ##      denied) (RFC-0006 review R10).
 ##  10. sanitizeControlBytes: ESC/TAB/DEL -> '?'; '\n' preserved; UTF-8
 ##      multibyte text (C1-adjacent continuation bytes) unchanged.
+##  11. sanitizeControlBytes: the UTF-8 ENCODING of a C1 control (0xC2 followed
+##      by 0x80-0x9F) collapses to a single '?'; a bare 0xC2 lead byte NOT
+##      followed by a C1-range continuation byte (e.g. U+00A0 NBSP, or a lone
+##      trailing 0xC2) is left untouched.
 
 import std/[os, strutils]
 import std/posix as posix_mod
@@ -242,5 +246,39 @@ block test_sanitizecontrolbytes_utf8_multibyte_unchanged:
   # control range because those bytes are ordinary UTF-8 continuation bytes.
   let s = "caf\xc3\xa9 — \xe6\xb5\x8b\xe8\xaf\x95"   # "café — 测试"
   assert sanitizeControlBytes(s) == s, "UTF-8 multibyte text must be unchanged"
+
+# ---------------------------------------------------------------------------
+# 11. sanitizeControlBytes: the UTF-8 ENCODING of a C1 control (0xC2 0x80-0x9F)
+#     is a live ANSI-injection vector (xterm in UTF-8 mode decodes 0xC2 0x9B
+#     to U+009B = CSI) and must be neutralized; a bare 0xC2 lead byte NOT
+#     forming that 2-byte sequence is an ordinary UTF-8 continuation and must
+#     survive untouched.
+# ---------------------------------------------------------------------------
+
+block test_sanitizecontrolbytes_utf8_encoded_c1_replaced:
+  # 0xC2 0x9B is the UTF-8 encoding of U+009B (CSI) — nkdl's `\u{9b}` string
+  # escape can carry this through a config group name.
+  assert sanitizeControlBytes("a\xc2\x9bb") == "a?b",
+    "UTF-8-encoded C1 control (0xC2 0x9B) must collapse to a single '?'"
+
+block test_sanitizecontrolbytes_utf8_non_c2_lead_unchanged:
+  # 0xC3 0xA9 is "é" (U+00E9) — not a C1-control encoding; must be untouched.
+  let s = "caf\xc3\xa9"
+  assert sanitizeControlBytes(s) == s,
+    "a non-0xC2 UTF-8 lead byte must be left alone"
+
+block test_sanitizecontrolbytes_utf8_c2_non_c1_unchanged:
+  # 0xC2 0xA0 is U+00A0 (NBSP) — 0xA0 is outside the 0x80-0x9F C1 range, so
+  # this 0xC2-led sequence must be left alone.
+  let s = "\xc2\xa0"
+  assert sanitizeControlBytes(s) == s,
+    "0xC2 followed by a non-C1-range byte (e.g. NBSP) must be left alone"
+
+block test_sanitizecontrolbytes_lone_trailing_c2_unchanged:
+  # A lone 0xC2 with nothing after it (truncated/malformed UTF-8) must not
+  # be touched — there is no following byte to form the 2-byte sequence.
+  let s = "trailing\xc2"
+  assert sanitizeControlBytes(s) == s,
+    "a lone trailing 0xC2 byte must be left alone"
 
 echo "test_ioutils: all blocks passed"

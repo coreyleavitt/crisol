@@ -187,13 +187,16 @@ one-time recompile of entrypoints whose closure gained members.
   `ioutils.sanitizeControlBytes` (`render.sanitizeForTerminal` is now a thin
   alias; `depgraph.nim`'s `sanitizeOneSegment` also delegates to it).
   Coverage is broadened well past `ConfigWarning.message` and the ad-hoc /
-  ambiguous-path warning lines (already covered) to every other write of
-  untrusted-origin text: every `CrisolError.msg` (including config parse
-  errors, which embed nkdl's raw offending source line — an unsanitized ESC
-  or other control byte in a `crisol.kdl` comment or string previously
-  reached the terminal/CI log raw), `RunReport.error`, `gateSkipMessages`
-  lines (group names / gate env-var names read back out of config), and
-  JUnit-report write-error messages. Sanitization is applied PER LINE
+  ambiguous-path warning lines (already covered) to every other DIAGNOSTIC
+  write of untrusted-origin text: every `CrisolError.msg` (including config
+  parse errors, which embed nkdl's raw offending source line — an
+  unsanitized ESC or other control byte in a `crisol.kdl` comment or string
+  previously reached the terminal/CI log raw), `RunReport.error`,
+  `gateSkipMessages` lines (group names / gate env-var names read back out
+  of config), and JUnit-report write-error messages. Report BODIES —
+  `render`/`renderPlan`/`renderClosure`'s own columns (entrypoint paths,
+  group names) — are NOT sanitized; only the diagnostics listed above are.
+  Sanitization is applied PER LINE
   (control bytes replaced with `'?'`; `'\n'` itself is preserved) so
   legitimately multi-line text — a config error's caret block — keeps its
   line structure; bytes 0x80-0x9f are left alone since they are ordinary

@@ -438,3 +438,59 @@ doAssert fooValue() == 42
     let closure = loaded.entries[key].closure
 
     check "src/foo.nim" in closure
+
+suite "closure resolves through a projectRoot that is itself a symlinked directory":
+
+  test "config.projectRoot given as a symlink records tests/t.nim, tests/sib.nim, src/foo.nim (project-relative lexical) and a second plan() is edRunFresh":
+    ## `config.projectRoot` need not itself be a plain directory — a caller
+    ## (e.g. milpa handing crisol a CAS-backed checkout) may pass a SYMLINKED
+    ## path as projectRoot directly.  `buildSourceIndex` records its walk
+    ## roots from `config.projectRoot.absolutePath` (the LEXICAL path, not
+    ## its realpath), so the index — and hence the recorded closure — must
+    ## stay expressed relative to the symlinked lexical root the caller gave
+    ## us, not the real directory it points at.
+    ##
+    ## `<tmp>/link_proj` -> `<tmp>/deep/er/real_proj`; the entrypoint
+    ## `tests/t.nim` imports a relative sibling `src/foo` (one directory up)
+    ## and a same-directory sibling `sib`.
+    let parent = makeTempRoot("symlinked_projectroot")
+    defer: removeDir(parent)
+
+    let realProj = parent / "deep" / "er" / "real_proj"
+    createDir(realProj / "src")
+    createDir(realProj / "tests")
+    writeFile(realProj / "src" / "foo.nim", "proc fooValue*(): int = 42\n")
+    writeFile(realProj / "tests" / "sib.nim", "proc sibValue*(): int = 7\n")
+    writeFile(realProj / "tests" / "t.nim", """
+import ../src/foo
+import sib
+doAssert fooValue() == 42
+doAssert sibValue() == 7
+""")
+
+    let linkProj = parent / "link_proj"
+    createSymlink(realProj, linkProj)
+
+    let cfg = makeCfg(linkProj)
+    let ep = Entrypoint(path: "tests/t.nim", group: "default", flags: @[])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    if results[0].outcome != oPassed:
+      echo "symlinked-projectRoot compile/run output:\n", results[0].output
+    check results[0].outcome == oPassed
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check closure == toHashSet(["tests/t.nim", "tests/sib.nim", "src/foo.nim"])
+
+    # A stable, un-invalidated entry must not force a recompile next run.
+    let p2 = plan(cfg, @[ep], graph, nimVersion = "")
+    check p2.entrypoints[0].edecision == edRunFresh

@@ -404,12 +404,23 @@ proc resolveMangledAll(mangledName: string;
   ##              REALPATH target, so `(epDir / body).normalizedPath`
   ##              resolves to the dep's REAL path, outside every tracked
   ##              root.  The primary candidate is always
-  ##              `(epDir / body).normalizedPath` (existence not checked —
-  ##              R5: record deleted deps too, but see the note below: this
-  ##              R5 "record deleted deps" guarantee is specific to THIS
-  ##              lexical case-1 candidate, which is always emitted
-  ##              unconditionally; case 2, below, has a different fallback
-  ##              rule).  When that candidate is NOT under any of `index`'s
+  ##              `(epDir / body).normalizedPath` (existence not checked
+  ##              here — this candidate is emitted unconditionally whether
+  ##              or not the file is currently on disk; case 2, below, has a
+  ##              different fallback rule).  This unconditional emit is NOT
+  ##              what makes R5's "deleted dep detected" guarantee hold:
+  ##              `depgraph.recordClosure` hashes every returned candidate
+  ##              immediately via `closureContentHash` (which `readFile`s
+  ##              each path), so a candidate missing AT EXTRACTION TIME makes
+  ##              THIS extraction fail and the entry gets invalidated rather
+  ##              than persisted with a phantom member — it is never actually
+  ##              recorded.  The real detection happens later, against the
+  ##              PERSISTED closure from an earlier run when the file still
+  ##              existed: `narrow.isEntryStale` and the planner's own
+  ##              missing-closure-file check both test that persisted
+  ##              closure's files for existence.
+  ##
+  ##              When that candidate is NOT under any of `index`'s
   ##              recorded roots, it is ALSO resolved via
   ##              `index.lookupByReal` on the identical real path (the plain
   ##              candidate already IS the real path in this branch, since
@@ -503,8 +514,14 @@ proc resolveMangledAll(mangledName: string;
       # Case 1: neither the entrypoint FILE nor its containing directory
       # carries a symlink, so `body` is relative to `epDir` exactly as
       # written — the lexical candidate IS the real one. Primary result;
-      # existence not checked (R5: record deleted deps too — this
-      # unconditional-emit is what makes the R5 guarantee hold here).
+      # existence not checked here (this candidate is emitted regardless of
+      # whether the file is currently on disk). That is NOT what makes R5's
+      # "deleted dep detected" guarantee hold — recordClosure hashes every
+      # closure member immediately (closureContentHash -> readFile), so a
+      # member missing right now makes THIS extraction fail rather than get
+      # persisted; the real detection happens later, via isEntryStale / the
+      # planner's missing-closure-file check against the PERSISTED closure
+      # from when the file still existed.
       result = @[lexicalCandidate]
       seen.incl lexicalCandidate
       # A realpath-through-a-symlinked-root escape (this proc's doc

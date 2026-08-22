@@ -93,21 +93,40 @@ proc sanitizeControlBytes*(s: string): string =
   ## still fully sanitized text, not raw control bytes, so it cannot itself
   ## move the cursor or issue further escape sequences.
   ##
-  ## Bytes 0x80-0x9F (the C1 control range) are deliberately left alone: in
-  ## a UTF-8 byte stream these are ordinary continuation bytes of a
-  ## multibyte character, so replacing them would corrupt legitimate UTF-8
+  ## Bare bytes 0x80-0x9F (the C1 control range) are left alone: in a UTF-8
+  ## byte stream these only ever appear as CONTINUATION bytes of a multibyte
+  ## character, so replacing one in isolation would corrupt legitimate UTF-8
   ## text (e.g. a test name or file path containing non-ASCII characters).
-  ## Modern terminals and CI log viewers operating in UTF-8 mode do not
-  ## interpret bare 8-bit C1 control codes either, so there is no
-  ## equivalent injection risk to guard against here.
-  result = newString(s.len)
-  for i, c in s:
+  ##
+  ## The UTF-8 *encoding* of a C1 control code point is a different matter
+  ## and IS neutralized: the two-byte sequence 0xC2 followed by 0x80-0x9F
+  ## decodes to U+0080-U+009F, and a terminal or CI log viewer operating in
+  ## UTF-8 mode decodes it exactly that way — e.g. 0xC2 0x9B decodes to
+  ## U+009B (CSI), which xterm treats as an escape-sequence introducer just
+  ## like the raw ESC-`[` two-byte form. No legitimate printable text uses
+  ## U+0080-U+009F, so this 2-byte sequence is always replaced with a single
+  ## '?' (collapsing both bytes, not just the second one) rather than passed
+  ## through. A bare 0xC2 not followed by a byte in 0x80-0x9F — including a
+  ## lone trailing 0xC2 with nothing after it — is left untouched: it is
+  ## either the lead byte of an unrelated 2-byte character (e.g. 0xC2 0xA0 =
+  ## U+00A0 NBSP) or malformed/truncated UTF-8, neither of which decodes to
+  ## a C1 control.
+  result = newStringOfCap(s.len)
+  var i = 0
+  while i < s.len:
+    let c = s[i]
     if c == '\n':
-      result[i] = c
+      result.add c
+      inc i
     elif ord(c) < 0x20 or ord(c) == 0x7f:
-      result[i] = '?'
+      result.add '?'
+      inc i
+    elif ord(c) == 0xc2 and i + 1 < s.len and ord(s[i + 1]) in 0x80 .. 0x9f:
+      result.add '?'
+      i += 2
     else:
-      result[i] = c
+      result.add c
+      inc i
 
 proc writeAllFd*(fd: cint; data: string): bool =
   ## Write all bytes of `data` to `fd` using raw posix.write.
