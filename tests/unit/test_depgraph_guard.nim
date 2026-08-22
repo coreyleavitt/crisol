@@ -139,7 +139,7 @@ suite "recordClosure — recovery policy (R5)":
 
     var graph = initDepGraph("")
     let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_ep.nim", group: "t"),
-                          nc, "rec_ep", ep,
+                          nc, "rec_ep",
                           protocolMajor = 1)
     check r.ok
     check r.error == ""
@@ -170,7 +170,7 @@ suite "recordClosure — recovery policy (R5)":
     saveDepGraph(graph, cfg)
 
     let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_fail.nim", group: "t"),
-                          nc, "rec_fail", ep,
+                          nc, "rec_fail",
                           protocolMajor = 1)
     check not r.ok
     check r.error.len > 0

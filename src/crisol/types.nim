@@ -337,20 +337,26 @@ type
     ## M8 distinctions (previously conflated):
     ##   cdmKeyMiss vs cdmStored:   both are fresh runs on a miss; cdmStored means
     ##     the result was written to the cache; cdmKeyMiss means it ran but was NOT
-    ##     stored (non-pass outcome, hermeticity degraded, flaky, or store error).
-    ##     A run/v1 consumer can determine whether a cache entry was written from
-    ##     cacheDecision alone — no need to infer from inputHash presence.
+    ##     stored, for a reason not covered by one of the other, more specific
+    ##     variants below (cdmHermeticityDeg, cdmFlaky, cdmClosureUnrecorded each
+    ##     split out of what would otherwise be cdmKeyMiss so a `--json` reader
+    ##     can tell WHY a result wasn't cached without inferring from inputHash
+    ##     presence or cross-referencing stderr).
     ##   cdmGroupOptOut vs cdmPolicyDisabled:  cdmGroupOptOut is the per-group
     ##     `cacheable #false` config knob (permanent, config-declared opt-out);
     ##     cdmPolicyDisabled is the invocation-level `--no-cache` flag.
-    cdmNotEligible      ## edNeverBuilt/edStale; cache not consulted
-    cdmHit              ## served from cache (plan-time hit)
-    cdmStored           ## fresh run on a miss; result WAS written to the cache
-    cdmKeyMiss          ## fresh run on a miss; result was NOT stored (see M8 notes)
-    cdmHermeticityDeg   ## hermeticity degraded; gate blocked the write
-    cdmGroupOptOut      ## per-group `cacheable #false` config; absolute cache opt-out
-    cdmPolicyDisabled   ## invocation `--no-cache` flag; cache bypassed this run
-    cdmFlaky            ## flaky-pass (attempt > 1); not stored
+    cdmNotEligible        ## edNeverBuilt/edStale; cache not consulted
+    cdmHit                ## served from cache (plan-time hit)
+    cdmStored             ## fresh run on a miss; result WAS written to the cache
+    cdmKeyMiss            ## fresh run on a miss; result was NOT stored (see M8 notes)
+    cdmHermeticityDeg     ## hermeticity degraded; gate blocked the write
+    cdmGroupOptOut        ## per-group `cacheable #false` config; absolute cache opt-out
+    cdmPolicyDisabled     ## invocation `--no-cache` flag; cache bypassed this run
+    cdmFlaky              ## flaky-pass (attempt > 1); not stored
+    cdmClosureUnrecorded  ## fresh run; store refused because the entrypoint's source
+                           ## closure could not be recorded (see depgraph.recordClosure)
+                           ## — the key would carry an empty closureContentHash and
+                           ## could never be looked up
 
   PlannedEntrypoint* = object
     ## A single entrypoint annotated with its compile decision and reason.

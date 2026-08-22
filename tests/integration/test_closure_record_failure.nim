@@ -121,8 +121,7 @@ suite "closure recording failure blocks the result-cache store (issue #5, R9)":
     # The store seam must NEVER have been called: a passing run whose
     # closure could not be recorded must not be written to the cache.
     check ms.storeCalls == 0
-    # And the live result must be stamped as NOT stored — reusing the same
-    # "fresh run, not stored" decision the store-gate already uses (no new
-    # CacheDecision variant).
-    check r1[0].cacheDecision == cdmKeyMiss
+    # And the live result must be stamped with the dedicated variant so a
+    # `--json` reader can tell WHY the store didn't happen (R9).
+    check r1[0].cacheDecision == cdmClosureUnrecorded
     check not r1[0].cached

@@ -418,7 +418,7 @@ proc saveDepGraph*(graph: DepGraph; config: Config) =
 # ---------------------------------------------------------------------------
 
 proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
-                    nimcacheDir, binaryName, epAbs: string;
+                    nimcacheDir, binaryName: string;
                     protocolMajor: int): tuple[ok: bool, error: string] =
   ## Extract, hash, and persist one entrypoint's source closure after a
   ## successful compile — the single place issue #5's recovery policy lives.
@@ -439,6 +439,7 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## `saveDepGraph` never raises (warns to stderr and returns), so there is
   ## no third outcome to handle.
   let fHash = flagHash(ep.flags)
+  let epAbs = if ep.path.isAbsolute: ep.path else: config.projectRoot / ep.path
   try:
     let closureSet = extractClosure(nimcacheDir, binaryName, epAbs, config)
     var closureSeq = toSeq(closureSet)

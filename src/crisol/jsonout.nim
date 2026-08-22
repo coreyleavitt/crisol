@@ -190,18 +190,23 @@ proc cacheDecisionString*(d: CacheDecision): string =
   ##   "stored"      — cdmStored: fresh run on a miss; result written to cache.
   ##   "groupOptOut" — cdmGroupOptOut: per-group cacheable #false config opt-out.
   ## M8 refined meanings:
-  ##   "keyMiss"        — ran live on a miss but was NOT stored (non-pass, degraded
-  ##                      hermeticity, flaky, or intermediate failure path).
-  ##   "policyDisabled" — invocation --no-cache flag only (not config cacheable #false).
+  ##   "keyMiss"           — ran live on a miss but was NOT stored, for a reason
+  ##                        not covered by one of the other, more specific
+  ##                        variants (see cdmHermeticityDeg, cdmFlaky,
+  ##                        cdmClosureUnrecorded).
+  ##   "policyDisabled"    — invocation --no-cache flag only (not config cacheable #false).
+  ##   "closureUnrecorded" — fresh run; store refused because the entrypoint's
+  ##                        source closure could not be recorded.
   case d
-  of cdmNotEligible:    "notEligible"
-  of cdmHit:            "hit"
-  of cdmStored:         "stored"
-  of cdmKeyMiss:        "keyMiss"
-  of cdmHermeticityDeg: "hermeticityDegraded"
-  of cdmGroupOptOut:    "groupOptOut"
-  of cdmPolicyDisabled: "policyDisabled"
-  of cdmFlaky:          "flaky"
+  of cdmNotEligible:      "notEligible"
+  of cdmHit:               "hit"
+  of cdmStored:            "stored"
+  of cdmKeyMiss:           "keyMiss"
+  of cdmHermeticityDeg:    "hermeticityDegraded"
+  of cdmGroupOptOut:       "groupOptOut"
+  of cdmPolicyDisabled:    "policyDisabled"
+  of cdmFlaky:             "flaky"
+  of cdmClosureUnrecorded: "closureUnrecorded"
 
 # ---------------------------------------------------------------------------
 # toJson -- pure serializer

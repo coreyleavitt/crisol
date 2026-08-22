@@ -51,7 +51,9 @@ on stderr); when a compile succeeds but its closure cannot be recorded, the
 entrypoint's dependency record is invalidated so it is recompiled and
 force-selected next run instead of serving the previous, stale record.
 Entrypoints outside `projectRoot`/`dep-roots` (library-API callers only) now
-warn and recompile every run instead of being silently fresh forever.
+warn and recompile every run instead of being silently fresh forever. A
+result whose closure could not be recorded is also NOT written to the result
+cache (reported as `cacheDecision` `"closureUnrecorded"` in `--json`).
 
 **Migration:** nothing to do; budget one full-suite compile after upgrading.
 

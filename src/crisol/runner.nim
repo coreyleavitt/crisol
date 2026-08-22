@@ -1288,10 +1288,6 @@ proc execute*(
             if compiledThisRun and slotCacheDir.len > 0:
               if completedOutcome notin {oCompileFailed, oSpawnError}:
                 let ep = p.entrypoints[completedIdx].ep
-                # R3: resolve absolute path for extractClosure.
-                let epAbs =
-                  if ep.path.isAbsolute: ep.path
-                  else: config.projectRoot / ep.path
                 let bname = binName(ep)
                 let stableBinDir = binPath(ep, config)
                 let stableBin    = stableBinDir / bname
@@ -1311,7 +1307,7 @@ proc execute*(
                 # (see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE, and
                 # recordClosure's doc comment in depgraph.nim).
                 let rec = recordClosure(graph, config, ep,
-                                        slotCacheDir, bname, epAbs, CrisolProtocolMajor)
+                                        slotCacheDir, bname, CrisolProtocolMajor)
                 closureRecorded = rec.ok
                 if not rec.ok:
                   stderr.write("crisol: warning: " & ep.path & ": could not record its " &
@@ -1361,13 +1357,15 @@ proc execute*(
               else:
                 # Not stored: either the verdict carries the structural reason, or
                 # (R9) the verdict said store but the closure wasn't recorded — in
-                # which case reuse cdmKeyMiss, the SAME decision a store attempt
-                # that returned false would report (no new CacheDecision variant).
+                # which case stamp cdmClosureUnrecorded, a dedicated variant so a
+                # `--json` reader can tell WHY the store didn't happen instead of
+                # this collapsing into the generic cdmKeyMiss.
                 # Stamp the plan-time key (set for an edRunFresh miss; "" otherwise)
                 # so a consulted-but-not-stored result still reports its inputHash.
                 result[completedIdx].inputHash = inputHashes[completedIdx]
                 result[completedIdx].cacheDecision =
-                  if verdict.store: cdmKeyMiss else: verdict.decision
+                  if verdict.store and not closureRecorded: cdmClosureUnrecorded
+                  else: verdict.decision
             else:
               # Caching inactive: stamp the structural reason recorded at plan time.
               result[completedIdx].cacheDecision = cacheDecisions[completedIdx]

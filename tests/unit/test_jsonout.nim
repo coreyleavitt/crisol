@@ -338,15 +338,17 @@ suite "jsonout A8 — cache reporting fields":
     check node["entrypoints"][1]["cacheDecision"].getStr == "keyMiss"
 
   test "cacheDecisionString maps every enum value to a stable distinct string":
-    ## M8 rev 6: cdmStored and cdmGroupOptOut added; all 8 variants covered.
-    check cacheDecisionString(cdmNotEligible)    == "notEligible"
-    check cacheDecisionString(cdmHit)            == "hit"
-    check cacheDecisionString(cdmStored)         == "stored"
-    check cacheDecisionString(cdmKeyMiss)        == "keyMiss"
-    check cacheDecisionString(cdmHermeticityDeg) == "hermeticityDegraded"
-    check cacheDecisionString(cdmGroupOptOut)    == "groupOptOut"
-    check cacheDecisionString(cdmPolicyDisabled) == "policyDisabled"
-    check cacheDecisionString(cdmFlaky)          == "flaky"
+    ## M8 rev 6: cdmStored and cdmGroupOptOut added.
+    ## R9: cdmClosureUnrecorded added; all 9 variants covered.
+    check cacheDecisionString(cdmNotEligible)       == "notEligible"
+    check cacheDecisionString(cdmHit)               == "hit"
+    check cacheDecisionString(cdmStored)            == "stored"
+    check cacheDecisionString(cdmKeyMiss)           == "keyMiss"
+    check cacheDecisionString(cdmHermeticityDeg)    == "hermeticityDegraded"
+    check cacheDecisionString(cdmGroupOptOut)       == "groupOptOut"
+    check cacheDecisionString(cdmPolicyDisabled)    == "policyDisabled"
+    check cacheDecisionString(cdmFlaky)             == "flaky"
+    check cacheDecisionString(cdmClosureUnrecorded) == "closureUnrecorded"
 
   test "default-constructed result reports notEligible cacheDecision":
     let node = toJson(syntheticResults(), syntheticSummary())
