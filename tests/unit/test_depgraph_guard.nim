@@ -17,7 +17,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_depgraph_guard.nim
 
-import std/[sets, tables, unittest]
+import std/[os, sets, tables, unittest]
 import crisol/types
 import crisol/depgraph
 
@@ -55,3 +55,44 @@ suite "depgraph writer guards (issue #5)":
     g.invalidateEntry("tests/t.nim", fh)          # idempotent
     g.invalidateEntry("tests/never.nim", fh)      # never present
     check g.entries.len == 0
+
+# ---------------------------------------------------------------------------
+# Migration + load-side defense
+# ---------------------------------------------------------------------------
+
+proc graphRoot(tag: string): string =
+  result = getTempDir() / ("crisol_depgraph_guard_" & tag & "_" & $getCurrentProcessId())
+  removeDir(result)
+  createDir(result / ".crisol")
+
+suite "depgraph load guards (issue #5 migration)":
+
+  test "a formatVersion-2 graph (written by the compile-array extractor) loads as empty":
+    ## Every v2 entry is suspect: any entry written after a warm recompile is
+    ## truncated or empty and hash-matches itself forever, so upgrading does
+    ## not self-heal it. Discard the whole graph once (one-time full recompile).
+    let root = graphRoot("v2")
+    defer: removeDir(root)
+    writeFile(root / ".crisol" / "depgraph", """
+    { "header": { "nimVersion": "2.2.10", "formatVersion": 2 },
+      "entries": [ { "path": "tests/t.nim", "flagHash": "cbf29ce484222325",
+                     "closure": ["tests/t.nim"], "closureHash": "abc", "protocolMajor": 1 } ] }
+    """)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+    check loadDepGraph(cfg, "2.2.10").entries.len == 0
+
+  test "an entry with an empty closure is dropped on load":
+    let root = graphRoot("emptycl")
+    defer: removeDir(root)
+    writeFile(root / ".crisol" / "depgraph", """
+    { "header": { "nimVersion": "2.2.10", "formatVersion": """ & $DepGraphFormatVersion & """ },
+      "entries": [
+        { "path": "tests/empty.nim", "flagHash": "cbf29ce484222325",
+          "closure": [], "closureHash": "abc", "protocolMajor": 1 },
+        { "path": "tests/ok.nim", "flagHash": "cbf29ce484222325",
+          "closure": ["tests/ok.nim"], "closureHash": "def", "protocolMajor": 1 } ] }
+    """)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+    let g = loadDepGraph(cfg, "2.2.10")
+    check ("tests/empty.nim", "cbf29ce484222325") notin g.entries
+    check ("tests/ok.nim", "cbf29ce484222325") in g.entries

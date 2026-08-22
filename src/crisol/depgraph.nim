@@ -55,9 +55,16 @@ import crisol/config  # for stateDirOf
 # Constants
 # ---------------------------------------------------------------------------
 
-const DepGraphFormatVersion* = 2
+const DepGraphFormatVersion* = 3
   ## Increment this when the JSON schema changes in an incompatible way.
   ## A loaded file with a different formatVersion is treated as absent.
+  ##
+  ## History:
+  ##   3 — issue #5: closures are derived from the nimcache `link` array.
+  ##       Every v2 entry is suspect (any entry rewritten after a warm
+  ##       recompile is truncated or empty and hash-matches itself forever,
+  ##       so upgrading alone cannot heal it); the bump discards the whole
+  ##       graph once — a one-time full recompile — rather than serve it.
   ## v2: added closureHash and protocolMajor fields.
 
 # ---------------------------------------------------------------------------
@@ -192,8 +199,7 @@ proc updateEntry*(graph: var DepGraph;
   ## `invalidateEntry` (the runner does).
   if closure.len == 0:
     raise newCrisolError(cekInternal,
-      "refusing to record an empty source closure for " & path &
-      " — an empty closure can never go stale")
+      "refusing to record an empty source closure (it could never go stale)")
   graph.entries[(path, fHash)] = DepGraphEntry(
     closure:       closure,
     closureHash:   closureHash,
@@ -454,5 +460,11 @@ proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
         # else: drop the suspicious absolute path silently
       else:
         filtered.incl p   # relative path: kept as-is (project-root-relative)
+    # issue #5 defense-in-depth: an entry with NO closure can never go stale
+    # (the writer refuses to record one — see updateEntry); if one reaches
+    # disk anyway, treat it as absent so decideCompile/narrow re-derive it.
+    if filtered.len == 0:
+      result.entries.del(key)
+      continue
     entry.closure = filtered
     result.entries[key] = entry
