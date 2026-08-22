@@ -57,6 +57,25 @@ cache (reported as `cacheDecision` `"closureUnrecorded"` in `--json`).
 
 **Migration:** nothing to do; budget one full-suite compile after upgrading.
 
+### Changed — search-path-resolved modules are now in closures (issue #8)
+
+**Prior behaviour:** a module the compiler resolved through any nim search
+path other than `projectRoot`, `projectRoot/src`, or a configured `dep-roots`
+entry (+`/src`) — e.g. shared test helpers made importable by a
+`tests/config.nims` `switch("path", thisDir())`, or a first-party library on
+`--path:lib/x/src` — was silently absent from every closure.  Editing such a
+module re-selected nothing under `--changed` and never invalidated the
+compiled binary.
+
+**New behaviour:** crisol builds a per-run index of every `.nim` file under
+`projectRoot` (dot-directories, `nimcache`, the state dir, and symlinked
+directories are skipped) plus each `dep-roots` entry, and resolves a
+search-path-relative module to every indexed file that ends with that
+relative path.  No configuration is needed for in-tree helpers; `dep-roots`
+remains the opt-in for out-of-tree content (e.g. `_deps/<x>` symlinks into a
+content store).  Closures may grow (they are now complete), so expect a
+one-time recompile of entrypoints whose closure gained members.
+
 ### Added
 
 - `crisol clean --config <path>` — `clean` now accepts `--config <path>` so it
