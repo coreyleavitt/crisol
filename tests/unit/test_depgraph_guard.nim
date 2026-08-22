@@ -169,7 +169,7 @@ suite "recordClosure — recovery policy (R5)":
     # would leave behind on failure.
     graph.updateEntry("tests/rec_fail.nim", fh, toHashSet(["tests/rec_fail.nim"]),
                       "priorhash", 1)
-    saveDepGraph(graph, cfg)
+    doAssert saveDepGraph(graph, cfg)
 
     let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_fail.nim", group: "t"),
                           nc, "rec_fail",
@@ -178,6 +178,59 @@ suite "recordClosure — recovery policy (R5)":
     check r.error.len > 0
     check ("tests/rec_fail.nim", fh) notin graph.entries
     check ("tests/rec_fail.nim", fh) notin loadDepGraph(cfg, "").entries
+
+  test "persist failure (issue #13.3): a manifest that would otherwise succeed still returns ok=false":
+    ## Fault injection: `createDir(depgraphPath(cfg) & ".tmp")`. `saveDepGraph`
+    ## opens its temp file with O_CREAT|O_EXCL, which fails with EEXIST when a
+    ## directory already occupies the .tmp path — reliable without needing
+    ## filesystem permissions the container's root user would bypass anyway.
+    let root = recRoot("persistfail")
+    defer: removeDir(root)
+    let ep = root / "tests" / "rec_persistfail.nim"
+    writeFile(ep, "# ep\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "rec_persistfail", link = @[nc / "@mrec_persistfail.nim.c.o"])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    createDir(depgraphPath(cfg) & ".tmp")
+
+    var graph = initDepGraph("")
+    let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_persistfail.nim", group: "t"),
+                          nc, "rec_persistfail",
+                          protocolMajor = 1, index = buildSourceIndex(cfg))
+    check not r.ok
+    check "dependency graph could not be persisted" in r.error
+
+    # The in-memory graph still holds the new entry (this run's own
+    # selection logic sees it correctly) — only the ON-DISK side failed;
+    # see recordClosure's doc comment for why the caller (the runner) must
+    # not trust the stable binary despite this.
+    let fh = flagHash(@[])
+    check ("tests/rec_persistfail.nim", fh) in graph.entries
+
+suite "saveDepGraph — return value (issue #13.3)":
+
+  test "returns false and leaves no depgraph file when the .tmp path is occupied by a directory":
+    let root = graphRoot("savefail")
+    defer: removeDir(root)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    createDir(depgraphPath(cfg) & ".tmp")
+
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    check not saveDepGraph(g, cfg)
+    check not fileExists(depgraphPath(cfg))
+
+  test "returns true and the depgraph file exists once the obstruction is removed":
+    let root = graphRoot("savefail_recover")
+    defer: removeDir(root)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    check saveDepGraph(g, cfg)
+    check fileExists(depgraphPath(cfg))
 
 # ---------------------------------------------------------------------------
 # depgraph load provenance — a discarded depgraph must be a visible,
@@ -193,7 +246,7 @@ suite "depgraph load provenance: discarded persisted graph":
 
     var g = initDepGraph("2.2.10")
     g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
-    saveDepGraph(g, cfg)
+    doAssert saveDepGraph(g, cfg)
 
     var d: DepGraphDiscard
     let loaded = loadDepGraph(cfg, "2.3.0", d)
@@ -229,7 +282,7 @@ suite "depgraph load provenance: discarded persisted graph":
 
     var g = initDepGraph("2.2.10")
     g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
-    saveDepGraph(g, cfg)
+    doAssert saveDepGraph(g, cfg)
 
     var d: DepGraphDiscard
     let loaded = loadDepGraph(cfg, "2.2.10", d)
@@ -255,7 +308,7 @@ suite "depgraph load provenance: discarded persisted graph":
 
     var g = initDepGraph("2.2.10")
     g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
-    saveDepGraph(g, cfg)
+    doAssert saveDepGraph(g, cfg)
 
     check loadDepGraph(cfg, "2.2.10").entries.len == 1
     check loadDepGraph(cfg, "2.3.0").entries.len == 0   # discarded; no way to observe why

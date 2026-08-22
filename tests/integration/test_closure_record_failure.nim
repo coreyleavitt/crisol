@@ -7,6 +7,16 @@
 ## recompiles next run and the PREVIOUS entry — arbitrarily stale — keeps
 ## being served as fresh. A reader cannot tell that entry from a valid one.
 ##
+## Issue #13.3 (D5) strengthened this further: the runner now also discards
+## the stable binary it just promoted whenever `recordClosure` reports
+## `not ok`, for either failure mode (extraction failure here, or a
+## depgraph persist failure) — so the invariant is "either the on-disk
+## depgraph entry matches the stable binary, or there is no stable binary",
+## never a binary the depgraph does not describe. The first test below
+## reflects that: after the recording failure, the next plan is
+## `edNeverBuilt` (no binary at all), not merely `edStale` (binary present,
+## entry missing).
+##
 ## Real-compile drive through execute(). The recording failure is induced the
 ## one way it can arise without a mock: the entrypoint lives OUTSIDE every
 ## tracked root, so its extracted closure is empty and updateEntry refuses it
@@ -55,7 +65,7 @@ suite "closure recording failure after a successful compile (issue #5)":
     graph.updateEntry(ep.path, fHash, seededClosure,
                       closureContentHash(@[ep.path], root), CrisolProtocolMajor)
     createDir(root / ".crisol")
-    saveDepGraph(graph, cfg)
+    doAssert saveDepGraph(graph, cfg)
 
     let plan1 = plan(cfg, @[ep], graph, nimVersion = "")
     check plan1.entrypoints[0].edecision == edNeverBuilt
@@ -69,9 +79,14 @@ suite "closure recording failure after a successful compile (issue #5)":
     check key notin loadDepGraph(cfg, "").entries
 
     # And the next plan must recompile rather than trust the stale entry.
+    # Issue #13.3 (D5) broadened the runner's recovery: on ANY recordClosure
+    # failure (not only a persist failure) the stable binary just promoted
+    # this run is discarded too, so no binary describes this key at all —
+    # the next plan sees edNeverBuilt, not edStale ("no closure record" only
+    # applies when a binary exists but no entry backs it).
     let plan2 = plan(cfg, @[ep], graph, nimVersion = "")
-    check plan2.entrypoints[0].edecision == edStale
-    check plan2.entrypoints[0].reason == "no closure record in dep graph"
+    check plan2.entrypoints[0].edecision == edNeverBuilt
+    check plan2.entrypoints[0].reason == "binary absent (first run or cache cleared)"
 
 # ---------------------------------------------------------------------------
 # R9: a result whose closure was NOT recorded must NOT be stored in the
@@ -104,7 +119,7 @@ suite "closure recording failure blocks the result-cache store (issue #5, R9)":
                         group: "default", flags: @[])
     var graph = initDepGraph("")
     createDir(root / ".crisol")
-    saveDepGraph(graph, cfg)
+    doAssert saveDepGraph(graph, cfg)
 
     let plan1 = plan(cfg, @[ep], graph, nimVersion = "")
     check plan1.entrypoints[0].edecision == edNeverBuilt

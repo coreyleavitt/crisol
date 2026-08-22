@@ -35,10 +35,45 @@
 ## ## Invalidation rules
 ##
 ## - **Nim-version mismatch** (header): whole graph → empty (treat as absent).
+##   This is a FRESHNESS judgment, not a fact about the stored file — see
+##   "Two loaders" below for who applies it.
 ## - **Missing file** in closure: `isEntryStale` returns true.
 ## - **Absent entry**: `isEntryStale` returns true.
 ## - **Deleted-entrypoint GC**: `gcDeletedEntrypoints` drops keys absent from the
 ##   provided current-entrypoint set.
+##
+## ## Two loaders — stored vs. freshness view (issue #12)
+##
+## `loadStoredDepGraph*(config; discarded)` loads the graph AS PERSISTED: the
+## header's `nimVersion` is preserved verbatim, with no comparison against
+## "the current Nim version" at all. It still discards on a formatVersion
+## mismatch or a malformed/unreadable file (those are facts about the
+## stored bytes, not about freshness), and it still applies the M10
+## on-disk-tamper guard to closure paths. A missing file loads as an empty
+## graph with header nimVersion `""`.
+##
+## `loadDepGraph*(config; nimVersion; discarded)` is `loadStoredDepGraph`
+## PLUS a freshness view: if the stored header's `nimVersion` disagrees with
+## the caller's `nimVersion` (and that disagreement is observable — an inert
+## `""`-header graph with zero entries, e.g. "no file yet", never counts),
+## the graph is treated as absent (`dgdNimVersion`) and an empty graph
+## stamped with the REQUESTED `nimVersion` is returned instead.
+##
+## Callers that make staleness/compile-avoidance decisions (`run`,
+## `closure`, `list`, ...) MUST use `loadDepGraph` — a graph recorded by a
+## different compiler cannot be trusted for those decisions.
+##
+## `crisol clean` MUST use `loadStoredDepGraph` instead: it only GCs the
+## on-disk entry set against the discovered entrypoints and re-saves. Using
+## the freshness view there was issue #12's bug — a graph written by the
+## real pipeline is always stamped with the real probed Nim fingerprint
+## (never `""`), so calling the freshness loader with the wrong/absent
+## expected version (crisol clean historically passed `""`) discarded the
+## WHOLE graph as empty before GC ever ran — so a clean GC'd nothing and
+## reported 0 dropped on every real graph. `loadStoredDepGraph` sidesteps
+## the whole problem: it never compares versions, so a clean cannot discard
+## a real graph, and its save path (see `clean.nim`) never rewrites the
+## header.
 ##
 ## ## Atomic writes
 ##
@@ -443,15 +478,24 @@ proc toJson(graph: DepGraph): JsonNode =
   result["header"]  = headerNode
   result["entries"] = entriesArr
 
-proc fromJson(node: JsonNode; nimVersion: string; discarded: var DepGraphDiscard): DepGraph =
-  ## Deserialize a DepGraph from a JsonNode.
-  ## Returns empty graph if the format is wrong, the nimVersion mismatches,
-  ## or formatVersion differs. discarded reports WHY a persisted graph was
-  ## discarded: dgdNone when nothing was discarded; dgdMalformed for every
-  ## shape/parse problem (missing/wrong-typed header fields, non-object
-  ## root, non-array entries, ...) so a present-but-unusable file is never
-  ## silently indistinguishable from dgdNone's "never ran".
-  result = initDepGraph(nimVersion)
+proc fromJson(node: JsonNode; discarded: var DepGraphDiscard): DepGraph =
+  ## Deserialize a DepGraph from a JsonNode, preserving the STORED header
+  ## verbatim (nimVersion + formatVersion) — this proc has no notion of
+  ## "the current Nim version" and performs no nimVersion comparison; that
+  ## freshness judgment belongs one layer up, in the public `loadDepGraph`
+  ## (see "Two loaders" in the module doc, issue #12), because a
+  ## caller like `clean` needs the graph AS PERSISTED — GCing it against the
+  ## discovered entrypoint set must never depend on, or silently stamp over,
+  ## the fingerprint the pipeline will compare on the next `run`.
+  ##
+  ## Returns an empty graph, header nimVersion "", on formatVersion mismatch
+  ## or on any malformed shape. discarded reports WHY a persisted graph was
+  ## discarded: dgdNone when nothing was discarded; dgdFormatVersion for a
+  ## formatVersion mismatch; dgdMalformed for every shape/parse problem
+  ## (missing/wrong-typed header fields, non-object root, non-array
+  ## entries, ...) so a present-but-unusable file is never silently
+  ## indistinguishable from dgdNone's "never ran".
+  result = initDepGraph("")
   discarded = DepGraphDiscard(kind: dgdNone)
 
   if node.kind != JObject:
@@ -482,17 +526,13 @@ proc fromJson(node: JsonNode; nimVersion: string; discarded: var DepGraphDiscard
   let storedNimVerStr = storedNimVer.getStr("")
   let storedFmtVerInt = storedFmtVer.getInt(-1)
 
-  # A discarded graph must be a visible, structured diagnostic — not a
-  # silent empty-graph fallback (see DepGraphDiscard doc comment).
-  if storedNimVerStr != nimVersion:
-    discarded = DepGraphDiscard(kind: dgdNimVersion, stored: storedNimVerStr, current: nimVersion)
-    return
   if storedFmtVerInt != DepGraphFormatVersion:
     discarded = DepGraphDiscard(kind: dgdFormatVersion, stored: $storedFmtVerInt, current: $DepGraphFormatVersion)
     return
 
-  # Update header (matches current nim version)
-  result.header.nimVersion    = nimVersion
+  # Preserve the header exactly as stored — no comparison against "the
+  # current Nim version" here (see the proc doc above).
+  result.header.nimVersion    = storedNimVerStr
   result.header.formatVersion = DepGraphFormatVersion
 
   # Parse entries
@@ -540,14 +580,29 @@ proc depgraphPath*(config: Config): string =
   ## Absolute path to the depgraph file.
   stateDirOf(config) / "depgraph"
 
-proc saveDepGraph*(graph: DepGraph; config: Config) =
+proc saveDepGraph*(graph: DepGraph; config: Config): bool =
   ## Write the graph to `<projectRoot>/<stateDir>/depgraph` atomically.
   ## Creates the state directory if absent.
-  ## On any write failure: warns to stderr and returns — never raises.
+  ##
+  ## Returns `true` iff the graph was actually persisted (the final
+  ## `moveFile` completed), `false` on ANY failure. Deliberately NOT
+  ## `{.discardable.}` — every caller (issue #13.3) must decide what a
+  ## failed persist means for what it just did in memory: `recordClosure`
+  ## turns it into a recovery-policy failure so the runner discards the
+  ## stable binary rather than leave it paired with a stale on-disk entry;
+  ## `clean` must not report entries as dropped from disk when the drop
+  ## never made it to disk. On any write failure: still warns to stderr
+  ## with the cause (unchanged from before) — the bool lets a caller react
+  ## structurally, the stderr line stays for a human watching the run — and
+  ## never raises.
   ##
   ## Uses O_CREAT|O_EXCL|O_WRONLY so the temp-file open fails if any file or
   ## symlink already exists at the .tmp path — prevents a pre-planted symlink
-  ## from redirecting the write to an attacker-chosen target (P5).
+  ## from redirecting the write to an attacker-chosen target (P5). This is
+  ## also the fault every persist-failure test in the suite injects:
+  ## `createDir(depgraphPath(config) & ".tmp")` makes the O_EXCL open fail
+  ## with EEXIST (a directory occupies the path) without needing filesystem
+  ## permissions the container's root user would bypass anyway.
   ## A stale .tmp from a previous crashed run is removed first.
   let stateDir  = stateDirOf(config)
   let finalPath = depgraphPath(config)
@@ -558,7 +613,7 @@ proc saveDepGraph*(graph: DepGraph; config: Config) =
   except OSError as e:
     stderr.write("crisol: warning: could not create state dir '" & stateDir &
                  "': " & e.msg & "\n")
-    return
+    return false
 
   let jsonStr = $toJson(graph)
   # Best-effort removal of a stale .tmp from a prior crashed run.
@@ -573,26 +628,29 @@ proc saveDepGraph*(graph: DepGraph; config: Config) =
       let err = $posix_mod.strerror(posix_mod.errno)
       stderr.write("crisol: warning: could not create temp file for depgraph: " &
                    err & "\n")
-      return
+      return false
     let written = posix_mod.write(tmpFd, jsonStr.cstring, jsonStr.len)
     discard posix_mod.close(tmpFd)
     tmpFd = -1
     if written < 0 or written != jsonStr.len:
       stderr.write("crisol: warning: short write to depgraph temp file\n")
       try: removeFile(tmpPath) except: discard
-      return
+      return false
     moveFile(tmpPath, finalPath)
+    return true
   except OSError as e:
     if tmpFd >= 0:
       discard posix_mod.close(tmpFd)
     stderr.write("crisol: warning: could not write depgraph: " & e.msg & "\n")
     try: removeFile(tmpPath) except: discard
+    return false
   except Exception as e:
     if tmpFd >= 0:
       discard posix_mod.close(tmpFd)
     stderr.write("crisol: warning: unexpected error writing depgraph: " &
                  e.msg & "\n")
     try: removeFile(tmpPath) except: discard
+    return false
 
 # ---------------------------------------------------------------------------
 # Public: recovery policy (issue #5)
@@ -617,15 +675,31 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## Invalidating instead makes decideCompile see `cdStale` and
   ## narrowByDiff force-include the entrypoint (unknown closure).
   ##
-  ## On success: `updateEntry` + `saveDepGraph`, returns `(ok: true, "")`.
+  ## On success: `updateEntry` + `saveDepGraph`, returns `(ok: true, "")` —
+  ## UNLESS the save itself fails (issue #13.3), in which case this returns
+  ## `(ok: false, "dependency graph could not be persisted")`. The in-memory
+  ## graph already holds the new entry at that point (this run's own
+  ## selection logic sees it correctly), but nothing describes it on disk;
+  ## the caller (the runner) must treat this exactly like an extraction
+  ## failure — see below — and discard the binary it just promoted to the stable path, so the NEXT run starts
+  ## from `cdNeverBuilt` rather than trusting a stable binary the on-disk
+  ## depgraph does not (yet, or ever) describe. Without that binary-discard
+  ## step, a later revert of the source back to whatever the STALE on-disk
+  ## entry's hash matches would make decideCompile find that stale entry
+  ## AND the (wrongly-provenanced) stable binary, and serve the binary that
+  ## was actually built from the edited sources — silently wrong output.
+  ##
   ## On ANY `CatchableError` (missing/unparseable manifest, empty `link` —
   ## see `extractClosure` — or `updateEntry`'s NONEMPTY-CLOSURE refusal):
-  ## `invalidateEntry` + `saveDepGraph`, returns `(ok: false, e.msg)`.  The
-  ## caller (the runner) only needs to warn on `not ok`; no further recovery
-  ## step is needed on either path.
+  ## `invalidateEntry` + `saveDepGraph`, returns `(ok: false, e.msg)`. If
+  ## THAT save also fails, `e.msg` gains "; dependency graph could not be
+  ## persisted" — the in-memory invalidation happened, but it did not reach
+  ## disk either, so the caller's binary-discard step applies here too: the
+  ## previous stable binary (if any) must not be trusted for the same
+  ## reason as the success-path persist failure above.
   ##
-  ## `saveDepGraph` never raises (warns to stderr and returns), so there is
-  ## no third outcome to handle.
+  ## The caller only needs to warn on `not ok` and discard the stable
+  ## binary; no further recovery step is needed on either path.
   let fHash = flagHash(ep.flags)
   let epAbs = if ep.path.isAbsolute: ep.path else: config.projectRoot / ep.path
   try:
@@ -634,31 +708,48 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
     closureSeq.sort()
     let contentHash = closureContentHash(closureSeq, config.projectRoot)
     graph.updateEntry(ep.path, fHash, closureSet, contentHash, protocolMajor)
-    saveDepGraph(graph, config)
-    result = (ok: true, error: "")
+    if saveDepGraph(graph, config):
+      result = (ok: true, error: "")
+    else:
+      result = (ok: false, error: "dependency graph could not be persisted")
   except CatchableError as e:
     graph.invalidateEntry(ep.path, fHash)
-    saveDepGraph(graph, config)
-    result = (ok: false, error: e.msg)
+    if saveDepGraph(graph, config):
+      result = (ok: false, error: e.msg)
+    else:
+      result = (ok: false, error: e.msg & "; dependency graph could not be persisted")
 
-proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDiscard): DepGraph =
-  ## Load the graph from `<projectRoot>/<stateDir>/depgraph`.
+proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGraph =
+  ## Load the graph from `<projectRoot>/<stateDir>/depgraph` exactly AS
+  ## PERSISTED — the stored header's `nimVersion` is preserved verbatim, with
+  ## NO comparison against "the current Nim version" (that freshness
+  ## judgment is `loadDepGraph`, below, which layers it on top of this
+  ## proc).
+  ##
+  ## This is the loader `crisol clean` must use (issue #12): a clean GCs the
+  ## graph against the discovered entrypoint set and must never depend on,
+  ## or silently stamp over, the fingerprint the pipeline compares on the
+  ## next `run` — using the freshness view here loaded every real graph as
+  ## empty (its header never equals the `""` a clean could pass), so a clean
+  ## GC'd nothing and reported 0 dropped.
   ##
   ## discarded reports WHY a persisted graph was discarded at load (dgdNone
   ## when nothing was discarded):
-  ## - Missing file → empty graph (not an error); dgdNone.
-  ## - Unreadable file → empty graph (safer fallback); dgdMalformed with the
-  ##   IO error text. No direct stderr write here — the caller surfaces
+  ## - Missing file → empty graph (not an error); dgdNone. Header nimVersion
+  ##   is "" — there is no stored value to preserve.
+  ## - Unreadable file → empty graph, header ""; dgdMalformed with the IO
+  ##   error text. No direct stderr write here — the caller surfaces
   ##   `discarded` as a `ConfigWarning` (sanitized by `message`), the single
   ##   report channel; see the `except` clause below for why both `IOError`
   ##   and `OSError` are caught.
-  ## - Malformed JSON, or valid JSON with an unexpected shape → empty graph;
-  ##   dgdMalformed with the parse-error text or a short shape reason. The
-  ##   caller's `ConfigWarning` (built from discarded) is now the sole
-  ##   report for this — no separate stderr write here, to avoid double-
-  ##   reporting the same discard.
-  ## - Nim-version mismatch → empty graph; dgdNimVersion.
-  ## - Format-version mismatch → empty graph; dgdFormatVersion.
+  ## - Malformed JSON, or valid JSON with an unexpected shape → empty graph,
+  ##   header ""; dgdMalformed with the parse-error text or a short shape
+  ##   reason. The caller's `ConfigWarning` (built from discarded) is now
+  ##   the sole report for this — no separate stderr write here, to avoid
+  ##   double-reporting the same discard.
+  ## - Format-version mismatch → empty graph, header ""; dgdFormatVersion.
+  ## - Otherwise → the graph as stored, header nimVersion == the value on
+  ##   disk (whatever it is — no comparison performed here).
   let path = depgraphPath(config)
   discarded = DepGraphDiscard(kind: dgdNone)
 
@@ -676,7 +767,7 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
     # attached to unblock `open()` on the FIFO's other end). Accepted: doing
     # so requires write access to crisol's own state dir, at which point an
     # attacker already has far more direct ways to disrupt this process.
-    return initDepGraph(nimVersion)
+    return initDepGraph("")
 
   var raw: string
   try:
@@ -693,45 +784,78 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
     let e = getCurrentException()
     discarded = DepGraphDiscard(kind: dgdMalformed,
                                 stored: "unreadable: " & e.msg)
-    return initDepGraph(nimVersion)
+    return initDepGraph("")
 
   var node: JsonNode
   try:
     node = parseJson(raw)
   except JsonParsingError as e:
     discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
-    return initDepGraph(nimVersion)
+    return initDepGraph("")
   except Exception as e:
     discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
-    return initDepGraph(nimVersion)
+    return initDepGraph("")
 
-  result = fromJson(node, nimVersion, discarded)
+  result = fromJson(node, discarded)
 
   # M10 soundness: re-validate closure paths from the on-disk graph.
-  # Drop any absolute path that does NOT resolve under the projectRoot.
-  # A tampered or corrupt depgraph could carry paths like "/etc/shadow",
-  # which would then be read by closureContentHash.  Relative paths are
-  # project-root-relative and are legitimate (they may not exist yet if a
-  # dep was deleted — that is handled by isEntryStale).
+  #
+  # Rule (issue #13.1): one rule for every closure path, absolute or
+  # relative alike. Normalize each path to a candidate absolute location —
+  # `p` itself if already absolute, else `projectRoot / p` — and keep the
+  # path (stored VERBATIM, exactly as read from disk) iff that candidate is
+  # projectRoot or a configured depRoot, or lives under one of them
+  # (`cand == root or cand.startsWith(root & DirSep)`). Everything else is
+  # dropped silently. `prNorm` and each depRoot are normalized ONCE per
+  # load, not once per path.
+  #
+  # Threat model: a tampered or corrupt depgraph file could carry an
+  # absolute path like "/etc/shadow", or — the #13.1 gap this closes — a
+  # RELATIVE path such as "../../etc/passwd" that `closureContentHash`
+  # would resolve via `projectRoot / relPath` to the very same place.
+  # Relative paths are project-root-relative BY CONTRACT (see
+  # closureContentHash, above, and DepGraphEntry.closure); admitting a
+  # relative path without normalizing and bounds-checking it first let a
+  # `..`-laden path escape the root exactly like an unchecked absolute one
+  # would, and the guard existed to prevent only the latter. A legitimate
+  # relative path that simply resolves inside the root (deleted deps
+  # included — that staleness is handled by `isEntryStale`, not here) is
+  # unaffected: it is still admitted, just via the same normalized
+  # bounds-check every path now goes through.
+  #
+  # Deliberately NOT applied: symlink/realpath resolution. The closure
+  # extractor's tracking policy (crisol/closure.underAnyRoot, and its
+  # callers' doc comments) is deliberately LEXICAL — a source file reached
+  # through a symlink inside a tracked root is recorded at its LEXICAL path
+  # and hashed THROUGH the link, by design (see closure.nim's discussion of
+  # `realEpDir`/`epDir` around the `@m`/`@p` resolution). Resolving
+  # symlinks here, at load time, would silently disagree with that: every
+  # legitimately symlinked-outside source would be dropped from the loaded
+  # closure, the loaded set would then miss what `closureContentHash` hashed
+  # at record time, the stored `closureHash` would never match again, and
+  # such a project would recompile on every single run — for no added
+  # defense, since a tampered depgraph only ever changes what gets HASHED
+  # (a comparison outcome), never what gets DISCLOSED to the caller; there
+  # is no channel here that reveals file contents. See
+  # tests/unit/test_soundness_m10.nim's symlink-retention blocks (issue
+  # #13.2) for the pin proving this stays lexical.
   let prNorm = config.projectRoot.absolutePath.normalizedPath
+  var rootsNorm = @[prNorm]
+  for dr in config.depRoots:
+    rootsNorm.add dr.absolutePath.normalizedPath
   for key in toSeq(result.entries.keys):
     var entry = result.entries[key]
     var filtered = initHashSet[string]()
     for p in entry.closure:
-      if p.isAbsolute:
-        # Keep only if it is under projectRoot (or a depRoot if configured).
-        var underRoot = p.startsWith(prNorm & $DirSep) or p == prNorm
-        if not underRoot:
-          for dr in config.depRoots:
-            let drNorm = dr.absolutePath.normalizedPath
-            if p.startsWith(drNorm & $DirSep) or p == drNorm:
-              underRoot = true
-              break
-        if underRoot:
-          filtered.incl p
-        # else: drop the suspicious absolute path silently
-      else:
-        filtered.incl p   # relative path: kept as-is (project-root-relative)
+      let cand = (if p.isAbsolute: p else: prNorm / p).normalizedPath
+      var underRoot = false
+      for root in rootsNorm:
+        if cand == root or cand.startsWith(root & $DirSep):
+          underRoot = true
+          break
+      if underRoot:
+        filtered.incl p   # kept VERBATIM — exactly as read from disk
+      # else: drop the escaping path silently (absolute or relative alike)
     # Defense in depth — see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE:
     # the writer refuses to record an empty closure, but if one reaches disk
     # anyway, treat it as absent so decideCompile/narrow re-derive it.
@@ -740,6 +864,59 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
       continue
     entry.closure = filtered
     result.entries[key] = entry
+
+proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDiscard): DepGraph =
+  ## Load the graph and apply the FRESHNESS view for `nimVersion` (the
+  ## caller's notion of "the current Nim version" — normally
+  ## `nimprobe.cachedNimFingerprint()`): loads the graph as persisted via
+  ## `loadStoredDepGraph`, then, if its header nimVersion does not match
+  ## `nimVersion`, discards it as stale and returns an empty graph stamped
+  ## with `nimVersion` instead of the stored value.
+  ##
+  ## This is the loader every consumer OTHER than `clean` must use (the
+  ## compile-avoidance/impact-analysis pipeline: `run`, `closure`, `list`,
+  ## ...) — a graph recorded under a different Nim compiler cannot be
+  ## trusted for staleness decisions, so it must be treated as absent.
+  ## `clean` uses `loadStoredDepGraph` directly instead (see its doc):
+  ## GCing the on-disk entry set must not depend on, or silently overwrite,
+  ## the recorded fingerprint.
+  ##
+  ## discarded reports WHY a persisted graph was discarded at load (dgdNone
+  ## when nothing was discarded); see `loadStoredDepGraph` for the
+  ## dgdMalformed/dgdFormatVersion/missing-file cases, all unchanged here.
+  ## On top of those, this proc adds:
+  ## - Stored nimVersion present (non-"") and different from `nimVersion` →
+  ##   empty graph stamped with `nimVersion`; dgdNimVersion(stored, current).
+  ## - Stored nimVersion "" with a NON-empty entries table (the
+  ##   loadStoredDepGraph missing-file/malformed/format-mismatch paths
+  ##   already return "" with zero entries, so this only fires for a
+  ##   genuinely-stored empty-string header — legacy/test data) and
+  ##   `nimVersion` also differs from "" → same treatment: dgdNimVersion.
+  ## - Otherwise (stored nimVersion == nimVersion, including "" == "") →
+  ##   loaded cleanly; whatever `loadStoredDepGraph` reported stands.
+  var stored = loadStoredDepGraph(config, discarded)
+  if discarded.kind != dgdNone:
+    # Already discarded by loadStoredDepGraph (missing file / malformed /
+    # format mismatch) — re-stamp the header with the REQUESTED version so
+    # the caller's "empty graph" carries the version it will compare
+    # against on the next write, exactly as before this refactor.
+    return initDepGraph(nimVersion)
+
+  # A mismatch is flagged only when it is OBSERVABLE: an inert empty-string
+  # header with zero entries is indistinguishable from "no file" (that is
+  # exactly what a missing file loads as via loadStoredDepGraph) and must
+  # stay dgdNone — otherwise a plain `--config` run with no depgraph yet
+  # would spuriously report a nimVersion discard on its very first run.
+  let mismatch = stored.header.nimVersion != nimVersion and
+                 (stored.entries.len > 0 or stored.header.nimVersion != "")
+  if mismatch:
+    discarded = DepGraphDiscard(kind: dgdNimVersion,
+                                stored: stored.header.nimVersion,
+                                current: nimVersion)
+    return initDepGraph(nimVersion)
+
+  stored.header.nimVersion = nimVersion
+  result = stored
 
 proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
   ## Load the graph, discarding load provenance. See the 3-arg overload

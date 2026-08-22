@@ -1308,6 +1308,14 @@ proc execute*(
                 let bname = binName(ep)
                 let stableBinDir = binPath(ep, config)
                 let stableBin    = stableBinDir / bname
+                # Invariant on exit from this block: either (the depgraph
+                # entry on disk matches the stable binary at `stableBin`) or
+                # (no stable binary exists at `stableBin`) — NEVER a binary
+                # whose provenance the on-disk depgraph does not describe
+                # (issue #13.3). A promotion or persist failure below always
+                # resolves toward "no stable binary" rather than leaving a
+                # binary paired with a stale or absent depgraph entry.
+                #
                 # Copy per-slot binary to the stable slug-keyed location.
                 # The stable binary is what decideCompile checks on future runs.
                 if slotBinCompiled.len > 0 and slotBinCompiled != stableBin:
@@ -1317,8 +1325,19 @@ proc execute*(
                     setFilePermissions(stableBin, {fpUserRead, fpUserWrite, fpUserExec,
                                                    fpGroupRead, fpGroupExec,
                                                    fpOthersRead, fpOthersExec})
-                  except:
-                    discard  # non-fatal
+                  except CatchableError as e:
+                    # Promotion failed partway (e.g. copyFile succeeded but
+                    # setFilePermissions did not) — whatever landed at
+                    # stableBin has unknown/partial content and no depgraph
+                    # entry describes it either way; discard it so the next
+                    # run starts from cdNeverBuilt instead of trusting it.
+                    # Not exercisable under test as root (chmod-based faults
+                    # do not fail for root); this is untested hardening.
+                    stderr.write("crisol: warning: " & ep.path &
+                                 ": could not promote its compiled binary (" &
+                                 e.msg & "); the previous binary was discarded\n")
+                    try: stderr.flushFile() except CatchableError: discard
+                    try: removeFile(stableBin) except CatchableError: discard
 
                 # Record the closure — recovery policy lives in recordClosure
                 # (see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE, and
@@ -1329,10 +1348,17 @@ proc execute*(
                                         sourceIndex)
                 closureRecorded = rec.ok
                 if not rec.ok:
+                  # The depgraph entry for this compile is either invalidated
+                  # or (on a persist failure) not reliably reflected on disk
+                  # at all — either way, the stable binary just promoted
+                  # above must not survive to be served by a future run
+                  # whose decideCompile can no longer be trusted to agree
+                  # with it (issue #13.3).
+                  try: removeFile(stableBin) except CatchableError: discard
                   stderr.write("crisol: warning: " & ep.path & ": could not record its " &
                                "source closure (" & rec.error & "); dependency record " &
-                               "invalidated — it will be recompiled and force-selected " &
-                               "next run\n")
+                               "invalidated and its binary was discarded — it will be " &
+                               "recompiled and force-selected next run\n")
                   try: stderr.flushFile() except CatchableError: discard
 
             # Clean up the per-slot bin dir after stable copy (M15).

@@ -6,6 +6,52 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### `crisol clean` dependency-graph GC now works on real graphs; failed persists can no longer leave a stale binary behind; load guard rejects relative `..` escapes (issues #12, #13)
+
+**`clean` GC was dark (#12).**  `cleanOrphans` loaded the graph with
+`loadDepGraph(config, "")`, and the loader discards the whole graph whenever
+the stored Nim fingerprint differs from the requested one — so on every real
+graph (always stamped with the probed fingerprint) `clean` saw zero entries,
+dropped nothing and reported `0 depgraph entry(ies)`.  The loader is now
+split by concern: `loadStoredDepGraph(config, discarded)` returns the graph
+exactly as persisted (format check + tamper guard, header preserved) and
+`loadDepGraph(config, nimVersion, discarded)` is that plus the freshness
+view (fingerprint mismatch → empty graph with `dgdNimVersion` provenance, as
+before).  `clean` uses the stored view, drops entries for deleted
+entrypoints, saves only when it dropped something and always writes the
+header back unchanged — the next `run` still compares against the real
+fingerprint.
+
+**A failed depgraph write no longer strands a binary (#13.3).**  The stable
+binary was promoted before the depgraph was persisted and `saveDepGraph`
+swallowed write errors, so a failed write left the OLD closure record on
+disk next to the NEW binary; reverting the edit that caused the recompile
+made the record hash fresh again and the binary built from the edited
+sources was served.  `saveDepGraph` now returns `bool`; `recordClosure`
+reports a failed persist as a recording failure (`dependency graph could not
+be persisted`); and the runner discards the stable binary whenever the
+closure could not be recorded for any reason (and whenever promotion itself
+fails, instead of ignoring it), so the next run starts from `cdNeverBuilt`.
+Invariant on disk after every compile: either the depgraph entry describes
+the stable binary, or there is no stable binary.  `clean` reports `0`
+dropped if its own save fails.
+
+**Load guard covers relative paths (#13.1).**  The on-disk guard that drops
+closure paths outside the tracked roots only examined absolute paths; a
+tampered graph could carry `../../etc/passwd` and `closureContentHash` would
+read it.  Every path is now resolved against the project root, normalized
+and required to land under the project root or a `dep-roots` entry; kept
+paths are stored verbatim.  No symlink resolution is applied (#13.2,
+decided against): the closure extractor's tracking policy is lexical — a
+symlinked source inside a tracked root is recorded at its lexical path and
+hashed through the link — so a realpath-resolving loader would drop every
+such file, break the stored hash and recompile those projects on every run,
+for no added defence (a tampered graph yields a hash, never content).  This
+is pinned by test.
+
+**Migration:** none — the graph format is unchanged (v4).  A `clean` after
+upgrading will drop the entries that earlier versions silently kept.
+
 ### BREAKING CHANGE — dependency graph format 4: closures cover every compile input; one-time full recompile (issue #11)
 
 **Prior behaviour:** the per-entrypoint source closure named Nim *module*

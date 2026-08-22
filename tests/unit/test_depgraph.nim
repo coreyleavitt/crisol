@@ -70,7 +70,7 @@ block test_round_trip:
 
   updateEntry(g, "tests/unit/test_foo.nim", fh1, closure1)
 
-  saveDepGraph(g, cfg)
+  doAssert saveDepGraph(g, cfg)
 
   let g2 = loadDepGraph(cfg, "2.2.10")
   assert g2.header.nimVersion == "2.2.10",
@@ -98,7 +98,7 @@ block test_atomic_valid_json:
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
   updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
-  saveDepGraph(g, cfg)
+  doAssert saveDepGraph(g, cfg)
 
   let depgraphPath = root / ".crisol" / "depgraph"
   assert fileExists(depgraphPath), "depgraph file not found after save"
@@ -130,7 +130,7 @@ block test_two_flaghashes_same_path:
   updateEntry(g, path, fh1, cl1)
   updateEntry(g, path, fh2, cl2)
 
-  saveDepGraph(g, cfg)
+  doAssert saveDepGraph(g, cfg)
   let g2 = loadDepGraph(cfg, "2.2.10")
 
   assert (path, fh1) in g2.entries, "entry fh1 not found"
@@ -152,7 +152,7 @@ block test_nim_version_mismatch_empty:
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
   updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
-  saveDepGraph(g, cfg)
+  doAssert saveDepGraph(g, cfg)
 
   # Load with a DIFFERENT nim version → should get empty graph
   let g2 = loadDepGraph(cfg, "2.4.0")
@@ -169,7 +169,7 @@ block test_nim_version_match_entries_present:
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
   updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
-  saveDepGraph(g, cfg)
+  doAssert saveDepGraph(g, cfg)
 
   let g2 = loadDepGraph(cfg, "2.2.10")
   assert g2.entries.len == 1, "expected 1 entry on nim-version match"
@@ -307,7 +307,7 @@ block test_saveDepGraph_symlink_write_through_protection:
   updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
 
   # Must not crash; sentinel must remain untouched.
-  saveDepGraph(g, cfg)
+  doAssert saveDepGraph(g, cfg)
 
   let sentinelContent = readFile(sentinel)
   assert sentinelContent == "ORIGINAL",
@@ -327,7 +327,7 @@ block test_saveDepGraph_normal_roundtrip_after_p5:
   cl.incl "tests/unit/test_p5.nim"
   updateEntry(g, "tests/unit/test_p5.nim", fh, cl)
 
-  saveDepGraph(g, cfg)
+  doAssert saveDepGraph(g, cfg)
 
   let g2 = loadDepGraph(cfg, "2.2.10")
   let key = ("tests/unit/test_p5.nim", fh)

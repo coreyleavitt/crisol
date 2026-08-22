@@ -201,13 +201,36 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   for ep in eps:
     currentKeys.incl (ep.path, flagHash(ep.flags))
 
-  var graph = loadDepGraph(config, "")   # nimVersion="" — we only GC, no freshness
+  # Load the graph AS PERSISTED (issue #12): `loadDepGraph`'s freshness view
+  # compares the stored header's nimVersion against a caller-supplied
+  # "current" version and discards the WHOLE graph on any mismatch. A graph
+  # written by the real pipeline is always stamped with the real probed Nim
+  # fingerprint (never ""), so a clean has no correct "current" version to
+  # pass — the freshness view would (and, before this fix, did) load a real
+  # graph as empty, GC nothing, and report 0 dropped no matter what was
+  # actually orphaned. `loadStoredDepGraph` never compares versions, so it
+  # cannot misfire this way.
+  var discarded: DepGraphDiscard
+  var graph = loadStoredDepGraph(config, discarded)
   let beforeCount = graph.entries.len
   gcDeletedEntrypoints(graph, currentKeys)
   let afterCount = graph.entries.len
-  let dropped = beforeCount - afterCount
-  if dropped > 0 or graph.entries.len > 0:
-    saveDepGraph(graph, config)
+  let gcCount = beforeCount - afterCount
+  # Save iff something was actually dropped. A clean with nothing to GC must
+  # not rewrite the depgraph file at all — in particular it must NEVER
+  # rewrite the header, which would silently replace the real recorded Nim
+  # fingerprint with whatever `loadStoredDepGraph` stamped an empty/discarded
+  # load with, corrupting the freshness check the next `run` performs.
+  #
+  # `dropped` (what the report claims) must reflect disk, not memory
+  # (issue #13.3, D4): if the save itself fails, the on-disk graph is
+  # unchanged, so the report must say 0 dropped rather than claim entries
+  # were GC'd that are still sitting on disk.
+  let dropped =
+    if gcCount > 0:
+      (if saveDepGraph(graph, config): gcCount else: 0)
+    else:
+      0
 
   # Step 5: GC result-cache (size + age LRU).
   let maxEntries = if config.maxCacheEntries > 0: config.maxCacheEntries

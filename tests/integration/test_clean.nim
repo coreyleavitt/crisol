@@ -292,7 +292,7 @@ suite "crisol clean — depgraph GC":
     # minimal real closure is the entrypoint itself.
     graph.updateEntry(keptPath,  fHash, toHashSet([keptPath]),  "", 1)
     graph.updateEntry(stalePath, fHash, toHashSet([stalePath]), "", 1)
-    saveDepGraph(graph, cfg)
+    doAssert saveDepGraph(graph, cfg)
 
     discard cleanOrphans(cfg)
 

@@ -121,7 +121,7 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
       compileTimeoutSecs: 60,
       maxOutputBytes:     65536,
     )
-    saveDepGraph(graph, cfg)
+    doAssert saveDepGraph(graph, cfg)
 
     # Git commit so there IS a HEAD, then clean tree.
     discard git(repo, "add -A")
