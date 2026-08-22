@@ -386,28 +386,6 @@ suite "render – memThrottleActive":
     let now = t0 + initDuration(milliseconds = 50)
     check memThrottleActive(some(t0), now, 100) == false
 
-# ---------------------------------------------------------------------------
-# sanitizeForTerminal — control/ANSI injection guard for untrusted-origin
-# diagnostic text (config warnings, on-disk state, manifests) before it
-# reaches stderr.
-# ---------------------------------------------------------------------------
-
-suite "render — sanitizeForTerminal":
-
-  test "replaces ESC/control bytes with '?', preserves '\\n', no truncation":
-    check sanitizeForTerminal("\e[31mred\e[0m\n") == "?[31mred?[0m\n"
-
-  test "plain text with no control bytes is unchanged":
-    check sanitizeForTerminal("unknown config key 'foo' in unit (ignored)") ==
-          "unknown config key 'foo' in unit (ignored)"
-
-  test "DEL (0x7f) is also replaced":
-    check sanitizeForTerminal("a\x7fb") == "a?b"
-
-# ---------------------------------------------------------------------------
-# renderClosure (crisol/closure/v1 human rendering)
-# ---------------------------------------------------------------------------
-
 suite "render — renderClosure":
 
   test "renders path, group, flagHash, closure files, and a distinct recorded/unrecorded marker":

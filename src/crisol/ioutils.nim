@@ -1,7 +1,17 @@
-## ioutils.nim — low-level POSIX I/O helpers shared by ledger and resultcache.
+## ioutils.nim — low-level POSIX I/O helpers shared by ledger and resultcache,
+## plus the one text sanitizer every user-facing stdout/stderr write uses.
 ##
-## This module is intentionally minimal: it imports only std/posix so it sits
-## at the very bottom of the crisol dependency graph and cannot create cycles.
+## This module is intentionally minimal: it imports only std/posix (and
+## std/os) so it sits at the very bottom of the crisol dependency graph and
+## cannot create cycles — which is also why `sanitizeControlBytes` lives
+## here rather than in render: crisol.nim, render.nim and depgraph.nim all
+## need it and depgraph must not depend on render.
+##
+## ## sanitizeControlBytes
+##
+## Per-line control-byte neutralizer for untrusted-origin diagnostic text
+## (config files, on-disk state, manifests) before it reaches a terminal or
+## CI log; see its doc comment for the exact byte policy.
 ##
 ## ## writeAllFd
 ##

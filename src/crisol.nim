@@ -37,7 +37,7 @@
 
 import std/[options, os, strutils]
 import std/posix
-import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe, render]
+import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe, render, ioutils]
 
 # O_NOFOLLOW is a Linux extension not declared in Nim's std/posix.
 # Pull it from <fcntl.h> via the emit+importc pattern.
@@ -292,21 +292,21 @@ proc takeConfigFlag(args: seq[string]; ci: var int; dest: var string): ConfigFla
     return cfoNotConfigFlag
 
 proc writeStderr(text: string) =
-  ## Sanitizes `text` (render.sanitizeForTerminal — a thin alias for
-  ## ioutils.sanitizeControlBytes) and writes it plus a trailing newline to
-  ## stderr.  This is the ONE write path for user-facing error/diagnostic
+  ## Sanitizes `text` (ioutils.sanitizeControlBytes — the one shared
+  ## primitive, also used by depgraph's header-field formatter) and writes it
+  ## plus a trailing newline to stderr.  This is the ONE write path for user-facing error/diagnostic
   ## text that may embed untrusted-origin content: `CrisolError.msg` (config
   ## errors legitimately embed nkdl's multi-line caret block —
-  ## sanitizeForTerminal preserves '\n' so that block's line structure
+  ## sanitizeControlBytes preserves '\n' so that block's line structure
   ## survives), `RunReport.error`, gate-skip lines, junit-write error
   ## messages, path-flag warnings, and `ConfigWarning.message`.
-  stderr.write(sanitizeForTerminal(text) & "\n")
+  stderr.write(sanitizeControlBytes(text) & "\n")
 
 proc writeStdout(text: string) =
   ## Same as `writeStderr` but for stdout — used for gate-skip lines, which
   ## `run` has always emitted on stdout and `closure` now matches (see
   ## CHANGELOG: gate-skip lines moved from stderr to stdout for `closure`).
-  stdout.write(sanitizeForTerminal(text) & "\n")
+  stdout.write(sanitizeControlBytes(text) & "\n")
 
 proc writeWarnings(ws: seq[ConfigWarning]) =
   ## Convenience: writes each ConfigWarning's message to stderr as

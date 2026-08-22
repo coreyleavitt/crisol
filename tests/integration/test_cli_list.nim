@@ -264,4 +264,4 @@ suite "crisol list — sanitized config-error diagnostics":
     let errText = readFile(errPath)
     check errText.len > 0   # sanity: the parse error did reach stderr
     for c in errText:
-      check (c == '\n') or (ord(c) >= 0x20)
+      check (c == '\n') or (ord(c) >= 0x20 and ord(c) != 0x7f)

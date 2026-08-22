@@ -333,7 +333,7 @@ suite "crisol closure — control-byte sanitization of config warnings":
     check "unk?key" in errText   # raw TAB sanitized to '?'
     check '\t' notin errText
     for c in errText:
-      check ord(c) >= 0x20 or c == '\n'
+      check (c == '\n') or (ord(c) >= 0x20 and ord(c) != 0x7f)
 
 # ---------------------------------------------------------------------------
 # `closure <path>` matching no entrypoint exits 3 with the same
@@ -467,7 +467,7 @@ group "unit" {
     let outText = readFile(outPath)
     check "skipped group \"un?it\"" in outText   # TAB sanitized to '?'
     for c in outText:
-      check (c == '\n') or (ord(c) >= 0x20)
+      check (c == '\n') or (ord(c) >= 0x20 and ord(c) != 0x7f)
     check readFile(errPath).len == 0   # nothing at all leaked to stderr
 
   test "usage text: closure path whose only match is gated out matches run's exit-0 contract, not the exit-3 no-match case":

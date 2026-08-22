@@ -206,22 +206,6 @@ proc countRecords(records: seq[TestRecord]): RecordCounts =
 # render — PURE
 # ---------------------------------------------------------------------------
 
-proc sanitizeForTerminal*(s: string): string =
-  ## Thin alias for `ioutils.sanitizeControlBytes` — kept as the exported
-  ## name here since call sites/tests already know `render.sanitizeForTerminal`.
-  ## See ioutils.sanitizeControlBytes's doc comment for the full threat model
-  ## (untrusted-origin diagnostic text: config files, on-disk state,
-  ## manifests) and the rationale for the two things this does NOT touch:
-  ## '\n' (preserved — some of this text is legitimately multi-line, e.g. a
-  ## config parse error's caret block) and bytes 0x80-0x9f (left alone —
-  ## ordinary UTF-8 continuation bytes, not interpretable C1 controls in a
-  ## UTF-8-mode terminal/CI log viewer). JSON output is exempt from all of
-  ## this — std/json already escapes control bytes correctly when
-  ## serializing a string. Every stdout/stderr write of untrusted-origin
-  ## text should route through this (or ioutils.sanitizeControlBytes
-  ## directly) first.
-  sanitizeControlBytes(s)
-
 proc gateSkipMessages*(gatedOut: seq[tuple[group: string; reason: string]]): seq[string] =
   ## PURE: convert a gatedOut list (from applyGates) into human-readable
   ## skip message lines.  Each line names the gated group and the reason.
