@@ -132,11 +132,27 @@ one-time recompile of entrypoints whose closure gained members.
   too (schema revision bumped to 2), mirroring `crisol/plan/v1`'s existing
   `gatedOut` array.
 - **run:** the zero-runnable "no entrypoints matched" branch (exit 3) now
-  populates `RunReport.plan`, so `run`'s stderr/JSON output for that branch
-  once again includes the plan-phase config warnings (including the
-  depgraph-discard warning) instead of silently dropping them. Previously
-  that branch built a bare `RunReport` without `plan`, so the CLI's
+  populates `RunReport.plan`, so its plan-phase config warnings (including
+  the depgraph-discard warning) reach stderr (and `RunReport.plan.warnings`
+  for library consumers) instead of being silently dropped. Previously that
+  branch built a bare `RunReport` without `plan`, so the CLI's
   `for w in rr.plan.warnings` loop had nothing to iterate.
+- **closure:** a positional `<entrypoint>` selection whose only match was
+  discovered but GATED OUT now prints the gate-skip diagnostic
+  (`skipped group "..." — ...`) to stderr in human (non-JSON) mode, mirroring
+  `run`'s `zrkAllGated` case. Previously `renderClosure` only walked
+  `.entries` and ignored `.gatedOut` entirely, so a fully-gated selection
+  exited 0 and printed nothing — a silent, empty-looking success
+  indistinguishable from an error swallowed upstream. `--json` mode was
+  unaffected: `crisol/closure/v1` already serializes `gatedOut`.
+- **security:** `ConfigWarning.message` — which can embed untrusted-origin
+  text verbatim (e.g. the raw KDL node name of an unrecognized config key) —
+  now reaches stderr control-byte-sanitized in `run`/`list`/`closure`, via a
+  new `render.sanitizeForTerminal`. Previously this sanitization existed
+  only for `depgraph.nim`'s own discard diagnostics; other `ConfigWarning`
+  producers (e.g. `config.nim`'s "unknown config key" message) and the
+  ad-hoc/ambiguous-path warning lines reached the terminal/CI log raw,
+  allowing control/ANSI injection from a hand-edited or foreign config file.
 
 ### Added
 

@@ -297,6 +297,45 @@ suite "crisol closure — ad-hoc / ambiguous path warnings":
     check "crisol: " & expected[0] in readFile(outPath)
 
 # ---------------------------------------------------------------------------
+# ConfigWarning.message can carry untrusted-origin text verbatim (e.g. the
+# raw KDL node name of an unrecognized config key) — it must reach stderr
+# control-byte-sanitized, same as depgraph.nim's own discard diagnostics.
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — control-byte sanitization of config warnings":
+
+  test "unknown config key containing a raw TAB byte reaches stderr sanitized (no control bytes but '\\n')":
+    ## nkdl (KDL v2) rejects the ESC byte (0x1b) literally ANYWHERE in a
+    ## document, including inside quoted strings — U+000E-U+001F is in its
+    ## disallowed-control-codepoint set, so a config key name can never
+    ## smuggle ESC through the parser.  TAB (0x09) IS accepted inside a
+    ## quoted node name, so it's the vehicle here for a control byte that
+    ## reaches ConfigWarning.message raw and must be sanitized before stderr.
+    let root = setUpProject()
+    defer: removeDir(root)
+
+    writeFile(root / "crisol.kdl",
+      "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n    \"unk\tkey\"\n}\n")
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_ctrlbyte_err.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["closure", "--all"]))
+    check code == 0
+
+    let errText = readFile(outPath)
+    check "unknown config key" in errText
+    check "unk?key" in errText   # raw TAB sanitized to '?'
+    check '\t' notin errText
+    for c in errText:
+      check ord(c) >= 0x20 or c == '\n'
+
+# ---------------------------------------------------------------------------
 # `closure <path>` matching no entrypoint exits 3 with the same
 # "no entrypoints matched" message `run` uses; `--all` with zero discovered
 # entrypoints stays exit 0 with an empty entries report.
@@ -356,6 +395,40 @@ group "unit" {
     check j["gatedOut"][0]["path"].getStr == "tests/unit/test_a.nim"
     check j["gatedOut"][0]["group"].getStr == "unit"
     check j["gatedOut"][0]["reason"].getStr.len > 0
+
+  test "closure <path> whose only match is gated out, non-JSON → exit 0, gate-skip line on stderr":
+    ## renderClosure ignores ClosureReport.gatedOut (it only walks .entries),
+    ## so the all-gated case previously printed NOTHING at all in human mode
+    ## — a silent, empty-looking success.  `run` mirrors the identical
+    ## zrkAllGated case with gateSkipMessages(...) lines; `closure`'s
+    ## non-JSON branch must do the same, to stderr, before the (possibly
+    ## empty) report.
+    let root = setUpProject()
+    defer: removeDir(root)
+
+    writeFile(root / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+    gate "CRISOL_CLOSURE_GATED_TEST_UNSET_XYZ_12345"
+}
+""")
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_gatedout_human_err.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["closure", "tests/unit/test_a.nim"]))
+    check code == 0
+
+    let errText = readFile(outPath)
+    # Stable substring: gateSkipMessages' own wording is
+    # `skipped group "<group>" — <reason>` — assert on the group-naming
+    # prefix rather than the (environment-dependent) reason text.
+    check "skipped group \"unit\"" in errText
 
   test "usage text: closure path whose only match is gated out matches run's exit-0 contract, not the exit-3 no-match case":
     let outPath = getTempDir() / "crisol_closure_usage_gated.txt"

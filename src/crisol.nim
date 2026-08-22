@@ -37,7 +37,7 @@
 
 import std/[options, os, strutils]
 import std/posix
-import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe]
+import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe, render]
 
 # O_NOFOLLOW is a Linux extension not declared in Nim's std/posix.
 # Pull it from <fcntl.h> via the emit+importc pattern.
@@ -254,28 +254,55 @@ proc computeColorEnabled(): bool =
   let tty = isatty(1.cint) != 0   # fd 1 = stdout
   shouldEnableColor(tty)
 
-proc takeConfigFlag(args: seq[string]; ci: var int; dest: var string): bool =
-  ## Parses `--config <path>` / `--config=<path>` at `args[ci]` — the caller
-  ## has already confirmed `args[ci]` is one of those two forms (`== "--config"`
-  ## or `.startsWith("--config=")`).  For the space-separated form, advances
-  ## `ci` past the consumed value token (so the caller's enclosing `while`
-  ## loop's `inc ci` lands past it, same as before this helper existed).
+type ConfigFlagOutcome = enum
+  cfoNotConfigFlag  ## `args[ci]` is not a `--config` flag at all — left
+                     ## completely untouched (`dest`/`ci` unchanged); the
+                     ## caller's other-flag handling runs in this case.
+  cfoTaken          ## `args[ci]` was `--config`/`--config=...` and `dest`
+                     ## was set.
+  cfoMissingValue    ## `args[ci]` was `--config`/`--config=` with a missing
+                     ## or empty value — the "--config requires a file path"
+                     ## error has already been written to stderr.
+
+proc takeConfigFlag(args: seq[string]; ci: var int; dest: var string): ConfigFlagOutcome =
+  ## Recognizes AND parses `--config <path>` / `--config=<path>` at
+  ## `args[ci]`, owning the whole branch (match condition, value extraction,
+  ## and the "--config requires a file path" error) so call sites don't
+  ## repeat any of it.
   ##
-  ## Sets `dest` and returns true on success.  Returns false (leaving `dest`
-  ## unchanged) when the value is missing (space-separated form with no next
-  ## token) or empty (`--config=` with nothing after the `=`) — the caller
-  ## then prints "crisol: --config requires a file path" and returns
-  ## ExitEnvironment, exactly as the inlined duplicate blocks did.
+  ## For the space-separated form, advances `ci` past the consumed value
+  ## token (so the caller's enclosing `while` loop's `inc ci` lands past it,
+  ## same as before this helper existed).
   let a = args[ci]
   if a == "--config":
     inc ci
     if ci >= args.len:
-      return false
+      stderr.write("crisol: --config requires a file path\n")
+      return cfoMissingValue
     dest = args[ci]
-    return true
+    return cfoTaken
+  elif a.startsWith("--config="):
+    let v = a[9..^1]   # strip "--config="
+    if v == "":
+      stderr.write("crisol: --config requires a file path\n")
+      return cfoMissingValue
+    dest = v
+    return cfoTaken
   else:
-    dest = a[9..^1]   # strip "--config="
-    return dest != ""
+    return cfoNotConfigFlag
+
+proc writeWarnings(ws: seq[ConfigWarning]) =
+  ## Writes each ConfigWarning's message to stderr as "warning: <msg>".
+  ## `w.message` can embed untrusted-origin text verbatim (e.g. the raw KDL
+  ## node name of an unrecognized config key), so it is routed through
+  ## render.sanitizeForTerminal before it ever reaches the terminal/CI log.
+  for w in ws:
+    stderr.write("warning: " & sanitizeForTerminal(w.message) & "\n")
+
+proc writeStderrLine(prefix, s: string) =
+  ## Writes `prefix & s & "\n"` to stderr with `s` routed through
+  ## render.sanitizeForTerminal first — see `writeWarnings`.
+  stderr.write(prefix & sanitizeForTerminal(s) & "\n")
 
 # ---------------------------------------------------------------------------
 # runMain — testable entry; returns the process exit code
@@ -350,15 +377,15 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     var ci = 0
     while ci < cleanArgs.len:
       let a = cleanArgs[ci]
-      if a == "--all":
-        doCleanAll = true
-      elif a == "--config" or a.startsWith("--config="):
-        if not takeConfigFlag(cleanArgs, ci, cleanCfgPath):
-          stderr.write("crisol: --config requires a file path\n")
+      case takeConfigFlag(cleanArgs, ci, cleanCfgPath)
+      of cfoTaken: discard
+      of cfoMissingValue: return ExitEnvironment
+      of cfoNotConfigFlag:
+        if a == "--all":
+          doCleanAll = true
+        else:
+          stderr.write("crisol: unknown flag for clean: '" & a & "'\n")
           return ExitEnvironment
-      else:
-        stderr.write("crisol: unknown flag for clean: '" & a & "'\n")
-        return ExitEnvironment
       inc ci
 
     let (cfg, _) = loadConfig(configPath = cleanCfgPath)
@@ -500,19 +527,19 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     var ci = 0
     while ci < closureArgs.len:
       let a = closureArgs[ci]
-      if a == "--all":
-        closureAll = true
-      elif a == "--json":
-        closureJson = true
-      elif a == "--config" or a.startsWith("--config="):
-        if not takeConfigFlag(closureArgs, ci, closureCfgPath):
-          stderr.write("crisol: --config requires a file path\n")
+      case takeConfigFlag(closureArgs, ci, closureCfgPath)
+      of cfoTaken: discard
+      of cfoMissingValue: return ExitEnvironment
+      of cfoNotConfigFlag:
+        if a == "--all":
+          closureAll = true
+        elif a == "--json":
+          closureJson = true
+        elif a.startsWith("-"):
+          stderr.write("crisol: unknown flag for closure: '" & a & "'\n")
           return ExitEnvironment
-      elif a.startsWith("-"):
-        stderr.write("crisol: unknown flag for closure: '" & a & "'\n")
-        return ExitEnvironment
-      else:
-        closurePaths.add a
+        else:
+          closurePaths.add a
       inc ci
 
     if closureAll and closurePaths.len > 0:
@@ -546,14 +573,13 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         stderr.write("crisol: internal error: " & e.msg & "\n")
         return ExitInternal
 
-    for w in cr.warnings:
-      stderr.write("warning: " & w.message & "\n")
+    writeWarnings(cr.warnings)
 
     # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles
     # paths, same as run/list.  closure has no --group flag, so withinGroups
     # is always empty here.
     for line in pathFlagsWarnings(cr.adHocPaths, cr.ambiguousPaths, @[]):
-      stderr.write("crisol: " & line & "\n")
+      writeStderrLine("crisol: ", line)
 
     # A positional <entrypoint>... selection that matched no discovered
     # entrypoint at all is a configuration error, same as `run` (exit 3).
@@ -571,6 +597,13 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       stdout.write(closureToJsonString(cr))
       stdout.write("\n")
     else:
+      # Mirror `run`'s zrkAllGated case: renderClosure only walks .entries,
+      # so an all-gated selection would otherwise print nothing at all in
+      # human mode.  Print the gate-skip lines (to stderr, since this is a
+      # diagnostic — renderClosure's report itself goes to stdout) before
+      # the (possibly empty) report.
+      for line in gateSkipMessages(cr.gatedOut):
+        stderr.write(line & "\n")
       stdout.write(renderClosure(cr))
     return ExitOk
 
@@ -917,12 +950,11 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         return ExitInternal
 
     # Emit config warnings.
-    for w in pr.warnings:
-      stderr.write("warning: " & w.message & "\n")
+    writeWarnings(pr.warnings)
 
     # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles paths.
     for line in pathFlagsWarnings(pr.adHocPaths, pr.ambiguousPaths, groupNames):
-      stderr.write("crisol: " & line & "\n")
+      writeStderrLine("crisol: ", line)
 
     if jsonMode:
       stdout.write(planToJsonString(pr))
@@ -939,12 +971,11 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
   let rr = runTests(opts)
 
   # Emit config warnings to stderr.
-  for w in rr.plan.warnings:
-    stderr.write("warning: " & w.message & "\n")
+  writeWarnings(rr.plan.warnings)
 
   # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles paths.
   for line in pathFlagsWarnings(rr.plan.adHocPaths, rr.plan.ambiguousPaths, groupNames):
-    stderr.write("crisol: " & line & "\n")
+    writeStderrLine("crisol: ", line)
 
   if rr.status == rsStructural:
     stderr.write("crisol: " & rr.error & "\n")

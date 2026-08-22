@@ -205,6 +205,24 @@ proc countRecords(records: seq[TestRecord]): RecordCounts =
 # render — PURE
 # ---------------------------------------------------------------------------
 
+proc sanitizeForTerminal*(s: string): string =
+  ## Replace every byte < 0x20 (control characters, including ESC 0x1b,
+  ## '\n', and '\t') and 0x7f (DEL) with '?'.  No truncation.
+  ##
+  ## Threat: diagnostic text written to stderr can originate from
+  ## untrusted-origin sources that were never meant to be terminal-safe —
+  ## config files (an unrecognized key's message embeds the raw KDL node
+  ## name verbatim), on-disk state, or externally supplied manifests.  Such
+  ## text can carry ANSI escape sequences or other control bytes; writing it
+  ## to a terminal or CI log raw enables control/ANSI injection (cursor
+  ## movement, screen clearing, spoofed prompts, or corrupted log capture).
+  ## Every stderr write of such text should route through this proc first.
+  ## JSON output is exempt — std/json already escapes control bytes
+  ## correctly when serializing a string.
+  result = newString(s.len)
+  for i, c in s:
+    result[i] = if ord(c) < 0x20 or ord(c) == 0x7f: '?' else: c
+
 proc gateSkipMessages*(gatedOut: seq[tuple[group: string; reason: string]]): seq[string] =
   ## PURE: convert a gatedOut list (from applyGates) into human-readable
   ## skip message lines.  Each line names the gated group and the reason.

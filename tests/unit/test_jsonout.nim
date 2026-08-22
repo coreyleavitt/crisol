@@ -1317,12 +1317,12 @@ suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
     check node["compile"]["segments"][0]["lowConfidence"].getBool == true
 
 # ---------------------------------------------------------------------------
-# T2 — closureToJson (crisol/closure/v1): schema/revision pin + full field
+# closureToJson (crisol/closure/v1): schema/revision pin + full field
 # serialization for both a recorded and an unrecorded ClosureEntry, plus the
 # warnings array.
 # ---------------------------------------------------------------------------
 
-suite "jsonout T2 — closureToJson (crisol/closure/v1)":
+suite "jsonout — closureToJson (crisol/closure/v1)":
 
   test "schema constants are the documented literals":
     check ClosureV1Schema == "crisol/closure/v1"

@@ -157,3 +157,43 @@ suite "crisol S4.4 — clean --config <path>":
 
     # The orphan should have been pruned from the custom state dir.
     check not dirExists(stateDir / "cache" / "orphan_aabbccdd")
+
+  test "clean --config=<path> (inline form) targets the state dir from that config":
+    let root = getTempDir() / ("crisol_s4_clean_eq_" & $getpid())
+    createDir(root)
+    defer: removeDir(root)
+
+    let customStateDir = ".mystate"
+    let cfgPath = root / "crisol_custom.kdl"
+    writeFile(cfgPath, "state-dir \"" & customStateDir & "\"\ngroup \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n")
+
+    let stateDir = root / customStateDir
+    createDir(stateDir / "cache")
+    createDir(stateDir / "cache" / "orphan_aabbccdd")
+
+    let unitDir = root / "tests" / "unit"
+    createDir(unitDir)
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let code = runMain(@["clean", "--config=" & cfgPath])
+    check code == 0
+    check not dirExists(stateDir / "cache" / "orphan_aabbccdd")
+
+  test "clean --config= (inline form, empty value) → exit 3":
+    var errText = ""
+    var code = 0
+    errText = captureStderr(proc() =
+      code = runMain(@["clean", "--config="]))
+    check code == 3
+    check "crisol: --config requires a file path" in errText
+
+  test "clean --config (space form, missing value) → exit 3":
+    var errText = ""
+    var code = 0
+    errText = captureStderr(proc() =
+      code = runMain(@["clean", "--config"]))
+    check code == 3
+    check "crisol: --config requires a file path" in errText
