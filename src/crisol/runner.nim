@@ -901,9 +901,16 @@ proc execute*(
 
   # issue #8: the source index used to resolve @p/@n closure entries is a
   # pure function of the source tree (config.projectRoot + config.depRoots),
-  # never of any single entrypoint/compile — build it ONCE per execute()
-  # call and thread it through every recordClosure call below.
-  let sourceIndex = buildSourceIndex(config)
+  # never of any single entrypoint/compile — build it at most ONCE per
+  # execute() call, lazily on the first closure recording, and thread it
+  # through every recordClosure call below. A run that compiles nothing
+  # (every entrypoint fresh or cached) never pays the walk.
+  var sourceIndex: SourceIndex
+  var sourceIndexBuilt = false
+  proc ensureSourceIndex() =
+    if not sourceIndexBuilt:
+      sourceIndex = buildSourceIndex(config)
+      sourceIndexBuilt = true
 
   # nimcache-persistence (RFC-0006): computed ONCE per execute() call, not
   # per slot/compile — both are pure functions of the plan/toolchain, never
@@ -1312,6 +1319,7 @@ proc execute*(
                 # Record the closure — recovery policy lives in recordClosure
                 # (see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE, and
                 # recordClosure's doc comment in depgraph.nim).
+                ensureSourceIndex()
                 let rec = recordClosure(graph, config, ep,
                                         slotCacheDir, bname, CrisolProtocolMajor,
                                         sourceIndex)
