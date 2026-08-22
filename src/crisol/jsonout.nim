@@ -92,7 +92,7 @@ const RunV1Schema* = "crisol/run/v1"
   ## Import crisol/api (or crisol/jsonout directly) to reference this constant
   ## rather than duplicating the string literal.
 
-const RunV1Revision* = 12
+const RunV1Revision* = 13
   ## Integer minor revision of the crisol/run/v1 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v1"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -164,6 +164,9 @@ const RunV1Revision* = 12
   ##                     `compile.objcache` optionally (as rev 10 always
   ##                     documented it) is unaffected by its permanent
   ##                     absence.
+  ##   rev 13 (#5)     — cacheDecision vocabulary: "closureUnrecorded" (fresh run;
+  ##                     store refused because the source closure could not be
+  ##                     recorded — see depgraph.recordClosure).
   ## A reader seeing `schemaRevision > RunV1Revision` treats the file as no-data
   ## (safe cold-start) — it was written by a newer crisol.
 
@@ -198,7 +201,7 @@ proc cacheDecisionString*(d: CacheDecision): string =
   ##   "closureUnrecorded" — fresh run; store refused because the entrypoint's
   ##                        source closure could not be recorded.
   case d
-  of cdmNotEligible:      "notEligible"
+  of cdmNotEligible:       "notEligible"
   of cdmHit:               "hit"
   of cdmStored:            "stored"
   of cdmKeyMiss:           "keyMiss"

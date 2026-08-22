@@ -100,7 +100,7 @@ suite "extractClosure — warm recompile (issue #5)":
     ## per-module: `.nim.c` ordinarily, `.nim.cpp` when the module has
     ## `{.importcpp.}` symbols (sfCompileToCpp — even under plain `nim c`),
     ## `.nim.m` for `{.importobjc.}`.  `link` then carries `@m<mod>.nim.cpp.o`
-    ## / `@m<mod>.nim.m.o` for such modules.  If moduleCPathOf only recognised
+    ## / `@m<mod>.nim.m.o` for such modules.  If moduleMangledNameOf only recognised
     ## `.nim.c.o`, these modules would be silently excluded from the closure:
     ## a non-empty closure still results (so the NONEMPTY-CLOSURE guard never
     ## fires), but edits to the dropped module never change closureHash —

@@ -1364,7 +1364,7 @@ proc execute*(
                 # so a consulted-but-not-stored result still reports its inputHash.
                 result[completedIdx].inputHash = inputHashes[completedIdx]
                 result[completedIdx].cacheDecision =
-                  if verdict.store and not closureRecorded: cdmClosureUnrecorded
+                  if verdict.store: cdmClosureUnrecorded   # else-branch ⇒ not closureRecorded
                   else: verdict.decision
             else:
               # Caching inactive: stamp the structural reason recorded at plan time.

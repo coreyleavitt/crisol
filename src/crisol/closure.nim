@@ -28,7 +28,7 @@
 ## ALSO be `@m`- or `@p`-mangled without naming a Nim module at all: a
 ## `{.compile: "foo.c".}`d external, for instance, appears as `@mfoo.c.o` —
 ## `@m`-prefixed, but no `.nim` component, so it names no source module.
-## `moduleCPathOf` (below) is the single place that applies this
+## `moduleMangledNameOf` (below) is the single place that applies this
 ## `.nim.{c,cpp,m}.o` contract.  For an entry that IS a module object, strip
 ## `.o` and the backend extension and the mangled name encodes the source
 ## location:
@@ -58,7 +58,7 @@
 ## slashes, matching the scheme used by `Entrypoint.path` and future
 ## dep-graph keys.  The entrypoint's own file is included (its object is in
 ## `link`).  External objects (`{.compile.}`d C/C++ files and foreign
-## libraries) are excluded by `moduleCPathOf`'s `.nim.{c,cpp,m}.o` filter —
+## libraries) are excluded by `moduleMangledNameOf`'s `.nim.{c,cpp,m}.o` filter —
 ## they may be `@m`-mangled too, but never end in `.nim.c.o` / `.nim.cpp.o` /
 ## `.nim.m.o`, so they never name a Nim module in the first place.
 ##
@@ -114,7 +114,7 @@ proc decodeBody(raw: string): string =
     .replace("@s", $DirSep)  # @s → path separator
     .replace("\x00", "@")    # restore literal @
 
-proc moduleCPathOf(objPath: string): string =
+proc moduleMangledNameOf(objPath: string): string =
   ## Maps one `link` object-file path to the mangled module name
   ## `resolveMangledAll` expects (the compile-unit basename with the backend
   ## extension and trailing `.o` already stripped, e.g. `@mfoo.nim`), or
@@ -141,7 +141,7 @@ proc moduleCPathOf(objPath: string): string =
 proc resolveMangledAll(mangledName: string;
                        entrypointPath: string;
                        roots: seq[string]): seq[string] =
-  ## Decode one mangled module name (`moduleCPathOf`'s output — the
+  ## Decode one mangled module name (`moduleMangledNameOf`'s output — the
   ## compile-unit basename with the backend extension and `.o` already
   ## stripped, e.g. `@mfoo.nim`) to zero or more absolute `.nim` candidate
   ## paths.
@@ -157,7 +157,7 @@ proc resolveMangledAll(mangledName: string;
   ##             ALL are recorded (over-selection) so a change to any copy triggers
   ##             re-selection.
   ## For anything else: empty list (conservative).
-  # `mangledName` is `moduleCPathOf`'s output — already ".nim.{c,cpp,m}.o"
+  # `mangledName` is `moduleMangledNameOf`'s output — already ".nim.{c,cpp,m}.o"
   # filtered, backend extension and ".o" stripped — so it is always
   # "<@m|@p><body>.nim" here; see that proc's doc comment for the
   # module-object contract this relies on.
@@ -299,10 +299,10 @@ proc extractClosure*(nimcacheDir: string;
   result = initHashSet[string]()
 
   for objPath in manifest.link:
-    # moduleCPathOf applies the ".nim.{c,cpp,m}.o" module-object contract:
+    # moduleMangledNameOf applies the ".nim.{c,cpp,m}.o" module-object contract:
     # only Nim-generated module objects satisfy it — a `{.compile.}`d C/C++
     # external or foreign object/archive names no Nim module and yields "".
-    let mangledName = moduleCPathOf(objPath)
+    let mangledName = moduleMangledNameOf(objPath)
     if mangledName == "": continue
 
     # R5+R7 fix: resolveMangledAll returns ALL candidate paths (possibly multiple

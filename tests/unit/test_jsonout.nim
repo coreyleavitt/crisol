@@ -1295,8 +1295,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunV1Revision was bumped again for RFC-0006 Stage R removal (compile.objcache no longer appears)":
-    check RunV1Revision == 12
+  test "RunV1Revision is 13 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\")":
+    check RunV1Revision == 13
 
   test "a compileBlock carrying the new per-segment fields threads through toJson opaquely (jsonout never inspects compile's internal shape)":
     var blk = newJObject()
