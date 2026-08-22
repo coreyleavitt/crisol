@@ -585,10 +585,10 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
 
     writeWarnings(cr.warnings)
 
-    # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles
-    # paths, same as run/list.  closure has no --group flag, so withinGroups
-    # is always empty here.
-    for line in pathFlagsWarnings(cr.adHocPaths, cr.ambiguousPaths, @[]):
+    # Issue #3 / RFC-0001:409: warn about ad-hoc gskFiles paths, same as
+    # run/list.  closure has no --group flag, so withinGroups is always
+    # empty here.
+    for line in pathFlagsWarnings(cr.adHocPaths, @[]):
       writeStderr("crisol: " & line)
 
     # A positional <entrypoint>... selection that matched no discovered
@@ -963,8 +963,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     # Emit config warnings.
     writeWarnings(pr.warnings)
 
-    # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles paths.
-    for line in pathFlagsWarnings(pr.adHocPaths, pr.ambiguousPaths, groupNames):
+    # Issue #3 / RFC-0001:409: warn about ad-hoc gskFiles paths.
+    for line in pathFlagsWarnings(pr.adHocPaths, groupNames):
       writeStderr("crisol: " & line)
 
     if jsonMode:
@@ -984,8 +984,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
   # Emit config warnings to stderr.
   writeWarnings(rr.plan.warnings)
 
-  # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles paths.
-  for line in pathFlagsWarnings(rr.plan.adHocPaths, rr.plan.ambiguousPaths, groupNames):
+  # Issue #3 / RFC-0001:409: warn about ad-hoc gskFiles paths.
+  for line in pathFlagsWarnings(rr.plan.adHocPaths, groupNames):
     writeStderr("crisol: " & line)
 
   if rr.status == rsStructural:

@@ -92,7 +92,7 @@ const RunV1Schema* = "crisol/run/v1"
   ## Import crisol/api (or crisol/jsonout directly) to reference this constant
   ## rather than duplicating the string literal.
 
-const RunV1Revision* = 13
+const RunV1Revision* = 14
   ## Integer minor revision of the crisol/run/v1 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v1"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -167,6 +167,11 @@ const RunV1Revision* = 13
   ##   rev 13 (#5)     — cacheDecision vocabulary: "closureUnrecorded" (fresh run;
   ##                     store refused because the source closure could not be
   ##                     recorded — see depgraph.recordClosure).
+  ##   rev 14 (#10)    — per-entrypoint `flags` (string array): the EFFECTIVE,
+  ##                     ordered compile-flag list (global then group) that
+  ##                     identifies this leg — the same path under two groups
+  ##                     with different flags is two rows.  Always present;
+  ##                     empty array when no flags.  Mirrors plan/v1 rev 3.
   ## A reader seeing `schemaRevision > RunV1Revision` treats the file as no-data
   ## (safe cold-start) — it was written by a newer crisol.
 
@@ -280,6 +285,10 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     let epNode = newJObject()
     epNode["path"]          = newJString(r.ep.path)
     epNode["group"]         = newJString(r.ep.group)
+    # rev 14 (issue #10): effective flags identify the leg (see plan/v1 rev 3).
+    let flagsNode = newJArray()
+    for f in r.ep.flags: flagsNode.add newJString(f)
+    epNode["flags"]         = flagsNode
     epNode["outcome"]       = newJString(outcomeString(r.outcome))
     epNode["exitCode"]      = newJInt(r.exitCode)
     if r.outcome == oSignal:
@@ -523,7 +532,7 @@ proc closureToJson*(r: ClosureReport): JsonNode =
   ## the project root, ABSOLUTE for files under a configured dep-root (see
   ## types.ClosureEntry.closure).
   ##
-  ## `ClosureReport.adHocPaths`/`.ambiguousPaths` are deliberately NOT
+  ## `ClosureReport.adHocPaths` is deliberately NOT
   ## serialized here — crisol/plan/v1's planToJson (planview.nim) does not
   ## serialize DiscoveredSet's equivalent fields either; the CLI prints them
   ## as stderr text (render.pathFlagsWarnings) instead, for both `run`/`list`

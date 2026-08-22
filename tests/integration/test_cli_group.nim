@@ -188,13 +188,13 @@ suite "crisol CLI — C2 --group / --all-groups":
   #    proof that giving both a path and --group no longer drops the group.
   # -------------------------------------------------------------------------
 
-  test "issue #3: --group narrows an ambiguous path to the NAMED group, not the first-declared one":
-    ## Two groups share an overlapping glob so the same path matches both.
-    ## "special" is declared FIRST (would win discover()'s first-match rule
-    ## with no narrowing); "unit" is declared second and is what --group asks
-    ## for. If crisol.nim silently drops --group when a path is also given
-    ## (the issue #3 bug), the plan reports group "special" (wrong). Threading
-    ## --group into GroupSelection.withinGroups must make it report "unit".
+  test "issue #3: --group narrows a multi-owner path to the NAMED group only":
+    ## Two groups share an overlapping glob so the same path matches both
+    ## (with no narrowing that is two legs, issue #10). "unit" is declared
+    ## second and is what --group asks for. If crisol.nim silently drops
+    ## --group when a path is also given (the issue #3 bug), the plan carries
+    ## both legs / the "special" leg (wrong). Threading --group into
+    ## GroupSelection.withinGroups must yield exactly the "unit" leg.
     let root = getTempDir() / ("crisol_c2_issue3_" & $getpid())
     createDir(root)
     defer: removeDir(root)

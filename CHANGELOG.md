@@ -6,6 +6,55 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### BREAKING CHANGE — an explicit path owned by several groups now runs every leg (issue #10)
+
+**Prior behaviour:** `crisol run <path>` / `crisol list <path>` where `<path>`
+matched the globs of more than one configured group resolved to the
+**first-declared** group only, and printed
+`crisol: path "..." matches multiple groups (a, b); using "a"` on stderr.
+
+**New behaviour:** the path runs once **per** owning group — one entrypoint
+("leg") per group, each under that group's effective flags — exactly what
+default discovery yields for that file. Nothing is reported as ambiguous;
+the plan listing shows each leg. `--group <name>` alongside the path narrows
+the candidate owners (unchanged). A path matched by no group is still ad hoc
+(global flags + the RFC-0001:409 warning, unchanged).
+
+**Rationale:** a group denotes (globs × flags), and an entrypoint's identity is
+(path, flags). The same file under two flag-sets is two distinct entrypoints —
+separately compiled, cached, reported and impact-selected. Naming the file
+selects the file; silently keeping one leg and dropping the rest turned a
+matrix into a hidden choice (`crisol run tests/unit/test_x.nim` "passed" while
+the orc leg never ran). Running every leg is the only reading under which an
+explicit path and `crisol run` agree on what that file's tests are.
+
+**Migration:** to run one leg of a multi-group file, add `--group <name>`.
+Library embedders: `DiscoveredSet`/`PlanReport`/`ClosureReport` lose
+`ambiguousPaths`, the `AmbiguousPath` type is gone, and
+`render.pathFlagsWarnings` no longer takes it (`pathFlagsWarnings(adHocPaths,
+withinGroups)`).
+
+### Fixed — positional glob selectors now inherit group flags; repeated selectors do not double-schedule
+
+`crisol run 'tests/unit/test_*.nim'` matched the glob as a literal string
+against each group's globs, so it never attributed to a group and ran every
+file ad hoc with global flags only (the issue #3 flag drop surviving for glob
+selectors). Selectors are now expanded to concrete files first and each file
+is attributed to its owning group(s); a selector matching nothing on disk is
+still reported as before. Discovery also dedups by entrypoint identity
+(path, group), so naming a file twice — or a path plus a glob covering it —
+schedules each leg once.
+
+### Changed — plan/v1 rev 3 and run/v1 rev 14 carry each leg's `flags` (issue #10)
+
+Every entrypoint object in `crisol list --json` / `run --dry-run --json`
+(`crisol/plan/v1`, `schemaRevision` 2 → 3) and in `crisol run --json` /
+`lastrun.json` (`crisol/run/v1`, 13 → 14) gains `"flags": [...]` — the
+effective, ordered compile-flag list (global then group) that identifies the
+leg; always present, empty array when none. The human `crisol list` row is
+now `path  [group]  <flags>  decision` (flags omitted when empty). Additive;
+older readers are unaffected.
+
 ### BREAKING CHANGE — `--base` without `--changed` is now an error (exit 3)
 
 **Prior behaviour:** `crisol run --base <ref>` without `--changed` emitted a

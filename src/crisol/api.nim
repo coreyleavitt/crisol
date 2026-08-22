@@ -68,7 +68,6 @@ export types.TestRecord
 export types.RecordStatus
 export types.Summary
 export types.GatedEntry
-export types.AmbiguousPath
 export types.ConfigWarning
 export types.ClosureEntry
 export types.ClosureReport
@@ -255,9 +254,6 @@ type
     settings*:    ResolvedSettings
     adHocPaths*:     seq[string]   ## Issue #3 / RFC-0001:409: gskFiles paths that
                                    ## matched no candidate group (ran ad-hoc, global flags).
-    ambiguousPaths*: seq[AmbiguousPath]
-                                   ## Issue #3: gskFiles paths that matched more than one
-                                   ## candidate group; the first (config order) was used.
 
   ZeroRunnableReason* = enum
     zrkNone           ## not a zero-runnable outcome (normal run)
@@ -468,7 +464,6 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     warnings:    warnings,
     settings:    settings,
     adHocPaths:     pv.adHocPaths,
-    ambiguousPaths: pv.ambiguousPaths,
   )
   PlanImplResult(pr: pr, cfg: cfg, pv: pv, useFailed: useFailed, useChanged: useChanged)
 
@@ -531,7 +526,6 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
     entries:        entries,
     warnings:       impl.pr.warnings,
     adHocPaths:     impl.pr.adHocPaths,
-    ambiguousPaths: impl.pr.ambiguousPaths,
     gatedOut:       impl.pr.gatedOut,
   )
 

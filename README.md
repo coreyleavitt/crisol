@@ -141,8 +141,8 @@ crisol --version | -V | version
 
 | Flag | Effect |
 |---|---|
-| `<path>...` | Restrict discovery to these paths or globs (overrides config globs). |
-| `--group <name>` | Run only the named group(s); repeatable. Mutually exclusive with `--all-groups`. |
+| `<path>...` | Restrict discovery to these paths or globs. Each path resolves to its owning group(s): a path matched by one group runs with that group's flags; a path matched by **several** groups runs once **per** group (one leg per flag-set — the matrix, not a collapse of it); a path matched by no group runs ad hoc with global flags plus a warning. |
+| `--group <name>` | Run only the named group(s); repeatable. Mutually exclusive with `--all-groups`. Alongside `<path>...`, narrows the candidate owners for those paths (a multi-group path to one leg). |
 | `--all-groups` | Include opt-in groups (gates still apply). Mutually exclusive with `--group`. |
 
 ### Additional flags for `run`
@@ -165,6 +165,8 @@ crisol --version | -V | version
 | Flag | Effect |
 |---|---|
 | `--json` | Emit machine-readable `crisol/plan/v1` JSON to stdout. |
+
+Each plan row is one leg — `path  [group]  <effective flags>  decision` — and the JSON entrypoint carries `flags` (the effective global-then-group list, in compile order). The same path under two groups with different flags is two rows.
 
 ### Exit-code table
 
@@ -218,7 +220,22 @@ Groups are declared with `group "name" { ... }`. At least one group is required 
 | `gate` | string | (none) | Environment variable name. If the variable is unset or empty at runtime, the group is skipped (not an error). |
 | `timeout-secs` | int | global value | Per-entrypoint timeout override for this group. `0` = inherit global. |
 | `max-jobs` | int | (none = uncapped) | Cap the number of parallel slots used by this group. Absent = uncapped; `1` = serial. `0` is a config error — use absence to express uncapped. |
-| `flags` | strings | (none) | Extra Nim compile flags for this group (appended after global flags). |
+| `flags` | strings | (none) | Extra Nim compile flags for this group (appended after global flags; repeatable, each node appends). |
+
+A group denotes **globs × flags**: an entrypoint's identity is (path, effective flags), so the same files under two groups with different `flags` are two distinct entrypoints — separately compiled (own binary, own nimcache), separately cached, separately reported, and separately selected by `--changed` (each leg's import closure comes from its own compile, so a `when defined(foo)` import is in the `-d:foo` leg's closure only). This is how a config expresses a CI matrix:
+
+```kdl
+group "unit-refc" {
+    globs "tests/unit/test_*.nim"
+    flags "-d:debug" "--mm:refc"
+}
+group "unit-orc" {
+    globs "tests/unit/test_*.nim"
+    flags "-d:debug" "--mm:orc"
+}
+```
+
+`crisol run` runs both legs; `crisol run --group unit-orc` runs one; `crisol run tests/unit/test_x.nim` runs that file under both (add `--group` to pick one). Per-group flags only append to the global set — a group that needs to escape a global flag argues for not making it global.
 
 ### Group-selection model
 

@@ -43,7 +43,7 @@
 ## `schema` string, and `loadLastPlan` — a forward/backward-tolerant reader
 ## symmetric with jsonout.loadLastRun.
 
-import std/[json, options, os, sets]
+import std/[json, options, os, sets, strutils]
 import crisol/[types, config, render]
 
 # GatedEntry is defined in types.nim and re-exported from there.
@@ -57,13 +57,16 @@ const PlanV1Schema* = "crisol/plan/v1"
   ## Import crisol/api (or crisol/planview directly) to reference this constant
   ## rather than duplicating the string literal.
 
-const PlanV1Revision* = 2
+const PlanV1Revision* = 3
   ## Integer minor revision of the crisol/plan/v1 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/plan/v1"; this integer is bumped each time
   ## additive optional fields land so a consumer can gate on feature presence
   ## (`schemaRevision >= 2`) without substring-parsing.  Current = max known.
   ##   rev 1 (implicit) — original B6 fields.
   ##   rev 2           — edCached decision string ("cached") representable.
+  ##   rev 3           — per-entrypoint `flags` (issue #10): the EFFECTIVE,
+  ##                     ordered compile-flag list (global then group) that
+  ##                     identifies this leg — exactly what `slug` hashes.
   ## A reader seeing `schemaRevision > PlanV1Revision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.
 
@@ -127,8 +130,15 @@ proc renderPlan*(plan: RunPlan; gatedOut: seq[GatedEntry];
         of edStale:      col(lbl, Ansi_Yellow, color)
         of edRunFresh:   col(lbl, Ansi_Green, color)
         of edCached:     col(lbl, Ansi_Cyan, color)
+      # Issue #10: the same path under two groups with different flags is two
+      # legs; the row carries the leg's effective flags (compile order) so the
+      # two are distinguishable without the config.  Omitted when empty.
+      let flagsCol =
+        if pep.ep.flags.len > 0: col("  " & pep.ep.flags.join(" "), Ansi_Dim, color)
+        else: ""
       buf.add "  " & pep.ep.path &
               col("  [" & pep.ep.group & "]", Ansi_Dim, color) &
+              flagsCol &
               "  " & labelCol & "\n"
   else:
     buf.add col("Planned entrypoints: none", Ansi_Dim, color) & "\n"
@@ -178,6 +188,12 @@ proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
     let epNode = newJObject()
     epNode["path"]         = newJString(pep.ep.path)
     epNode["group"]        = newJString(pep.ep.group)
+    # rev 3 (issue #10): effective flags identify the leg — (path, flags) is
+    # the entrypoint identity, and the same path under two groups with
+    # different flags is two rows.  Ordered as compiled: global then group.
+    let flagsNode = newJArray()
+    for f in pep.ep.flags: flagsNode.add newJString(f)
+    epNode["flags"]        = flagsNode
     epNode["decision"]     = newJString(decisionStringEd(pep.edecision))
     epNode["reason"]       = newJString(pep.reason)
     epNode["runTimeoutMs"] = newJInt(pep.runTimeoutMs)

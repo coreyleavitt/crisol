@@ -172,14 +172,16 @@ suite "gskFiles – withinGroups path outside the named group is ad-hoc":
     check ds.adHocPaths == @["tests/other/test_z.nim"]
 
 # ---------------------------------------------------------------------------
-# Behavior 6: a path matching TWO candidate groups (declared "unit" then
-# "all-tests", with differing flags) resolves to the FIRST declared ("unit")
-# AND is recorded as ambiguous so the CLI can warn about it.
+# Behavior 6 (issue #10 supersedes issue #3's first-declared-wins rule): a path
+# matching TWO candidate groups (declared "unit" then "all-tests", with
+# differing flags) is TWO legs — one entrypoint per owning group, each under
+# that group's flags, exactly as default discovery would yield for the file.
+# Nothing is "ambiguous" and nothing is recorded for warning.
 # ---------------------------------------------------------------------------
 
-suite "gskFiles – ambiguous multi-match":
-  test "path matching two candidate groups picks the first declared, records ambiguity":
-    let root = makeTempRoot("ambiguous")
+suite "gskFiles – path owned by several groups":
+  test "path matching two candidate groups yields one leg per group, in declaration order":
+    let root = makeTempRoot("multileg")
     defer: cleanupDir(root)
 
     writeFixture(root, "tests/unit/test_a.nim")
@@ -193,47 +195,104 @@ suite "gskFiles – ambiguous multi-match":
     let ds  = discover(cfg, sel)
     let eps = applyGates(ds, cfg, initGateState([])).run
 
+    check eps.len == 2
+    check eps.mapIt((it.group, it.flags)) == @[
+      ("all-tests", @["-d:allDefine"]),
+      ("unit",      @["-d:unitDefine"]),
+    ]  # discover() sorts by (path, group)
+    check ds.adHocPaths.len == 0
+
+  test "--group narrows a multi-owner path to the named leg":
+    let root = makeTempRoot("multileg_narrow")
+    defer: cleanupDir(root)
+
+    writeFixture(root, "tests/unit/test_a.nim")
+
+    let cfg = makeConfig(root, @[
+      Group(name: "unit",      globs: @["tests/unit/test_*.nim"], flags: @["-d:unitDefine"]),
+      Group(name: "all-tests", globs: @["tests/**/test_*.nim"],   flags: @["-d:allDefine"]),
+    ])
+
+    let sel = GroupSelection(kind: gskFiles, paths: @["tests/unit/test_a.nim"],
+                             withinGroups: @["all-tests"])
+    let eps = applyGates(discover(cfg, sel), cfg, initGateState([])).run
+
     check eps.len == 1
-    check eps[0].group == "unit"
-    check eps[0].flags == @["-d:unitDefine"]
-    check ds.ambiguousPaths.len == 1
-    check ds.ambiguousPaths[0].path == "tests/unit/test_a.nim"
-    check ds.ambiguousPaths[0].groups == @["unit", "all-tests"]
+    check eps[0].group == "all-tests"
+    check eps[0].flags == @["-d:allDefine"]
+
+  test "a positional GLOB selector attributes each matched file to its owning group(s)":
+    ## A glob given on the CLI is expanded to files first; each file then
+    ## inherits its owner's flags — a glob is never matched as a literal
+    ## string against group globs (which silently made it ad hoc, global
+    ## flags only).
+    let root = makeTempRoot("glob_selector")
+    defer: cleanupDir(root)
+
+    writeFixture(root, "tests/unit/test_a.nim")
+    writeFixture(root, "tests/unit/test_b.nim")
+    writeFixture(root, "tests/other/test_z.nim")
+
+    let cfg = makeConfig(root, @[
+      Group(name: "unit", globs: @["tests/unit/test_*.nim"], flags: @["-d:unitDefine"]),
+    ])
+
+    let sel = GroupSelection(kind: gskFiles, paths: @["tests/**/test_*.nim"])
+    let ds  = discover(cfg, sel)
+    let eps = applyGates(ds, cfg, initGateState([])).run
+
+    check eps.mapIt((it.path, it.group, it.flags)) == @[
+      ("tests/other/test_z.nim", "paths", cfg.flags),
+      ("tests/unit/test_a.nim",  "unit",  @["-d:unitDefine"]),
+      ("tests/unit/test_b.nim",  "unit",  @["-d:unitDefine"]),
+    ]
+    check ds.adHocPaths == @["tests/other/test_z.nim"]
+
+  test "naming the same file twice (path + covering glob) yields one leg per owner, no duplicates":
+    ## Entrypoint identity is (path, group): two selectors resolving to the
+    ## same file under the same owner must not schedule that leg twice.
+    let root = makeTempRoot("multileg_dedup")
+    defer: cleanupDir(root)
+
+    writeFixture(root, "tests/unit/test_a.nim")
+
+    let cfg = makeConfig(root, @[
+      Group(name: "unit",      globs: @["tests/unit/test_*.nim"], flags: @["-d:unitDefine"]),
+      Group(name: "all-tests", globs: @["tests/**/test_*.nim"],   flags: @["-d:allDefine"]),
+    ])
+
+    let sel = GroupSelection(kind: gskFiles,
+                             paths: @["tests/unit/test_a.nim", "tests/unit/*.nim"])
+    let eps = applyGates(discover(cfg, sel), cfg, initGateState([])).run
+
+    check eps.mapIt((it.path, it.group)) == @[
+      ("tests/unit/test_a.nim", "all-tests"),
+      ("tests/unit/test_a.nim", "unit"),
+    ]
 
 # ---------------------------------------------------------------------------
 # Behavior 7 (CLI warnings, pure helper): pathFlagsWarnings() turns discovery
-# data (adHocPaths/ambiguousPaths) into human-readable RFC-0001:409 warning
+# data (adHocPaths) into human-readable RFC-0001:409 warning
 # lines — same pattern as render.gateSkipMessages.  crisol.nim prints these
 # to stderr; the formatting itself is unit-tested here, pure, no I/O.
 # ---------------------------------------------------------------------------
 
 suite "pathFlagsWarnings – pure helper":
   test "ad-hoc path with no --group in effect: 'matched no configured group'":
-    let msgs = pathFlagsWarnings(adHocPaths = @["tests/adhoc/test_a.nim"],
-                                  ambiguousPaths = @[])
+    let msgs = pathFlagsWarnings(adHocPaths = @["tests/adhoc/test_a.nim"])
     check msgs.len == 1
     check "tests/adhoc/test_a.nim" in msgs[0]
     check "matched no configured group" in msgs[0]
 
   test "ad-hoc path WITH --group in effect: names the group mismatch":
     let msgs = pathFlagsWarnings(adHocPaths = @["tests/other/test_z.nim"],
-                                  ambiguousPaths = @[],
                                   withinGroups = @["unit"])
     check msgs.len == 1
     check "tests/other/test_z.nim" in msgs[0]
     check "unit" in msgs[0]
 
-  test "ambiguous path: names all matching groups and the one used":
-    let msgs = pathFlagsWarnings(adHocPaths = @[],
-                                  ambiguousPaths = @[(path: "tests/unit/test_a.nim",
-                                                       groups: @["unit", "all-tests"])])
-    check msgs.len == 1
-    check "tests/unit/test_a.nim" in msgs[0]
-    check "unit" in msgs[0]
-    check "all-tests" in msgs[0]
-
-  test "no ad-hoc, no ambiguous → empty result":
-    check pathFlagsWarnings(adHocPaths = @[], ambiguousPaths = @[]).len == 0
+  test "no ad-hoc paths → empty result":
+    check pathFlagsWarnings(adHocPaths = @[]).len == 0
 
 # ---------------------------------------------------------------------------
 # Behavior 10 (follow-up): an UNKNOWN --group name alongside a positional path

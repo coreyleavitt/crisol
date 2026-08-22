@@ -46,9 +46,6 @@ type
     warnings*: seq[ConfigWarning]  ## config warnings (unknown keys etc.) from loadConfig
     adHocPaths*:     seq[string]   ## Issue #3 / RFC-0001:409: from discover()'s gskFiles
                                    ## resolution — paths that matched no candidate group.
-    ambiguousPaths*: seq[tuple[path: string; groups: seq[string]]]
-                                   ## Issue #3: paths that matched more than one candidate
-                                   ## group; the first (config order) was used.
 
 # ---------------------------------------------------------------------------
 # buildRunPlan — the SHARED pure plan phase
@@ -183,5 +180,4 @@ proc buildRunPlan*(
     graph:    graph,
     warnings: planWarnings,
     adHocPaths:     discovered.adHocPaths,
-    ambiguousPaths: discovered.ambiguousPaths,
   )

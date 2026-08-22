@@ -315,6 +315,23 @@ suite "jsonout A8 — cache reporting fields":
     check node["schemaRevision"].getInt == RunV1Revision
     check RunV1Revision >= 2
 
+  test "issue #10 (rev 14): each entrypoint carries its effective flags, identifying the leg":
+    ## The same path under two groups with different flags is two legs; a
+    ## result row must identify its leg without the config, so it carries the
+    ## effective (global-then-group) flag list exactly as compiled.
+    var legA = liveResult()
+    legA.ep = Entrypoint(path: "tests/unit/test_probe.nim", group: "unit-a",
+                         flags: @["-d:common", "-d:legA"])
+    var legB = liveResult()
+    legB.ep = Entrypoint(path: "tests/unit/test_probe.nim", group: "unit-b",
+                         flags: @["-d:common", "-d:legB"])
+    let node = toJson(@[legA, legB], Summary(total: 2, passed: 2))
+    check node["schemaRevision"].getInt >= 14
+    check node["entrypoints"][0]["flags"] == %*["-d:common", "-d:legA"]
+    check node["entrypoints"][1]["flags"] == %*["-d:common", "-d:legB"]
+    # A flagless entrypoint reports an empty array, not an absent key.
+    check toJson(@[liveResult()], Summary(total: 1, passed: 1))["entrypoints"][0]["flags"] == %*[]
+
   test "each entrypoint carries cached boolean (absence-default false)":
     let node = toJson(@[cachedResult(), liveResult()], Summary(total: 2, passed: 2))
     check node["entrypoints"][0]["cached"].getBool == true
@@ -1295,8 +1312,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunV1Revision is 13 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\")":
-    check RunV1Revision == 13
+  test "RunV1Revision is 14 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags)":
+    check RunV1Revision == 14
 
   test "a compileBlock carrying the new per-segment fields threads through toJson opaquely (jsonout never inspects compile's internal shape)":
     var blk = newJObject()

@@ -224,30 +224,27 @@ proc gateSkipMessages*(gatedOut: seq[GatedEntry]): seq[string] =
   gateSkipMessages(deduped)
 
 proc pathFlagsWarnings*(adHocPaths: seq[string];
-                         ambiguousPaths: seq[AmbiguousPath];
                          withinGroups: seq[string] = @[]): seq[string] =
-  ## PURE: convert DiscoveredSet.adHocPaths/ambiguousPaths (from a gskFiles
-  ## discover()) into human-readable RFC-0001:409 warning lines.  Same pattern
-  ## as gateSkipMessages — discover() stays pure; this is the only place the
-  ## data is turned into text, and the CLI is the only place that text is
-  ## written to stderr.
+  ## PURE: convert DiscoveredSet.adHocPaths (from a gskFiles discover()) into
+  ## human-readable RFC-0001:409 warning lines.  Same pattern as
+  ## gateSkipMessages — discover() stays pure; this is the only place the data
+  ## is turned into text, and the CLI is the only place that text is written
+  ## to stderr.
   ##
-  ##   adHocPaths     — paths that matched no candidate group; ran with global
-  ##                    flags under the ad-hoc "paths" group.  When
-  ##                    `withinGroups` is non-empty (a --group was given
-  ##                    alongside the path), the message names the mismatch
-  ##                    against those groups rather than "no configured group".
-  ##   ambiguousPaths — paths that matched more than one candidate group; the
-  ##                    FIRST (config-declaration order) was used to run it.
+  ##   adHocPaths   — paths that matched no candidate group; ran with global
+  ##                  flags under the ad-hoc "paths" group.  When
+  ##                  `withinGroups` is non-empty (a --group was given
+  ##                  alongside the path), the message names the mismatch
+  ##                  against those groups rather than "no configured group".
+  ##
+  ## A path owned by several groups is not warned about: it runs as one leg
+  ## per owning group (issue #10), which the plan listing shows explicitly.
   for p in adHocPaths:
     if withinGroups.len > 0:
       result.add "path \"" & p & "\" is not in group " & withinGroups.join(", ") &
                  "; using global flags"
     else:
       result.add "path \"" & p & "\" matched no configured group; using global flags"
-  for a in ambiguousPaths:
-    result.add "path \"" & a.path & "\" matches multiple groups (" &
-               a.groups.join(", ") & "); using \"" & a.groups[0] & "\""
 
 proc render*(results: seq[EntrypointResult]; summary: Summary;
              opts: RenderOpts): string =

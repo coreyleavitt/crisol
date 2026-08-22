@@ -285,7 +285,7 @@ suite "crisol closure — ad-hoc / ambiguous path warnings":
     # discover() records it as an ad-hoc path.
     writeF(root, "scripts/adhoc.nim", "doAssert true\n")
 
-    let expected = pathFlagsWarnings(@["scripts/adhoc.nim"], @[], @[])
+    let expected = pathFlagsWarnings(@["scripts/adhoc.nim"], @[])
     check expected.len == 1
 
     let outPath = getTempDir() / "crisol_closure_adhoc_err.txt"

@@ -289,6 +289,22 @@ suite "planview A8 — edCached + schemaRevision":
     check "tests/unit/test_cached.nim" in s
     check "cached" in s.toLowerAscii
 
+  test "issue #10: a leg's row shows its effective flags between group and decision":
+    ## The same path under two groups with different flags is two legs; the
+    ## human listing must let a reader tell them apart without consulting the
+    ## config, so each row carries the leg's effective flags (in compile order)
+    ## after the group.  Rows with no flags keep the original two-column form.
+    var legA = mkPep("tests/unit/test_probe.nim", "unit-a", cdNeverBuilt)
+    legA.ep.flags = @["-d:common", "-d:legA"]
+    var legB = mkPep("tests/unit/test_probe.nim", "unit-b", cdStale)
+    legB.ep.flags = @["-d:common", "-d:legB"]
+    let plan = RunPlan(jobs: 1, entrypoints: @[
+      legA, legB, mkPep("tests/unit/test_plain.nim", "unit", cdSkipFresh)])
+    let s = renderPlan(plan, @[], RenderOpts(color: false, slowestN: 5))
+    check "  tests/unit/test_probe.nim  [unit-a]  -d:common -d:legA  never built (would compile)\n" in s
+    check "  tests/unit/test_probe.nim  [unit-b]  -d:common -d:legB  would compile\n" in s
+    check "  tests/unit/test_plain.nim  [unit]  binary fresh — would skip compile\n" in s
+
   test "renderPlan human output for non-cached decisions stays stable":
     let s = renderPlan(samplePlan(), sampleGated(),
                        RenderOpts(color: false, slowestN: 5))
