@@ -45,14 +45,17 @@
 ##
 ## Two prefixes matter:
 ##
-## - `@m<body>` — body is a path relative to the *entrypoint's source
-##   directory* (not the CWD).  Candidate = normalize(entrypointDir / body).
-##   When the resolved module is reached through a symlinked root (e.g. a
-##   depRoot symlinked into milpa's CAS) and the entrypoint is shallow
-##   enough that `@m` still beats `@p`, this normalized candidate is a
-##   REALPATH outside every tracked root; `resolveMangledAll` then falls
-##   back to the same index lookup `@p`/`@n` uses (see that proc's
-##   doc comment for the full case analysis).
+## - `@m<body>` — body is a path relative to `parentDir(realpath(ENTRYPOINT
+##   FILE))` (not the CWD, and not merely `realpath` of the entrypoint's
+##   lexical *directory* — a symlinked entrypoint FILE inside an otherwise
+##   ordinary directory has a different real parent than its lexical one
+##   too).  Candidate = normalize(entrypointDir / body).  When the resolved
+##   module is reached through a symlinked root (e.g. a depRoot symlinked
+##   into milpa's CAS) and the entrypoint is shallow enough that `@m` still
+##   beats `@p`, this normalized candidate is a REALPATH outside every
+##   tracked root; `resolveMangledAll` then falls back to the same index
+##   lookup `@p`/`@n` uses (see that proc's doc comment for the full case
+##   analysis).
 ##
 ## - `@p<body>` (and `@n<body>`, Nim's nimblePath prefix — treated identically)
 ##   — body is a path relative to whichever search-path root resolved it
@@ -308,6 +311,17 @@ proc underAnyRoot(index: SourceIndex; absPath: string): bool =
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+proc addUnique(result: var seq[string]; seen: var HashSet[string];
+               cands: seq[string]) =
+  ## Append each of `cands` to `result` iff not already in `seen` (and mark
+  ## it seen) — the dedup step shared by `resolveMangledAll`'s `@m` case 1
+  ## and case 2 branches, both of which union zero or more `lookupByReal`
+  ## matches onto a `result` seq that may already hold a candidate.
+  for cand in cands:
+    if cand notin seen:
+      seen.incl cand
+      result.add cand
+
 proc toProjectRelative(absPath: string; projectRoot: string): string =
   ## Convert an absolute path to a projectRoot-relative forward-slash path.
   let root = projectRoot.absolutePath.normalizedPath
@@ -368,59 +382,84 @@ proc resolveMangledAll(mangledName: string;
   ##           from the entrypoint's own directory — the mangler's default
   ##           choice, used whenever no `--path` root gives a STRICTLY
   ##           shorter body (`@p`/`@n`, below).  Critically, `body` is always
-  ##           computed from the entrypoint directory's REALPATH (symlinks
-  ##           resolved), never its lexical path — this drives two distinct
-  ##           cases, split on whether the entrypoint directory itself is
-  ##           reached through a symlink:
+  ##           computed by the compiler from `parentDir(realpath(ENTRYPOINT
+  ##           FILE))` — the real directory containing the resolved
+  ##           entrypoint FILE, not `realpath` of the entrypoint's (lexical)
+  ##           directory path (`realEpDir`, below, computes exactly this: it
+  ##           resolves the entrypoint FILE's realpath first, then takes
+  ##           `parentDir` — so a symlinked entrypoint FILE inside an
+  ##           ordinary, non-symlinked directory is handled the same way as a
+  ##           symlinked entrypoint DIRECTORY).  This drives two distinct
+  ##           cases, split on whether the entrypoint's real directory
+  ##           differs from its lexical one:
   ##
-  ##           1. `expandFilename(epDir) == epDir` (the common case — no
-  ##              symlink on the entrypoint's own directory). `body` is then
-  ##              lexical-path-relative from `epDir` UNLESS the RESOLVED
-  ##              module is itself reached through a symlinked root (e.g. a
-  ##              milpa depRoot symlinked into the CAS) and the entrypoint is
-  ##              shallow enough that `@m` still wins over `@p` — then `body`
-  ##              carries `..` components up to a common ancestor and back
-  ##              down into the symlink's REALPATH target, so
-  ##              `(epDir / body).normalizedPath` resolves to the dep's REAL
-  ##              path, outside every tracked root.  The primary candidate is
-  ##              always `(epDir / body).normalizedPath` (existence not
-  ##              checked — R5: record deleted deps too).  When that
-  ##              candidate is NOT under any of `index`'s recorded roots, it
-  ##              is ALSO resolved via `index.lookupByReal` on the identical
-  ##              real path (the plain candidate already IS the real path in
-  ##              this branch, since `epDir` has no symlink of its own) — an
-  ##              EXACT match, not a suffix scan: an untracked,
-  ##              out-of-every-root import (no depRoot of its own) has no
-  ##              indexed file at that realpath, so it resolves to nothing
-  ##              extra, instead of over-selecting an unrelated same-suffix
-  ##              decoy elsewhere in the tree (the precision regression a
-  ##              suffix-based fallback previously caused).  A genuine
-  ##              symlinked-depRoot escape DOES have an indexed file at that
-  ##              exact realpath (the depRoot walk records it), so it is
-  ##              correctly recovered at its lexical path.
+  ##           1. `realEpDir == epDir` (the common case — neither the
+  ##              entrypoint FILE nor any component of its directory is a
+  ##              symlink). `body` is then lexical-path-relative from `epDir`
+  ##              UNLESS the RESOLVED module is itself reached through a
+  ##              symlinked root (e.g. a milpa depRoot symlinked into the
+  ##              CAS) and the entrypoint is shallow enough that `@m` still
+  ##              wins over `@p` — then `body` carries `..` components up to
+  ##              a common ancestor and back down into the symlink's
+  ##              REALPATH target, so `(epDir / body).normalizedPath`
+  ##              resolves to the dep's REAL path, outside every tracked
+  ##              root.  The primary candidate is always
+  ##              `(epDir / body).normalizedPath` (existence not checked —
+  ##              R5: record deleted deps too, but see the note below: this
+  ##              R5 "record deleted deps" guarantee is specific to THIS
+  ##              lexical case-1 candidate, which is always emitted
+  ##              unconditionally; case 2, below, has a different fallback
+  ##              rule).  When that candidate is NOT under any of `index`'s
+  ##              recorded roots, it is ALSO resolved via
+  ##              `index.lookupByReal` on the identical real path (the plain
+  ##              candidate already IS the real path in this branch, since
+  ##              `epDir` has no symlink of its own) — an EXACT match, not a
+  ##              suffix scan: an untracked, out-of-every-root import (no
+  ##              depRoot of its own) has no indexed file at that realpath,
+  ##              so it resolves to nothing extra, instead of over-selecting
+  ##              an unrelated same-suffix decoy elsewhere in the tree (the
+  ##              precision regression a suffix-based fallback previously
+  ##              caused).  A genuine symlinked-depRoot escape DOES have an
+  ##              indexed file at that exact realpath (the depRoot walk
+  ##              records it), so it is correctly recovered at its lexical
+  ##              path.  (Note: if a planted symlink inside a tracked root
+  ##              happens to make `lookupByReal` resolve to a DIFFERENT
+  ##              tracked file than the one actually imported, that
+  ##              unrelated file is recorded — over-selection under the R7
+  ##              policy; an attacker able to plant symlinks inside a
+  ##              tracked root can already edit tracked sources directly, so
+  ##              this is not a new capability.)
   ##
-  ##           2. `expandFilename(epDir) != epDir` (the entrypoint's own
-  ##              directory is reached through a symlink — not necessarily a
-  ##              depRoot, just an ordinary in-project directory that happens
-  ##              to be one).  `body` was computed by the compiler from the
-  ##              REAL directory, so naively joining it onto the LEXICAL
-  ##              `epDir` (case 1's arithmetic) does not reliably cancel back
-  ##              to the right path whenever the lexical and real directories
-  ##              differ in path DEPTH — it can land on a bogus, nonexistent,
-  ##              yet still textually-in-root path, silently dropping the
-  ##              real dependency while polluting the closure with a
-  ##              never-existing entry.  Here the REAL candidate,
-  ##              `(realEpDir / body).normalizedPath`, is resolved first via
-  ##              `index.lookupByReal`; only if that misses (unindexed —
-  ##              e.g. it names the entrypoint's own file, which a symlinked
-  ##              directory is never walked into and indexed) does the plain
-  ##              lexical `(epDir / body).normalizedPath` serve as the
-  ##              fallback (R5: still record something rather than silently
-  ##              drop).
+  ##           2. `realEpDir != epDir` (the entrypoint's real directory
+  ##              differs from its lexical one — either the entrypoint FILE
+  ##              itself is a symlink, or some component of its containing
+  ##              directory is, or both; not necessarily a depRoot, just an
+  ##              ordinary in-project symlink).  `body` was computed by the
+  ##              compiler from the REAL directory, so naively joining it
+  ##              onto the LEXICAL `epDir` (case 1's arithmetic) does not
+  ##              reliably cancel back to the right path whenever the
+  ##              lexical and real directories differ in path DEPTH — it can
+  ##              land on a bogus, nonexistent, yet still textually-in-root
+  ##              path, silently dropping the real dependency while
+  ##              polluting the closure with a never-existing entry.  Here
+  ##              the REAL candidate, `(realEpDir / body).normalizedPath`,
+  ##              is resolved first via `index.lookupByReal`.  IMPORTANT:
+  ##              this case's lexical candidate is NOT what the compiler
+  ##              actually saw (it is case 1's arithmetic, known unreliable
+  ##              here) — so it is used as a fallback ONLY when it exists on
+  ##              disk (`fileExists`/`symlinkExists`; this is how the
+  ##              entrypoint's own module recovers: a symlinked directory is
+  ##              never walked into and indexed by `buildSourceIndex`, but
+  ##              the lexical entrypoint path itself resolves through the OS
+  ##              symlink just fine).  When the lexical candidate does NOT
+  ##              exist either, the REAL candidate itself is kept instead —
+  ##              it is then subject to `extractClosure`'s ordinary
+  ##              under-tracked-root filter, exactly like any other
+  ##              out-of-root import, rather than inventing a nonexistent
+  ##              in-root path that would later break `closureContentHash`
+  ##              and perpetually invalidate the entry.
   ##
-  ##           Results are deduped; in either case, the plain lexical
-  ##           candidate is included as a fallback so a deleted dep is still
-  ##           recorded even once it can no longer be indexed.
+  ##           Results are deduped via the shared `addUnique` helper.
   ##
   ## For `@p`/`@n` (Nim's nimblePath prefix — treated identically to `@p`):
   ##           resolved against `index` (issue #8 — see `SourceIndex.lookup`).
@@ -448,20 +487,24 @@ proc resolveMangledAll(mangledName: string;
 
   if mangledName.startsWith("@m"):
     # Relative to the entrypoint's source directory. `body` is always
-    # computed by the compiler from that directory's REALPATH — see this
-    # proc's doc comment for the two cases this splits into.
-    let epDir = entrypointPath.absolutePath.parentDir
+    # computed by the compiler from `parentDir(realpath(ENTRYPOINT FILE))`
+    # — see this proc's doc comment for the two cases this splits into.
+    let epAbs = entrypointPath.absolutePath
+    let epDir = epAbs.parentDir
     let realEpDir =
-      try: expandFilename(epDir)
-      except OSError: epDir
+      try: expandFilename(epAbs).parentDir
+      except OSError:
+        try: expandFilename(epDir)
+        except OSError: epDir
     let lexicalCandidate = (epDir / body).normalizedPath
     var seen = initHashSet[string]()
 
     if realEpDir == epDir:
-      # Case 1: the entrypoint's own directory carries no symlink, so
-      # `body` is relative to `epDir` exactly as written — the lexical
-      # candidate IS the real one. Primary result; existence not checked
-      # (R5: record deleted deps too).
+      # Case 1: neither the entrypoint FILE nor its containing directory
+      # carries a symlink, so `body` is relative to `epDir` exactly as
+      # written — the lexical candidate IS the real one. Primary result;
+      # existence not checked (R5: record deleted deps too — this
+      # unconditional-emit is what makes the R5 guarantee hold here).
       result = @[lexicalCandidate]
       seen.incl lexicalCandidate
       # A realpath-through-a-symlinked-root escape (this proc's doc
@@ -471,26 +514,31 @@ proc resolveMangledAll(mangledName: string;
       # exact realpath, so it correctly adds nothing, while a genuine
       # symlinked-depRoot dep does and is recovered at its lexical path.
       if not index.underAnyRoot(lexicalCandidate):
-        for cand in index.lookupByReal(lexicalCandidate):
-          if cand notin seen:
-            seen.incl cand
-            result.add cand
+        addUnique(result, seen, index.lookupByReal(lexicalCandidate))
     else:
-      # Case 2: the entrypoint's own directory IS reached through a
-      # symlink, so `body` was computed from `realEpDir`, not `epDir` — the
-      # lexical candidate's `..` arithmetic does not reliably cancel back
-      # to the right path. Prefer the REAL candidate via an exact realpath
-      # match; fall back to the plain lexical candidate only if that
-      # misses (R5 — e.g. the entrypoint's own file, which a symlinked
-      # directory is never indexed under).
+      # Case 2: the entrypoint's REAL directory differs from its LEXICAL
+      # one (the entrypoint FILE itself is a symlink, a component of its
+      # containing directory is, or both), so `body` was computed from
+      # `realEpDir`, not `epDir` — the lexical candidate's `..` arithmetic
+      # (case 1's) does not reliably cancel back to the right path. Prefer
+      # the REAL candidate via an exact realpath match; the lexical
+      # candidate is NOT what the compiler saw here, so it serves as a
+      # fallback only when it exists on disk (the entrypoint's own module,
+      # e.g. — a symlinked directory is never walked into and indexed by
+      # buildSourceIndex, but the lexical path itself still resolves
+      # through the OS symlink). When neither resolves, keep the REAL
+      # candidate itself: it is then root-filtered by extractClosure like
+      # any ordinary out-of-root import, rather than fabricating a
+      # nonexistent lexical sibling that would pollute the closure and
+      # break closureContentHash.
       let realCandidate = (realEpDir / body).normalizedPath
       result = @[]
-      for cand in index.lookupByReal(realCandidate):
-        if cand notin seen:
-          seen.incl cand
-          result.add cand
+      addUnique(result, seen, index.lookupByReal(realCandidate))
       if result.len == 0:
-        result.add lexicalCandidate
+        if fileExists(lexicalCandidate) or symlinkExists(lexicalCandidate):
+          result.add lexicalCandidate
+        else:
+          result.add realCandidate
 
   else: # "@p" or "@n"
     result = index.lookup(body)

@@ -275,7 +275,7 @@ doAssert depValue() == 7
     check "_deps/dep/src/dep.nim" in closure
     check epPath in closure
 
-suite "closure does not over-select an unrelated decoy for an untracked out-of-root @m import (F1)":
+suite "closure does not over-select an unrelated decoy for an untracked out-of-root @m import":
 
   test "an untracked out-of-root import via a relative '../../' path does not pull in an unrelated in-tree decoy sharing its suffix":
     ## `proj/tests/t.nim` imports `../../other/lib` — a module that lives
@@ -321,7 +321,7 @@ doAssert libValue() == 9
 
     check results.len == 1
     if results[0].outcome != oPassed:
-      echo "F1 untracked-decoy compile/run output:\n", results[0].output
+      echo "untracked-decoy compile/run output:\n", results[0].output
     check results[0].outcome == oPassed
 
     let key = (ep.path, flagHash(ep.flags))
@@ -331,3 +331,110 @@ doAssert libValue() == 9
 
     check "src/other/lib.nim" notin closure
     check "tests/t.nim" in closure
+
+suite "closure resolves @m bodies through a symlinked entrypoint FILE by the file's real directory":
+
+  test "a symlinked entrypoint file's @m body is recorded at the real sibling, not a bogus lexical one":
+    ## `root/other/t.nim` is the entrypoint's REAL file (imports `helper`,
+    ## `root/other/helper.nim`); `root/tests/t.nim` is a SYMLINK to it, and
+    ## the CONFIGURED entrypoint is the symlink path `tests/t.nim`. `root/
+    ## tests` itself is an ORDINARY directory — no symlink on any of its
+    ## own path components, only the FILE inside it is one. Nim's `@m` base
+    ## is `parentDir(realpath(ENTRYPOINT FILE))`, i.e. `root/other`, NOT
+    ## `realpath` of the entrypoint's (already-non-symlinked) directory —
+    ## so the compiler mangles `helper.nim`'s @m body relative to
+    ## `root/other`, decoding to the sibling `other/helper.nim`.
+    ##
+    ## Before the fix, `realEpDir` was computed as `expandFilename(epDir)`
+    ## (epDir = `root/tests`, itself no symlink), which is unaffected by a
+    ## symlink on the FILE component alone — so the code wrongly took the
+    ## case-1 (lexical) branch and recorded the bogus, nonexistent
+    ## `tests/helper.nim`. `closureContentHash` then raised on the missing
+    ## file on EVERY subsequent run, permanently invalidating the entry
+    ## ("could not record its source closure … force-selected" every run,
+    ## precision lost for this entrypoint).
+    let root = makeTempRoot("r4_1_symlinked_ep_file")
+    defer: removeDir(root)
+
+    createDir(root / "other")
+    createDir(root / "tests")
+    writeFile(root / "other" / "helper.nim", "proc helperValue*(): int = 11\n")
+    writeFile(root / "other" / "t.nim", """
+import helper
+doAssert helperValue() == 11
+""")
+    createSymlink(root / "other" / "t.nim", root / "tests" / "t.nim")
+
+    let cfg = makeCfg(root)
+    let ep = Entrypoint(path: "tests/t.nim", group: "default", flags: @[])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    if results[0].outcome != oPassed:
+      echo "symlinked-entrypoint-file compile/run output:\n", results[0].output
+    check results[0].outcome == oPassed
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    # If recordClosure failed (e.g. closureContentHash raised on the bogus
+    # "tests/helper.nim"), the entry is invalidated and removed — its
+    # PRESENCE here is direct evidence recording succeeded with no warning.
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check "other/helper.nim" in closure
+    check "tests/helper.nim" notin closure
+
+    # A stable, un-invalidated entry must not force a recompile next run.
+    let p2 = plan(cfg, @[ep], graph, nimVersion = "")
+    check p2.entrypoints[0].edecision == edRunFresh
+
+suite "closure resolves @m bodies through a symlinked entrypoint DIRECTORY via a real compile (case 2)":
+
+  test "src/foo.nim is recorded when the entrypoint's directory is a symlink to a shallower directory inside the project":
+    ## `root/a/b/tests` is a SYMLINK to `root/real_tests` (a shallower
+    ## sibling of `a`, still inside the project) holding the entrypoint
+    ## `t.nim`, which imports `root/src/foo.nim` via a plain relative
+    ## import ("../src/foo") — resolved (and @m-mangled) from the
+    ## entrypoint FILE's REAL directory (`root/real_tests`), not its
+    ## lexical one (`root/a/b/tests`), confirmed empirically against a real
+    ## `nim c` of this exact fixture shape (`@m..@ssrc@sfoo.nim.c.o`). This
+    ## is the real-compile counterpart of the synthetic (manifest-only) pin
+    ## in tests/unit/test_source_index.nim — same case-2 mechanism, driven
+    ## through execute() end-to-end instead of a hand-written nimcache JSON.
+    let root = makeTempRoot("case2_dir_real_compile")
+    defer: removeDir(root)
+
+    createDir(root / "real_tests")
+    createDir(root / "src")
+    createDir(root / "a" / "b")
+    writeFile(root / "src" / "foo.nim", "proc fooValue*(): int = 42\n")
+    writeFile(root / "real_tests" / "t.nim", """
+import ../src/foo
+doAssert fooValue() == 42
+""")
+    createSymlink(root / "real_tests", root / "a" / "b" / "tests")
+
+    let cfg = makeCfg(root)
+    let ep = Entrypoint(path: "a/b/tests/t.nim", group: "default", flags: @[])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    if results[0].outcome != oPassed:
+      echo "symlinked-entrypoint-dir compile/run output:\n", results[0].output
+    check results[0].outcome == oPassed
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check "src/foo.nim" in closure

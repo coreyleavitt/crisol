@@ -449,7 +449,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "other/foo.nim" notin cl
     check cl == toHashSet(["tests/t.nim", "tests/foo.nim"])
 
-  test "F1: an @m body escaping every tracked root, with no dep-root of its own, is NOT unioned against the whole index (untracked out-of-root import)":
+  test "an @m body escaping every tracked root, with no dep-root of its own, is NOT unioned against the whole index (untracked out-of-root import)":
     ## `root/tests/t.nim` imports an UNTRACKED out-of-root module via
     ## `../../other/lib` (two ".." from tests/ escapes `root` entirely, into
     ## a sibling directory that is neither projectRoot nor any configured
@@ -480,7 +480,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "src/other/lib.nim" notin cl
     check cl == toHashSet(["tests/t.nim"])
 
-  test "F2: an @m body computed from a symlinked entrypoint directory's REALPATH resolves via byReal to the lexical in-root path":
+  test "an @m body computed from a symlinked entrypoint directory's REALPATH resolves via byReal to the lexical in-root path":
     ## `root/a/b/tests` is a SYMLINK to a SHALLOW outside directory `st`
     ## (a direct sibling of `root`, NOT nested under it) holding `t.nim` —
     ## the entrypoint directory's LEXICAL depth (4 components below `root`'s
@@ -526,3 +526,74 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "src/foo.nim" in cl
     check "a/b/tests/t.nim" in cl
     check cl == toHashSet(["a/b/tests/t.nim", "src/foo.nim"])
+
+  test "a symlinked entrypoint FILE's @m body resolves via the file's real directory, not its (non-symlinked) containing directory's":
+    ## `root/tests/t.nim` is a SYMLINK to the real file `root/other/t.nim`;
+    ## `root/tests` itself is an ORDINARY directory (no symlink on any of
+    ## its own path components). Nim's `@m` base is
+    ## `parentDir(realpath(ENTRYPOINT FILE))`, i.e. `root/other` — NOT
+    ## `realpath` of the entrypoint's (already-non-symlinked) containing
+    ## directory, `root/tests`. Pre-fix, `resolveMangledAll` computed
+    ## `realEpDir` from `expandFilename(epDir)` (epDir = `root/tests`),
+    ## which is unaffected by a symlink on the FILE component alone, so it
+    ## equals `epDir` and the code wrongly took case 1 (lexical == real),
+    ## recording the bogus, nonexistent sibling `tests/helper.nim` for an
+    ## @m body of plain "helper.nim" — the real dependency is
+    ## `other/helper.nim`. `closureContentHash` then raises on the missing
+    ## file on every subsequent run, permanently invalidating the entry.
+    let root = freshRoot("symlinked_ep_file")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "other")
+    writeFile(root / "other" / "helper.nim", "# helper, real sibling\n")
+    writeFile(root / "other" / "t.nim", "# ep, real file\n")
+    createSymlink(root / "other" / "t.nim", root / "tests" / "t.nim")
+
+    let ep = root / "tests" / "t.nim"      # lexical, symlinked FILE
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@mhelper.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "other/helper.nim" in cl
+    check "tests/helper.nim" notin cl
+
+  test "case-2 miss (neither realCandidate nor the lexical candidate is indexed/exists) keeps realCandidate, not a bogus lexical sibling":
+    ## Same symlinked-entrypoint-DIRECTORY shape as the byReal-recovery test
+    ## above, but the @m body names a module that has NO file anywhere on
+    ## disk (e.g. a dependency deleted since the index was built) — so
+    ## BOTH `index.lookupByReal(realCandidate)` misses (nothing indexed at
+    ## that realpath) AND the lexical candidate does not exist on disk
+    ## either. The old unconditional "fall back to the lexical candidate"
+    ## rule would add `a/b/ghost.nim` — a nonexistent path that is still
+    ## textually INSIDE `root` (so `extractClosure`'s under-tracked-root
+    ## filter would NOT catch it) — permanently breaking
+    ## `closureContentHash` on every later run. The fix keeps `realCandidate`
+    ## itself instead: it lies OUTSIDE `root` (a sibling temp dir), so
+    ## `extractClosure`'s ordinary under-tracked-root filter correctly drops
+    ## it, exactly like any other untracked out-of-root import.
+    let root = freshRoot("case2_miss")
+    defer: removeDir(root)
+    let st = freshRoot("case2_miss_st")
+    defer: removeDir(st)
+
+    createDir(root / "a" / "b")
+    writeFile(st / "t.nim", "# ep\n")
+    createSymlink(st, root / "a" / "b" / "tests")
+
+    let ep = root / "a" / "b" / "tests" / "t.nim"
+    let nc = root / "nimcache"
+
+    # A single ".." from the real entrypoint dir (`st`) to a module that
+    # was never written anywhere — no indexed file at its realpath, and no
+    # lexical file at root/a/b/ghost.nim either.
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@m..@sghost.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "a/b/ghost.nim" notin cl
+    check cl == toHashSet(["a/b/tests/t.nim"])
