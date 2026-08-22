@@ -78,6 +78,13 @@ one-time recompile of entrypoints whose closure gained members.
 
 ### Added
 
+- `crisol closure <entrypoint> [--json]` / `crisol closure --all [--json]` —
+  read-only depgraph introspection (issue #9).  Emits one entry per planned
+  entrypoint × group/flag-set: `path`, `group`, `flagHash`, `recorded`,
+  sorted `closure`, `closureHash`; JSON schema `crisol/closure/v1`
+  (revision 1).  Uses crisol's own config, discovery, group-flag resolution
+  and depgraph loader (including the nim-version probe), so downstream
+  tools never re-implement them.  No lock, no compile.
 - `crisol clean --config <path>` — `clean` now accepts `--config <path>` so it
   honours a project's custom `state-dir` setting.  Previously `clean` always
   used the default `.crisol/` directory regardless of config.

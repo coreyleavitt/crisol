@@ -496,3 +496,41 @@ proc loadLastRun*(config: Config):
       failedSet.incl((path: epPath, group: epGroup))
 
   result = (found: true, failed: failedSet)
+
+# ---------------------------------------------------------------------------
+# closureToJsonString — issue #9 slice A: crisol/closure/v1
+# ---------------------------------------------------------------------------
+
+const ClosureV1Schema* = "crisol/closure/v1"
+  ## Stable schema identifier embedded in every crisol/closure/v1 JSON document.
+
+const ClosureV1Revision* = 1
+  ## Integer minor revision of the crisol/closure/v1 schema (A8 convention).
+
+proc closureToJson*(r: ClosureReport): JsonNode =
+  ## Pure: serialize a ClosureReport to the crisol/closure/v1 JsonNode.  No I/O.
+  ## Deterministic ordering: entries in plan order (as received); each
+  ## entry's `closure` array is already sorted by api.closureReport().
+  let entriesNode = newJArray()
+  for e in r.entries:
+    let eNode = newJObject()
+    eNode["path"]        = newJString(e.path)
+    eNode["group"]       = newJString(e.group)
+    eNode["flagHash"]    = newJString(e.flagHash)
+    eNode["recorded"]    = newJBool(e.recorded)
+    let closureNode = newJArray()
+    for f in e.closure:
+      closureNode.add newJString(f)
+    eNode["closure"]     = closureNode
+    eNode["closureHash"] = newJString(e.closureHash)
+    entriesNode.add eNode
+
+  result = newJObject()
+  result["schema"]         = newJString(ClosureV1Schema)
+  result["schemaRevision"] = newJInt(ClosureV1Revision)
+  result["entries"]        = entriesNode
+  result["warnings"]       = warningsToJsonArray(r.warnings)
+
+proc closureToJsonString*(r: ClosureReport): string =
+  ## Pure: compact JSON string of the crisol/closure/v1 document.
+  $closureToJson(r)

@@ -45,7 +45,7 @@
 ##   memThrottleActive, formatProgressLine, planview internals (planToJson,
 ##   decisionStringEd, decisionLabelEd, warningsToJsonArray)
 
-import std/[json, options, os, sequtils, sets, strutils, times]
+import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, times]
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals,
                sandbox, cachedispatch, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
@@ -69,6 +69,8 @@ export types.RecordStatus
 export types.Summary
 export types.GatedEntry
 export types.ConfigWarning
+export types.ClosureEntry
+export types.ClosureReport
 export types.CompileDecision
 export types.EntrypointDecision
 export types.CacheDecision
@@ -89,10 +91,13 @@ export render.filterRecordsByTag
 export render.hasZeroTagMatches
 export render.RenderOpts
 export render.defaultOpts
+export render.renderClosure
 
 # From jsonout — schema constant + toJsonString only (NOT persistLastRun, loadLastRun)
 export jsonout.toJsonString
 export jsonout.RunV1Schema
+export jsonout.closureToJsonString
+export jsonout.ClosureV1Schema
 
 # From planview — schema constant only; PlanReport-typed facades are defined below
 export planview.PlanV1Schema
@@ -477,6 +482,49 @@ proc planTests*(opts: RunOptions = RunOptions()): PlanReport =
   ## group, --failed with no prior run, --changed outside a git repo) are
   ## exceptional here and RAISE CrisolError.  No lock, no subprocess execution.
   planImpl(opts).pr
+
+# ---------------------------------------------------------------------------
+# closureReport — issue #9 slice A: read-only depgraph projection
+# ---------------------------------------------------------------------------
+
+proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
+  ## Read-only depgraph lookup for every entrypoint planImpl(opts) plans.
+  ##
+  ## Built on the EXISTING plan phase (planImpl) so this does NOT duplicate
+  ## discovery/config/group-resolution or the DepGraph loader (which is keyed
+  ## on crisol's real Nim compiler fingerprint — a downstream consumer that
+  ## hand-rolled this probe would silently see an empty graph on a mismatch).
+  ##
+  ## Raises CrisolError like planTests (structural problems: bad config,
+  ## unknown group, etc.).  No lock, no subprocess, no compile.
+  let impl = planImpl(opts)
+  var entries: seq[ClosureEntry]
+  for pep in impl.pr.entrypoints:
+    let ep    = pep.ep
+    let fHash = flagHash(ep.flags)
+    let key   = (ep.path, fHash)
+    if impl.pv.graph.entries.hasKey(key):
+      let ge = impl.pv.graph.entries[key]
+      var closureSeq = toSeq(ge.closure)
+      closureSeq.sort()
+      entries.add ClosureEntry(
+        path:        ep.path,
+        group:       ep.group,
+        flagHash:    fHash,
+        recorded:    true,
+        closure:     closureSeq,
+        closureHash: ge.closureHash,
+      )
+    else:
+      entries.add ClosureEntry(
+        path:        ep.path,
+        group:       ep.group,
+        flagHash:    fHash,
+        recorded:    false,
+        closure:     @[],
+        closureHash: "",
+      )
+  ClosureReport(entries: entries, warnings: impl.pr.warnings)
 
 # ---------------------------------------------------------------------------
 # runTests — full run facade; catches-and-encodes structural failures

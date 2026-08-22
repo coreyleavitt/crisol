@@ -149,16 +149,21 @@ Usage:
               [--hermetic <none|isolated|network>]
               [--rlimit-nofile <N>]
   crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
+  crisol closure <entrypoint> [--json]
+  crisol closure --all [--json]
   crisol clean [--all] [--config <path>]
 
   crisol --help | -h
   crisol --version | -V | version
 
 Subcommands:
-  run    Discover, compile, and run test entrypoints.
-  list   Show what WOULD run (the plan) without compiling or running anything.
-  clean  Prune orphan cache/bin dirs and stale depgraph entries.
-         --all removes the entire state dir.  --config overrides the config file.
+  run      Discover, compile, and run test entrypoints.
+  list     Show what WOULD run (the plan) without compiling or running anything.
+  closure  Read-only: show the recorded depgraph entry (group, flagHash,
+           closure files, closureHash) for one entrypoint, or every discovered
+           entrypoint with --all.  No compile, no run, no lock.
+  clean    Prune orphan cache/bin dirs and stale depgraph entries.
+           --all removes the entire state dir.  --config overrides the config file.
 
 Options for 'run' and 'list':
   <path>...       Restrict discovery to these paths/globs (default: convention
@@ -211,6 +216,15 @@ Additional options for 'run':
 
 Additional options for 'list':
   --json          Emit the crisol/plan/v1 JSON document instead of human output.
+
+Options for 'closure':
+  <entrypoint>    Show the recorded depgraph entry for this one planned path.
+                  Mutually exclusive with --all (specifying both is a usage
+                  error); one of the two is required.
+  --all           Show every discovered entrypoint, one crisol/closure/v1
+                  document.
+  --json          Emit the crisol/closure/v1 JSON document instead of human
+                  output.
 
 Exit codes:
   0   All selected entrypoints passed (or a pure listing succeeded).
@@ -281,7 +295,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       return ExitEnvironment
     return runMeasureCompileWorker(args[1])
 
-  if sub notin ["run", "list", "clean", "init"]:
+  if sub notin ["run", "list", "clean", "init", "closure"]:
     stderr.write("crisol: unknown subcommand '" & sub & "'\n\n")
     stderr.write(usage())
     return ExitEnvironment
@@ -440,6 +454,72 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       return ExitEnvironment
 
     stdout.write("crisol: init: wrote " & absTarget & "\n")
+    return ExitOk
+
+  # -------------------------------------------------------------------------
+  # `closure` subcommand: issue #9 slice A — read-only depgraph projection.
+  # Handled early, before the shared run/list flag parser: closure has its
+  # own minimal flag set (positional <entrypoint> XOR --all, plus --json)
+  # and shares NONE of run/list's tuning flags.
+  # -------------------------------------------------------------------------
+
+  if sub == "closure":
+    var closurePaths: seq[string]
+    var closureAll   = false
+    var closureJson  = false
+    let closureArgs = args[1..^1]
+    var ci = 0
+    while ci < closureArgs.len:
+      let a = closureArgs[ci]
+      if a == "--all":
+        closureAll = true
+      elif a == "--json":
+        closureJson = true
+      elif a.startsWith("-"):
+        stderr.write("crisol: unknown flag for closure: '" & a & "'\n")
+        return ExitEnvironment
+      else:
+        closurePaths.add a
+      inc ci
+
+    if closureAll and closurePaths.len > 0:
+      stderr.write("crisol: 'closure' accepts either <entrypoint> or --all, " &
+                   "not both\n\n")
+      stderr.write(usage())
+      return ExitEnvironment
+
+    if not closureAll and closurePaths.len == 0:
+      stderr.write("crisol: closure requires <entrypoint> or --all\n\n")
+      stderr.write(usage())
+      return ExitEnvironment
+
+    let closureSelection =
+      if closureAll: allGroups()
+      else: filesSelection(closurePaths)
+
+    var cr: ClosureReport
+    try:
+      cr = closureReport(RunOptions(selection: closureSelection))
+    except CrisolError as e:
+      case e.kind
+      of cekEnvironment:
+        stderr.write("crisol: environment error: " & e.msg & "\n")
+        return ExitEnvironment
+      of cekConfig:
+        stderr.write("crisol: config error: " & e.msg & "\n")
+        return ExitEnvironment
+      of cekInternal:
+        stderr.write("crisol: internal error: " & e.msg & "\n")
+        return ExitInternal
+
+    for w in cr.warnings:
+      stderr.write("warning: " & w.message & "\n")
+
+    if closureJson:
+      stdout.write(closureToJsonString(cr))
+      stdout.write("\n")
+    else:
+      stdout.write(renderClosure(cr))
     return ExitOk
 
   # -------------------------------------------------------------------------

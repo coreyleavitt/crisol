@@ -518,6 +518,27 @@ type
     ## Produced by applyGates (discover); surfaced by buildRunPlan; consumed by
     ## planview (rendering) and jsonout.
 
+  ClosureEntry* = object
+    ## Issue #9 slice A: one planned entrypoint's depgraph record, as read
+    ## back by the `crisol closure` CLI subcommand / api.closureReport().
+    ## A downstream consumer (e.g. amoxtli) reads this instead of
+    ## re-implementing the depgraph loader (nim-version probe mismatch would
+    ## otherwise silently yield an empty graph) or group/flag resolution.
+    path*:        string          ## entrypoint path, as planned (project-relative)
+    group*:       string          ## resolved group name
+    flagHash*:    string          ## flagHash(ep.flags); 16 hex chars
+    recorded*:    bool            ## true iff the depgraph has an entry for (path, flagHash)
+    closure*:     seq[string]     ## sorted closure paths as stored (project-relative,
+                                   ## or absolute for dep-root files); empty when not recorded
+    closureHash*: string          ## 16 hex chars; "" when not recorded
+
+  ClosureReport* = object
+    ## Output of api.closureReport(): one ClosureEntry per planned entrypoint
+    ## (one per group/flag-set it belongs to), plus any config warnings from
+    ## the underlying plan phase.
+    entries*:  seq[ClosureEntry]
+    warnings*: seq[ConfigWarning]
+
   SelectionReason* = enum
     srClosureHit     ## Known fresh closure that intersects `changed` → run it.
     srUnknownClosure ## Graph present but no entry for this (path, flagHash) key.

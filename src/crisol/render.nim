@@ -495,3 +495,22 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     buf.add col(msg, Ansi_Red & Ansi_Bold, color) & "\n"
 
   result = buf
+
+# ---------------------------------------------------------------------------
+# renderClosure — issue #9 slice A: human rendering of `crisol closure`
+# ---------------------------------------------------------------------------
+
+proc renderClosure*(r: ClosureReport): string =
+  ## Pure: minimal human-readable rendering of a ClosureReport.  No I/O, no
+  ## color (this is a diagnostic listing, not the run/plan report).
+  ##
+  ## One line per entry: `path [group] flagHash recorded/unrecorded (N files)`
+  ## followed by the closure paths, indented, one per line.
+  var buf = newStringOfCap(1024)
+  for e in r.entries:
+    let status = if e.recorded: "recorded" else: "unrecorded"
+    buf.add e.path & "  [" & e.group & "]  " & e.flagHash & "  " &
+            status & "  (" & $e.closure.len & " files)\n"
+    for f in e.closure:
+      buf.add "  " & f & "\n"
+  result = buf
