@@ -97,31 +97,100 @@ type
     closureHash*:   string           ## 64-bit chained FNV-1a over sorted closure file CONTENTS (16 hex)
     protocolMajor*: int              ## crisol protocol major at build time
 
-  DepGraphDiscard* = enum
-    ## Why `loadDepGraph` discarded a persisted graph (see `DepGraph.loadDiscard`).
+  DepGraphDiscardKind* = enum
+    ## Why `loadDepGraph` discarded a persisted graph.
     dgdNone           ## no file, or loaded cleanly
     dgdNimVersion     ## header.nimVersion != current compiler fingerprint
     dgdFormatVersion  ## header.formatVersion != DepGraphFormatVersion
+    dgdMalformed      ## file present but unreadable, unparseable, or an unexpected shape
+
+  DepGraphDiscard* = object
+    ## Load-time provenance of a discard decision: WHY a persisted graph was
+    ## discarded (kind == dgdNone when nothing was discarded), and the two
+    ## header values that disagreed (dgdNimVersion/dgdFormatVersion) or a
+    ## short reason (dgdMalformed, in `stored`; `current` unused). Deliberately
+    ## NOT a field on `DepGraph` — `DepGraph` is otherwise the exact
+    ## persistence mirror of the on-disk JSON, so stapling a load-time-only
+    ## fact onto it would leave that fact's validity window (one
+    ## `loadDepGraph` call) as a docstring promise instead of something the
+    ## type system enforces. Produced by the out-param overload of
+    ## `loadDepGraph`; the caller (pipeline.nim's `buildRunPlan`) surfaces a
+    ## non-dgdNone discard as a `ConfigWarning` via `key`/`message` below, so
+    ## a discarded graph is a visible, structured diagnostic instead of a
+    ## silent empty-graph fallback (issue: after a Nim upgrade, or when the
+    ## file is corrupt, every entrypoint would otherwise show
+    ## `recorded:false` indistinguishable from "never ran").
+    kind*:    DepGraphDiscardKind
+    stored*:  string  ## the mismatched header field, or the dgdMalformed reason ("" for dgdNone)
+    current*: string  ## this run's value for that field, stringified ("" for dgdNone/dgdMalformed)
 
   DepGraph* = object
     header*:  DepGraphHeader
     entries*: Table[(string, string), DepGraphEntry]
       ## Key: (entrypoint path, flagHash)
       ## Value: DepGraphEntry with closure, content hash, and protocol major
-    loadDiscard*: DepGraphDiscard
-      ## S3: WHY a persisted graph was discarded at load (dgdNone when
-      ## nothing was discarded); the typed twin of `loadDiagnostic`.
-    loadDiagnostic*: string
-      ## S3: load-time transient (NEVER persisted by `toJson`) — set by
-      ## `fromJson` when a persisted graph was present on disk but discarded
-      ## because its header did not match the current run (nimVersion or
-      ## formatVersion mismatch). "" means either no file was present or the
-      ## loaded graph matched cleanly — nothing to report. The caller
-      ## (pipeline.nim's `buildRunPlan`) surfaces a non-empty diagnostic as a
-      ## `ConfigWarning` so a discarded graph is a visible, structured
-      ## diagnostic instead of a silent empty-graph fallback (issue: after a
-      ## Nim upgrade, every entrypoint would otherwise show `recorded:false`
-      ## indistinguishable from "never ran").
+
+# ---------------------------------------------------------------------------
+# Public: DepGraphDiscard formatting (single authority — do not re-derive
+# `key`/`message` elsewhere, e.g. with a `case` in pipeline.nim)
+# ---------------------------------------------------------------------------
+
+proc sanitizeHeaderField(s: string): string =
+  ## `stored`/`current` values may come from an on-disk depgraph file, which
+  ## may be foreign, hand-edited, or corrupted, or from the Nim compiler
+  ## fingerprint, which is itself MULTI-LINE ("Nim Compiler Version ...\n
+  ## Compiled at ...\nactive boot switches ...|<hash>"). `message` below
+  ## concatenates this text verbatim into a diagnostic that is later written
+  ## raw to stderr, so: keep only the first line (multi-line input would
+  ## otherwise blow the diagnostic out to 6+ stderr lines), then replace
+  ## every remaining byte < 0x20 or == 0x7f with '?' so control/ANSI escape
+  ## bytes cannot spoof or corrupt the terminal (or a log that captures it),
+  ## then cap the length so a pathological value cannot blow up the message
+  ## either.
+  const maxLen = 64
+  let nlPos = s.find('\n')
+  let firstLine = if nlPos >= 0: s[0 ..< nlPos] else: s
+  let truncated = firstLine.len > maxLen
+  let clipped = if truncated: firstLine[0 ..< maxLen] else: firstLine
+  result = newString(clipped.len)
+  for i, c in clipped:
+    result[i] = if ord(c) < 0x20 or ord(c) == 0x7f: '?' else: c
+  if truncated:
+    result.add "..."
+
+proc key*(d: DepGraphDiscard): string =
+  ## ConfigWarning `key` for a discard: "nimVersion" / "formatVersion" /
+  ## "malformed" / "" (dgdNone). The single formatting authority for this
+  ## fact.
+  case d.kind
+  of dgdNone:          ""
+  of dgdNimVersion:    "nimVersion"
+  of dgdFormatVersion: "formatVersion"
+  of dgdMalformed:     "malformed"
+
+proc message*(d: DepGraphDiscard): string =
+  ## Human-readable diagnostic for a discard, or "" for dgdNone. The single
+  ## formatting authority for this fact; `stored`/`current` are sanitized
+  ## before being embedded (see `sanitizeHeaderField`). Worded neutrally —
+  ## this is also printed by subcommands (e.g. `list`, `closure`) that never
+  ## compile anything.
+  case d.kind
+  of dgdNone:
+    ""
+  of dgdNimVersion:
+    "depgraph discarded: recorded for Nim " & sanitizeHeaderField(d.stored) &
+    ", current compiler is " & sanitizeHeaderField(d.current) &
+    " -- the recorded graph is treated as empty (run recompiles and " &
+    "force-selects every entrypoint)"
+  of dgdFormatVersion:
+    "depgraph discarded: format version " & sanitizeHeaderField(d.stored) &
+    ", current is " & sanitizeHeaderField(d.current) &
+    " -- the recorded graph is treated as empty (run recompiles and " &
+    "force-selects every entrypoint)"
+  of dgdMalformed:
+    "depgraph discarded: unreadable or malformed (" &
+    sanitizeHeaderField(d.stored) &
+    ") -- the recorded graph is treated as empty"
 
 # ---------------------------------------------------------------------------
 # FNV-1a 64-bit hash (stable across Nim versions; never std/hashes)
@@ -318,40 +387,49 @@ proc toJson(graph: DepGraph): JsonNode =
   result["header"]  = headerNode
   result["entries"] = entriesArr
 
-proc fromJson(node: JsonNode; nimVersion: string): DepGraph =
+proc fromJson(node: JsonNode; nimVersion: string; discarded: var DepGraphDiscard): DepGraph =
   ## Deserialize a DepGraph from a JsonNode.
   ## Returns empty graph if the format is wrong, the nimVersion mismatches,
-  ## or formatVersion differs.
+  ## or formatVersion differs. discarded reports WHY a persisted graph was
+  ## discarded: dgdNone when nothing was discarded; dgdMalformed for every
+  ## shape/parse problem (missing/wrong-typed header fields, non-object
+  ## root, non-array entries, ...) so a present-but-unusable file is never
+  ## silently indistinguishable from dgdNone's "never ran".
   result = initDepGraph(nimVersion)
+  discarded = DepGraphDiscard(kind: dgdNone)
 
-  if node.kind != JObject: return
+  if node.kind != JObject:
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root not an object")
+    return
 
   # Validate header
   let headerNode = node{"header"}
-  if headerNode == nil or headerNode.kind != JObject: return
+  if headerNode == nil or headerNode.kind != JObject:
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: "header not an object")
+    return
 
-  let storedNimVer    = headerNode{"nimVersion"}
-  let storedFmtVer    = headerNode{"formatVersion"}
-  if storedNimVer == nil or storedFmtVer == nil: return
+  let storedNimVer = headerNode{"nimVersion"}
+  if storedNimVer == nil:
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: "header missing nimVersion")
+    return
+  let storedFmtVer = headerNode{"formatVersion"}
+  if storedFmtVer == nil:
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: "header missing formatVersion")
+    return
+  if storedFmtVer.kind != JInt:
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: "formatVersion not an integer")
+    return
 
   let storedNimVerStr = storedNimVer.getStr("")
   let storedFmtVerInt = storedFmtVer.getInt(-1)
 
-  # S3: a discarded graph must be a visible, structured diagnostic — not a
-  # silent empty-graph fallback (see DepGraph.loadDiagnostic doc comment).
+  # A discarded graph must be a visible, structured diagnostic — not a
+  # silent empty-graph fallback (see DepGraphDiscard doc comment).
   if storedNimVerStr != nimVersion:
-    result.loadDiscard = dgdNimVersion
-    result.loadDiagnostic =
-      "depgraph discarded: recorded for Nim " & storedNimVerStr &
-      ", current compiler is " & nimVersion &
-      " -- every entrypoint will be recompiled and force-selected this run"
+    discarded = DepGraphDiscard(kind: dgdNimVersion, stored: storedNimVerStr, current: nimVersion)
     return
   if storedFmtVerInt != DepGraphFormatVersion:
-    result.loadDiscard = dgdFormatVersion
-    result.loadDiagnostic =
-      "depgraph discarded: format version " & $storedFmtVerInt &
-      ", current is " & $DepGraphFormatVersion &
-      " -- every entrypoint will be recompiled and force-selected this run"
+    discarded = DepGraphDiscard(kind: dgdFormatVersion, stored: $storedFmtVerInt, current: $DepGraphFormatVersion)
     return
 
   # Update header (matches current nim version)
@@ -360,7 +438,12 @@ proc fromJson(node: JsonNode; nimVersion: string): DepGraph =
 
   # Parse entries
   let entriesArr = node{"entries"}
-  if entriesArr == nil or entriesArr.kind != JArray: return
+  if entriesArr == nil:
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root missing entries")
+    return
+  if entriesArr.kind != JArray:
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: "entries not an array")
+    return
 
   for entryNode in entriesArr:
     if entryNode.kind != JObject: continue
@@ -499,15 +582,25 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
     saveDepGraph(graph, config)
     result = (ok: false, error: e.msg)
 
-proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
+proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDiscard): DepGraph =
   ## Load the graph from `<projectRoot>/<stateDir>/depgraph`.
   ##
-  ## - Missing file → empty graph (not an error); `loadDiagnostic` stays "".
-  ## - Malformed JSON → empty graph (safer fallback; log to stderr);
-  ##   `loadDiagnostic` stays "" (a read/parse failure, not a discard).
-  ## - Nim-version mismatch → empty graph; `loadDiagnostic` set (S3).
-  ## - Format-version mismatch → empty graph; `loadDiagnostic` set (S3).
+  ## discarded reports WHY a persisted graph was discarded at load (dgdNone
+  ## when nothing was discarded):
+  ## - Missing file → empty graph (not an error); dgdNone.
+  ## - Unreadable file → empty graph (safer fallback); dgdMalformed with the
+  ##   IO error text (also still logged to stderr immediately — the file may
+  ##   be unreadable for reasons a caller who ignores discarded, e.g. the
+  ##   2-arg overload, still needs to see right away).
+  ## - Malformed JSON, or valid JSON with an unexpected shape → empty graph;
+  ##   dgdMalformed with the parse-error text or a short shape reason. The
+  ##   caller's `ConfigWarning` (built from discarded) is now the sole
+  ##   report for this — no separate stderr write here, to avoid double-
+  ##   reporting the same discard.
+  ## - Nim-version mismatch → empty graph; dgdNimVersion.
+  ## - Format-version mismatch → empty graph; dgdFormatVersion.
   let path = depgraphPath(config)
+  discarded = DepGraphDiscard(kind: dgdNone)
 
   if not fileExists(path):
     return initDepGraph(nimVersion)
@@ -518,21 +611,20 @@ proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
   except OSError as e:
     stderr.write("crisol: warning: could not read depgraph '" & path &
                  "': " & e.msg & " — starting with empty graph\n")
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
     return initDepGraph(nimVersion)
 
   var node: JsonNode
   try:
     node = parseJson(raw)
   except JsonParsingError as e:
-    stderr.write("crisol: warning: depgraph is malformed JSON: " & e.msg &
-                 " — starting with empty graph\n")
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
     return initDepGraph(nimVersion)
   except Exception as e:
-    stderr.write("crisol: warning: could not parse depgraph: " & e.msg &
-                 " — starting with empty graph\n")
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
     return initDepGraph(nimVersion)
 
-  result = fromJson(node, nimVersion)
+  result = fromJson(node, nimVersion, discarded)
 
   # M10 soundness: re-validate closure paths from the on-disk graph.
   # Drop any absolute path that does NOT resolve under the projectRoot.
@@ -567,3 +659,10 @@ proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
       continue
     entry.closure = filtered
     result.entries[key] = entry
+
+proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
+  ## Load the graph, discarding load provenance. See the 3-arg overload
+  ## (with the `discard: var DepGraphDiscard` out-parameter) for the full
+  ## behavior and for observing WHY a persisted graph was discarded.
+  var d: DepGraphDiscard
+  result = loadDepGraph(config, nimVersion, d)

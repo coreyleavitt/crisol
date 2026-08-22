@@ -179,13 +179,13 @@ suite "recordClosure — recovery policy (R5)":
     check ("tests/rec_fail.nim", fh) notin loadDepGraph(cfg, "").entries
 
 # ---------------------------------------------------------------------------
-# loadDiagnostic — S3: a discarded depgraph must be a visible, structured
-# diagnostic, not a silent empty-graph fallback.
+# depgraph load provenance — a discarded depgraph must be a visible,
+# structured diagnostic, not a silent empty-graph fallback.
 # ---------------------------------------------------------------------------
 
-suite "depgraph loadDiagnostic (S3)":
+suite "depgraph load provenance: discarded persisted graph":
 
-  test "nimVersion mismatch: entries empty AND loadDiagnostic mentions both versions":
+  test "nimVersion mismatch: entries empty AND message mentions both versions":
     let root = graphRoot("nimver_mismatch")
     defer: removeDir(root)
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
@@ -194,13 +194,15 @@ suite "depgraph loadDiagnostic (S3)":
     g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
     saveDepGraph(g, cfg)
 
-    let loaded = loadDepGraph(cfg, "2.3.0")
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.3.0", d)
     check loaded.entries.len == 0
-    check loaded.loadDiagnostic.len > 0
-    check "2.2.10" in loaded.loadDiagnostic
-    check "2.3.0" in loaded.loadDiagnostic
+    check d.kind == dgdNimVersion
+    check d.key == "nimVersion"
+    check "2.2.10" in d.message
+    check "2.3.0" in d.message
 
-  test "formatVersion mismatch: loadDiagnostic mentions the format version":
+  test "formatVersion mismatch: message mentions the format version":
     let root = graphRoot("fmtver_mismatch")
     defer: removeDir(root)
     let staleVer = DepGraphFormatVersion - 1
@@ -211,13 +213,15 @@ suite "depgraph loadDiagnostic (S3)":
     """)
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
-    let loaded = loadDepGraph(cfg, "2.2.10")
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.2.10", d)
     check loaded.entries.len == 0
-    check loaded.loadDiagnostic.len > 0
-    check $staleVer in loaded.loadDiagnostic
-    check $DepGraphFormatVersion in loaded.loadDiagnostic
+    check d.kind == dgdFormatVersion
+    check d.key == "formatVersion"
+    check $staleVer in d.message
+    check $DepGraphFormatVersion in d.message
 
-  test "matching graph loads cleanly: loadDiagnostic == \"\"":
+  test "matching graph loads cleanly: dgdNone and message == \"\"":
     let root = graphRoot("clean_load")
     defer: removeDir(root)
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
@@ -226,15 +230,99 @@ suite "depgraph loadDiagnostic (S3)":
     g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
     saveDepGraph(g, cfg)
 
-    let loaded = loadDepGraph(cfg, "2.2.10")
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.2.10", d)
     check loaded.entries.len == 1
-    check loaded.loadDiagnostic == ""
+    check d.kind == dgdNone
+    check d.message == ""
 
-  test "no file present: loadDiagnostic == \"\"":
+  test "no file present: dgdNone":
     let root = graphRoot("no_file")
     defer: removeDir(root)
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
-    let loaded = loadDepGraph(cfg, "2.2.10")
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.2.10", d)
     check loaded.entries.len == 0
-    check loaded.loadDiagnostic == ""
+    check d.kind == dgdNone
+    check d.message == ""
+
+  test "the 2-arg overload still works and drops provenance":
+    let root = graphRoot("two_arg")
+    defer: removeDir(root)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    saveDepGraph(g, cfg)
+
+    check loadDepGraph(cfg, "2.2.10").entries.len == 1
+    check loadDepGraph(cfg, "2.3.0").entries.len == 0   # discarded; no way to observe why
+
+  test "control bytes and ANSI escapes in a stored header value are sanitized out of message":
+    let root = graphRoot("control_bytes")
+    defer: removeDir(root)
+    let stalePayload = "2.2.10\x1b[31m\x01bad"
+    let doc = %*{
+      "header":  {"nimVersion": stalePayload, "formatVersion": DepGraphFormatVersion},
+      "entries": newJArray(),
+    }
+    writeFile(root / ".crisol" / "depgraph", $doc)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.3.0", d)
+    check loaded.entries.len == 0
+    check d.kind == dgdNimVersion
+    let msg = d.message
+    for c in msg:
+      check ord(c) >= 0x20
+
+  test "message shows only the first line of a multi-line stored value":
+    let root = graphRoot("multiline")
+    defer: removeDir(root)
+    let doc = %*{
+      "header":  {"nimVersion": "A\nB\nC", "formatVersion": DepGraphFormatVersion},
+      "entries": newJArray(),
+    }
+    writeFile(root / ".crisol" / "depgraph", $doc)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.3.0", d)
+    check loaded.entries.len == 0
+    check d.kind == dgdNimVersion
+    let msg = d.message
+    check "A" in msg
+    check "\n" notin msg
+
+  test "header missing nimVersion: dgdMalformed with reason text":
+    let root = graphRoot("missing_nimver")
+    defer: removeDir(root)
+    let doc = %*{
+      "header":  {"formatVersion": DepGraphFormatVersion},
+      "entries": newJArray(),
+    }
+    writeFile(root / ".crisol" / "depgraph", $doc)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.2.10", d)
+    check loaded.entries.len == 0
+    check d.kind == dgdMalformed
+    check d.key == "malformed"
+    check "nimVersion" in d.stored
+    check "depgraph discarded" in d.message
+
+  test "root is a JSON array: dgdMalformed":
+    let root = graphRoot("root_array")
+    defer: removeDir(root)
+    writeFile(root / ".crisol" / "depgraph", "[]")
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.2.10", d)
+    check loaded.entries.len == 0
+    check d.kind == dgdMalformed
+    check d.key == "malformed"
+    check "depgraph discarded" in d.message

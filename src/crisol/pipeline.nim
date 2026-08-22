@@ -110,25 +110,24 @@ proc buildRunPlan*(
   let gatedEntries: seq[GatedEntry] = gated.gatedOut
 
   # Load the persisted dep graph (D6 freshness; D5 impact selection).
-  let graph = loadDepGraph(cfg, nimVersion)
+  var discarded: DepGraphDiscard
+  let graph = loadDepGraph(cfg, nimVersion, discarded)
 
-  # S3: a discarded depgraph (nimVersion/formatVersion mismatch) must be a
-  # visible, structured diagnostic — not a silent empty-graph fallback that
-  # leaves `run`/`list`/`closure` indistinguishable from "never ran". Reuses
-  # the existing ConfigWarning shape (see api.nim's measure-compile-reuse
-  # warning for the precedent of a runtime, not config-parse, diagnostic).
+  # A discarded depgraph (nimVersion/formatVersion mismatch, or an
+  # unreadable/malformed file) must be a visible, structured diagnostic —
+  # not a silent empty-graph fallback that leaves `run`/`list`/`closure`
+  # indistinguishable from "never ran". Reuses the existing ConfigWarning
+  # shape (see api.nim's measure-compile-reuse warning for the precedent of
+  # a runtime, not config-parse, diagnostic). `key`/`message` are
+  # depgraph.nim's single formatting authority for this fact — no case
+  # statement here.
   var planWarnings = warnings
-  if graph.loadDiscard != dgdNone:
-    let key =
-      case graph.loadDiscard
-      of dgdNimVersion:    "nimVersion"
-      of dgdFormatVersion: "formatVersion"
-      of dgdNone:          ""
+  if discarded.kind != dgdNone:
     planWarnings.add ConfigWarning(
       source:  depgraphPath(cfg),
       context: "depgraph",
-      key:     key,
-      message: graph.loadDiagnostic,
+      key:     discarded.key,
+      message: discarded.message,
     )
 
   # Narrowing: applied AFTER applyGates, BEFORE plan (pipeline invariant).
