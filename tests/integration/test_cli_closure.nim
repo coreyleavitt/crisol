@@ -24,8 +24,8 @@
 import std/[json, monotimes, os, strutils, unittest]
 import std/posix as posix_mod
 import crisol  # runMain
-import crisol/render  # pathFlagsWarnings — D1: reuse run/list's exact wording
-import crisol/jsonout  # ClosureV1Schema/ClosureV1Revision — T2: schema/revision pin
+import crisol/render  # pathFlagsWarnings — reuse run/list's exact wording
+import crisol/jsonout  # ClosureV1Schema/ClosureV1Revision — schema/revision pin
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -209,11 +209,11 @@ suite "crisol closure — issue #9 slice A":
     check "tests/unit/test_b.nim" in txt
 
 # ---------------------------------------------------------------------------
-# L1/T1 — `closure` accepts --config <path> / --config=<path>, mirroring
+# `closure` accepts --config <path> / --config=<path>, mirroring
 # clean's parsing (same error text + exit 3 when the value is missing).
 # ---------------------------------------------------------------------------
 
-suite "crisol closure — L1/T1 --config <path>":
+suite "crisol closure — --config <path>":
 
   test "closure --all --json --config <path> targets a non-default config file":
     let root = setUpProject()
@@ -267,11 +267,11 @@ suite "crisol closure — L1/T1 --config <path>":
     check "crisol: --config requires a file path" in readFile(outPath)
 
 # ---------------------------------------------------------------------------
-# D1 — `closure` prints the same ad-hoc / ambiguous path diagnostics that
+# `closure` prints the same ad-hoc / ambiguous path diagnostics that
 # `run`/`list` print via render.pathFlagsWarnings.
 # ---------------------------------------------------------------------------
 
-suite "crisol closure — D1 ad-hoc / ambiguous path warnings":
+suite "crisol closure — ad-hoc / ambiguous path warnings":
 
   test "closure <path not in any group glob> prints the same ad-hoc warning run/list print":
     let root = setUpProject()
@@ -297,12 +297,12 @@ suite "crisol closure — D1 ad-hoc / ambiguous path warnings":
     check "crisol: " & expected[0] in readFile(outPath)
 
 # ---------------------------------------------------------------------------
-# S4 — `closure <path>` matching no entrypoint exits 3 with the same
+# `closure <path>` matching no entrypoint exits 3 with the same
 # "no entrypoints matched" message `run` uses; `--all` with zero discovered
 # entrypoints stays exit 0 with an empty entries report.
 # ---------------------------------------------------------------------------
 
-suite "crisol closure — S4 no-match exit code":
+suite "crisol closure — no-match exit code":
 
   test "closure <nonexistent path> --json → exit 3, stderr mentions no entrypoints matched":
     let root = setUpProject()
@@ -319,11 +319,59 @@ suite "crisol closure — S4 no-match exit code":
     check code == 3
     check "no entrypoints matched" in readFile(outPath)
 
+  test "closure <path> whose only match is gated out → exit 0, empty report (matches run's contract)":
+    ## A positional path whose group is gated out IS a discovered
+    ## entrypoint — it lands in the plan's gatedOut, not in entries.  That
+    ## is different from a path matching no discovered entrypoint at all
+    ## (the exit-3 case above): `run` for the same selection exits 0
+    ## (zrkAllGated), and `closure` must match that contract rather than
+    ## treating "gated out" as "no match".
+    let root = setUpProject()
+    defer: removeDir(root)
+
+    writeFile(root / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+    gate "CRISOL_CLOSURE_GATED_TEST_UNSET_XYZ_12345"
+}
+""")
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_gatedout.json"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      code = runMain(@["closure", "tests/unit/test_a.nim", "--json"]))
+    check code == 0
+
+    let j = parseJson(readFile(outPath).strip())
+    check j["entries"].len == 0
+    # plan/v1 serializes gatedOut, so closure/v1 must mirror it (revision bump).
+    check j["schemaRevision"].getInt == ClosureV1Revision
+    check j.hasKey("gatedOut")
+    check j["gatedOut"].len == 1
+    check j["gatedOut"][0]["path"].getStr == "tests/unit/test_a.nim"
+    check j["gatedOut"][0]["group"].getStr == "unit"
+    check j["gatedOut"][0]["reason"].getStr.len > 0
+
+  test "usage text: closure path whose only match is gated out matches run's exit-0 contract, not the exit-3 no-match case":
+    let outPath = getTempDir() / "crisol_closure_usage_gated.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      code = runMain(@["--help"]))
+    check code == 0
+    let txt = readFile(outPath)
+    check "gated out" in txt
+
 # ---------------------------------------------------------------------------
-# D2 — usage text reflects N-positional-path grammar for `closure`.
+# Usage text reflects N-positional-path grammar for `closure`.
 # ---------------------------------------------------------------------------
 
-suite "crisol closure — D2 usage grammar":
+suite "crisol closure — usage grammar":
 
   test "--help usage text documents closure <entrypoint>... (N paths, not just one)":
     let outPath = getTempDir() / "crisol_closure_usage.txt"
@@ -336,11 +384,11 @@ suite "crisol closure — D2 usage grammar":
 
 
 # ---------------------------------------------------------------------------
-# S3 — a discarded depgraph (Nim-version mismatch) surfaces as a visible,
+# A discarded depgraph (Nim-version mismatch) surfaces as a visible,
 # structured diagnostic, not a silent empty-graph fallback.
 # ---------------------------------------------------------------------------
 
-suite "crisol closure — S3 stale depgraph diagnostic":
+suite "crisol closure — stale depgraph diagnostic":
 
   test "stale depgraph nimVersion → closure --all --json reports recorded==false " &
        "for every entry AND a structured 'depgraph discarded' warning":
@@ -397,10 +445,10 @@ suite "crisol closure — S3 stale depgraph diagnostic":
     check "depgraph discarded" in readFile(errPath)
 
 # ---------------------------------------------------------------------------
-# T2 — code-review test-gap closures.
+# Code-review test-gap closures.
 # ---------------------------------------------------------------------------
 
-suite "crisol closure — T2 schema/warnings completeness":
+suite "crisol closure — schema/warnings completeness":
 
   test "closure --all --json: schemaRevision == ClosureV1Revision; warnings is a present array; an unknown config key surfaces as a warning":
     let root = setUpProject()
@@ -436,13 +484,13 @@ suite "crisol closure — T2 schema/warnings completeness":
     check foundBogusWarning
 
 # ---------------------------------------------------------------------------
-# T2 — an entrypoint belonging to two groups (same glob, different flags)
+# An entrypoint belonging to two groups (same glob, different flags)
 # yields one ClosureEntry PER group — discover()'s documented cross-group
 # fan-out (discover.nim: "the same file in two groups yields one entry PER
 # group"), surfaced end-to-end through `closure --all --json`.
 # ---------------------------------------------------------------------------
 
-suite "crisol closure — T2 multi-group entrypoint":
+suite "crisol closure — multi-group entrypoint":
 
   test "an entrypoint matching TWO groups' globs yields TWO ClosureEntry rows (same path, different group/flagHash)":
     let root = uniqueTmpDir("multigroup")
@@ -484,10 +532,10 @@ group "beta" {
     check flagHashes[0] != flagHashes[1]
 
 # ---------------------------------------------------------------------------
-# T2 — CLI-level flag/config error branches.
+# CLI-level flag/config error branches.
 # ---------------------------------------------------------------------------
 
-suite "crisol closure — T2 unknown flag":
+suite "crisol closure — unknown flag":
 
   test "closure --bogus → exit 3, stderr mentions unknown flag for closure":
     let root = setUpProject()
@@ -504,7 +552,7 @@ suite "crisol closure — T2 unknown flag":
     check code == 3
     check "unknown flag for closure" in readFile(outPath)
 
-suite "crisol closure — T2 --config error path":
+suite "crisol closure — --config error path":
 
   test "closure --all --config <nonexistent path> → exit 3, stderr mentions the error":
     let root = setUpProject()

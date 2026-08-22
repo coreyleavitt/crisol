@@ -495,6 +495,15 @@ type
     ## API (loadGateState, initGateState, applyGates).
     vars*: seq[GateStateEntry]
 
+  AmbiguousPath* = tuple[path: string; groups: seq[string]]
+    ## One gskFiles path that matched more than one candidate group.
+    ## `groups` lists every matching group name in config-declaration order;
+    ## the entrypoint uses the FIRST one.  Shared element type for
+    ## DiscoveredSet.ambiguousPaths / PlanReport.ambiguousPaths (api.nim) /
+    ## ClosureReport.ambiguousPaths — kept as one declaration so the three
+    ## sites (plus render.pathFlagsWarnings' signature) don't each spell out
+    ## the same anonymous tuple.
+
   DiscoveredSet* = object
     ## Returned exclusively by discover(); consumed exclusively by applyGates().
     ## Wrapping `entries` in a dedicated (non-seq-compatible) type enforces
@@ -507,11 +516,10 @@ type
       ## ran as an ad-hoc "paths" entrypoint with global flags only.  discover()
       ## stays pure (no stderr writes); the CLI layer reads this to print the
       ## RFC-0001:409 warning.  Always empty outside a gskFiles selection.
-    ambiguousPaths*:  seq[tuple[path: string; groups: seq[string]]]
-      ## gskFiles paths that matched MORE THAN ONE candidate group.  `groups`
-      ## lists every matching group name in config-declaration order; the
-      ## entrypoint uses the FIRST one.  The CLI layer reads this to warn
-      ## about the ambiguity.  Always empty outside a gskFiles selection.
+    ambiguousPaths*:  seq[AmbiguousPath]
+      ## gskFiles paths that matched MORE THAN ONE candidate group.  See
+      ## AmbiguousPath's doc.  The CLI layer reads this to warn about the
+      ## ambiguity.  Always empty outside a gskFiles selection.
 
   GatedEntry* = tuple[path: string; group: string; reason: string]
     ## One discovered-but-gated-out entrypoint with its gate reason.
@@ -543,14 +551,19 @@ type
     entries*:         seq[ClosureEntry]
     warnings*:        seq[ConfigWarning]
     adHocPaths*:      seq[string]
-      ## D1: gskFiles paths that matched no configured group (ran ad-hoc,
+      ## gskFiles paths that matched no configured group (ran ad-hoc,
       ## global flags only) — mirrors PlanReport.adHocPaths / DiscoveredSet.
       ## Always empty for `--all` (gskAll selection). The CLI layer turns
       ## this (and ambiguousPaths below) into warning lines via
       ## render.pathFlagsWarnings, same as `run`/`list`.
-    ambiguousPaths*:  seq[tuple[path: string; groups: seq[string]]]
-      ## D1: gskFiles paths that matched more than one candidate group; the
+    ambiguousPaths*:  seq[AmbiguousPath]
+      ## gskFiles paths that matched more than one candidate group; the
       ## first (config-declaration order) was used. Always empty for `--all`.
+    gatedOut*:        seq[GatedEntry]
+      ## Discovered-but-gated-out entrypoints — mirrors PlanReport.gatedOut.
+      ## A positional path whose only match is gated out lands HERE, not in
+      ## `entries`; the CLI treats that the same as `run`'s zrkAllGated exit-0
+      ## branch rather than as "no entrypoints matched".
 
   SelectionReason* = enum
     srClosureHit     ## Known fresh closure that intersects `changed` → run it.

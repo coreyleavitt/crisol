@@ -504,8 +504,14 @@ proc loadLastRun*(config: Config):
 const ClosureV1Schema* = "crisol/closure/v1"
   ## Stable schema identifier embedded in every crisol/closure/v1 JSON document.
 
-const ClosureV1Revision* = 1
+const ClosureV1Revision* = 2
   ## Integer minor revision of the crisol/closure/v1 schema (A8 convention).
+  ##   rev 1 (implicit) — entries[]/warnings, as issue #9 slice A shipped it.
+  ##   rev 2           — top-level `gatedOut` array (path, group, reason):
+  ##                     mirrors crisol/plan/v1's own `gatedOut` field, now
+  ##                     that a positional path whose only match is gated
+  ##                     out is distinguishable from "no entrypoints matched"
+  ##                     (see api.closureReport / ClosureReport.gatedOut).
 
 proc closureToJson*(r: ClosureReport): JsonNode =
   ## Pure: serialize a ClosureReport to the crisol/closure/v1 JsonNode.  No I/O.
@@ -517,13 +523,15 @@ proc closureToJson*(r: ClosureReport): JsonNode =
   ## the project root, ABSOLUTE for files under a configured dep-root (see
   ## types.ClosureEntry.closure).
   ##
-  ## D1: `ClosureReport.adHocPaths`/`.ambiguousPaths` are deliberately NOT
+  ## `ClosureReport.adHocPaths`/`.ambiguousPaths` are deliberately NOT
   ## serialized here — crisol/plan/v1's planToJson (planview.nim) does not
   ## serialize DiscoveredSet's equivalent fields either; the CLI prints them
   ## as stderr text (render.pathFlagsWarnings) instead, for both `run`/`list`
   ## and `closure`.  Kept symmetric with plan/v1 rather than introducing a
   ## one-off JSON surface; revisit both schemas together if a machine-
-  ## readable form is ever needed.
+  ## readable form is ever needed.  `gatedOut` (rev 2) IS serialized because
+  ## plan/v1 already serializes its own `gatedOut` field — see planview.nim's
+  ## planToJson.
   let entriesNode = newJArray()
   for e in r.entries:
     let eNode = newJObject()
@@ -538,10 +546,19 @@ proc closureToJson*(r: ClosureReport): JsonNode =
     eNode["closureHash"] = newJString(e.closureHash)
     entriesNode.add eNode
 
+  let gatedNode = newJArray()
+  for g in r.gatedOut:
+    let gNode = newJObject()
+    gNode["path"]   = newJString(g.path)
+    gNode["group"]  = newJString(g.group)
+    gNode["reason"] = newJString(g.reason)
+    gatedNode.add gNode
+
   result = newJObject()
   result["schema"]         = newJString(ClosureV1Schema)
   result["schemaRevision"] = newJInt(ClosureV1Revision)
   result["entries"]        = entriesNode
+  result["gatedOut"]       = gatedNode
   result["warnings"]       = warningsToJsonArray(r.warnings)
 
 proc closureToJsonString*(r: ClosureReport): string =

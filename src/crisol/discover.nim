@@ -216,7 +216,7 @@ proc resolveFilesGroups(
   selection: GroupSelection;
   root:      string;
 ): tuple[active: seq[Group]; adHocPaths: seq[string];
-         ambiguousPaths: seq[tuple[path: string; groups: seq[string]]]] =
+         ambiguousPaths: seq[AmbiguousPath]] =
   ## PURE: resolve each gskFiles path/glob to a synthesised single-path Group
   ## carrying its owning group's name+flags (or the ad-hoc "paths" group +
   ## global flags when no candidate matches).  See discover()'s gskFiles
@@ -297,7 +297,7 @@ proc discover*(
   # 1. Resolve active groups (selection only — no gate logic).
   var active: seq[Group]
   var adHocPaths: seq[string]
-  var ambiguousPaths: seq[tuple[path: string; groups: seq[string]]]
+  var ambiguousPaths: seq[AmbiguousPath]
 
   case selection.kind
   of gskDefault:

@@ -222,8 +222,10 @@ Options for 'closure':
   <entrypoint>... Show the recorded depgraph entry for one or more planned
                   paths (repeatable).  Mutually exclusive with --all
                   (specifying both is a usage error); one of the two is
-                  required.  A path matching no discovered entrypoint is a
-                  configuration error (exit 3), same as `run`.
+                  required.  A path matching no discovered entrypoint at all
+                  is a configuration error (exit 3), same as `run`.  A path
+                  whose only match was discovered but gated out prints an
+                  empty report and exits 0, also same as `run`.
   --all           Show every discovered entrypoint, one crisol/closure/v1
                   document.  Discovery gates still apply: this is the same
                   set `crisol list --all-groups` would show — a gated-out
@@ -251,6 +253,29 @@ proc computeColorEnabled(): bool =
   ## Returns true iff stdout is a TTY AND NO_COLOR is unset.
   let tty = isatty(1.cint) != 0   # fd 1 = stdout
   shouldEnableColor(tty)
+
+proc takeConfigFlag(args: seq[string]; ci: var int; dest: var string): bool =
+  ## Parses `--config <path>` / `--config=<path>` at `args[ci]` — the caller
+  ## has already confirmed `args[ci]` is one of those two forms (`== "--config"`
+  ## or `.startsWith("--config=")`).  For the space-separated form, advances
+  ## `ci` past the consumed value token (so the caller's enclosing `while`
+  ## loop's `inc ci` lands past it, same as before this helper existed).
+  ##
+  ## Sets `dest` and returns true on success.  Returns false (leaving `dest`
+  ## unchanged) when the value is missing (space-separated form with no next
+  ## token) or empty (`--config=` with nothing after the `=`) — the caller
+  ## then prints "crisol: --config requires a file path" and returns
+  ## ExitEnvironment, exactly as the inlined duplicate blocks did.
+  let a = args[ci]
+  if a == "--config":
+    inc ci
+    if ci >= args.len:
+      return false
+    dest = args[ci]
+    return true
+  else:
+    dest = a[9..^1]   # strip "--config="
+    return dest != ""
 
 # ---------------------------------------------------------------------------
 # runMain — testable entry; returns the process exit code
@@ -327,15 +352,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       let a = cleanArgs[ci]
       if a == "--all":
         doCleanAll = true
-      elif a == "--config":
-        inc ci
-        if ci >= cleanArgs.len:
-          stderr.write("crisol: --config requires a file path\n")
-          return ExitEnvironment
-        cleanCfgPath = cleanArgs[ci]
-      elif a.startsWith("--config="):
-        cleanCfgPath = a[9..^1]
-        if cleanCfgPath == "":
+      elif a == "--config" or a.startsWith("--config="):
+        if not takeConfigFlag(cleanArgs, ci, cleanCfgPath):
           stderr.write("crisol: --config requires a file path\n")
           return ExitEnvironment
       else:
@@ -477,7 +495,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     var closurePaths: seq[string]
     var closureAll   = false
     var closureJson  = false
-    var closureCfgPath = ""   # L1/T1: --config <path> / --config=<path>
+    var closureCfgPath = ""   # --config <path> / --config=<path>
     let closureArgs = args[1..^1]
     var ci = 0
     while ci < closureArgs.len:
@@ -486,15 +504,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         closureAll = true
       elif a == "--json":
         closureJson = true
-      elif a == "--config":
-        inc ci
-        if ci >= closureArgs.len:
-          stderr.write("crisol: --config requires a file path\n")
-          return ExitEnvironment
-        closureCfgPath = closureArgs[ci]
-      elif a.startsWith("--config="):
-        closureCfgPath = a[9..^1]
-        if closureCfgPath == "":
+      elif a == "--config" or a.startsWith("--config="):
+        if not takeConfigFlag(closureArgs, ci, closureCfgPath):
           stderr.write("crisol: --config requires a file path\n")
           return ExitEnvironment
       elif a.startsWith("-"):
@@ -538,17 +549,21 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     for w in cr.warnings:
       stderr.write("warning: " & w.message & "\n")
 
-    # D1 / Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles
+    # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles
     # paths, same as run/list.  closure has no --group flag, so withinGroups
     # is always empty here.
     for line in pathFlagsWarnings(cr.adHocPaths, cr.ambiguousPaths, @[]):
       stderr.write("crisol: " & line & "\n")
 
-    # S4: a positional <entrypoint>... selection that matched no discovered
-    # entrypoint is a configuration error, same as `run` (exit 3).  `--all`
-    # with zero discovered entrypoints is NOT an error (an empty report is a
-    # legitimate answer to "what's discovered").
-    if not closureAll and cr.entries.len == 0:
+    # A positional <entrypoint>... selection that matched no discovered
+    # entrypoint at all is a configuration error, same as `run` (exit 3).
+    # A selection whose only match(es) were discovered but GATED OUT is
+    # NOT that case — it lands in cr.gatedOut, not cr.entries — and `run`
+    # exits 0 for the identical selection (zrkAllGated); `closure` matches
+    # that contract: print the (empty-entries) report and exit 0.  `--all`
+    # with zero discovered entrypoints is likewise NOT an error (an empty
+    # report is a legitimate answer to "what's discovered").
+    if not closureAll and cr.entries.len == 0 and cr.gatedOut.len == 0:
       stderr.write("crisol: no entrypoints matched — check config/globs\n")
       return ExitEnvironment
 

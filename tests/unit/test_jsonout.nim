@@ -1326,7 +1326,7 @@ suite "jsonout T2 — closureToJson (crisol/closure/v1)":
 
   test "schema constants are the documented literals":
     check ClosureV1Schema == "crisol/closure/v1"
-    check ClosureV1Revision == 1
+    check ClosureV1Revision == 2
 
   test "closureToJson: schema/schemaRevision, a recorded entry's full field set, an unrecorded entry, and warnings":
     let report = ClosureReport(
@@ -1384,6 +1384,7 @@ suite "jsonout T2 — closureToJson (crisol/closure/v1)":
     let j = closureToJson(ClosureReport())
     check j["entries"].len == 0
     check j["warnings"].len == 0
+    check j["gatedOut"].len == 0
 
   test "closureToJsonString round-trips through parseJson to the same document as closureToJson":
     let report = ClosureReport(

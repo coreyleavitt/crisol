@@ -378,3 +378,58 @@ suite "crisol CLI — B7 --failed":
     # Pass a path that exists but doesn't contain the seeded (nonexistent) path.
     let code = runMain(@["run", fd / "pass_always.nim", "--failed", "--jobs", "1"])
     check code == 0
+
+# ---------------------------------------------------------------------------
+# Suite 3 — the no-entrypoints-matched structural branch still carries the
+# plan's config warnings (RunReport.plan must not be dropped on that branch).
+# ---------------------------------------------------------------------------
+
+proc uniqueTmpDirD(tag: string): string =
+  let mono = getMonoTime()
+  getTempDir() / ("crisol_norun_plan_" & tag & "_" & $mono.ticks)
+
+proc writeFD(root, rel, content: string) =
+  let p = root / rel
+  createDir(p.parentDir)
+  writeFile(p, content)
+
+proc captureStderrToFileD(path: string; body: proc()): void =
+  ## Redirect fd 2 (stderr) to `path`, call body(), then restore.
+  let f = open(path, fmWrite)
+  let fileFd: cint = f.getFileHandle.cint
+  let savedFd: cint = posix_mod2.dup(2.cint)
+  if savedFd < 0:
+    f.close()
+    raise newException(OSError, "dup(2) failed")
+  discard posix_mod2.dup2(fileFd, 2.cint)
+  f.close()
+  try:
+    body()
+  finally:
+    flushFile(stderr)
+    discard posix_mod2.dup2(savedFd, 2.cint)
+    discard posix_mod2.close(savedFd)
+
+suite "crisol CLI — no-entrypoints-matched carries plan warnings":
+
+  test "run <nonexistent path> with an unknown config key → exit 3 and stderr still carries the config warning":
+    let root = uniqueTmpDirD("cfgwarn")
+    defer: removeDir(root)
+    writeFD(root, "tests/unit/test_a.nim", "doAssert true\n")
+    writeFile(root / "crisol.kdl",
+      "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n" &
+      "bogus-top-level-key \"nope\"\n")
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let errPath = getTempDir() / "crisol_norun_plan_err.txt"
+    defer: (try: removeFile(errPath) except: discard)
+    var code = 0
+    captureStderrToFileD(errPath, proc () =
+      code = runMain(@["run", "does/not/exist.nim"]))
+    check code == 3
+    let err = readFile(errPath)
+    check "warning:" in err
+    check "bogus-top-level-key" in err

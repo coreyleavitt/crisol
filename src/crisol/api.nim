@@ -68,6 +68,7 @@ export types.TestRecord
 export types.RecordStatus
 export types.Summary
 export types.GatedEntry
+export types.AmbiguousPath
 export types.ConfigWarning
 export types.ClosureEntry
 export types.ClosureReport
@@ -254,7 +255,7 @@ type
     settings*:    ResolvedSettings
     adHocPaths*:     seq[string]   ## Issue #3 / RFC-0001:409: gskFiles paths that
                                    ## matched no candidate group (ran ad-hoc, global flags).
-    ambiguousPaths*: seq[tuple[path: string; groups: seq[string]]]
+    ambiguousPaths*: seq[AmbiguousPath]
                                    ## Issue #3: gskFiles paths that matched more than one
                                    ## candidate group; the first (config order) was used.
 
@@ -531,6 +532,7 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
     warnings:       impl.pr.warnings,
     adHocPaths:     impl.pr.adHocPaths,
     ambiguousPaths: impl.pr.ambiguousPaths,
+    gatedOut:       impl.pr.gatedOut,
   )
 
 # ---------------------------------------------------------------------------
@@ -623,8 +625,8 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
                        zeroRunnableReason: zrkAllGated)
     else:
       releaseLock(lockHandle)
-      return structuralResult(
-        "no entrypoints matched — check config/globs", 3)
+      return structuralResultWithPlan(
+        "no entrypoints matched — check config/globs", 3, pr)
 
   var graph = pv.graph   # mutable copy for depgraph recording
   let cb    = if opts.onResult != nil: opts.onResult

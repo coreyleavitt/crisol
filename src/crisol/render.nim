@@ -224,7 +224,7 @@ proc gateSkipMessages*(gatedOut: seq[GatedEntry]): seq[string] =
   gateSkipMessages(deduped)
 
 proc pathFlagsWarnings*(adHocPaths: seq[string];
-                         ambiguousPaths: seq[tuple[path: string; groups: seq[string]]];
+                         ambiguousPaths: seq[AmbiguousPath];
                          withinGroups: seq[string] = @[]): seq[string] =
   ## PURE: convert DiscoveredSet.adHocPaths/ambiguousPaths (from a gskFiles
   ## discover()) into human-readable RFC-0001:409 warning lines.  Same pattern

@@ -93,6 +93,23 @@ one-time recompile of entrypoints whose closure gained members.
   leading `""`/`"."`/`".."` component before matching against either — a
   pure widening of the match, so still sound under the R7 over-selection
   policy.  The reported/recorded path remains the lexical one.
+- **closure:** an `@m`-mangled `link` entry (Nim's entrypoint-directory-
+  relative candidate, the mangler's default choice whenever it is not
+  strictly longer than the `@p`/`@n` search-path-relative one) can *also*
+  carry a realpath through a symlinked dep-root when the entrypoint is
+  shallow enough for `@m` to still win — e.g. a depth-1 entrypoint
+  importing a module via a milpa `_deps/<dep>` symlink into the CAS.
+  Previously `resolveMangledAll` resolved `@m` bodies with a single
+  `(entrypointDir / body).normalizedPath` candidate; when that candidate
+  fell outside every tracked root (the realpath-through-symlink case) the
+  under-tracked-root filter silently dropped it, so the dep was absent from
+  the closure and an edit to it never re-selected the entrypoint under
+  `--changed` (unsound).  `resolveMangledAll` now also resolves the body
+  through the same `SourceIndex` lookup `@p`/`@n` bodies use whenever the
+  plain candidate escapes every tracked root, recovering it at its lexical
+  path.  The fallback is gated on that escape condition specifically, so an
+  ordinary in-root `@m` body (e.g. a sibling `foo.nim`) is never unioned
+  against the whole index.
 - **closure:** `decodeBody` now decodes Nim's `@c` (`:`) and `@h` (`#`)
   mangling escapes in addition to `@s` and `@@`; a module path containing a
   colon or hash character previously failed to decode correctly.
@@ -104,6 +121,22 @@ one-time recompile of entrypoints whose closure gained members.
   reported `recorded:false` for every entrypoint with exit 0 —
   indistinguishable from "never ran" — and `run`/`list` silently
   recompiled and force-selected everything with no explanation.
+- **closure:** a positional `<entrypoint>` path whose only match was
+  discovered but GATED OUT (e.g. an unset `gate` env var) now prints the
+  (empty-`entries`) report and exits 0, matching `run`'s `zrkAllGated`
+  contract for the identical selection.  Previously it was treated the same
+  as "matched no discovered entrypoint at all" and exited 3 — a gated-out
+  entrypoint is a legitimate discovery result, not a configuration error.
+  `ClosureReport` gained a `gatedOut` field (mirroring `PlanReport.gatedOut`)
+  to distinguish the two cases; `crisol/closure/v1` JSON now serializes it
+  too (schema revision bumped to 2), mirroring `crisol/plan/v1`'s existing
+  `gatedOut` array.
+- **run:** the zero-runnable "no entrypoints matched" branch (exit 3) now
+  populates `RunReport.plan`, so `run`'s stderr/JSON output for that branch
+  once again includes the plan-phase config warnings (including the
+  depgraph-discard warning) instead of silently dropping them. Previously
+  that branch built a bare `RunReport` without `plan`, so the CLI's
+  `for w in rr.plan.warnings` loop had nothing to iterate.
 
 ### Added
 
