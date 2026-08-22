@@ -17,7 +17,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_depgraph_guard.nim
 
-import std/[os, sets, tables, unittest]
+import std/[json, os, sets, tables, unittest]
 import crisol/types
 import crisol/depgraph
 
@@ -96,3 +96,83 @@ suite "depgraph load guards (issue #5 migration)":
     let g = loadDepGraph(cfg, "2.2.10")
     check ("tests/empty.nim", "cbf29ce484222325") notin g.entries
     check ("tests/ok.nim", "cbf29ce484222325") in g.entries
+
+# ---------------------------------------------------------------------------
+# recordClosure — R5: the recovery policy lives beside the invariant it
+# enforces (DepGraphEntry.closure, invariant NONEMPTY-CLOSURE).
+# ---------------------------------------------------------------------------
+
+proc writeManifest(dir, bname: string; link: seq[string]) =
+  ## Minimal synthetic nimcache manifest — only `link` matters to
+  ## extractClosure (see tests/unit/test_closure_warm.nim's writeManifest).
+  let node = newJObject()
+  node["compile"] = newJArray()
+  let linkArr = newJArray()
+  for o in link: linkArr.add newJString(o)
+  node["link"]    = linkArr
+  node["linkcmd"] = newJString("")
+  createDir(dir)
+  writeFile(dir / bname & ".json", $node)
+
+proc recRoot(tag: string): string =
+  result = getTempDir() / ("crisol_recordclosure_" & tag & "_" & $getCurrentProcessId())
+  removeDir(result)
+  createDir(result / ".crisol")
+  createDir(result / "tests")
+
+proc isHex16(s: string): bool =
+  if s.len != 16: return false
+  for c in s:
+    if c notin {'0'..'9', 'a'..'f'}: return false
+  true
+
+suite "recordClosure — recovery policy (R5)":
+
+  test "valid manifest → ok, entry recorded with non-empty closure + closureHash, persisted":
+    let root = recRoot("ok")
+    defer: removeDir(root)
+    let ep = root / "tests" / "rec_ep.nim"
+    writeFile(ep, "# ep\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "rec_ep", link = @[nc / "@mrec_ep.nim.c.o"])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var graph = initDepGraph("")
+    let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_ep.nim", group: "t"),
+                          nc, "rec_ep", ep,
+                          protocolMajor = 1)
+    check r.ok
+    check r.error == ""
+
+    let fh = flagHash(@[])
+    check ("tests/rec_ep.nim", fh) in graph.entries
+    let entry = graph.entries[("tests/rec_ep.nim", fh)]
+    check entry.closure.len > 0
+    check isHex16(entry.closureHash)
+
+    check ("tests/rec_ep.nim", fh) in loadDepGraph(cfg, "").entries
+
+  test "extraction failure (empty link) → ok=false, error non-empty, entry GONE in memory and on disk":
+    let root = recRoot("fail")
+    defer: removeDir(root)
+    let ep = root / "tests" / "rec_fail.nim"
+    writeFile(ep, "# ep\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "rec_fail", link = @[])   # empty link → extractClosure raises
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var graph = initDepGraph("")
+    let fh = flagHash(@[])
+    # Pre-seed a fresh-looking prior entry — exactly what a naive writer
+    # would leave behind on failure.
+    graph.updateEntry("tests/rec_fail.nim", fh, toHashSet(["tests/rec_fail.nim"]),
+                      "priorhash", 1)
+    saveDepGraph(graph, cfg)
+
+    let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_fail.nim", group: "t"),
+                          nc, "rec_fail", ep,
+                          protocolMajor = 1)
+    check not r.ok
+    check r.error.len > 0
+    check ("tests/rec_fail.nim", fh) notin graph.entries
+    check ("tests/rec_fail.nim", fh) notin loadDepGraph(cfg, "").entries

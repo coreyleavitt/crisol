@@ -30,9 +30,9 @@
 ##   • Output captured to per-entrypoint temp files; read atomically after
 ##     completion; bounded by maxOutputBytes.
 
-import std/[algorithm, json, monotimes, options, os, sequtils, sets, times]
+import std/[json, monotimes, options, os, sets, times]
 import std/posix
-import crisol/[types, config, spawn, signals, render, depgraph, closure, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan]
+import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan]
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
 # M4: re-export the CacheContext bundle + constructors so callers of execute()
 # don't need a separate `import crisol/cachedispatch`.
@@ -1281,6 +1281,10 @@ proc execute*(
             # to the stable slug-keyed path, then record freshness in the depgraph.
             # Binary is valid (compile succeeded) whenever outcome is not
             # oCompileFailed or oSpawnError.
+            # R9: default true — only a compiled-this-run entry whose closure
+            # recording actually failed sets this false; every other path
+            # (cache hit, edSkipFresh, etc.) is unaffected by this gate.
+            var closureRecorded = true
             if compiledThisRun and slotCacheDir.len > 0:
               if completedOutcome notin {oCompileFailed, oSpawnError}:
                 let ep = p.entrypoints[completedIdx].ep
@@ -1303,33 +1307,18 @@ proc execute*(
                   except:
                     discard  # non-fatal
 
-                # Record the closure. If this FAILS after a successful compile
-                # (issue #5 writer hole): the stable binary is already in
-                # place, so "next run will just recompile" is false — the
-                # PREVIOUS entry (arbitrarily stale) would keep being served
-                # as fresh. Invalidate it instead: no entry ⇒ decideCompile
-                # cdStale and narrow "unknown closure" (force-included), and
-                # the result-cache never looks up an entrypoint without one.
-                let fHash = flagHash(ep.flags)
-                try:
-                  let closureSet = extractClosure(slotCacheDir, bname, epAbs, config)
-                  var closureSeq: seq[string] = toSeq(closureSet)
-                  closureSeq.sort()
-                  let contentHash = closureContentHash(closureSeq, config.projectRoot)
-                  graph.updateEntry(ep.path, fHash, closureSet, contentHash, CrisolProtocolMajor)
-                  saveDepGraph(graph, config)
-                except CatchableError as e:
+                # Record the closure — recovery policy lives in recordClosure
+                # (see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE, and
+                # recordClosure's doc comment in depgraph.nim).
+                let rec = recordClosure(graph, config, ep,
+                                        slotCacheDir, bname, epAbs, CrisolProtocolMajor)
+                closureRecorded = rec.ok
+                if not rec.ok:
                   stderr.write("crisol: warning: " & ep.path & ": could not record its " &
-                               "source closure (" & e.msg & "); dependency record " &
+                               "source closure (" & rec.error & "); dependency record " &
                                "invalidated — it will be recompiled and force-selected " &
                                "next run\n")
                   try: stderr.flushFile() except CatchableError: discard
-                  graph.invalidateEntry(ep.path, fHash)
-                  try:
-                    saveDepGraph(graph, config)
-                  except CatchableError as e2:
-                    stderr.write("crisol: warning: could not persist the dependency graph (" &
-                                 e2.msg & ")\n")
 
             # Clean up the per-slot bin dir after stable copy (M15).
             # pollSlot already cleaned this on compile-fail; only clean here on success.
@@ -1346,7 +1335,13 @@ proc execute*(
             if cacheActive:
               let verdict = shouldStore(result[completedIdx], cache.spec, slotAttempt, cache.policy,
                                         p.entrypoints[completedIdx].cacheable)
-              if verdict.store:
+              # R9: a store is permitted only when BOTH the policy verdict AND
+              # the closure recording (above) agree. A result whose closure
+              # failed to record must never be stored: keyOf would derive the
+              # SoundnessKey from an empty closureContentHash, and the entry
+              # could never be looked up again (lookup needs edRunFresh, which
+              # needs a depgraph entry) — a permanently dead cache write.
+              if verdict.store and closureRecorded:
                 # Re-derive the key from the NOW-updated graph (closureHash fresh)
                 # so a later run's lookup-key matches this store-key.
                 let key = cache.seams.keyOf(p.entrypoints[completedIdx])
@@ -1364,11 +1359,15 @@ proc execute*(
                 result[completedIdx].cacheDecision =
                   if stored: cdmStored else: cdmKeyMiss
               else:
-                # Not stored: the verdict carries the structural reason.  Stamp the
-                # plan-time key (set for an edRunFresh miss; "" otherwise) so a
-                # consulted-but-not-stored result still reports its inputHash.
+                # Not stored: either the verdict carries the structural reason, or
+                # (R9) the verdict said store but the closure wasn't recorded — in
+                # which case reuse cdmKeyMiss, the SAME decision a store attempt
+                # that returned false would report (no new CacheDecision variant).
+                # Stamp the plan-time key (set for an edRunFresh miss; "" otherwise)
+                # so a consulted-but-not-stored result still reports its inputHash.
                 result[completedIdx].inputHash = inputHashes[completedIdx]
-                result[completedIdx].cacheDecision = verdict.decision
+                result[completedIdx].cacheDecision =
+                  if verdict.store: cdmKeyMiss else: verdict.decision
             else:
               # Caching inactive: stamp the structural reason recorded at plan time.
               result[completedIdx].cacheDecision = cacheDecisions[completedIdx]

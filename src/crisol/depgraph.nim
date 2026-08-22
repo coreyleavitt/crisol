@@ -50,6 +50,8 @@ import std/[algorithm, json, os, sequtils, sets, strutils, tables]
 import std/posix as posix_mod
 import crisol/types
 import crisol/config  # for stateDirOf
+import crisol/closure  # for extractClosure (recordClosure); no cycle — closure.nim
+                        # imports only crisol/types
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -62,9 +64,10 @@ const DepGraphFormatVersion* = 3
   ## History:
   ##   3 — issue #5: closures are derived from the nimcache `link` array.
   ##       Every v2 entry is suspect (any entry rewritten after a warm
-  ##       recompile is truncated or empty and hash-matches itself forever,
-  ##       so upgrading alone cannot heal it); the bump discards the whole
-  ##       graph once — a one-time full recompile — rather than serve it.
+  ##       recompile is truncated or empty — see DepGraphEntry.closure,
+  ##       invariant NONEMPTY-CLOSURE — so upgrading alone cannot heal it);
+  ##       the bump discards the whole graph once — a one-time full
+  ##       recompile — rather than serve it.
   ## v2: added closureHash and protocolMajor fields.
 
 # ---------------------------------------------------------------------------
@@ -77,7 +80,19 @@ type
     formatVersion*: int     ## DepGraphFormatVersion
 
   DepGraphEntry* = object
-    closure*:       HashSet[string]  ## project-root-relative closure paths
+    closure*:       HashSet[string]
+      ## project-root-relative closure paths.
+      ##
+      ## Invariant NONEMPTY-CLOSURE: a compiled entrypoint's closure always
+      ## contains at least the entrypoint itself, so an empty closure is
+      ## never a plausible scan result — it is a crisol defect (manifest
+      ## misread, demangle regression, entrypoint outside every tracked
+      ## root).  Recording one would make the entry permanently fresh (the
+      ## content hash over nothing matches forever), so decideCompile, the
+      ## result-cache key, and `--changed` selection could never observe a
+      ## change.  `updateEntry` refuses to write an empty closure;
+      ## `loadDepGraph` drops any that reach disk anyway (defense in depth).
+      ## Every other site that touches this rule is a pointer back here.
     closureHash*:   string           ## 64-bit chained FNV-1a over sorted closure file CONTENTS (16 hex)
     protocolMajor*: int              ## crisol protocol major at build time
 
@@ -188,18 +203,14 @@ proc updateEntry*(graph: var DepGraph;
                   protocolMajor: int = 0) =
   ## Insert or replace the entry for (path, fHash).
   ##
-  ## Refuses an EMPTY closure (issue #5): a compiled entrypoint's closure
-  ## always contains at least the entrypoint itself, so an empty set is a
-  ## crisol defect (manifest misread, demangle regression, entrypoint outside
-  ## every tracked root), never a real scan result.  Recording it would make
-  ## the entry permanently fresh — the content hash over nothing matches
-  ## forever — so decideCompile, the result-cache key and --changed selection
-  ## could never observe a change.  Raises `CrisolError(cekInternal)` and
-  ## leaves any existing entry untouched; the caller decides whether to
-  ## `invalidateEntry` (the runner does).
+  ## Refuses an EMPTY closure — see `DepGraphEntry.closure`, invariant
+  ## NONEMPTY-CLOSURE.  Raises `CrisolError(cekInternal)` and leaves any
+  ## existing entry untouched; the caller decides whether to
+  ## `invalidateEntry` (`recordClosure`, below, does).
   if closure.len == 0:
     raise newCrisolError(cekInternal,
-      "refusing to record an empty source closure (it could never go stale)")
+      "refusing to record an empty source closure (see DepGraphEntry.closure, " &
+      "invariant NONEMPTY-CLOSURE)")
   graph.entries[(path, fHash)] = DepGraphEntry(
     closure:       closure,
     closureHash:   closureHash,
@@ -211,9 +222,10 @@ proc invalidateEntry*(graph: var DepGraph; path: string; fHash: string) =
   ## record": decideCompile → cdStale (recompile) and narrowByDiff → unknown
   ## closure (force-included).  Idempotent; absent key is a no-op.
   ##
-  ## Used by the runner when a compile SUCCEEDED but the closure could not be
-  ## recorded: the stable binary is already in place, so without this the
-  ## PREVIOUS entry (arbitrarily stale) would keep being served as fresh.
+  ## Used by `recordClosure` (below) when a compile SUCCEEDED but the
+  ## closure could not be recorded: the stable binary is already in place,
+  ## so without this the PREVIOUS entry (arbitrarily stale) would keep
+  ## being served as fresh.
   graph.entries.del((path, fHash))
 
 # ---------------------------------------------------------------------------
@@ -401,6 +413,45 @@ proc saveDepGraph*(graph: DepGraph; config: Config) =
                  e.msg & "\n")
     try: removeFile(tmpPath) except: discard
 
+# ---------------------------------------------------------------------------
+# Public: recovery policy (issue #5)
+# ---------------------------------------------------------------------------
+
+proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
+                    nimcacheDir, binaryName, epAbs: string;
+                    protocolMajor: int): tuple[ok: bool, error: string] =
+  ## Extract, hash, and persist one entrypoint's source closure after a
+  ## successful compile — the single place issue #5's recovery policy lives.
+  ##
+  ## Policy: a compile whose closure cannot be recorded must not leave the
+  ## previous entry in place — the stable binary already exists, so nothing
+  ## would recompile and the stale record would be served as fresh.
+  ## Invalidating instead makes decideCompile see `cdStale` and
+  ## narrowByDiff force-include the entrypoint (unknown closure).
+  ##
+  ## On success: `updateEntry` + `saveDepGraph`, returns `(ok: true, "")`.
+  ## On ANY `CatchableError` (missing/unparseable manifest, empty `link` —
+  ## see `extractClosure` — or `updateEntry`'s NONEMPTY-CLOSURE refusal):
+  ## `invalidateEntry` + `saveDepGraph`, returns `(ok: false, e.msg)`.  The
+  ## caller (the runner) only needs to warn on `not ok`; no further recovery
+  ## step is needed on either path.
+  ##
+  ## `saveDepGraph` never raises (warns to stderr and returns), so there is
+  ## no third outcome to handle.
+  let fHash = flagHash(ep.flags)
+  try:
+    let closureSet = extractClosure(nimcacheDir, binaryName, epAbs, config)
+    var closureSeq = toSeq(closureSet)
+    closureSeq.sort()
+    let contentHash = closureContentHash(closureSeq, config.projectRoot)
+    graph.updateEntry(ep.path, fHash, closureSet, contentHash, protocolMajor)
+    saveDepGraph(graph, config)
+    result = (ok: true, error: "")
+  except CatchableError as e:
+    graph.invalidateEntry(ep.path, fHash)
+    saveDepGraph(graph, config)
+    result = (ok: false, error: e.msg)
+
 proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
   ## Load the graph from `<projectRoot>/<stateDir>/depgraph`.
   ##
@@ -460,9 +511,9 @@ proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
         # else: drop the suspicious absolute path silently
       else:
         filtered.incl p   # relative path: kept as-is (project-root-relative)
-    # issue #5 defense-in-depth: an entry with NO closure can never go stale
-    # (the writer refuses to record one — see updateEntry); if one reaches
-    # disk anyway, treat it as absent so decideCompile/narrow re-derive it.
+    # Defense in depth — see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE:
+    # the writer refuses to record an empty closure, but if one reaches disk
+    # anyway, treat it as absent so decideCompile/narrow re-derive it.
     if filtered.len == 0:
       result.entries.del(key)
       continue

@@ -17,9 +17,9 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_closure_record_failure.nim
 
-import std/[os, sets, tables, times, unittest]
+import std/[options, os, sets, tables, times, unittest]
 import std/posix as posix_mod
-import crisol/[types, runner, depgraph, planner]
+import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache]
 
 proc fixtureDir(): string =
   currentSourcePath().parentDir.parentDir / "fixtures"
@@ -72,3 +72,57 @@ suite "closure recording failure after a successful compile (issue #5)":
     let plan2 = plan(cfg, @[ep], graph, nimVersion = "")
     check plan2.entrypoints[0].edecision == edStale
     check plan2.entrypoints[0].reason == "no closure record in dep graph"
+
+# ---------------------------------------------------------------------------
+# R9: a result whose closure was NOT recorded must NOT be stored in the
+# result cache either — a dead entry (closureContentHash "") that a later
+# lookup could never find (lookup needs edRunFresh, which needs an entry).
+# ---------------------------------------------------------------------------
+
+type MockCacheState = ref object
+  storeCalls: int
+
+proc mockStoreOnlySeams(ms: MockCacheState): CacheSeams =
+  ## keyOf/load are never expected to be hit by this scenario (edNeverBuilt
+  ## is not plan-time cache-eligible); store is the seam under test.
+  CacheSeams(
+    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
+             SoundnessKey("mk-" & pep.ep.path),
+    load:  proc(key: SoundnessKey): Option[CachedResult] = none(CachedResult),
+    store: proc(key: SoundnessKey; res: CachedResult): bool =
+             inc ms.storeCalls; true,
+  )
+
+suite "closure recording failure blocks the result-cache store (issue #5, R9)":
+
+  test "with caching ACTIVE, a failed closure recording must not store a dead entry":
+    let root = makeTempRoot("nostorewithcache")
+    defer: removeDir(root)
+    let cfg = makeCfg(root)
+    # Same out-of-root scenario as above: closure recording fails.
+    let ep = Entrypoint(path: fixtureDir() / "pass_always.nim",
+                        group: "default", flags: @[])
+    var graph = initDepGraph("")
+    createDir(root / ".crisol")
+    saveDepGraph(graph, cfg)
+
+    let plan1 = plan(cfg, @[ep], graph, nimVersion = "")
+    check plan1.entrypoints[0].edecision == edNeverBuilt
+
+    let ms = MockCacheState()
+    let cache = cacheEnabled(resolveSandbox(hlIsolated), defaultCachePolicy(),
+                             mockStoreOnlySeams(ms))
+    let r1 = execute(plan1, config = cfg, graph = graph,
+                     nimVersion = "", showProgress = false, cache = cache)
+
+    check r1.len == 1
+    check r1[0].outcome == oPassed          # compile + run still succeeded
+
+    # The store seam must NEVER have been called: a passing run whose
+    # closure could not be recorded must not be written to the cache.
+    check ms.storeCalls == 0
+    # And the live result must be stamped as NOT stored — reusing the same
+    # "fresh run, not stored" decision the store-gate already uses (no new
+    # CacheDecision variant).
+    check r1[0].cacheDecision == cdmKeyMiss
+    check not r1[0].cached
