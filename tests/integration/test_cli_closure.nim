@@ -24,6 +24,7 @@
 import std/[json, monotimes, os, strutils, unittest]
 import std/posix as posix_mod
 import crisol  # runMain
+import crisol/render  # pathFlagsWarnings — D1: reuse run/list's exact wording
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,6 +50,23 @@ proc captureStdoutToFile(path: string; body: proc()): void =
   finally:
     flushFile(stdout)
     discard posix_mod.dup2(savedFd, 1.cint)
+    discard posix_mod.close(savedFd)
+
+proc captureStderrToFile(path: string; body: proc()): void =
+  ## Redirect fd 2 (stderr) to `path`, call body(), then restore.
+  let f = open(path, fmWrite)
+  let fileFd: cint = f.getFileHandle.cint
+  let savedFd: cint = posix_mod.dup(2.cint)
+  if savedFd < 0:
+    f.close()
+    raise newException(OSError, "dup(2) failed")
+  discard posix_mod.dup2(fileFd, 2.cint)
+  f.close()
+  try:
+    body()
+  finally:
+    flushFile(stderr)
+    discard posix_mod.dup2(savedFd, 2.cint)
     discard posix_mod.close(savedFd)
 
 proc writeF(root, rel, content: string) =
@@ -182,3 +200,185 @@ suite "crisol closure — issue #9 slice A":
     let txt = readFile(outPath)
     check "tests/unit/test_a.nim" in txt
     check "tests/unit/test_b.nim" in txt
+
+# ---------------------------------------------------------------------------
+# L1/T1 — `closure` accepts --config <path> / --config=<path>, mirroring
+# clean's parsing (same error text + exit 3 when the value is missing).
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — L1/T1 --config <path>":
+
+  test "closure --all --json --config <path> targets a non-default config file":
+    let root = setUpProject()
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    # Write a second, non-default config file naming the same convention glob.
+    let cfgPath = root / "crisol_alt.kdl"
+    writeFile(cfgPath, "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n")
+
+    let outPath = getTempDir() / "crisol_closure_config.json"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      code = runMain(@["closure", "--all", "--json", "--config", cfgPath]))
+    check code == 0
+
+    let j = parseJson(readFile(outPath).strip())
+    check j["entries"].len == 2
+
+  test "closure --config= (inline form) with an empty value → exit 3":
+    let root = setUpProject()
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_config_empty_err.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["closure", "--all", "--config="]))
+    check code == 3
+    check "crisol: --config requires a file path" in readFile(outPath)
+
+  test "closure --config with no following value → exit 3":
+    let root = setUpProject()
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_config_missing_err.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["closure", "--all", "--config"]))
+    check code == 3
+    check "crisol: --config requires a file path" in readFile(outPath)
+
+# ---------------------------------------------------------------------------
+# D1 — `closure` prints the same ad-hoc / ambiguous path diagnostics that
+# `run`/`list` print via render.pathFlagsWarnings.
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — D1 ad-hoc / ambiguous path warnings":
+
+  test "closure <path not in any group glob> prints the same ad-hoc warning run/list print":
+    let root = setUpProject()
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    # A .nim file that exists but is outside the "unit" group's convention
+    # glob (tests/unit/test_*.nim) — matches no configured group, so
+    # discover() records it as an ad-hoc path.
+    writeF(root, "scripts/adhoc.nim", "doAssert true\n")
+
+    let expected = pathFlagsWarnings(@["scripts/adhoc.nim"], @[], @[])
+    check expected.len == 1
+
+    let outPath = getTempDir() / "crisol_closure_adhoc_err.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["closure", "scripts/adhoc.nim"]))
+    check code == 0
+    check "crisol: " & expected[0] in readFile(outPath)
+
+# ---------------------------------------------------------------------------
+# S4 — `closure <path>` matching no entrypoint exits 3 with the same
+# "no entrypoints matched" message `run` uses; `--all` with zero discovered
+# entrypoints stays exit 0 with an empty entries report.
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — S4 no-match exit code":
+
+  test "closure <nonexistent path> --json → exit 3, stderr mentions no entrypoints matched":
+    let root = setUpProject()
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_nomatch_err.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["closure", "does/not/exist.nim", "--json"]))
+    check code == 3
+    check "no entrypoints matched" in readFile(outPath)
+
+# ---------------------------------------------------------------------------
+# D2 — usage text reflects N-positional-path grammar for `closure`.
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — D2 usage grammar":
+
+  test "--help usage text documents closure <entrypoint>... (N paths, not just one)":
+    let outPath = getTempDir() / "crisol_closure_usage.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      code = runMain(@["--help"]))
+    check code == 0
+    check "crisol closure <entrypoint>..." in readFile(outPath)
+
+
+# ---------------------------------------------------------------------------
+# S3 — a discarded depgraph (Nim-version mismatch) surfaces as a visible,
+# structured diagnostic, not a silent empty-graph fallback.
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — S3 stale depgraph diagnostic":
+
+  test "stale depgraph nimVersion → closure --all --json reports recorded==false " &
+       "for every entry AND a structured 'depgraph discarded' warning":
+    ## Simulates a Nim upgrade: after a real `run` records entries, the
+    ## depgraph file's header.nimVersion is rewritten to a value that will
+    ## never match the running compiler's fingerprint. `closure --all --json`
+    ## must still exit 0, but every entry must show recorded==false AND the
+    ## discard must be a VISIBLE, STRUCTURED diagnostic — both in the JSON
+    ## `warnings` array and on stderr (crisol.nim's closure handler: `for w
+    ## in cr.warnings: stderr.write("warning: " & w.message & "\n")`) — not
+    ## silently indistinguishable from "never ran".
+    let root = setUpProject()
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let runCode = runMain(@["run", "tests/unit/test_a.nim"])
+    flushFile(stdout)
+    check runCode == 0
+
+    # Rewrite the persisted depgraph's header.nimVersion so it can never
+    # match the current compiler fingerprint (see depgraph.nim's top doc
+    # comment: `<projectRoot>/<stateDir>/depgraph`, stateDir defaults to
+    # ".crisol").
+    let depgraphPath = root / ".crisol" / "depgraph"
+    check fileExists(depgraphPath)
+    var doc = parseJson(readFile(depgraphPath))
+    doc["header"]["nimVersion"] = newJString("0.0.0-stale")
+    writeFile(depgraphPath, $doc)
+
+    let outPath = getTempDir() / "crisol_closure_stale_depgraph.json"
+    let errPath = getTempDir() / "crisol_closure_stale_depgraph.err"
+    defer:
+      (try: removeFile(outPath) except: discard)
+      (try: removeFile(errPath) except: discard)
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      captureStderrToFile(errPath, proc () =
+        code = runMain(@["closure", "--all", "--json"])))
+    check code == 0
+
+    let j = parseJson(readFile(outPath).strip())
+    check j["entries"].len > 0
+    for e in j["entries"]:
+      check e["recorded"].getBool == false
+
+    var foundDiscardWarning = false
+    for w in j["warnings"]:
+      if "depgraph discarded" in w["message"].getStr:
+        foundDiscardWarning = true
+    check foundDiscardWarning
+
+    check "depgraph discarded" in readFile(errPath)

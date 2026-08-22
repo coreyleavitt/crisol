@@ -149,8 +149,8 @@ Usage:
               [--hermetic <none|isolated|network>]
               [--rlimit-nofile <N>]
   crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
-  crisol closure <entrypoint> [--json]
-  crisol closure --all [--json]
+  crisol closure <entrypoint>... [--json] [--config <path>]
+  crisol closure --all [--json] [--config <path>]
   crisol clean [--all] [--config <path>]
 
   crisol --help | -h
@@ -160,8 +160,9 @@ Subcommands:
   run      Discover, compile, and run test entrypoints.
   list     Show what WOULD run (the plan) without compiling or running anything.
   closure  Read-only: show the recorded depgraph entry (group, flagHash,
-           closure files, closureHash) for one entrypoint, or every discovered
-           entrypoint with --all.  No compile, no run, no lock.
+           closure files, closureHash) for one or more planned entrypoints,
+           or every discovered entrypoint with --all.  No compile, no run,
+           no lock.
   clean    Prune orphan cache/bin dirs and stale depgraph entries.
            --all removes the entire state dir.  --config overrides the config file.
 
@@ -218,13 +219,22 @@ Additional options for 'list':
   --json          Emit the crisol/plan/v1 JSON document instead of human output.
 
 Options for 'closure':
-  <entrypoint>    Show the recorded depgraph entry for this one planned path.
-                  Mutually exclusive with --all (specifying both is a usage
-                  error); one of the two is required.
+  <entrypoint>... Show the recorded depgraph entry for one or more planned
+                  paths (repeatable).  Mutually exclusive with --all
+                  (specifying both is a usage error); one of the two is
+                  required.  A path matching no discovered entrypoint is a
+                  configuration error (exit 3), same as `run`.
   --all           Show every discovered entrypoint, one crisol/closure/v1
-                  document.
+                  document.  Discovery gates still apply: this is the same
+                  set `crisol list --all-groups` would show — a gated-out
+                  entrypoint is not listed (and --all with zero discovered
+                  entrypoints is not an error; it prints an empty report).
   --json          Emit the crisol/closure/v1 JSON document instead of human
                   output.
+  --config <path> Use this config file instead of walking up from the
+                  current directory for crisol.kdl.
+  Each entry's `closure` paths are project-root-relative (forward slashes)
+  for in-root files, and absolute for files under a configured dep-root.
 
 Exit codes:
   0   All selected entrypoints passed (or a pure listing succeeded).
@@ -467,6 +477,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     var closurePaths: seq[string]
     var closureAll   = false
     var closureJson  = false
+    var closureCfgPath = ""   # L1/T1: --config <path> / --config=<path>
     let closureArgs = args[1..^1]
     var ci = 0
     while ci < closureArgs.len:
@@ -475,6 +486,17 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         closureAll = true
       elif a == "--json":
         closureJson = true
+      elif a == "--config":
+        inc ci
+        if ci >= closureArgs.len:
+          stderr.write("crisol: --config requires a file path\n")
+          return ExitEnvironment
+        closureCfgPath = closureArgs[ci]
+      elif a.startsWith("--config="):
+        closureCfgPath = a[9..^1]
+        if closureCfgPath == "":
+          stderr.write("crisol: --config requires a file path\n")
+          return ExitEnvironment
       elif a.startsWith("-"):
         stderr.write("crisol: unknown flag for closure: '" & a & "'\n")
         return ExitEnvironment
@@ -499,7 +521,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
 
     var cr: ClosureReport
     try:
-      cr = closureReport(RunOptions(selection: closureSelection))
+      cr = closureReport(RunOptions(selection: closureSelection,
+                                    configPath: closureCfgPath))
     except CrisolError as e:
       case e.kind
       of cekEnvironment:
@@ -514,6 +537,20 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
 
     for w in cr.warnings:
       stderr.write("warning: " & w.message & "\n")
+
+    # D1 / Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles
+    # paths, same as run/list.  closure has no --group flag, so withinGroups
+    # is always empty here.
+    for line in pathFlagsWarnings(cr.adHocPaths, cr.ambiguousPaths, @[]):
+      stderr.write("crisol: " & line & "\n")
+
+    # S4: a positional <entrypoint>... selection that matched no discovered
+    # entrypoint is a configuration error, same as `run` (exit 3).  `--all`
+    # with zero discovered entrypoints is NOT an error (an empty report is a
+    # legitimate answer to "what's discovered").
+    if not closureAll and cr.entries.len == 0:
+      stderr.write("crisol: no entrypoints matched — check config/globs\n")
+      return ExitEnvironment
 
     if closureJson:
       stdout.write(closureToJsonString(cr))

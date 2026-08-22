@@ -528,16 +528,29 @@ type
     group*:       string          ## resolved group name
     flagHash*:    string          ## flagHash(ep.flags); 16 hex chars
     recorded*:    bool            ## true iff the depgraph has an entry for (path, flagHash)
-    closure*:     seq[string]     ## sorted closure paths as stored (project-relative,
-                                   ## or absolute for dep-root files); empty when not recorded
+    closure*:     seq[string]     ## sorted closure paths as stored in the depgraph:
+                                   ## project-root-relative with forward slashes for
+                                   ## files inside the project root; ABSOLUTE for
+                                   ## files under a configured dep-root (outside the
+                                   ## project root — see depgraph.DepGraphEntry.closure).
+                                   ## Empty when `recorded` is false.
     closureHash*: string          ## 16 hex chars; "" when not recorded
 
   ClosureReport* = object
     ## Output of api.closureReport(): one ClosureEntry per planned entrypoint
     ## (one per group/flag-set it belongs to), plus any config warnings from
     ## the underlying plan phase.
-    entries*:  seq[ClosureEntry]
-    warnings*: seq[ConfigWarning]
+    entries*:         seq[ClosureEntry]
+    warnings*:        seq[ConfigWarning]
+    adHocPaths*:      seq[string]
+      ## D1: gskFiles paths that matched no configured group (ran ad-hoc,
+      ## global flags only) — mirrors PlanReport.adHocPaths / DiscoveredSet.
+      ## Always empty for `--all` (gskAll selection). The CLI layer turns
+      ## this (and ambiguousPaths below) into warning lines via
+      ## render.pathFlagsWarnings, same as `run`/`list`.
+    ambiguousPaths*:  seq[tuple[path: string; groups: seq[string]]]
+      ## D1: gskFiles paths that matched more than one candidate group; the
+      ## first (config-declaration order) was used. Always empty for `--all`.
 
   SelectionReason* = enum
     srClosureHit     ## Known fresh closure that intersects `changed` → run it.

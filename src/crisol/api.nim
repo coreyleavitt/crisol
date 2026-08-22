@@ -496,7 +496,9 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
   ## hand-rolled this probe would silently see an empty graph on a mismatch).
   ##
   ## Raises CrisolError like planTests (structural problems: bad config,
-  ## unknown group, etc.).  No lock, no subprocess, no compile.
+  ## unknown group, etc.).  No lock, no compile, no test execution; the only
+  ## subprocess is the Nim compiler version/fingerprint probe shared with
+  ## run/list (needed to key the depgraph lookup — see depgraph.loadDepGraph).
   let impl = planImpl(opts)
   var entries: seq[ClosureEntry]
   for pep in impl.pr.entrypoints:
@@ -524,7 +526,12 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
         closure:     @[],
         closureHash: "",
       )
-  ClosureReport(entries: entries, warnings: impl.pr.warnings)
+  ClosureReport(
+    entries:        entries,
+    warnings:       impl.pr.warnings,
+    adHocPaths:     impl.pr.adHocPaths,
+    ambiguousPaths: impl.pr.ambiguousPaths,
+  )
 
 # ---------------------------------------------------------------------------
 # runTests — full run facade; catches-and-encodes structural failures

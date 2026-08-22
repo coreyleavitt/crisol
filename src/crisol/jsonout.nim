@@ -511,6 +511,19 @@ proc closureToJson*(r: ClosureReport): JsonNode =
   ## Pure: serialize a ClosureReport to the crisol/closure/v1 JsonNode.  No I/O.
   ## Deterministic ordering: entries in plan order (as received); each
   ## entry's `closure` array is already sorted by api.closureReport().
+  ##
+  ## Each entry's `closure` array holds paths exactly as recorded in the
+  ## depgraph: project-root-relative with forward slashes for files inside
+  ## the project root, ABSOLUTE for files under a configured dep-root (see
+  ## types.ClosureEntry.closure).
+  ##
+  ## D1: `ClosureReport.adHocPaths`/`.ambiguousPaths` are deliberately NOT
+  ## serialized here — crisol/plan/v1's planToJson (planview.nim) does not
+  ## serialize DiscoveredSet's equivalent fields either; the CLI prints them
+  ## as stderr text (render.pathFlagsWarnings) instead, for both `run`/`list`
+  ## and `closure`.  Kept symmetric with plan/v1 rather than introducing a
+  ## one-off JSON surface; revisit both schemas together if a machine-
+  ## readable form is ever needed.
   let entriesNode = newJArray()
   for e in r.entries:
     let eNode = newJObject()

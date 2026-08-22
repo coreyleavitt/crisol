@@ -96,16 +96,43 @@ one-time recompile of entrypoints whose closure gained members.
 - **closure:** `decodeBody` now decodes Nim's `@c` (`:`) and `@h` (`#`)
   mangling escapes in addition to `@s` and `@@`; a module path containing a
   colon or hash character previously failed to decode correctly.
+- **depgraph:** a discarded depgraph (recorded `nimVersion` differs from the
+  current compiler fingerprint, or `formatVersion` differs from
+  `DepGraphFormatVersion`) now surfaces as a structured warning in
+  `run`/`list`/`closure` output and JSON, instead of silently falling back
+  to an empty graph.  Previously, after a Nim upgrade, `crisol closure --all`
+  reported `recorded:false` for every entrypoint with exit 0 —
+  indistinguishable from "never ran" — and `run`/`list` silently
+  recompiled and force-selected everything with no explanation.
 
 ### Added
 
-- `crisol closure <entrypoint> [--json]` / `crisol closure --all [--json]` —
+- `crisol closure <entrypoint>... [--json]` / `crisol closure --all [--json]` —
   read-only depgraph introspection (issue #9).  Emits one entry per planned
   entrypoint × group/flag-set: `path`, `group`, `flagHash`, `recorded`,
   sorted `closure`, `closureHash`; JSON schema `crisol/closure/v1`
   (revision 1).  Uses crisol's own config, discovery, group-flag resolution
   and depgraph loader (including the nim-version probe), so downstream
   tools never re-implement them.  No lock, no compile.
+- `crisol closure` now accepts `--config <path>` / `--config=<path>`, matching
+  `run`/`list`/`clean`.  Previously `closure` always walked up from the
+  current directory for `crisol.kdl`, ignoring any explicit config override.
+- `crisol closure` now prints the same ad-hoc / ambiguous path diagnostics
+  `run`/`list` print (`crisol: path "..." matched no configured group; using
+  global flags` / `crisol: path "..." matches multiple groups (...); using
+  "..."`) to stderr when a positional `<entrypoint>` argument matches no
+  configured group's globs, or matches more than one.  `ClosureReport`
+  gained `adHocPaths`/`ambiguousPaths` fields (populated by
+  `api.closureReport()`) to carry this; the `crisol/closure/v1` JSON
+  document is unchanged (revision stays 1) — `crisol/plan/v1` does not
+  serialize the equivalent `DiscoveredSet` fields either, so closure/v1
+  stays symmetric with it and reports the same information as stderr text.
+- `crisol closure <entrypoint>...` now exits 3 with `crisol: no entrypoints
+  matched — check config/globs` when a given path matches no discovered
+  entrypoint, matching `run`'s behaviour.  Previously it silently printed an
+  empty report and exited 0, indistinguishable from a legitimate empty
+  `--all` result.  `crisol closure --all` with zero discovered entrypoints is
+  unaffected: it still exits 0 with an empty `entries` array.
 - `crisol clean --config <path>` — `clean` now accepts `--config <path>` so it
   honours a project's custom `state-dir` setting.  Previously `clean` always
   used the default `.crisol/` directory regardless of config.
