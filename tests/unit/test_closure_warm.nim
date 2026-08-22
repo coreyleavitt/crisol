@@ -68,3 +68,72 @@ suite "extractClosure — warm recompile (issue #5)":
     let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     let cl = extractClosure(nc, "test_ep", ep, cfg)
     check cl == toHashSet(["tests/test_ep.nim", "tests/dep.nim", "src/proj.nim"])
+
+  test "a {.compile.}d C external (@m-mangled, .c.o but not .nim.c.o) yields no phantom entry (R1)":
+    ## Real evidence: tests/fixtures/golden_reuse/generated/ep_a/ep_a.json's
+    ## `link` array contains `.../@mfixture.c.o` for `fixture_ffi.nim`'s
+    ## `{.compile: "fixture.c".}`.  Only a Nim module object is named
+    ## `<mangled>.nim.c.o`; an external C/C++ file compiled via `{.compile.}`
+    ## is `@m`-mangled too but never carries the `.nim` component, so it must
+    ## be excluded — not misread as a module named "fixture".
+    let root = freshRoot("extcompile")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    let ep = root / "tests" / "main.nim"
+    writeFile(ep, "# main\n")
+    writeFile(root / "tests" / "fixture.c", "// vendor C\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "main", compile = @[], link = @[
+      nc / "@mfixture.c.o",        # {.compile.}d external — must be excluded
+      nc / "@mmain.nim.c.o",       # the entrypoint's own module — must be kept
+      nc / "@mweird.cpp.o",        # non-Nim, no .nim component — excluded
+      "libfoo.a",                  # foreign archive — excluded
+      "/opt/x.o",                  # foreign object — excluded
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "main", ep, cfg)
+    check cl == toHashSet(["tests/main.nim"])
+    check "tests/fixture" notin cl
+
+  test "raises cekEnvironment when link is present but empty (R3)":
+    let root = freshRoot("emptylink")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    let ep = root / "tests" / "test_ep.nim"
+    writeFile(ep, "# ep\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "test_ep", compile = @["some.c"], link = @[])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var raised = false
+    try:
+      discard extractClosure(nc, "test_ep", ep, cfg)
+    except CrisolError as e:
+      raised = true
+      check e.kind == cekEnvironment
+    check raised
+
+  test "raises cekEnvironment when the link key is missing entirely (R3)":
+    let root = freshRoot("nolinkkey")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    let ep = root / "tests" / "test_ep.nim"
+    writeFile(ep, "# ep\n")
+    let nc = root / "nimcache"
+    createDir(nc)
+    let compileArr = newJArray()
+    let pair = newJArray()
+    pair.add newJString("some.c")
+    pair.add newJString("gcc -c some.c")
+    compileArr.add pair
+    let node = newJObject()
+    node["compile"] = compileArr
+    # Deliberately no "link" key at all.
+    writeFile(nc / "test_ep.json", $node)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var raised = false
+    try:
+      discard extractClosure(nc, "test_ep", ep, cfg)
+    except CrisolError as e:
+      raised = true
+      check e.kind == cekEnvironment
+    check raised

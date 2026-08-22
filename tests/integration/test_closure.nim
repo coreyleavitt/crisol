@@ -196,7 +196,34 @@ suite "extractClosure — @p soundness (--path:src project modules tracked)":
     check "src/crisol/types.nim" notin cl
 
 # ---------------------------------------------------------------------------
-# Test 4 — missing JSON raises CrisolError(cekEnvironment)
+# Test 5 — R1 regression: a real {.compile.}d C external must not become a
+# phantom closure entry.
+# ---------------------------------------------------------------------------
+
+suite "extractClosure — real {.compile.}d external (R1 regression, issue #5 fix)":
+
+  test "ep_a's closure has no phantom entry for fixture.c; every path exists on disk":
+    ## Real evidence: tests/fixtures/golden_reuse/generated/ep_a/ep_a.json's
+    ## `link` array contains `.../@mfixture.c.o` (from `fixture_ffi.nim`'s
+    ## `{.compile: "fixture.c".}`).  A `.c.o`-only filter accepts it and
+    ## resolveMangledAll decodes it into the phantom path
+    ## `<epDir>/fixture` (no `.nim` extension) — under projectRoot, so it
+    ## survives the tracked-root filter and lands in the closure even though
+    ## no such file exists on disk.
+    let src        = fixtureDir / "golden_reuse" / "ep_a.nim"
+    let includeDir = fixtureDir / "golden_reuse" / "include"
+    let (nc, bn)   = compileFixture(src, @["--passC:-I" & includeDir])
+    let config     = Config(projectRoot: projectRoot, depRoots: @[])
+    let cl         = extractClosure(nc, bn, src, config)
+
+    check "tests/fixtures/golden_reuse/ep_a.nim" in cl
+    check "tests/fixtures/golden_reuse/fixture_substrate.nim" in cl
+
+    for p in cl:
+      check fileExists(projectRoot / p)
+
+# ---------------------------------------------------------------------------
+# Test 6 — missing JSON raises CrisolError(cekEnvironment)
 # ---------------------------------------------------------------------------
 
 suite "extractClosure — error handling":
