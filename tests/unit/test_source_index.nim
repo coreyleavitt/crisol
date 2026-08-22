@@ -152,7 +152,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## canonicalizes (realpath) the resolved source file, so the "shortest
     ## relative path from the search-path root" is computed against the
     ## REALPATH, not the lexical (symlinked) root — yielding a `..`-laden,
-    ## realpath-relative body (S1 finding, trigger B). A body with no `..`
+    ## realpath-relative body (trigger B). A body with no `..`
     ## at all (the old pin) is a shape Nim never emits for a symlinked root.
     let root = freshRoot("deproot_symlink")
     defer: removeDir(root)
@@ -239,23 +239,35 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "lib/zx.nim" notin cl
     check cl == toHashSet(["tests/t.nim", "src/x.nim"])
 
-  test "S2: @c (colon) and @h (hash) mangling escapes are decoded":
-    let root = freshRoot("s2escapes")
+  test "@c (colon) and @h (hash) mangling escapes are decoded in a directory component":
+    ## Nim rejects `#`/`:` in a module BASENAME (module names must be plain
+    ## identifiers), so `@h`/`@c` never appear inside the basename itself.
+    ## What Nim actually emits them for is a DIRECTORY component reached via
+    ## a quoted import path, e.g. `import "../lib#1:2/w"` — the mangler
+    ## encodes the literal `#`/`:` characters in "lib#1:2" with `@h`/`@c`
+    ## while the basename ("w") stays a plain, decodable identifier.
+    ##
+    ## Both mangling forms that can carry the escapes are exercised here:
+    ## `@p` (SourceIndex-based --path resolution) and `@m` (resolved
+    ## relative to the entrypoint's own source directory, via a leading
+    ## `..` body) — both must decode "lib@h1@c2@sw.nim" to "lib#1:2/w.nim".
+    let root = freshRoot("hashcolonescapes")
     defer: removeDir(root)
     createDir(root / "tests")
-    createDir(root / "lib")
+    createDir(root / "lib#1:2")
     let ep = root / "tests" / "t.nim"
     writeFile(ep, "# ep\n")
-    writeFile(root / "lib" / "weird#1:2.nim", "# weird\n")
+    writeFile(root / "lib#1:2" / "w.nim", "# w\n")
     let nc = root / "nimcache"
     writeManifest(nc, "t", compile = @[], link = @[
       nc / "@mt.nim.c.o",
-      nc / "@pweird@h1@c2.nim.c.o",
+      nc / "@plib@h1@c2@sw.nim.c.o",
+      nc / "@m..@slib@h1@c2@sw.nim.c.o",
     ])
     let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "lib/weird#1:2.nim" in cl
-    check cl == toHashSet(["tests/t.nim", "lib/weird#1:2.nim"])
+    check "lib#1:2/w.nim" in cl
+    check cl == toHashSet(["tests/t.nim", "lib#1:2/w.nim"])
 
   test "ambiguity pin: a body present under two tracked locations resolves to both (R7 over-selection)":
     let root = freshRoot("ambig")
@@ -358,3 +370,82 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     let cl = extractClosure(nc, "t", ep, cfg)
     check "lib/dep.nim" in cl
     check cl == toHashSet(["tests/t.nim", "lib/dep.nim"])
+
+  test "an @m body carrying a realpath through a symlinked depRoot resolves to the lexical depRoot path":
+    ## Reproduces the shape a shallow entrypoint (`tests/t.nim`, one level
+    ## below root) produces for a module reached through a symlinked
+    ## depRoot: Nim's mangler prefers `@m` (entrypointDir-relative) whenever
+    ## it is not STRICTLY longer than the `@p` (search-path-relative)
+    ## candidate, and — because the resolved source is realpath-
+    ## canonicalized — the `@m` body itself carries `..` components up to a
+    ## common ancestor and back down into the symlink's REAL target
+    ## (confirmed empirically against a real `nim c` run of this exact
+    ## fixture shape: `@m..@s..@s<casDir>@sdep@ssrc@sdep.nim.c.o`).
+    ## `(epDir / body).normalizedPath` therefore resolves OUTSIDE every
+    ## tracked root, so `resolveMangledAll` must fall back to `index.lookup`
+    ## to recover it at its LEXICAL depRoot path,
+    ## "_deps/dep/src/dep.nim" — exactly like the `@p` case already covered
+    ## above, but reached via the `@m` branch instead.
+    let root = freshRoot("s3_m_symlink")
+    defer: removeDir(root)
+    let outside = freshRoot("s3_m_symlink_outside")
+    defer: removeDir(outside)
+
+    let depRootPath = root / "_deps" / "dep"
+    createDir(root / "tests")
+    createDir(root / "_deps")
+    createDir(outside / "dep" / "src")
+    writeFile(outside / "dep" / "src" / "dep.nim", "# dep\n")
+    createSymlink(outside / "dep", depRootPath)
+
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    let nc = root / "nimcache"
+
+    # Realpath-relative @m body: leading ".." components up to a common
+    # ancestor, then the REAL (symlink-resolved) absolute path to
+    # outside/dep/src/dep.nim, mangled with @s in place of '/'. The exact
+    # ".." count does not matter — lookup strips ALL leading ".."/"."/""
+    # components — but it must be enough to make the plain (epDir / body)
+    # candidate resolve outside `root` (it does here: it collapses to the
+    # real, non-symlinked `outside/dep/src/dep.nim`).
+    let realOutsideAbs = outside.expandFilename
+    let mangledBody = ("../../../.." & realOutsideAbs & "/dep/src/dep.nim")
+                        .replace("/", "@s")
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / ("@m" & mangledBody & ".c.o"),
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol",
+                     depRoots: @[depRootPath])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "_deps/dep/src/dep.nim" in cl
+    check cl == toHashSet(["tests/t.nim", "_deps/dep/src/dep.nim"])
+
+  test "negative pin: an in-root @m body is NOT unioned against the index — a same-basename decoy elsewhere is never selected":
+    ## The fallback (index.lookup for an @m body) is gated on the plain
+    ## `(epDir / body)` candidate escaping every tracked root. An ORDINARY
+    ## in-root @m body (no symlink involved: body is just "foo.nim", the
+    ## plain candidate is epDir/foo.nim, which IS under projectRoot) must
+    ## resolve to ONLY that candidate — never additionally to some unrelated
+    ## "other/foo.nim" elsewhere in the tree that happens to share the
+    ## basename. Unconditionally unioning `index.lookup` for every @m body
+    ## would over-select such decoys; the fallback must not trigger here.
+    let root = freshRoot("s3_negative_pin")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "other")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(root / "tests" / "foo.nim", "# real, epDir-relative\n")
+    writeFile(root / "other" / "foo.nim", "# decoy, elsewhere in the tree\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@mfoo.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "tests/foo.nim" in cl
+    check "other/foo.nim" notin cl
+    check cl == toHashSet(["tests/t.nim", "tests/foo.nim"])

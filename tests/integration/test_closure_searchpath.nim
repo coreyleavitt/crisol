@@ -19,9 +19,9 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_closure_searchpath.nim
 
-import std/[os, sets, tables, times, unittest]
+import std/[os, sets, tables, times, unittest, json, strutils]
 import std/posix as posix_mod
-import crisol/[types, runner, depgraph, narrow]
+import crisol/[types, runner, depgraph, narrow, planner]
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_searchpath_" & tag & "_" &
@@ -91,7 +91,7 @@ switch("path", thisDir())
       check selection[0].ep.path == ep.path
       check selection[0].reason == srClosureHit
 
-suite "closure records @p bodies with leading '..' (S1: shortest-relative-path / realpath-canonicalized)":
+suite "closure records @p bodies with leading '..' (shortest-relative-path / realpath-canonicalized)":
 
   test "trigger A: in-root relative import shorter from a --path root is recorded":
     ## projectRoot has src/, lib/x.nim, tests/unit/deep/t.nim; t.nim imports
@@ -187,6 +187,85 @@ doAssert depValue() == 7
     if results[0].outcome != oPassed:
       echo "trigger B compile/run output:\n", results[0].output
     check results[0].outcome == oPassed
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check "_deps/dep/src/dep.nim" in closure
+    check epPath in closure
+
+  test "trigger C: a symlinked dep-root's realpath-relative @m body (shallow entrypoint) is recorded at its lexical path":
+    ## Same physical layout as trigger B (a depRoot reached through a
+    ## symlink into an outside "CAS" dir, put on the search path via
+    ## --path:_deps/dep/src, imported as `import dep`), but the entrypoint
+    ## is SHALLOW (root/tests/t.nim, one level below root) instead of nested
+    ## 8-9 levels deep. Nim's mangler always tries the entrypoint-dir-relative
+    ## candidate (`@m<relpath-from-epDir>`) first and only switches to the
+    ## search-path-relative candidate (`@p<relpath-from-searchRoot>`) when
+    ## that is STRICTLY shorter; with a shallow entrypoint dir, `@m`'s
+    ## relative path (a couple of ".." components up to the temp dir, then
+    ## down into the CAS) is not longer than `@p`'s, so the compiler emits
+    ## `@m` here — confirmed empirically against this exact fixture shape
+    ## (`@m..@s..@s<casDirName>@sdep@ssrc@sdep.nim.c.o`).  Because the `@m`
+    ## body is computed from realpath(epDir) to the realpath-canonicalized
+    ## source, `(epDir / body).normalizedPath` resolves to the dep's REAL
+    ## path (through the CAS), which is NOT under any tracked root — so the
+    ## dep must be recovered via the index fallback, not the plain
+    ## `@m` candidate.
+    let root = makeTempRoot("triggerC")
+    defer: removeDir(root)
+    let cas = makeTempRoot("triggerC_cas")
+    defer: removeDir(cas)
+
+    createDir(cas / "dep" / "src")
+    writeFile(cas / "dep" / "src" / "dep.nim", "proc depValue*(): int = 7\n")
+
+    createDir(root / "_deps")
+    createSymlink(cas / "dep", root / "_deps" / "dep")
+
+    # Shallow entrypoint: root/tests/t.nim, one level below root — NOT
+    # nested like trigger B.
+    createDir(root / "tests")
+    writeFile(root / "tests" / "t.nim", """
+import dep
+doAssert depValue() == 7
+""")
+
+    var cfg = makeCfg(root)
+    cfg.depRoots = @[root / "_deps" / "dep"]
+    let epPath = "tests/t.nim"
+    let ep = Entrypoint(path: epPath, group: "default",
+                        flags: @["--path:" & (root / "_deps" / "dep" / "src")])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    if results[0].outcome != oPassed:
+      echo "trigger C compile/run output:\n", results[0].output
+    check results[0].outcome == oPassed
+
+    # Sanity-pin the mangled shape this fixture actually produces, so a
+    # future Nim upgrade that changes the mangling heuristic fails loudly
+    # here rather than silently testing the wrong branch (@p instead of @m).
+    let cacheDir = cachePath(ep, cfg)
+    let manifestPath = cacheDir / binName(ep) & ".json"
+    check fileExists(manifestPath)
+    if fileExists(manifestPath):
+      let manifest = parseFile(manifestPath)
+      var sawMangledDep = false
+      var mangledSeen = ""
+      for node in manifest{"link"}:
+        let base = node.getStr("").extractFilename
+        if base.startsWith("@m") and base.endsWith("dep.nim.c.o"):
+          sawMangledDep = true
+          mangledSeen = base
+      echo "trigger C observed mangled dep entry: ", mangledSeen
+      check sawMangledDep
 
     let key = (ep.path, flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
