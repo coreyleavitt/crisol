@@ -92,7 +92,24 @@ one-time recompile of entrypoints whose closure gained members.
   file's realpath alongside its lexical path, and `lookup` strips every
   leading `""`/`"."`/`".."` component before matching against either — a
   pure widening of the match, so still sound under the R7 over-selection
-  policy.  The reported/recorded path remains the lexical one.
+  policy.  The reported/recorded path remains the lexical one.  A follow-up
+  found this still missed a related shape: a realpath-relative `@p`/`@n`
+  body whose file lives under a directory `walkForIndex` prunes for WALK
+  COST (a dot-dir or a `nimcache` dir) *inside* a tracked root — e.g. a
+  milpa `_deps/<dep>` symlink whose target sits under a dot-dir inside
+  projectRoot itself, rather than in an external CAS, with no `dep-roots`
+  entry naming that dot-dir directly.  The compiler resolves and
+  realpath-canonicalizes the import fine (the symlink is on the search
+  path), but nothing under the pruned directory was ever indexed, so
+  `SourceIndex.lookup` misses and the module silently dropped out of the
+  closure.  That pruning is a walk-cost decision, not a tracking decision:
+  when `lookup` returns no match at all, `resolveMangledAll`'s `@p`/`@n`
+  branch now falls back to an existence check — the same stripped suffix
+  joined onto each of `index.roots` in turn, keeping whichever candidate(s)
+  exist on disk (`fileExists`/`symlinkExists`).  Sound (every candidate is
+  under a tracked root by construction, and nothing is fabricated when no
+  candidate exists), and consistent with the R7 over-selection policy when
+  more than one root matches.
 - **closure:** an `@m`-mangled `link` entry (Nim's entrypoint-directory-
   relative candidate, the mangler's default choice whenever it is not
   strictly longer than the `@p`/`@n` search-path-relative one) can *also*

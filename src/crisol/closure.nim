@@ -76,6 +76,22 @@
 ##   and nimble-package bodies match nothing in the index (excluded) or, in
 ##   rare basename-collision cases, over-select harmlessly (R7 policy).
 ##
+##   The index walk itself prunes some directories for WALK COST — dot-dirs,
+##   `nimcache` dirs, the state dir (see `walkForIndex`'s doc comment) — a
+##   file living under one of those is never indexed, so a plain index
+##   lookup misses it even though it is tracked (it lives under a root by
+##   construction).  That pruning is deliberately a walk-cost decision, not
+##   a tracking decision: when `body` resolves to no indexed file at all,
+##   `resolveMangledAll` falls back to an EXISTENCE check against
+##   `index.roots` directly (join the stripped suffix onto each root, keep
+##   whichever candidate(s) exist on disk) before concluding the module is
+##   genuinely untracked.  This matters concretely for a milpa `_deps/<dep>`
+##   symlink whose realpath target sits under a dot-dir INSIDE projectRoot
+##   (rather than in an external CAS) with no `dep-roots` entry naming that
+##   dot-dir directly — the compiler resolves the import fine (the symlink
+##   is on the search path), but nothing under the dot-dir was indexed to
+##   suffix-match against.
+##
 ## The under-tracked-root filter (step 5) is path-location based, NOT
 ## prefix based.  A project module imported via `--path:src` is `@p`-mangled
 ## but must be tracked because excluding it breaks both `narrowByDiff` and
@@ -172,6 +188,17 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
   ##   • skip the resolved state dir (`stateDirOf`), by absolute-path
   ##     comparison, in case it is ever configured outside the '.'-prefix
   ##     convention.
+  ##
+  ## IMPORTANT: every rule above is a WALK-COST decision, not a TRACKING
+  ## decision. A file under a pruned directory is still "tracked" — it
+  ## lives under `recordRoot`/a root by construction — it is simply never
+  ## added to `index.byBasename`/`index.byReal`, so a `lookup` against it
+  ## misses. `resolveMangledAll`'s `@p`/`@n` branch accounts for exactly
+  ## this: when `SourceIndex.lookup` misses entirely, it falls back to an
+  ## EXISTENCE check of the stripped body suffix joined onto each of
+  ## `index.roots` directly (bypassing the index, and hence this pruning)
+  ## rather than treating a pruned-and-therefore-unindexed file as
+  ## untracked.
   let realDir =
     try: expandFilename(dir)
     except OSError: dir
@@ -224,6 +251,24 @@ proc buildSourceIndex*(config: Config): SourceIndex =
     if dirExists(drAbs):
       walkForIndex(drAbs, drAbs, stateDirAbs, result)
 
+proc strippedSuffix(body: string): string =
+  ## Strip every LEADING `""`/`"."`/`".."` path component from a decoded
+  ## `@p`/`@n` body, leaving the suffix relative to whichever search-path
+  ## root produced it (see `lookup`'s doc comment for why a body can carry
+  ## leading `..` components at all).  Returns `""` if nothing but such
+  ## components remains (no usable suffix).
+  ##
+  ## The SINGLE place this stripping rule lives — shared by `lookup` (index
+  ## suffix match) and `resolveMangledAll`'s roots existence-check fallback
+  ## (below), so the two can never diverge on what counts as "the suffix".
+  let normBody = body.replace('\\', DirSep).replace('/', DirSep)
+  var comps = normBody.split(DirSep)
+  var start = 0
+  while start < comps.len and comps[start] in ["", ".", ".."]:
+    inc start
+  if start >= comps.len: return ""
+  comps[start .. ^1].join($DirSep)
+
 proc lookup(index: SourceIndex; body: string): seq[string] =
   ## Resolve a decoded `@p`/`@n` body (a path relative to SOME search-path
   ## root) against the index.
@@ -240,11 +285,12 @@ proc lookup(index: SourceIndex; body: string): seq[string] =
   ##   components followed by the target's absolute, symlink-resolved path
   ##   (e.g. `../../../../home/u/.cache/milpa/cas/.../dep/src/dep.nim`).
   ##
-  ## Every LEADING `""`/`"."`/`".."` component is therefore stripped before
-  ## matching — this is a pure WIDENING of the suffix match (a shorter
-  ## suffix can only match more indexed files, never fewer), so it stays
-  ## sound under the R7 over-selection policy: ambiguous/spurious matches
-  ## are acceptable (they only over-select), silent drops are not.
+  ## Every LEADING `""`/`"."`/`".."` component is therefore stripped
+  ## (`strippedSuffix`) before matching — this is a pure WIDENING of the
+  ## suffix match (a shorter suffix can only match more indexed files,
+  ## never fewer), so it stays sound under the R7 over-selection policy:
+  ## ambiguous/spurious matches are acceptable (they only over-select),
+  ## silent drops are not.
   ##
   ## The stripped suffix is matched against BOTH `IndexedFile.lexical` (the
   ## walk-recorded, project/depRoot-relative path — what a `..`-free body
@@ -255,17 +301,20 @@ proc lookup(index: SourceIndex; body: string): seq[string] =
   ##
   ## Multiple matches (ambiguous — the same suffix exists under more than
   ## one indexed location) are ALL returned (R7 over-selection policy).
+  ##
+  ## This is an INDEX lookup only — it necessarily misses a file that is
+  ## on disk but was never indexed, e.g. one living under a directory
+  ## `walkForIndex` prunes for WALK COST (a dot-dir, a `nimcache` dir).
+  ## That pruning is a walk-cost decision, not a tracking decision: such a
+  ## file is still tracked (it lives under a root by construction) and is
+  ## recovered separately, by `resolveMangledAll`'s roots existence-check
+  ## fallback, when this lookup returns nothing.
   result = @[]
-  let normBody = body.replace('\\', DirSep).replace('/', DirSep)
-  var comps = normBody.split(DirSep)
-  var start = 0
-  while start < comps.len and comps[start] in ["", ".", ".."]:
-    inc start
-  if start >= comps.len: return
-  let sufComps = comps[start .. ^1]
+  let suffix = strippedSuffix(body)
+  if suffix.len == 0: return
+  let sufComps = suffix.split(DirSep)
   let base = sufComps[^1]
   if base notin index.byBasename: return
-  let suffix = sufComps.join($DirSep)
   let suffixPattern = $DirSep & suffix
   var seen = initHashSet[string]()
   for f in index.byBasename[base]:
@@ -484,6 +533,24 @@ proc resolveMangledAll(mangledName: string;
   ##             isEntryStale (R4 fix) detects the missing file and forces a
   ##             re-run, so soundness is maintained via the stale-entry path
   ##             rather than the closure-rebuild path (same policy as before).
+  ##           - when `index.lookup` misses entirely (no indexed file at all
+  ##             matches the stripped suffix), a SECOND fallback runs before
+  ##             giving up: join the stripped suffix (`strippedSuffix`, the
+  ##             helper `lookup` also uses) onto each of `index.roots` and
+  ##             keep whichever joined candidate(s) exist on disk. This
+  ##             recovers a file that IS on disk under a tracked root but
+  ##             was never indexed because `walkForIndex` prunes its
+  ##             containing directory for WALK COST — a dot-dir or a
+  ##             `nimcache` dir — rather than because it is untracked (e.g.
+  ##             a milpa depRoot symlink whose target sits under a dot-dir
+  ##             inside projectRoot, with no `dep-roots` entry naming that
+  ##             dot-dir directly: the symlink is on the search path, so
+  ##             the compiler resolves and realpath-canonicalizes the
+  ##             import fine, but nothing under the dot-dir was ever
+  ##             indexed to suffix-match against). Sound: every candidate
+  ##             produced is under a tracked root by construction, and
+  ##             existence is checked, so nothing is fabricated; multiple
+  ##             roots may match (R7 — all recorded).
   ## For anything else: empty list (conservative).
   # `mangledName` is `moduleMangledNameOf`'s output — already ".nim.{c,cpp,m}.o"
   # filtered, backend extension and ".o" stripped — so it is always
@@ -559,6 +626,29 @@ proc resolveMangledAll(mangledName: string;
 
   else: # "@p" or "@n"
     result = index.lookup(body)
+    if result.len == 0:
+      # `index.lookup` is an INDEX-ONLY lookup — it misses a file that is
+      # genuinely on disk under a tracked root but was never indexed
+      # because `walkForIndex` prunes its containing directory for WALK
+      # COST (a dot-dir, a `nimcache` dir; e.g. a milpa depRoot symlink
+      # whose target sits under a dot-dir inside projectRoot, with no
+      # `dep-roots` entry of its own naming that dot-dir directly). That
+      # pruning is a walk-cost decision, not a tracking decision: the file
+      # is still tracked (it lives under a root by construction), so it is
+      # recovered here via a plain EXISTENCE check — join the stripped
+      # suffix onto each tracked root and keep whichever candidate(s)
+      # actually exist on disk. Sound (every candidate is under a tracked
+      # root by construction; existence checked, so nothing fabricated),
+      # and consistent with R7: multiple roots may match — all are kept.
+      let suffix = strippedSuffix(body)
+      if suffix.len > 0:
+        var seen = initHashSet[string]()
+        for root in index.roots:
+          let cand = (root / suffix).normalizedPath
+          if fileExists(cand) or symlinkExists(cand):
+            if cand notin seen:
+              seen.incl cand
+              result.add cand
 
 # ---------------------------------------------------------------------------
 # Public API

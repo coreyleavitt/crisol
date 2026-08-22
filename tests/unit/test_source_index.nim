@@ -597,3 +597,83 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     let cl = extractClosure(nc, "t", ep, cfg)
     check "a/b/ghost.nim" notin cl
     check cl == toHashSet(["a/b/tests/t.nim"])
+
+suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned dot-dir":
+
+  test "an @p body whose file lives under a pruned dot-dir INSIDE a tracked root resolves via the roots existence-check fallback":
+    ## `root/.hidden/cas/dep/src/dep.nim` lives INSIDE projectRoot, but under
+    ## a DOT-DIR — `walkForIndex` prunes dot-dirs for WALK COST, so this file
+    ## is never indexed and `index.lookup` (a pure index lookup) necessarily
+    ## misses. It is nonetheless *tracked* (it lives under projectRoot by
+    ## construction), so `resolveMangledAll`'s @p/@n branch must recover it
+    ## via the roots existence-check fallback: strip the body's leading
+    ## ""/"."/".." components (the same `strippedSuffix` helper `lookup`
+    ## uses) and join the remainder onto each of `index.roots`, keeping any
+    ## candidate that exists on disk.
+    let root = freshRoot("dotdir_fallback")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / ".hidden" / "cas" / "dep" / "src")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(root / ".hidden" / "cas" / "dep" / "src" / "dep.nim", "# dep\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@p..@s..@s.hidden@scas@sdep@ssrc@sdep.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check ".hidden/cas/dep/src/dep.nim" in cl
+    check cl == toHashSet(["tests/t.nim", ".hidden/cas/dep/src/dep.nim"])
+
+  test "negative pin: the same pruned-dot-dir @p body resolves to nothing when the file is absent (no fabricated path)":
+    ## Same body/shape as above, but `root/.hidden/cas/dep/src/dep.nim` is
+    ## never written. The roots existence-check fallback must not fabricate
+    ## a candidate that fails `fileExists`/`symlinkExists` — a body that
+    ## resolves to nothing anywhere on disk stays excluded, exactly like an
+    ## ordinary index miss.
+    let root = freshRoot("dotdir_fallback_negative")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    # NOTE: root/.hidden/cas/dep/src/dep.nim intentionally not created.
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@p..@s..@s.hidden@scas@sdep@ssrc@sdep.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check ".hidden/cas/dep/src/dep.nim" notin cl
+    check cl == toHashSet(["tests/t.nim"])
+
+  test "dep-root variant: the roots existence-check fallback also tries a configured depRoot, not just projectRoot":
+    ## `depRoot/.hidden/extra.nim` lives OUTSIDE projectRoot, under a pruned
+    ## dot-dir inside a configured depRoot. The fallback must join the
+    ## stripped suffix onto EVERY entry of `index.roots` — projectRoot AND
+    ## each depRoot — so this resolves via the depRoot candidate even though
+    ## projectRoot/.hidden/extra.nim does not exist: only trying projectRoot
+    ## (not iterating every root) would miss it entirely. Since the resolved
+    ## path is not under projectRoot, `toProjectRelative` reports it
+    ## absolute (the same depRoot convention used elsewhere in this file).
+    let root = freshRoot("dotdir_fallback_deproot")
+    defer: removeDir(root)
+    let depRoot = freshRoot("dotdir_fallback_deproot_dep")
+    defer: removeDir(depRoot)
+    createDir(root / "tests")
+    createDir(depRoot / ".hidden")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(depRoot / ".hidden" / "extra.nim", "# extra\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@p..@s.hidden@sextra.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[depRoot])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    let expected = (depRoot / ".hidden" / "extra.nim").normalizedPath
+    check expected in cl
+    check cl == toHashSet(["tests/t.nim", expected])

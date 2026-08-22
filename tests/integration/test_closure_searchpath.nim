@@ -494,3 +494,137 @@ doAssert sibValue() == 7
     # A stable, un-invalidated entry must not force a recompile next run.
     let p2 = plan(cfg, @[ep], graph, nimVersion = "")
     check p2.entrypoints[0].edecision == edRunFresh
+
+suite "closure records a dep reached through a dep-root symlink whose target sits under a pruned dot-dir inside projectRoot":
+
+  test "deep entrypoint (@p shape): dep.nim under a dot-dir is recorded via the roots existence-check fallback, no dep-roots configured":
+    ## `<root>/.hidden/cas/dep/src/dep.nim` lives INSIDE projectRoot but
+    ## under a DOT-DIR that `walkForIndex` prunes for walk cost (never
+    ## indexed). `<root>/_deps/dep` is a RELATIVE symlink to
+    ## `../.hidden/cas/dep` (milpa's own convention), put on the search path
+    ## via `--path:_deps/dep/src`, with NO `dep-roots` entry configured —
+    ## the dot-dir is reached only through the symlink, never declared as
+    ## its own tracked root. Because the compiler realpath-canonicalizes the
+    ## resolved source file, the @p body is realpath-relative
+    ## (`.hidden/cas/dep/src/dep.nim`, reached from the search root via a
+    ## few ".." components) and `index.lookup` necessarily misses (nothing
+    ## is indexed under the dot-dir). The dep is nonetheless tracked — it
+    ## lives under projectRoot by construction — so it must be recovered via
+    ## the roots existence-check fallback and recorded at its LEXICAL,
+    ## project-relative path.
+    let root = makeTempRoot("dotdir_deep")
+    defer: removeDir(root)
+
+    createDir(root / ".hidden" / "cas" / "dep" / "src")
+    writeFile(root / ".hidden" / "cas" / "dep" / "src" / "dep.nim",
+              "proc depValue*(): int = 7\n")
+
+    createDir(root / "_deps")
+    createSymlink("../.hidden/cas/dep", root / "_deps" / "dep")
+
+    # Nested entrypoint directory so the compiler's shortest-relative-path
+    # mangling picks the @p (search-path-root-relative) candidate over the
+    # @m (entrypoint-dir-relative) one — mirrors trigger B's depth choice
+    # above.
+    createDir(root / "tests" / "a" / "b" / "c" / "d" / "e" / "f" / "g" / "h")
+    writeFile(root / "tests" / "a" / "b" / "c" / "d" / "e" / "f" / "g" / "h" /
+              "test_uses_dep.nim", """
+import dep
+doAssert depValue() == 7
+""")
+
+    var cfg = makeCfg(root)
+    # Deliberately NOT configuring cfg.depRoots — the dot-dir must be
+    # recovered purely via the roots existence-check fallback against
+    # projectRoot, not via a depRoot walk.
+    let epPath = "tests/a/b/c/d/e/f/g/h/test_uses_dep.nim"
+    let ep = Entrypoint(path: epPath, group: "default",
+                        flags: @["--path:" & (root / "_deps" / "dep" / "src")])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    if results[0].outcome != oPassed:
+      echo "dotdir-deep compile/run output:\n", results[0].output
+    check results[0].outcome == oPassed
+
+    # Sanity-pin the mangled shape this fixture actually produces.
+    let cacheDir = cachePath(ep, cfg)
+    let manifestPath = cacheDir / binName(ep) & ".json"
+    check fileExists(manifestPath)
+    if fileExists(manifestPath):
+      let manifest = parseFile(manifestPath)
+      var mangledSeen = ""
+      for node in manifest{"link"}:
+        let base = node.getStr("").extractFilename
+        if base.endsWith("dep.nim.c.o") and not base.contains("test_uses_dep"):
+          mangledSeen = base
+      echo "dotdir-deep observed mangled dep entry: ", mangledSeen
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check ".hidden/cas/dep/src/dep.nim" in closure
+    check epPath in closure
+
+  test "shallow entrypoint (@m shape): dep.nim under the same dot-dir layout is already recorded (pre-existing byReal fallback)":
+    ## Same physical layout as above, but the entrypoint is SHALLOW
+    ## (`tests/t.nim`, one level below root) — mirrors trigger C. This
+    ## exercises the `@m` branch's pre-existing `lookupByReal` recovery
+    ## (unaffected by this fix), recorded here to confirm it already covers
+    ## this dot-dir layout even though the `@p` branch (above) did not.
+    let root = makeTempRoot("dotdir_shallow")
+    defer: removeDir(root)
+
+    createDir(root / ".hidden" / "cas" / "dep" / "src")
+    writeFile(root / ".hidden" / "cas" / "dep" / "src" / "dep.nim",
+              "proc depValue*(): int = 7\n")
+
+    createDir(root / "_deps")
+    createSymlink("../.hidden/cas/dep", root / "_deps" / "dep")
+
+    createDir(root / "tests")
+    writeFile(root / "tests" / "t.nim", """
+import dep
+doAssert depValue() == 7
+""")
+
+    var cfg = makeCfg(root)
+    let epPath = "tests/t.nim"
+    let ep = Entrypoint(path: epPath, group: "default",
+                        flags: @["--path:" & (root / "_deps" / "dep" / "src")])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    if results[0].outcome != oPassed:
+      echo "dotdir-shallow compile/run output:\n", results[0].output
+    check results[0].outcome == oPassed
+
+    let cacheDir = cachePath(ep, cfg)
+    let manifestPath = cacheDir / binName(ep) & ".json"
+    check fileExists(manifestPath)
+    if fileExists(manifestPath):
+      let manifest = parseFile(manifestPath)
+      var mangledSeen = ""
+      for node in manifest{"link"}:
+        let base = node.getStr("").extractFilename
+        if base.endsWith("dep.nim.c.o") and not base.contains("test_uses_dep"):
+          mangledSeen = base
+      echo "dotdir-shallow observed mangled dep entry: ", mangledSeen
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check ".hidden/cas/dep/src/dep.nim" in closure
+    check epPath in closure
