@@ -1303,16 +1303,33 @@ proc execute*(
                   except:
                     discard  # non-fatal
 
+                # Record the closure. If this FAILS after a successful compile
+                # (issue #5 writer hole): the stable binary is already in
+                # place, so "next run will just recompile" is false — the
+                # PREVIOUS entry (arbitrarily stale) would keep being served
+                # as fresh. Invalidate it instead: no entry ⇒ decideCompile
+                # cdStale and narrow "unknown closure" (force-included), and
+                # the result-cache never looks up an entrypoint without one.
+                let fHash = flagHash(ep.flags)
                 try:
                   let closureSet = extractClosure(slotCacheDir, bname, epAbs, config)
                   var closureSeq: seq[string] = toSeq(closureSet)
                   closureSeq.sort()
                   let contentHash = closureContentHash(closureSeq, config.projectRoot)
-                  let fHash = flagHash(ep.flags)
                   graph.updateEntry(ep.path, fHash, closureSet, contentHash, CrisolProtocolMajor)
                   saveDepGraph(graph, config)
-                except:
-                  discard  # non-fatal; next run will just recompile
+                except CatchableError as e:
+                  stderr.write("crisol: warning: " & ep.path & ": could not record its " &
+                               "source closure (" & e.msg & "); dependency record " &
+                               "invalidated — it will be recompiled and force-selected " &
+                               "next run\n")
+                  try: stderr.flushFile() except CatchableError: discard
+                  graph.invalidateEntry(ep.path, fHash)
+                  try:
+                    saveDepGraph(graph, config)
+                  except CatchableError as e2:
+                    stderr.write("crisol: warning: could not persist the dependency graph (" &
+                                 e2.msg & ")\n")
 
             # Clean up the per-slot bin dir after stable copy (M15).
             # pollSlot already cleaned this on compile-fail; only clean here on success.
