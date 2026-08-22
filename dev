@@ -20,9 +20,10 @@ IMAGE="crisol-dev:latest"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DOCKER_HOME="${PROJECT_DIR}/.docker-home"
 # milpa vendors deps into _deps/ as symlinks into its content-addressed store
-# (~/.cache/milpa). Those symlinks use ABSOLUTE host paths, so the store must be
-# mounted into the container at that same absolute path for `import nkdl` (etc.)
-# to resolve. Read-only — the container never writes the CAS.
+# (~/.cache/milpa). Those symlinks are RELATIVE to the project dir (e.g.
+# ../../../../../.cache/milpa/cas/...), so BOTH the project and the store must
+# be mounted into the container at their host paths for `import nkdl` (etc.)
+# to resolve. The store is read-only — the container never writes the CAS.
 MILPA_CACHE="${MILPA_CACHE:-${HOME}/.cache/milpa}"
 
 ensure_docker_home() { mkdir -p "${DOCKER_HOME}"; }
@@ -43,11 +44,11 @@ podman_run() {
     ensure_docker_home
     mapfile -t _milpa < <(milpa_mount)
     podman run --rm \
-        --volume "${PROJECT_DIR}:/workspace" \
+        --volume "${PROJECT_DIR}:${PROJECT_DIR}" \
         --volume "${DOCKER_HOME}:/dockerhome" \
         "${_milpa[@]}" \
         --env HOME=/dockerhome \
-        --workdir /workspace \
+        --workdir "${PROJECT_DIR}" \
         "${IMAGE}" "$@"
 }
 
@@ -74,11 +75,11 @@ case "${cmd}" in
         ensure_docker_home
         mapfile -t _milpa < <(milpa_mount)
         podman run --rm -it \
-            --volume "${PROJECT_DIR}:/workspace" \
+            --volume "${PROJECT_DIR}:${PROJECT_DIR}" \
             --volume "${DOCKER_HOME}:/dockerhome" \
             "${_milpa[@]}" \
             --env HOME=/dockerhome \
-            --workdir /workspace \
+            --workdir "${PROJECT_DIR}" \
             "${IMAGE}" /bin/bash
         ;;
     clean)

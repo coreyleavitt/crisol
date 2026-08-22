@@ -3,11 +3,18 @@ version 1
 strategy "maxver"
 
 dep "nkdl" {
-    identity "sha256:dd907474be3ae29640286d382525d3c49ef59e7f190219e4e45aa24a7766b277"
-    version "0.0.1"
+    source {
+        kind "git"
+        url (url)"ssh://github.com/coreyleavitt/nkdl"
+        ref "v0.1.0"
+    }
+    identity "dag-sha256:714c3f0ecc823280befb51c5ad61bf2012703a3416d9cfb5faf62e5e9a897f97"
+    version "0.1.0"
+    declared_version_source "nimble"
     src_dir "src"
     requires
     provenance {
+        origin "observed"
         kind "git"
         url "ssh://git@github.com/coreyleavitt/nkdl.git"
         ref "v0.1.0"
