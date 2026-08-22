@@ -117,16 +117,31 @@ type
     ## (`buildSourceIndex`) and threaded through `extractClosure` for ALL
     ## entrypoints in the run — never rebuilt per entrypoint.
     byBasename: Table[string, seq[IndexedFile]]
+    byReal: Table[string, seq[string]]
+      ## realpath (absolute, normalized) -> every indexed file's LEXICAL
+      ## path(s) recorded at that realpath.  Used by `lookupByReal` for an
+      ## EXACT (non-suffix) match — the mechanism `resolveMangledAll`'s `@m`
+      ## branch uses instead of the old whole-index suffix scan (see that
+      ## proc's doc comment). Multiple lexicals can share one realpath (two
+      ## symlinked roots pointing at the same target, etc.); all are kept
+      ## (R7 over-selection policy, same as `byBasename`).
     roots: seq[string]
       ## The lexical, absolute, normalized roots this index was built from
-      ## (projectRoot plus every depRoot that existed on disk at build
-      ## time) — used by `underAnyRoot` to detect an `@m` candidate that
-      ## escaped every tracked root (see the `@m` paragraph of
-      ## `resolveMangledAll`'s doc comment).
+      ## — projectRoot plus EVERY configured depRoot, regardless of whether
+      ## it existed on disk at build time (a depRoot need not exist for R5:
+      ## a deleted dep must still be reported as "tracked" so its last-known
+      ## closure entry is retained rather than silently dropped by the
+      ## under-tracked-root filter).  Only roots that DO exist are actually
+      ## walked (`buildSourceIndex`).  This is the single source of truth
+      ## for "is this path tracked" — both `underAnyRoot` (the `@m` escape
+      ## check, below) and `extractClosure`'s under-tracked-root filter use
+      ## it; there is no separate, duplicate root list.
 
 proc addToIndex(index: var SourceIndex; lexical: string; real: string) =
   let base = lexical.extractFilename
   index.byBasename.mgetOrPut(base, @[]).add IndexedFile(lexical: lexical, real: real)
+  let realNorm = real.normalizedPath
+  index.byReal.mgetOrPut(realNorm, @[]).add lexical
 
 proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
                   index: var SourceIndex) =
@@ -184,7 +199,15 @@ proc buildSourceIndex*(config: Config): SourceIndex =
   ## the exact pruning rules.  Meant to be built ONCE per run (by the
   ## caller — `runner.execute`) and passed to every `extractClosure` call
   ## in that run, never rebuilt per entrypoint.
-  result = SourceIndex(byBasename: initTable[string, seq[IndexedFile]]())
+  ##
+  ## `result.roots` records projectRoot AND EVERY configured depRoot
+  ## unconditionally — regardless of whether the depRoot exists on disk —
+  ## so a deleted/missing depRoot is still "tracked" for the purposes of
+  ## `underAnyRoot`/the under-tracked-root filter (R5: a dep that has since
+  ## vanished must still be reported, not silently dropped because its root
+  ## no longer resolves).  Only EXISTING roots are actually walked.
+  result = SourceIndex(byBasename: initTable[string, seq[IndexedFile]](),
+                        byReal: initTable[string, seq[string]]())
   let stateDirAbs = stateDirOf(config)
 
   let prAbs = config.projectRoot.absolutePath.normalizedPath
@@ -194,8 +217,8 @@ proc buildSourceIndex*(config: Config): SourceIndex =
 
   for dr in config.depRoots:
     let drAbs = dr.absolutePath.normalizedPath
+    result.roots.add drAbs
     if dirExists(drAbs):
-      result.roots.add drAbs
       walkForIndex(drAbs, drAbs, stateDirAbs, result)
 
 proc lookup(index: SourceIndex; body: string): seq[string] =
@@ -248,13 +271,34 @@ proc lookup(index: SourceIndex; body: string): seq[string] =
         seen.incl f.lexical
         result.add f.lexical
 
+proc lookupByReal(index: SourceIndex; realAbs: string): seq[string] =
+  ## Resolve an absolute, normalized REALPATH to the indexed file(s) whose
+  ## realpath EXACTLY equals it — the mechanism `resolveMangledAll`'s `@m`
+  ## branch uses to recover a candidate that landed outside every tracked
+  ## root (or was computed from the wrong base directory — see that proc's
+  ## doc comment), returning the LEXICAL path(s) `extractClosure` records.
+  ## Unlike `lookup` (used for `@p`/`@n`), this is an EXACT match, not a
+  ## suffix match: an `@m` body is not "the shortest relative path from
+  ## some search-path root" (ambiguous which root), it is unambiguously
+  ## "the path from one specific directory" (the entrypoint's, real or
+  ## lexical) — so the candidate it produces is either the file or it isn't,
+  ## with no suffix-widening question to resolve.  An untracked,
+  ## out-of-every-root import therefore correctly resolves to nothing here
+  ## (no indexed file shares its realpath) rather than over-selecting an
+  ## unrelated same-suffix decoy elsewhere in the tree.
+  index.byReal.getOrDefault(realAbs, @[])
+
 proc underAnyRoot(index: SourceIndex; absPath: string): bool =
   ## True iff `absPath` (normalized absolute) lives under one of `index`'s
   ## recorded lexical roots (projectRoot or a depRoot) — path equals the
-  ## root, or starts with `root & DirSep`.  Used by `resolveMangledAll`'s
-  ## `@m` branch to detect a candidate that escaped every tracked root (the
-  ## realpath-through-a-symlinked-depRoot case) so it can fall back to
-  ## the index instead of silently dropping the module.
+  ## root, or starts with `root & DirSep`.  The single source of truth for
+  ## "is this path tracked": used both by `resolveMangledAll`'s `@m` branch
+  ## (to detect a candidate that escaped every tracked root, e.g. the
+  ## realpath-through-a-symlinked-depRoot case, so it can fall back to the
+  ## index instead of silently dropping the module) and by `extractClosure`'s
+  ## under-tracked-root filter (the SOUNDNESS gate over every resolved
+  ## candidate, `@m` and `@p`/`@n` alike) — there is no separate,
+  ## independently-computed root list.
   for root in index.roots:
     if absPath == root or absPath.startsWith(root & $DirSep):
       return true
@@ -263,13 +307,6 @@ proc underAnyRoot(index: SourceIndex; absPath: string): bool =
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-proc isUnderRoot(path: string; root: string): bool =
-  ## True iff `path` (normalised absolute) starts with `root` followed by a
-  ## path separator (or equals root exactly).  Both arguments must be absolute
-  ## and already normalised.
-  if path == root: return true
-  path.startsWith(root & $DirSep)
 
 proc toProjectRelative(absPath: string; projectRoot: string): string =
   ## Convert an absolute path to a projectRoot-relative forward-slash path.
@@ -327,45 +364,63 @@ proc resolveMangledAll(mangledName: string;
   ## stripped, e.g. `@mfoo.nim`) to zero or more absolute `.nim` candidate
   ## paths.
   ##
-  ## For `@m`: normally exactly one candidate, `(entrypointDir / body)`
-  ##           normalized; existence not checked (R5: record deleted deps
-  ##           too).
+  ## For `@m`: `body` is Nim's SHORTEST-relative-path candidate measured
+  ##           from the entrypoint's own directory — the mangler's default
+  ##           choice, used whenever no `--path` root gives a STRICTLY
+  ##           shorter body (`@p`/`@n`, below).  Critically, `body` is always
+  ##           computed from the entrypoint directory's REALPATH (symlinks
+  ##           resolved), never its lexical path — this drives two distinct
+  ##           cases, split on whether the entrypoint directory itself is
+  ##           reached through a symlink:
   ##
-  ##           `body` is Nim's SHORTEST-relative-path candidate measured
-  ##           from the entrypoint's own (realpath-canonicalized) directory
-  ##           — the mangler's default choice, used whenever no `--path`
-  ##           root gives a STRICTLY shorter body (`@p`/`@n`, below).  When
-  ##           the entrypoint's directory itself carries no symlinks, `body`
-  ##           is lexical-path-relative and the single candidate is exactly
-  ##           right. But when the RESOLVED module is reached through a
-  ##           symlinked root (e.g. a milpa depRoot symlinked into the CAS,
-  ##           imported via `import dep` with `--path:_deps/dep/src`) *and*
-  ##           the entrypoint is shallow enough that `@m` still wins over
-  ##           `@p` (a shallow entrypoint dir keeps the `@m` candidate no
-  ##           longer than the `@p` one), `body` carries `..` components
-  ##           back up to a common ancestor and down into the symlink's
-  ##           REALPATH target — so `(entrypointDir / body).normalizedPath`
-  ##           resolves to the dep's REAL path, not its lexical
-  ##           (`_deps/dep/...`) path.  That real path is not under any
-  ##           tracked root, so the under-tracked-root filter in
-  ##           `extractClosure` would silently drop it (an unsound gap
-  ##           neighbouring the `@p` realpath fix above — same root cause,
-  ##           different mangling branch).
+  ##           1. `expandFilename(epDir) == epDir` (the common case — no
+  ##              symlink on the entrypoint's own directory). `body` is then
+  ##              lexical-path-relative from `epDir` UNLESS the RESOLVED
+  ##              module is itself reached through a symlinked root (e.g. a
+  ##              milpa depRoot symlinked into the CAS) and the entrypoint is
+  ##              shallow enough that `@m` still wins over `@p` — then `body`
+  ##              carries `..` components up to a common ancestor and back
+  ##              down into the symlink's REALPATH target, so
+  ##              `(epDir / body).normalizedPath` resolves to the dep's REAL
+  ##              path, outside every tracked root.  The primary candidate is
+  ##              always `(epDir / body).normalizedPath` (existence not
+  ##              checked — R5: record deleted deps too).  When that
+  ##              candidate is NOT under any of `index`'s recorded roots, it
+  ##              is ALSO resolved via `index.lookupByReal` on the identical
+  ##              real path (the plain candidate already IS the real path in
+  ##              this branch, since `epDir` has no symlink of its own) — an
+  ##              EXACT match, not a suffix scan: an untracked,
+  ##              out-of-every-root import (no depRoot of its own) has no
+  ##              indexed file at that realpath, so it resolves to nothing
+  ##              extra, instead of over-selecting an unrelated same-suffix
+  ##              decoy elsewhere in the tree (the precision regression a
+  ##              suffix-based fallback previously caused).  A genuine
+  ##              symlinked-depRoot escape DOES have an indexed file at that
+  ##              exact realpath (the depRoot walk records it), so it is
+  ##              correctly recovered at its lexical path.
   ##
-  ##           The fix: when the plain `(entrypointDir / body)` candidate is
-  ##           NOT under any of `index`'s recorded roots, ALSO resolve
-  ##           `body` through `index.lookup` (exactly the `@p`/`@n` path)
-  ##           and include those matches too.  This fallback is gated on
-  ##           "candidate escaped every tracked root" specifically so it
-  ##           does NOT fire for an ordinary in-root `@m` body (e.g. a
-  ##           sibling `foo.nim`) — unconditionally unioning `index.lookup`
-  ##           for every `@m` body would over-select every `foo.nim`
-  ##           anywhere in the indexed tree merely because the entrypoint
-  ##           happens to import one. It fires only in the narrow case that
-  ##           produces the realpath escape: `@m` through a symlinked root.
-  ##           Results are deduped; the plain candidate is always kept (R5:
-  ##           a deleted dep must still be recorded even though it can no
-  ##           longer be indexed).
+  ##           2. `expandFilename(epDir) != epDir` (the entrypoint's own
+  ##              directory is reached through a symlink — not necessarily a
+  ##              depRoot, just an ordinary in-project directory that happens
+  ##              to be one).  `body` was computed by the compiler from the
+  ##              REAL directory, so naively joining it onto the LEXICAL
+  ##              `epDir` (case 1's arithmetic) does not reliably cancel back
+  ##              to the right path whenever the lexical and real directories
+  ##              differ in path DEPTH — it can land on a bogus, nonexistent,
+  ##              yet still textually-in-root path, silently dropping the
+  ##              real dependency while polluting the closure with a
+  ##              never-existing entry.  Here the REAL candidate,
+  ##              `(realEpDir / body).normalizedPath`, is resolved first via
+  ##              `index.lookupByReal`; only if that misses (unindexed —
+  ##              e.g. it names the entrypoint's own file, which a symlinked
+  ##              directory is never walked into and indexed) does the plain
+  ##              lexical `(epDir / body).normalizedPath` serve as the
+  ##              fallback (R5: still record something rather than silently
+  ##              drop).
+  ##
+  ##           Results are deduped; in either case, the plain lexical
+  ##           candidate is included as a fallback so a deleted dep is still
+  ##           recorded even once it can no longer be indexed.
   ##
   ## For `@p`/`@n` (Nim's nimblePath prefix — treated identically to `@p`):
   ##           resolved against `index` (issue #8 — see `SourceIndex.lookup`).
@@ -392,24 +447,50 @@ proc resolveMangledAll(mangledName: string;
   let body     = decodeBody(noPrefix)        # decode @s/@@ escapes
 
   if mangledName.startsWith("@m"):
-    # Relative to the entrypoint's source directory.
-    # Primary candidate; do NOT check existence (R5: record deleted deps).
+    # Relative to the entrypoint's source directory. `body` is always
+    # computed by the compiler from that directory's REALPATH — see this
+    # proc's doc comment for the two cases this splits into.
     let epDir = entrypointPath.absolutePath.parentDir
-    let plainCandidate = (epDir / body).normalizedPath
-    result = @[plainCandidate]
-    # An @m body carrying a realpath through a symlinked root (see
-    # this proc's doc comment) resolves to a path outside every tracked
-    # root — recover it via the index, same as @p/@n. Gated on "escaped
-    # every root" so an ordinary in-root @m body is never unioned against
-    # the whole index (that would over-select every same-basename file in
-    # the tree).
-    if not index.underAnyRoot(plainCandidate):
-      var seen = initHashSet[string]()
-      seen.incl plainCandidate
-      for cand in index.lookup(body):
+    let realEpDir =
+      try: expandFilename(epDir)
+      except OSError: epDir
+    let lexicalCandidate = (epDir / body).normalizedPath
+    var seen = initHashSet[string]()
+
+    if realEpDir == epDir:
+      # Case 1: the entrypoint's own directory carries no symlink, so
+      # `body` is relative to `epDir` exactly as written — the lexical
+      # candidate IS the real one. Primary result; existence not checked
+      # (R5: record deleted deps too).
+      result = @[lexicalCandidate]
+      seen.incl lexicalCandidate
+      # A realpath-through-a-symlinked-root escape (this proc's doc
+      # comment) puts the candidate outside every tracked root — recover
+      # it via an EXACT realpath match (not @p/@n's suffix scan): an
+      # untracked, out-of-every-root import has no indexed file at this
+      # exact realpath, so it correctly adds nothing, while a genuine
+      # symlinked-depRoot dep does and is recovered at its lexical path.
+      if not index.underAnyRoot(lexicalCandidate):
+        for cand in index.lookupByReal(lexicalCandidate):
+          if cand notin seen:
+            seen.incl cand
+            result.add cand
+    else:
+      # Case 2: the entrypoint's own directory IS reached through a
+      # symlink, so `body` was computed from `realEpDir`, not `epDir` — the
+      # lexical candidate's `..` arithmetic does not reliably cancel back
+      # to the right path. Prefer the REAL candidate via an exact realpath
+      # match; fall back to the plain lexical candidate only if that
+      # misses (R5 — e.g. the entrypoint's own file, which a symlinked
+      # directory is never indexed under).
+      let realCandidate = (realEpDir / body).normalizedPath
+      result = @[]
+      for cand in index.lookupByReal(realCandidate):
         if cand notin seen:
           seen.incl cand
           result.add cand
+      if result.len == 0:
+        result.add lexicalCandidate
 
   else: # "@p" or "@n"
     result = index.lookup(body)
@@ -521,12 +602,6 @@ proc extractClosure*(nimcacheDir: string;
   let epAbs = entrypoint.absolutePath.normalizedPath
   let prAbs = config.projectRoot.absolutePath.normalizedPath
 
-  # Collect all tracked roots for the under-root filter.
-  # A candidate is kept iff it lives under projectRoot OR any depRoot.
-  var trackedDirs: seq[string] = @[prAbs]
-  for dr in config.depRoots:
-    trackedDirs.add dr.absolutePath.normalizedPath
-
   result = initHashSet[string]()
 
   for objPath in manifest.link:
@@ -542,15 +617,13 @@ proc extractClosure*(nimcacheDir: string;
     for resolved in candidates:
       if resolved == "": continue            # (shouldn't occur, but be defensive)
 
-      # Under-tracked-root filter: the SOUNDNESS gate. Keeps only what lives under
-      # projectRoot or a depRoot. Stdlib/nimble paths are excluded here.
-      # Existence is NOT checked (R5): deleted deps remain in the closure.
-      var underTracked = false
-      for dir in trackedDirs:
-        if isUnderRoot(resolved, dir):
-          underTracked = true
-          break
-      if not underTracked: continue
+      # Under-tracked-root filter: the SOUNDNESS gate. Keeps only what lives
+      # under projectRoot or a depRoot — `index.roots`/`underAnyRoot` is the
+      # single source of truth for "tracked", shared with `resolveMangledAll`'s
+      # `@m` escape check (no separate, independently-computed root list).
+      # Stdlib/nimble paths are excluded here. Existence is NOT checked (R5):
+      # deleted deps remain in the closure.
+      if not index.underAnyRoot(resolved): continue
 
       # Convert to projectRoot-relative, forward slashes.
       result.incl toProjectRelative(resolved, prAbs)

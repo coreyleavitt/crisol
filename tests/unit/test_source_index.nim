@@ -290,7 +290,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "lib/shared.nim" in cl
     check cl == toHashSet(["tests/t.nim", "src/shared.nim", "lib/shared.nim"])
 
-  test "T2: a non-dot state dir (Config.stateDir with no leading dot) is still pruned, by absolute path — not by name convention":
+  test "a non-dot state dir (Config.stateDir with no leading dot) is still pruned, by absolute path — not by name convention":
     ## walkForIndex's state-dir skip is an ABSOLUTE-PATH comparison
     ## (entryAbs == stateDirAbs), applied independently of the "starts with
     ## '.'" dot-dir check. A state dir configured WITHOUT a leading dot (e.g.
@@ -317,7 +317,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "state/shared.nim" notin cl
     check cl == toHashSet(["tests/t.nim", "src/shared.nim"])
 
-  test "T2: a nonexistent depRoot in config.depRoots is tolerated — no raise, in-root resolution unaffected":
+  test "a nonexistent depRoot in config.depRoots is tolerated — no raise, in-root resolution unaffected":
     let root = freshRoot("deproot_missing")
     defer: removeDir(root)
     createDir(root / "tests")
@@ -336,7 +336,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     let cl = extractClosure(nc, "t", ep, cfg)
     check cl == toHashSet(["tests/t.nim", "src/x.nim"])
 
-  test "T2: a .nim SYMLINK FILE inside the project (pcLinkToFile) is indexed under its lexical path; a realpath-relative body resolves to it":
+  test "a .nim SYMLINK FILE inside the project (pcLinkToFile) is indexed under its lexical path; a realpath-relative body resolves to it":
     ## root/lib/dep.nim is a FILE symlink (not a symlinked directory)
     ## pointing to a same-named file OUTSIDE the project root. This exercises
     ## the pcLinkToFile branch of walkForIndex specifically — distinct from
@@ -371,7 +371,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "lib/dep.nim" in cl
     check cl == toHashSet(["tests/t.nim", "lib/dep.nim"])
 
-  test "an @m body carrying a realpath through a symlinked depRoot resolves to the lexical depRoot path":
+  test "an @m body carrying a realpath through a symlinked depRoot resolves to the lexical depRoot path (via byReal)":
     ## Reproduces the shape a shallow entrypoint (`tests/t.nim`, one level
     ## below root) produces for a module reached through a symlinked
     ## depRoot: Nim's mangler prefers `@m` (entrypointDir-relative) whenever
@@ -380,12 +380,15 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## canonicalized — the `@m` body itself carries `..` components up to a
     ## common ancestor and back down into the symlink's REAL target
     ## (confirmed empirically against a real `nim c` run of this exact
-    ## fixture shape: `@m..@s..@s<casDir>@sdep@ssrc@sdep.nim.c.o`).
-    ## `(epDir / body).normalizedPath` therefore resolves OUTSIDE every
-    ## tracked root, so `resolveMangledAll` must fall back to `index.lookup`
-    ## to recover it at its LEXICAL depRoot path,
-    ## "_deps/dep/src/dep.nim" — exactly like the `@p` case already covered
-    ## above, but reached via the `@m` branch instead.
+    ## fixture shape: `@m..@s..@s<casDir>@sdep@ssrc@sdep.nim.c.o`). The body
+    ## here is computed with `relativePath` exactly as Nim's mangler does
+    ## (shortest relative path from the entrypoint's directory, which
+    ## carries no symlink of its own, to the dep's REAL path), so
+    ## `(epDir / body).normalizedPath` lands EXACTLY on the dep's real path
+    ## — outside every tracked root — and `resolveMangledAll` must recover
+    ## it via an EXACT `index.lookupByReal` match at its LEXICAL depRoot
+    ## path, "_deps/dep/src/dep.nim" — exactly like the `@p` case already
+    ## covered above, but reached via the `@m` branch instead.
     let root = freshRoot("s3_m_symlink")
     defer: removeDir(root)
     let outside = freshRoot("s3_m_symlink_outside")
@@ -402,16 +405,12 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     writeFile(ep, "# ep\n")
     let nc = root / "nimcache"
 
-    # Realpath-relative @m body: leading ".." components up to a common
-    # ancestor, then the REAL (symlink-resolved) absolute path to
-    # outside/dep/src/dep.nim, mangled with @s in place of '/'. The exact
-    # ".." count does not matter — lookup strips ALL leading ".."/"."/""
-    # components — but it must be enough to make the plain (epDir / body)
-    # candidate resolve outside `root` (it does here: it collapses to the
-    # real, non-symlinked `outside/dep/src/dep.nim`).
-    let realOutsideAbs = outside.expandFilename
-    let mangledBody = ("../../../.." & realOutsideAbs & "/dep/src/dep.nim")
-                        .replace("/", "@s")
+    # Realpath-relative @m body, computed exactly as Nim's mangler does:
+    # the shortest relative path from the entrypoint's (real) directory to
+    # the dep's REAL (symlink-resolved) path.
+    let realDepNim = expandFilename(outside / "dep" / "src" / "dep.nim")
+    let realEpDir = expandFilename(root / "tests")
+    let mangledBody = relativePath(realDepNim, realEpDir).replace($DirSep, "@s")
     writeManifest(nc, "t", compile = @[], link = @[
       nc / "@mt.nim.c.o",
       nc / ("@m" & mangledBody & ".c.o"),
@@ -449,3 +448,81 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "tests/foo.nim" in cl
     check "other/foo.nim" notin cl
     check cl == toHashSet(["tests/t.nim", "tests/foo.nim"])
+
+  test "F1: an @m body escaping every tracked root, with no dep-root of its own, is NOT unioned against the whole index (untracked out-of-root import)":
+    ## `root/tests/t.nim` imports an UNTRACKED out-of-root module via
+    ## `../../other/lib` (two ".." from tests/ escapes `root` entirely, into
+    ## a sibling directory that is neither projectRoot nor any configured
+    ## depRoot). Pre-fix, `resolveMangledAll`'s @m fallback unioned
+    ## `index.lookup(body)` — a SUFFIX match — against the whole index once
+    ## the plain candidate escaped every tracked root; an unrelated in-tree
+    ## decoy `root/src/other/lib.nim` shares the suffix "other/lib.nim" and
+    ## was wrongly pulled into the closure even though it has nothing to do
+    ## with the untracked import. The fix replaces the suffix fallback with
+    ## an EXACT realpath lookup (`byReal`), so an untracked import with no
+    ## indexed file at its own realpath resolves to nothing extra: only the
+    ## (out-of-root, therefore filtered) plain candidate is produced, and the
+    ## decoy is never selected.
+    let root = freshRoot("f1_untracked")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "src" / "other")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(root / "src" / "other" / "lib.nim", "# decoy, in-tree but unrelated\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@m..@s..@sother@slib.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "src/other/lib.nim" notin cl
+    check cl == toHashSet(["tests/t.nim"])
+
+  test "F2: an @m body computed from a symlinked entrypoint directory's REALPATH resolves via byReal to the lexical in-root path":
+    ## `root/a/b/tests` is a SYMLINK to a SHALLOW outside directory `st`
+    ## (a direct sibling of `root`, NOT nested under it) holding `t.nim` —
+    ## the entrypoint directory's LEXICAL depth (4 components below `root`'s
+    ## parent) differs from its REAL depth (1 component below the same
+    ## parent). Nim computes the @m body relative to the REAL entrypoint
+    ## directory (`st`); naively joining that body onto the LEXICAL epDir
+    ## (as the pre-fix code did) does NOT cancel out correctly when the
+    ## depths differ, landing on a bogus, nonexistent, but still
+    ## textually-in-root path — silently dropping `src/foo.nim` from the
+    ## closure (and leaving `isEntryStale` permanently confused by a
+    ## recorded-but-nonexistent path) while a garbage entry pollutes the
+    ## closure instead. The fix detects that `expandFilename(epDir) !=
+    ## epDir` and resolves the body from the REAL epDir, recovering the file
+    ## at its LEXICAL path via `byReal`.
+    let root = freshRoot("f2_symlinked_epdir")
+    defer: removeDir(root)
+    let stDir = freshRoot("f2_symlinked_epdir_st")
+    defer: removeDir(stDir)
+
+    createDir(root / "a" / "b")
+    createDir(root / "src")
+    writeFile(root / "src" / "foo.nim", "# foo\n")
+    writeFile(stDir / "t.nim", "# ep\n")
+    createSymlink(stDir, root / "a" / "b" / "tests")
+
+    let ep = root / "a" / "b" / "tests" / "t.nim"
+    let nc = root / "nimcache"
+
+    # Body computed from the REAL entrypoint directory (`st`), exactly as
+    # Nim's mangler does — the shortest relative path from realpath(epDir)
+    # to the target, with leading ".." components as needed. `st` and
+    # `root` are siblings, so this body carries just one leading "..".
+    let realFoo = expandFilename(root / "src" / "foo.nim")
+    let realSt = expandFilename(stDir)
+    let mangledBody = relativePath(realFoo, realSt).replace($DirSep, "@s")
+
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / ("@m" & mangledBody & ".c.o"),
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "src/foo.nim" in cl
+    check "a/b/tests/t.nim" in cl
+    check cl == toHashSet(["a/b/tests/t.nim", "src/foo.nim"])

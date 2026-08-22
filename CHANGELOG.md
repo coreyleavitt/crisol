@@ -104,12 +104,26 @@ one-time recompile of entrypoints whose closure gained members.
   fell outside every tracked root (the realpath-through-symlink case) the
   under-tracked-root filter silently dropped it, so the dep was absent from
   the closure and an edit to it never re-selected the entrypoint under
-  `--changed` (unsound).  `resolveMangledAll` now also resolves the body
-  through the same `SourceIndex` lookup `@p`/`@n` bodies use whenever the
-  plain candidate escapes every tracked root, recovering it at its lexical
-  path.  The fallback is gated on that escape condition specifically, so an
-  ordinary in-root `@m` body (e.g. a sibling `foo.nim`) is never unioned
-  against the whole index.
+  `--changed` (unsound).  A first fix (commit 38e094e) recovered the
+  candidate by unioning it against `@p`/`@n`'s SUFFIX-based `SourceIndex`
+  lookup, but review found that fallback over-selects: an `@m` body that
+  escapes every tracked root because it names a genuinely UNTRACKED,
+  out-of-root import (no dep-root of its own) could still suffix-match an
+  unrelated same-basename/same-suffix decoy elsewhere in the tree, wrongly
+  pulling it into the closure and churning `closureHash`/`--changed`
+  selection.  `SourceIndex` now also indexes every file by its realpath
+  (`byReal`), and the `@m` fallback resolves through an EXACT realpath
+  match (`lookupByReal`) instead of a suffix scan: a genuine
+  symlinked-dep-root escape has an indexed file at that exact realpath and
+  is recovered at its lexical path, while an untracked import has none and
+  correctly adds nothing.  Separately, when the entrypoint's OWN directory
+  is itself reached through a symlink whose lexical path depth differs from
+  its real path depth, the compiler computes the `@m` body from the real
+  directory; joining that body onto the lexical directory (the prior
+  behaviour in all cases) could land on a bogus, nonexistent path instead of
+  the real dependency.  `resolveMangledAll` now detects that case
+  (`expandFilename(epDir) != epDir`) and resolves the body from the real
+  entrypoint directory instead, via the same exact-realpath lookup.
 - **closure:** `decodeBody` now decodes Nim's `@c` (`:`) and `@h` (`#`)
   mangling escapes in addition to `@s` and `@@`; a module path containing a
   colon or hash character previously failed to decode correctly.

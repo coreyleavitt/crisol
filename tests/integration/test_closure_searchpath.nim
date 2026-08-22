@@ -274,3 +274,60 @@ doAssert depValue() == 7
 
     check "_deps/dep/src/dep.nim" in closure
     check epPath in closure
+
+suite "closure does not over-select an unrelated decoy for an untracked out-of-root @m import (F1)":
+
+  test "an untracked out-of-root import via a relative '../../' path does not pull in an unrelated in-tree decoy sharing its suffix":
+    ## `proj/tests/t.nim` imports `../../other/lib` — a module that lives
+    ## OUTSIDE projectRoot entirely (a sibling of `proj`, literally named
+    ## "other"), is not configured as (or under) any depRoot, and so has no
+    ## tracked root of its own — the exact review-round repro shape.
+    ## `proj/src/other/lib.nim` is an UNRELATED in-tree module that happens
+    ## to share the suffix "other/lib.nim" with the untracked import's
+    ## mangled body ("../../other/lib.nim"). Pre-fix, resolveMangledAll's
+    ## @m fallback suffix-matched the escaped body against the whole
+    ## SourceIndex once the plain candidate fell outside every tracked root,
+    ## wrongly pulling the decoy into the closure. Post-fix (exact-realpath
+    ## `byReal` lookup) the decoy must never be selected, and the entrypoint
+    ## must still compile and run.
+    let parent = makeTempRoot("f1_untracked_decoy")
+    defer: removeDir(parent)
+    let root = parent / "proj"
+    createDir(root)
+
+    # The untracked module actually imported: parent/other/lib.nim, a
+    # sibling of `proj` (projectRoot), named "other" — so the compiler's
+    # shortest-relative-path @m body is exactly "../../other/lib.nim".
+    createDir(parent / "other")
+    writeFile(parent / "other" / "lib.nim", "proc libValue*(): int = 9\n")
+
+    # The unrelated in-tree decoy, sharing the suffix "other/lib.nim".
+    createDir(root / "src" / "other")
+    writeFile(root / "src" / "other" / "lib.nim", "proc libValue*(): int = -1\n")
+
+    createDir(root / "tests")
+    writeFile(root / "tests" / "t.nim", """
+import ../../other/lib
+doAssert libValue() == 9
+""")
+
+    let cfg = makeCfg(root)
+    let ep = Entrypoint(path: "tests/t.nim", group: "default", flags: @[])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    if results[0].outcome != oPassed:
+      echo "F1 untracked-decoy compile/run output:\n", results[0].output
+    check results[0].outcome == oPassed
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check "src/other/lib.nim" notin closure
+    check "tests/t.nim" in closure
