@@ -433,3 +433,78 @@ suite "crisol CLI — no-entrypoints-matched carries plan warnings":
     let err = readFile(errPath)
     check "warning:" in err
     check "bogus-top-level-key" in err
+
+# ---------------------------------------------------------------------------
+# L2: a stale-nimVersion depgraph must be a visible, structured diagnostic
+# for `run` — reported exactly ONCE on stderr (no double-report between the
+# depgraph loader and the caller's ConfigWarning surfacing), and present in
+# the run/v1 JSON `warnings` array.
+# ---------------------------------------------------------------------------
+
+proc captureStdoutToFileD(path: string; body: proc()): void =
+  ## Redirect fd 1 (stdout) to `path`, call body(), then restore.
+  let f = open(path, fmWrite)
+  let fileFd: cint = f.getFileHandle.cint
+  let savedFd: cint = posix_mod2.dup(1.cint)
+  if savedFd < 0:
+    f.close()
+    raise newException(OSError, "dup(1) failed")
+  discard posix_mod2.dup2(fileFd, 1.cint)
+  f.close()
+  try:
+    body()
+  finally:
+    flushFile(stdout)
+    discard posix_mod2.dup2(savedFd, 1.cint)
+    discard posix_mod2.close(savedFd)
+
+suite "crisol CLI — L2: stale depgraph nimVersion is a visible, once-only diagnostic":
+
+  test "run --json after depgraph header nimVersion goes stale → stderr has exactly ONE 'depgraph discarded' line; JSON warnings has key==nimVersion":
+    let root = uniqueTmpDirD("depgraph_nimver")
+    defer: removeDir(root)
+    writeFD(root, "tests/unit/test_a.nim", "doAssert true\n")
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    # Record a real depgraph first.
+    let primeCode = runMain(@["run", "tests/unit/test_a.nim"])
+    flushFile(stdout)  # avoid leaking this uncaptured run's buffered stdout
+                       # into the capture blocks below
+    check primeCode == 0
+    let depgraphPath = root / ".crisol" / "depgraph"
+    check fileExists(depgraphPath)
+
+    # Make the recorded nimVersion stale by editing the header in place.
+    var doc = parseJson(readFile(depgraphPath))
+    doc["header"]["nimVersion"] = newJString("0.0.0-stale")
+    writeFile(depgraphPath, $doc)
+
+    let outPath = getTempDir() / "crisol_l2_run_stale.json"
+    let errPath = getTempDir() / "crisol_l2_run_stale_err.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    defer: (try: removeFile(errPath) except: discard)
+    var code = 0
+    captureStderrToFileD(errPath, proc () =
+      captureStdoutToFileD(outPath, proc () =
+        code = runMain(@["run", "tests/unit/test_a.nim", "--json"])))
+    check code == 0
+
+    # Exactly one report of the discard on stderr (no double-reporting
+    # between depgraph.nim's loader and pipeline.nim's ConfigWarning).
+    let err = readFile(errPath)
+    var occurrences = 0
+    for line in err.splitLines:
+      if "depgraph discarded" in line:
+        inc occurrences
+    check occurrences == 1
+
+    let j = parseJson(readFile(outPath).strip())
+    check j.hasKey("warnings")
+    var found = false
+    for w in j["warnings"].items:
+      if w["key"].getStr == "nimVersion":
+        found = true
+    check found

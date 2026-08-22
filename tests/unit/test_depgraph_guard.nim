@@ -17,7 +17,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_depgraph_guard.nim
 
-import std/[json, os, sets, strutils, tables, unittest]
+import std/[json, os, posix, sets, strutils, tables, unittest]
 import crisol/types
 import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
 import crisol/depgraph
@@ -326,3 +326,73 @@ suite "depgraph load provenance: discarded persisted graph":
     check d.kind == dgdMalformed
     check d.key == "malformed"
     check "depgraph discarded" in d.message
+
+  test "F6: header nimVersion of non-string JSON type → dgdMalformed with reason text":
+    let root = graphRoot("nimver_not_string")
+    defer: removeDir(root)
+    let doc = %*{
+      "header":  {"nimVersion": 123, "formatVersion": DepGraphFormatVersion},
+      "entries": newJArray(),
+    }
+    writeFile(root / ".crisol" / "depgraph", $doc)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfg, "2.2.10", d)
+    check loaded.entries.len == 0
+    check d.kind == dgdMalformed
+    check d.key == "malformed"
+    check "nimVersion" in d.stored
+    check "not a string" in d.stored
+    check "depgraph discarded" in d.message
+
+  test "F4: unreadable-but-present depgraph file → dgdMalformed with 'unreadable' in stored/message":
+    ## `readFile` raises IOError (not OSError); loadDepGraph must catch both
+    ## so an EACCES-style failure surfaces as a structured dgdMalformed
+    ## discard instead of propagating as an unhandled exception. chmod
+    ## 0o000 only denies a NON-root reader — root bypasses regular-file
+    ## permission checks entirely — so this assertion is skipped when
+    ## running as root (this suite runs inside crisol's podman toolchain,
+    ## which runs as root by default; the guard still protects a rootless
+    ## CI or a native host run).
+    if getuid() == 0:
+      skip()
+    else:
+      let root = graphRoot("unreadable")
+      defer: removeDir(root)
+      let path = root / ".crisol" / "depgraph"
+      writeFile(path, """
+      { "header": { "nimVersion": "2.2.10", "formatVersion": """ & $DepGraphFormatVersion & """ },
+        "entries": [] }
+      """)
+      setFilePermissions(path, {})
+      var d: DepGraphDiscard
+      let loaded = loadDepGraph(Config(projectRoot: root, stateDir: ".crisol"), "2.2.10", d)
+      # Restore read access immediately so `defer: removeDir(root)` above can
+      # still clean up regardless of what the checks below find.
+      setFilePermissions(path, {fpUserRead, fpUserWrite})
+      check loaded.entries.len == 0
+      check d.kind == dgdMalformed
+      check d.key == "malformed"
+      check "unreadable" in d.stored
+      check "unreadable" in d.message
+
+  test "F3: a '|'-delimited fingerprint renders as <first line>|<last-12 hash chars>, single-line, differs by hash":
+    ## Two toolchains that share a `nim --version` line but differ in
+    ## binary hash (e.g. a patched vs. stock 2.2.10 — this repo's exact
+    ## situation) must not collapse to identical diagnostics.
+    let d1 = DepGraphDiscard(kind: dgdNimVersion,
+      stored:  "Nim Compiler Version 2.2.10 [Linux: amd64]\nCompiled at 2024-01-01|deadbeefcafe0001",
+      current: "Nim Compiler Version 2.2.10 [Linux: amd64]\nCompiled at 2024-01-01|deadbeefcafe0001")
+    let d2 = DepGraphDiscard(kind: dgdNimVersion,
+      stored:  "Nim Compiler Version 2.2.10 [Linux: amd64]\nCompiled at 2024-01-01|deadbeefcafe0002",
+      current: "Nim Compiler Version 2.2.10 [Linux: amd64]\nCompiled at 2024-01-01|deadbeefcafe0002")
+    let msg1 = d1.message
+    let msg2 = d2.message
+    check msg1 != msg2
+    check "\n" notin msg1
+    check "\n" notin msg2
+    check "Nim Compiler Version 2.2.10 [Linux: amd64]" in msg1
+    check "Nim Compiler Version 2.2.10 [Linux: amd64]" in msg2
+    check "beefcafe0001" in msg1   # last 12 chars of "deadbeefcafe0001"
+    check "beefcafe0002" in msg2   # last 12 chars of "deadbeefcafe0002"

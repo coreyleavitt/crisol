@@ -135,28 +135,58 @@ type
 # `key`/`message` elsewhere, e.g. with a `case` in pipeline.nim)
 # ---------------------------------------------------------------------------
 
-proc sanitizeHeaderField(s: string): string =
-  ## `stored`/`current` values may come from an on-disk depgraph file, which
-  ## may be foreign, hand-edited, or corrupted, or from the Nim compiler
-  ## fingerprint, which is itself MULTI-LINE ("Nim Compiler Version ...\n
-  ## Compiled at ...\nactive boot switches ...|<hash>"). `message` below
-  ## concatenates this text verbatim into a diagnostic that is later written
-  ## raw to stderr, so: keep only the first line (multi-line input would
-  ## otherwise blow the diagnostic out to 6+ stderr lines), then replace
-  ## every remaining byte < 0x20 or == 0x7f with '?' so control/ANSI escape
-  ## bytes cannot spoof or corrupt the terminal (or a log that captures it),
-  ## then cap the length so a pathological value cannot blow up the message
-  ## either.
+proc sanitizeOneSegment(s: string): string =
+  ## Sanitize a single already-extracted segment: replace every byte < 0x20
+  ## or == 0x7f with '?' (control/ANSI escape bytes cannot spoof or corrupt
+  ## the terminal, or a log that captures it), then cap the length so a
+  ## pathological value cannot blow up the message. The cap applies to THIS
+  ## segment alone — callers that split a value into multiple segments (see
+  ## `sanitizeHeaderField`) must cap each segment independently, or a long
+  ## leading segment would consume the whole budget and hide the rest.
   const maxLen = 64
-  let nlPos = s.find('\n')
-  let firstLine = if nlPos >= 0: s[0 ..< nlPos] else: s
-  let truncated = firstLine.len > maxLen
-  let clipped = if truncated: firstLine[0 ..< maxLen] else: firstLine
+  let truncated = s.len > maxLen
+  let clipped = if truncated: s[0 ..< maxLen] else: s
   result = newString(clipped.len)
   for i, c in clipped:
     result[i] = if ord(c) < 0x20 or ord(c) == 0x7f: '?' else: c
   if truncated:
     result.add "..."
+
+proc sanitizeHeaderField(s: string): string =
+  ## `stored`/`current` values may come from an on-disk depgraph file, which
+  ## may be foreign, hand-edited, or corrupted, or from the Nim compiler
+  ## fingerprint, which is itself MULTI-LINE and pipe-delimited
+  ## ("Nim Compiler Version ...\nCompiled at ...\nactive boot switches
+  ## ...|<binary hash>" — see nimprobe.cachedNimFingerprint). `message`
+  ## below concatenates this text verbatim into a diagnostic that is later
+  ## written raw to stderr, so this proc must both keep the diagnostic
+  ## short and single-line, and preserve enough of the value to tell two
+  ## different fingerprints apart.
+  ##
+  ## A value containing '|' is treated as
+  ## `<multi-line version text>|<binary hash>`: the part before the FINAL
+  ## '|' is reduced to its first line (the human-readable version string);
+  ## the part after it is reduced to its last 12 characters (enough of the
+  ## hash to distinguish two builds with an identical version line — e.g.
+  ## a patched vs. stock compiler at the same reported version — without
+  ## reproducing the whole hash). Each part is sanitized and capped
+  ## independently (see `sanitizeOneSegment`) so the version-line cap
+  ## cannot itself swallow the '|' and hide the hash suffix.
+  ##
+  ## A value with no '|' falls back to the original behavior: first line
+  ## only, sanitized and capped.
+  let pipePos = s.rfind('|')
+  if pipePos >= 0:
+    let versionSeg = s[0 ..< pipePos]
+    let hashSeg     = s[pipePos + 1 .. ^1]
+    let vNlPos = versionSeg.find('\n')
+    let versionFirstLine = if vNlPos >= 0: versionSeg[0 ..< vNlPos] else: versionSeg
+    let hashTail = if hashSeg.len > 12: hashSeg[^12 .. ^1] else: hashSeg
+    return sanitizeOneSegment(versionFirstLine) & "|" & sanitizeOneSegment(hashTail)
+
+  let nlPos = s.find('\n')
+  let firstLine = if nlPos >= 0: s[0 ..< nlPos] else: s
+  sanitizeOneSegment(firstLine)
 
 proc key*(d: DepGraphDiscard): string =
   ## ConfigWarning `key` for a discard: "nimVersion" / "formatVersion" /
@@ -412,6 +442,9 @@ proc fromJson(node: JsonNode; nimVersion: string; discarded: var DepGraphDiscard
   if storedNimVer == nil:
     discarded = DepGraphDiscard(kind: dgdMalformed, stored: "header missing nimVersion")
     return
+  if storedNimVer.kind != JString:
+    discarded = DepGraphDiscard(kind: dgdMalformed, stored: "nimVersion not a string")
+    return
   let storedFmtVer = headerNode{"formatVersion"}
   if storedFmtVer == nil:
     discarded = DepGraphDiscard(kind: dgdMalformed, stored: "header missing formatVersion")
@@ -589,9 +622,10 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
   ## when nothing was discarded):
   ## - Missing file → empty graph (not an error); dgdNone.
   ## - Unreadable file → empty graph (safer fallback); dgdMalformed with the
-  ##   IO error text (also still logged to stderr immediately — the file may
-  ##   be unreadable for reasons a caller who ignores discarded, e.g. the
-  ##   2-arg overload, still needs to see right away).
+  ##   IO error text. No direct stderr write here — the caller surfaces
+  ##   `discarded` as a `ConfigWarning` (sanitized by `message`), the single
+  ##   report channel; see the `except` clause below for why both `IOError`
+  ##   and `OSError` are caught.
   ## - Malformed JSON, or valid JSON with an unexpected shape → empty graph;
   ##   dgdMalformed with the parse-error text or a short shape reason. The
   ##   caller's `ConfigWarning` (built from discarded) is now the sole
@@ -603,15 +637,30 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
   discarded = DepGraphDiscard(kind: dgdNone)
 
   if not fileExists(path):
+    # NOTE: `fileExists` (see std/private/oscommon) returns false for
+    # anything that is not a regular file or symlink — a directory, device
+    # file, named pipe, or socket at `path` all land here as dgdNone
+    # ("missing"), never reach `readFile` below, and therefore can NEVER
+    # exercise the dgdMalformed "unreadable" branch. Only a regular file
+    # (or symlink to one) that exists but cannot be READ — e.g. permission
+    # denied — reaches that branch.
     return initDepGraph(nimVersion)
 
   var raw: string
   try:
     raw = readFile(path)
-  except OSError as e:
-    stderr.write("crisol: warning: could not read depgraph '" & path &
-                 "': " & e.msg & " — starting with empty graph\n")
-    discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
+  except IOError, OSError:
+    # `readFile` raises `IOError` (std/syncio), NOT `OSError` — the two are
+    # unrelated CatchableError subtypes, so `except OSError` alone never
+    # fires and an unreadable-but-present file (EACCES, or a race where the
+    # file is removed between `fileExists` and `readFile`) would otherwise
+    # propagate as an unhandled exception all the way to the CLI. Catch
+    # both explicitly rather than relying on inheritance. (Nim's `except`
+    # does not support an `as` binding on a multi-type list, hence
+    # `getCurrentException` here instead of `except IOError, OSError as e`.)
+    let e = getCurrentException()
+    discarded = DepGraphDiscard(kind: dgdMalformed,
+                                stored: "unreadable: " & e.msg)
     return initDepGraph(nimVersion)
 
   var node: JsonNode
