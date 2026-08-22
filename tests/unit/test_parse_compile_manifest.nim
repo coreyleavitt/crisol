@@ -57,6 +57,26 @@ suite "parseCompileManifest — raw unfiltered read":
     check manifest.compile[1].ccCmd == "gcc -c /proj/nimcache/@mmain.nim.c -o /proj/nimcache/@mmain.nim.c.o"
     check manifest.linkcmd == "gcc -o /proj/bin/main /proj/nimcache/@mmain.nim.c.o /opt/nim/lib/@psystem.nim.c.o"
 
+  test "link array is returned raw: every object path, externals included":
+    let json = """
+    {
+      "compile": [],
+      "link": ["/proj/nimcache/@mmain.nim.c.o", "/opt/nim/lib/@psystem.nim.c.o", "/opt/vendor/libfoo.o"],
+      "linkcmd": "gcc -o /proj/bin/main"
+    }
+    """
+    let path = writeManifest(tmpRoot / "t_link", json)
+    let manifest = parseCompileManifest(path)
+    check manifest.compile.len == 0
+    check manifest.link == @["/proj/nimcache/@mmain.nim.c.o",
+                             "/opt/nim/lib/@psystem.nim.c.o",
+                             "/opt/vendor/libfoo.o"]
+
+  test "missing link array yields an empty link seq, not an error":
+    let json = """{ "compile": [], "linkcmd": "" }"""
+    let path = writeManifest(tmpRoot / "t_nolink", json)
+    check parseCompileManifest(path).link.len == 0
+
   test "empty compile array yields empty result, linkcmd still read":
     let json = """{"compile": [], "linkcmd": "gcc -o /proj/bin/main"}"""
     let path = writeManifest(tmpRoot / "t2", json)

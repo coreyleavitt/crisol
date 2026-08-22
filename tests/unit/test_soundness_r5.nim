@@ -32,8 +32,13 @@ proc writeNimcacheJson(dir: string; bname: string; pairs: seq[(string, string)])
     pair.add newJString(c)
     pair.add newJString(cmd)
     compileArr.add pair
+  # `link` mirrors `compile` (one object per C unit) — the shape Nim emits on a
+  # cold compile; extractClosure reads `link` (issue #5).
+  let linkArr = newJArray()
+  for (c, _) in pairs: linkArr.add newJString(c & ".o")
   let node = newJObject()
   node["compile"] = compileArr
+  node["link"]    = linkArr
   createDir(dir)
   writeFile(dir / bname & ".json", $node)
 

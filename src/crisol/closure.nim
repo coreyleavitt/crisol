@@ -8,9 +8,19 @@
 ##
 ## ## Algorithm (RFC-0001 §Dependency Source, verified decode algorithm)
 ##
-## The nimcache JSON at `<nimcacheDir>/<binaryName>.json` contains a `compile`
-## array of `[cFilePath, gccCmd]` pairs.  For each pair, element 0 is the path
-## to the generated `.c` file whose **basename** encodes the source location:
+## The nimcache JSON at `<nimcacheDir>/<binaryName>.json` contains two
+## arrays that name compile units:
+##
+## - `compile` — `[cFilePath, gccCmd]` pairs: the C-compile WORK LIST for
+##   this invocation.  Complete only on a cold nimcache; on a warm recompile
+##   it holds just the modules whose generated C changed, and is EMPTY when
+##   nothing did (a comment-only edit).  NOT a closure source (issue #5).
+## - `link`    — object-file paths: everything the linker consumes.  Built
+##   from ALL of the compiler's `toCompile` plus external objects, so it is
+##   complete on every compile by construction.  THIS is the closure source.
+##
+## Each `link` entry's **basename** is `<mangled>.nim.c.o`; strip `.o` and
+## the mangled `.c` name encodes the source location:
 ##
 ##   basename: strip `.c` → strip leading prefix → decode body (@s→/, @@→@)
 ##
@@ -35,8 +45,9 @@
 ##
 ## A `HashSet[string]` of paths relative to `projectRoot`, using forward
 ## slashes, matching the scheme used by `Entrypoint.path` and future
-## dep-graph keys.  The entrypoint's own file is included (it appears in
-## `compile`).
+## dep-graph keys.  The entrypoint's own file is included (its object is in
+## `link`).  External objects (no `@m`/`@p` prefix, e.g. `{.compile.}`d C
+## files and foreign libraries) are excluded by the prefix guard.
 ##
 ## ## Error handling
 ##
@@ -140,16 +151,20 @@ proc resolveMangledAll(cFilePath: string;
 # ---------------------------------------------------------------------------
 
 proc parseCompileManifest*(jsonPath: string):
-    tuple[compile: seq[tuple[cPath, ccCmd: string]]; linkcmd: string] =
+    tuple[compile: seq[tuple[cPath, ccCmd: string]];
+          link: seq[string];
+          linkcmd: string] =
   ## Low-level nimcache-JSON reader (RFC-0006 §File scoping / "Manifest
   ## access") — the SINGLE JSON-reading implementation shared by
   ## `extractClosure` (below, a filter over this) and RFC-0006's M/R stages
   ## (which need the raw shape `extractClosure` deliberately discards).
   ##
   ## Returns the RAW, UNFILTERED `compile` array as `(cPath, ccCmd)` pairs —
-  ## stdlib/nimble paths INCLUDED, cc commands INCLUDED — plus the `linkcmd`
-  ## string. Does no path resolution, no under-root filtering, no @m/@p
-  ## decoding: that is `extractClosure`'s job, not this proc's.
+  ## stdlib/nimble paths INCLUDED, cc commands INCLUDED — plus the RAW `link`
+  ## array (every object path the linker consumes, external objects INCLUDED;
+  ## empty if the manifest has no `link` array) and the `linkcmd` string.
+  ## Does no path resolution, no under-root filtering, no @m/@p decoding:
+  ## that is `extractClosure`'s job, not this proc's.
   ##
   ## An entry whose `cPath` is empty is skipped (matches the historical
   ## `extractClosure` guard — such an entry cannot name a compile unit).
@@ -182,7 +197,14 @@ proc parseCompileManifest*(jsonPath: string):
     let ccCmd = if pair.len >= 2: pair[1].getStr("") else: ""
     pairs.add (cPath: cPath, ccCmd: ccCmd)
 
-  result = (compile: pairs, linkcmd: jnode{"linkcmd"}.getStr(""))
+  var link: seq[string] = @[]
+  let linkArr = jnode{"link"}
+  if linkArr != nil and linkArr.kind == JArray:
+    for o in linkArr:
+      let oPath = o.getStr("")
+      if oPath != "": link.add oPath
+
+  result = (compile: pairs, link: link, linkcmd: jnode{"linkcmd"}.getStr(""))
 
 proc extractClosure*(nimcacheDir: string;
                      binaryName: string;
@@ -202,12 +224,25 @@ proc extractClosure*(nimcacheDir: string;
   ##
   ## Raises `CrisolError(cekEnvironment)` if the JSON is missing or unparseable.
   ##
-  ## A FILTER over `parseCompileManifest`'s raw output (RFC-0006 §File
-  ## scoping): stdlib/nimble paths and the cc command are deliberately
+  ## A FILTER over `parseCompileManifest`'s raw `link` array (RFC-0006 §File
+  ## scoping): stdlib/nimble paths and external objects are deliberately
   ## dropped here — `parseCompileManifest` is the shape that keeps them.
+  ##
+  ## Reads `link`, NEVER `compile` (issue #5): `compile` is the per-invocation
+  ## C work list and is partial/empty on a warm nimcache, so a closure built
+  ## from it shrinks to nothing on the first incremental recompile and
+  ## permanently disables invalidation.  `link` is complete on every compile.
+  ##
+  ## Raises `CrisolError(cekEnvironment)` if `link` is empty: a linked binary
+  ## has at least its main module's object, so an empty `link` is a malformed
+  ## manifest, never a real (empty) closure.
 
   let jsonPath = nimcacheDir / binaryName & ".json"
   let manifest = parseCompileManifest(jsonPath)
+  if manifest.link.len == 0:
+    raise newCrisolError(cekEnvironment,
+      "nimcache JSON at " & jsonPath & " has no 'link' entries" &
+      " — cannot derive the source closure")
 
   let roots      = trackedRoots(config)
   let epAbs      = entrypoint.absolutePath.normalizedPath
@@ -221,8 +256,11 @@ proc extractClosure*(nimcacheDir: string;
 
   result = initHashSet[string]()
 
-  for pair in manifest.compile:
-    let cPath = pair.cPath
+  for objPath in manifest.link:
+    # Only Nim-generated objects carry the mangled `.nim.c.o` name; anything
+    # else (`{.compile.}`d C, foreign `.o`/`.a`) names no Nim module.
+    if not objPath.endsWith(".c.o"): continue
+    let cPath = objPath[0 .. ^3]             # strip ".o" → the generated .c path
 
     # R5+R7 fix: resolveMangledAll returns ALL candidate paths (possibly multiple
     # for ambiguous @p entries, possibly non-existent for deleted deps).
