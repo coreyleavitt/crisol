@@ -27,9 +27,9 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_nimcache_persistence_real.nim
 
-import std/[os, strutils, times, unittest]
+import std/[os, sets, strutils, tables, times, unittest]
 import std/posix as posix_mod
-import crisol/[types, runner]
+import crisol/[types, runner, depgraph]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -57,8 +57,17 @@ proc makeCfg(root: string): Config =
     maxOutputBytes:     65_536,
   )
 
-proc epFor(path: string): Entrypoint =
-  Entrypoint(path: path, group: "default", flags: @[])
+proc stageEp(root: string; fixtureName = "pass_always.nim"; group = "default";
+             flags: seq[string] = @[]): Entrypoint =
+  ## Copy a fixture UNDER the isolated projectRoot (`root`) and return a
+  ## project-relative Entrypoint. crisol refuses to record an entrypoint
+  ## whose closure is empty (issue #5) — which is exactly what an
+  ## out-of-root entrypoint produces, so every entrypoint used by this file
+  ## must live under `root` (see tests/integration/test_skipfresh.nim's
+  ## `stageEp` for the same pattern).
+  createDir(root / "tests")
+  copyFile(fixtureDir() / fixtureName, root / "tests" / fixtureName)
+  Entrypoint(path: "tests" / fixtureName, group: group, flags: flags)
 
 proc countCFiles(dir: string): int =
   if not dirExists(dir): return 0
@@ -76,12 +85,18 @@ suite "nimcache-persistence — REUSE (real compile)":
     let root = makeTempRoot("reuse")
     defer: removeDir(root)
     let cfg = makeCfg(root)
-    let ep  = epFor(fixtureDir() / "pass_always.nim")
+    let ep  = stageEp(root)
 
     let toolchainFp = toolchainFingerprint("nim-test-v1", "cc-test-v1")
     let expectedCacheDir = cachePath(ep, cfg, toolchainFp)
+    let key = (ep.path, flagHash(ep.flags))
 
-    var graph = emptyDepGraph()
+    # initDepGraph (not emptyDepGraph, which stamps header.nimVersion = "")
+    # so the graph's header matches the nimVersion given to plan()/execute()
+    # below — mirrors real callers, who construct the initial graph via
+    # loadDepGraph(cfg, actualNimVersion) — and lets loadDepGraph(cfg,
+    # "nim-test-v1") below see the persisted entries.
+    var graph = initDepGraph("nim-test-v1")
     let plan1 = plan(cfg, @[ep], graph, nimVersion = "nim-test-v1")
     check plan1.entrypoints[0].edecision == edNeverBuilt
 
@@ -97,6 +112,17 @@ suite "nimcache-persistence — REUSE (real compile)":
     check dirExists(expectedCacheDir)
     check countCFiles(expectedCacheDir) > 0
 
+    # Issue #5 acceptance property through the product entry point: execute()
+    # must have recorded a NON-EMPTY source closure for `ep` (the entrypoint
+    # lives under the tracked projectRoot, so extractClosure/updateEntry must
+    # succeed — not take the "could not record its source closure" warning
+    # path in runner.nim, which would invalidate the entry instead).
+    let graphAfter1 = loadDepGraph(cfg, "nim-test-v1")
+    check key in graphAfter1.entries
+    let cl1 = graphAfter1.entries[key].closure
+    check cl1.len >= 1
+    check "tests/pass_always.nim" in cl1
+
     # Plant a marker: if the next compile wipes-and-recreates this directory
     # (the old volatile-suffix behavior would have used a DIFFERENT dir every
     # run, so this marker would never even be at risk), the marker is gone.
@@ -104,7 +130,10 @@ suite "nimcache-persistence — REUSE (real compile)":
     writeFile(markerPath, "persisted-from-run-1")
 
     # Force a second real compile of the SAME entrypoint into the SAME
-    # (unchanged) stable path.
+    # (unchanged) stable path. This is the real WARM path: Nim reuses the
+    # persistent nimcache, marks everything Cached, and emits an empty
+    # `compile` array in the nimcache's `<name>.json` — extractClosure must
+    # still recover the full closure (falling back to the `link` array).
     let plan2 = plan(cfg, @[ep], graph, nimVersion = "nim-test-v1",
                      forceCompile = true)
     check plan2.entrypoints[0].edecision == edStale
@@ -121,6 +150,15 @@ suite "nimcache-persistence — REUSE (real compile)":
     check fileExists(markerPath)
     check countCFiles(expectedCacheDir) > 0
 
+    # Issue #5 acceptance property (warm side): the entry is still PRESENT
+    # (not invalidated via the warning path) and the warm-recompile closure
+    # is identical to — and still as complete as — the cold-compile closure.
+    let graphAfter2 = loadDepGraph(cfg, "nim-test-v1")
+    check key in graphAfter2.entries
+    let cl2 = graphAfter2.entries[key].closure
+    check cl2.len >= 1
+    check cl2 == cl1
+
 # ---------------------------------------------------------------------------
 # Suite 2 — soundness
 # ---------------------------------------------------------------------------
@@ -131,7 +169,7 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     let root = makeTempRoot("soundness")
     defer: removeDir(root)
     let cfg = makeCfg(root)
-    let ep  = epFor(fixtureDir() / "pass_always.nim")
+    let ep  = stageEp(root)
 
     let oldCacheDir = cachePath(ep, cfg, toolchainFingerprint("nim-v1", "cc-OLD"))
     let newCacheDir = cachePath(ep, cfg, toolchainFingerprint("nim-v1", "cc-NEW"))
@@ -180,8 +218,8 @@ suite "nimcache-persistence — STABLE ACROSS PLAN POSITION (the --changed fix)"
     let root = makeTempRoot("position")
     defer: removeDir(root)
     let cfg = makeCfg(root)
-    let ep     = epFor(fixtureDir() / "pass_always.nim")
-    let decoy  = epFor(fixtureDir() / "env_probe.nim")
+    let ep     = stageEp(root)
+    let decoy  = stageEp(root, "env_probe.nim")
 
     let toolchainFp = toolchainFingerprint("nim-v1", "cc-v1")
     let expectedCacheDir = cachePath(ep, cfg, toolchainFp)
@@ -233,7 +271,7 @@ suite "nimcache-persistence — a failed compile does not leave a corrupt persis
     let root = makeTempRoot("compilefail")
     defer: removeDir(root)
     let cfg = makeCfg(root)
-    let ep  = epFor(fixtureDir() / "fail_compile.nim")
+    let ep  = stageEp(root, "fail_compile.nim")
 
     let toolchainFp = toolchainFingerprint("nim-v1", "cc-v1")
     let expectedCacheDir = cachePath(ep, cfg, toolchainFp)
@@ -264,7 +302,7 @@ suite "nimcache-persistence — rare same-entrypoint-twice-in-plan duplicate":
     let cfg = makeCfg(root)
     var cfg2Jobs = cfg
     cfg2Jobs.jobs = 2  ## give both copies a real chance to run concurrently
-    let ep  = epFor(fixtureDir() / "pass_always.nim")
+    let ep  = stageEp(root)
 
     var graph = emptyDepGraph()
     # Build the plan directly with two identical entries — bypassing
