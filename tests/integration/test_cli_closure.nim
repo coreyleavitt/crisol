@@ -25,6 +25,7 @@ import std/[json, monotimes, os, strutils, unittest]
 import std/posix as posix_mod
 import crisol  # runMain
 import crisol/render  # pathFlagsWarnings — D1: reuse run/list's exact wording
+import crisol/jsonout  # ClosureV1Schema/ClosureV1Revision — T2: schema/revision pin
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,6 +94,7 @@ suite "crisol closure — issue #9 slice A":
 
   test "closure <path> --json BEFORE any run: recorded == false, closure == []":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -115,6 +117,7 @@ suite "crisol closure — issue #9 slice A":
 
   test "run then closure <path> --json: recorded == true, closure has both files":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -146,6 +149,7 @@ suite "crisol closure — issue #9 slice A":
 
   test "closure --all --json: entries for BOTH test_a (recorded) and test_b (not)":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -171,6 +175,7 @@ suite "crisol closure — issue #9 slice A":
 
   test "closure with no args → exit 3":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -179,6 +184,7 @@ suite "crisol closure — issue #9 slice A":
 
   test "closure --all <path> together → exit 3":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -187,6 +193,7 @@ suite "crisol closure — issue #9 slice A":
 
   test "non-json closure --all → exit 0, stdout mentions both paths":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -210,6 +217,7 @@ suite "crisol closure — L1/T1 --config <path>":
 
   test "closure --all --json --config <path> targets a non-default config file":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -230,6 +238,7 @@ suite "crisol closure — L1/T1 --config <path>":
 
   test "closure --config= (inline form) with an empty value → exit 3":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -244,6 +253,7 @@ suite "crisol closure — L1/T1 --config <path>":
 
   test "closure --config with no following value → exit 3":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -265,6 +275,7 @@ suite "crisol closure — D1 ad-hoc / ambiguous path warnings":
 
   test "closure <path not in any group glob> prints the same ad-hoc warning run/list print":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -295,6 +306,7 @@ suite "crisol closure — S4 no-match exit code":
 
   test "closure <nonexistent path> --json → exit 3, stderr mentions no entrypoints matched":
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -341,6 +353,7 @@ suite "crisol closure — S3 stale depgraph diagnostic":
     ## in cr.warnings: stderr.write("warning: " & w.message & "\n")`) — not
     ## silently indistinguishable from "never ran".
     let root = setUpProject()
+    defer: removeDir(root)
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
@@ -382,3 +395,130 @@ suite "crisol closure — S3 stale depgraph diagnostic":
     check foundDiscardWarning
 
     check "depgraph discarded" in readFile(errPath)
+
+# ---------------------------------------------------------------------------
+# T2 — code-review test-gap closures.
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — T2 schema/warnings completeness":
+
+  test "closure --all --json: schemaRevision == ClosureV1Revision; warnings is a present array; an unknown config key surfaces as a warning":
+    let root = setUpProject()
+    defer: removeDir(root)
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    # An unknown top-level config key becomes a ConfigWarning (config.nim's
+    # "top-level" makeConfigWarning branch) that must reach BOTH the
+    # closure/v1 JSON `warnings` array and closureReport's plan-phase
+    # warnings — not merely be swallowed by the parser.
+    let cfgPath = root / "crisol.kdl"
+    writeFile(cfgPath, "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n" &
+                       "bogus-top-level-key \"nope\"\n")
+
+    let outPath = getTempDir() / "crisol_closure_t2_schema.json"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      code = runMain(@["closure", "--all", "--json", "--config", cfgPath]))
+    check code == 0
+
+    let j = parseJson(readFile(outPath).strip())
+    check j["schema"].getStr == ClosureV1Schema
+    check j["schemaRevision"].getInt == ClosureV1Revision
+    check j.hasKey("warnings")
+    check j["warnings"].kind == JArray
+    var foundBogusWarning = false
+    for w in j["warnings"]:
+      if "bogus-top-level-key" in w["message"].getStr:
+        foundBogusWarning = true
+    check foundBogusWarning
+
+# ---------------------------------------------------------------------------
+# T2 — an entrypoint belonging to two groups (same glob, different flags)
+# yields one ClosureEntry PER group — discover()'s documented cross-group
+# fan-out (discover.nim: "the same file in two groups yields one entry PER
+# group"), surfaced end-to-end through `closure --all --json`.
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — T2 multi-group entrypoint":
+
+  test "an entrypoint matching TWO groups' globs yields TWO ClosureEntry rows (same path, different group/flagHash)":
+    let root = uniqueTmpDir("multigroup")
+    defer: removeDir(root)
+    writeF(root, "tests/unit/test_a.nim", "doAssert true\n")
+    let cfgPath = root / "crisol.kdl"
+    writeFile(cfgPath, """
+group "alpha" {
+    globs "tests/unit/test_*.nim"
+    flags "-d:alphamarker"
+}
+group "beta" {
+    globs "tests/unit/test_*.nim"
+    flags "-d:betamarker"
+}
+""")
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_t2_multigroup.json"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      code = runMain(@["closure", "--all", "--json", "--config", cfgPath]))
+    check code == 0
+
+    let j = parseJson(readFile(outPath).strip())
+    check j["entries"].len == 2
+    var groups: seq[string]
+    var flagHashes: seq[string]
+    for e in j["entries"]:
+      check e["path"].getStr == "tests/unit/test_a.nim"
+      groups.add e["group"].getStr
+      flagHashes.add e["flagHash"].getStr
+    check "alpha" in groups
+    check "beta" in groups
+    check groups[0] != groups[1]
+    check flagHashes[0] != flagHashes[1]
+
+# ---------------------------------------------------------------------------
+# T2 — CLI-level flag/config error branches.
+# ---------------------------------------------------------------------------
+
+suite "crisol closure — T2 unknown flag":
+
+  test "closure --bogus → exit 3, stderr mentions unknown flag for closure":
+    let root = setUpProject()
+    defer: removeDir(root)
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_t2_bogusflag.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["closure", "--bogus"]))
+    check code == 3
+    check "unknown flag for closure" in readFile(outPath)
+
+suite "crisol closure — T2 --config error path":
+
+  test "closure --all --config <nonexistent path> → exit 3, stderr mentions the error":
+    let root = setUpProject()
+    defer: removeDir(root)
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_t2_badconfig.txt"
+    defer: (try: removeFile(outPath) except: discard)
+    var code = 0
+    captureStderrToFile(outPath, proc () =
+      code = runMain(@["closure", "--all", "--config", "/nonexistent/crisol.kdl"]))
+    check code == 3
+    let err = readFile(outPath)
+    check "environment error" in err
+    check "/nonexistent/crisol.kdl" in err

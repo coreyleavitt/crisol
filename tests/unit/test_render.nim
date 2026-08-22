@@ -385,3 +385,42 @@ suite "render – memThrottleActive":
     let t0  = getMonoTime()
     let now = t0 + initDuration(milliseconds = 50)
     check memThrottleActive(some(t0), now, 100) == false
+
+# ---------------------------------------------------------------------------
+# T2 — renderClosure (crisol/closure/v1 human rendering)
+# ---------------------------------------------------------------------------
+
+suite "render T2 — renderClosure":
+
+  test "renders path, group, flagHash, closure files, and a distinct recorded/unrecorded marker":
+    let report = ClosureReport(
+      entries: @[
+        ClosureEntry(
+          path:        "tests/unit/test_a.nim",
+          group:       "unit",
+          flagHash:    "0123456789abcdef",
+          recorded:    true,
+          closure:     @["lib/dep.nim", "tests/unit/test_a.nim"],
+          closureHash: "fedcba9876543210",
+        ),
+        ClosureEntry(
+          path:        "tests/unit/test_b.nim",
+          group:       "unit",
+          flagHash:    "1111111111111111",
+          recorded:    false,
+          closure:     @[],
+          closureHash: "",
+        ),
+      ],
+    )
+    let lines = renderClosure(report).splitLines
+
+    # One header line per entry, then one indented line per closure file:
+    # entry 1 (recorded, 2 files) occupies lines[0..2]; entry 2 (unrecorded,
+    # 0 files) occupies line[3] only, followed by the trailing "" from the
+    # final newline.
+    check lines.len == 5
+    check lines[0] == "tests/unit/test_a.nim  [unit]  0123456789abcdef  recorded  (2 files)"
+    check lines[1] == "  lib/dep.nim"
+    check lines[2] == "  tests/unit/test_a.nim"
+    check lines[3] == "tests/unit/test_b.nim  [unit]  1111111111111111  unrecorded  (0 files)"

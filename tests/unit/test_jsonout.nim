@@ -1315,3 +1315,79 @@ suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
     check node["compile"]["segments"][0]["currentRunEntrypoints"].getInt == 1
     check node["compile"]["segments"][0]["sampleEntrypoints"].getInt == 9
     check node["compile"]["segments"][0]["lowConfidence"].getBool == true
+
+# ---------------------------------------------------------------------------
+# T2 — closureToJson (crisol/closure/v1): schema/revision pin + full field
+# serialization for both a recorded and an unrecorded ClosureEntry, plus the
+# warnings array.
+# ---------------------------------------------------------------------------
+
+suite "jsonout T2 — closureToJson (crisol/closure/v1)":
+
+  test "schema constants are the documented literals":
+    check ClosureV1Schema == "crisol/closure/v1"
+    check ClosureV1Revision == 1
+
+  test "closureToJson: schema/schemaRevision, a recorded entry's full field set, an unrecorded entry, and warnings":
+    let report = ClosureReport(
+      entries: @[
+        ClosureEntry(
+          path:        "tests/unit/test_a.nim",
+          group:       "unit",
+          flagHash:    "0123456789abcdef",
+          recorded:    true,
+          closure:     @["lib/dep.nim", "tests/unit/test_a.nim"],
+          closureHash: "fedcba9876543210",
+        ),
+        ClosureEntry(
+          path:        "tests/unit/test_b.nim",
+          group:       "unit",
+          flagHash:    "1111111111111111",
+          recorded:    false,
+          closure:     @[],
+          closureHash: "",
+        ),
+      ],
+      warnings: @[
+        ConfigWarning(source: "crisol.kdl", context: "top-level", key: "bogus",
+                      message: "unknown config key 'bogus' in top-level (ignored)"),
+      ],
+    )
+    let j = closureToJson(report)
+
+    check j["schema"].getStr == ClosureV1Schema
+    check j["schemaRevision"].getInt == ClosureV1Revision
+
+    check j["entries"].len == 2
+    let recEntry = j["entries"][0]
+    check recEntry["path"].getStr        == "tests/unit/test_a.nim"
+    check recEntry["group"].getStr       == "unit"
+    check recEntry["flagHash"].getStr    == "0123456789abcdef"
+    check recEntry["recorded"].getBool   == true
+    check recEntry["closureHash"].getStr == "fedcba9876543210"
+    var closureFiles: seq[string]
+    for f in recEntry["closure"]:
+      closureFiles.add f.getStr
+    check closureFiles == @["lib/dep.nim", "tests/unit/test_a.nim"]
+
+    let unrecEntry = j["entries"][1]
+    check unrecEntry["path"].getStr        == "tests/unit/test_b.nim"
+    check unrecEntry["recorded"].getBool   == false
+    check unrecEntry["closure"].len        == 0
+    check unrecEntry["closureHash"].getStr == ""
+
+    check j["warnings"].len == 1
+    check j["warnings"][0]["key"].getStr == "bogus"
+    check "bogus" in j["warnings"][0]["message"].getStr
+
+  test "closureToJson: no entries and no warnings -> empty (but present) arrays":
+    let j = closureToJson(ClosureReport())
+    check j["entries"].len == 0
+    check j["warnings"].len == 0
+
+  test "closureToJsonString round-trips through parseJson to the same document as closureToJson":
+    let report = ClosureReport(
+      entries: @[ClosureEntry(path: "a.nim", group: "unit", flagHash: "h",
+                              recorded: false, closure: @[], closureHash: "")],
+    )
+    check parseJson(closureToJsonString(report)) == closureToJson(report)

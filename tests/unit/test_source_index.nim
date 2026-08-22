@@ -277,3 +277,84 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check "src/shared.nim" in cl
     check "lib/shared.nim" in cl
     check cl == toHashSet(["tests/t.nim", "src/shared.nim", "lib/shared.nim"])
+
+  test "T2: a non-dot state dir (Config.stateDir with no leading dot) is still pruned, by absolute path — not by name convention":
+    ## walkForIndex's state-dir skip is an ABSOLUTE-PATH comparison
+    ## (entryAbs == stateDirAbs), applied independently of the "starts with
+    ## '.'" dot-dir check. A state dir configured WITHOUT a leading dot (e.g.
+    ## Config(stateDir: "state")) must still be excluded from the index. A
+    ## decoy file inside it sharing the real module's basename must never
+    ## resolve — only the real file (indexed elsewhere) may.
+    let root = freshRoot("statedir_nodot")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "state")
+    createDir(root / "src")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(root / "state" / "shared.nim", "# decoy in non-dot state dir\n")
+    writeFile(root / "src" / "shared.nim", "# real\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@pshared.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: "state", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "src/shared.nim" in cl
+    check "state/shared.nim" notin cl
+    check cl == toHashSet(["tests/t.nim", "src/shared.nim"])
+
+  test "T2: a nonexistent depRoot in config.depRoots is tolerated — no raise, in-root resolution unaffected":
+    let root = freshRoot("deproot_missing")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "src")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(root / "src" / "x.nim", "# x\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@px.nim.c.o",
+    ])
+    let missingDepRoot = root / "_deps" / "does_not_exist"
+    check not dirExists(missingDepRoot)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[missingDepRoot])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check cl == toHashSet(["tests/t.nim", "src/x.nim"])
+
+  test "T2: a .nim SYMLINK FILE inside the project (pcLinkToFile) is indexed under its lexical path; a realpath-relative body resolves to it":
+    ## root/lib/dep.nim is a FILE symlink (not a symlinked directory)
+    ## pointing to a same-named file OUTSIDE the project root. This exercises
+    ## the pcLinkToFile branch of walkForIndex specifically — distinct from
+    ## the symlinked-depRoot-DIRECTORY case above, which never hits
+    ## pcLinkToFile at all (dep.nim there is an ordinary pcFile once the
+    ## symlinked directory itself has been walked into). Per the depRoot-
+    ## symlink test's doc comment, the compiler mangles @p bodies from the
+    ## REALPATH-canonicalized source, so a realistic body here is realpath-
+    ## relative; lookup must report the file's LEXICAL project path
+    ## (lib/dep.nim), not the untracked outside real path.
+    let root = freshRoot("symlinkfile")
+    defer: removeDir(root)
+    let outside = freshRoot("symlinkfile_outside")
+    defer: removeDir(outside)
+    createDir(root / "tests")
+    createDir(root / "lib")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(outside / "dep.nim", "# outside dep\n")
+    createSymlink(outside / "dep.nim", root / "lib" / "dep.nim")
+
+    let nc = root / "nimcache"
+    let realOutsideAbs = outside.expandFilename
+    let mangledBody = ("../../../.." & realOutsideAbs & "/dep.nim")
+                        .replace("/", "@s")
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / ("@p" & mangledBody & ".c.o"),
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "lib/dep.nim" in cl
+    check cl == toHashSet(["tests/t.nim", "lib/dep.nim"])
