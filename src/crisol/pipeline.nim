@@ -112,6 +112,25 @@ proc buildRunPlan*(
   # Load the persisted dep graph (D6 freshness; D5 impact selection).
   let graph = loadDepGraph(cfg, nimVersion)
 
+  # S3: a discarded depgraph (nimVersion/formatVersion mismatch) must be a
+  # visible, structured diagnostic — not a silent empty-graph fallback that
+  # leaves `run`/`list`/`closure` indistinguishable from "never ran". Reuses
+  # the existing ConfigWarning shape (see api.nim's measure-compile-reuse
+  # warning for the precedent of a runtime, not config-parse, diagnostic).
+  var planWarnings = warnings
+  if graph.loadDiscard != dgdNone:
+    let key =
+      case graph.loadDiscard
+      of dgdNimVersion:    "nimVersion"
+      of dgdFormatVersion: "formatVersion"
+      of dgdNone:          ""
+    planWarnings.add ConfigWarning(
+      source:  depgraphPath(cfg),
+      context: "depgraph",
+      key:     key,
+      message: graph.loadDiagnostic,
+    )
+
   # Narrowing: applied AFTER applyGates, BEFORE plan (pipeline invariant).
   #
   #   useFailed  → keep only entrypoints whose (path,group) is in failedKeys.
@@ -163,7 +182,7 @@ proc buildRunPlan*(
     gatedOut: gatedEntries,
     runnable: runnable.len,
     graph:    graph,
-    warnings: warnings,
+    warnings: planWarnings,
     adHocPaths:     discovered.adHocPaths,
     ambiguousPaths: discovered.ambiguousPaths,
   )

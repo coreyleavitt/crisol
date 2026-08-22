@@ -97,11 +97,31 @@ type
     closureHash*:   string           ## 64-bit chained FNV-1a over sorted closure file CONTENTS (16 hex)
     protocolMajor*: int              ## crisol protocol major at build time
 
+  DepGraphDiscard* = enum
+    ## Why `loadDepGraph` discarded a persisted graph (see `DepGraph.loadDiscard`).
+    dgdNone           ## no file, or loaded cleanly
+    dgdNimVersion     ## header.nimVersion != current compiler fingerprint
+    dgdFormatVersion  ## header.formatVersion != DepGraphFormatVersion
+
   DepGraph* = object
     header*:  DepGraphHeader
     entries*: Table[(string, string), DepGraphEntry]
       ## Key: (entrypoint path, flagHash)
       ## Value: DepGraphEntry with closure, content hash, and protocol major
+    loadDiscard*: DepGraphDiscard
+      ## S3: WHY a persisted graph was discarded at load (dgdNone when
+      ## nothing was discarded); the typed twin of `loadDiagnostic`.
+    loadDiagnostic*: string
+      ## S3: load-time transient (NEVER persisted by `toJson`) — set by
+      ## `fromJson` when a persisted graph was present on disk but discarded
+      ## because its header did not match the current run (nimVersion or
+      ## formatVersion mismatch). "" means either no file was present or the
+      ## loaded graph matched cleanly — nothing to report. The caller
+      ## (pipeline.nim's `buildRunPlan`) surfaces a non-empty diagnostic as a
+      ## `ConfigWarning` so a discarded graph is a visible, structured
+      ## diagnostic instead of a silent empty-graph fallback (issue: after a
+      ## Nim upgrade, every entrypoint would otherwise show `recorded:false`
+      ## indistinguishable from "never ran").
 
 # ---------------------------------------------------------------------------
 # FNV-1a 64-bit hash (stable across Nim versions; never std/hashes)
@@ -313,8 +333,26 @@ proc fromJson(node: JsonNode; nimVersion: string): DepGraph =
   let storedNimVer    = headerNode{"nimVersion"}
   let storedFmtVer    = headerNode{"formatVersion"}
   if storedNimVer == nil or storedFmtVer == nil: return
-  if storedNimVer.getStr("") != nimVersion: return
-  if storedFmtVer.getInt(-1) != DepGraphFormatVersion: return
+
+  let storedNimVerStr = storedNimVer.getStr("")
+  let storedFmtVerInt = storedFmtVer.getInt(-1)
+
+  # S3: a discarded graph must be a visible, structured diagnostic — not a
+  # silent empty-graph fallback (see DepGraph.loadDiagnostic doc comment).
+  if storedNimVerStr != nimVersion:
+    result.loadDiscard = dgdNimVersion
+    result.loadDiagnostic =
+      "depgraph discarded: recorded for Nim " & storedNimVerStr &
+      ", current compiler is " & nimVersion &
+      " -- every entrypoint will be recompiled and force-selected this run"
+    return
+  if storedFmtVerInt != DepGraphFormatVersion:
+    result.loadDiscard = dgdFormatVersion
+    result.loadDiagnostic =
+      "depgraph discarded: format version " & $storedFmtVerInt &
+      ", current is " & $DepGraphFormatVersion &
+      " -- every entrypoint will be recompiled and force-selected this run"
+    return
 
   # Update header (matches current nim version)
   result.header.nimVersion    = nimVersion
@@ -356,7 +394,7 @@ proc fromJson(node: JsonNode; nimVersion: string): DepGraph =
 # Public: persistence
 # ---------------------------------------------------------------------------
 
-proc depgraphPath(config: Config): string =
+proc depgraphPath*(config: Config): string =
   ## Absolute path to the depgraph file.
   stateDirOf(config) / "depgraph"
 
@@ -464,10 +502,11 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
 proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
   ## Load the graph from `<projectRoot>/<stateDir>/depgraph`.
   ##
-  ## - Missing file → empty graph (not an error).
-  ## - Malformed JSON → empty graph (safer fallback; log to stderr).
-  ## - Nim-version mismatch → empty graph.
-  ## - Format-version mismatch → empty graph.
+  ## - Missing file → empty graph (not an error); `loadDiagnostic` stays "".
+  ## - Malformed JSON → empty graph (safer fallback; log to stderr);
+  ##   `loadDiagnostic` stays "" (a read/parse failure, not a discard).
+  ## - Nim-version mismatch → empty graph; `loadDiagnostic` set (S3).
+  ## - Format-version mismatch → empty graph; `loadDiagnostic` set (S3).
   let path = depgraphPath(config)
 
   if not fileExists(path):

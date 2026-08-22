@@ -17,7 +17,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_depgraph_guard.nim
 
-import std/[json, os, sets, tables, unittest]
+import std/[json, os, sets, strutils, tables, unittest]
 import crisol/types
 import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
 import crisol/depgraph
@@ -177,3 +177,64 @@ suite "recordClosure — recovery policy (R5)":
     check r.error.len > 0
     check ("tests/rec_fail.nim", fh) notin graph.entries
     check ("tests/rec_fail.nim", fh) notin loadDepGraph(cfg, "").entries
+
+# ---------------------------------------------------------------------------
+# loadDiagnostic — S3: a discarded depgraph must be a visible, structured
+# diagnostic, not a silent empty-graph fallback.
+# ---------------------------------------------------------------------------
+
+suite "depgraph loadDiagnostic (S3)":
+
+  test "nimVersion mismatch: entries empty AND loadDiagnostic mentions both versions":
+    let root = graphRoot("nimver_mismatch")
+    defer: removeDir(root)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    saveDepGraph(g, cfg)
+
+    let loaded = loadDepGraph(cfg, "2.3.0")
+    check loaded.entries.len == 0
+    check loaded.loadDiagnostic.len > 0
+    check "2.2.10" in loaded.loadDiagnostic
+    check "2.3.0" in loaded.loadDiagnostic
+
+  test "formatVersion mismatch: loadDiagnostic mentions the format version":
+    let root = graphRoot("fmtver_mismatch")
+    defer: removeDir(root)
+    let staleVer = DepGraphFormatVersion - 1
+    writeFile(root / ".crisol" / "depgraph", """
+    { "header": { "nimVersion": "2.2.10", "formatVersion": """ & $staleVer & """ },
+      "entries": [ { "path": "tests/t.nim", "flagHash": "cbf29ce484222325",
+                     "closure": ["tests/t.nim"], "closureHash": "abc", "protocolMajor": 1 } ] }
+    """)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    let loaded = loadDepGraph(cfg, "2.2.10")
+    check loaded.entries.len == 0
+    check loaded.loadDiagnostic.len > 0
+    check $staleVer in loaded.loadDiagnostic
+    check $DepGraphFormatVersion in loaded.loadDiagnostic
+
+  test "matching graph loads cleanly: loadDiagnostic == \"\"":
+    let root = graphRoot("clean_load")
+    defer: removeDir(root)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    saveDepGraph(g, cfg)
+
+    let loaded = loadDepGraph(cfg, "2.2.10")
+    check loaded.entries.len == 1
+    check loaded.loadDiagnostic == ""
+
+  test "no file present: loadDiagnostic == \"\"":
+    let root = graphRoot("no_file")
+    defer: removeDir(root)
+    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+
+    let loaded = loadDepGraph(cfg, "2.2.10")
+    check loaded.entries.len == 0
+    check loaded.loadDiagnostic == ""
