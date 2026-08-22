@@ -396,13 +396,14 @@ group "unit" {
     check j["gatedOut"][0]["group"].getStr == "unit"
     check j["gatedOut"][0]["reason"].getStr.len > 0
 
-  test "closure <path> whose only match is gated out, non-JSON → exit 0, gate-skip line on stderr":
+  test "closure <path> whose only match is gated out, non-JSON → exit 0, gate-skip line on stdout (not stderr)":
     ## renderClosure ignores ClosureReport.gatedOut (it only walks .entries),
     ## so the all-gated case previously printed NOTHING at all in human mode
     ## — a silent, empty-looking success.  `run` mirrors the identical
-    ## zrkAllGated case with gateSkipMessages(...) lines; `closure`'s
-    ## non-JSON branch must do the same, to stderr, before the (possibly
-    ## empty) report.
+    ## zrkAllGated case with gateSkipMessages(...) lines on STDOUT; `closure`'s
+    ## non-JSON branch used to put the same lines on stderr — a parity gap
+    ## with `run` — and now matches: gate-skip lines go to stdout, before
+    ## the (possibly empty) report, and stderr carries none of them.
     let root = setUpProject()
     defer: removeDir(root)
 
@@ -417,18 +418,57 @@ group "unit" {
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
 
-    let outPath = getTempDir() / "crisol_closure_gatedout_human_err.txt"
-    defer: (try: removeFile(outPath) except: discard)
+    let outPath = getTempDir() / "crisol_closure_gatedout_human_out.txt"
+    let errPath = getTempDir() / "crisol_closure_gatedout_human_err.txt"
+    defer:
+      (try: removeFile(outPath) except: discard)
+      (try: removeFile(errPath) except: discard)
     var code = 0
-    captureStderrToFile(outPath, proc () =
-      code = runMain(@["closure", "tests/unit/test_a.nim"]))
+    captureStderrToFile(errPath, proc () =
+      captureStdoutToFile(outPath, proc () =
+        code = runMain(@["closure", "tests/unit/test_a.nim"])))
     check code == 0
 
-    let errText = readFile(outPath)
+    let outText = readFile(outPath)
     # Stable substring: gateSkipMessages' own wording is
     # `skipped group "<group>" — <reason>` — assert on the group-naming
     # prefix rather than the (environment-dependent) reason text.
-    check "skipped group \"unit\"" in errText
+    check "skipped group \"unit\"" in outText
+    check "skipped group \"unit\"" notin readFile(errPath)
+
+  test "closure gate-skip line for a group name containing a TAB byte renders sanitized on stdout":
+    ## Same gated-group shape as above, but the group's own NAME (config-file
+    ## text, not the reason) carries a raw TAB byte — via KDL's own `\t`
+    ## escape — proving gateSkipMessages lines are sanitized end-to-end on
+    ## the (now-stdout) path, not just the report body.
+    let root = setUpProject()
+    defer: removeDir(root)
+
+    writeFile(root / "crisol.kdl", "group \"un\\tit\" {\n" &
+      "    globs \"tests/unit/test_*.nim\"\n" &
+      "    gate \"CRISOL_CLOSURE_GATED_TEST_UNSET_XYZ_12345\"\n" &
+      "}\n")
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let outPath = getTempDir() / "crisol_closure_gatedout_tab_out.txt"
+    let errPath = getTempDir() / "crisol_closure_gatedout_tab_err.txt"
+    defer:
+      (try: removeFile(outPath) except: discard)
+      (try: removeFile(errPath) except: discard)
+    var code = 0
+    captureStderrToFile(errPath, proc () =
+      captureStdoutToFile(outPath, proc () =
+        code = runMain(@["closure", "tests/unit/test_a.nim"])))
+    check code == 0
+
+    let outText = readFile(outPath)
+    check "skipped group \"un?it\"" in outText   # TAB sanitized to '?'
+    for c in outText:
+      check (c == '\n') or (ord(c) >= 0x20)
+    check readFile(errPath).len == 0   # nothing at all leaked to stderr
 
   test "usage text: closure path whose only match is gated out matches run's exit-0 contract, not the exit-3 no-match case":
     let outPath = getTempDir() / "crisol_closure_usage_gated.txt"

@@ -53,6 +53,8 @@ import crisol/config  # for stateDirOf
 import crisol/closure  # for extractClosure/SourceIndex (recordClosure); no cycle —
                         # closure.nim imports only crisol/types and crisol/config
                         # (which itself imports only crisol/types)
+import crisol/ioutils  # for sanitizeControlBytes — the shared control/ANSI-byte
+                        # sanitization primitive (bottom of the dep graph; no cycle)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -136,23 +138,22 @@ type
 # ---------------------------------------------------------------------------
 
 proc sanitizeOneSegment(s: string): string =
-  ## Sanitize a single already-extracted segment: replace every byte < 0x20
-  ## or == 0x7f with '?' (control/ANSI escape bytes cannot spoof or corrupt
-  ## the terminal, or a log that captures it), then cap the length so a
-  ## pathological value cannot blow up the message. The cap applies to THIS
-  ## segment alone — callers that split a value into multiple segments (see
-  ## `sanitizeHeaderField`) must cap each segment independently, or a long
-  ## leading segment would consume the whole budget and hide the rest.
+  ## Sanitize a single already-extracted segment: replace control/ANSI bytes
+  ## via `ioutils.sanitizeControlBytes` (control/ANSI escape bytes cannot
+  ## spoof or corrupt the terminal, or a log that captures it), then cap the
+  ## length so a pathological value cannot blow up the message. The cap
+  ## applies to THIS segment alone — callers that split a value into
+  ## multiple segments (see `sanitizeHeaderField`) must cap each segment
+  ## independently, or a long leading segment would consume the whole
+  ## budget and hide the rest.
   const maxLen = 64
   let truncated = s.len > maxLen
   let clipped = if truncated: s[0 ..< maxLen] else: s
-  result = newString(clipped.len)
-  for i, c in clipped:
-    result[i] = if ord(c) < 0x20 or ord(c) == 0x7f: '?' else: c
+  result = sanitizeControlBytes(clipped)
   if truncated:
     result.add "..."
 
-proc sanitizeHeaderField(s: string): string =
+proc sanitizeHeaderField(s: string; pipeAware: bool = false): string =
   ## `stored`/`current` values may come from an on-disk depgraph file, which
   ## may be foreign, hand-edited, or corrupted, or from the Nim compiler
   ## fingerprint, which is itself MULTI-LINE and pipe-delimited
@@ -163,7 +164,19 @@ proc sanitizeHeaderField(s: string): string =
   ## short and single-line, and preserve enough of the value to tell two
   ## different fingerprints apart.
   ##
-  ## A value containing '|' is treated as
+  ## `pipeAware` gates the '|'-tail rendering below — it must be true ONLY
+  ## for dgdNimVersion's `stored`/`current` (the Nim fingerprint, whose
+  ## shape is documented above and genuinely ends in `|<hash>`). Every
+  ## other caller (dgdFormatVersion, dgdMalformed) passes the default
+  ## `false`: those values are arbitrary text — a dgdMalformed reason can be
+  ## a filesystem path, and a path containing a literal '|' must render
+  ## intact rather than being mangled by a heuristic meant for a completely
+  ## different value shape (see the "F3" test below for the fingerprint
+  ## case this heuristic exists for, and test_depgraph_guard.nim's
+  ## "'|' hash heuristic" test for the dgdMalformed case it must NOT apply
+  ## to).
+  ##
+  ## When `pipeAware` and the value contains '|', it is treated as
   ## `<multi-line version text>|<binary hash>`: the part before the FINAL
   ## '|' is reduced to its first line (the human-readable version string);
   ## the part after it is reduced to its last 12 characters (enough of the
@@ -173,16 +186,17 @@ proc sanitizeHeaderField(s: string): string =
   ## independently (see `sanitizeOneSegment`) so the version-line cap
   ## cannot itself swallow the '|' and hide the hash suffix.
   ##
-  ## A value with no '|' falls back to the original behavior: first line
-  ## only, sanitized and capped.
-  let pipePos = s.rfind('|')
-  if pipePos >= 0:
-    let versionSeg = s[0 ..< pipePos]
-    let hashSeg     = s[pipePos + 1 .. ^1]
-    let vNlPos = versionSeg.find('\n')
-    let versionFirstLine = if vNlPos >= 0: versionSeg[0 ..< vNlPos] else: versionSeg
-    let hashTail = if hashSeg.len > 12: hashSeg[^12 .. ^1] else: hashSeg
-    return sanitizeOneSegment(versionFirstLine) & "|" & sanitizeOneSegment(hashTail)
+  ## Otherwise (pipeAware is false, or the value has no '|'): first line
+  ## only, sanitized and capped — plain first-line/truncate rendering.
+  if pipeAware:
+    let pipePos = s.rfind('|')
+    if pipePos >= 0:
+      let versionSeg = s[0 ..< pipePos]
+      let hashSeg     = s[pipePos + 1 .. ^1]
+      let vNlPos = versionSeg.find('\n')
+      let versionFirstLine = if vNlPos >= 0: versionSeg[0 ..< vNlPos] else: versionSeg
+      let hashTail = if hashSeg.len > 12: hashSeg[^12 .. ^1] else: hashSeg
+      return sanitizeOneSegment(versionFirstLine) & "|" & sanitizeOneSegment(hashTail)
 
   let nlPos = s.find('\n')
   let firstLine = if nlPos >= 0: s[0 ..< nlPos] else: s
@@ -208,8 +222,8 @@ proc message*(d: DepGraphDiscard): string =
   of dgdNone:
     ""
   of dgdNimVersion:
-    "depgraph discarded: recorded for Nim " & sanitizeHeaderField(d.stored) &
-    ", current compiler is " & sanitizeHeaderField(d.current) &
+    "depgraph discarded: recorded for Nim " & sanitizeHeaderField(d.stored, pipeAware = true) &
+    ", current compiler is " & sanitizeHeaderField(d.current, pipeAware = true) &
     " -- the recorded graph is treated as empty (run recompiles and " &
     "force-selects every entrypoint)"
   of dgdFormatVersion:
@@ -644,6 +658,12 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
     # exercise the dgdMalformed "unreadable" branch. Only a regular file
     # (or symlink to one) that exists but cannot be READ — e.g. permission
     # denied — reaches that branch.
+    #
+    # TOCTOU: a swap of `path` for a FIFO between this `fileExists` check and
+    # the `readFile` below would block the read indefinitely (no reader has
+    # attached to unblock `open()` on the FIFO's other end). Accepted: doing
+    # so requires write access to crisol's own state dir, at which point an
+    # attacker already has far more direct ways to disrupt this process.
     return initDepGraph(nimVersion)
 
   var raw: string

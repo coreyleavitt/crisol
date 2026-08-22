@@ -123,7 +123,27 @@ one-time recompile of entrypoints whose closure gained members.
   behaviour in all cases) could land on a bogus, nonexistent path instead of
   the real dependency.  `resolveMangledAll` now detects that case
   (`expandFilename(epDir) != epDir`) and resolves the body from the real
-  entrypoint directory instead, via the same exact-realpath lookup.
+  entrypoint directory instead, via the same exact-realpath lookup.  A
+  follow-up review round found `expandFilename(epDir)` itself insufficient:
+  Nim's `@m` base is `parentDir(realpath(ENTRYPOINT FILE))`, not `realpath`
+  of the entrypoint's *directory* — a symlinked entrypoint FILE sitting
+  inside an otherwise ordinary, non-symlinked directory (crisol's own
+  discovery admits such entrypoints) left `expandFilename(epDir) == epDir`,
+  so the code wrongly took the lexical-candidate branch and recorded a
+  bogus, nonexistent sibling — `closureContentHash` then raised on the
+  missing file on every subsequent run, permanently invalidating the entry
+  (a perpetual "could not record its source closure … force-selected"
+  warning, precision lost for that entrypoint).  `realEpDir` is now computed
+  from `parentDir(expandFilename(entrypointPath))` (falling back to
+  `expandFilename(epDir)`, then `epDir`, on an `OSError`), which subsumes
+  the symlinked-directory case too.  Also, the real-candidate branch's
+  fallback (when `lookupByReal` misses — e.g. a dependency deleted since the
+  index was built) no longer falls back to the lexical candidate
+  unconditionally: that candidate is not what the compiler actually saw in
+  this branch, and could itself be a bogus-but-in-root path.  It is now used
+  only when it exists on disk (`fileExists`/`symlinkExists`); otherwise the
+  real candidate itself is kept and left to `extractClosure`'s ordinary
+  under-tracked-root filter, exactly like any other out-of-root import.
 - **closure:** `decodeBody` now decodes Nim's `@c` (`:`) and `@h` (`#`)
   mangling escapes in addition to `@s` and `@@`; a module path containing a
   colon or hash character previously failed to decode correctly.
@@ -153,20 +173,31 @@ one-time recompile of entrypoints whose closure gained members.
   `for w in rr.plan.warnings` loop had nothing to iterate.
 - **closure:** a positional `<entrypoint>` selection whose only match was
   discovered but GATED OUT now prints the gate-skip diagnostic
-  (`skipped group "..." — ...`) to stderr in human (non-JSON) mode, mirroring
-  `run`'s `zrkAllGated` case. Previously `renderClosure` only walked
-  `.entries` and ignored `.gatedOut` entirely, so a fully-gated selection
-  exited 0 and printed nothing — a silent, empty-looking success
-  indistinguishable from an error swallowed upstream. `--json` mode was
-  unaffected: `crisol/closure/v1` already serializes `gatedOut`.
-- **security:** `ConfigWarning.message` — which can embed untrusted-origin
-  text verbatim (e.g. the raw KDL node name of an unrecognized config key) —
-  now reaches stderr control-byte-sanitized in `run`/`list`/`closure`, via a
-  new `render.sanitizeForTerminal`. Previously this sanitization existed
-  only for `depgraph.nim`'s own discard diagnostics; other `ConfigWarning`
-  producers (e.g. `config.nim`'s "unknown config key" message) and the
-  ad-hoc/ambiguous-path warning lines reached the terminal/CI log raw,
-  allowing control/ANSI injection from a hand-edited or foreign config file.
+  (`skipped group "..." — ...`) to **stdout** in human (non-JSON) mode,
+  mirroring `run`'s `zrkAllGated` case exactly (both the destination and the
+  wording). Previously `renderClosure` only walked `.entries` and ignored
+  `.gatedOut` entirely, so a fully-gated selection exited 0 and printed
+  nothing — a silent, empty-looking success indistinguishable from an error
+  swallowed upstream; a first fix routed the line to stderr, which was
+  itself a parity gap against `run`'s stdout placement, now closed. `--json`
+  mode is unaffected: `crisol/closure/v1` already serializes `gatedOut`, and
+  nothing but the JSON document is written to stdout.
+- **security:** untrusted-origin diagnostic text reaching stdout/stderr is
+  now sanitized through ONE shared primitive,
+  `ioutils.sanitizeControlBytes` (`render.sanitizeForTerminal` is now a thin
+  alias; `depgraph.nim`'s `sanitizeOneSegment` also delegates to it).
+  Coverage is broadened well past `ConfigWarning.message` and the ad-hoc /
+  ambiguous-path warning lines (already covered) to every other write of
+  untrusted-origin text: every `CrisolError.msg` (including config parse
+  errors, which embed nkdl's raw offending source line — an unsanitized ESC
+  or other control byte in a `crisol.kdl` comment or string previously
+  reached the terminal/CI log raw), `RunReport.error`, `gateSkipMessages`
+  lines (group names / gate env-var names read back out of config), and
+  JUnit-report write-error messages. Sanitization is applied PER LINE
+  (control bytes replaced with `'?'`; `'\n'` itself is preserved) so
+  legitimately multi-line text — a config error's caret block — keeps its
+  line structure; bytes 0x80-0x9f are left alone since they are ordinary
+  UTF-8 continuation bytes, not interpretable C1 controls.
 
 ### Added
 

@@ -17,7 +17,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_depgraph_guard.nim
 
-import std/[json, os, posix, sets, strutils, tables, unittest]
+import std/[json, os, sets, strutils, tables, unittest]
 import crisol/types
 import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
 import crisol/depgraph
@@ -347,30 +347,31 @@ suite "depgraph load provenance: discarded persisted graph":
     check "depgraph discarded" in d.message
 
   test "F4: unreadable-but-present depgraph file → dgdMalformed with 'unreadable' in stored/message":
-    ## `readFile` raises IOError (not OSError); loadDepGraph must catch both
-    ## so an EACCES-style failure surfaces as a structured dgdMalformed
-    ## discard instead of propagating as an unhandled exception. chmod
-    ## 0o000 only denies a NON-root reader — root bypasses regular-file
-    ## permission checks entirely — so this assertion is skipped when
-    ## running as root (this suite runs inside crisol's podman toolchain,
-    ## which runs as root by default; the guard still protects a rootless
-    ## CI or a native host run).
-    if getuid() == 0:
+    ## Root-proof variant: chmod 0o000 is a NO-OP for root (root bypasses
+    ## regular-file permission checks entirely), and this suite runs inside
+    ## crisol's podman toolchain, which runs as root by default — so a
+    ## chmod-based "deny read" never actually exercised this branch here
+    ## (see toolchain-milpa-podman / dev-test-verification-gotchas memory:
+    ## this is exactly the kind of silently-skipped assertion that gotcha
+    ## warns about).
+    ##
+    ## `/proc/self/mem` gives a permission-independent way to trigger the
+    ## same dgdMalformed "unreadable" branch: `fileExists` follows the
+    ## symlink and stats a regular, present file (so the branch is reached
+    ## at all — see loadDepGraph's own NOTE on why `fileExists` gates this),
+    ## but reading from offset 0 always fails with EIO because that address
+    ## is never mapped without a prior `lseek` — true for root exactly as
+    ## for an unprivileged reader. This exercises the identical
+    ## unreadable-but-present code path that root permissions cannot.
+    let root = graphRoot("unreadable")
+    defer: removeDir(root)
+    let path = root / ".crisol" / "depgraph"
+    if not fileExists("/proc/self/mem"):
       skip()
     else:
-      let root = graphRoot("unreadable")
-      defer: removeDir(root)
-      let path = root / ".crisol" / "depgraph"
-      writeFile(path, """
-      { "header": { "nimVersion": "2.2.10", "formatVersion": """ & $DepGraphFormatVersion & """ },
-        "entries": [] }
-      """)
-      setFilePermissions(path, {})
+      createSymlink("/proc/self/mem", path)
       var d: DepGraphDiscard
       let loaded = loadDepGraph(Config(projectRoot: root, stateDir: ".crisol"), "2.2.10", d)
-      # Restore read access immediately so `defer: removeDir(root)` above can
-      # still clean up regardless of what the checks below find.
-      setFilePermissions(path, {fpUserRead, fpUserWrite})
       check loaded.entries.len == 0
       check d.kind == dgdMalformed
       check d.key == "malformed"
@@ -396,3 +397,16 @@ suite "depgraph load provenance: discarded persisted graph":
     check "Nim Compiler Version 2.2.10 [Linux: amd64]" in msg2
     check "beefcafe0001" in msg1   # last 12 chars of "deadbeefcafe0001"
     check "beefcafe0002" in msg2   # last 12 chars of "deadbeefcafe0002"
+
+  test "the '|' hash heuristic applies ONLY to dgdNimVersion — a dgdMalformed path containing '|' renders intact":
+    ## sanitizeHeaderField's '|'-tail rendering exists solely for the
+    ## dgdNimVersion fingerprint shape ("<version text>|<hash>"). It must
+    ## NOT apply to dgdMalformed's free-text `stored` reason: a filesystem
+    ## path can legitimately contain '|' (e.g. an unusual-but-valid dir
+    ## name), and running the fingerprint heuristic on it would mangle
+    ## "unreadable: cannot open: /tmp/a|b/depgraph" down to
+    ## "…|sol/depgraph" instead of showing the real path.
+    let d = DepGraphDiscard(kind: dgdMalformed,
+      stored: "unreadable: cannot open: /tmp/a|b/depgraph")
+    check "a|b" in d.message
+    check "unreadable: cannot open: /tmp/a|b/depgraph" in d.message

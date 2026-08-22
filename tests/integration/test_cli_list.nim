@@ -36,6 +36,23 @@ proc captureStdoutToFile(path: string; body: proc()): void =
     discard posix_mod.dup2(savedFd, 1.cint)
     discard posix_mod.close(savedFd)
 
+proc captureStderrToFile(path: string; body: proc()): void =
+  ## Redirect fd 2 (stderr) to `path`, call body(), then restore.
+  let f = open(path, fmWrite)
+  let fileFd: cint = f.getFileHandle.cint
+  let savedFd: cint = posix_mod.dup(2.cint)
+  if savedFd < 0:
+    f.close()
+    raise newException(OSError, "dup(2) failed")
+  discard posix_mod.dup2(fileFd, 2.cint)
+  f.close()
+  try:
+    body()
+  finally:
+    flushFile(stderr)
+    discard posix_mod.dup2(savedFd, 2.cint)
+    discard posix_mod.close(savedFd)
+
 # Result-phase markers that must NEVER appear in a plan render.
 const RunMarkers = ["[OK]", "[FAIL]", "[COMPILE]", "PASSED:", "FAILED:"]
 
@@ -146,7 +163,7 @@ suite "crisol list / run --dry-run — B6 (no execution)":
     check code == 3
 
 # ---------------------------------------------------------------------------
-# L2: a malformed on-disk depgraph must be a visible, structured diagnostic
+# A malformed on-disk depgraph must be a visible, structured diagnostic
 # for `list`, not silently swallowed. Temp-project harness (mirrors
 # test_cli_closure.nim's setUpProject / test_cli_run.nim's writeFD +
 # uniqueTmpDirD + setCurrentDir pattern) so we can point loadConfig() —
@@ -162,7 +179,7 @@ proc writeFL(root, rel, content: string) =
   createDir(p.parentDir)
   writeFile(p, content)
 
-suite "crisol list — L2: malformed depgraph is a visible diagnostic":
+suite "crisol list — malformed depgraph is a visible diagnostic":
 
   test "list --json after depgraph corruption → exit 0, warnings has key==malformed and 'depgraph discarded' message":
     let root = uniqueTmpDirL("malformed")
@@ -199,3 +216,52 @@ suite "crisol list — L2: malformed depgraph is a visible diagnostic":
         found = true
         check "depgraph discarded" in w["message"].getStr
     check found
+
+# ---------------------------------------------------------------------------
+# A crisol.kdl config-parse error embeds the raw offending source line
+# verbatim (nkdl's formatError caret block) into the CrisolError message
+# that reaches stderr. That line can carry control/ANSI bytes an attacker —
+# or a hand-edited config with a stray control byte — put there; crisol must
+# sanitize it before writing to stderr, not pass it through raw.
+# ---------------------------------------------------------------------------
+
+proc uniqueTmpDirLc(tag: string): string =
+  let mono = getMonoTime()
+  getTempDir() / ("crisol_list_cfgerr_" & tag & "_" & $mono.ticks)
+
+suite "crisol list — sanitized config-error diagnostics":
+
+  test "crisol.kdl parse error whose offending line has a TAB byte -> list exits 3, stderr has no raw control byte other than '\\n'":
+    ## nkdl's `isDisallowedControl` (src/lexer.nim) allows U+0009 TAB
+    ## literally anywhere in a KDL document — only ESC and the other C0
+    ## controls (U+0000-0x08, U+000E-0x1F) and DEL are rejected by the
+    ## parser itself. TAB is therefore usable to prove sanitization reaches
+    ## config-parse-error text specifically (an ESC byte would never survive
+    ## far enough to be echoed back — the parser rejects it outright before
+    ## `formatError` ever renders the offending line).
+    let root = uniqueTmpDirLc("tab")
+    defer: removeDir(root)
+    createDir(root / "tests" / "unit")
+    writeFile(root / "tests" / "unit" / "test_a.nim", "doAssert true\n")
+    # A TAB between `globs` and its value, on the same line as an invalid
+    # `\z` escape (nkdl has no such escape — see lexer.nim's dispatchEscape)
+    # that makes this a genuine parse error. formatError embeds this exact
+    # line, TAB included, verbatim into the CrisolError message.
+    writeFile(root / "crisol.kdl",
+      "group \"unit\" {\n    globs\t\"tests/unit/test_*.nim\\z\"\n}\n")
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
+    let errPath = getTempDir() / "crisol_list_cfgerr_tab.txt"
+    defer: (try: removeFile(errPath) except: discard)
+    var code = 0
+    captureStderrToFile(errPath, proc () =
+      code = runMain(@["list"]))
+    check code == 3
+
+    let errText = readFile(errPath)
+    check errText.len > 0   # sanity: the parse error did reach stderr
+    for c in errText:
+      check (c == '\n') or (ord(c) >= 0x20)

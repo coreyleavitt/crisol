@@ -57,6 +57,7 @@
 
 import std/[algorithm, monotimes, os, options, sequtils, strutils, times]
 import crisol/types
+import crisol/ioutils
 
 # ---------------------------------------------------------------------------
 # C3 pure filter predicates
@@ -206,22 +207,20 @@ proc countRecords(records: seq[TestRecord]): RecordCounts =
 # ---------------------------------------------------------------------------
 
 proc sanitizeForTerminal*(s: string): string =
-  ## Replace every byte < 0x20 (control characters, including ESC 0x1b,
-  ## '\n', and '\t') and 0x7f (DEL) with '?'.  No truncation.
-  ##
-  ## Threat: diagnostic text written to stderr can originate from
-  ## untrusted-origin sources that were never meant to be terminal-safe —
-  ## config files (an unrecognized key's message embeds the raw KDL node
-  ## name verbatim), on-disk state, or externally supplied manifests.  Such
-  ## text can carry ANSI escape sequences or other control bytes; writing it
-  ## to a terminal or CI log raw enables control/ANSI injection (cursor
-  ## movement, screen clearing, spoofed prompts, or corrupted log capture).
-  ## Every stderr write of such text should route through this proc first.
-  ## JSON output is exempt — std/json already escapes control bytes
-  ## correctly when serializing a string.
-  result = newString(s.len)
-  for i, c in s:
-    result[i] = if ord(c) < 0x20 or ord(c) == 0x7f: '?' else: c
+  ## Thin alias for `ioutils.sanitizeControlBytes` — kept as the exported
+  ## name here since call sites/tests already know `render.sanitizeForTerminal`.
+  ## See ioutils.sanitizeControlBytes's doc comment for the full threat model
+  ## (untrusted-origin diagnostic text: config files, on-disk state,
+  ## manifests) and the rationale for the two things this does NOT touch:
+  ## '\n' (preserved — some of this text is legitimately multi-line, e.g. a
+  ## config parse error's caret block) and bytes 0x80-0x9f (left alone —
+  ## ordinary UTF-8 continuation bytes, not interpretable C1 controls in a
+  ## UTF-8-mode terminal/CI log viewer). JSON output is exempt from all of
+  ## this — std/json already escapes control bytes correctly when
+  ## serializing a string. Every stdout/stderr write of untrusted-origin
+  ## text should route through this (or ioutils.sanitizeControlBytes
+  ## directly) first.
+  sanitizeControlBytes(s)
 
 proc gateSkipMessages*(gatedOut: seq[tuple[group: string; reason: string]]): seq[string] =
   ## PURE: convert a gatedOut list (from applyGates) into human-readable

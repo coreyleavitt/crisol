@@ -60,6 +60,45 @@
 import std/os
 import std/posix as posix_mod
 
+proc sanitizeControlBytes*(s: string): string =
+  ## Sanitize untrusted-origin text before it reaches a terminal or CI log.
+  ##
+  ## Threat: crisol writes diagnostic text that can originate from
+  ## untrusted-origin sources never meant to be terminal-safe — config file
+  ## content (nkdl's `formatError` embeds the raw offending source line
+  ## verbatim, including a caret pointer), on-disk state (group names,
+  ## gate env-var names read back out of a crisol.kdl someone else wrote),
+  ## or externally supplied manifests. Such text can carry ANSI escape
+  ## sequences (cursor movement, screen clearing, spoofed prompts) or other
+  ## control bytes that corrupt a CI log's capture. Writing it to
+  ## stdout/stderr raw enables control/ANSI injection.
+  ##
+  ## Sanitization is applied PER LINE: every byte < 0x20 other than '\n'
+  ## itself, and byte 0x7f (DEL), is replaced with '?'. '\n' is deliberately
+  ## preserved — some of this text is legitimately multi-line (a config
+  ## parse error's caret block spans several lines) and callers rely on that
+  ## line structure surviving intact. This does mean an embedded '\n' in the
+  ## untrusted text can splice an extra output line; that is accepted and
+  ## documented here rather than treated as a defect — the spliced line is
+  ## still fully sanitized text, not raw control bytes, so it cannot itself
+  ## move the cursor or issue further escape sequences.
+  ##
+  ## Bytes 0x80-0x9F (the C1 control range) are deliberately left alone: in
+  ## a UTF-8 byte stream these are ordinary continuation bytes of a
+  ## multibyte character, so replacing them would corrupt legitimate UTF-8
+  ## text (e.g. a test name or file path containing non-ASCII characters).
+  ## Modern terminals and CI log viewers operating in UTF-8 mode do not
+  ## interpret bare 8-bit C1 control codes either, so there is no
+  ## equivalent injection risk to guard against here.
+  result = newString(s.len)
+  for i, c in s:
+    if c == '\n':
+      result[i] = c
+    elif ord(c) < 0x20 or ord(c) == 0x7f:
+      result[i] = '?'
+    else:
+      result[i] = c
+
 proc writeAllFd*(fd: cint; data: string): bool =
   ## Write all bytes of `data` to `fd` using raw posix.write.
   ##

@@ -18,6 +18,8 @@
 ##   9. atomicPutFile into an UNWRITABLE (mode 0o500) parent dir -> ok=false
 ##      and a non-empty error string containing the OS reason (permission
 ##      denied) (RFC-0006 review R10).
+##  10. sanitizeControlBytes: ESC/TAB/DEL -> '?'; '\n' preserved; UTF-8
+##      multibyte text (C1-adjacent continuation bytes) unchanged.
 
 import std/[os, strutils]
 import std/posix as posix_mod
@@ -200,5 +202,45 @@ block test_atomicputfile_unwritable_dir_reports_error:
     assert error.len > 0,
       "atomicPutFile must report a NON-EMPTY error naming the OS reason, got empty string"
     assert not fileExists(path), "no file may be created on a create-temp-file failure"
+
+# ---------------------------------------------------------------------------
+# 10. sanitizeControlBytes: control/ANSI injection guard for untrusted-origin
+#     text — see crisol/ioutils.nim's doc comment for the threat model.
+# ---------------------------------------------------------------------------
+
+block test_sanitizecontrolbytes_esc_replaced:
+  let s = "\e[31mred\e[0m"
+  assert sanitizeControlBytes(s) == "?[31mred?[0m",
+    "ESC (0x1b) must be replaced with '?'"
+
+block test_sanitizecontrolbytes_tab_replaced:
+  assert sanitizeControlBytes("a\tb") == "a?b", "TAB (0x09) must be replaced with '?'"
+
+block test_sanitizecontrolbytes_del_replaced:
+  assert sanitizeControlBytes("a\x7fb") == "a?b", "DEL (0x7f) must be replaced with '?'"
+
+block test_sanitizecontrolbytes_newline_preserved:
+  let s = "line one\nline two\n"
+  assert sanitizeControlBytes(s) == s, "'\\n' must be preserved unchanged"
+
+block test_sanitizecontrolbytes_mixed_multiline:
+  # A multi-line, caret-block-shaped message (like nkdl's formatError output)
+  # with a control byte embedded in one line: line structure survives, only
+  # the control byte on that line is replaced.
+  let s = "error: bad token\n  --> file.kdl:2:5\n2 | \tglobs \"x\"\n  |  ^\n"
+  let want = "error: bad token\n  --> file.kdl:2:5\n2 | ?globs \"x\"\n  |  ^\n"
+  assert sanitizeControlBytes(s) == want,
+    "multi-line text must sanitize each line's control bytes while keeping '\\n' boundaries"
+
+block test_sanitizecontrolbytes_plain_text_unchanged:
+  let s = "unknown config key 'foo' in unit (ignored)"
+  assert sanitizeControlBytes(s) == s, "plain text with no control bytes must be unchanged"
+
+block test_sanitizecontrolbytes_utf8_multibyte_unchanged:
+  # UTF-8 multibyte text (e.g. non-ASCII test names/paths) must survive
+  # untouched — the C1 range (0x80-0x9f) is deliberately not treated as a
+  # control range because those bytes are ordinary UTF-8 continuation bytes.
+  let s = "caf\xc3\xa9 — \xe6\xb5\x8b\xe8\xaf\x95"   # "café — 测试"
+  assert sanitizeControlBytes(s) == s, "UTF-8 multibyte text must be unchanged"
 
 echo "test_ioutils: all blocks passed"

@@ -291,18 +291,28 @@ proc takeConfigFlag(args: seq[string]; ci: var int; dest: var string): ConfigFla
   else:
     return cfoNotConfigFlag
 
-proc writeWarnings(ws: seq[ConfigWarning]) =
-  ## Writes each ConfigWarning's message to stderr as "warning: <msg>".
-  ## `w.message` can embed untrusted-origin text verbatim (e.g. the raw KDL
-  ## node name of an unrecognized config key), so it is routed through
-  ## render.sanitizeForTerminal before it ever reaches the terminal/CI log.
-  for w in ws:
-    stderr.write("warning: " & sanitizeForTerminal(w.message) & "\n")
+proc writeStderr(text: string) =
+  ## Sanitizes `text` (render.sanitizeForTerminal — a thin alias for
+  ## ioutils.sanitizeControlBytes) and writes it plus a trailing newline to
+  ## stderr.  This is the ONE write path for user-facing error/diagnostic
+  ## text that may embed untrusted-origin content: `CrisolError.msg` (config
+  ## errors legitimately embed nkdl's multi-line caret block —
+  ## sanitizeForTerminal preserves '\n' so that block's line structure
+  ## survives), `RunReport.error`, gate-skip lines, junit-write error
+  ## messages, path-flag warnings, and `ConfigWarning.message`.
+  stderr.write(sanitizeForTerminal(text) & "\n")
 
-proc writeStderrLine(prefix, s: string) =
-  ## Writes `prefix & s & "\n"` to stderr with `s` routed through
-  ## render.sanitizeForTerminal first — see `writeWarnings`.
-  stderr.write(prefix & sanitizeForTerminal(s) & "\n")
+proc writeStdout(text: string) =
+  ## Same as `writeStderr` but for stdout — used for gate-skip lines, which
+  ## `run` has always emitted on stdout and `closure` now matches (see
+  ## CHANGELOG: gate-skip lines moved from stderr to stdout for `closure`).
+  stdout.write(sanitizeForTerminal(text) & "\n")
+
+proc writeWarnings(ws: seq[ConfigWarning]) =
+  ## Convenience: writes each ConfigWarning's message to stderr as
+  ## "warning: <msg>", routed through `writeStderr`.
+  for w in ws:
+    writeStderr("warning: " & w.message)
 
 # ---------------------------------------------------------------------------
 # runMain — testable entry; returns the process exit code
@@ -396,7 +406,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       try:
         cleanAll(cfg)
       except Exception as e:
-        stderr.write("crisol: clean --all failed: " & e.msg & "\n")
+        writeStderr("crisol: clean --all failed: " & e.msg)
         return ExitInternal
       return ExitOk
 
@@ -405,7 +415,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     try:
       lockHandle = acquireLock(stateDir)
     except CrisolError as e:
-      stderr.write("crisol: " & e.msg & "\n")
+      writeStderr("crisol: " & e.msg)
       return ExitEnvironment
 
     defer: releaseLock(lockHandle)
@@ -429,10 +439,10 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                    $r.compileCostReport.shardsRemoved & " compile-cost shard(s) (" &
                    $r.compileCostReport.rowsKept & " row(s) kept)\n")
     except CrisolError as e:
-      stderr.write("crisol: clean error: " & e.msg & "\n")
+      writeStderr("crisol: clean error: " & e.msg)
       return ExitEnvironment
     except Exception as e:
-      stderr.write("crisol: clean unexpected error: " & e.msg & "\n")
+      writeStderr("crisol: clean unexpected error: " & e.msg)
       return ExitInternal
 
     return ExitOk
@@ -564,13 +574,13 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     except CrisolError as e:
       case e.kind
       of cekEnvironment:
-        stderr.write("crisol: environment error: " & e.msg & "\n")
+        writeStderr("crisol: environment error: " & e.msg)
         return ExitEnvironment
       of cekConfig:
-        stderr.write("crisol: config error: " & e.msg & "\n")
+        writeStderr("crisol: config error: " & e.msg)
         return ExitEnvironment
       of cekInternal:
-        stderr.write("crisol: internal error: " & e.msg & "\n")
+        writeStderr("crisol: internal error: " & e.msg)
         return ExitInternal
 
     writeWarnings(cr.warnings)
@@ -579,7 +589,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     # paths, same as run/list.  closure has no --group flag, so withinGroups
     # is always empty here.
     for line in pathFlagsWarnings(cr.adHocPaths, cr.ambiguousPaths, @[]):
-      writeStderrLine("crisol: ", line)
+      writeStderr("crisol: " & line)
 
     # A positional <entrypoint>... selection that matched no discovered
     # entrypoint at all is a configuration error, same as `run` (exit 3).
@@ -599,11 +609,12 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     else:
       # Mirror `run`'s zrkAllGated case: renderClosure only walks .entries,
       # so an all-gated selection would otherwise print nothing at all in
-      # human mode.  Print the gate-skip lines (to stderr, since this is a
-      # diagnostic — renderClosure's report itself goes to stdout) before
-      # the (possibly empty) report.
+      # human mode.  Print the gate-skip lines on STDOUT (matching `run`'s
+      # placement — see CHANGELOG) before the (possibly empty) report;
+      # JSON mode above is unaffected (nothing but the JSON document on
+      # stdout).
       for line in gateSkipMessages(cr.gatedOut):
-        stderr.write(line & "\n")
+        writeStdout(line)
       stdout.write(renderClosure(cr))
     return ExitOk
 
@@ -940,13 +951,13 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     except CrisolError as e:
       case e.kind
       of cekEnvironment:
-        stderr.write("crisol: environment error: " & e.msg & "\n")
+        writeStderr("crisol: environment error: " & e.msg)
         return ExitEnvironment
       of cekConfig:
-        stderr.write("crisol: config error: " & e.msg & "\n")
+        writeStderr("crisol: config error: " & e.msg)
         return ExitEnvironment
       of cekInternal:
-        stderr.write("crisol: internal error: " & e.msg & "\n")
+        writeStderr("crisol: internal error: " & e.msg)
         return ExitInternal
 
     # Emit config warnings.
@@ -954,7 +965,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
 
     # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles paths.
     for line in pathFlagsWarnings(pr.adHocPaths, pr.ambiguousPaths, groupNames):
-      writeStderrLine("crisol: ", line)
+      writeStderr("crisol: " & line)
 
     if jsonMode:
       stdout.write(planToJsonString(pr))
@@ -975,10 +986,10 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
 
   # Issue #3 / RFC-0001:409: warn about ad-hoc / ambiguous gskFiles paths.
   for line in pathFlagsWarnings(rr.plan.adHocPaths, rr.plan.ambiguousPaths, groupNames):
-    writeStderrLine("crisol: ", line)
+    writeStderr("crisol: " & line)
 
   if rr.status == rsStructural:
-    stderr.write("crisol: " & rr.error & "\n")
+    writeStderr("crisol: " & rr.error)
     return rr.exitCode
 
   if rr.status == rsInterrupted:
@@ -995,7 +1006,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       return ExitOk
     of zrkAllGated:
       for line in gateSkipMessages(rr.plan.gatedOut):
-        stdout.write(line & "\n")
+        writeStdout(line)
       stdout.write("crisol: all groups gated out — nothing to run\n")
       return ExitOk
     of zrkNone:
@@ -1023,7 +1034,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     # Gate-skip messages after results.
     if rr.plan.gatedOut.len > 0:
       for line in gateSkipMessages(rr.plan.gatedOut):
-        stdout.write(line & "\n")
+        writeStdout(line)
 
   # C1: --junit <path> — write JUnit XML report as an additional output sink.
   # Composes with normal stdout reporting (--json or human render still runs).
@@ -1032,11 +1043,11 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     try:
       writeFile(junitPath, xmlStr)
     except IOError as e:
-      stderr.write("crisol: warning: could not write junit report to '" &
-                   junitPath & "': " & e.msg & "\n")
+      writeStderr("crisol: warning: could not write junit report to '" &
+                   junitPath & "': " & e.msg)
     except OSError as e:
-      stderr.write("crisol: warning: could not write junit report to '" &
-                   junitPath & "': " & e.msg & "\n")
+      writeStderr("crisol: warning: could not write junit report to '" &
+                   junitPath & "': " & e.msg)
 
   return rr.exitCode
 

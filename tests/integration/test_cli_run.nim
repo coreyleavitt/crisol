@@ -435,8 +435,8 @@ suite "crisol CLI — no-entrypoints-matched carries plan warnings":
     check "bogus-top-level-key" in err
 
 # ---------------------------------------------------------------------------
-# L2: a stale-nimVersion depgraph must be a visible, structured diagnostic
-# for `run` — reported exactly ONCE on stderr (no double-report between the
+# A stale-nimVersion depgraph must be a visible, structured diagnostic for
+# `run` — reported exactly ONCE on stderr (no double-report between the
 # depgraph loader and the caller's ConfigWarning surfacing), and present in
 # the run/v1 JSON `warnings` array.
 # ---------------------------------------------------------------------------
@@ -458,7 +458,7 @@ proc captureStdoutToFileD(path: string; body: proc()): void =
     discard posix_mod2.dup2(savedFd, 1.cint)
     discard posix_mod2.close(savedFd)
 
-suite "crisol CLI — L2: stale depgraph nimVersion is a visible, once-only diagnostic":
+suite "crisol CLI — stale depgraph nimVersion is a visible, once-only diagnostic":
 
   test "run --json after depgraph header nimVersion goes stale → stderr has exactly ONE 'depgraph discarded' line; JSON warnings has key==nimVersion":
     let root = uniqueTmpDirD("depgraph_nimver")

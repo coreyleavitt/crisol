@@ -394,8 +394,8 @@ suite "render – memThrottleActive":
 
 suite "render — sanitizeForTerminal":
 
-  test "replaces ESC/newline/control bytes with '?', no truncation":
-    check sanitizeForTerminal("\e[31mred\e[0m\n") == "?[31mred?[0m?"
+  test "replaces ESC/control bytes with '?', preserves '\\n', no truncation":
+    check sanitizeForTerminal("\e[31mred\e[0m\n") == "?[31mred?[0m\n"
 
   test "plain text with no control bytes is unchanged":
     check sanitizeForTerminal("unknown config key 'foo' in unit (ignored)") ==
