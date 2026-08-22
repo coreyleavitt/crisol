@@ -180,11 +180,35 @@ proc updateEntry*(graph: var DepGraph;
                   closureHash:   string = "";
                   protocolMajor: int = 0) =
   ## Insert or replace the entry for (path, fHash).
+  ##
+  ## Refuses an EMPTY closure (issue #5): a compiled entrypoint's closure
+  ## always contains at least the entrypoint itself, so an empty set is a
+  ## crisol defect (manifest misread, demangle regression, entrypoint outside
+  ## every tracked root), never a real scan result.  Recording it would make
+  ## the entry permanently fresh — the content hash over nothing matches
+  ## forever — so decideCompile, the result-cache key and --changed selection
+  ## could never observe a change.  Raises `CrisolError(cekInternal)` and
+  ## leaves any existing entry untouched; the caller decides whether to
+  ## `invalidateEntry` (the runner does).
+  if closure.len == 0:
+    raise newCrisolError(cekInternal,
+      "refusing to record an empty source closure for " & path &
+      " — an empty closure can never go stale")
   graph.entries[(path, fHash)] = DepGraphEntry(
     closure:       closure,
     closureHash:   closureHash,
     protocolMajor: protocolMajor,
   )
+
+proc invalidateEntry*(graph: var DepGraph; path: string; fHash: string) =
+  ## Drop the entry for (path, fHash) so the next plan sees "no closure
+  ## record": decideCompile → cdStale (recompile) and narrowByDiff → unknown
+  ## closure (force-included).  Idempotent; absent key is a no-op.
+  ##
+  ## Used by the runner when a compile SUCCEEDED but the closure could not be
+  ## recorded: the stable binary is already in place, so without this the
+  ## PREVIOUS entry (arbitrarily stale) would keep being served as fresh.
+  graph.entries.del((path, fHash))
 
 # ---------------------------------------------------------------------------
 # Public: invalidation
