@@ -29,7 +29,7 @@
 
 import std/[os, sets, strutils, tables, times, unittest]
 import std/posix as posix_mod
-import crisol/[types, runner, depgraph]
+import crisol/[types, runner, depgraph, closure]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -122,6 +122,9 @@ suite "nimcache-persistence — REUSE (real compile)":
     let cl1 = graphAfter1.entries[key].closure
     check cl1.len >= 1
     check "tests/pass_always.nim" in cl1
+    # Cold compile: Nim's per-invocation C work list is populated.
+    let manifest1 = parseCompileManifest(expectedCacheDir / binName(ep) & ".json")
+    check manifest1.compile.len > 0
 
     # Plant a marker: if the next compile wipes-and-recreates this directory
     # (the old volatile-suffix behavior would have used a DIFFERENT dir every
@@ -158,6 +161,13 @@ suite "nimcache-persistence — REUSE (real compile)":
     let cl2 = graphAfter2.entries[key].closure
     check cl2.len >= 1
     check cl2 == cl1
+    # Prove run 2 really was the WARM path (issue #5's trigger): Nim marked
+    # every module Cached and emitted an EMPTY compile array, while link is
+    # still complete. Without this the test would silently pass as a second
+    # cold compile if run 2 ever went cold.
+    let manifest2 = parseCompileManifest(expectedCacheDir / binName(ep) & ".json")
+    check manifest2.compile.len == 0
+    check manifest2.link.len > 0
 
 # ---------------------------------------------------------------------------
 # Suite 2 — soundness
