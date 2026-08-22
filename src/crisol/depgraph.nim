@@ -50,8 +50,9 @@ import std/[algorithm, json, os, sequtils, sets, strutils, tables]
 import std/posix as posix_mod
 import crisol/types
 import crisol/config  # for stateDirOf
-import crisol/closure  # for extractClosure (recordClosure); no cycle — closure.nim
-                        # imports only crisol/types
+import crisol/closure  # for extractClosure/SourceIndex (recordClosure); no cycle —
+                        # closure.nim imports only crisol/types and crisol/config
+                        # (which itself imports only crisol/types)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -419,9 +420,16 @@ proc saveDepGraph*(graph: DepGraph; config: Config) =
 
 proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
                     nimcacheDir, binaryName: string;
-                    protocolMajor: int): tuple[ok: bool, error: string] =
+                    protocolMajor: int; index: SourceIndex):
+                    tuple[ok: bool, error: string] =
   ## Extract, hash, and persist one entrypoint's source closure after a
   ## successful compile — the single place issue #5's recovery policy lives.
+  ##
+  ## `index` — a `SourceIndex` (`buildSourceIndex(config)`) used to resolve
+  ## `@p`/`@n` closure entries (issue #8).  Built ONCE per run by the caller
+  ## (`runner.execute`) and passed through for every entrypoint — never
+  ## rebuilt per entrypoint (it is a pure function of the source tree, not
+  ## of any single compile).
   ##
   ## Policy: a compile whose closure cannot be recorded must not leave the
   ## previous entry in place — the stable binary already exists, so nothing
@@ -441,7 +449,7 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   let fHash = flagHash(ep.flags)
   let epAbs = if ep.path.isAbsolute: ep.path else: config.projectRoot / ep.path
   try:
-    let closureSet = extractClosure(nimcacheDir, binaryName, epAbs, config)
+    let closureSet = extractClosure(nimcacheDir, binaryName, epAbs, config, index)
     var closureSeq = toSeq(closureSet)
     closureSeq.sort()
     let contentHash = closureContentHash(closureSeq, config.projectRoot)

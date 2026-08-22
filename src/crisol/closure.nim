@@ -6,6 +6,14 @@
 ## depRoot).  Stdlib, nimble-package paths, and anything that cannot be
 ## resolved to a tracked root are silently excluded.
 ##
+## `@p`/`@n` resolution is index-based (issue #8), not root-guessing: see
+## `SourceIndex` / `buildSourceIndex` / the `@p` doc paragraph below.  crisol
+## no longer needs to enumerate candidate `--path` roots (`src/`, depRoots,
+## …) — any module the compiler actually resolved through SOME `--path`
+## entry is on disk somewhere under projectRoot or a depRoot, so a full
+## source-tree index finds it regardless of which `--path` produced it
+## (project `nim.cfg`/`config.nims`, a dep's own config, …).
+##
 ## ## Algorithm (RFC-0001 §Dependency Source, verified decode algorithm)
 ##
 ## The nimcache JSON at `<nimcacheDir>/<binaryName>.json` contains two
@@ -40,12 +48,24 @@
 ## - `@m<body>` — body is a path relative to the *entrypoint's source
 ##   directory* (not the CWD).  Candidate = normalize(entrypointDir / body).
 ##
-## - `@p<body>` — body is a path relative to whichever search-path root
-##   resolved it (stdlib dir, nimble pkg dir, or a project `--path` root
-##   such as `src/`).  crisol cannot know which root from the mangled name,
-##   so it tries each tracked root in order: `projectRoot`, `projectRoot/src`,
-##   then each `depRoot` and `depRoot/src`.  The first that names an existing
-##   file wins.  If none matches → stdlib/nimble → excluded.
+## - `@p<body>` (and `@n<body>`, Nim's nimblePath prefix — treated identically)
+##   — body is a path relative to whichever search-path root resolved it
+##   (stdlib dir, nimble pkg dir, or ANY project `--path` root — `src/`, a
+##   dep's own root, or a root added ad hoc by a `config.nims`/`nim.cfg`
+##   `switch("path", …)` somewhere up the project-file's directory chain).
+##   crisol cannot know which root from the mangled name alone, and — issue
+##   #8 — a fixed guess-list of roots (`projectRoot`, `projectRoot/src`,
+##   depRoots, depRoots/src) misses any root added by a config file rather
+##   than by crisol's own config, silently dropping that module from the
+##   closure.  Instead, `body` is resolved against a once-per-run
+##   `SourceIndex` (`buildSourceIndex`, below): every `.nim` file under
+##   projectRoot or a depRoot, indexed by basename.  A candidate is kept iff
+##   its indexed absolute path equals `body` or ends with `DirSep & body` —
+##   exactly the semantics of "some search-path root resolved this suffix".
+##   Ambiguous matches (the body suffix matches under multiple indexed
+##   files) keep ALL of them (R7 over-selection policy, unchanged).  Stdlib
+##   and nimble-package bodies match nothing in the index (excluded) or, in
+##   rare basename-collision cases, over-select harmlessly (R7 policy).
 ##
 ## The under-tracked-root filter (step 5) is path-location based, NOT
 ## prefix based.  A project module imported via `--path:src` is `@p`-mangled
@@ -68,24 +88,100 @@
 ## The caller (D2/D6) decides recovery policy; the conservative fallback
 ## (run the entrypoint regardless) is a later-slice concern.
 
-import std/[json, os, sets, strutils]
+import std/[json, os, sets, strutils, tables]
 import crisol/types
+import crisol/config  # for stateDirOf — the source-index walk prunes it
+
+# ---------------------------------------------------------------------------
+# SourceIndex — once-per-run basename -> absolute-paths index (issue #8)
+# ---------------------------------------------------------------------------
+
+type
+  SourceIndex* = object
+    ## basename ("foo.nim") -> every absolute, normalised path under
+    ## projectRoot or a depRoot whose file has that basename.  Built once
+    ## per run (`buildSourceIndex`) and threaded through `extractClosure`
+    ## for ALL entrypoints in the run — never rebuilt per entrypoint.
+    byBasename: Table[string, seq[string]]
+
+proc addToIndex(index: var SourceIndex; absPath: string) =
+  let base = absPath.extractFilename
+  index.byBasename.mgetOrPut(base, @[]).add absPath
+
+proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
+                  index: var SourceIndex) =
+  ## Recursively index `.nim` files under `dir`, RECORDING each file's path
+  ## as `recordRoot / <relative path from the original walk root>` rather
+  ## than whatever `os.walkDir` hands back — this matters for depRoots
+  ## (`buildSourceIndex` passes `recordRoot == dir` at the top so recorded
+  ## paths are lexically `<depRootAbs>/<rel>`, matching what the
+  ## under-tracked-root filter and `toProjectRelative` expect).
+  ##
+  ## Pruning (mirrors discover.nim's `walkNimFiles` walk discipline):
+  ##   • never descend into a symlinked directory (pcLinkToDir) — dependency
+  ##     content (e.g. milpa's `_deps/*` -> CAS) stays opt-in via depRoots;
+  ##     a depRoot itself CAN be a symlink (the caller walks into it
+  ##     directly), only NESTED symlinked subdirectories are pruned here.
+  ##   • skip directories whose name starts with '.' (.git, .crisol, and
+  ##     any other dotdir — e.g. a vendored toolchain checkout living under
+  ##     projectRoot, such as this repo's `.docker-home/`).
+  ##   • skip directories named "nimcache" (generated, never source).
+  ##   • skip the resolved state dir (`stateDirOf`), by absolute-path
+  ##     comparison, in case it is ever configured outside the '.'-prefix
+  ##     convention.
+  for entry in walkDir(dir):
+    let name = entry.path.lastPathPart
+    case entry.kind
+    of pcLinkToDir:
+      discard                          # never descend into symlinked dirs
+    of pcDir:
+      if name.startsWith("."): continue
+      if name == "nimcache": continue
+      let entryAbs = entry.path.absolutePath.normalizedPath
+      if stateDirAbs.len > 0 and entryAbs == stateDirAbs: continue
+      walkForIndex(entry.path, recordRoot / name, stateDirAbs, index)
+    of pcFile, pcLinkToFile:
+      if entry.path.endsWith(".nim"):
+        index.addToIndex(recordRoot / name)
+
+proc buildSourceIndex*(config: Config): SourceIndex =
+  ## Walk `config.projectRoot` and each `config.depRoots[i]` once, indexing
+  ## every `.nim` file by basename.  See `walkForIndex`'s doc comment for
+  ## the exact pruning rules.  Meant to be built ONCE per run (by the
+  ## caller — `runner.execute`) and passed to every `extractClosure` call
+  ## in that run, never rebuilt per entrypoint.
+  result = SourceIndex(byBasename: initTable[string, seq[string]]())
+  let stateDirAbs = stateDirOf(config)
+
+  let prAbs = config.projectRoot.absolutePath.normalizedPath
+  if dirExists(prAbs):
+    walkForIndex(prAbs, prAbs, stateDirAbs, result)
+
+  for dr in config.depRoots:
+    let drAbs = dr.absolutePath.normalizedPath
+    if dirExists(drAbs):
+      walkForIndex(drAbs, drAbs, stateDirAbs, result)
+
+proc lookup(index: SourceIndex; body: string): seq[string] =
+  ## Resolve a decoded `@p`/`@n` body (a path relative to SOME search-path
+  ## root) against the index.  Returns every indexed absolute path whose
+  ## basename matches AND which the body names as a suffix — exactly the
+  ## semantics of a search-path resolution: if the compiler resolved this
+  ## body under ANY in-root directory, that file is indexed and matches.
+  ## Multiple matches (ambiguous — the same body suffix exists under more
+  ## than one indexed location) are ALL returned (R7 over-selection policy).
+  result = @[]
+  let normBody = body.replace('\\', DirSep).replace('/', DirSep)
+  let base = normBody.extractFilename
+  if base notin index.byBasename: return
+  let suffix = $DirSep & normBody
+  for p in index.byBasename[base]:
+    if p == normBody or p.endsWith(suffix):
+      result.add p
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-proc trackedRoots(config: Config): seq[string] =
-  ## Ordered list of directories to try when resolving `@p` bodies.
-  ## For each root R we include R itself and R/src (the universal src layout).
-  result = @[]
-  let pr = config.projectRoot.absolutePath.normalizedPath
-  result.add pr
-  result.add pr / "src"
-  for dr in config.depRoots:
-    let d = dr.absolutePath.normalizedPath
-    result.add d
-    result.add d / "src"
 
 proc isUnderRoot(path: string; root: string): bool =
   ## True iff `path` (normalised absolute) starts with `root` followed by a
@@ -140,7 +236,7 @@ proc moduleMangledNameOf(objPath: string): string =
 
 proc resolveMangledAll(mangledName: string;
                        entrypointPath: string;
-                       roots: seq[string]): seq[string] =
+                       index: SourceIndex): seq[string] =
   ## Decode one mangled module name (`moduleMangledNameOf`'s output — the
   ## compile-unit basename with the backend extension and `.o` already
   ## stripped, e.g. `@mfoo.nim`) to zero or more absolute `.nim` candidate
@@ -148,23 +244,28 @@ proc resolveMangledAll(mangledName: string;
   ##
   ## For `@m`: exactly one candidate (entrypointDir/body), existence not checked
   ##           (R5: record deleted deps too).
-  ## For `@p`: ALL tracked roots that produce a valid candidate path are returned,
-  ##           regardless of whether the file currently exists on disk (R5+R7 fix):
-  ##           - R5: a dep that was deleted still appears as a candidate from its
-  ##             original root → the closure records it → narrowByDiff detects the
-  ##             deletion in git diff.
-  ##           - R7: when multiple roots could have provided the file (ambiguous),
-  ##             ALL are recorded (over-selection) so a change to any copy triggers
-  ##             re-selection.
+  ## For `@p`/`@n` (Nim's nimblePath prefix — treated identically to `@p`):
+  ##           resolved against `index` (issue #8 — see `SourceIndex.lookup`).
+  ##           ALL matches are returned (R7 over-selection policy, unchanged):
+  ##           - R7: when the body suffix matches under multiple indexed
+  ##             locations (ambiguous), ALL are recorded (over-selection) so
+  ##             a change to any copy triggers re-selection.
+  ##           - a body that resolves to a file DELETED since the index was
+  ##             built simply isn't in the index → no candidate → excluded
+  ##             here.  The previous closure still holds the path and
+  ##             isEntryStale (R4 fix) detects the missing file and forces a
+  ##             re-run, so soundness is maintained via the stale-entry path
+  ##             rather than the closure-rebuild path (same policy as before).
   ## For anything else: empty list (conservative).
   # `mangledName` is `moduleMangledNameOf`'s output — already ".nim.{c,cpp,m}.o"
   # filtered, backend extension and ".o" stripped — so it is always
-  # "<@m|@p><body>.nim" here; see that proc's doc comment for the
+  # "<@m|@p|@n><body>.nim" here; see that proc's doc comment for the
   # module-object contract this relies on.
-  if not (mangledName.startsWith("@m") or mangledName.startsWith("@p")):
+  if not (mangledName.startsWith("@m") or mangledName.startsWith("@p") or
+          mangledName.startsWith("@n")):
     return @[]                               # unknown prefix — exclude
 
-  let noPrefix = mangledName[2 .. ^1]        # strip "@m" or "@p"
+  let noPrefix = mangledName[2 .. ^1]        # strip "@m"/"@p"/"@n"
   let body     = decodeBody(noPrefix)        # decode @s/@@ escapes
 
   if mangledName.startsWith("@m"):
@@ -173,20 +274,8 @@ proc resolveMangledAll(mangledName: string;
     let epDir = entrypointPath.absolutePath.parentDir
     result = @[(epDir / body).normalizedPath]
 
-  else: # "@p"
-    # R7 fix: generate candidates from ALL tracked roots where the file EXISTS.
-    # When multiple roots have the file (ambiguous), record all of them so a
-    # change to any copy triggers re-selection (over-selection, safe).
-    # When no root has the file: the file is from stdlib/nimble/was deleted;
-    # return empty so the under-root filter excludes it.  For deleted @p deps,
-    # the previous closure still holds the path and isEntryStale (R4 fix) will
-    # detect the missing file and force a re-run, so soundness is maintained
-    # via the stale-entry path rather than the closure-rebuild path.
-    result = @[]
-    for root in roots:
-      let candidate = (root / body).normalizedPath
-      if fileExists(candidate):
-        result.add candidate
+  else: # "@p" or "@n"
+    result = index.lookup(body)
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -251,7 +340,8 @@ proc parseCompileManifest*(jsonPath: string):
 proc extractClosure*(nimcacheDir: string;
                      binaryName: string;
                      entrypoint: string;
-                     config: Config): HashSet[string] =
+                     config: Config;
+                     index: SourceIndex): HashSet[string] =
   ## Extract the source-dependency closure for one compiled entrypoint.
   ##
   ## Parameters:
@@ -261,6 +351,11 @@ proc extractClosure*(nimcacheDir: string;
   ##   `entrypoint`   — absolute (or project-root-relative) path to the `.nim`
   ##                    source file.
   ##   `config`       — must have `projectRoot` set; may have `depRoots`.
+  ##   `index`        — a `SourceIndex` (`buildSourceIndex(config)`), used to
+  ##                    resolve `@p`/`@n` bodies (issue #8).  Built ONCE per
+  ##                    run by the caller (`runner.execute`) — never rebuild
+  ##                    per entrypoint; the overload below builds one ad hoc
+  ##                    for tests/one-off callers.
   ##
   ## Returns a `HashSet[string]` of projectRoot-relative, forward-slash paths.
   ##
@@ -286,9 +381,8 @@ proc extractClosure*(nimcacheDir: string;
       "nimcache JSON at " & jsonPath & " has no 'link' entries" &
       " — cannot derive the source closure")
 
-  let roots      = trackedRoots(config)
-  let epAbs      = entrypoint.absolutePath.normalizedPath
-  let prAbs      = config.projectRoot.absolutePath.normalizedPath
+  let epAbs = entrypoint.absolutePath.normalizedPath
+  let prAbs = config.projectRoot.absolutePath.normalizedPath
 
   # Collect all tracked roots for the under-root filter.
   # A candidate is kept iff it lives under projectRoot OR any depRoot.
@@ -306,8 +400,8 @@ proc extractClosure*(nimcacheDir: string;
     if mangledName == "": continue
 
     # R5+R7 fix: resolveMangledAll returns ALL candidate paths (possibly multiple
-    # for ambiguous @p entries, possibly non-existent for deleted deps).
-    let candidates = resolveMangledAll(mangledName, epAbs, roots)
+    # for ambiguous @p/@n entries, possibly none for deps no longer on disk).
+    let candidates = resolveMangledAll(mangledName, epAbs, index)
     for resolved in candidates:
       if resolved == "": continue            # (shouldn't occur, but be defensive)
 
@@ -323,3 +417,13 @@ proc extractClosure*(nimcacheDir: string;
 
       # Convert to projectRoot-relative, forward slashes.
       result.incl toProjectRelative(resolved, prAbs)
+
+proc extractClosure*(nimcacheDir: string;
+                     binaryName: string;
+                     entrypoint: string;
+                     config: Config): HashSet[string] =
+  ## Convenience overload for tests/one-offs: builds a fresh `SourceIndex`
+  ## from `config` and delegates.  Production callers (`depgraph.recordClosure`
+  ## via `runner.execute`) build the index ONCE per run instead — see the
+  ## 5-arg overload above.
+  extractClosure(nimcacheDir, binaryName, entrypoint, config, buildSourceIndex(config))

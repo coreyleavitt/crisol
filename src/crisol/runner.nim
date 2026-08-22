@@ -32,7 +32,7 @@
 
 import std/[json, monotimes, options, os, sets, times]
 import std/posix
-import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan]
+import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure]
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
 # M4: re-export the CacheContext bundle + constructors so callers of execute()
 # don't need a separate `import crisol/cachedispatch`.
@@ -899,6 +899,12 @@ proc execute*(
   if n == 0:
     return @[]
 
+  # issue #8: the source index used to resolve @p/@n closure entries is a
+  # pure function of the source tree (config.projectRoot + config.depRoots),
+  # never of any single entrypoint/compile — build it ONCE per execute()
+  # call and thread it through every recordClosure call below.
+  let sourceIndex = buildSourceIndex(config)
+
   # nimcache-persistence (RFC-0006): computed ONCE per execute() call, not
   # per slot/compile — both are pure functions of the plan/toolchain, never
   # of a slot's runtime state.
@@ -1307,7 +1313,8 @@ proc execute*(
                 # (see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE, and
                 # recordClosure's doc comment in depgraph.nim).
                 let rec = recordClosure(graph, config, ep,
-                                        slotCacheDir, bname, CrisolProtocolMajor)
+                                        slotCacheDir, bname, CrisolProtocolMajor,
+                                        sourceIndex)
                 closureRecorded = rec.ok
                 if not rec.ok:
                   stderr.write("crisol: warning: " & ep.path & ": could not record its " &

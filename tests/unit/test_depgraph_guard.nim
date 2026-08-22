@@ -19,6 +19,7 @@
 
 import std/[json, os, sets, tables, unittest]
 import crisol/types
+import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
 import crisol/depgraph
 
 suite "depgraph writer guards (issue #5)":
@@ -140,7 +141,7 @@ suite "recordClosure — recovery policy (R5)":
     var graph = initDepGraph("")
     let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_ep.nim", group: "t"),
                           nc, "rec_ep",
-                          protocolMajor = 1)
+                          protocolMajor = 1, index = buildSourceIndex(cfg))
     check r.ok
     check r.error == ""
 
@@ -171,7 +172,7 @@ suite "recordClosure — recovery policy (R5)":
 
     let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_fail.nim", group: "t"),
                           nc, "rec_fail",
-                          protocolMajor = 1)
+                          protocolMajor = 1, index = buildSourceIndex(cfg))
     check not r.ok
     check r.error.len > 0
     check ("tests/rec_fail.nim", fh) notin graph.entries
