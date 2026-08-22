@@ -90,3 +90,108 @@ switch("path", thisDir())
     if selection.len == 1:
       check selection[0].ep.path == ep.path
       check selection[0].reason == srClosureHit
+
+suite "closure records @p bodies with leading '..' (S1: shortest-relative-path / realpath-canonicalized)":
+
+  test "trigger A: in-root relative import shorter from a --path root is recorded":
+    ## projectRoot has src/, lib/x.nim, tests/unit/deep/t.nim; t.nim imports
+    ## ../../../lib/x (relative to itself). Compiled with --path:<root>/src,
+    ## the SHORTEST relative path to lib/x.nim is from src/ ("../lib/x.nim",
+    ## one ".."), not from the entrypoint's own directory ("../../../lib/x.nim",
+    ## three ".."), so Nim mangles this as an @p body with a leading "..":
+    ## @p..@slib@sx.nim. Pre-fix, lookup's whole-body suffix match never
+    ## matches (the indexed path never ends with ".../../lib/x.nim"), so
+    ## lib/x.nim silently drops out of the closure.
+    let root = makeTempRoot("triggerA")
+    defer: removeDir(root)
+
+    createDir(root / "src")
+    createDir(root / "lib")
+    createDir(root / "tests" / "unit" / "deep")
+    writeFile(root / "lib" / "x.nim", "proc xValue*(): int = 5\n")
+    writeFile(root / "tests" / "unit" / "deep" / "t.nim", """
+import ../../../lib/x
+doAssert xValue() == 5
+""")
+
+    var cfg = makeCfg(root)
+    let ep = Entrypoint(path: "tests/unit/deep/t.nim", group: "default",
+                        flags: @["--path:" & (root / "src")])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    check results[0].outcome == oPassed
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check "lib/x.nim" in closure
+    check "tests/unit/deep/t.nim" in closure
+
+  test "trigger B: a symlinked dep-root's realpath-relative @p body is recorded at its lexical path":
+    ## <temp>/cas/dep/src/dep.nim lives OUTSIDE the project root; root/_deps/dep
+    ## is a symlink to it, configured as a depRoot, and put on the search path
+    ## via --path:_deps/dep/src. Because the compiler canonicalizes (realpath)
+    ## the resolved source file, the shortest-relative-path computation runs
+    ## against the REALPATH, not the symlinked lexical path, producing a
+    ## `..`-laden, realpath-relative @p body (this repo's own nkdl nimcache
+    ## manifests show exactly this shape for milpa's `_deps/*` -> CAS symlinks).
+    ## The closure must record the LEXICAL project-relative path,
+    ## "_deps/dep/src/dep.nim", not the realpath.
+    let root = makeTempRoot("triggerB")
+    defer: removeDir(root)
+    let cas = makeTempRoot("triggerB_cas")
+    defer: removeDir(cas)
+
+    createDir(cas / "dep" / "src")
+    writeFile(cas / "dep" / "src" / "dep.nim", "proc depValue*(): int = 7\n")
+
+    createDir(root / "_deps")
+    createSymlink(cas / "dep", root / "_deps" / "dep")
+
+    # The entrypoint is nested deep under root so that Nim's shortest-path
+    # mangling picks the @p (search-path-root-relative) candidate over the
+    # @m (entrypoint-dir-relative) one: both candidates are realpath-relative
+    # and share the same common ancestor (the temp dir housing both `root`
+    # and `cas`), so whichever starting directory is SHALLOWER below that
+    # ancestor wins. depRootPath/src (`root/_deps/dep/src`, 4 components
+    # below root's parent) is far shallower than a deeply-nested entrypoint
+    # dir, so @p wins here — reproducing the real shape observed in this
+    # repo's own nkdl nimcache manifests (`.crisol/ledger/artifacts/*.ndjson`
+    # contain `"@p..@s..@shome@scorey@s.cache@smilpa@s...@ssrc@sgrammar.nim.c"`).
+    createDir(root / "tests" / "a" / "b" / "c" / "d" / "e" / "f" / "g" / "h")
+    writeFile(root / "tests" / "a" / "b" / "c" / "d" / "e" / "f" / "g" / "h" /
+              "test_uses_dep.nim", """
+import dep
+doAssert depValue() == 7
+""")
+
+    var cfg = makeCfg(root)
+    cfg.depRoots = @[root / "_deps" / "dep"]
+    let epPath = "tests/a/b/c/d/e/f/g/h/test_uses_dep.nim"
+    let ep = Entrypoint(path: epPath, group: "default",
+                        flags: @["--path:" & (root / "_deps" / "dep" / "src")])
+
+    var graph = initDepGraph("")
+    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let results = execute(p, config = cfg, graph = graph,
+                          nimVersion = "", showProgress = false)
+
+    check results.len == 1
+    if results[0].outcome != oPassed:
+      echo "trigger B compile/run output:\n", results[0].output
+    check results[0].outcome == oPassed
+
+    let key = (ep.path, flagHash(ep.flags))
+    let loaded = loadDepGraph(cfg, "")
+    check key in loaded.entries
+    let closure = loaded.entries[key].closure
+
+    check "_deps/dep/src/dep.nim" in closure
+    check epPath in closure

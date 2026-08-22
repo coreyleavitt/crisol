@@ -146,6 +146,14 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## Since that path is not under projectRoot, toProjectRelative reports
     ## it absolute (forward-slash normalised) — the same depRoot convention
     ## tests/unit/test_soundness_r7.nim exercises for an ordinary depRoot.
+    ##
+    ## The manifest body here is the REALISTIC shape Nim actually emits for
+    ## a module reached through a symlinked search-path root: the compiler
+    ## canonicalizes (realpath) the resolved source file, so the "shortest
+    ## relative path from the search-path root" is computed against the
+    ## REALPATH, not the lexical (symlinked) root — yielding a `..`-laden,
+    ## realpath-relative body (S1 finding, trigger B). A body with no `..`
+    ## at all (the old pin) is a shape Nim never emits for a symlinked root.
     let root = freshRoot("deproot_symlink")
     defer: removeDir(root)
     let outside = freshRoot("deproot_outside")
@@ -162,9 +170,17 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     let ep = projRoot / "tests" / "t.nim"
     writeFile(ep, "# ep\n")
     let nc = projRoot / "nimcache"
+
+    # Realpath-relative body: many leading ".." components (the exact count
+    # does not matter for the fix — lookup strips ALL leading ".." /"."/""
+    # components) followed by the REAL (symlink-resolved) absolute path to
+    # outside/src/dep.nim, mangled with @s in place of '/'.
+    let realOutsideAbs = outside.expandFilename
+    let mangledBody = ("../../../.." & realOutsideAbs & "/src/dep.nim")
+                        .replace("/", "@s")
     writeManifest(nc, "t", compile = @[], link = @[
       nc / "@mt.nim.c.o",
-      nc / "@pdep.nim.c.o",
+      nc / ("@p" & mangledBody & ".c.o"),
     ])
     let cfg = Config(projectRoot: projRoot, stateDir: ".crisol",
                      depRoots: @[depRootPath])
@@ -172,6 +188,74 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     let expected = depRootPath / "src" / "dep.nim"
     check expected in cl
     check cl == toHashSet(["tests/t.nim", expected])
+
+  test "trigger A: in-root relative import shorter from a --path root (leading .. body)":
+    ## `--path:src` importing `../lib/x.nim` — Nim's mangler emits the
+    ## SHORTEST relative path from the --path root, which here has a
+    ## leading ".." because lib/ is a sibling of src/, not under it. The
+    ## body carries no symlink/realpath involvement at all (trigger A is
+    ## the plain in-root case; trigger B, above, is the symlinked-root case).
+    let root = freshRoot("triggerA")
+    defer: removeDir(root)
+    createDir(root / "tests" / "unit" / "deep")
+    createDir(root / "lib")
+    let ep = root / "tests" / "unit" / "deep" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(root / "lib" / "x.nim", "# x\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@p..@slib@sx.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "lib/x.nim" in cl
+    check cl == toHashSet(["tests/unit/deep/t.nim", "lib/x.nim"])
+
+  test "decoy sanity: a leading-.. body still enforces the basename boundary":
+    ## Stripping leading ".."/"."/""'" components from the body must not
+    ## loosen the basename match: a decoy with a different basename
+    ## (zx.nim) or a different extension (x.nims — not even indexed) must
+    ## never resolve for body "../x.nim"; only the real src/x.nim match does.
+    let root = freshRoot("decoy")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "lib")
+    createDir(root / "other")
+    createDir(root / "src")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(root / "lib" / "zx.nim", "# decoy basename\n")
+    writeFile(root / "other" / "x.nims", "# decoy extension, not even indexed\n")
+    writeFile(root / "src" / "x.nim", "# real\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@p..@sx.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "src/x.nim" in cl
+    check "lib/zx.nim" notin cl
+    check cl == toHashSet(["tests/t.nim", "src/x.nim"])
+
+  test "S2: @c (colon) and @h (hash) mangling escapes are decoded":
+    let root = freshRoot("s2escapes")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "lib")
+    let ep = root / "tests" / "t.nim"
+    writeFile(ep, "# ep\n")
+    writeFile(root / "lib" / "weird#1:2.nim", "# weird\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "t", compile = @[], link = @[
+      nc / "@mt.nim.c.o",
+      nc / "@pweird@h1@c2.nim.c.o",
+    ])
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    let cl = extractClosure(nc, "t", ep, cfg)
+    check "lib/weird#1:2.nim" in cl
+    check cl == toHashSet(["tests/t.nim", "lib/weird#1:2.nim"])
 
   test "ambiguity pin: a body present under two tracked locations resolves to both (R7 over-selection)":
     let root = freshRoot("ambig")

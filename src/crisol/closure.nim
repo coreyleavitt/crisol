@@ -97,25 +97,38 @@ import crisol/config  # for stateDirOf — the source-index walk prunes it
 # ---------------------------------------------------------------------------
 
 type
-  SourceIndex* = object
-    ## basename ("foo.nim") -> every absolute, normalised path under
-    ## projectRoot or a depRoot whose file has that basename.  Built once
-    ## per run (`buildSourceIndex`) and threaded through `extractClosure`
-    ## for ALL entrypoints in the run — never rebuilt per entrypoint.
-    byBasename: Table[string, seq[string]]
+  IndexedFile = object
+    ## One indexed `.nim` file, recorded under both the LEXICAL path
+    ## (project/depRoot-relative walk path — what we report and record in
+    ## the closure) and the REALPATH (symlinks resolved) — see `lookup`'s
+    ## doc comment for why both are needed.
+    lexical: string
+    real:    string
 
-proc addToIndex(index: var SourceIndex; absPath: string) =
-  let base = absPath.extractFilename
-  index.byBasename.mgetOrPut(base, @[]).add absPath
+  SourceIndex* = object
+    ## basename ("foo.nim") -> every indexed file under projectRoot or a
+    ## depRoot whose file has that basename.  Built once per run
+    ## (`buildSourceIndex`) and threaded through `extractClosure` for ALL
+    ## entrypoints in the run — never rebuilt per entrypoint.
+    byBasename: Table[string, seq[IndexedFile]]
+
+proc addToIndex(index: var SourceIndex; lexical: string; real: string) =
+  let base = lexical.extractFilename
+  index.byBasename.mgetOrPut(base, @[]).add IndexedFile(lexical: lexical, real: real)
 
 proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
                   index: var SourceIndex) =
-  ## Recursively index `.nim` files under `dir`, RECORDING each file's path
-  ## as `recordRoot / <relative path from the original walk root>` rather
+  ## Recursively index `.nim` files under `dir`, RECORDING each file's LEXICAL
+  ## path as `recordRoot / <relative path from the original walk root>` rather
   ## than whatever `os.walkDir` hands back — this matters for depRoots
   ## (`buildSourceIndex` passes `recordRoot == dir` at the top so recorded
   ## paths are lexically `<depRootAbs>/<rel>`, matching what the
-  ## under-tracked-root filter and `toProjectRelative` expect).
+  ## under-tracked-root filter and `toProjectRelative` expect) — AND each
+  ## file's REALPATH (symlinks resolved), used by `lookup` to match `@p`
+  ## bodies the compiler mangled from a realpath-canonicalized source (e.g.
+  ## a depRoot reached through a symlink into milpa's CAS).  `dir`'s real
+  ## directory is resolved ONCE per recursive call (`expandFilename`,
+  ## falling back to the lexical `dir` on `OSError`) rather than per file.
   ##
   ## Pruning (mirrors discover.nim's `walkNimFiles` walk discipline):
   ##   • never descend into a symlinked directory (pcLinkToDir) — dependency
@@ -129,6 +142,9 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
   ##   • skip the resolved state dir (`stateDirOf`), by absolute-path
   ##     comparison, in case it is ever configured outside the '.'-prefix
   ##     convention.
+  let realDir =
+    try: expandFilename(dir)
+    except OSError: dir
   for entry in walkDir(dir):
     let name = entry.path.lastPathPart
     case entry.kind
@@ -140,9 +156,15 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
       let entryAbs = entry.path.absolutePath.normalizedPath
       if stateDirAbs.len > 0 and entryAbs == stateDirAbs: continue
       walkForIndex(entry.path, recordRoot / name, stateDirAbs, index)
-    of pcFile, pcLinkToFile:
+    of pcFile:
       if entry.path.endsWith(".nim"):
-        index.addToIndex(recordRoot / name)
+        index.addToIndex(recordRoot / name, realDir / name)
+    of pcLinkToFile:
+      if entry.path.endsWith(".nim"):
+        let real =
+          try: expandFilename(entry.path)
+          except OSError: recordRoot / name
+        index.addToIndex(recordRoot / name, real)
 
 proc buildSourceIndex*(config: Config): SourceIndex =
   ## Walk `config.projectRoot` and each `config.depRoots[i]` once, indexing
@@ -150,7 +172,7 @@ proc buildSourceIndex*(config: Config): SourceIndex =
   ## the exact pruning rules.  Meant to be built ONCE per run (by the
   ## caller — `runner.execute`) and passed to every `extractClosure` call
   ## in that run, never rebuilt per entrypoint.
-  result = SourceIndex(byBasename: initTable[string, seq[string]]())
+  result = SourceIndex(byBasename: initTable[string, seq[IndexedFile]]())
   let stateDirAbs = stateDirOf(config)
 
   let prAbs = config.projectRoot.absolutePath.normalizedPath
@@ -164,20 +186,53 @@ proc buildSourceIndex*(config: Config): SourceIndex =
 
 proc lookup(index: SourceIndex; body: string): seq[string] =
   ## Resolve a decoded `@p`/`@n` body (a path relative to SOME search-path
-  ## root) against the index.  Returns every indexed absolute path whose
-  ## basename matches AND which the body names as a suffix — exactly the
-  ## semantics of a search-path resolution: if the compiler resolved this
-  ## body under ANY in-root directory, that file is indexed and matches.
-  ## Multiple matches (ambiguous — the same body suffix exists under more
-  ## than one indexed location) are ALL returned (R7 over-selection policy).
+  ## root) against the index.
+  ##
+  ## `body` is the SHORTEST relative path from SOME search-path root to the
+  ## compiler's CANONICALIZED (realpath) source file.  Two consequences:
+  ##
+  ## - "shortest" means `body` may start with one or more `..` components
+  ##   (an in-root file reached via a `--path` root that isn't its own
+  ##   ancestor, e.g. `--path:src` importing `../lib/x.nim`).
+  ## - "realpath-canonicalized" means that if the search-path root itself is
+  ##   reached through a symlink (e.g. a milpa depRoot symlinked into the
+  ##   CAS), `body` is relative-to-realpath and can carry MANY `..`
+  ##   components followed by the target's absolute, symlink-resolved path
+  ##   (e.g. `../../../../home/u/.cache/milpa/cas/.../dep/src/dep.nim`).
+  ##
+  ## Every LEADING `""`/`"."`/`".."` component is therefore stripped before
+  ## matching — this is a pure WIDENING of the suffix match (a shorter
+  ## suffix can only match more indexed files, never fewer), so it stays
+  ## sound under the R7 over-selection policy: ambiguous/spurious matches
+  ## are acceptable (they only over-select), silent drops are not.
+  ##
+  ## The stripped suffix is matched against BOTH `IndexedFile.lexical` (the
+  ## walk-recorded, project/depRoot-relative path — what a `..`-free body
+  ## already matched pre-fix) and `IndexedFile.real` (the realpath — what a
+  ## realpath-canonicalized body from a symlinked root matches).  The
+  ## reported path is always `lexical`: crisol records and diffs against
+  ## project-relative paths, never realpaths.
+  ##
+  ## Multiple matches (ambiguous — the same suffix exists under more than
+  ## one indexed location) are ALL returned (R7 over-selection policy).
   result = @[]
   let normBody = body.replace('\\', DirSep).replace('/', DirSep)
-  let base = normBody.extractFilename
+  var comps = normBody.split(DirSep)
+  var start = 0
+  while start < comps.len and comps[start] in ["", ".", ".."]:
+    inc start
+  if start >= comps.len: return
+  let sufComps = comps[start .. ^1]
+  let base = sufComps[^1]
   if base notin index.byBasename: return
-  let suffix = $DirSep & normBody
-  for p in index.byBasename[base]:
-    if p == normBody or p.endsWith(suffix):
-      result.add p
+  let suffix = sufComps.join($DirSep)
+  let suffixPattern = $DirSep & suffix
+  var seen = initHashSet[string]()
+  for f in index.byBasename[base]:
+    if f.lexical.endsWith(suffixPattern) or f.real.endsWith(suffixPattern):
+      if f.lexical notin seen:
+        seen.incl f.lexical
+        result.add f.lexical
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -204,10 +259,14 @@ proc toProjectRelative(absPath: string; projectRoot: string): string =
   result = result.replace($DirSep, "/")
 
 proc decodeBody(raw: string): string =
-  ## Decode @s → /, @@ → @ in the post-prefix mangled body string.
+  ## Decode Nim's mangling escapes in the post-prefix mangled body string:
+  ## @s → /, @c → :, @h → #, @@ → @ (protected first so a literal `@` in
+  ## the source path never collides with the other escapes).
   raw
     .replace("@@", "\x00")   # protect literal @ temporarily
     .replace("@s", $DirSep)  # @s → path separator
+    .replace("@c", ":")      # @c → colon
+    .replace("@h", "#")      # @h → hash
     .replace("\x00", "@")    # restore literal @
 
 proc moduleMangledNameOf(objPath: string): string =

@@ -76,6 +76,27 @@ remains the opt-in for out-of-tree content (e.g. `_deps/<x>` symlinks into a
 content store).  Closures may grow (they are now complete), so expect a
 one-time recompile of entrypoints whose closure gained members.
 
+### Fixed
+
+- **closure:** `@p`/`@n` bodies with leading `..` components — the shape Nim
+  emits when the shortest relative path to a module runs from a `--path`
+  root that isn't the module's ancestor (e.g. an in-root `../lib/x` import
+  that is shorter measured from `--path:src` than from the importing file),
+  or when a search-path root is reached through a symlink and Nim
+  realpath-canonicalizes the resolved source (e.g. a milpa `_deps/<dep>`
+  symlink into the CAS) — are now resolved.  Previously `SourceIndex.lookup`
+  suffix-matched the *whole, unstripped* body against indexed absolute
+  paths, so any body containing `..` matched nothing and the module silently
+  dropped out of the closure (unsound: an edit to that file would not
+  re-select the entrypoint under `--changed`).  The index now records each
+  file's realpath alongside its lexical path, and `lookup` strips every
+  leading `""`/`"."`/`".."` component before matching against either — a
+  pure widening of the match, so still sound under the R7 over-selection
+  policy.  The reported/recorded path remains the lexical one.
+- **closure:** `decodeBody` now decodes Nim's `@c` (`:`) and `@h` (`#`)
+  mangling escapes in addition to `@s` and `@@`; a module path containing a
+  colon or hash character previously failed to decode correctly.
+
 ### Added
 
 - `crisol closure <entrypoint> [--json]` / `crisol closure --all [--json]` —
