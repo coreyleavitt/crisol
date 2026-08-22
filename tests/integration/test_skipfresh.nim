@@ -24,8 +24,15 @@ proc fixtureDir(): string =
   let testsDir = thisFile.parentDir.parentDir
   testsDir / "fixtures"
 
-proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "test", flags: @[])
+proc stageEp(tmpRoot: string; group = "test"; flags: seq[string] = @[]): Entrypoint =
+  ## Copy the pass_always fixture UNDER the isolated projectRoot and return a
+  ## project-relative entrypoint. The entrypoint must live under a tracked
+  ## root: crisol refuses to record an entrypoint whose closure is empty
+  ## (issue #5), which is exactly what an out-of-root entrypoint produces —
+  ## and an unrecorded entrypoint is never cdSkipFresh.
+  createDir(tmpRoot / "tests")
+  copyFile(fixtureDir() / "pass_always.nim", tmpRoot / "tests" / "pass_always.nim")
+  Entrypoint(path: "tests/pass_always.nim", group: group, flags: flags)
 
 proc makeIsolatedConfig(root: string): Config =
   ## Build a Config that uses an isolated stateDir under `root`.
@@ -49,7 +56,7 @@ suite "skip-fresh — compile avoidance integration":
     createDir(tmpRoot)
     defer: removeDir(tmpRoot)
 
-    let ep  = mkEp(fixtureDir() / "pass_always.nim")
+    let ep  = stageEp(tmpRoot)
     let cfg = makeIsolatedConfig(tmpRoot)
 
     # First run: empty graph, binary does not exist yet.
@@ -77,7 +84,7 @@ suite "skip-fresh — compile avoidance integration":
     createDir(tmpRoot)
     defer: removeDir(tmpRoot)
 
-    let ep  = mkEp(fixtureDir() / "pass_always.nim")
+    let ep  = stageEp(tmpRoot)
     let cfg = makeIsolatedConfig(tmpRoot)
 
     # Run 1: compile and record.
@@ -111,7 +118,7 @@ suite "skip-fresh — compile avoidance integration":
     createDir(tmpRoot)
     defer: removeDir(tmpRoot)
 
-    let ep  = mkEp(fixtureDir() / "pass_always.nim")
+    let ep  = stageEp(tmpRoot)
     let cfg = makeIsolatedConfig(tmpRoot)
 
     # Run 1: compile and record.
@@ -143,10 +150,9 @@ suite "skip-fresh — compile avoidance integration":
     createDir(tmpRoot)
     defer: removeDir(tmpRoot)
 
-    let ep1 = mkEp(fixtureDir() / "pass_always.nim")
-    let ep2 = Entrypoint(path: fixtureDir() / "pass_always.nim",
-                         group: "test2",
-                         flags: @["-d:skiptest"])  # different flags → different slug
+    let ep1 = stageEp(tmpRoot)
+    let ep2 = stageEp(tmpRoot, group = "test2",
+                      flags = @["-d:skiptest"])  # different flags → different slug
 
     let cfg = makeIsolatedConfig(tmpRoot)
 

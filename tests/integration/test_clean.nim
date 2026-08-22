@@ -286,11 +286,12 @@ suite "crisol clean — depgraph GC":
     var graph = initDepGraph("")
     let keptPath  = "tests/unit/test_kept.nim"
     let stalePath = "tests/unit/test_deleted_long_ago.nim"  # no file on disk
-    let emptySet  = initHashSet[string]()
     let fHash     = flagHash(@[])
 
-    graph.updateEntry(keptPath,  fHash, emptySet, "", 1)
-    graph.updateEntry(stalePath, fHash, emptySet, "", 1)
+    # A closure is never empty (updateEntry refuses one — issue #5); the
+    # minimal real closure is the entrypoint itself.
+    graph.updateEntry(keptPath,  fHash, toHashSet([keptPath]),  "", 1)
+    graph.updateEntry(stalePath, fHash, toHashSet([stalePath]), "", 1)
     saveDepGraph(graph, cfg)
 
     discard cleanOrphans(cfg)
