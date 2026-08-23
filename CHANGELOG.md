@@ -6,6 +6,20 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### spawn: portable POSIX in place of two glibc-isms; macOS builds again (issue #18)
+
+`spawn.nim` called `pipe2(O_CLOEXEC)` and `execvpe(3)`, both absent from
+Darwin's libc, so crisol did not compile on macOS.  The status pipe is now
+`pipe(2)` followed by `FD_CLOEXEC` on both ends — equivalent to `pipe2`
+because crisol's executor is single-threaded by invariant, so no other thread
+can fork between the two calls — and the child execs with POSIX `execve(2)`
+on a path the **parent** resolves with `findExe` (PATH search iff the name has
+no `/`, exactly `execvp`'s rule; `argv[0]` is preserved).  Resolving before
+fork also keeps the async-signal-safe child window free of any PATH walking.
+One behavioural consequence: a program that cannot be resolved is now a spawn
+error at the call site rather than a child that `_exit(127)`s.  One code
+path, no `when defined(linux)` — Linux CI exercises exactly what macOS runs.
+
 ### `crisol clean` dependency-graph GC now works on real graphs; failed persists can no longer leave a stale binary behind; load guard rejects relative `..` escapes (issues #12, #13)
 
 **`clean` GC was dark (#12).**  `cleanOrphans` loaded the graph with

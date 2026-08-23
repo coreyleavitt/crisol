@@ -1,8 +1,8 @@
 ## spawn.nim — low-level fork+exec supervisor for crisol A2b/A4a/A4b/A4c.
 ##
 ## Invariants (RFC Implementation Decisions):
-##   • Between fork() and execvp() the child executes ONLY async-signal-safe
-##     primitives: setpgid, dup2, close, chdir, setrlimit, execvp, _exit.  No
+##   • Between fork() and exec the child executes ONLY async-signal-safe
+##     primitives: setpgid, dup2, close, chdir, setrlimit, execvp/execve, _exit.  No
 ##     Nim GC, no heap allocation, no string construction, no exceptions.
 ##   • The cstring argv array is pre-built BEFORE fork so the child path is
 ##     a plain pointer dereference.
@@ -31,16 +31,21 @@ proc mkdtemp(tmpl: cstring): cstring
   ## Modifies the template in-place and returns it on success, or nil on error.
   ## Async-signal-safe: safe to call before fork (called in parent only here).
 
-proc pipe2(fds: var array[2, cint]; flags: cint): cint
-  {.importc: "pipe2", header: "<unistd.h>".}
-  ## Linux pipe2(2): create a pipe with the given flags atomically.
-  ## With O_CLOEXEC: both ends are marked close-on-exec at creation, so they
-  ## auto-close at execvp/execvpe without a separate fcntl call.
-  ## The write end is still usable in the child between fork and execvpe.
-  ## Available on Linux 2.6.27+ (all supported containers).
-
-const O_CLOEXEC {.importc: "O_CLOEXEC", header: "<fcntl.h>".}: cint = 0
-  ## Mark file descriptor as close-on-exec.  Value: 0x80000 (524288) on Linux.
+proc cloexecPipe(fds: var array[2, cint]): bool =
+  ## Portable stand-in for Linux pipe2(O_CLOEXEC): pipe(2) then FD_CLOEXEC on
+  ## both ends.  Darwin has no pipe2.  The atomicity pipe2 buys only matters if
+  ## another thread can fork between the two calls; crisol's executor is
+  ## single-threaded by invariant (see module doc), so this is equivalent.
+  ## Both ends stay usable in the child between fork and exec; they auto-close
+  ## at exec.  Returns false (fds closed) on any failure.
+  if posix.pipe(fds) != 0:
+    return false
+  for fd in fds:
+    if fcntl(fd, F_SETFD, FD_CLOEXEC) == -1:
+      discard posix.close(fds[0])
+      discard posix.close(fds[1])
+      return false
+  true
 
 # ---------------------------------------------------------------------------
 # A4b: rlimit constants — importc the ones missing from Nim's std/posix
@@ -91,10 +96,11 @@ proc devNull(): cint =
   ## Called before fork — result passed to child via closure.
   posix.open("/dev/null".cstring, O_RDONLY)
 
-proc execvpe(path: cstring; argv: cstringArray; envp: cstringArray): cint
-  {.importc: "execvpe", header: "<unistd.h>".}
-  ## Linux execvpe(3): exec path with explicit argv + envp arrays.
-  ## Async-signal-safe: safe to call in the child after fork.
+# Exec with an explicit envp is done with POSIX execve(2) on a path resolved
+# in the PARENT (std/os findExe: PATH search iff the name has no '/', exactly
+# execvp's rule).  glibc's execvpe(3) — which does the PATH walk in the child —
+# is absent on Darwin; resolving before fork also keeps the async-signal-safe
+# child window free of any PATH walking.  argv[0] stays as the caller gave it.
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +193,7 @@ proc forkExec*(args: openArray[string]; outputFd: cint): Pid =
 # ---------------------------------------------------------------------------
 # A4d: SandboxAchieved status-word bit encoding (child → parent over a pre-fork
 # pipe).  The child performs each control, sets the matching bit, and write(2)s
-# this single byte BEFORE execvpe.  The parent reads it and decodes it into a
+# this single byte BEFORE execve.  The parent reads it and decodes it into a
 # SandboxAchieved record.  EOF (0 bytes read) ⇒ child died before writing ⇒ all
 # bits false (not achieved).
 # ---------------------------------------------------------------------------
@@ -238,7 +244,7 @@ proc forkExecEnvScratch*(
   ##
   ## When ``spec.chdirIntoScratch == true``:
   ##   - The child calls ``chdir(2)`` into the scratch dir in the
-  ##     async-signal-safe window (after setpgid, before execvpe).  This is
+  ##     async-signal-safe window (after setpgid, before execve).  This is
   ##     opt-in (default off) because a default chdir silently breaks tests
   ##     that open fixtures at compile-time-relative paths.
   ##
@@ -261,6 +267,13 @@ proc forkExecEnvScratch*(
   for i, s in args:
     cargs[i] = s.cstring
   cargs[args.len] = nil
+
+  # Resolve the executable in the parent (see the execve note above).  An
+  # unresolvable program is a spawn error here rather than a 127 in the child.
+  let exePath = findExe(args[0])
+  if exePath.len == 0:
+    return
+  let exeCstr = exePath.cstring   # points into exePath; live until after fork
 
   # A4a: create the scratch tmpdir BEFORE fork when spec.tmpdir is true.
   # We build the injected list with TMPDIR included so filterEnv can append it.
@@ -306,16 +319,16 @@ proc forkExecEnvScratch*(
     return
 
   # A4d: pre-fork status pipe.  The child write(2)s a single status byte
-  # (achieved-bits) before execvpe; the parent reads it post-fork.  Both ends are
-  # inherited across fork.  We mark BOTH ends O_CLOEXEC via pipe2(2):
-  #   - O_CLOEXEC closes fds at EXEC (not at fork), so the child can STILL write
-  #     pipeWrite post-fork/pre-exec.
-  #   - At execvpe the write end auto-closes (O_CLOEXEC), so the parent's
-  #     blocking read() observes EOF cleanly — making the manual close(pipeWrite)
-  #     below redundant-but-harmless (kept for defence-in-depth).
+  # (achieved-bits) before exec; the parent reads it post-fork.  Both ends are
+  # inherited across fork.  We mark BOTH ends FD_CLOEXEC (cloexecPipe):
+  #   - FD_CLOEXEC closes fds at EXEC (not at fork), so the child can STILL
+  #     write pipeWrite post-fork/pre-exec.
+  #   - At execve the write end auto-closes, so the parent's blocking read()
+  #     observes EOF cleanly — making the manual close(pipeWrite) below
+  #     redundant-but-harmless (kept for defence-in-depth).
   #   - The read end in the parent is closed explicitly after reading.
   var statusPipe: array[2, cint]
-  if pipe2(statusPipe, O_CLOEXEC) != 0:
+  if not cloexecPipe(statusPipe):
     discard posix.close(nullFd)
     if outScratchDir.len > 0:
       try: removeDir(outScratchDir) except: discard
@@ -339,7 +352,7 @@ proc forkExecEnvScratch*(
     return
 
   if childPid == 0:
-    # CHILD — only async-signal-safe operations from here to execvpe/_exit.
+    # CHILD — only async-signal-safe operations from here to execve/_exit.
     # A4d: track achieved-hermeticity bits in a stack uint8 (no heap, no GC).
     var statusWord: uint8 = 0
 
@@ -443,9 +456,9 @@ proc forkExecEnvScratch*(
     # therefore stays clear, so a hlNetwork request degrades and isFullyAchieved
     # returns false.  When netIso is implemented it sets AchNetIso here on success.
 
-    # A4d: write the status word to the pipe BEFORE execvpe (partial-write loop).
+    # A4d: write the status word to the pipe BEFORE execve (partial-write loop).
     # write(2) is async-signal-safe.  After this the write-end is closed so the
-    # parent's read observes EOF cleanly even if execvpe somehow leaves the fd open.
+    # parent's read observes EOF cleanly even if execve somehow leaves the fd open.
     var wbuf = statusWord
     var off = 0
     while off < 1:
@@ -458,8 +471,8 @@ proc forkExecEnvScratch*(
         break
     discard posix.close(pipeWrite)
 
-    discard execvpe(cargs[0], cast[cstringArray](addr cargs[0]),
-                    cast[cstringArray](addr cenv[0]))
+    discard execve(exeCstr, cast[cstringArray](addr cargs[0]),
+                   cast[cstringArray](addr cenv[0]))
     discard posix.write(cint(STDERR_FILENO), "_exit(127)\n".cstring, 11)
     exitnow(127)
 
