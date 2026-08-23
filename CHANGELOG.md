@@ -6,6 +6,51 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### BREAKING CHANGE — dependency graph format 5: the headers a `{.compile.}`d source `#include`s are tracked compile inputs; one-time full recompile (issue #16)
+
+**Prior behaviour:** a `{.compile.}`d C/C++ source was in the closure
+(format 4, issue #11) but nothing it `#include`d was.  A header-only edit was
+invisible twice over: crisol neither recompiled the entrypoint nor selected
+it under `--changed`, and Nim's own external-object cache — keyed on the
+source's content and the cc command, never on headers — would have relinked
+the stale object even if crisol had recompiled.
+
+**New behaviour:** after a successful compile crisol derives a `cc -M` probe
+from the exact compile command the nimcache manifest records for each
+single-path external, keeps every reported header that resolves under a
+tracked root (system headers are excluded by the same gate as every other
+closure path), and folds those headers into the entrypoint's closure — so
+the closure content hash, `--changed` selection and `crisol closure` all see
+them.  Each entry now also records one record per external (source, object
+basename, sorted header set, header content hash).  An external Nim served
+from its own object cache — no compile command in the manifest this round —
+carries its header set forward from the previous record; with no record to
+carry, extraction fails closed (the entry is invalidated and the entrypoint
+recompiles and is force-selected until it succeeds).
+
+Before spawning `nim c`, the runner evicts from the persistent nimcache
+every external object whose recorded header set no longer hashes to its
+stored hash (a missing or unreadable header counts as changed), so Nim
+recompiles exactly those objects.  A warm nimcache with no depgraph entry at
+all (format discard, `crisol clean` GC, an invalidated record) has every
+non-module object evicted so the next compile rediscovers headers through
+`cc -M` instead of failing closed.  A failed eviction is a pre-compile setup
+failure (`oSpawnError`), never a silently linked stale object.  Unchanged
+headers evict nothing and recompile nothing.
+
+`DepGraphFormatVersion` is now 5: an existing `.crisol/depgraph` is discarded
+on first load and the **next run recompiles every entrypoint once**.  A v4
+closure cannot be healed in place — it is missing whatever headers its
+externals include, and its persisted manifest carries no compile command for
+a cached external to re-derive them from.
+
+**Not covered (by design):** `gorge` (a shell command, not a file input);
+headers outside every tracked root (system and toolchain headers — a
+toolchain change is keyed by the nimcache's toolchain fingerprint, not by
+the closure).
+
+**Migration:** nothing to do; budget one full-suite compile after upgrading.
+
 ### spawn: portable POSIX in place of two glibc-isms; macOS builds again (issue #18)
 
 `spawn.nim` called `pipe2(O_CLOEXEC)` and `execvpe(3)`, both absent from
@@ -108,9 +153,8 @@ with no `depfiles` key at all (an entrypoint compiled by a Nim that does not
 honour the define) is refused rather than trusted.
 
 **Not covered (by design):** `gorge` runs a shell command, not a file input.
-The C headers `#include`d by a `{.compile.}`d source are not tracked — Nim's
-own external-object cache ignores headers too, so crisol cannot make the
-recompile half sound without forcing; tracked as a follow-up issue.
+The C headers `#include`d by a `{.compile.}`d source were not tracked by
+format 4 — see the format 5 entry above (issue #16).
 
 **Migration:** nothing to do; budget one full-suite compile after upgrading.
 
