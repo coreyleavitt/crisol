@@ -505,6 +505,18 @@ proc moduleMangledNameOf(objPath: string): string =
       return base[0 ..< base.len - (suffix.len - 4)]   # keep through ".nim"
   ""
 
+proc isModuleObjectName*(basename: string): bool =
+  ## Public predicate wrapping `moduleMangledNameOf`'s `.nim.{c,cpp,m}.o`
+  ## contract (issue #16 slice 1b): true iff `basename` (a bare object
+  ## filename, e.g. as found directly inside a nimcache directory) names a
+  ## Nim MODULE object, false for anything else — in particular, false for a
+  ## `{.compile.}`d external's object (`@mfoo.c.o`) or a foreign/tuple-form
+  ## object.  Exported so `runner.bustStaleExternalObjects` can distinguish
+  ## "Nim module object, leave it alone" from "everything else in this
+  ## nimcache dir, treat as a possibly-stale external" without duplicating
+  ## the `.nim.{c,cpp,m}.o` contract stated once above.
+  moduleMangledNameOf(basename) != ""
+
 proc externalMangledNameOf(objPath: string): string =
   ## Maps one `link` object-file path that names NO Nim module
   ## (`moduleMangledNameOf` returned `""` for it) to the mangled name

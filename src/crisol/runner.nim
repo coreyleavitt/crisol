@@ -30,7 +30,7 @@
 ##   • Output captured to per-entrypoint temp files; read atomically after
 ##     completion; bounded by maxOutputBytes.
 
-import std/[json, monotimes, options, os, sets, times]
+import std/[json, monotimes, options, os, sets, strutils, tables, times]
 import std/posix
 import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver]
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
@@ -357,11 +357,77 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
     stateDir:          stateDirOf(config),
   )
 
+proc dirHasEntries(dir: string): bool =
+  ## True iff `dir` exists and contains at least one directory entry.  Used
+  ## by `spawnCompileStable` to decide, BEFORE `createDir(cacheDir)` runs,
+  ## whether this compile is landing in a genuinely fresh nimcache directory
+  ## or a warm-but-unrecorded one (issue #16 slice 1b, rule 2 of
+  ## `bustStaleExternalObjects`).
+  if not dirExists(dir): return false
+  for _ in walkDir(dir):
+    return true
+  false
+
+proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
+                              config: Config; hadPriorContent: bool) =
+  ## Issue #16 slice 1b. Nim's own external-object cache (`extccomp.nim`:
+  ## `footprint` = sha1 of source content + OS + CPU + cc name + cc command,
+  ## NEVER the headers it `#include`s; `addExternalFileToCompile` marks an
+  ## external Cached — skips recompiling it — iff `fileExists(obj)` and that
+  ## footprint is unchanged) ignores headers entirely. So after a
+  ## header-only edit, crisol's own closure hash correctly goes stale and the
+  ## entrypoint recompiles, but Nim's cache still considers the external
+  ## itself unchanged and would happily relink the STALE object sitting in
+  ## the persistent nimcache — silently serving output that does not reflect
+  ## the header edit. Deleting the object (no `.sha1`-file surgery needed) is
+  ## what forces Nim to recompile it; this must happen BEFORE `nim c` is
+  ## spawned, which is why this is called from `spawnCompileStable` right
+  ## after the pre-compile `createDir`/`removeFile` housekeeping.
+  ##
+  ## Two rules:
+  ##
+  ## 1. A depgraph entry exists for `(ep.path, flagHash(ep.flags))`: delete
+  ##    exactly the objects `depgraph.staleExternalObjects` flags, using the
+  ##    entry's recorded per-external header hashes — precise, per-external.
+  ##
+  ## 2. No entry exists, but `cacheDir` already held content before this
+  ##    compile (`hadPriorContent`, computed by the caller BEFORE
+  ##    `createDir(cacheDir)` — see `dirHasEntries`): a warm nimcache with no
+  ##    matching record (a depgraph format-version discard, a `crisol clean`
+  ##    GC, or an entry invalidated by a previous failed `recordClosure`).
+  ##    With no header record to compare against, crisol cannot know
+  ##    PRECISELY which external objects are stale, so it conservatively
+  ##    colds EVERY foreign (non-module) object directly in `cacheDir` —
+  ##    anything `closure.isModuleObjectName` does NOT recognize as a Nim
+  ##    module object — forcing Nim to recompile every external. This lets
+  ##    the next `extractCompileInputs` see a fresh `compile` entry for each
+  ##    one and re-derive its headers via `cc -M`, instead of failing closed
+  ##    for want of a carried-forward header record.
+  ##
+  ## Fails closed: a deletion that raises (the object exists but cannot be
+  ## removed) propagates to the caller, which treats it like any other
+  ## pre-compile setup failure (`oSpawnError`) — a stale external object
+  ## that cannot be evicted must never be linked into a binary crisol then
+  ## reports on. `removeFile` on an already-absent object is a no-op, so
+  ## only a genuinely broken state directory reaches this path.
+  let key = (ep.path, flagHash(ep.flags))
+  if key in graph.entries:
+    for obj in staleExternalObjects(graph, ep.path, ep.flags, config.projectRoot):
+      removeFile(cacheDir / obj)
+  elif hadPriorContent:
+    for kind, path in walkDir(cacheDir):
+      if kind != pcFile: continue
+      let base = path.extractFilename
+      if not base.endsWith(".o"): continue
+      if isModuleObjectName(base): continue
+      removeFile(path)
+
 proc spawnCompileStable(
   slot:             var Slot;
   pepIdx:           int;
   pep:              PlannedEntrypoint;
   config:           Config;
+  graph:            DepGraph;
   compileTimeoutMs: int;
   spec:             SandboxSpec;
   toolchainFp:      string;
@@ -426,6 +492,12 @@ proc spawnCompileStable(
   let bname       = binName(ep)
   let binCompiled = binDirSlot / bname     # compile output + run source
 
+  # Issue #16 slice 1b: "did cacheDir already hold content" must be observed
+  # BEFORE createDir(cacheDir) below (which would otherwise make a fresh dir
+  # indistinguishable from a warm one) — see bustStaleExternalObjects's rule
+  # 2 and dirHasEntries's doc comment.
+  let hadPriorCacheContent = dirHasEntries(cacheDir)
+
   try:
     createDir(cacheDir)
     createDir(binDirSlot)
@@ -439,6 +511,12 @@ proc spawnCompileStable(
     # here so the short-circuit's precondition is false by construction at
     # the moment the compiler is spawned, not by a distant cleanup.
     removeFile(binCompiled)
+    # Issue #16: bust any external object Nim's own cache would otherwise
+    # serve stale because a header it #includes changed — see
+    # bustStaleExternalObjects's doc comment. Must run BEFORE forkExec
+    # below; a failed eviction is a pre-compile setup failure like the
+    # createDir/removeFile calls above (return false, oSpawnError).
+    bustStaleExternalObjects(cacheDir, ep, graph, config, hadPriorCacheContent)
   except:
     return false
 
@@ -1154,8 +1232,9 @@ proc execute*(
               slots[i].token = tok.get  # S3: store token for onSlotFinish
           else:
             # Normal compile + run using stable slug-keyed paths.
-            let ok = spawnCompileStable(slots[i], pepIdx, pep, config, compileTimeoutMs,
-                                        cache.spec, toolchainFp, dupSlugs)
+            let ok = spawnCompileStable(slots[i], pepIdx, pep, config, graph,
+                                        compileTimeoutMs, cache.spec, toolchainFp,
+                                        dupSlugs)
             if not ok:
               ac.release(tok.get)  # S3: rollback admission on spawn failure
               # Fork/resource failure: record oSpawnError immediately.

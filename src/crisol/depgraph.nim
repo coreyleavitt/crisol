@@ -439,6 +439,51 @@ proc isEntryStale*(graph: DepGraph;
       return true
   return false
 
+proc staleExternalObjects*(graph: DepGraph; path: string; flags: seq[string];
+                           projectRoot: string): seq[string] =
+  ## Issue #16 slice 1b: which of this entrypoint's `{.compile.}`d external
+  ## objects the RUNNER must delete before spawning `nim c`, so Nim actually
+  ## recompiles them.
+  ##
+  ## Nim's own external-object cache (`extccomp.nim`, verified Nim 2.2.10):
+  ## `footprint` is a sha1 of the external source's CONTENT plus OS, CPU, cc
+  ## name, and cc command — never the headers it `#include`s — and
+  ## `addExternalFileToCompile` marks an external Cached (skips recompiling
+  ## it) iff `fileExists(obj)` and that footprint is unchanged. So a
+  ## header-only edit never changes the footprint: crisol's OWN closure hash
+  ## correctly goes stale and the entrypoint recompiles, but Nim's cache
+  ## still considers the external itself unchanged and would happily relink
+  ## the STALE object sitting in the persistent nimcache — silently ignoring
+  ## the header edit. Deleting that object (no `.sha1`-file surgery needed)
+  ## is what forces Nim to recompile it.
+  ##
+  ## Returns the `obj` BASENAME (`ExternalSource.obj`, as recorded in the
+  ## entry's `externals`) of every external whose header set can no longer be
+  ## trusted: the header content, hashed NOW via `chainedContentHash`, no
+  ## longer matches the `headersHash` recorded at the last successful
+  ## `recordClosure`, OR that hash cannot even be computed right now (a
+  ## header file missing or unreadable — treated conservatively as
+  ## "changed", never raised out of this proc), OR `headersHash == ""` (no
+  ## trustworthy prior record to compare against).
+  ##
+  ## No entry for `(path, flagHash(flags))` -> `@[]` (nothing recorded, so
+  ## nothing to bust here — see `bustStaleExternalObjects` in runner.nim for
+  ## how the runner handles a warm nimcache with NO matching record at all).
+  ##
+  ## Pure apart from reading the header files on disk; never raises (a read
+  ## failure is treated as "stale", not propagated).
+  let key = (path, flagHash(flags))
+  if key notin graph.entries: return @[]
+  for ext in graph.entries[key].externals:
+    var stale = ext.headersHash == ""
+    if not stale:
+      try:
+        stale = chainedContentHash(ext.headers, projectRoot) != ext.headersHash
+      except CatchableError:
+        stale = true
+    if stale:
+      result.add ext.obj
+
 proc gcDeletedEntrypoints*(graph:               var DepGraph;
                            currentKeys: HashSet[(string, string)]) =
   ## Drop all entries whose key is NOT in `currentKeys`.
