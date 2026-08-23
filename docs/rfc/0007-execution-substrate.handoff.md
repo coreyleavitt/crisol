@@ -7,7 +7,7 @@
 ## Slices
 - [ ] A1a  types + derived `outcome` + run/v2 + consumers — **load-bearing** (hang fixture ⇒ `killed`/`cause:runner/timeout` via `crisol run --json`)
 - [ ] A1b  authorship & grace (escalated, crash/external/limit, interrupt)
-- [ ] A2   `process.nim` + `process/posix.nim`; runner loses std/posix; `SlotState` (#1); `tests/conformance/`
+- [ ] A2   `process.nim` + `process/posix.nim`; runner loses std/posix; `SlotState` (#1); `ChildSpec.cwd = projectRoot` (#17, subdirectory `--config` integration test); `tests/conformance/`
 - [ ] A3   `ioutils` sole owner of raw file I/O (grep-asserted)
 - [ ] A4   `flock` lock; `shutdownRequested()`
 - [ ] A5   rusage → `Exit.rusage`, ledger/admission, `nearAddressSpaceLimit`
@@ -21,6 +21,7 @@
 - none for 0007. (RFC-0005 FORK-2 still open, unrelated.)
 
 ## Key decisions (this session, 2026-08-22 — grill-me, first-principles mode)
+- 2026-08-23: #16 landed on main ahead of 0007 (8a1fa0f, c91988f, 793ac0a; depgraph format 5). #17 folded into A2 (compile/run cwd = projectRoot) rather than fixed standalone — A2 rewrites the spawn seam anyway.
 - Executor **guarantees are identity; mechanisms are capabilities** (probed, degraded, reported). → RFC §Identity check.
 - Result model = `Exit` (lossless) × `Cause` (authorship, asserted only when known) × `Evidence`; `Outcome` **derived, pure, never stored**; compile+run share `ProcessResult`. Clean break: `run/v2`, `oCrashed`/`oKilled` replace `oSignal`/`oTimeout`, `signal`/`exitCode`/`achieved`/`peakRssBytes` fields removed.
 - Kill authorship from the runner's own action, never from the signal number; Windows forced kill uses a runner-chosen exit code.
