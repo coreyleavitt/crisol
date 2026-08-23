@@ -84,22 +84,44 @@
 import std/[algorithm, json, os, sequtils, sets, strutils, tables]
 import std/posix as posix_mod
 import crisol/types
-import crisol/config  # for stateDirOf
-import crisol/closure  # for extractClosure/SourceIndex (recordClosure); no cycle —
-                        # closure.nim imports only crisol/types and crisol/config
-                        # (which itself imports only crisol/types)
+import crisol/config   # for stateDirOf
+import crisol/closure  # for extractClosure/extractCompileInputs/SourceIndex/
+                        # ExternalSource (recordClosure); no cycle — closure.nim
+                        # imports crisol/types, crisol/config, and crisol/ccprobe
+                        # (a leaf) — never crisol/depgraph (see closure.nim's
+                        # import comment for why: this module importing
+                        # crisol/artifactid would have closed that cycle,
+                        # issue #16).
+import crisol/ccprobe   # for RunProc/realRun (recordClosure's ccRun param)
 import crisol/ioutils  # for sanitizeControlBytes — the shared control/ANSI-byte
                         # sanitization primitive (bottom of the dep graph; no cycle)
+import crisol/fnv       # FNV-1a primitives (fnv1a64/toHex16/fnvOffset64/
+                        # fnvPrime64) and chainedContentHash — a leaf module,
+                        # re-exported below so every existing
+                        # `import crisol/depgraph` call site that uses these
+                        # unqualified keeps compiling unchanged.
+export fnv
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-const DepGraphFormatVersion* = 4
+const DepGraphFormatVersion* = 5
   ## Increment this when the JSON schema changes in an incompatible way.
   ## A loaded file with a different formatVersion is treated as absent.
   ##
   ## History:
+  ##   5 — issue #16: a `{.compile.}`d external's `#include`d headers are
+  ##       tracked compile inputs. `DepGraphEntry` gains `externals` (one
+  ##       `closure.ExternalSource` per single-path external: its source
+  ##       path, object basename, and header set), and every header now also
+  ##       joins `closure`/`closureHash` itself (`closure.extractCompileInputs`
+  ##       replaces `extractClosure` as `recordClosure`'s extraction call).
+  ##       Every v4 entry's `closure` is missing whatever headers its
+  ##       externals (if any) `#include` — under-selecting exactly like a v3
+  ##       entry was missing `{.compile.}`d sources themselves (issue #11) —
+  ##       so the graph is discarded once (a one-time full recompile) rather
+  ##       than served or migrated in place.
   ##   4 — issue #11: closures also cover non-module compile inputs —
   ##       `include`d files, `staticRead`/`slurp` targets, `nim.cfg`/
   ##       `config.nims` (from the manifest's `depfiles`, written under the
@@ -145,6 +167,16 @@ type
       ## Every other site that touches this rule is a pointer back here.
     closureHash*:   string           ## 64-bit chained FNV-1a over sorted closure file CONTENTS (16 hex)
     protocolMajor*: int              ## crisol protocol major at build time
+    externals*:     seq[ExternalSource]
+      ## One entry per single-path `{.compile.}`d external this entrypoint
+      ## names (issue #16) — its source path, object basename, and the
+      ## header set it `#include`s. Every header here is ALSO a member of
+      ## `closure` (closure/`--changed` selection see headers directly);
+      ## this field exists so a WARM recompile — where Nim serves the
+      ## external's object from its own cache and the manifest carries no
+      ## `cc` command to re-probe — can carry the header set FORWARD instead
+      ## of losing it (`closure.extractCompileInputs`'s `carried` parameter,
+      ## fed from this field on the entry's previous `recordClosure`).
 
   DepGraphDiscardKind* = enum
     ## Why `loadDepGraph` discarded a persisted graph.
@@ -284,31 +316,6 @@ proc message*(d: DepGraphDiscard): string =
     ") -- the recorded graph is treated as empty"
 
 # ---------------------------------------------------------------------------
-# FNV-1a 64-bit hash (stable across Nim versions; never std/hashes)
-# ---------------------------------------------------------------------------
-
-const fnvOffset64* = 0xcbf29ce484222325'u64
-  ## FNV-1a 64-bit offset basis.  Exported so ``keys.nim`` can seed its chain
-  ## from the same basis without re-declaring the constant.
-const fnvPrime64  = 0x00000100000001b3'u64
-
-proc fnv1a64*(data: string): uint64 =
-  ## 64-bit FNV-1a hash over `data`.
-  result = fnvOffset64
-  for c in data:
-    result = result xor uint64(ord(c))
-    result = result * fnvPrime64
-
-proc toHex16*(v: uint64): string =
-  ## Render a uint64 as 16 lower-case hex chars.
-  const hexChars = "0123456789abcdef"
-  result = newString(16)
-  var x = v
-  for i in countdown(15, 0):
-    result[i] = hexChars[x and 0xf]
-    x = x shr 4
-
-# ---------------------------------------------------------------------------
 # Public: flagHash
 # ---------------------------------------------------------------------------
 
@@ -347,18 +354,12 @@ proc closureContentHash*(files: seq[string]; projectRoot: string): string =
   ## Returns 16 lower-case hex chars (or all-zeros string if files is empty).
   ##
   ## Raises OSError if any file cannot be read.
-  var sorted = files
-  sorted.sort()
-  var running: uint64 = fnvOffset64  # start from FNV offset (not 0) for non-trivial empty case
-  for relPath in sorted:
-    let absPath =
-      if relPath.isAbsolute: relPath
-      else: projectRoot / relPath
-    let content = readFile(absPath)
-    # Chain: mix running hash value, path, and content together.
-    # This makes the result sensitive to both WHICH file changed AND WHAT its content is.
-    running = fnv1a64(toHex16(running) & "\x00" & relPath & "\x00" & content)
-  result = toHex16(running)
+  ##
+  ## Delegates to `crisol/fnv.chainedContentHash` — the depgraph-facing name
+  ## for the identical fold; `crisol/closure` (which cannot import this
+  ## module — see closure.nim's import comment) calls `chainedContentHash`
+  ## directly for the same result.
+  chainedContentHash(files, projectRoot)
 
 # ---------------------------------------------------------------------------
 # Public: constructors
@@ -381,7 +382,8 @@ proc updateEntry*(graph: var DepGraph;
                   fHash:         string;
                   closure:       HashSet[string];
                   closureHash:   string = "";
-                  protocolMajor: int = 0) =
+                  protocolMajor: int = 0;
+                  externals:     seq[ExternalSource] = @[]) =
   ## Insert or replace the entry for (path, fHash).
   ##
   ## Refuses an EMPTY closure — see `DepGraphEntry.closure`, invariant
@@ -396,6 +398,7 @@ proc updateEntry*(graph: var DepGraph;
     closure:       closure,
     closureHash:   closureHash,
     protocolMajor: protocolMajor,
+    externals:     externals,
   )
 
 proc invalidateEntry*(graph: var DepGraph; path: string; fHash: string) =
@@ -466,12 +469,29 @@ proc toJson(graph: DepGraph): JsonNode =
     sortedClosure.sort()
     for f in sortedClosure:
       closureArr.add newJString(f)
+    let externalsArr = newJArray()
+    var sortedExternals = entry.externals
+    sortedExternals.sort(proc(a, b: ExternalSource): int = cmp(a.source, b.source))
+    for ext in sortedExternals:
+      let extNode = newJObject()
+      extNode["source"] = newJString(ext.source)
+      extNode["obj"]    = newJString(ext.obj)
+      let hdrArr = newJArray()
+      var sortedHeaders = ext.headers
+      sortedHeaders.sort()
+      for h in sortedHeaders:
+        hdrArr.add newJString(h)
+      extNode["headers"]     = hdrArr
+      extNode["headersHash"] = newJString(ext.headersHash)
+      externalsArr.add extNode
+
     let entryNode = newJObject()
     entryNode["path"]          = newJString(path)
     entryNode["flagHash"]      = newJString(fHash)
     entryNode["closure"]       = closureArr
     entryNode["closureHash"]   = newJString(entry.closureHash)
     entryNode["protocolMajor"] = newJInt(entry.protocolMajor)
+    entryNode["externals"]     = externalsArr
     entriesArr.add entryNode
 
   result = newJObject()
@@ -566,10 +586,33 @@ proc fromJson(node: JsonNode; discarded: var DepGraphDiscard): DepGraph =
     let closureHash   = if closureHashNode != nil: closureHashNode.getStr("") else: ""
     let protocolMajor = if protocolMajNode != nil: protocolMajNode.getInt(0)  else: 0
 
+    var externals: seq[ExternalSource] = @[]
+    let externalsNode = entryNode{"externals"}
+    if externalsNode != nil and externalsNode.kind == JArray:
+      for extNode in externalsNode:
+        if extNode.kind != JObject: continue
+        let srcNode = extNode{"source"}
+        let objNode = extNode{"obj"}
+        if srcNode == nil or objNode == nil: continue
+        let src    = srcNode.getStr("")
+        let objVal = objNode.getStr("")
+        if src == "" or objVal == "": continue
+        var headers: seq[string] = @[]
+        let hdrNode = extNode{"headers"}
+        if hdrNode != nil and hdrNode.kind == JArray:
+          for h in hdrNode:
+            let hs = h.getStr("")
+            if hs != "": headers.add hs
+        let hHashNode = extNode{"headersHash"}
+        let hHash = if hHashNode != nil: hHashNode.getStr("") else: ""
+        externals.add ExternalSource(source: src, obj: objVal, headers: headers,
+                                     headersHash: hHash)
+
     result.entries[(path, fHash)] = DepGraphEntry(
       closure:       closure,
       closureHash:   closureHash,
       protocolMajor: protocolMajor,
+      externals:     externals,
     )
 
 # ---------------------------------------------------------------------------
@@ -658,7 +701,8 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
 
 proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
                     nimcacheDir, binaryName: string;
-                    protocolMajor: int; index: SourceIndex):
+                    protocolMajor: int; index: SourceIndex;
+                    ccRun: RunProc = realRun):
                     tuple[ok: bool, error: string] =
   ## Extract, hash, and persist one entrypoint's source closure after a
   ## successful compile — the single place issue #5's recovery policy lives.
@@ -668,6 +712,21 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## (`runner.execute`) and passed through for every entrypoint — never
   ## rebuilt per entrypoint (it is a pure function of the source tree, not
   ## of any single compile).
+  ##
+  ## `ccRun` — the `cc -M` header-probe seam (issue #16), threaded through to
+  ## `closure.extractCompileInputs`; defaults to `ccprobe.realRun`. Tests
+  ## inject a synthetic runner; production (`runner.execute`) uses the
+  ## default.
+  ##
+  ## Extraction (issue #16) now goes through `closure.extractCompileInputs`,
+  ## not `closure.extractClosure` directly: it additionally derives, for
+  ## every `{.compile.}`d single-path external this entrypoint names, the
+  ## header set it `#include`s (folded into the closure) and the entry's
+  ## `externals` list. `carried` is fed the CURRENT entry's `externals` (if
+  ## one already exists for this `(path, flagHash)` key) so a warm recompile
+  ## — where Nim serves an external's object from its own cache and the
+  ## manifest carries no `cc` command to re-probe — carries the header set
+  ## FORWARD instead of losing it (see `extractCompileInputs`'s doc comment).
   ##
   ## Policy: a compile whose closure cannot be recorded must not leave the
   ## previous entry in place — the stable binary already exists, so nothing
@@ -703,11 +762,15 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   let fHash = flagHash(ep.flags)
   let epAbs = if ep.path.isAbsolute: ep.path else: config.projectRoot / ep.path
   try:
-    let closureSet = extractClosure(nimcacheDir, binaryName, epAbs, config, index)
-    var closureSeq = toSeq(closureSet)
+    let key = (ep.path, fHash)
+    let carried = if key in graph.entries: graph.entries[key].externals else: @[]
+    let inputs = extractCompileInputs(nimcacheDir, binaryName, epAbs, config,
+                                      index, carried, ccRun)
+    var closureSeq = toSeq(inputs.files)
     closureSeq.sort()
     let contentHash = closureContentHash(closureSeq, config.projectRoot)
-    graph.updateEntry(ep.path, fHash, closureSet, contentHash, protocolMajor)
+    graph.updateEntry(ep.path, fHash, inputs.files, contentHash, protocolMajor,
+                      inputs.externals)
     if saveDepGraph(graph, config):
       result = (ok: true, error: "")
     else:
@@ -843,19 +906,58 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
   var rootsNorm = @[prNorm]
   for dr in config.depRoots:
     rootsNorm.add dr.absolutePath.normalizedPath
+
+  proc underRootNorm(p: string): bool =
+    ## Shared M10 predicate: normalize `p` (relative -> projectRoot-relative)
+    ## and test it against `rootsNorm` — the identical rule applied to
+    ## `entry.closure` paths, below, and now (issue #16) to
+    ## `entry.externals[].source`/`.headers[]` paths too.
+    let cand = (if p.isAbsolute: p else: prNorm / p).normalizedPath
+    for root in rootsNorm:
+      if cand == root or cand.startsWith(root & $DirSep):
+        return true
+    false
+
+  proc isPlainBasename(s: string): bool =
+    ## M10 guard for `entry.externals[].obj` (issue #16): per
+    ## `closure.ExternalSource.obj`'s contract, this field is documented as
+    ## a bare object BASENAME, never a resolvable path — so the guard here
+    ## is "contains no path separator and is not '..'", not a root-boundary
+    ## check (there is no directory to resolve it against; it names an
+    ## object inside a nimcache dir crisol never persists a rooted path
+    ## for).
+    if s.len == 0: return false
+    if '/' in s or '\\' in s: return false
+    if s == "..": return false
+    true
+
   for key in toSeq(result.entries.keys):
     var entry = result.entries[key]
     var filtered = initHashSet[string]()
     for p in entry.closure:
-      let cand = (if p.isAbsolute: p else: prNorm / p).normalizedPath
-      var underRoot = false
-      for root in rootsNorm:
-        if cand == root or cand.startsWith(root & $DirSep):
-          underRoot = true
-          break
-      if underRoot:
+      if underRootNorm(p):
         filtered.incl p   # kept VERBATIM — exactly as read from disk
       # else: drop the escaping path silently (absolute or relative alike)
+
+    # M10, extended (issue #16): `entry.externals[].source` must resolve
+    # under a tracked root (same rule/gate as a closure path — an
+    # ExternalSource whose `source` escapes is fully untrustworthy, so the
+    # WHOLE record is dropped, not just its `source` field) and `.obj` must
+    # be a plain basename; `.headers[]` are filtered per-path, mirroring
+    # `entry.closure`'s own per-path filtering above (an escaping header is
+    # dropped, the rest of the record is kept).
+    var filteredExternals: seq[ExternalSource] = @[]
+    for ext in entry.externals:
+      if not underRootNorm(ext.source): continue
+      if not isPlainBasename(ext.obj): continue
+      var keptHeaders: seq[string] = @[]
+      for h in ext.headers:
+        if underRootNorm(h):
+          keptHeaders.add h    # kept VERBATIM — exactly as read from disk
+      var kept = ext
+      kept.headers = keptHeaders
+      filteredExternals.add kept
+
     # Defense in depth — see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE:
     # the writer refuses to record an empty closure, but if one reaches disk
     # anyway, treat it as absent so decideCompile/narrow re-derive it.
@@ -863,6 +965,7 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
       result.entries.del(key)
       continue
     entry.closure = filtered
+    entry.externals = filteredExternals
     result.entries[key] = entry
 
 proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDiscard): DepGraph =

@@ -181,9 +181,20 @@
 ## `{.compile.}` object, and a non-absolute `{.link.}` entry — both name a
 ## `link` member `extractClosure` cannot attribute to any source file.
 
-import std/[json, os, sets, strutils, tables]
+import std/[algorithm, json, os, sets, strutils, tables]
 import crisol/types
-import crisol/config  # for stateDirOf — the source-index walk prunes it
+import crisol/config   # for stateDirOf — the source-index walk prunes it
+import crisol/ccprobe  # for RunProc/realRun/deriveCcMInvocation/ccIncludeHeaders
+                        # (issue #16) — a true leaf module (std-only), so this
+                        # creates no cycle. NOTE: this module deliberately does
+                        # NOT import crisol/depgraph (which imports THIS module
+                        # for extractClosure/SourceIndex) — importing it here
+                        # would close a cycle.
+import crisol/fnv       # for chainedContentHash — the same leaf `crisol/depgraph`
+                        # imports for its own hash primitives; used below for
+                        # ExternalSource.headersHash (issue #16).
+export ccprobe.RunProc
+export ccprobe.realRun
 
 # ---------------------------------------------------------------------------
 # SourceIndex — once-per-run basename -> absolute-paths index (issue #8)
@@ -812,6 +823,37 @@ proc resolveMangledAll(mangledName: string;
               result.add cand
 
 # ---------------------------------------------------------------------------
+# ExternalSource / CompileInputs (issue #16)
+# ---------------------------------------------------------------------------
+
+type
+  ExternalSource* = object
+    ## One `{.compile.}`d C/C++ source of an entrypoint (single-path @m/@p/@n
+    ## form, D3c — issue #11), plus the header set it `#include`s (issue #16).
+    source*:      string    ## project-relative, forward slashes
+    obj*:         string    ## object BASENAME inside the entrypoint's
+                             ## nimcache, e.g. "@mnative@sadd.c.o"
+    headers*:     seq[string] ## project-relative, sorted, deduped; only
+                               ## tracked-root headers (system headers excluded)
+    headersHash*: string    ## chainedContentHash(headers, projectRoot)
+
+  CompileInputs* = object
+    files*:     HashSet[string]  ## extractClosure result UNION every
+                                  ## external's headers
+    externals*: seq[ExternalSource]
+
+  AnalyzedExternal = object
+    ## Internal: one `link`-classified single-path external, as seen by
+    ## `analyzeManifest` — before header derivation (`extractCompileInputs`'s
+    ## job, since that needs to spawn `cc -M`, which `analyzeManifest` must
+    ## not do: it stays a pure manifest read, matching `extractClosure`'s
+    ## existing no-process-spawn contract).
+    source:   string   ## project-relative — same value that lands in `files`
+    obj:      string   ## object basename
+    ccCmd:    string    ## "" when no matching `compile` entry (warm-cached)
+    hasCcCmd: bool
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -900,12 +942,62 @@ proc parseCompileManifest*(jsonPath: string):
   result = (compile: pairs, link: link, linkcmd: jnode{"linkcmd"}.getStr(""),
            depfiles: depfiles, hasDepfiles: hasDepfiles)
 
-proc extractClosure*(nimcacheDir: string;
+proc ccCmdOutputObj(ccCmd: string): tuple[obj: string; ok: bool] =
+  ## Extract the `-o <obj>` (or fused `-o<obj>`) value from a manifest
+  ## `ccCmd` string — the mirror image of `ccprobe.deriveCcMInvocation`'s own
+  ## recognition of the same two forms (that proc DROPS the output flag to
+  ## build a `-M` probe invocation; this one CAPTURES its value instead, to
+  ## match a `compile` array entry to its `link` object EXACTLY — see
+  ## `analyzeManifest`'s external-matching comment below for why this must be
+  ## exact-value matching, never a basename heuristic). `ok = false` when the
+  ## command cannot be cleanly tokenized or carries no `-o` flag.
+  let (toks, splitOk) = shellSplit(ccCmd)
+  if not splitOk or toks.len < 2:
+    return (obj: "", ok: false)
+  var idx = 1
+  while idx < toks.len:
+    let t = toks[idx]
+    if t == "-o":
+      if idx + 1 < toks.len:
+        return (obj: toks[idx + 1], ok: true)
+      return (obj: "", ok: false)
+    if t.startsWith("-o") and t.len > 2:
+      return (obj: t[2 .. ^1], ok: true)
+    inc idx
+  (obj: "", ok: false)
+
+proc analyzeManifest(nimcacheDir: string;
                      binaryName: string;
                      entrypoint: string;
                      config: Config;
-                     index: SourceIndex): HashSet[string] =
-  ## Extract the source-dependency closure for one compiled entrypoint.
+                     index: SourceIndex):
+    tuple[files: HashSet[string]; externals: seq[AnalyzedExternal]] =
+  ## Extract the source-dependency closure for one compiled entrypoint, AND
+  ## (issue #16) classify every `link` entry that is a single-path
+  ## `{.compile.}`d external (D3c) into an `AnalyzedExternal` — its
+  ## project-relative source path, its object's basename, and (when the
+  ## manifest's `compile` array has a matching entry — a COLD compile of this
+  ## unit this round) the exact `ccCmd` that produced it.
+  ##
+  ## `extractClosure*` (below) is a thin wrapper: `analyzeManifest(...).files`.
+  ## `extractCompileInputs*` (below) is the other consumer: it drives each
+  ## `AnalyzedExternal` through a `cc -M` header probe (or, when `hasCcCmd`
+  ## is false — the object was served from Nim's OWN external-object cache
+  ## this round — a carried-forward header record from the entry's previous
+  ## `recordClosure`). Spawning that probe is deliberately NOT done here:
+  ## `analyzeManifest` stays a pure manifest read, matching `extractClosure`'s
+  ## existing no-process-spawn contract (recordClosure's failure-handling
+  ## doc comment, and this module's `parseCompileManifest*` doc, both assume
+  ## closure derivation never shells out).
+  ##
+  ## A `compile` array entry is matched to its `link` object EXACTLY: its
+  ## `ccCmd`'s `-o <obj>` (or fused `-o<obj>`) value, normalized, must equal
+  ## the `link` entry's own path, normalized (`ccCmdOutputObj`, above) — never
+  ## a basename heuristic (two different externals with colliding object
+  ## basenames under different nimcache subtrees must not cross-match).
+  ##
+  ## Parameters/return/raises: identical to `extractClosure*`'s doc comment
+  ## (below) for the `files` half of the return value — see that proc.
   ##
   ## Parameters:
   ##   `nimcacheDir`  — the `--nimcache` directory used to compile `entrypoint`.
@@ -989,18 +1081,33 @@ proc extractClosure*(nimcacheDir: string;
   let epAbs = entrypoint.absolutePath.normalizedPath
   let prAbs = config.projectRoot.absolutePath.normalizedPath
 
-  result = initHashSet[string]()
+  var files = initHashSet[string]()
+  var externals: seq[AnalyzedExternal] = @[]
+
+  # Map each `compile` entry's OUTPUT OBJECT (extracted from its own ccCmd,
+  # normalized) to that ccCmd — the exact-match table `analyzeManifest`'s
+  # doc comment describes. Built once, up front: `compile` is short (only
+  # this round's C work list, issue #5) and every `link` entry is checked
+  # against it at most once.
+  var objToCcCmd = initTable[string, string]()
+  for pair in manifest.compile:
+    let (obj, ok) = ccCmdOutputObj(pair.ccCmd)
+    if ok:
+      objToCcCmd[obj.normalizedPath] = pair.ccCmd
 
   for objPath in manifest.link:
     # moduleMangledNameOf applies the ".nim.{c,cpp,m}.o" module-object contract:
     # only Nim-generated module objects satisfy it — a `{.compile.}`d C/C++
     # external or foreign object/archive yields "" here.
     var mangledName = moduleMangledNameOf(objPath)
+    var isExternal = false
     if mangledName == "":
       # Not a module object. D3c (issue #11): a `{.compile.}`d external in
       # single-path (@m/@p/@n) form still names a real source file — decode
       # it via the SAME resolveMangledAll a module object uses below.
       mangledName = externalMangledNameOf(objPath)
+      if mangledName != "":
+        isExternal = true
       if mangledName == "":
         # Neither a module object nor a mangled single-path external — D8/D9
         # (issue #11 slices 8-9): classify what remains via
@@ -1028,7 +1135,7 @@ proc extractClosure*(nimcacheDir: string;
           # resolved candidate.
           let absObj = objPath.absolutePath.normalizedPath
           if index.underAnyRoot(absObj):
-            result.incl toProjectRelative(absObj, prAbs)
+            files.incl toProjectRelative(absObj, prAbs)
           continue
         of flkPrebuiltRel:
           # D9: a `{.link.}` entry with a non-absolute path — cannot be
@@ -1054,14 +1161,27 @@ proc extractClosure*(nimcacheDir: string;
       if not index.underAnyRoot(resolved): continue
 
       # Convert to projectRoot-relative, forward slashes.
-      result.incl toProjectRelative(resolved, prAbs)
+      let rel = toProjectRelative(resolved, prAbs)
+      files.incl rel
+
+      if isExternal:
+        # D3c (issue #11) single-path external — issue #16: also record it
+        # as an AnalyzedExternal for header derivation. Matched against
+        # `objToCcCmd` by the SAME `objPath` this iteration is processing
+        # (not `resolved`/`rel` — the match is object-to-object, source
+        # resolution is a separate concern).
+        let objKey = objPath.normalizedPath
+        let hasCcCmd = objKey in objToCcCmd
+        let ccCmd = if hasCcCmd: objToCcCmd[objKey] else: ""
+        externals.add AnalyzedExternal(source: rel, obj: objPath.extractFilename,
+                                       ccCmd: ccCmd, hasCcCmd: hasCcCmd)
 
   for df in manifest.depfiles:
     # depfiles entries are already absolute paths (no @m/@p/@n mangling) —
     # normalize only. Existence is NOT checked (R5 policy, same as `link`).
     let abs = df.path.absolutePath.normalizedPath
     if index.underAnyRoot(abs):
-      result.incl toProjectRelative(abs, prAbs)
+      files.incl toProjectRelative(abs, prAbs)
     else:
       # Fallback for a depfiles path recorded relative to something other
       # than the tracked lexical root (e.g. reached through a symlink into
@@ -1071,7 +1191,40 @@ proc extractClosure*(nimcacheDir: string;
       for cand in index.lookupByReal(abs):
         let candAbs = cand.absolutePath.normalizedPath
         if index.underAnyRoot(candAbs):
-          result.incl toProjectRelative(candAbs, prAbs)
+          files.incl toProjectRelative(candAbs, prAbs)
+
+  result = (files: files, externals: externals)
+
+proc extractClosure*(nimcacheDir: string;
+                     binaryName: string;
+                     entrypoint: string;
+                     config: Config;
+                     index: SourceIndex): HashSet[string] =
+  ## Extract the source-dependency closure for one compiled entrypoint.
+  ##
+  ## Parameters:
+  ##   `nimcacheDir`  — the `--nimcache` directory used to compile `entrypoint`.
+  ##   `binaryName`   — the basename of the `-o:` binary (used to locate the
+  ##                    JSON: `<nimcacheDir>/<binaryName>.json`).
+  ##   `entrypoint`   — absolute (or project-root-relative) path to the `.nim`
+  ##                    source file.
+  ##   `config`       — must have `projectRoot` set; may have `depRoots`.
+  ##   `index`        — a `SourceIndex` (`buildSourceIndex(config)`), used to
+  ##                    resolve `@p`/`@n` bodies (issue #8).  Built ONCE per
+  ##                    run by the caller (`runner.execute`) — never rebuild
+  ##                    per entrypoint; the overload below builds one ad hoc
+  ##                    for tests/one-off callers.
+  ##
+  ## Returns a `HashSet[string]` of projectRoot-relative, forward-slash paths.
+  ##
+  ## Thin wrapper over `analyzeManifest` (issue #16 refactor) — see that
+  ## proc's doc comment, and the module doc comment above, for the full
+  ## algorithm (unchanged): unions `link` (4-way classified) and `depfiles`,
+  ## both filtered through the under-tracked-root soundness gate. Raises
+  ## `CrisolError(cekEnvironment)` under the same conditions documented
+  ## there (missing/unparseable manifest; empty `link`; no `depfiles` key;
+  ## a tuple-form `{.compile.}` object; a non-absolute `{.link.}` entry).
+  analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index).files
 
 proc extractClosure*(nimcacheDir: string;
                      binaryName: string;
@@ -1082,3 +1235,114 @@ proc extractClosure*(nimcacheDir: string;
   ## via `runner.execute`) build the index ONCE per run instead — see the
   ## 5-arg overload above.
   extractClosure(nimcacheDir, binaryName, entrypoint, config, buildSourceIndex(config))
+
+# ---------------------------------------------------------------------------
+# extractCompileInputs (issue #16) — closure.files PLUS every {.compile.}d
+# external's #include'd header set.
+# ---------------------------------------------------------------------------
+
+proc extractCompileInputs*(nimcacheDir: string;
+                           binaryName: string;
+                           entrypoint: string;
+                           config: Config;
+                           index: SourceIndex;
+                           carried: openArray[ExternalSource];
+                           ccRun: RunProc = realRun): CompileInputs =
+  ## Extract the source-dependency closure AND, for every `{.compile.}`d
+  ## single-path external (D3c) it names, the header set that external's
+  ## `#include`s — folded into `result.files` so `--changed` selection and
+  ## `crisol closure` both see it (issue #16).
+  ##
+  ## For each `AnalyzedExternal` `analyzeManifest` classifies:
+  ##
+  ## - `hasCcCmd` (the manifest's `compile` array has a matching entry — Nim
+  ##   actually compiled this unit THIS round): derive a `cc -M` invocation
+  ##   from its exact `ccCmd` (`ccprobe.deriveCcMInvocation` — REPLICATES the
+  ##   real command, never an allow-list; see that proc's doc comment), run
+  ##   it through the injectable `ccRun` seam, and parse the header set
+  ##   (`ccprobe.ccIncludeHeaders`). A derivation or probe failure raises
+  ##   `CrisolError(cekEnvironment)` — fail closed, exactly like every other
+  ##   closure-extraction failure (`recordClosure` invalidates the entry and
+  ##   discards the stable binary; see its doc comment).
+  ##
+  ## - NOT `hasCcCmd` (Nim served the object from its OWN external-object
+  ##   cache this round — `extccomp.footprint`/`addExternalFileToCompile`
+  ##   marked it Cached, so the manifest's `compile` array omits it, mirroring
+  ##   how a warm module recompile omits unchanged modules, issue #5): the
+  ##   header set cannot be re-derived THIS round (there is no `cc` command to
+  ##   probe), so it is carried forward from `carried` — the entry's
+  ##   `externals` from the PREVIOUS successful `recordClosure` for this
+  ##   (path, flagHash), matched by `source`. Absent from `carried` (the
+  ##   external is new to the closure this round yet somehow already
+  ##   Nim-cached — shouldn't happen in practice, but is not assumed away):
+  ##   raises `CrisolError(cekEnvironment)` naming the source — fail closed,
+  ##   never silently record an unknown (and therefore possibly stale)
+  ##   header set.
+  ##
+  ## Each header path `cc -M` reports is normalized before being kept: a
+  ## relative path is resolved against `getCurrentDir()` (the same directory
+  ## `ccRun` — and the real `nim c`/`cc` invocation before it — ran in; see
+  ## `ccprobe.realRun`'s doc comment), then kept iff it resolves under a
+  ## tracked root (`index.underAnyRoot`/`toProjectRelative` — the identical
+  ## soundness gate `analyzeManifest`'s closure paths pass through), else
+  ## dropped silently (a system header, e.g. `/usr/include/stdint.h`, is
+  ## never tracked). The kept set is sorted and deduplicated.
+  ##
+  ## `result.files = analyzeManifest(...).files UNION every external's headers`.
+  let analyzed = analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index)
+  let prAbs = config.projectRoot.absolutePath.normalizedPath
+  let cwd = getCurrentDir()
+
+  var carriedBySource = initTable[string, ExternalSource]()
+  for c in carried:
+    carriedBySource[c.source] = c
+
+  var files = analyzed.files
+  var externals: seq[ExternalSource] = @[]
+
+  for ext in analyzed.externals:
+    var headers: seq[string]
+
+    if ext.hasCcCmd:
+      let inv = deriveCcMInvocation(ext.ccCmd)
+      if not inv.ok:
+        raise newCrisolError(cekEnvironment,
+          "cannot derive a 'cc -M' header probe for '" & ext.source &
+          "': its compile command in the nimcache manifest could not be " &
+          "cleanly tokenized")
+      let (output, ranOk) = ccRun(inv.cmd, inv.args)
+      if not ranOk:
+        raise newCrisolError(cekEnvironment,
+          "'cc -M' header probe failed for '" & ext.source & "'" &
+          " (command: " & inv.cmd & ")")
+
+      var kept: seq[string] = @[]
+      var seen = initHashSet[string]()
+      for h in ccIncludeHeaders(output, inv.sourceFile):
+        let habs =
+          if h.isAbsolute: h.normalizedPath
+          else: (cwd / h).normalizedPath
+        if not index.underAnyRoot(habs): continue    # system header, etc. — excluded
+        let rel = toProjectRelative(habs, prAbs)
+        if rel notin seen:
+          seen.incl rel
+          kept.add rel
+      kept.sort()
+      headers = kept
+    else:
+      if ext.source notin carriedBySource:
+        raise newCrisolError(cekEnvironment,
+          "cannot determine the header set for '" & ext.source &
+          "': its object was served from Nim's own external-object cache " &
+          "this compile (no matching 'compile' entry in the nimcache " &
+          "manifest to derive a 'cc -M' probe from), and no carried-forward " &
+          "header record exists for it from a previous run")
+      headers = carriedBySource[ext.source].headers
+
+    let hHash = chainedContentHash(headers, config.projectRoot)
+    externals.add ExternalSource(source: ext.source, obj: ext.obj,
+                                 headers: headers, headersHash: hHash)
+    for h in headers:
+      files.incl h
+
+  result = CompileInputs(files: files, externals: externals)

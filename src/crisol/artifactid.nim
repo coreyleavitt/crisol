@@ -127,10 +127,21 @@
 ## segmentation.
 
 import std/[algorithm, sets, strutils, tables]
-import crisol/depgraph   # re-uses fnv1a64, toHex16, fnvOffset64; never reimplement
+import crisol/depgraph   # re-uses fnv1a64, toHex16, fnvOffset64 — now defined in
+                          # crisol/fnv, re-exported by depgraph; never reimplement
 import crisol/ccprobe    # re-uses the RunProc (cmd,args)->(output,ok) seam idiom
 export ccprobe.RunProc
 export ccprobe.realRun
+# `shellSplit`/`deriveCcMInvocation`/`parseCcMDeps`/`ccIncludeHeaders` moved to
+# `crisol/ccprobe` (issue #16, see that module's doc comment for why: they are
+# dependency-free and `crisol/closure`'s `extractCompileInputs` needed them
+# too, but `closure.nim` cannot import `artifactid.nim` without closing a
+# cycle through `depgraph.nim`). Re-exported here so every existing caller of
+# `import crisol/artifactid` keeps compiling unchanged.
+export ccprobe.shellSplit
+export ccprobe.deriveCcMInvocation
+export ccprobe.parseCcMDeps
+export ccprobe.ccIncludeHeaders
 
 # ---------------------------------------------------------------------------
 # Seam: file reader (response-file inlining + header-closure content hashing)
@@ -259,154 +270,10 @@ proc normalize*(content: string; knownStrings: openArray[string];
 # ---------------------------------------------------------------------------
 # ccIncludeClosure()
 # ---------------------------------------------------------------------------
-
-proc shellSplit*(s: string): tuple[toks: seq[string]; ok: bool] =
-  ## **Exported (review Finding 2).** Tokenizes a manifest `ccCmd` string
-  ## shell-AWARE, for `deriveCcMInvocation`'s own use below — a
-  ## whitespace-containing path (realistic under WSL2 — the RFC itself calls
-  ## this out) would otherwise silently corrupt a naive `splitWhitespace()`
-  ## derivation instead of failing loudly.
-  ##
-  ## Minimal POSIX-shell-like tokenizer: single-quoted segments (literal, no
-  ## escapes inside — matches `sh`), double-quoted segments (backslash
-  ## escapes `\\`, `\"`, `\$`, `` \` `` inside — matches `sh`), and
-  ## backslash-escaping outside quotes. Whitespace (space/tab/newline/CR)
-  ## separates tokens outside quotes. `ok = false` on an unterminated quote
-  ## or a trailing unescaped backslash — cases this parser cannot
-  ## disambiguate; callers MUST treat that as a derivation failure
-  ## (fail-safe: never guess, never emit a wrong-but-plausible tokenization).
-  ##
-  ## This is deliberately the SAME quoting convention `std/os.quoteShellPosix`
-  ## produces (single-quote-wrap, `'\''`-escape for an embedded quote), so it
-  ## correctly round-trips a Nim-generated cc command whose `-I` argument
-  ## contains a space (realistic under WSL2 / a mounted toolchain) — the real
-  ## compile runs that same string through a shell (`execProcesses`'s
-  ## `poEvalCommand` — see compiledriver.nim's module doc), so deriving the
-  ## `cc -M` probe args must tokenize identically or the probe silently runs
-  ## with wrong/omitted flags (R1b).
-  var toks: seq[string]
-  var cur = ""
-  var haveCur = false
-  var i = 0
-  let n = s.len
-  while i < n:
-    let c = s[i]
-    case c
-    of ' ', '\t', '\n', '\r':
-      if haveCur:
-        toks.add cur
-        cur = ""
-        haveCur = false
-      inc i
-    of '\'':
-      haveCur = true
-      inc i
-      while i < n and s[i] != '\'':
-        cur.add s[i]
-        inc i
-      if i >= n:
-        return (toks: newSeq[string](), ok: false)   # unterminated single quote
-      inc i   # skip closing quote
-    of '"':
-      haveCur = true
-      inc i
-      while i < n and s[i] != '"':
-        if s[i] == '\\' and i + 1 < n and s[i + 1] in {'\\', '"', '$', '`'}:
-          cur.add s[i + 1]
-          i += 2
-        else:
-          cur.add s[i]
-          inc i
-      if i >= n:
-        return (toks: newSeq[string](), ok: false)   # unterminated double quote
-      inc i   # skip closing quote
-    of '\\':
-      haveCur = true
-      if i + 1 < n:
-        cur.add s[i + 1]
-        i += 2
-      else:
-        return (toks: newSeq[string](), ok: false)   # trailing unescaped backslash
-    else:
-      haveCur = true
-      cur.add c
-      inc i
-  if haveCur:
-    toks.add cur
-  result = (toks: toks, ok: true)
-
-proc deriveCcMInvocation*(ccCmd: string):
-    tuple[cmd: string; args: seq[string]; sourceFile: string; ok: bool] =
-  ## Derive a `cc -M` dependency-generation invocation from one manifest
-  ## `ccCmd` string (see `closure.parseCompileManifest`).
-  ##
-  ## **Review Finding 1 (soundness): REPLICATE the real command, don't
-  ## allow-list.** Every flag token survives VERBATIM except the two that
-  ## must not be there for a `-M` run: the compile-action flag `-c`, and the
-  ## output flag `-o <obj>` — removed in EITHER its space-separated form
-  ## (the `-o` token AND the single token immediately following it) or its
-  ## fused form (a token starting with `-o` and longer than 2 characters,
-  ## e.g. `-ofoo`; that token alone is dropped, it has no separate argument).
-  ## `-M` is prepended and the original source file (the command's last
-  ## shell token — matching `closure.parseCompileManifest`'s own convention
-  ## that the compiled `.c` is always the final argument) is appended last.
-  ## See the module doc's "ccIncludeClosure()" section for WHY this must be
-  ## a denylist of exactly these two things, never an allow-list of flags
-  ## assumed to matter: any OTHER flag (`-isystem`, `-iquote`, `-include`,
-  ## `-nostdinc`, …) changes header resolution just as much as `-I`/`-D`/
-  ## `-std` and must reach the probe unchanged.
-  ##
-  ## Tokenizes via `shellSplit` — shell-AWARE (R1b), not a naive
-  ## `splitWhitespace` — because the real compile runs `ccCmd` through a
-  ## shell (compiledriver's `execProcesses`/`poEvalCommand`), so a
-  ## whitespace-naive split would mis-tokenize a shell-quoted path
-  ## containing a space and silently derive a WRONG-but-nonempty probe
-  ## (feeds R1's soundness bug). `ok = false` (R4/R1b) — never a raise, never
-  ## a `Defect` — whenever the command can't be cleanly tokenized (an
-  ## unterminated quote) OR has fewer than 2 tokens (no source file to
-  ## target): a per-unit oddity must degrade, never crash the worker past
-  ## its `except CatchableError` escape hatch (R4).
-  let (toks, splitOk) = shellSplit(ccCmd)
-  if not splitOk or toks.len < 2:
-    return (cmd: "", args: newSeq[string](), sourceFile: "", ok: false)
-  let cc = toks[0]
-  let sourceFile = toks[^1]
-  var kept: seq[string] = @["-M"]
-  var idx = 1
-  while idx < toks.len - 1:
-    let t = toks[idx]
-    if t == "-c":
-      inc idx   # drop the compile-action flag
-      continue
-    if t == "-o":
-      idx += 2   # drop the flag AND its separated argument
-      continue
-    if t.startsWith("-o") and t.len > 2:
-      inc idx   # drop the fused "-o<obj>" form (no separate argument)
-      continue
-    kept.add t
-    inc idx
-  kept.add sourceFile
-  result = (cmd: cc, args: kept, sourceFile: sourceFile, ok: true)
-
-proc parseCcMDeps*(ccMOutput: string): seq[string] =
-  ## Parse GNU-make-style dependency output (`target: dep1 dep2 \` with
-  ## backslash line continuations) into the flat list of dependency tokens,
-  ## INCLUDING the source file itself (callers that need it excluded should
-  ## filter by the known source path — see `ccIncludeHeaders`).
-  let joined = ccMOutput.replace("\\\r\n", " ").replace("\\\n", " ")
-  let colonIdx = joined.find(':')
-  let depsStr = if colonIdx >= 0: joined[colonIdx + 1 .. ^1] else: joined
-  for tok in depsStr.splitWhitespace():
-    result.add tok
-
-proc ccIncludeHeaders*(ccMOutput: string; sourceFile: string): seq[string] =
-  ## The header set: every dependency `cc -M` reports EXCEPT the compiled
-  ## source file itself (excluded by exact match on the known path used to
-  ## derive the invocation — never guessed).
-  for p in parseCcMDeps(ccMOutput):
-    if p.len > 0 and p != sourceFile:
-      result.add p
+#
+# `shellSplit`/`deriveCcMInvocation`/`parseCcMDeps`/`ccIncludeHeaders` now
+# live in `crisol/ccprobe` (issue #16) and are re-exported above — see this
+# module's top-of-file import comment and ccprobe.nim's module doc for why.
 
 proc includeClosureContentHash*(headerPaths: seq[string];
                                 readFile: FileReaderProc = realFileReader): string =

@@ -341,28 +341,28 @@ echo "PASS test_depgraph"
 # ---------------------------------------------------------------------------
 
 block test_format_version_pin:
-  ## DepGraphFormatVersion is 4 as of issue #11: closures now cover
-  ## non-module compile inputs (include'd files, staticRead/slurp targets,
-  ## nim.cfg/config.nims, {.compile.}d sources, {.link.}ed objects). A v3
-  ## closure missing one of those inputs hash-matches itself forever and
-  ## its nimcache manifest (compiled without -d:nimBetterRun) carries no
-  ## `depfiles` to re-derive from, so the graph must be discarded once.
+  ## DepGraphFormatVersion is 5 as of issue #16: a {.compile.}d external's
+  ## #include'd headers are now tracked compile inputs, joining `closure`
+  ## itself and recorded per-external in the new `externals` field. A v4
+  ## closure is missing whatever headers its externals (if any) #include —
+  ## under-selecting exactly like a v3 entry was missing {.compile.}d
+  ## sources themselves (issue #11) — so the graph must be discarded once.
   ## Bump this pin only together with a History entry in depgraph.nim and a
   ## CHANGELOG "BREAKING CHANGE — dependency graph format N" section.
-  assert DepGraphFormatVersion == 4,
-    "DepGraphFormatVersion pin: expected 4 (issue #11), got " & $DepGraphFormatVersion
+  assert DepGraphFormatVersion == 5,
+    "DepGraphFormatVersion pin: expected 5 (issue #16), got " & $DepGraphFormatVersion
 
-  # A v3 graph on disk is treated as absent (discarded, not migrated).
-  let root = getTempDir() / ("crisol_depgraph_v3pin_" & $getpid())
+  # A v4 graph on disk is treated as absent (discarded, not migrated).
+  let root = getTempDir() / ("crisol_depgraph_v4pin_" & $getpid())
   removeDir(root)
   ensureStateDirExists(root)
   defer: removeDir(root)
-  let v3 = %*{
-    "header": {"nimVersion": "", "formatVersion": 3},
+  let v4 = %*{
+    "header": {"nimVersion": "", "formatVersion": 4},
     "entries": [{"path": "tests/unit/test_x.nim", "flagHash": "cbf29ce484222325",
                  "closure": ["tests/unit/test_x.nim"], "closureHash": "00",
                  "protocolMajor": 1}]}
-  writeFile(root / ".crisol" / "depgraph", $v3)
+  writeFile(root / ".crisol" / "depgraph", $v4)
   let loaded = loadDepGraph(makeTmpConfig(root), "")
   assert loaded.entries.len == 0,
-    "a format-3 depgraph must be discarded on load (got " & $loaded.entries.len & " entries)"
+    "a format-4 depgraph must be discarded on load (got " & $loaded.entries.len & " entries)"
