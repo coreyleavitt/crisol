@@ -254,6 +254,17 @@ proc hasFailRecords*(r: EntrypointResult): bool =
     if rec.status == rsFail: return true
   false
 
+type
+  Rfc7Window* = object
+    ## A1b-A1e dual-write carrier: pairs one legacy `crisol/types.EntrypointResult`
+    ## with the compile/run `Phase`s actually captured for it, so `runner.execute`
+    ## can populate the §2 shape ALONGSIDE the legacy fields without `crisol/types`
+    ## importing this module (that would cycle back through `ctypes` above).
+    ## Indexed identically to `execute()`'s returned `seq[EntrypointResult]`.
+    ## Exists only for the dual-write window — deleted at A1e-i once these
+    ## fields live directly on `EntrypointResult`.
+    compile*, run*: Phase
+
 proc deriveOutcome*(r: EntrypointResult; policy: OutcomePolicy = DefaultPolicy): Outcome =
   ## PURE over (result, policy) — §2's total case expression, verbatim.
   ## Named `deriveOutcome`, not `outcome`: while the legacy `outcome` FIELD

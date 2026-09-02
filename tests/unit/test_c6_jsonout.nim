@@ -35,8 +35,9 @@ suite "C6 — run/v1 regressions + render":
     ## RFC-0006 Stage R removal bumped 11->12 -- `compile.objcache` (rev 10)
     ## no longer appears in any document (Stage M + the RFC-0004 result
     ## cache are unchanged); issue #5 bumped 12->13 (cacheDecision
-    ## "closureUnrecorded"); issue #10 bumped 13->14 (per-entrypoint `flags`).
-    check RunV1Revision == 14
+    ## "closureUnrecorded"); issue #10 bumped 13->14 (per-entrypoint `flags`);
+    ## rfc-0007 A1b bumped 14->15 (advisory per-entrypoint `exit`/`cause`).
+    check RunV1Revision == 15
 
   test "regressions array present and empty when no regressions":
     let results = @[

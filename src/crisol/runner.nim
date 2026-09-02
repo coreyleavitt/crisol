@@ -33,6 +33,12 @@
 import std/[json, monotimes, options, os, sets, strutils, tables, times]
 import std/posix
 import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver]
+# rfc-0007 A1b: the §2 result-model types (Exit/Cause/Phase/…), dual-written
+# alongside the legacy fields above via process/types.Rfc7Window — see
+# pollSlot and buildProcResult below. `import nil` (not a plain `import as`)
+# so nothing unqualified leaks in — `Rusage` in this file must stay
+# std/posix's Rusage (used at every real reap site), never ptypes.Rusage.
+from crisol/process/types as ptypes import nil
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
 # M4: re-export the CacheContext bundle + constructors so callers of execute()
 # don't need a separate `import crisol/cachedispatch`.
@@ -214,31 +220,149 @@ type
                                    # the slot is claimed (before compile or run spawned).
                                    # Updated each poll tick for run-phase (spRunning) slots.
                                    # Read at finalize; threaded into ledger row + EntrypointResult.
+    compileProcRes:  Option[ptypes.ProcessResult]  # rfc-0007 A1b: the compile phase's
+                                   # captured Exit/Cause/rusage, set the moment a
+                                   # this-run compile is reaped successfully so the
+                                   # eventual run-phase result can dual-write BOTH
+                                   # phases. Reset to none() at every slot claim
+                                   # (spawnCompileStable / spawnRunDirect) so a
+                                   # reused physical slot never leaks a prior
+                                   # occupant's compile observation.
 
-proc reapBlocking(pid: Pid) =
-  ## Blocking waitpid that retries on EINTR — consistent with supervise's
-  ## post-SIGKILL reap.  Ensures a child killed during interrupt/exception
-  ## teardown is collected even if a signal interrupts the wait.
-  var ws: cint = 0
+# ---------------------------------------------------------------------------
+# rfc-0007 A1b: honest reap capture — waitpid replaced with wait4 at every
+# reap site so rusage is captured alongside the wstatus (never zero-filled;
+# std/posix already declares `wait4`/`Rusage` in this toolchain, so no
+# hand-rolled FFI struct was needed here — see decodeRusage below).
+# ---------------------------------------------------------------------------
+
+type
+  Rfc7Stop = Option[tuple[reason: ptypes.KillReason, escalated: bool]]
+
+  KillCapture = object
+    ## What a reap actually observed — NEVER fabricated. `reaped == false`
+    ## means truly unreaped (ECHILD, or the RFC's "unkillable child" corner:
+    ## a wedged D-state process outliving even a blocking reap's retry
+    ## loop) — callers must not synthesize an Exit in that case (§2).
+    reaped*:    bool
+    exit*:      ptypes.Exit
+    rusage*:    ptypes.Rusage
+    escalated*: bool   ## true iff SIGKILL was sent BEFORE this exit was
+                       ## observed — the §2 definition of `escalated`.
+
+let NoRfc7Stop: Rfc7Stop = none(tuple[reason: ptypes.KillReason, escalated: bool])
+
+proc wcoredump(wstatus: cint): bool =
+  ## WCOREDUMP is a C macro, not always importc-able through the header.
+  ## Linux/glibc defines it as `status & __WCOREFLAG` (0200 octal = 0x80) —
+  ## see <bits/waitstatus.h> — a stable ABI bit, not a guess.
+  (wstatus and 0x80) != 0
+
+proc decodeExit(wstatus: cint): ptypes.Exit =
+  ## The one place a raw wstatus becomes a §2 Exit — lossless, and nothing
+  ## else (never derives Cause here; that is classifyCause's job alone).
+  if WIFEXITED(wstatus):
+    ptypes.Exit(kind: ptypes.ekExited, code: int(WEXITSTATUS(wstatus)))
+  elif WIFSIGNALED(wstatus):
+    ptypes.Exit(kind: ptypes.ekSignaled, sig: int(WTERMSIG(wstatus)),
+               coreDumped: wcoredump(wstatus))
+  else:
+    # wait4 is never called with WUNTRACED/WCONTINUED here, so a stopped/
+    # continued notification cannot reach this branch in practice; kept as
+    # a defined fallback rather than an unreachable-by-construction crash.
+    ptypes.Exit(kind: ptypes.ekExited, code: 0)
+
+proc decodeRusage(ru: Rusage): ptypes.Rusage =
+  ## ru_maxrss is reported in KiB on Linux — converted to bytes here so
+  ## every ptypes.Rusage.maxRssBytes consumer sees the same unit (§2).
+  ptypes.Rusage(
+    maxRssBytes: int64(ru.ru_maxrss) * 1024,
+    userCpuUs:   int64(ru.ru_utime.tv_sec) * 1_000_000 + int64(ru.ru_utime.tv_usec),
+    sysCpuUs:    int64(ru.ru_stime.tv_sec) * 1_000_000 + int64(ru.ru_stime.tv_usec),
+  )
+
+proc buildProcResult(exit: ptypes.Exit; rusage: ptypes.Rusage; stop: Rfc7Stop;
+                     durationUs: int64): ptypes.ProcessResult =
+  ## The one place a live reap's ProcessResult is assembled. Limits/
+  ## LimitsAchieved stay at their zero value (lsNotRequested) because the
+  ## runner does not yet plumb requested-limit info into Cause (A2a-iii) —
+  ## classifyCause's cbLimit branch is therefore unreachable from here until
+  ## then, which is the honest default (never a false vouch), not a bug.
+  ptypes.ProcessResult(
+    exit: exit,
+    cause: ptypes.classifyCause(exit, stop, ptypes.Limits(), default(ptypes.LimitsAchieved)),
+    evidence: default(ptypes.Evidence),
+    rusage: some(rusage),
+    durationUs: durationUs,
+  )
+
+proc reapBlocking(pid: Pid): KillCapture =
+  ## Blocking wait4 that retries on EINTR — consistent with supervise's
+  ## post-SIGKILL reap.  Captures the real wstatus + rusage (rfc-0007 A1b:
+  ## this used to be a bare waitpid whose status was thrown away).
+  var wstatus: cint = 0
+  var ru: Rusage
   while true:
-    let r = waitpid(pid, ws, 0)
-    if r >= Pid(0) or errno != EINTR: break
+    let r = wait4(pid, addr wstatus, 0, addr ru)
+    if r >= Pid(0):
+      return KillCapture(reaped: true, exit: decodeExit(wstatus), rusage: decodeRusage(ru))
+    if errno != EINTR:
+      return KillCapture(reaped: false)
 
-proc killAndReap(pid: Pid) =
-  ## M11: Send SIGTERM to the process group, wait up to GracePeriodMs, then
-  ## escalate to SIGKILL and do a blocking reap.
+proc killAndReap(pid: Pid): KillCapture =
+  ## M11 / rfc-0007 A1b: Send SIGTERM to the process group, wait up to
+  ## GracePeriodMs, then escalate to SIGKILL and do a blocking reap —
+  ## capturing what actually happened instead of discarding it. `escalated`
+  ## is true iff SIGKILL was sent before an exit was observed (§2) — exactly
+  ## what the two return points below encode structurally: the WNOHANG poll
+  ## loop returns escalated:false on every path (an exit was seen before any
+  ## SIGKILL), and reaching the SIGKILL line below is only possible once the
+  ## grace window is exhausted with no exit observed.
   ## Safe to call when the process may already be dead.
   discard killpg(pid, SIGTERM)
   let graceDeadline = getMonoTime() + initDuration(milliseconds = GracePeriodMs)
   while getMonoTime() < graceDeadline:
-    var ws: cint = 0
-    let r = waitpid(pid, ws, WNOHANG)
+    var wstatus: cint = 0
+    var ru: Rusage
+    let r = wait4(pid, addr wstatus, WNOHANG, addr ru)
     if r == pid:
-      return  # exited cleanly during grace
+      return KillCapture(reaped: true, exit: decodeExit(wstatus),
+                         rusage: decodeRusage(ru), escalated: false)
     os.sleep(20)
   # Escalate to SIGKILL and reap.
   discard killpg(pid, SIGKILL)
-  reapBlocking(pid)
+  result = reapBlocking(pid)
+  result.escalated = true
+
+# ---------------------------------------------------------------------------
+# rfc-0007 A1b: dual-write coherence — a debug-gated postcondition asserting
+# the legacy outcome and the newly-captured compile/run Phase pair agree
+# under §2's documented retry mapping (oTimeout -> oKilled, oSignal ->
+# oCrashed). Runs in the normal test path (every execute() call, not a
+# bespoke test) so a regression in the new capture chain cannot hide behind
+# a green legacy assertion. Deleted at A1e-i once the legacy fields are gone.
+# ---------------------------------------------------------------------------
+
+proc mapLegacyOutcomeForward(o: Outcome): Outcome =
+  case o
+  of oTimeout: oKilled
+  of oSignal:  oCrashed
+  else:        o
+
+proc checkRfc7Coherence(legacy: EntrypointResult; w: ptypes.Rfc7Window) =
+  let shaped = ptypes.EntrypointResult(
+    ep: legacy.ep, compile: w.compile, run: w.run, records: legacy.records,
+  )
+  let derived  = ptypes.deriveOutcome(shaped)
+  let expected = mapLegacyOutcomeForward(legacy.outcome)
+  doAssert derived == expected,
+    "rfc-0007 A1b dual-write coherence: " & legacy.ep.path & " legacy outcome=" &
+    $legacy.outcome & " (mapped " & $expected & ") but derived=" & $derived &
+    " from the captured compile/run Phase"
+
+template rfc7Check(legacy: EntrypointResult; w: ptypes.Rfc7Window) =
+  when not defined(danger):
+    checkRfc7Coherence(legacy, w)
 
 proc teardownLiveSlots(slots: var seq[Slot]) =
   ## M6: Graceful shutdown of all live slots — shared by handleInterrupt and the
@@ -262,11 +386,19 @@ proc teardownLiveSlots(slots: var seq[Slot]) =
       if slots[i].pepIdx == -1: continue  # idle or already reap-tracked
       if reapedInGrace[i]: continue       # reaped this grace window — skip
       var ws: cint = 0
-      let r = waitpid(slots[i].pid, ws, WNOHANG)
+      var ru: Rusage
+      let r = wait4(slots[i].pid, addr ws, WNOHANG, addr ru)
       if r == Pid(0):
         allDead = false                   # still alive; keep draining
       elif r > Pid(0):
         reapedInGrace[i] = true           # exited cleanly during grace; do NOT SIGKILL
+        # rfc-0007 A1b: captured (decoded), not discarded — a real Exit, not
+        # a fabricated one. Attribution to an EntrypointResult and emission
+        # on the wire are A1e-ii's job: interrupt-killed results are OMITTED
+        # from the emission set (§2), so there is no result to attach this
+        # to yet.
+        discard decodeExit(ws)
+        discard decodeRusage(ru)
     if allDead: break
     os.sleep(20)
 
@@ -276,11 +408,17 @@ proc teardownLiveSlots(slots: var seq[Slot]) =
     if slots[i].pepIdx == -1: continue
     if reapedInGrace[i]: continue  # R2-2: already reaped in Phase 2; do not SIGKILL
     var ws: cint = 0
-    let r = waitpid(slots[i].pid, ws, WNOHANG)
+    var ru: Rusage
+    let r = wait4(slots[i].pid, addr ws, WNOHANG, addr ru)
     if r == Pid(0):
       discard killpg(slots[i].pid, SIGKILL)
-      reapBlocking(slots[i].pid)
+      discard reapBlocking(slots[i].pid)  # rfc-0007 A1b: captures via wait4; see above
     # else: exited between Phase 2 end and Phase 3 check — already reaped, no SIGKILL
+    elif r > Pid(0):
+      # rfc-0007 A1b: captured, not discarded — same deferred-attribution
+      # note as Phase 2 above.
+      discard decodeExit(ws)
+      discard decodeRusage(ru)
 
   ## Phase 4: cleanup temp dirs and clear slot so loops are idempotent on
   ## double-invocation (e.g. interrupt path marks slots idle before finally runs).
@@ -631,6 +769,10 @@ proc spawnCompileStable(
   slot.compiledThisRun = true
   slot.compileSkipped  = false
   slot.spec            = spec          # A6: stored for the compile→run transition (spawnRun)
+  slot.compileProcRes  = none(ptypes.ProcessResult)  # rfc-0007 A1b: reset on every claim
+                                        # so a reused slot never leaks a prior occupant's
+                                        # compile observation; pollSlot sets this for real
+                                        # once THIS compile is reaped.
   result = true
 
 proc spawnRunDirect(
@@ -702,6 +844,10 @@ proc spawnRunDirect(
   slot.compiledThisRun = false
   slot.compileSkipped  = true
   slot.achieved        = achieved      # A4d/A6: hermeticity delivered by this run
+  slot.compileProcRes  = none(ptypes.ProcessResult)  # rfc-0007 A1b: cdSkipFresh —
+                                        # no compile happened this run; reset so a
+                                        # reused slot never leaks a prior occupant's
+                                        # compile observation.
   result = true
 
 proc spawnRun(
@@ -761,10 +907,12 @@ proc cleanupSlotTmp(slot: Slot) =
 proc pollSlot(
   slot:           var Slot;
   results:        var seq[EntrypointResult];
+  window:         var seq[ptypes.Rfc7Window];
   plan:           RunPlan;
   maxOutputBytes: int;
 ): bool =
-  ## Poll a live slot with waitpid(WNOHANG).
+  ## Poll a live slot with wait4(WNOHANG) — rfc-0007 A1b: wait4 (not
+  ## waitpid), so every real reap captures rusage alongside the wstatus.
   ## Returns true if the slot is now idle (completed or errored) — caller
   ## should clear slot.pepIdx and may fill it with a new entrypoint.
   ##
@@ -778,12 +926,17 @@ proc pollSlot(
   ## onResult is called ONCE by the execute loop after that decision.
   ##
   ## Records the result in `results[slot.pepIdx]`; execute loop calls onResult.
+  ## rfc-0007 A1b: `window[slot.pepIdx]` is dual-written alongside every
+  ## `results[slot.pepIdx]` write below EXCEPT two documented, never-
+  ## fabricated corners: a genuinely unreaped kill (the "unkillable child"
+  ## case) and ECHILD (truly no child to observe).
 
   var wstatus: cint = 0
+  var ru: Rusage
   var r: Pid
-  # R10: retry waitpid on EINTR.
+  # R10: retry wait4 on EINTR.
   while true:
-    r = waitpid(slot.pid, wstatus, WNOHANG)
+    r = wait4(slot.pid, addr wstatus, WNOHANG, addr ru)
     if r >= Pid(0) or errno != EINTR:
       break
 
@@ -792,8 +945,7 @@ proc pollSlot(
 
   # Check for timeout first: kill and reap, then process as timed out.
   if timedOut and r != slot.pid:
-    killAndReap(slot.pid)
-    # After kill, wstatus is meaningless; synthesize the timeout result.
+    let cap = killAndReap(slot.pid)
     let pep    = plan.entrypoints[slot.pepIdx]
     let elapsed = int64((epochTime() - slot.t0) * 1000)
     let output =
@@ -820,6 +972,27 @@ proc pollSlot(
       try: removeDir(slot.cacheDir) except: discard
     cleanupSlotTmp(slot)
     results[slot.pepIdx] = res
+    # rfc-0007 A1b: the honest observation. `cap.reaped == false` is the
+    # RFC's "unkillable child" corner — never fabricate a Phase for it;
+    # window/coherence are simply not populated for this pepIdx (the legacy
+    # result above is unaffected either way).
+    if cap.reaped:
+      let killedRes = buildProcResult(cap.exit, cap.rusage,
+        some((reason: ptypes.krTimeout, escalated: cap.escalated)), elapsed * 1000)
+      let w =
+        if slot.phase == spCompiling:
+          ptypes.Rfc7Window(compile: ptypes.Phase(kind: ptypes.pkRan, res: killedRes),
+                            run: ptypes.Phase(kind: ptypes.pkSkipped))
+        else:
+          ptypes.Rfc7Window(
+            compile:
+              if slot.compileProcRes.isSome:
+                ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
+              else:
+                ptypes.Phase(kind: ptypes.pkSkipped),
+            run: ptypes.Phase(kind: ptypes.pkRan, res: killedRes))
+      window[slot.pepIdx] = w
+      rfc7Check(res, w)
     return true  # execute loop calls onResult after retry decision
 
   if r == 0:
@@ -836,12 +1009,16 @@ proc pollSlot(
                                compileSkipped: slot.compileSkipped)
     cleanupSlotTmp(slot)
     results[slot.pepIdx] = res
+    # rfc-0007 A1b: truly no observation is possible here (ECHILD) — dual-
+    # write is skipped for this pepIdx, same never-fabricate rule as above.
     return true  # execute loop calls onResult after retry decision
 
   # r == slot.pid: child has exited.
   let exitedCode   = if WIFEXITED(wstatus):   int(WEXITSTATUS(wstatus)) else: 0
   let sigNum       = if WIFSIGNALED(wstatus): int(WTERMSIG(wstatus))    else: 0
   let pep          = plan.entrypoints[slot.pepIdx]
+  let reapedExit   = decodeExit(wstatus)
+  let reapedRusage = decodeRusage(ru)
 
   case slot.phase
   of spCompiling:
@@ -859,9 +1036,20 @@ proc pollSlot(
         try: removeDir(slot.slotBinDir) except: discard
       cleanupSlotTmp(slot)
       results[slot.pepIdx] = res
+      let failedRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000)
+      let w = ptypes.Rfc7Window(compile: ptypes.Phase(kind: ptypes.pkRan, res: failedRes),
+                                run: ptypes.Phase(kind: ptypes.pkSkipped))
+      window[slot.pepIdx] = w
+      rfc7Check(res, w)
       return true  # execute loop calls onResult after retry decision
     else:
-      # Compile succeeded → transition to running phase.
+      # Compile succeeded → transition to running phase. rfc-0007 A1b:
+      # capture the compile's own observation onto the slot BEFORE spawning
+      # the run child, so the eventual run-phase result (below, or the
+      # timeout branch above) can dual-write BOTH phases.
+      let elapsedCompile = int64((epochTime() - slot.t0) * 1000)
+      slot.compileProcRes = some(buildProcResult(
+        reapedExit, reapedRusage, NoRfc7Stop, elapsedCompile * 1000))
       # S2b: use the per-entrypoint run budget stored at slot setup time.
       # B0: pass the attempt counter stored on the slot.
       let ok = spawnRun(slot, slot.runTimeoutMs, slot.attempt)
@@ -881,6 +1069,12 @@ proc pollSlot(
           try: removeDir(slot.slotBinDir) except: discard
         cleanupSlotTmp(slot)
         results[slot.pepIdx] = res
+        let w = ptypes.Rfc7Window(
+          compile: ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get),
+          run: ptypes.Phase(kind: ptypes.pkSpawnFailed,
+                            spawnError: "fork failed during run phase"))
+        window[slot.pepIdx] = w
+        rfc7Check(res, w)
         return true  # execute loop calls onResult after retry decision
       # Slot is now in spRunning; not yet done.
       return false
@@ -888,16 +1082,27 @@ proc pollSlot(
   of spRunning:
     let output  = readCapped(slot.runOut, maxOutputBytes)
     let elapsed = int64((epochTime() - slot.t0) * 1000)
+    let compilePhase =
+      if slot.compileProcRes.isSome:
+        ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
+      else:
+        ptypes.Phase(kind: ptypes.pkSkipped)  # cdSkipFresh: no compile this run
 
     # R1: Precedence rule — oTimeout/oSignal/oSpawnError are decided by the
     # executor (above).  Here the process exited normally; apply the OR-rule.
-    # Only read the sink and reconcile when the process exited (not signaled).
     var res: EntrypointResult
+    let runRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000)
     if sigNum != 0:
-      # Killed by signal — oSignal takes precedence; no sink reconciliation.
+      # Killed by signal — oSignal takes precedence. rfc-0007 A1b (§2): the
+      # sink is read/reconciled on EVERY run end, killed included — records
+      # from a signaled process are diagnostic only (they never flip the
+      # legacy verdict decided by sigNum above) but must not be silently
+      # dropped just because the process was signaled.
+      let sinkData = readSink(slot.sinkPath, maxOutputBytes)
       res = EntrypointResult(ep: pep.ep, outcome: oSignal, signal: sigNum,
                              output: output, durationMs: elapsed,
-                             compileSkipped: slot.compileSkipped)
+                             compileSkipped: slot.compileSkipped,
+                             records: sinkData.records)
     else:
       # Normal exit — read the sink and apply the OR-rule (R1).
       let sinkData = readSink(slot.sinkPath, maxOutputBytes)
@@ -919,6 +1124,10 @@ proc pollSlot(
     res.achieved = slot.achieved
     cleanupSlotTmp(slot)
     results[slot.pepIdx] = res
+    let w = ptypes.Rfc7Window(compile: compilePhase,
+                              run: ptypes.Phase(kind: ptypes.pkRan, res: runRes))
+    window[slot.pepIdx] = w
+    rfc7Check(res, w)
     return true  # execute loop calls onResult after retry decision
 
 # ---------------------------------------------------------------------------
@@ -941,6 +1150,11 @@ proc execute*(
   progressIntervalMs: int = 30_000;
   memThrottledOut:  ptr int = nil;  ## S6b: if non-nil, written with ac.memThrottledSlots on return
   cache:            CacheContext = cacheDisabled(resolveSandbox());  ## M4: cohesive cache bundle
+  windowOut:        ptr seq[ptypes.Rfc7Window] = nil;  ## rfc-0007 A1b: if non-nil, written
+                                  ## with the dual-written compile/run Phase pairs, same
+                                  ## index as the returned seq (mirrors memThrottledOut's
+                                  ## out-param shape). The A1a-A1e transitional carrying
+                                  ## mechanism — deleted at A1e-i.
 ): seq[EntrypointResult] =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
   ## scheduler honouring p.jobs (A4).  At most p.jobs child processes alive at
@@ -1007,6 +1221,8 @@ proc execute*(
 
   # Pre-allocate result slots so we can fill them by index (plan order).
   result = newSeq[EntrypointResult](n)
+  # rfc-0007 A1b: parallel, same-index dual-write carrier — see windowOut.
+  var window = newSeq[ptypes.Rfc7Window](n)
 
   # B2: open the ledger shard for this invocation (if stateDir is set).
   # Guards on empty stateDir — some callers (e.g. runEntrypoint) leave it "".
@@ -1228,6 +1444,13 @@ proc execute*(
               finalized[pepIdx] = true
               anyFailed = true
               inc done
+              # rfc-0007 A1b: no process was ever spawned for either phase.
+              let w = ptypes.Rfc7Window(
+                compile: ptypes.Phase(kind: ptypes.pkSkipped),
+                run: ptypes.Phase(kind: ptypes.pkSpawnFailed,
+                                  spawnError: "fork or file-open failed for skip-fresh run"))
+              window[pepIdx] = w
+              rfc7Check(res, w)
             else:
               slots[i].token = tok.get  # S3: store token for onSlotFinish
           else:
@@ -1247,6 +1470,13 @@ proc execute*(
               finalized[pepIdx] = true
               anyFailed = true
               inc done
+              # rfc-0007 A1b: no process was ever spawned for either phase.
+              let w = ptypes.Rfc7Window(
+                compile: ptypes.Phase(kind: ptypes.pkSpawnFailed,
+                                      spawnError: "fork or file-open failed before compile"),
+                run: ptypes.Phase(kind: ptypes.pkSkipped))
+              window[pepIdx] = w
+              rfc7Check(res, w)
               # Slot remains idle (pepIdx == -1); loop continues.
             else:
               slots[i].token = tok.get  # S3: store token for onSlotFinish
@@ -1294,7 +1524,7 @@ proc execute*(
           if rssNow.isSome:
             slots[i].peakRssBytes = max(slots[i].peakRssBytes, rssNow.get)
 
-        let finished = pollSlot(slots[i], result, p, maxOutputBytes)
+        let finished = pollSlot(slots[i], result, window, p, maxOutputBytes)
 
         # C5: post-poll RSS sample for slots that JUST transitioned to spRunning
         # (compile finished this tick → spawnRun ran inside pollSlot → slot is now
@@ -1515,9 +1745,13 @@ proc execute*(
           # H1: with skip-ahead, finalized indices may be non-contiguous; emit only
           # entries actually completed (never-dispatched entries are omitted).
           var ran: seq[EntrypointResult]
+          var ranWindow: seq[ptypes.Rfc7Window]  # rfc-0007 A1b: filtered in lockstep
           for j in 0 ..< n:
-            if finalized[j]: ran.add(result[j])
+            if finalized[j]:
+              ran.add(result[j])
+              ranWindow.add(window[j])
           result = ran
+          window = ranWindow
           return
 
       # Avoid busy-spinning when all slots are live.
@@ -1571,6 +1805,8 @@ proc execute*(
       closeLedger(led)
     if memThrottledOut != nil:
       memThrottledOut[] = ac.memThrottledSlots
+    if windowOut != nil:
+      windowOut[] = window  # rfc-0007 A1b: mirrors memThrottledOut's out-param shape
 
 # ---------------------------------------------------------------------------
 # runEntrypoint — compile + run ONE entrypoint (M6: thin wrapper)

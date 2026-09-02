@@ -82,6 +82,10 @@ import crisol/outcomestrings  # re-exports FailureOutcomeStrings (the only symbo
                               # types so the dependency on the wire-string set is
                               # explicit rather than hidden inside a bulk import.
 import crisol/ioutils  # R2-a: writeAllFd replaces bare write() (EINTR/short-write safe)
+# rfc-0007 A1b: advisory `exit`/`cause` nodes (§2) — `import nil` so nothing
+# unqualified leaks into this module's own Outcome/etc namespace.
+from crisol/process/types as ptypes import nil
+import crisol/process/resultjson  # exitToJson/causeToJson: the ONE wire format owner
 
 # ---------------------------------------------------------------------------
 # Schema-version constant (single source of truth)
@@ -92,7 +96,7 @@ const RunV1Schema* = "crisol/run/v1"
   ## Import crisol/api (or crisol/jsonout directly) to reference this constant
   ## rather than duplicating the string literal.
 
-const RunV1Revision* = 14
+const RunV1Revision* = 15
   ## Integer minor revision of the crisol/run/v1 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v1"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -172,6 +176,16 @@ const RunV1Revision* = 14
   ##                     identifies this leg — the same path under two groups
   ##                     with different flags is two rows.  Always present;
   ##                     empty array when no flags.  Mirrors plan/v1 rev 3.
+  ##   rev 15 (rfc-0007 A1b) — ADVISORY per-entrypoint `exit`/`cause` nodes
+  ##                     (process/types.nim §2: Exit is the lossless OS
+  ##                     observation; Cause is runner-asserted authorship).
+  ##                     Populated only for entrypoints with a captured
+  ##                     run-phase ProcessResult (a live run this invocation);
+  ##                     `null` otherwise (e.g. a cache hit — real cache-
+  ##                     replay dual-write is A1d-ii). Recomputed observation,
+  ##                     NOT the source of truth — `outcome` stays the
+  ##                     authoritative verdict string until run/v2 (A1d-i).
+  ##                     Readers are unknown-tolerant by design (§2).
   ## A reader seeing `schemaRevision > RunV1Revision` treats the file as no-data
   ## (safe cold-start) — it was written by a newer crisol.
 
@@ -225,7 +239,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              warnings: seq[ConfigWarning] = @[];
              memThrottledSlots: int = 0;
              compileBlock: JsonNode = nil;
-             reuseAlerts: JsonNode = nil): JsonNode =
+             reuseAlerts: JsonNode = nil;
+             window: seq[ptypes.Rfc7Window] = @[]): JsonNode =
   ## Pure: serialize to the crisol/run/v1 JsonNode.
   ## No I/O.
   ## C3: when filterTag is non-empty, each entrypoint's records array contains
@@ -242,6 +257,11 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## (crisol/compilereport.buildReuseAlerts). Unlike compileBlock, this field
   ## is ALWAYS PRESENT (mirrors `regressions`) -- nil/omitted is treated as an
   ## empty JArray, never omitted from the document.
+  ## window: rfc-0007 A1b dual-write carrier (runner.execute's windowOut),
+  ## same index as `results`. Empty (the default -- every pre-A1b caller)
+  ## means no advisory `exit`/`cause` nodes are emitted anywhere; a shorter-
+  ## than-`results` window (defensive only -- runner always sizes it to
+  ## match) is treated the same as "absent" for the entries past its end.
 
   # Build summary object (always full-run counts)
   let summaryNode = newJObject()
@@ -258,7 +278,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
 
   # Build entrypoints array
   let entrypointsNode = newJArray()
-  for r in results:
+  for i, r in results:
     # C3: filter records if a tag was supplied
     let displayRecords =
       if filterTag.len > 0: filterRecordsByTag(r.records, filterTag)
@@ -317,6 +337,16 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     # Only true when perf-check is enabled AND this run exceeded median+k·MAD.
     epNode["regressed"]     = newJBool(r.regressed)
     epNode["records"]       = recordsNode
+    # rev 15 (rfc-0007 A1b): advisory exit/cause -- null when this entry has
+    # no captured run-phase ProcessResult (window absent/short, or a
+    # pkSkipped/pkSpawnFailed/pkCached run phase -- e.g. a cache hit, A1d-ii).
+    if i < window.len and window[i].run.kind in {ptypes.pkRan, ptypes.pkCached}:
+      let runRes = window[i].run.res
+      epNode["exit"]  = exitToJson(runRes.exit)
+      epNode["cause"] = causeToJson(runRes.cause)
+    else:
+      epNode["exit"]  = newJNull()
+      epNode["cause"] = newJNull()
     entrypointsNode.add epNode
 
   # C6 (rev 5): build the regressions array from regressed results.
@@ -351,10 +381,12 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    warnings: seq[ConfigWarning] = @[];
                    memThrottledSlots: int = 0;
                    compileBlock: JsonNode = nil;
-                   reuseAlerts: JsonNode = nil): string =
+                   reuseAlerts: JsonNode = nil;
+                   window: seq[ptypes.Rfc7Window] = @[]): string =
   ## Pure: compact JSON string of the crisol/run/v1 document.
   ## C3: filterTag threads through to toJson.
-  $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock, reuseAlerts)
+  $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
+         reuseAlerts, window)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
@@ -365,7 +397,8 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
                      warnings: seq[ConfigWarning] = @[];
                      memThrottledSlots: int = 0;
                      compileBlock: JsonNode = nil;
-                     reuseAlerts: JsonNode = nil) =
+                     reuseAlerts: JsonNode = nil;
+                     window: seq[ptypes.Rfc7Window] = @[]) =
   ## Write lastrun.json atomically to <projectRoot>/<stateDir>/lastrun.json.
   ## Creates the state directory if it does not exist.
   ## On any failure: prints a warning to stderr and returns -- never raises.
@@ -396,7 +429,8 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   let jsonStr = toJsonString(results, summary, warnings = warnings,
                              memThrottledSlots = memThrottledSlots,
                              compileBlock = compileBlock,
-                             reuseAlerts = reuseAlerts)
+                             reuseAlerts = reuseAlerts,
+                             window = window)
   var tmpFd: cint = -1
   try:
     let flags = O_CREAT or O_EXCL or O_WRONLY or O_CLOEXEC

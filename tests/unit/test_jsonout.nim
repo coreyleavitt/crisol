@@ -1312,8 +1312,18 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunV1Revision is 14 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags)":
-    check RunV1Revision == 14
+  test "RunV1Revision is 15 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause)":
+    check RunV1Revision == 15
+
+  test "rfc-0007 A1b: exit/cause are null when no dual-write window is supplied (back-compat default)":
+    ## window defaults to @[] -- every pre-A1b caller keeps emitting null
+    ## advisory nodes rather than omitting the keys (additive, not a schema
+    ## break: readers are unknown-tolerant, and `null` is a stable presence).
+    let node = toJson(@[EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
+                                         outcome: oPassed, exitCode: 0)],
+                      Summary(total: 1, passed: 1))
+    check node["entrypoints"][0]["exit"].kind == JNull
+    check node["entrypoints"][0]["cause"].kind == JNull
 
   test "a compileBlock carrying the new per-segment fields threads through toJson opaquely (jsonout never inspects compile's internal shape)":
     var blk = newJObject()

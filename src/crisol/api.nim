@@ -49,6 +49,10 @@ import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, time
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals,
                sandbox, cachedispatch, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
+# rfc-0007 A1b: RunReport.procWindow carries the dual-write window through to
+# the CLI's --json path (see runner.execute's windowOut). `import nil` so
+# nothing unqualified leaks into this module's own namespace.
+from crisol/process/types as ptypes import nil
 
 # ---------------------------------------------------------------------------
 # Selective re-exports (H1)
@@ -278,6 +282,13 @@ type
                                   ## compile summary line without re-scanning the
                                   ## ledgers. nil when opts.persist is false, or when
                                   ## measureCompileReuse is not enabled (no telemetry).
+    procWindow*:        seq[ptypes.Rfc7Window]  ## rfc-0007 A1b: the dual-write window
+                                  ## from runner.execute (same index as `results`) —
+                                  ## threaded to the CLI's --json path for the advisory
+                                  ## exit/cause nodes (jsonout rev 15). Empty on every
+                                  ## early-return status (rsStructural/rsInterrupted/
+                                  ## zero-runnable). The A1a-A1e transitional carrying
+                                  ## mechanism — deleted at A1e-i.
 
 # ---------------------------------------------------------------------------
 # Selection constructors — hide the GroupSelection discriminated-union syntax
@@ -681,6 +692,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
           protocolMajor = CrisolProtocolMajor,
         ))
 
+  var procWindow: seq[ptypes.Rfc7Window]  # rfc-0007 A1b: dual-write window
   try:
     results = execute(
       pv.plan,
@@ -694,6 +706,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       progressIntervalMs = opts.progressIntervalMs,
       memThrottledOut    = addr memThrottled,
       cache              = cacheCtx,
+      windowOut          = addr procWindow,
     )
   except CrisolInterrupted as e:
     # SIGINT/SIGTERM: release lock and report rsInterrupted.
@@ -786,4 +799,5 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     status:            rsOk,
     exitCode:          exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
     compileBlock:      compileBlock,
+    procWindow:        procWindow,  # rfc-0007 A1b
   )

@@ -171,7 +171,7 @@ proc snapshotSeqFromJson(node: JsonNode): Option[seq[ProcSnapshot]] =
 # Exit
 # ---------------------------------------------------------------------------
 
-proc exitToJson(e: Exit): JsonNode =
+proc exitToJson*(e: Exit): JsonNode =
   result = newJObject()
   result["kind"] = newJString(exitKindStr(e.kind))
   case e.kind
@@ -207,7 +207,7 @@ proc exitFromJson(node: JsonNode): Option[Exit] =
 # Cause
 # ---------------------------------------------------------------------------
 
-proc causeToJson(c: Cause): JsonNode =
+proc causeToJson*(c: Cause): JsonNode =
   result = newJObject()
   result["by"] = newJString(causeByStr(c.by))
   case c.by

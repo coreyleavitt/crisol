@@ -1024,7 +1024,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     stderr.write("crisol: warning: no test records matched tag \"" & filterTag & "\"\n")
 
   if jsonMode:
-    stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings, rr.memThrottledSlots))
+    stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
+                              rr.memThrottledSlots, window = rr.procWindow))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,
