@@ -1,7 +1,7 @@
-## test_c5_rss_jsonout.nim — C5: peak RSS serialization + RunV1Revision bump
+## test_c5_rss_jsonout.nim — C5: peak RSS serialization + RunSchemaRevision bump
 ##
 ## Tests:
-##   1. RunV1Revision is now 4 (bumped from 3 for the peakRssBytes field).
+##   1. RunSchemaRevision is now 4 (bumped from 3 for the peakRssBytes field).
 ##   2. Each entrypoint node carries "peakRssBytes" as a JInt.
 ##   3. peakRssBytes defaults to 0 for default-constructed EntrypointResult.
 ##   4. peakRssBytes is serialized from EntrypointResult.peakRssBytes.
@@ -19,9 +19,9 @@ proc makeEp(path: string): Entrypoint =
 
 suite "C5 — run/v1 peakRssBytes serialization":
 
-  test "RunV1Revision is at least 5 (bumped by M8 to 6 for expanded cacheDecision)":
+  test "RunSchemaRevision is at least 5 (bumped by M8 to 6 for expanded cacheDecision)":
     ## Rev 5 added top-level regressions array; rev 6 (M8) expanded cacheDecision vocab.
-    check RunV1Revision >= 5
+    check RunSchemaRevision >= 5
 
   test "each entrypoint carries peakRssBytes as integer field":
     let results = @[
@@ -60,9 +60,9 @@ suite "C5 — run/v1 peakRssBytes serialization":
     check node["entrypoints"][0]["peakRssBytes"].getBiggestInt == 4_000_000
     check node["entrypoints"][1]["peakRssBytes"].getBiggestInt == 12_000_000
 
-  test "schemaRevision in output equals RunV1Revision (currently 6)":
+  test "schemaRevision in output equals RunSchemaRevision (currently 6)":
     let node = toJson(@[], Summary())
-    check node["schemaRevision"].getInt == RunV1Revision
+    check node["schemaRevision"].getInt == RunSchemaRevision
 
 when isMainModule:
   echo "test_c5_rss_jsonout done"

@@ -24,11 +24,28 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_cli_run.nim
 
-import std/[json, monotimes, os, strutils, unittest]
+import std/[json, monotimes, options, os, strutils, unittest]
 import std/posix as posix_mod2
 import crisol         # imports runMain
 import crisol/types
 import crisol/jsonout
+import crisol/process/types as ptypes
+
+# rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
+# which reads it) is sourced from deriveOutcome(r), which walks the real
+# compile/run Phase pair -- a fixture must carry a coherent Phase, not just
+# the legacy `outcome` field, or every entry silently derives oSpawnError
+# (Phase defaults to pkSkipped) and gets treated as failed.
+proc okPhase(code: int = 0): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: ptypes.Exit(kind: ptypes.ekExited, code: code),
+    cause: ptypes.Cause(by: ptypes.cbProcess),
+    evidence: ptypes.Evidence(killDomain: ptypes.kdsProcessGroup,
+                              tree: ptypes.toUnobservable,
+                              hermetic: ptypes.hlIsolated),
+    rusage: none(ptypes.Rusage),
+    durationUs: 1000,
+  ))
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -299,10 +316,12 @@ suite "crisol CLI — B7 --failed":
     let results = @[
       EntrypointResult(
         ep:       Entrypoint(path: failRelPath, group: "paths", flags: @[]),
-        outcome:  oFailed, exitCode: 1, signal: 0, durationMs: 100, records: @[]),
+        outcome:  oFailed, exitCode: 1, signal: 0, durationMs: 100, records: @[],
+        compile: okPhase(), run: okPhase(1)),
       EntrypointResult(
         ep:       Entrypoint(path: passRelPath, group: "paths", flags: @[]),
-        outcome:  oPassed, exitCode: 0, signal: 0, durationMs: 50, records: @[]),
+        outcome:  oPassed, exitCode: 0, signal: 0, durationMs: 50, records: @[],
+        compile: okPhase(), run: okPhase()),
     ]
     let summary = Summary(total: 2, passed: 1, failed: 1)
     let cfg = makeCfg(realRoot, ".crisol")
@@ -361,7 +380,8 @@ suite "crisol CLI — B7 --failed":
       EntrypointResult(
         ep:      Entrypoint(path: "tests/fixtures/nonexistent_xyzzy.nim",
                             group: "paths", flags: @[]),
-        outcome: oFailed, exitCode: 1, signal: 0, durationMs: 10, records: @[]),
+        outcome: oFailed, exitCode: 1, signal: 0, durationMs: 10, records: @[],
+        compile: okPhase(), run: okPhase(1)),
     ]
     let summary = Summary(total: 1, passed: 0, failed: 1)
     let cfg = makeCfg(realRoot, ".crisol")

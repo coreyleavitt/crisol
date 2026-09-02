@@ -1,5 +1,5 @@
 ## compilereport.nim — RFC-0006 M-report PASS (a)+(b1)+(b2): segmented
-## `compile` block for the crisol/run/v1 JSON document, plus PASS (b1)'s
+## `compile` block for the crisol/run/v2 (formerly run/v1) JSON document, plus PASS (b1)'s
 ## three additive durable-report surfaces (reuse-check alerting,
 ## ambient-ccache detection, per-basename top-N).
 ##

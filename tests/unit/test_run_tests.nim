@@ -31,10 +31,28 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_run_tests.nim
 
-import std/[os, osproc, strutils, unittest]
+import std/[options, os, osproc, strutils, unittest]
 import crisol/api
 import crisol/types
 import crisol/signals
+
+import crisol/process/types as ptypes
+
+# rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
+# which reads it) is sourced from deriveOutcome(r), which walks the real
+# compile/run Phase pair -- a fixture must carry a coherent Phase, not just
+# the legacy `outcome` field, or every entry silently derives oSpawnError
+# (Phase defaults to pkSkipped) and gets treated as failed.
+proc okPhase(code: int = 0): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: ptypes.Exit(kind: ptypes.ekExited, code: code),
+    cause: ptypes.Cause(by: ptypes.cbProcess),
+    evidence: ptypes.Evidence(killDomain: ptypes.kdsProcessGroup,
+                              tree: ptypes.toUnobservable,
+                              hermetic: ptypes.hlIsolated),
+    rusage: none(ptypes.Rusage),
+    durationUs: 1000,
+  ))
 
 # Helper: import the test support module
 import "../support/helpers"
@@ -256,7 +274,7 @@ suite "runTests — S2c structural + zero-runnable":
       # Seed: everything passed.
       let results = @[EntrypointResult(
         ep:      Entrypoint(path: "tests/unit/test_pass.nim", group: "unit"),
-        outcome: oPassed,
+        outcome: oPassed, compile: okPhase(), run: okPhase(),
       )]
       seedLastRun(projectRoot, results, Summary(total: 1, passed: 1))
       let opts = RunOptions(

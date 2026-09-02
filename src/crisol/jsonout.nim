@@ -1,11 +1,12 @@
 ## jsonout.nim — B5 JSON serialization + lastrun.json persistence
 ##              B7 loadLastRun: read back failed (path,group) keys
+##              rfc-0007 A1d-i: the wire — crisol/run/v1 -> crisol/run/v2
 ##
 ## Public API:
 ##
 ##   toJson*(results: seq[EntrypointResult]; summary: Summary;
 ##           filterTag: string = ""): JsonNode
-##     Pure: produce the crisol/run/v1 JSON object.
+##     Pure: produce the crisol/run/v2 JSON object.
 ##     C3: when filterTag is non-empty, each entrypoint's records array
 ##     contains ONLY records whose tags include the tag.  This keeps
 ##     --filter-tag consistent between human and machine output.
@@ -25,23 +26,37 @@
 ##     Effectful: read <projectRoot>/<stateDir>/lastrun.json and return the set
 ##     of (path, group) pairs whose outcome is a failure (not "passed" and not
 ##     "noTestsRan" — specifically: "exitNonZero", "compileFailed", "timedOut",
-##     "signaled", "spawnError").
+##     "signaled", "spawnError", "killed", "crashed").
 ##     found=false means the file is ABSENT (caller should exit 3).
-##     If the file is present but malformed or has an unrecognized schema version,
-##     raises CrisolError(cekEnvironment) — caller also exits 3.
+##     A file written by the PRIOR schema ("crisol/run/v1") is ALSO treated as
+##     found=false — cold start, no error, no partial parse.  A schema change
+##     is not something a byte-compatible reader can partially trust; the
+##     honest posture is "we have no data", exactly like a missing file (A1d-i).
+##     If the file is present but malformed or carries some OTHER unrecognized
+##     schema string, raises CrisolError(cekEnvironment) — caller also exits 3.
 ##
-## Schema (crisol/run/v1):
+## Schema (crisol/run/v2):
 ##   {
-##     "schema":      "crisol/run/v1",
-##     "summary": { total, passed, failed, compileFailed, timedOut,
-##                  signaled, spawnErrors, noTestsRan },
+##     "schema":      "crisol/run/v2",
+##     "schemaRevision": <int>,
+##     "interrupted": bool,          // rev 16: true iff this run was cut short
+##                                   // by Ctrl-C; ALWAYS false on the normal
+##                                   // path in this slice — real values are
+##                                   // A1e-ii's (rfc-0007 §2 interrupt bullet).
+##     "summary": {
+##       total, counts: { passed, exitNonZero, compileFailed, timedOut,
+##                        signaled, spawnError, killed, crashed },
+##       flaky, quarantined, noTestsRan, notStarted
+##     },
 ##     "entrypoints": [
-##       { path, group, outcome (string), exitCode (int),
-##         signal (int|null), durationMs (float),
+##       { path, group, flags, outcome (string, advisory),
+##         compile: <PhaseNode>, run: <PhaseNode>,
+##         compileSkipped, cached, inputHash, cacheDecision, flaky, attempts,
+##         quarantined, peakRssBytes, regressed,
 ##         records: [{ name, status (string), durationUs (int),
 ##                     msg (string|null), tags ([string]) }] }
 ##     ],
-##     "compile": {   // OPTIONAL (rev 7): present only when telemetry exists
+##     "compileStats": {   // OPTIONAL (rev 7); present only when telemetry exists
 ##       "segments": [
 ##         { groupId, configHash, rTime, rSize, ccPct, codegenPct, linkPct,
 ##           reproducible (bool), artifactsTotal, artifactsShared,
@@ -49,14 +64,29 @@
 ##       ],
 ##       "ambientCcacheDetected": bool,  // rev 8
 ##       "topUnits": [ { basename, sizeBytes, ccTimeUs }, ... ],  // rev 8, top-10
-##       "compileRegressions": [   // rev 9: ALWAYS PRESENT (once compile exists); empty by default
+##       "compileRegressions": [   // rev 9: ALWAYS PRESENT (once compileStats exists); empty by default
 ##         { entrypointIdentity, groupId, configHash, currentUs, baselineUs, thresholdUs }
 ##       ]
 ##     },
 ##     "reuseAlerts": [   // rev 8: ALWAYS PRESENT; empty when reuse-check disabled
 ##       { groupId, configHash, rTime, alertBelow }
 ##     ]
+##     // NO "substrate" key: absent until A7 lands the substrate-identity
+##     // block.  Absence IS the honest placeholder — no null, no stub object.
 ##   }
+##
+##   <PhaseNode> (rfc-0007 §2's Phase, one shape shared by "compile" and "run"):
+##     {
+##       "kind": "skipped" | "spawnFailed" | "ran" | "cached",
+##       "spawnError": string | null,   // non-null only when kind=="spawnFailed"
+##       "exit": <Exit> | null, "cause": <Cause> | null,
+##       "evidence": <Evidence> | null, "rusage": <Rusage> | null,
+##       "durationUs": int | null       // non-null only when kind ran/cached;
+##     }                                // exit/cause/evidence/rusage/durationUs
+##                                       // are process/resultjson.toJson's own
+##                                       // wire (the ONE owner — see that
+##                                       // module) — jsonout never re-derives
+##                                       // their shape.
 ##
 ## Outcome string values (stable):
 ##   oPassed        -> "passed"
@@ -65,11 +95,121 @@
 ##   oTimeout       -> "timedOut"
 ##   oSignal        -> "signaled"
 ##   oSpawnError    -> "spawnError"
+##   oKilled        -> "killed"
+##   oCrashed       -> "crashed"
 ##
 ## RecordStatus string values (stable):
 ##   rsPass -> "pass"
 ##   rsFail -> "fail"
 ##   rsSkip -> "skip"
+##
+## ---------------------------------------------------------------------------
+## run/v1 -> run/v2 COMPLETE field-mapping table (rfc-0007 A1d-i)
+## ---------------------------------------------------------------------------
+## Every v1 field, and its v2 disposition.  "derived-now" = the value is
+## computable from a v2 field rather than carried as its own key; "dropped"
+## = the v1 key does not exist on the v2 wire at all (with no successor).
+##
+## TOP LEVEL
+##   schema            RENAMED VALUE   "crisol/run/v1" -> "crisol/run/v2"
+##   schemaRevision    KEPT            integer scheme continues; v1's last
+##                                     value (15) -> v2 starts at 16.
+##   summary           KEPT (RESHAPED) see SUMMARY OBJECT below
+##   entrypoints       KEPT            per-entry shape changes; see below
+##   memThrottledSlots KEPT            unchanged
+##   warnings          KEPT            unchanged
+##   regressions       KEPT            unchanged
+##   compile           RENAMED KEY     -> "compileStats" (frees "compile" for
+##                                     the per-entrypoint Phase node)
+##   reuseAlerts       KEPT            unchanged
+##   (new) interrupted ADDED           top-level bool; false on the normal
+##                                     path this slice; A1e-ii wires real
+##                                     interrupt values (rfc-0007 §2)
+##   (new) substrate   NOT ADDED       deliberately absent until A7 — no key,
+##                                     not even null; the honest placeholder
+##
+## SUMMARY OBJECT (v1: total, passed, failed, compileFailed, timedOut,
+##                 signaled, spawnErrors, quarantined, noTestsRan)
+##   total          KEPT
+##   passed         DROPPED   superseded by summary.counts["passed"]
+##   failed         DROPPED   superseded by summary.counts["exitNonZero"]
+##   compileFailed  DROPPED   superseded by summary.counts["compileFailed"]
+##   timedOut       DROPPED   superseded by summary.counts["timedOut"] (always
+##                            0 — deriveOutcome never produces the legacy value)
+##   signaled       DROPPED   superseded by summary.counts["signaled"] (always
+##                            0, same reason)
+##   spawnErrors    DROPPED   superseded by summary.counts["spawnError"]
+##   quarantined    KEPT      moved under summary; unchanged meaning
+##   noTestsRan     KEPT      unchanged
+##   (new) counts      ADDED  object keyed by outcomeString(o) for every
+##                            Outcome o, sourced from Summary.counts (rfc-0007
+##                            A1c's array) — "killed"/"crashed" are now real,
+##                            first-class keys, not just advisory
+##   (new) flaky       ADDED  Summary.flaky (count of flaky passes) was never
+##                            surfaced in v1's summary node; it is now
+##   (new) notStarted  ADDED  count of entries omitted from the emission set
+##                            on interrupt (rfc-0007 §2); always 0 until
+##                            A1e-ii, an honest placeholder like `interrupted`
+##
+## PER-ENTRYPOINT (v1: path, group, flags, outcome, exitCode, signal,
+##                 durationMs, compileSkipped, cached, inputHash,
+##                 cacheDecision, flaky, attempts, quarantined, peakRssBytes,
+##                 regressed, records, exit [rev15 advisory], cause [rev15 advisory])
+##   path            KEPT
+##   group           KEPT
+##   flags           KEPT
+##   outcome         KEPT (RE-SOURCED)  same advisory string; now produced by
+##                            deriveOutcome(r) (rfc-0007 §2's total recomputation)
+##                            instead of the legacy stored field — the wire
+##                            cutover itself.  For a real runner-authored kill
+##                            this now reads "killed", not "timedOut" — the
+##                            load-bearing honesty property A1b introduced
+##                            finally reaches the primary outcome string.
+##   exitCode        DROPPED   derived-now from run.exit.code when
+##                            run.kind in {ran, cached} and run.exit.kind=="exited"
+##   signal          DROPPED   derived-now from run.exit.sig when
+##                            run.exit.kind=="signaled"
+##   durationMs      DROPPED   superseded by the per-phase, authoritative
+##                            compile.durationUs / run.durationUs (§2's real
+##                            ProcessResult.durationUs, microsecond precision) —
+##                            a combined wall-clock figure can be derived by
+##                            summing the two when both are present
+##   compileSkipped  KEPT      unchanged
+##   cached          KEPT      unchanged
+##   inputHash       KEPT      unchanged — the soundness-key fingerprint is a
+##                            caching concern (RFC-0004/0005), orthogonal to
+##                            §2's process-result model; §2 is silent on it,
+##                            which is not a reason to drop an actively-used
+##                            cache-diagnostic field
+##   cacheDecision   KEPT      "carried under its real name" — unchanged
+##   flaky           KEPT (RE-SOURCED)  now serialized as the DERIVED value
+##                            (deriveOutcome(r)==oPassed and r.attempts > 1)
+##                            rather than the stored field — a stored bool
+##                            over a policy-dependent quantity would
+##                            contradict recomputation (rfc-0007 §2)
+##   attempts        KEPT      unchanged (an observation, stored — not derived)
+##   quarantined     KEPT      unchanged (stays STORED: deriving it needs the
+##                            Config overlay, not the result — §2's one
+##                            deliberate exemption from the derived-field rule)
+##   peakRssBytes    KEPT      unchanged
+##   regressed       KEPT      unchanged
+##   records         KEPT      unchanged (name/status/durationUs/msg/tags)
+##   exit (rev15)    RENAMED   absorbed into the nested "run" Phase node's
+##                            "exit" — real (non-null) whenever run.kind is
+##                            ran/cached, matching the node's own "kind"
+##   cause (rev15)   RENAMED   absorbed into the nested "run" Phase node's
+##                            "cause", same rule
+##   (new) compile   ADDED    the compile phase's own Phase node — entirely
+##                            absent from v1; §2 gives compile and run the
+##                            SAME shape (a ProcessResult under a Phase), and
+##                            v1 only ever exposed the run phase's advisory
+##                            half.  A compile timeout/kill is now visible on
+##                            the wire exactly like a run timeout/kill.
+##   (new) run       ADDED    the run phase's Phase node — supersedes v1
+##                            rev15's flat advisory exit/cause with the FULL
+##                            §2 observation (adds evidence, rusage,
+##                            durationUs; real not advisory)
+## ---------------------------------------------------------------------------
 
 import std/[json, options, os, sets]
 import std/posix as posix_mod
@@ -85,20 +225,28 @@ import crisol/ioutils  # R2-a: writeAllFd replaces bare write() (EINTR/short-wri
 # rfc-0007 A1b: advisory `exit`/`cause` nodes (§2) — `import nil` so nothing
 # unqualified leaks into this module's own Outcome/etc namespace.
 from crisol/process/types as ptypes import nil
-import crisol/process/resultjson  # exitToJson/causeToJson: the ONE wire format owner
+import crisol/process/resultjson  # resultjson.toJson(ProcessResult): the ONE wire format owner
 
 # ---------------------------------------------------------------------------
 # Schema-version constant (single source of truth)
 # ---------------------------------------------------------------------------
 
-const RunV1Schema* = "crisol/run/v1"
-  ## Stable schema identifier embedded in every crisol/run/v1 JSON document.
-  ## Import crisol/api (or crisol/jsonout directly) to reference this constant
-  ## rather than duplicating the string literal.
+const LegacyRunV1Schema = "crisol/run/v1"
+  ## The PRIOR schema string (rfc-0007 A1d-i).  Not exported: the only
+  ## consumer is loadLastRun's cold-start check below — nothing should ever
+  ## emit this value again.
 
-const RunV1Revision* = 15
-  ## Integer minor revision of the crisol/run/v1 schema (A8).  Additive only:
-  ## the `schema` STRING stays "crisol/run/v1"; this integer is bumped each time
+const RunSchema* = "crisol/run/v2"
+  ## Stable schema identifier embedded in every crisol/run/v2 JSON document.
+  ## Import crisol/api (or crisol/jsonout directly) to reference this constant
+  ## rather than duplicating the string literal.  Named without a trailing
+  ## version number deliberately (rfc-0007 A1d-i): RFC-0008 EXTENDS v2, not
+  ## v3 — a versioned identifier would need renaming for no reason the day
+  ## rev 17 lands.
+
+const RunSchemaRevision* = 16
+  ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
+  ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
   ## (`schemaRevision >= 6`) without substring-parsing the string.
   ##   rev 1 (implicit) — B5/S2a fields (compileSkipped, memThrottledSlots, …).
@@ -186,8 +334,31 @@ const RunV1Revision* = 15
   ##                     NOT the source of truth — `outcome` stays the
   ##                     authoritative verdict string until run/v2 (A1d-i).
   ##                     Readers are unknown-tolerant by design (§2).
-  ## A reader seeing `schemaRevision > RunV1Revision` treats the file as no-data
-  ## (safe cold-start) — it was written by a newer crisol.
+  ##   rev 16 (rfc-0007 A1d-i) — THE WIRE CUTOVER.  `schema` becomes
+  ##                     "crisol/run/v2".  Per-entrypoint `exit`/`cause`
+  ##                     (rev 15, advisory, run-phase-only, flat) are replaced
+  ##                     by real nested `compile`/`run` Phase nodes (kind +
+  ##                     exit/cause/evidence/rusage/durationUs, sourced from
+  ##                     process/resultjson — the one wire owner); `outcome`
+  ##                     is now produced by deriveOutcome(r) instead of the
+  ##                     legacy stored field (a genuine kill now reads
+  ##                     "killed", not "timedOut"); per-entrypoint `exitCode`/
+  ##                     `signal`/`durationMs` are dropped (derivable from
+  ##                     `run.exit`/`run.durationUs`); `flaky` is now the
+  ##                     derived value, not the stored field; `summary`
+  ##                     drops its hand-maintained pass/fail/etc counters for
+  ##                     a `counts` object (keyed by outcomeString, from
+  ##                     Summary.counts) plus `flaky`/`notStarted`; top-level
+  ##                     `interrupted` is added (always false this slice);
+  ##                     top-level `compile` (telemetry) is renamed
+  ##                     `compileStats` (the name `compile` now names the
+  ##                     per-entrypoint phase node); NO `substrate` key until
+  ##                     A7.  See the field-mapping table above for the full,
+  ##                     per-field disposition.
+  ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
+  ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
+  ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
+  ## loadLastRun's doc comment above.
 
 # ---------------------------------------------------------------------------
 # Stable string mappings
@@ -231,6 +402,29 @@ proc cacheDecisionString*(d: CacheDecision): string =
   of cdmClosureUnrecorded: "closureUnrecorded"
 
 # ---------------------------------------------------------------------------
+# phaseToJson -- the ONE place a Phase (compile OR run) becomes a wire node
+# ---------------------------------------------------------------------------
+
+proc phaseToJson(p: ptypes.Phase): JsonNode =
+  ## rfc-0007 A1d-i: serialize a Phase to its <PhaseNode> shape (see the
+  ## module doc comment).  `exit`/`cause`/`evidence`/`rusage`/`durationUs`
+  ## come from process/resultjson.toJson (the one wire owner for
+  ## ProcessResult) -- this proc never re-derives their shape, only merges
+  ## it in alongside `kind`/`spawnError`.
+  result = newJObject()
+  case p.kind
+  of ptypes.pkSkipped:
+    result["kind"] = newJString("skipped")
+  of ptypes.pkSpawnFailed:
+    result["kind"] = newJString("spawnFailed")
+    result["spawnError"] = newJString(p.spawnError)
+  of ptypes.pkRan, ptypes.pkCached:
+    result["kind"] = newJString(if p.kind == ptypes.pkRan: "ran" else: "cached")
+    let inner = resultjson.toJson(p.res)  # {exit, cause, evidence, rusage, durationUs}
+    for k, v in inner.pairs:
+      result[k] = v
+
+# ---------------------------------------------------------------------------
 # toJson -- pure serializer
 # ---------------------------------------------------------------------------
 
@@ -240,7 +434,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              memThrottledSlots: int = 0;
              compileBlock: JsonNode = nil;
              reuseAlerts: JsonNode = nil): JsonNode =
-  ## Pure: serialize to the crisol/run/v1 JsonNode.
+  ## Pure: serialize to the crisol/run/v2 JsonNode.
   ## No I/O.
   ## C3: when filterTag is non-empty, each entrypoint's records array contains
   ## only records whose tags include filterTag.  The summary block always
@@ -250,28 +444,28 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## field; populated by AdmissionController in S6b).  Defaults to 0. # S6b
   ## compileBlock: M-report pass (a) segmented compile-reuse/cost-split block
   ## (crisol/compilereport.readCompileBlock), or nil when no telemetry exists
-  ## (measureCompileReuse off). nil -> the "compile" field is OMITTED entirely
-  ## (additive/back-compat) rather than emitted as an empty object.
+  ## (measureCompileReuse off). nil -> the "compileStats" field is OMITTED
+  ## entirely (additive/back-compat) rather than emitted as an empty object.
   ## reuseAlerts: M-report pass (b1) alert array
   ## (crisol/compilereport.buildReuseAlerts). Unlike compileBlock, this field
   ## is ALWAYS PRESENT (mirrors `regressions`) -- nil/omitted is treated as an
   ## empty JArray, never omitted from the document.
-  ## rfc-0007 A1c: the advisory `exit`/`cause` nodes (rev 15) now read
-  ## `r.run` directly off each EntrypointResult (the window lives on the
-  ## result itself) -- no separate window parameter.
+  ## rfc-0007 A1d-i: `outcome`/`flaky` are now sourced from deriveOutcome(r)
+  ## (§2's total recomputation), not the legacy stored fields; `compile`/
+  ## `run` are real Phase nodes read directly off each EntrypointResult.
 
-  # Build summary object (always full-run counts)
+  # Build summary object (counts array + scalars; see the field-mapping table)
   let summaryNode = newJObject()
-  summaryNode["total"]         = newJInt(summary.total)
-  summaryNode["passed"]        = newJInt(summary.passed)
-  summaryNode["failed"]        = newJInt(summary.failed)
-  summaryNode["compileFailed"] = newJInt(summary.compileFailed)
-  summaryNode["timedOut"]      = newJInt(summary.timedOut)
-  summaryNode["signaled"]      = newJInt(summary.signaled)
-  summaryNode["spawnErrors"]   = newJInt(summary.spawnErrors)
+  summaryNode["total"] = newJInt(summary.total)
+  let countsNode = newJObject()
+  for o in Outcome:
+    countsNode[outcomeString(o)] = newJInt(summary.counts[o])
+  summaryNode["counts"]       = countsNode
+  summaryNode["flaky"]        = newJInt(summary.flaky)
   # B3: quarantined failure count — failures excluded from exit-1 decision.
-  summaryNode["quarantined"]   = newJInt(summary.quarantined)
-  summaryNode["noTestsRan"]    = newJBool(summary.noTestsRan)
+  summaryNode["quarantined"]  = newJInt(summary.quarantined)
+  summaryNode["noTestsRan"]   = newJBool(summary.noTestsRan)
+  summaryNode["notStarted"]   = newJInt(summary.notStarted)
 
   # Build entrypoints array
   let entrypointsNode = newJArray()
@@ -298,6 +492,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
       recNode["tags"] = tagsNode
       recordsNode.add recNode
 
+    let derived = deriveOutcome(r)
+
     # Build entrypoint object
     let epNode = newJObject()
     epNode["path"]          = newJString(r.ep.path)
@@ -306,23 +502,21 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     let flagsNode = newJArray()
     for f in r.ep.flags: flagsNode.add newJString(f)
     epNode["flags"]         = flagsNode
-    epNode["outcome"]       = newJString(outcomeString(r.outcome))
-    epNode["exitCode"]      = newJInt(r.exitCode)
-    if r.outcome == oSignal:
-      epNode["signal"] = newJInt(r.signal)
-    else:
-      epNode["signal"] = newJNull()
-    epNode["durationMs"]    = newJFloat(r.durationMs.float)
+    # rev 16: advisory `outcome` is now deriveOutcome(r), not the legacy
+    # stored field -- the wire cutover itself (see the field-mapping table).
+    epNode["outcome"]       = newJString(outcomeString(derived))
     epNode["compileSkipped"] = newJBool(r.compileSkipped)  # S2a: complete the schema
-    # A8 (run/v1 rev 2): cache observability.  `cached` absence-default false;
+    # A8 (rev 2): cache observability.  `cached` absence-default false;
     # `inputHash` is the soundnessKey string ("" when caching not consulted);
     # `cacheDecision` is the stable string form of the always-populated enum.
     epNode["cached"]        = newJBool(r.cached)
     epNode["inputHash"]     = newJString(r.inputHash)
     epNode["cacheDecision"] = newJString(cacheDecisionString(r.cacheDecision))
-    # B1 (rev 3): per-entrypoint retry observability.  `flaky` absence-default false;
-    # `attempts` is 0 for cached results (no live run), 1 for a clean first-pass, >1 if retried.
-    epNode["flaky"]         = newJBool(r.flaky)
+    # B1 (rev 3, rev 16): per-entrypoint retry observability.  `flaky` is now
+    # the DERIVED value (deriveOutcome==oPassed and attempts>1), not the
+    # stored field -- see the field-mapping table.  `attempts` stays stored:
+    # 0 for cached results (no live run), 1 for a clean first-pass, >1 if retried.
+    epNode["flaky"]         = newJBool(derived == oPassed and r.attempts > 1)
     epNode["attempts"]      = newJInt(r.attempts)
     # B3 (rev 3): quarantine overlay — true iff ep.path ∈ Config.quarantine.
     # Absence-default false; only quarantined entrypoints carry true.
@@ -334,18 +528,10 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     # Only true when perf-check is enabled AND this run exceeded median+k·MAD.
     epNode["regressed"]     = newJBool(r.regressed)
     epNode["records"]       = recordsNode
-    # rev 15 (rfc-0007 A1c): advisory exit/cause -- null when this entry has
-    # no captured LIVE run-phase ProcessResult (pkSkipped/pkSpawnFailed, or a
-    # cache hit's pkCached -- cachedispatch synthesizes a minimal Phase for
-    # deriveOutcome's benefit, A1c, but it is not a real replayed observation;
-    # the wire stays null until A1d-ii's genuine cache-replay dual-write).
-    if r.run.kind == ptypes.pkRan:
-      let runRes = r.run.res
-      epNode["exit"]  = exitToJson(runRes.exit)
-      epNode["cause"] = causeToJson(runRes.cause)
-    else:
-      epNode["exit"]  = newJNull()
-      epNode["cause"] = newJNull()
+    # rev 16: real, nested compile/run Phase nodes -- supersede rev 15's flat
+    # advisory exit/cause (run-phase-only).  See the field-mapping table.
+    epNode["compile"]       = phaseToJson(r.compile)
+    epNode["run"]           = phaseToJson(r.run)
     entrypointsNode.add epNode
 
   # C6 (rev 5): build the regressions array from regressed results.
@@ -363,17 +549,23 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
 
   # Assemble top-level object
   result = newJObject()
-  result["schema"]           = newJString(RunV1Schema)
-  result["schemaRevision"]   = newJInt(RunV1Revision)  # A8: additive minor revision
+  result["schema"]           = newJString(RunSchema)
+  result["schemaRevision"]   = newJInt(RunSchemaRevision)  # A8: additive minor revision
+  # rev 16: always false on the normal path -- A1e-ii wires real interrupt values.
+  result["interrupted"]      = newJBool(false)
   result["summary"]          = summaryNode
   result["entrypoints"]      = entrypointsNode
   result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
   result["warnings"]         = warningsToJsonArray(warnings)
   result["regressions"]      = regressionsNode  # C6: empty when perf-check disabled
   if compileBlock != nil:
-    result["compile"] = compileBlock  # M-report pass (a): additive; absent when nil
+    result["compileStats"] = compileBlock  # M-report pass (a): additive; absent when nil;
+                                            # renamed from "compile" (rev 16) -- that name
+                                            # now belongs to the per-entrypoint phase node.
   # M-report pass (b1): always present, empty by default (mirrors `regressions`).
   result["reuseAlerts"] = if reuseAlerts != nil: reuseAlerts else: newJArray()
+  # rev 16: deliberately NO "substrate" key -- absence is the honest
+  # placeholder until A7 lands the substrate-identity block.
 
 proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    filterTag: string = "";
@@ -381,7 +573,7 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    memThrottledSlots: int = 0;
                    compileBlock: JsonNode = nil;
                    reuseAlerts: JsonNode = nil): string =
-  ## Pure: compact JSON string of the crisol/run/v1 document.
+  ## Pure: compact JSON string of the crisol/run/v2 document.
   ## C3: filterTag threads through to toJson.
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
          reuseAlerts)
@@ -477,8 +669,11 @@ proc loadLastRun*(config: Config):
   ##   (found: true,  failed: S)   — file parsed; S is the set of (path,group)
   ##                                 pairs whose outcome is a failure string.
   ##
+  ## rfc-0007 A1d-i: a file written by the PRIOR schema ("crisol/run/v1") is
+  ## ALSO treated as (found: false, failed: {}) -- cold start, not an error.
+  ##
   ## Raises CrisolError(cekEnvironment) if the file exists but is malformed
-  ## or carries an unrecognized schema version.
+  ## or carries some OTHER unrecognized schema version.
   let path = stateDirOf(config) / "lastrun.json"
 
   if not fileExists(path):
@@ -504,7 +699,12 @@ proc loadLastRun*(config: Config):
     raise newCrisolError(cekEnvironment,
       "lastrun.json is missing 'schema' field — run `crisol run` first")
   let schemaVal = node["schema"].getStr("")
-  if schemaVal != RunV1Schema:
+  if schemaVal == LegacyRunV1Schema:
+    # rfc-0007 A1d-i: a schema CHANGE is not something a byte-compatible
+    # reader can partially trust -- the honest posture is "no data", exactly
+    # like a missing file.  No error, no partial parse of v1's shape.
+    return (found: false, failed: initHashSet[tuple[path, group: string]]())
+  if schemaVal != RunSchema:
     raise newCrisolError(cekEnvironment,
       "stale lastrun.json (schema '" & schemaVal &
       "') — run `crisol run` first")
@@ -514,10 +714,10 @@ proc loadLastRun*(config: Config):
   # crisol whose additive fields we cannot interpret — treat as no-data (safe
   # cold-start), symmetric with loadLastPlan.  Caller handles found=false (exit 3).
   let rev = node.getOrDefault("schemaRevision").getInt(0)
-  if rev > RunV1Revision:
+  if rev > RunSchemaRevision:
     stderr.write("crisol: warning: lastrun.json schemaRevision " & $rev &
                  " is newer than this crisol understands (max " &
-                 $RunV1Revision & "); ignoring it as cold-start\n")
+                 $RunSchemaRevision & "); ignoring it as cold-start\n")
     return (found: false, failed: initHashSet[tuple[path, group: string]]())
 
   # Parse entrypoints array.

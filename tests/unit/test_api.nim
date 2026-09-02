@@ -41,6 +41,23 @@
 import std/[json, options, os, osproc, strutils, times, unittest]
 import crisol/api
 import crisol/types
+import crisol/process/types as ptypes
+
+# rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
+# which reads it) is sourced from deriveOutcome(r), which walks the real
+# compile/run Phase pair -- a fixture must carry a coherent Phase, not just
+# the legacy `outcome` field, or every entry silently derives oSpawnError
+# (Phase defaults to pkSkipped) and gets treated as failed.
+proc okPhase(code: int = 0): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: ptypes.Exit(kind: ptypes.ekExited, code: code),
+    cause: ptypes.Cause(by: ptypes.cbProcess),
+    evidence: ptypes.Evidence(killDomain: ptypes.kdsProcessGroup,
+                              tree: ptypes.toUnobservable,
+                              hermetic: ptypes.hlIsolated),
+    rusage: none(ptypes.Rusage),
+    durationUs: 1000,
+  ))
 
 # Helper: import the test support module (path relative to project root)
 import "../support/helpers"
@@ -224,11 +241,11 @@ suite "planTests — failedOnly() narrowing":
       let results = @[
         EntrypointResult(
           ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"),
-          outcome: oFailed,
+          outcome: oFailed, compile: okPhase(), run: okPhase(1),
         ),
         EntrypointResult(
           ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit"),
-          outcome: oPassed,
+          outcome: oPassed, compile: okPhase(), run: okPhase(),
         ),
       ]
       let summary = Summary(total: 2, passed: 1, failed: 1)
@@ -249,7 +266,7 @@ suite "planTests — failedOnly() narrowing":
       let results = @[
         EntrypointResult(
           ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"),
-          outcome: oPassed,
+          outcome: oPassed, compile: okPhase(), run: okPhase(),
         ),
       ]
       let summary = Summary(total: 1, passed: 1)
@@ -351,11 +368,11 @@ suite "planTests — changedOnly / failedOrChanged narrowing":
       let results = @[
         EntrypointResult(
           ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"),
-          outcome: oPassed,
+          outcome: oPassed, compile: okPhase(), run: okPhase(),
         ),
         EntrypointResult(
           ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit"),
-          outcome: oFailed,
+          outcome: oFailed, compile: okPhase(), run: okPhase(1),
         ),
       ]
       seedLastRun(gitRoot, results, Summary(total: 2, passed: 1, failed: 1))

@@ -33,7 +33,7 @@ suite "api boundary — positive: contracted symbols reachable":
     # CrisolError is an exception type
 
   test "schema constants":
-    check RunV1Schema.len > 0
+    check RunSchema.len > 0
     check PlanV1Schema.len > 0
 
   test "render helpers":

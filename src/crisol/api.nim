@@ -36,7 +36,7 @@
 ##   CrisolInterrupted, ResultCallback, EntrypointResult, isFailure, exitCode
 ## From render: render, gateSkipMessages, pathFlagsWarnings, filterRecordsByTag,
 ##   hasZeroTagMatches, RenderOpts, defaultOpts
-## From jsonout: toJsonString, RunV1Schema
+## From jsonout: toJsonString, RunSchema
 ## From planview: PlanV1Schema (+ PlanReport-typed facade overloads defined here)
 ##
 ## NOT re-exported: Config, Gate, Group, GateState, GateStateEntry, DiscoveredSet,
@@ -118,7 +118,7 @@ export render.renderClosure
 
 # From jsonout — schema constant + toJsonString only (NOT persistLastRun, loadLastRun)
 export jsonout.toJsonString
-export jsonout.RunV1Schema
+export jsonout.RunSchema
 export jsonout.closureToJsonString
 export jsonout.ClosureV1Schema
 

@@ -54,7 +54,7 @@ import crisol/depgraph
 import crisol/runner
 import crisol/artifactledger
 import crisol/keys
-import crisol/jsonout  # RunV1Revision
+import crisol/jsonout  # RunSchemaRevision
 import crisol/ledger
 
 # ---------------------------------------------------------------------------
@@ -285,10 +285,10 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     let lastRunPath = stateDir / "lastrun.json"
     check fileExists(lastRunPath)
     let doc = parseJson(readFile(lastRunPath))
-    check doc["schemaRevision"].getInt == RunV1Revision
+    check doc["schemaRevision"].getInt == RunSchemaRevision
 
-    check doc.hasKey("compile")
-    let segments = doc["compile"]["segments"]
+    check doc.hasKey("compileStats")
+    let segments = doc["compileStats"]["segments"]
     check segments.kind == JArray
     check segments.len >= 1
 
@@ -316,8 +316,8 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     if exitCode != 0: echo "crisol run output:\n", output
 
     let doc = parseJson(readFile(stateDir / "lastrun.json"))
-    check doc.hasKey("compile")
-    let compileBlock = doc["compile"]
+    check doc.hasKey("compileStats")
+    let compileBlock = doc["compileStats"]
 
     check compileBlock.hasKey("ambientCcacheDetected")
     check compileBlock["ambientCcacheDetected"].kind == JBool
@@ -373,8 +373,8 @@ reuse-check {
     check doc["reuseAlerts"].kind == JArray
     check doc["reuseAlerts"].len == 0   # R7: suppressed -- low-confidence, not "no regressions"
 
-    check doc.hasKey("compile")
-    for seg in doc["compile"]["segments"]:
+    check doc.hasKey("compileStats")
+    for seg in doc["compileStats"]["segments"]:
       check seg.hasKey("lowConfidence")
       check seg["lowConfidence"].getBool == true   # only 1 entrypoint compiled THIS run
       check seg["currentRunEntrypoints"].getInt == 1
@@ -401,9 +401,9 @@ reuse-check {
     if exitCode2 != 0: echo "crisol run 2 output:\n", output2
 
     let doc = parseJson(readFile(stateDir / "lastrun.json"))
-    check doc["schemaRevision"].getInt == RunV1Revision
-    check doc.hasKey("compile")
-    let compileBlock = doc["compile"]
+    check doc["schemaRevision"].getInt == RunSchemaRevision
+    check doc.hasKey("compileStats")
+    let compileBlock = doc["compileStats"]
 
     check compileBlock.hasKey("compileRegressions")
     check compileBlock["compileRegressions"].kind == JArray

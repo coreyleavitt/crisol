@@ -7,7 +7,7 @@
 ##   without updating the template, this test fails.
 ##
 ## Guard 2 — schema-version pin:
-##   The emitted run JSON's schema field must equal RunV1Schema (not a duplicated
+##   The emitted run JSON's schema field must equal RunSchema (not a duplicated
 ##   string literal).  The emitted plan JSON's schema field must equal PlanV1Schema.
 ##   Asserting the EXPORTED CONSTANTS (not copied strings) makes the test drift-proof:
 ##   if either schema string changes, both the emitter and this test see the same value.
@@ -19,7 +19,7 @@
 import std/[json, options, os, tempfiles, unittest]
 import crisol/types
 import crisol/config
-import crisol/jsonout   # RunV1Schema
+import crisol/jsonout   # RunSchema
 import crisol/planview  # PlanV1Schema
 import crisol           # InitTemplate
 
@@ -46,15 +46,15 @@ suite "S7 guard — canonical InitTemplate parses with zero warnings":
 
 suite "S7 guard — schema-version pin via exported constants":
 
-  test "toJson emits RunV1Schema in the schema field":
-    ## The run JSON document's schema field must equal the exported RunV1Schema
+  test "toJson emits RunSchema in the schema field":
+    ## The run JSON document's schema field must equal the exported RunSchema
     ## constant.  This is drift-proof: if the emitter string changes, either
     ## the constant or the assertion fails — there is no hidden duplication.
     let results: seq[EntrypointResult] = @[]
     let summary = Summary()
     let node = toJson(results, summary)
     check node.hasKey("schema")
-    check node["schema"].getStr == RunV1Schema
+    check node["schema"].getStr == RunSchema
 
   test "planToJson emits PlanV1Schema in the schema field":
     ## The plan JSON document's schema field must equal the exported PlanV1Schema

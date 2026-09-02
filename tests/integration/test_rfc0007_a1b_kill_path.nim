@@ -5,15 +5,16 @@
 ## a runner-authored kill is reported as such, end-to-end, with the ACTUAL
 ## observed wstatus — not the synthesized SIGKILL `pollSlot` fabricated
 ## before this slice. Three cases, all asserted through the CLI's `--json`
-## output (crisol/run/v1, advisory `exit`/`cause` nodes, rev bump):
+## output (crisol/run/v2, real per-phase `run.exit`/`run.cause` nodes):
 ##
 ##   hang_forever  (default signal dispositions) — dies on SIGTERM inside the
-##     grace window: legacy outcome "timedOut" STILL present (dual-write) AND
-##     cause {by:"runner", reason:"timeout", escalated:false},
-##     exit.kind "signaled", symbol SIGTERM.
+##     grace window: the primary `outcome` string is now "killed" (rfc-0007
+##     A1d-i's wire cutover — deriveOutcome, not the legacy stored field) AND
+##     run.cause {by:"runner", reason:"timeout", escalated:false},
+##     run.exit.kind "signaled", symbol SIGTERM.
 ##   term_ignores  (traps/ignores SIGTERM, keeps running) — forces escalation:
-##     cause.escalated == true, symbol SIGKILL.
-##   pass_always — exit.code == 0.
+##     run.cause.escalated == true, symbol SIGKILL.
+##   pass_always — run.exit.code == 0.
 ##
 ## Generous timeouts (--timeout 2, i.e. 2s) so this is load-robust; the
 ## grace window itself (spawn.GracePeriodMs, 400 ms) is a fixed runner
@@ -67,31 +68,36 @@ proc firstEntrypoint(jsonText: string): JsonNode =
 
 suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
 
-  test "hang_forever: legacy timedOut + honest cause/exit (SIGTERM, not escalated)":
+  test "hang_forever: outcome killed + honest run.cause/run.exit (SIGTERM, not escalated)":
     let fd = fixtureDir()
     let (_, output) = captureStdout(@["run", fd / "hang_forever.nim",
                                       "--timeout", "2", "--jobs", "1", "--json",
                                       "--no-cache"])
     let ep = firstEntrypoint(output)
 
-    # Dual-write: the legacy outcome string is unchanged.
-    check ep["outcome"].getStr == "timedOut"
+    # rfc-0007 A1d-i: the wire cutover — `outcome` is now deriveOutcome(r),
+    # not the legacy stored field.  A runner-authored kill finally reads
+    # "killed" as the PRIMARY verdict, not just an advisory side-channel.
+    check ep["outcome"].getStr == "killed"
 
     # The honest observation: the runner authored this kill (not fabricated).
     # Wire strings are resultjson's own Nim-identifier convention (A1a,
     # locked) — cbRunner/krTimeout, not a paraphrase.
-    check ep.hasKey("cause")
-    check ep["cause"]["by"].getStr == "runner"
-    check ep["cause"]["reason"].getStr == "timeout"
-    check ep["cause"]["escalated"].getBool == false
+    check ep.hasKey("run")
+    check ep["run"]["kind"].getStr == "ran"
+    check ep["run"]["cause"]["by"].getStr == "runner"
+    check ep["run"]["cause"]["reason"].getStr == "timeout"
+    check ep["run"]["cause"]["escalated"].getBool == false
 
     # hang_forever has default signal dispositions — it dies on the FIRST
     # signal sent (SIGTERM), inside the grace window. Before this slice,
     # pollSlot synthesized SIGKILL unconditionally regardless of what
     # actually happened — this is the fabrication being fixed.
-    check ep.hasKey("exit")
-    check ep["exit"]["kind"].getStr == "signaled"
-    check ep["exit"]["sig"].getInt == int(SIGTERM)
+    check ep["run"]["exit"]["kind"].getStr == "signaled"
+    check ep["run"]["exit"]["sig"].getInt == int(SIGTERM)
+    # rfc-0007 A1d-i: evidence is now a real node too (not just exit/cause).
+    check ep["run"].hasKey("evidence")
+    check ep["run"]["evidence"]["killDomain"].kind == JString
 
   test "term_ignores: SIGTERM-ignoring child forces escalation to SIGKILL":
     let fd = fixtureDir()
@@ -100,15 +106,15 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
                                       "--no-cache"])
     let ep = firstEntrypoint(output)
 
-    check ep["outcome"].getStr == "timedOut"
-    check ep["cause"]["by"].getStr == "runner"
-    check ep["cause"]["reason"].getStr == "timeout"
-    check ep["cause"]["escalated"].getBool == true
+    check ep["outcome"].getStr == "killed"
+    check ep["run"]["cause"]["by"].getStr == "runner"
+    check ep["run"]["cause"]["reason"].getStr == "timeout"
+    check ep["run"]["cause"]["escalated"].getBool == true
 
-    check ep["exit"]["kind"].getStr == "signaled"
-    check ep["exit"]["sig"].getInt == int(SIGKILL)
+    check ep["run"]["exit"]["kind"].getStr == "signaled"
+    check ep["run"]["exit"]["sig"].getInt == int(SIGKILL)
 
-  test "pass_always: exit.code == 0":
+  test "pass_always: run.exit.code == 0":
     let fd = fixtureDir()
     let (code, output) = captureStdout(@["run", fd / "pass_always.nim",
                                          "--timeout", "2", "--jobs", "1", "--json",
@@ -116,7 +122,11 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
     check code == 0
     let ep = firstEntrypoint(output)
     check ep["outcome"].getStr == "passed"
-    check ep.hasKey("exit")
-    check ep["exit"]["kind"].getStr == "exited"
-    check ep["exit"]["code"].getInt == 0
-    check ep["cause"]["by"].getStr == "process"
+    check ep.hasKey("run")
+    check ep["run"]["kind"].getStr == "ran"
+    check ep["run"]["exit"]["kind"].getStr == "exited"
+    check ep["run"]["exit"]["code"].getInt == 0
+    check ep["run"]["cause"]["by"].getStr == "process"
+    # rfc-0007 A1d-i: the compile phase is now its own real Phase node too.
+    check ep.hasKey("compile")
+    check ep["compile"]["kind"].getStr in ["ran", "skipped"]

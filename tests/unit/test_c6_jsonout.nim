@@ -1,7 +1,7 @@
 ## test_c6_jsonout.nim — C6: regression serialization in run/v1 + render tag
 ##
 ## Coverage:
-##   1. RunV1Revision is 13.
+##   1. RunSchemaRevision is 13.
 ##   2. regressions array is present in output (empty when no regressions).
 ##   3. regressed=false results do NOT appear in regressions array.
 ##   4. regressed=true results appear in regressions array with correct fields.
@@ -22,7 +22,7 @@ proc makeEp(path: string): Entrypoint =
 
 suite "C6 — run/v1 regressions + render":
 
-  test "RunV1Revision is 13":
+  test "RunSchemaRevision is 13":
     ## M8 bumped 5->6 for expanded CacheDecision wire vocabulary;
     ## M-report pass (a) bumped 6->7 for the additive top-level `compile` field;
     ## M-report pass (b1) bumped 7->8 for the additive top-level `reuseAlerts`
@@ -36,8 +36,9 @@ suite "C6 — run/v1 regressions + render":
     ## no longer appears in any document (Stage M + the RFC-0004 result
     ## cache are unchanged); issue #5 bumped 12->13 (cacheDecision
     ## "closureUnrecorded"); issue #10 bumped 13->14 (per-entrypoint `flags`);
-    ## rfc-0007 A1b bumped 14->15 (advisory per-entrypoint `exit`/`cause`).
-    check RunV1Revision == 15
+    ## rfc-0007 A1b bumped 14->15 (advisory per-entrypoint `exit`/`cause`);
+    ## rfc-0007 A1d-i bumped 15->16 (the run/v2 wire cutover).
+    check RunSchemaRevision == 16
 
   test "regressions array present and empty when no regressions":
     let results = @[

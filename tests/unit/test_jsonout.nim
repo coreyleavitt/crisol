@@ -19,6 +19,8 @@ import std/posix as posix_mod
 import crisol/types
 import crisol/jsonout
 import crisol/render
+import crisol/process/types as ptypes
+import crisol/runner  # for summarize
 import crisol
 
 # ---------------------------------------------------------------------------
@@ -38,8 +40,41 @@ proc makeRecord(name: string; status: RecordStatus;
     tags:       tags,
   )
 
+# ---------------------------------------------------------------------------
+# rfc-0007 A1d-i: coherent Phase builders.  run/v2's `outcome`/`flaky` (and
+# Summary.counts, populated by the real summarize()) are all sourced from
+# deriveOutcome(r), which walks compile/run's real Phase pair -- a fixture
+# must carry one, not just the legacy `outcome` field, for the two to agree.
+# ---------------------------------------------------------------------------
+
+proc procRes(exit: ptypes.Exit;
+            cause: ptypes.Cause = ptypes.Cause(by: ptypes.cbProcess)): ptypes.ProcessResult =
+  ptypes.ProcessResult(
+    exit: exit,
+    cause: cause,
+    evidence: ptypes.Evidence(killDomain: ptypes.kdsProcessGroup,
+                              tree: ptypes.toUnobservable,
+                              hermetic: ptypes.hlIsolated),
+    rusage: none(ptypes.Rusage),
+    durationUs: 1000,
+  )
+
+proc ranPhase(exit: ptypes.Exit;
+             cause: ptypes.Cause = ptypes.Cause(by: ptypes.cbProcess)): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: procRes(exit, cause))
+
+proc okPhase(code: int = 0): ptypes.Phase =
+  ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: code))
+
+const skippedPhase = ptypes.Phase(kind: ptypes.pkSkipped)
+proc spawnFailedPhase(msg: string = "fork failed"): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkSpawnFailed, spawnError: msg)
+
 proc syntheticResults(): seq[EntrypointResult] =
-  ## One result per distinct Outcome; each with representative records.
+  ## One result per distinct Outcome deriveOutcome can produce; each with
+  ## representative records.  Legacy `outcome`/`exitCode`/`signal` fields are
+  ## still set (dual-write window; other modules still read them) but the
+  ## coherent compile/run Phase pair is what run/v2's wire actually reflects.
   result = @[
     # Passed -- rsPass + rsSkip records
     EntrypointResult(
@@ -47,6 +82,8 @@ proc syntheticResults(): seq[EntrypointResult] =
       outcome:    oPassed,
       exitCode:   0,
       signal:     0,
+      compile:    okPhase(),
+      run:        okPhase(),
       durationMs: 123,
       records:    @[
         makeRecord("alpha passes",  rsPass),
@@ -59,61 +96,69 @@ proc syntheticResults(): seq[EntrypointResult] =
       outcome:    oFailed,
       exitCode:   1,
       signal:     0,
+      compile:    okPhase(),
+      run:        okPhase(1),
       durationMs: 456,
       records:    @[
         makeRecord("beta passes",  rsPass),
         makeRecord("beta fails",   rsFail, "expected 1 got 2"),
       ],
     ),
-    # CompileFailed -- no records
+    # CompileFailed -- no records; the compile phase itself failed.
     EntrypointResult(
       ep:         makeEp("tests/unit/test_gamma.nim"),
       outcome:    oCompileFailed,
       exitCode:   1,
       signal:     0,
+      compile:    okPhase(1),
+      run:        skippedPhase,
       durationMs: 789,
       records:    @[],
     ),
-    # Timeout -- no records
+    # Killed (rfc-0007's honest replacement for the legacy "timedOut") --
+    # runner-authored kill: cause cbRunner/krTimeout, exit signaled SIGTERM.
     EntrypointResult(
       ep:         makeEp("tests/integration/test_delta.nim", "integration"),
       outcome:    oTimeout,
       exitCode:   0,
       signal:     0,
+      compile:    okPhase(),
+      run:        ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 15, coreDumped: false),
+                           ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: false)),
       durationMs: 300_000,
       records:    @[],
     ),
-    # Signal -- no records
+    # Crashed (rfc-0007's honest replacement for the legacy "signaled") --
+    # a signal we did NOT send classifies as cbProcess (§2's documented
+    # heuristic for default-disposition crash signals).
     EntrypointResult(
       ep:         makeEp("tests/unit/test_epsilon.nim"),
       outcome:    oSignal,
       exitCode:   0,
       signal:     11,   # SIGSEGV
+      compile:    okPhase(),
+      run:        ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 11, coreDumped: false)),
       durationMs: 50,
       records:    @[],
     ),
-    # SpawnError -- no records
+    # SpawnError -- compile succeeded, the run phase failed to spawn.
     EntrypointResult(
       ep:         makeEp("tests/unit/test_zeta.nim"),
       outcome:    oSpawnError,
       exitCode:   0,
       signal:     0,
+      compile:    okPhase(),
+      run:        spawnFailedPhase(),
       durationMs: 0,
       records:    @[],
     ),
   ]
 
 proc syntheticSummary(): Summary =
-  Summary(
-    total:         6,
-    passed:        1,
-    failed:        1,
-    compileFailed: 1,
-    timedOut:      1,
-    signaled:      1,
-    spawnErrors:   1,
-    noTestsRan:    false,
-  )
+  ## Real counts, not hand-guessed: summarize() folds deriveOutcome over
+  ## syntheticResults() the same way the runner does, so this Summary agrees
+  ## with what toJson(syntheticResults(), ...) actually emits.
+  summarize(syntheticResults())
 
 # ---------------------------------------------------------------------------
 # Suite 1 -- Schema stability / completeness
@@ -121,11 +166,11 @@ proc syntheticSummary(): Summary =
 
 suite "jsonout - toJson schema":
 
-  test "top-level schema field is crisol/run/v1":
+  test "top-level schema field is crisol/run/v2":
     let node = toJson(syntheticResults(), syntheticSummary())
     check node.kind == JObject
     check node.hasKey("schema")
-    check node["schema"].getStr == "crisol/run/v1"
+    check node["schema"].getStr == "crisol/run/v2"
 
   test "top-level has summary, entrypoints, and warnings keys":
     let node = toJson(syntheticResults(), syntheticSummary())
@@ -133,12 +178,25 @@ suite "jsonout - toJson schema":
     check node.hasKey("entrypoints")
     check node.hasKey("warnings")
 
-  test "run/v1 warnings array is empty when no warnings passed":
+  test "top-level interrupted field is false on the normal path (rev 16)":
+    ## rfc-0007 A1d-i: always false this slice -- real interrupt values are
+    ## A1e-ii's.  Placeholder, not a fabricated claim.
+    let node = toJson(syntheticResults(), syntheticSummary())
+    check node.hasKey("interrupted")
+    check node["interrupted"].kind == JBool
+    check node["interrupted"].getBool == false
+
+  test "top-level has NO substrate key (rev 16)":
+    ## rfc-0007 A1d-i: absence IS the honest placeholder until A7.
+    let node = toJson(syntheticResults(), syntheticSummary())
+    check not node.hasKey("substrate")
+
+  test "run/v2 warnings array is empty when no warnings passed":
     let node = toJson(syntheticResults(), syntheticSummary())
     check node["warnings"].kind == JArray
     check node["warnings"].len == 0
 
-  test "run/v1 warnings array carries ConfigWarning fields when provided":
+  test "run/v2 warnings array carries ConfigWarning fields when provided":
     let warn = ConfigWarning(
       source:  "/proj/crisol.kdl",
       context: "integration",
@@ -153,18 +211,38 @@ suite "jsonout - toJson schema":
     check w["key"].getStr     == "max-retries"
     check "max-retries" in w["message"].getStr
 
-  test "summary counts match input Summary":
+  test "summary counts match input Summary (rev 16 counts object)":
     let s    = syntheticSummary()
     let node = toJson(syntheticResults(), s)
     let sum  = node["summary"]
-    check sum["total"].getInt         == s.total
-    check sum["passed"].getInt        == s.passed
-    check sum["failed"].getInt        == s.failed
-    check sum["compileFailed"].getInt == s.compileFailed
-    check sum["timedOut"].getInt      == s.timedOut
-    check sum["signaled"].getInt      == s.signaled
-    check sum["spawnErrors"].getInt   == s.spawnErrors
-    check sum["noTestsRan"].getBool   == s.noTestsRan
+    check sum["total"].getInt          == s.total
+    check sum["counts"]["passed"].getInt        == s.counts[oPassed]
+    check sum["counts"]["exitNonZero"].getInt   == s.counts[oFailed]
+    check sum["counts"]["compileFailed"].getInt == s.counts[oCompileFailed]
+    check sum["counts"]["timedOut"].getInt      == s.counts[oTimeout]
+    check sum["counts"]["signaled"].getInt      == s.counts[oSignal]
+    check sum["counts"]["spawnError"].getInt    == s.counts[oSpawnError]
+    check sum["counts"]["killed"].getInt        == s.counts[oKilled]
+    check sum["counts"]["crashed"].getInt       == s.counts[oCrashed]
+    check sum["flaky"].getInt          == s.flaky
+    check sum["quarantined"].getInt    == s.quarantined
+    check sum["notStarted"].getInt     == s.notStarted
+    check sum["noTestsRan"].getBool    == s.noTestsRan
+
+  test "summary.counts reflects the real per-outcome tallies from syntheticResults":
+    ## syntheticResults(): 1 passed, 1 failed, 1 compileFailed, 1 killed
+    ## (legacy "timedOut" fixture), 1 crashed (legacy "signaled" fixture),
+    ## 1 spawnError -- deriveOutcome never returns oTimeout/oSignal.
+    let node = toJson(syntheticResults(), syntheticSummary())
+    let counts = node["summary"]["counts"]
+    check counts["passed"].getInt        == 1
+    check counts["exitNonZero"].getInt   == 1
+    check counts["compileFailed"].getInt == 1
+    check counts["killed"].getInt        == 1
+    check counts["crashed"].getInt       == 1
+    check counts["spawnError"].getInt    == 1
+    check counts["timedOut"].getInt      == 0
+    check counts["signaled"].getInt      == 0
 
   test "entrypoints array has correct length":
     let results = syntheticResults()
@@ -176,7 +254,10 @@ suite "jsonout - toJson schema":
     for ep in node["entrypoints"]:
       check ep["outcome"].kind == JString
 
-  test "outcome string values are stable expected strings":
+  test "outcome string values are stable expected strings (rev 16: deriveOutcome-sourced)":
+    ## rfc-0007 A1d-i: `outcome` is now deriveOutcome(r), not the legacy
+    ## stored field -- the legacy "timedOut"/"signaled" fixtures now read
+    ## "killed"/"crashed", deriveOutcome's honest replacements (§2).
     let results = syntheticResults()
     let node    = toJson(results, syntheticSummary())
     let eps     = node["entrypoints"]
@@ -184,8 +265,8 @@ suite "jsonout - toJson schema":
     check eps[0]["outcome"].getStr == "passed"
     check eps[1]["outcome"].getStr == "exitNonZero"
     check eps[2]["outcome"].getStr == "compileFailed"
-    check eps[3]["outcome"].getStr == "timedOut"
-    check eps[4]["outcome"].getStr == "signaled"
+    check eps[3]["outcome"].getStr == "killed"
+    check eps[4]["outcome"].getStr == "crashed"
     check eps[5]["outcome"].getStr == "spawnError"
 
   test "record status field is a STRING not an integer":
@@ -224,16 +305,18 @@ suite "jsonout - toJson schema":
     let rec = node["entrypoints"][0]["records"][0]
     check rec["msg"].kind == JNull
 
-  test "signal entrypoint carries signal integer":
+  test "rev 16: exitCode/signal/durationMs are DROPPED from the wire; derivable from run.exit/run.durationUs":
+    ## The oSignal fixture (delta index is now "killed" not "signaled" --
+    ## see the reordered outcome test above; epsilon/index 4 is "crashed",
+    ## the genuine signaled-exit fixture).  Its signal is derivable from
+    ## run.exit.sig, not a standalone `signal` key.
     let node  = toJson(syntheticResults(), syntheticSummary())
-    let sigEp = node["entrypoints"][4]   # oSignal result
-    check sigEp["signal"].kind == JInt
-    check sigEp["signal"].getInt == 11
-
-  test "non-signal entrypoint has null signal field":
-    let node   = toJson(syntheticResults(), syntheticSummary())
-    let passEp = node["entrypoints"][0]   # oPassed result
-    check passEp["signal"].kind == JNull
+    let sigEp = node["entrypoints"][4]   # crashed (ekSignaled) result
+    check not sigEp.hasKey("signal")
+    check not sigEp.hasKey("exitCode")
+    check not sigEp.hasKey("durationMs")
+    check sigEp["run"]["exit"]["kind"].getStr == "signaled"
+    check sigEp["run"]["exit"]["sig"].getInt == 11
 
   test "entrypoint carries path and group strings":
     let node = toJson(syntheticResults(), syntheticSummary())
@@ -241,20 +324,21 @@ suite "jsonout - toJson schema":
     check ep["path"].getStr  == "tests/integration/test_delta.nim"
     check ep["group"].getStr == "integration"
 
-  test "durationMs is a number field":
+  test "run.durationUs and compile.durationUs are number fields for a ran phase":
     let node = toJson(syntheticResults(), syntheticSummary())
     let ep   = node["entrypoints"][0]
-    check ep["durationMs"].kind in {JFloat, JInt}
+    check ep["run"]["durationUs"].kind == JInt
+    check ep["compile"]["durationUs"].kind == JInt
 
   test "toJsonString produces valid parseable JSON":
     let s      = toJsonString(syntheticResults(), syntheticSummary())
     check s.len > 0
     let parsed = parseJson(s)   # throws if invalid
-    check parsed["schema"].getStr == "crisol/run/v1"
+    check parsed["schema"].getStr == "crisol/run/v2"
 
   # S2a: compileSkipped and memThrottledSlots schema fields
 
-  test "run/v1 each entrypoint carries compileSkipped boolean field":
+  test "run/v2 each entrypoint carries compileSkipped boolean field":
     ## S2a: EntrypointResult.compileSkipped already exists but toJson never
     ## emitted it.  This completes the schema.
     let results = @[
@@ -268,7 +352,7 @@ suite "jsonout - toJson schema":
     check node["entrypoints"][0]["compileSkipped"].getBool == true
     check node["entrypoints"][1]["compileSkipped"].getBool == false
 
-  test "run/v1 has top-level memThrottledSlots integer field":
+  test "run/v2 has top-level memThrottledSlots integer field":
     ## S2a: schema field for memory-throttled slot count.  The AdmissionController
     ## (S6b) will populate this; for now it is always 0.  # S6b
     let node = toJson(syntheticResults(), syntheticSummary())
@@ -276,7 +360,7 @@ suite "jsonout - toJson schema":
     check node["memThrottledSlots"].kind == JInt
     check node["memThrottledSlots"].getInt == 0
 
-  test "run/v1 memThrottledSlots accepts a non-zero value when passed":
+  test "run/v2 memThrottledSlots accepts a non-zero value when passed":
     ## Verify the field is wired through the parameter, not hard-coded.
     let node = toJson(syntheticResults(), syntheticSummary(),
                       memThrottledSlots = 3)
@@ -285,7 +369,7 @@ suite "jsonout - toJson schema":
   test "empty results sequence serializes cleanly":
     let s    = Summary(total: 0, passed: 0, noTestsRan: true)
     let node = toJson(@[], s)
-    check node["schema"].getStr == "crisol/run/v1"
+    check node["schema"].getStr == "crisol/run/v2"
     check node["entrypoints"].len == 0
     check node["summary"]["noTestsRan"].getBool == true
 
@@ -307,13 +391,13 @@ suite "jsonout A8 — cache reporting fields":
       exitCode: 0, durationMs: 12, records: @[],
       cached: false, inputHash: "0011223344556677", cacheDecision: cdmKeyMiss)
 
-  test "run/v1 carries an integer schemaRevision alongside schema string":
+  test "run/v2 carries an integer schemaRevision alongside schema string":
     let node = toJson(syntheticResults(), syntheticSummary())
-    check node["schema"].getStr == "crisol/run/v1"
+    check node["schema"].getStr == "crisol/run/v2"
     check node.hasKey("schemaRevision")
     check node["schemaRevision"].kind == JInt
-    check node["schemaRevision"].getInt == RunV1Revision
-    check RunV1Revision >= 2
+    check node["schemaRevision"].getInt == RunSchemaRevision
+    check RunSchemaRevision >= 2
 
   test "issue #10 (rev 14): each entrypoint carries its effective flags, identifying the leg":
     ## The same path under two groups with different flags is two legs; a
@@ -442,7 +526,7 @@ suite "jsonout - persistLastRun":
     let finalPath = tmpDir / stateDir / "lastrun.json"
     let raw       = readFile(finalPath)
     let parsed    = parseJson(raw)   # throws if invalid
-    check parsed["schema"].getStr == "crisol/run/v1"
+    check parsed["schema"].getStr == "crisol/run/v2"
 
   test "persisted JSON matches toJson output":
     let tmpDir   = uniqueTmpDir("match")
@@ -469,9 +553,11 @@ suite "jsonout - persistLastRun":
     let fromToJson = toJson(results, summary)
 
     # Compare summary counts
-    check fromFile["summary"]["total"].getInt  == fromToJson["summary"]["total"].getInt
-    check fromFile["summary"]["passed"].getInt == fromToJson["summary"]["passed"].getInt
-    check fromFile["summary"]["failed"].getInt == fromToJson["summary"]["failed"].getInt
+    check fromFile["summary"]["total"].getInt == fromToJson["summary"]["total"].getInt
+    check fromFile["summary"]["counts"]["passed"].getInt ==
+          fromToJson["summary"]["counts"]["passed"].getInt
+    check fromFile["summary"]["counts"]["exitNonZero"].getInt ==
+          fromToJson["summary"]["counts"]["exitNonZero"].getInt
     check fromFile["entrypoints"].len          == fromToJson["entrypoints"].len
 
   test "persistLastRun creates stateDir if absent":
@@ -605,7 +691,7 @@ suite "jsonout - --json CLI flag":
       let raw    = readFile(outPath)
       check raw.strip().len > 0
       let parsed = parseJson(raw.strip())
-      check parsed["schema"].getStr == "crisol/run/v1"
+      check parsed["schema"].getStr == "crisol/run/v2"
 
   test "RFC-0006 Issue-2 regression: in-process runMain() with no selfWorkerBinary never self-reexecs; compiles monolithically and succeeds (cold stateDir)":
     ## Direct proof of the fix's soundness invariant. Before the fix,
@@ -640,8 +726,8 @@ suite "jsonout - --json CLI flag":
       let raw = readFile(outPath).strip()
       check raw.len > 0
       let parsed = parseJson(raw)
-      check parsed["schema"].getStr == "crisol/run/v1"
-      check parsed["summary"]["passed"].getInt == 1
+      check parsed["schema"].getStr == "crisol/run/v2"
+      check parsed["summary"]["counts"]["passed"].getInt == 1
       check parsed["summary"]["total"].getInt == 1
 
   test "--json flag: output has no human-render lines (no [OK], PASSED:)":
@@ -673,7 +759,7 @@ suite "jsonout - --json CLI flag":
 
     check code == 1
     let parsed = parseJson(readFile(outPath).strip())
-    check parsed["schema"].getStr == "crisol/run/v1"
+    check parsed["schema"].getStr == "crisol/run/v2"
 
   test "without --json: lastrun.json is written to .crisol/":
     ## runMain uses loadConfig() which roots at getCurrentDir().
@@ -692,7 +778,7 @@ suite "jsonout - --json CLI flag":
     check code == 0
     check fileExists(statePath)
     let parsed = parseJson(readFile(statePath))
-    check parsed["schema"].getStr == "crisol/run/v1"
+    check parsed["schema"].getStr == "crisol/run/v2"
 
 # ---------------------------------------------------------------------------
 # Suite 4 -- B7: loadLastRun
@@ -733,7 +819,7 @@ suite "jsonout - loadLastRun (B7)":
     createDir(tmpDir / stateDir)
     defer: removeDir(tmpDir)
 
-    let jsonDoc = """{"schema":"crisol/run/v1","summary":{"total":3,"passed":2,"failed":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnErrors":0,"noTestsRan":false},"entrypoints":[{"path":"tests/unit/test_shared.nim","group":"unit","outcome":"exitNonZero","exitCode":1,"signal":null,"durationMs":100.0,"records":[]},{"path":"tests/unit/test_shared.nim","group":"integration","outcome":"passed","exitCode":0,"signal":null,"durationMs":50.0,"records":[]},{"path":"tests/unit/test_other.nim","group":"unit","outcome":"passed","exitCode":0,"signal":null,"durationMs":20.0,"records":[]}]}"""
+    let jsonDoc = """{"schema":"crisol/run/v2","summary":{"total":3,"counts":{"passed":2,"exitNonZero":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnError":0,"killed":0,"crashed":0},"flaky":0,"quarantined":0,"notStarted":0,"noTestsRan":false},"entrypoints":[{"path":"tests/unit/test_shared.nim","group":"unit","outcome":"exitNonZero","records":[]},{"path":"tests/unit/test_shared.nim","group":"integration","outcome":"passed","records":[]},{"path":"tests/unit/test_other.nim","group":"unit","outcome":"passed","records":[]}]}"""
     writeFile(tmpDir / stateDir / "lastrun.json", jsonDoc)
 
     let cfg = makeCfg(tmpDir, stateDir)
@@ -756,7 +842,7 @@ suite "jsonout - loadLastRun (B7)":
     createDir(tmpDir / stateDir)
     defer: removeDir(tmpDir)
 
-    let jsonDoc = """{"schema":"crisol/run/v1","summary":{"total":5,"passed":0,"failed":5,"compileFailed":0,"timedOut":0,"signaled":0,"spawnErrors":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","exitCode":1,"signal":null,"durationMs":1.0,"records":[]},{"path":"b.nim","group":"g","outcome":"compileFailed","exitCode":1,"signal":null,"durationMs":1.0,"records":[]},{"path":"c.nim","group":"g","outcome":"timedOut","exitCode":0,"signal":null,"durationMs":1.0,"records":[]},{"path":"d.nim","group":"g","outcome":"signaled","exitCode":0,"signal":11,"durationMs":1.0,"records":[]},{"path":"e.nim","group":"g","outcome":"spawnError","exitCode":0,"signal":null,"durationMs":1.0,"records":[]}]}"""
+    let jsonDoc = """{"schema":"crisol/run/v2","summary":{"total":5,"counts":{"passed":0,"exitNonZero":1,"compileFailed":1,"timedOut":0,"signaled":0,"spawnError":1,"killed":1,"crashed":1},"flaky":0,"quarantined":0,"notStarted":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","records":[]},{"path":"b.nim","group":"g","outcome":"compileFailed","records":[]},{"path":"c.nim","group":"g","outcome":"killed","records":[]},{"path":"d.nim","group":"g","outcome":"crashed","records":[]},{"path":"e.nim","group":"g","outcome":"spawnError","records":[]}]}"""
     writeFile(tmpDir / stateDir / "lastrun.json", jsonDoc)
 
     let cfg = makeCfg(tmpDir, stateDir)
@@ -777,13 +863,32 @@ suite "jsonout - loadLastRun (B7)":
     createDir(tmpDir / stateDir)
     defer: removeDir(tmpDir)
 
-    let jsonDoc = """{"schema":"crisol/run/v1","summary":{"total":1,"passed":1,"failed":0,"compileFailed":0,"timedOut":0,"signaled":0,"spawnErrors":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"passed","exitCode":0,"signal":null,"durationMs":1.0,"records":[]}]}"""
+    let jsonDoc = """{"schema":"crisol/run/v2","summary":{"total":1,"counts":{"passed":1,"exitNonZero":0,"compileFailed":0,"timedOut":0,"signaled":0,"spawnError":0,"killed":0,"crashed":0},"flaky":0,"quarantined":0,"notStarted":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"passed","records":[]}]}"""
     writeFile(tmpDir / stateDir / "lastrun.json", jsonDoc)
 
     let cfg = makeCfg(tmpDir, stateDir)
     let lr  = loadLastRun(cfg)
 
     check lr.found == true
+    check lr.failed.len == 0
+
+  test "loadLastRun: a persisted crisol/run/v1 document is treated as cold start (rfc-0007 A1d-i)":
+    ## A schema CHANGE is not something a byte-compatible reader can
+    ## partially trust -- reading v1 is honest "no data", exactly like a
+    ## missing file: found=false, no error, no partial parse.
+    let tmpDir   = uniqueTmpDir("v1coldstart")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir)
+    createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+
+    let jsonDoc = """{"schema":"crisol/run/v1","summary":{"total":1,"passed":0,"failed":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnErrors":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","exitCode":1,"signal":null,"durationMs":1.0,"records":[]}]}"""
+    writeFile(tmpDir / stateDir / "lastrun.json", jsonDoc)
+
+    let cfg = makeCfg(tmpDir, stateDir)
+    let lr  = loadLastRun(cfg)
+
+    check lr.found == false
     check lr.failed.len == 0
 
   test "loadLastRun: wrong schema version raises CrisolError":
@@ -933,8 +1038,8 @@ suite "jsonout - loadLastRun (B7)":
     let stateDir = ".crisol_test"
     createDir(tmpDir); createDir(tmpDir / stateDir)
     defer: removeDir(tmpDir)
-    # An old document: no schemaRevision, entrypoint has no cached/inputHash.
-    let doc = """{"schema":"crisol/run/v1","summary":{"total":1,"passed":0,"failed":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnErrors":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","exitCode":1,"signal":null,"durationMs":1.0,"records":[]}]}"""
+    # An old v2 document: no schemaRevision, entrypoint has no cached/inputHash.
+    let doc = """{"schema":"crisol/run/v2","summary":{"total":1,"counts":{"passed":0,"exitNonZero":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnError":0,"killed":0,"crashed":0},"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","records":[]}]}"""
     writeFile(tmpDir / stateDir / "lastrun.json", doc)
     let lr = loadLastRun(makeCfg(tmpDir, stateDir))
     check lr.found == true
@@ -945,7 +1050,7 @@ suite "jsonout - loadLastRun (B7)":
     let stateDir = ".crisol_test"
     createDir(tmpDir); createDir(tmpDir / stateDir)
     defer: removeDir(tmpDir)
-    let doc = """{"schema":"crisol/run/v1","schemaRevision":2,"summary":{"total":1,"passed":1,"failed":0,"compileFailed":0,"timedOut":0,"signaled":0,"spawnErrors":0,"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"passed","exitCode":0,"signal":null,"durationMs":1.0,"cached":true,"inputHash":"abc","cacheDecision":"hit","records":[]}]}"""
+    let doc = """{"schema":"crisol/run/v2","schemaRevision":2,"summary":{"total":1,"counts":{"passed":1,"exitNonZero":0,"compileFailed":0,"timedOut":0,"signaled":0,"spawnError":0,"killed":0,"crashed":0},"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"passed","cached":true,"inputHash":"abc","cacheDecision":"hit","records":[]}]}"""
     writeFile(tmpDir / stateDir / "lastrun.json", doc)
     let lr = loadLastRun(makeCfg(tmpDir, stateDir))
     check lr.found == true
@@ -958,7 +1063,7 @@ suite "jsonout - loadLastRun (B7)":
     let stateDir = ".crisol_test"
     createDir(tmpDir); createDir(tmpDir / stateDir)
     defer: removeDir(tmpDir)
-    let doc = """{"schema":"crisol/run/v1","schemaRevision":9999,"summary":{"total":1,"passed":0,"failed":1},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","records":[]}]}"""
+    let doc = """{"schema":"crisol/run/v2","schemaRevision":9999,"summary":{"total":1},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","records":[]}]}"""
     writeFile(tmpDir / stateDir / "lastrun.json", doc)
     let lr = loadLastRun(makeCfg(tmpDir, stateDir))
     check lr.found == false
@@ -976,9 +1081,11 @@ suite "jsonout - loadLastRun (B7)":
     let results = @[
       EntrypointResult(ep: Entrypoint(path: "tests/unit/test_alpha.nim", group: "unit", flags: @[]),
                        outcome: oFailed, exitCode: 1, signal: 0,
+                       compile: okPhase(), run: okPhase(1),
                        durationMs: 100, records: @[]),
       EntrypointResult(ep: Entrypoint(path: "tests/unit/test_beta.nim", group: "unit", flags: @[]),
                        outcome: oPassed, exitCode: 0, signal: 0,
+                       compile: okPhase(), run: okPhase(),
                        durationMs: 50, records: @[]),
     ]
     let summary = Summary(total: 2, passed: 1, failed: 1)
@@ -1076,17 +1183,17 @@ suite "jsonout - P3 symlink-safe temp write":
 
 suite "jsonout M-report (a) — compile block threading":
 
-  test "compileBlock=nil (default): document is byte-identical to before this slice -- no 'compile' key":
+  test "compileBlock=nil (default): document is byte-identical to before this slice -- no 'compileStats' key":
     let withDefault = toJson(syntheticResults(), syntheticSummary())
     let withExplicitNil = toJson(syntheticResults(), syntheticSummary(), compileBlock = nil)
-    check not withDefault.hasKey("compile")
-    check not withExplicitNil.hasKey("compile")
+    check not withDefault.hasKey("compileStats")
+    check not withExplicitNil.hasKey("compileStats")
     check $withDefault == $withExplicitNil
 
-  test "RunV1Revision was bumped for the additive compile field":
-    check RunV1Revision >= 7
+  test "RunSchemaRevision was bumped for the additive compile field":
+    check RunSchemaRevision >= 7
 
-  test "a non-nil compileBlock is threaded through toJson as the top-level 'compile' key, well-formed":
+  test "a non-nil compileBlock is threaded through toJson as the top-level 'compileStats' key, well-formed":
     var blk = newJObject()
     var segments = newJArray()
     var seg = newJObject()
@@ -1097,19 +1204,19 @@ suite "jsonout M-report (a) — compile block threading":
     blk["segments"] = segments
 
     let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
-    check node.hasKey("compile")
-    check node["compile"]["segments"].kind == JArray
-    check node["compile"]["segments"].len == 1
-    check node["compile"]["segments"][0]["groupId"].getStr == "g1"
-    check node["compile"]["segments"][0]["rTime"].getFloat == 0.5
+    check node.hasKey("compileStats")
+    check node["compileStats"]["segments"].kind == JArray
+    check node["compileStats"]["segments"].len == 1
+    check node["compileStats"]["segments"][0]["groupId"].getStr == "g1"
+    check node["compileStats"]["segments"][0]["rTime"].getFloat == 0.5
 
   test "toJsonString threads compileBlock through to the serialized string":
     var blk = newJObject()
     blk["segments"] = newJArray()
     let str = toJsonString(syntheticResults(), syntheticSummary(), compileBlock = blk)
     let node = parseJson(str)
-    check node.hasKey("compile")
-    check node["compile"]["segments"].len == 0
+    check node.hasKey("compileStats")
+    check node["compileStats"]["segments"].len == 0
 
   test "persistLastRun threads compileBlock through to the persisted lastrun.json":
     let tmpDir   = uniqueTmpDir("compileblock")
@@ -1139,8 +1246,8 @@ suite "jsonout M-report (a) — compile block threading":
     persistLastRun(syntheticResults(), syntheticSummary(), cfg, compileBlock = blk)
 
     let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
-    check persisted.hasKey("compile")
-    check persisted["compile"]["segments"][0]["groupId"].getStr == "unit"
+    check persisted.hasKey("compileStats")
+    check persisted["compileStats"]["segments"][0]["groupId"].getStr == "unit"
 
   test "persistLastRun with compileBlock=nil (default) omits 'compile' from the persisted file":
     let tmpDir   = uniqueTmpDir("compileblocknil")
@@ -1161,7 +1268,7 @@ suite "jsonout M-report (a) — compile block threading":
     persistLastRun(syntheticResults(), syntheticSummary(), cfg)
 
     let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
-    check not persisted.hasKey("compile")
+    check not persisted.hasKey("compileStats")
 
 # ---------------------------------------------------------------------------
 # M-report PASS (b1) — reuseAlerts array threading, additive/back-compat
@@ -1180,8 +1287,8 @@ suite "jsonout M-report (b1) — reuseAlerts threading":
     let withExplicitEmpty = toJson(syntheticResults(), syntheticSummary(), reuseAlerts = newJArray())
     check $withDefault == $withExplicitEmpty
 
-  test "RunV1Revision was bumped again for the additive reuseAlerts/ambientCcacheDetected/topUnits fields":
-    check RunV1Revision >= 8
+  test "RunSchemaRevision was bumped again for the additive reuseAlerts/ambientCcacheDetected/topUnits fields":
+    check RunSchemaRevision >= 8
 
   test "a non-empty reuseAlerts array is threaded through toJson as the top-level 'reuseAlerts' key, well-formed":
     var alerts = newJArray()
@@ -1269,8 +1376,8 @@ suite "jsonout M-report (b1) — reuseAlerts threading":
 
 suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
-  test "RunV1Revision was bumped again for the additive compile.compileRegressions field":
-    check RunV1Revision >= 9
+  test "RunSchemaRevision was bumped again for the additive compile.compileRegressions field":
+    check RunSchemaRevision >= 9
 
   test "a compileBlock carrying a non-empty compileRegressions array threads through toJson opaquely":
     var blk = newJObject()
@@ -1287,9 +1394,9 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
     blk["compileRegressions"] = regressions
 
     let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
-    check node["compile"]["compileRegressions"].len == 1
-    check node["compile"]["compileRegressions"][0]["entrypointIdentity"].getStr == "ep_a|flaghash"
-    check node["compile"]["compileRegressions"][0]["currentUs"].getBiggestInt == 500_000
+    check node["compileStats"]["compileRegressions"].len == 1
+    check node["compileStats"]["compileRegressions"][0]["entrypointIdentity"].getStr == "ep_a|flaghash"
+    check node["compileStats"]["compileRegressions"][0]["currentUs"].getBiggestInt == 500_000
 
   test "compileBlock with an empty compileRegressions array (the default) -> present and empty, document otherwise byte-identical":
     var blkEmpty = newJObject()
@@ -1302,29 +1409,32 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
     let withEmpty   = toJson(syntheticResults(), syntheticSummary(), compileBlock = blkEmpty)
     let withOmitted = toJson(syntheticResults(), syntheticSummary(), compileBlock = blkOmitted)
-    check withEmpty["compile"]["compileRegressions"].len == 0
+    check withEmpty["compileStats"]["compileRegressions"].len == 0
     check $withEmpty == $withOmitted
 
 # ---------------------------------------------------------------------------
 # Code review R7 — compile.segments[] gains currentRunEntrypoints/
-# sampleEntrypoints/lowConfidence, additive/back-compat (RunV1Revision 10->11)
+# sampleEntrypoints/lowConfidence, additive/back-compat (RunSchemaRevision 10->11)
 # ---------------------------------------------------------------------------
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunV1Revision is 15 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause)":
-    check RunV1Revision == 15
+  test "RunSchemaRevision is 16 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover)":
+    check RunSchemaRevision == 16
 
-  test "rfc-0007 A1c: exit/cause are null when the result carries no captured run phase (back-compat default)":
-    ## A default-constructed EntrypointResult's `run` Phase defaults to
-    ## pkSkipped (zero value) -- toJson emits null advisory nodes rather than
-    ## omitting the keys (additive, not a schema break: readers are
-    ## unknown-tolerant, and `null` is a stable presence).
+  test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
+    ## A default-constructed EntrypointResult's `compile`/`run` Phase default
+    ## to pkSkipped (zero value) -- toJson emits the Phase node's `kind` as
+    ## "skipped" with no exit/cause/evidence/rusage/durationUs keys at all
+    ## (there is no observation to report -- the honest posture, not a null
+    ## placeholder for every possible field).
     let node = toJson(@[EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
                                          outcome: oPassed, exitCode: 0)],
                       Summary(total: 1, passed: 1))
-    check node["entrypoints"][0]["exit"].kind == JNull
-    check node["entrypoints"][0]["cause"].kind == JNull
+    check node["entrypoints"][0]["run"]["kind"].getStr == "skipped"
+    check not node["entrypoints"][0]["run"].hasKey("exit")
+    check not node["entrypoints"][0]["run"].hasKey("cause")
+    check node["entrypoints"][0]["compile"]["kind"].getStr == "skipped"
 
   test "a compileBlock carrying the new per-segment fields threads through toJson opaquely (jsonout never inspects compile's internal shape)":
     var blk = newJObject()
@@ -1340,9 +1450,9 @@ suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
     blk["segments"] = segments
 
     let node = toJson(syntheticResults(), syntheticSummary(), compileBlock = blk)
-    check node["compile"]["segments"][0]["currentRunEntrypoints"].getInt == 1
-    check node["compile"]["segments"][0]["sampleEntrypoints"].getInt == 9
-    check node["compile"]["segments"][0]["lowConfidence"].getBool == true
+    check node["compileStats"]["segments"][0]["currentRunEntrypoints"].getInt == 1
+    check node["compileStats"]["segments"][0]["sampleEntrypoints"].getInt == 9
+    check node["compileStats"]["segments"][0]["lowConfidence"].getBool == true
 
 # ---------------------------------------------------------------------------
 # closureToJson (crisol/closure/v1): schema/revision pin + full field

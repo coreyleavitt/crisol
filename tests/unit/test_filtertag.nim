@@ -26,6 +26,7 @@ import crisol/types
 import crisol/render
 import crisol/jsonout
 import crisol/runner  # for summarize
+import crisol/process/types as ptypes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -40,12 +41,29 @@ proc taggedRecord(name: string; tags: seq[string];
   TestRecord(name: name, status: status, durationUs: us,
              msg: none(string), tags: tags)
 
+proc phase(code: int): ptypes.Phase =
+  ## rfc-0007 A1d-i: summarize()'s Summary.counts (and jsonout's derived
+  ## `outcome`/`flaky`) read deriveOutcome(r), which walks the real
+  ## compile/run Phase pair -- a fixture must carry a coherent Phase, not
+  ## just the legacy `outcome` field, for those derivations to agree with it.
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: ptypes.Exit(kind: ptypes.ekExited, code: code),
+    cause: ptypes.Cause(by: ptypes.cbProcess),
+    evidence: ptypes.Evidence(killDomain: ptypes.kdsProcessGroup,
+                              tree: ptypes.toUnobservable,
+                              hermetic: ptypes.hlIsolated),
+    rusage: none(ptypes.Rusage),
+    durationUs: 1000,
+  ))
+
 proc passedEp(path: string; records: seq[TestRecord]): EntrypointResult =
   EntrypointResult(ep: makeEp(path), outcome: oPassed, exitCode: 0,
+                   compile: phase(0), run: phase(0),
                    durationMs: 50, records: records)
 
 proc failedEp(path: string; records: seq[TestRecord]): EntrypointResult =
   EntrypointResult(ep: makeEp(path), outcome: oFailed, exitCode: 1,
+                   compile: phase(0), run: phase(1),
                    durationMs: 50, records: records)
 
 proc noFilterOpts(): RenderOpts =
@@ -281,6 +299,6 @@ suite "toJson – filter-tag":
     let s = summarize(results)
     let node = toJson(results, s, "fast")
     # Summary should reflect the full run: 1 entrypoint total, 1 passed
-    check node["summary"]["total"].getInt  == 1
-    check node["summary"]["passed"].getInt == 1
-    check node["summary"]["failed"].getInt == 0
+    check node["summary"]["total"].getInt == 1
+    check node["summary"]["counts"]["passed"].getInt      == 1
+    check node["summary"]["counts"]["exitNonZero"].getInt == 0

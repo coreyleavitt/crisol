@@ -10,7 +10,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_zero_runnable.nim
 
-import std/[monotimes, os, osproc, sets, strutils, unittest]
+import std/[monotimes, options, os, osproc, sets, strutils, unittest]
 import std/posix as posix_mod
 import crisol
 import crisol/types
@@ -18,6 +18,24 @@ import crisol/jsonout
 import crisol/depgraph
 import crisol/nimprobe  # for cachedNimFingerprint (the fingerprint runMain seeds/reads with)
 import crisol/planner  # for CrisolProtocolMajor
+
+import crisol/process/types as ptypes
+
+# rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
+# which reads it) is sourced from deriveOutcome(r), which walks the real
+# compile/run Phase pair -- a fixture must carry a coherent Phase, not just
+# the legacy `outcome` field, or every entry silently derives oSpawnError
+# (Phase defaults to pkSkipped) and gets treated as failed.
+proc okPhase(code: int = 0): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: ptypes.Exit(kind: ptypes.ekExited, code: code),
+    cause: ptypes.Cause(by: ptypes.cbProcess),
+    evidence: ptypes.Evidence(killDomain: ptypes.kdsProcessGroup,
+                              tree: ptypes.toUnobservable,
+                              hermetic: ptypes.hlIsolated),
+    rusage: none(ptypes.Rusage),
+    durationUs: 1000,
+  ))
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -173,7 +191,8 @@ suite "crisol zero-runnable — branch 2: --failed no prior failures":
     let results = @[
       EntrypointResult(
         ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]),
-        outcome: oPassed, exitCode: 0, signal: 0, durationMs: 10, records: @[]),
+        outcome: oPassed, exitCode: 0, signal: 0, durationMs: 10, records: @[],
+        compile: okPhase(), run: okPhase()),
     ]
     persistLastRun(results, Summary(total: 1, passed: 1), cfg)
 

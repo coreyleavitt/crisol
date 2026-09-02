@@ -503,6 +503,15 @@ type
                          ## reads them until A1d-i). `counts[oTimeout]` and
                          ## `counts[oSignal]` stay 0 — deriveOutcome never
                          ## returns the legacy values.
+    notStarted*:   int   ## rfc-0007 A1d-i: count of entries OMITTED from the
+                         ## emission set because their next phase never
+                         ## started (queued, or compile-done-run-unstarted) —
+                         ## §2's "no representable 'run never started' state"
+                         ## rule.  Always 0 until A1e-ii wires real interrupt
+                         ## partial-run omission; summarize() does not yet
+                         ## produce a non-zero value (it only ever sees the
+                         ## already-emitted result set), so this is an honest
+                         ## placeholder, not a fabricated zero.
 
   GateStateEntry* = tuple[name: string; value: string]
     ## Internal element of GateState; exported so discover.nim can read it.
@@ -633,7 +642,7 @@ proc outcomeString*(o: Outcome): string =
   ## Returns the stable JSON wire string for an Outcome enum value.
   ## Single source of truth — outcomestrings.nim and jsonout.nim derive
   ## their constants and delegating proc from this mapping.
-  ## Wire values are defined by the crisol/run/v1 schema and must never change.
+  ## Wire values are defined by the crisol/run/v2 schema and must never change.
   case o
   of oPassed:        "passed"
   of oFailed:        "exitNonZero"
