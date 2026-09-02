@@ -33,8 +33,8 @@
 import std/[json, monotimes, options, os, sets, strutils, tables, times]
 import std/posix
 import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver]
-# rfc-0007 A1b: the §2 result-model types (Exit/Cause/Phase/…), dual-written
-# alongside the legacy fields above via process/types.Rfc7Window — see
+# rfc-0007 A1c: the §2 result-model types (Exit/Cause/Phase/…), dual-written
+# directly onto EntrypointResult.compile/.run (crisol/types.nim) — see
 # pollSlot and buildProcResult below. `import nil` (not a plain `import as`)
 # so nothing unqualified leaks in — `Rusage` in this file must stay
 # std/posix's Rusage (used at every real reap site), never ptypes.Rusage.
@@ -125,7 +125,8 @@ proc isQuarantined*(ep: Entrypoint; res: EntrypointResult;
 
   # B4: per-test name-match.
   # Preconditions: must be a failure with ≥ 1 rsFail record.
-  if not res.outcome.isFailure:
+  # rfc-0007 A1c: derived, not the stored legacy field.
+  if not deriveOutcome(res).isFailure:
     return false  # passed result — nothing to downgrade
 
   # Collect failing records. If none, per-test rule does not apply.
@@ -349,20 +350,20 @@ proc mapLegacyOutcomeForward(o: Outcome): Outcome =
   of oSignal:  oCrashed
   else:        o
 
-proc checkRfc7Coherence(legacy: EntrypointResult; w: ptypes.Rfc7Window) =
-  let shaped = ptypes.EntrypointResult(
-    ep: legacy.ep, compile: w.compile, run: w.run, records: legacy.records,
-  )
-  let derived  = ptypes.deriveOutcome(shaped)
+proc checkRfc7Coherence(legacy: EntrypointResult) =
+  ## rfc-0007 A1c: the window now lives directly on `legacy` (compile/run
+  ## Phase fields) — no more shaping a parallel process/types.EntrypointResult
+  ## to derive over.
+  let derived  = deriveOutcome(legacy)
   let expected = mapLegacyOutcomeForward(legacy.outcome)
   doAssert derived == expected,
     "rfc-0007 A1b dual-write coherence: " & legacy.ep.path & " legacy outcome=" &
     $legacy.outcome & " (mapped " & $expected & ") but derived=" & $derived &
     " from the captured compile/run Phase"
 
-template rfc7Check(legacy: EntrypointResult; w: ptypes.Rfc7Window) =
+template rfc7Check(legacy: EntrypointResult) =
   when not defined(danger):
-    checkRfc7Coherence(legacy, w)
+    checkRfc7Coherence(legacy)
 
 proc teardownLiveSlots(slots: var seq[Slot]) =
   ## M6: Graceful shutdown of all live slots — shared by handleInterrupt and the
@@ -907,7 +908,6 @@ proc cleanupSlotTmp(slot: Slot) =
 proc pollSlot(
   slot:           var Slot;
   results:        var seq[EntrypointResult];
-  window:         var seq[ptypes.Rfc7Window];
   plan:           RunPlan;
   maxOutputBytes: int;
 ): bool =
@@ -926,10 +926,11 @@ proc pollSlot(
   ## onResult is called ONCE by the execute loop after that decision.
   ##
   ## Records the result in `results[slot.pepIdx]`; execute loop calls onResult.
-  ## rfc-0007 A1b: `window[slot.pepIdx]` is dual-written alongside every
-  ## `results[slot.pepIdx]` write below EXCEPT two documented, never-
-  ## fabricated corners: a genuinely unreaped kill (the "unkillable child"
-  ## case) and ECHILD (truly no child to observe).
+  ## rfc-0007 A1c: `results[slot.pepIdx].compile`/`.run` (the §2 window) are
+  ## dual-written alongside every legacy-field write below EXCEPT two
+  ## documented, never-fabricated corners: a genuinely unreaped kill (the
+  ## "unkillable child" case) and ECHILD (truly no child to observe) — both
+  ## leave `compile`/`run` at their pkSkipped zero-value default.
 
   var wstatus: cint = 0
   var ru: Rusage
@@ -971,28 +972,25 @@ proc pollSlot(
     if slot.phase == spCompiling and slot.cacheDir.len > 0:
       try: removeDir(slot.cacheDir) except: discard
     cleanupSlotTmp(slot)
-    results[slot.pepIdx] = res
-    # rfc-0007 A1b: the honest observation. `cap.reaped == false` is the
+    # rfc-0007 A1c: the honest observation. `cap.reaped == false` is the
     # RFC's "unkillable child" corner — never fabricate a Phase for it;
-    # window/coherence are simply not populated for this pepIdx (the legacy
-    # result above is unaffected either way).
+    # `res.compile`/`.run` are simply left at their pkSkipped zero-value
+    # default for this pepIdx (the legacy result above is unaffected either way).
     if cap.reaped:
       let killedRes = buildProcResult(cap.exit, cap.rusage,
         some((reason: ptypes.krTimeout, escalated: cap.escalated)), elapsed * 1000)
-      let w =
-        if slot.phase == spCompiling:
-          ptypes.Rfc7Window(compile: ptypes.Phase(kind: ptypes.pkRan, res: killedRes),
-                            run: ptypes.Phase(kind: ptypes.pkSkipped))
-        else:
-          ptypes.Rfc7Window(
-            compile:
-              if slot.compileProcRes.isSome:
-                ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
-              else:
-                ptypes.Phase(kind: ptypes.pkSkipped),
-            run: ptypes.Phase(kind: ptypes.pkRan, res: killedRes))
-      window[slot.pepIdx] = w
-      rfc7Check(res, w)
+      if slot.phase == spCompiling:
+        res.compile = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
+        res.run      = ptypes.Phase(kind: ptypes.pkSkipped)
+      else:
+        res.compile =
+          if slot.compileProcRes.isSome:
+            ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
+          else:
+            ptypes.Phase(kind: ptypes.pkSkipped)
+        res.run = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
+      rfc7Check(res)
+    results[slot.pepIdx] = res
     return true  # execute loop calls onResult after retry decision
 
   if r == 0:
@@ -1009,8 +1007,9 @@ proc pollSlot(
                                compileSkipped: slot.compileSkipped)
     cleanupSlotTmp(slot)
     results[slot.pepIdx] = res
-    # rfc-0007 A1b: truly no observation is possible here (ECHILD) — dual-
-    # write is skipped for this pepIdx, same never-fabricate rule as above.
+    # rfc-0007 A1c: truly no observation is possible here (ECHILD) — the
+    # Phase fields are left at their pkSkipped zero-value default, same
+    # never-fabricate rule as the "unkillable child" corner above.
     return true  # execute loop calls onResult after retry decision
 
   # r == slot.pid: child has exited.
@@ -1035,12 +1034,11 @@ proc pollSlot(
       if slot.slotBinDir.len > 0:
         try: removeDir(slot.slotBinDir) except: discard
       cleanupSlotTmp(slot)
-      results[slot.pepIdx] = res
       let failedRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000)
-      let w = ptypes.Rfc7Window(compile: ptypes.Phase(kind: ptypes.pkRan, res: failedRes),
-                                run: ptypes.Phase(kind: ptypes.pkSkipped))
-      window[slot.pepIdx] = w
-      rfc7Check(res, w)
+      res.compile = ptypes.Phase(kind: ptypes.pkRan, res: failedRes)
+      res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
+      rfc7Check(res)
+      results[slot.pepIdx] = res
       return true  # execute loop calls onResult after retry decision
     else:
       # Compile succeeded → transition to running phase. rfc-0007 A1b:
@@ -1068,13 +1066,11 @@ proc pollSlot(
         if slot.slotBinDir.len > 0:
           try: removeDir(slot.slotBinDir) except: discard
         cleanupSlotTmp(slot)
+        res.compile = ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
+        res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
+                                   spawnError: "fork failed during run phase")
+        rfc7Check(res)
         results[slot.pepIdx] = res
-        let w = ptypes.Rfc7Window(
-          compile: ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get),
-          run: ptypes.Phase(kind: ptypes.pkSpawnFailed,
-                            spawnError: "fork failed during run phase"))
-        window[slot.pepIdx] = w
-        rfc7Check(res, w)
         return true  # execute loop calls onResult after retry decision
       # Slot is now in spRunning; not yet done.
       return false
@@ -1107,8 +1103,13 @@ proc pollSlot(
       # Normal exit — read the sink and apply the OR-rule (R1).
       let sinkData = readSink(slot.sinkPath, maxOutputBytes)
       if sinkData.hasProtocol:
-        # Structured protocol: reconcile exit code + fail records.
-        let outcome = reconcile(sinkData.records, exitedCode)
+        # Structured protocol: OR-rule over exit code + fail records.
+        # rfc-0007 A1c: the OR-rule itself now lives here (protocol.reconcile
+        # shrank to a records-only predicate — the executor-precedence rule
+        # is subsumed by deriveOutcome, §2).
+        let outcome =
+          if reconcile(sinkData.records) or exitedCode != 0: oFailed
+          else: oPassed
         res = EntrypointResult(ep: pep.ep, outcome: outcome,
                                exitCode: exitedCode, output: output,
                                durationMs: elapsed,
@@ -1123,11 +1124,10 @@ proc pollSlot(
     # execute loop's cache-store gate can apply isFullyAchieved.
     res.achieved = slot.achieved
     cleanupSlotTmp(slot)
+    res.compile = compilePhase
+    res.run     = ptypes.Phase(kind: ptypes.pkRan, res: runRes)
+    rfc7Check(res)
     results[slot.pepIdx] = res
-    let w = ptypes.Rfc7Window(compile: compilePhase,
-                              run: ptypes.Phase(kind: ptypes.pkRan, res: runRes))
-    window[slot.pepIdx] = w
-    rfc7Check(res, w)
     return true  # execute loop calls onResult after retry decision
 
 # ---------------------------------------------------------------------------
@@ -1150,11 +1150,6 @@ proc execute*(
   progressIntervalMs: int = 30_000;
   memThrottledOut:  ptr int = nil;  ## S6b: if non-nil, written with ac.memThrottledSlots on return
   cache:            CacheContext = cacheDisabled(resolveSandbox());  ## M4: cohesive cache bundle
-  windowOut:        ptr seq[ptypes.Rfc7Window] = nil;  ## rfc-0007 A1b: if non-nil, written
-                                  ## with the dual-written compile/run Phase pairs, same
-                                  ## index as the returned seq (mirrors memThrottledOut's
-                                  ## out-param shape). The A1a-A1e transitional carrying
-                                  ## mechanism — deleted at A1e-i.
 ): seq[EntrypointResult] =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
   ## scheduler honouring p.jobs (A4).  At most p.jobs child processes alive at
@@ -1221,8 +1216,6 @@ proc execute*(
 
   # Pre-allocate result slots so we can fill them by index (plan order).
   result = newSeq[EntrypointResult](n)
-  # rfc-0007 A1b: parallel, same-index dual-write carrier — see windowOut.
-  var window = newSeq[ptypes.Rfc7Window](n)
 
   # B2: open the ledger shard for this invocation (if stateDir is set).
   # Guards on empty stateDir — some callers (e.g. runEntrypoint) leave it "".
@@ -1439,18 +1432,16 @@ proc execute*(
                                          durationMs: 0,
                                          compileSkipped: true,
                                          attempts: attemptNum)
+              # rfc-0007 A1c: no process was ever spawned for either phase.
+              res.compile = ptypes.Phase(kind: ptypes.pkSkipped)
+              res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
+                                spawnError: "fork or file-open failed for skip-fresh run")
+              rfc7Check(res)
               result[pepIdx] = res
               onResult(res)
               finalized[pepIdx] = true
               anyFailed = true
               inc done
-              # rfc-0007 A1b: no process was ever spawned for either phase.
-              let w = ptypes.Rfc7Window(
-                compile: ptypes.Phase(kind: ptypes.pkSkipped),
-                run: ptypes.Phase(kind: ptypes.pkSpawnFailed,
-                                  spawnError: "fork or file-open failed for skip-fresh run"))
-              window[pepIdx] = w
-              rfc7Check(res, w)
             else:
               slots[i].token = tok.get  # S3: store token for onSlotFinish
           else:
@@ -1465,18 +1456,16 @@ proc execute*(
                                          output: "fork or file-open failed before compile",
                                          durationMs: 0,
                                          attempts: attemptNum)
+              # rfc-0007 A1c: no process was ever spawned for either phase.
+              res.compile = ptypes.Phase(kind: ptypes.pkSpawnFailed,
+                                spawnError: "fork or file-open failed before compile")
+              res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
+              rfc7Check(res)
               result[pepIdx] = res
               onResult(res)
               finalized[pepIdx] = true
               anyFailed = true
               inc done
-              # rfc-0007 A1b: no process was ever spawned for either phase.
-              let w = ptypes.Rfc7Window(
-                compile: ptypes.Phase(kind: ptypes.pkSpawnFailed,
-                                      spawnError: "fork or file-open failed before compile"),
-                run: ptypes.Phase(kind: ptypes.pkSkipped))
-              window[pepIdx] = w
-              rfc7Check(res, w)
               # Slot remains idle (pepIdx == -1); loop continues.
             else:
               slots[i].token = tok.get  # S3: store token for onSlotFinish
@@ -1524,7 +1513,7 @@ proc execute*(
           if rssNow.isSome:
             slots[i].peakRssBytes = max(slots[i].peakRssBytes, rssNow.get)
 
-        let finished = pollSlot(slots[i], result, window, p, maxOutputBytes)
+        let finished = pollSlot(slots[i], result, p, maxOutputBytes)
 
         # C5: post-poll RSS sample for slots that JUST transitioned to spRunning
         # (compile finished this tick → spawnRun ran inside pollSlot → slot is now
@@ -1546,7 +1535,10 @@ proc execute*(
           # behavior is unaffected by C5's sampling.
           ac.onSlotFinish(slotToken, procGroupRssBytes(slotPid))
 
-          let completedOutcome = result[completedIdx].outcome
+          # rfc-0007 A1c: retry/flaky/quarantine decisions read the DERIVED
+          # outcome, not the stored legacy field — preserved 1:1 under the
+          # documented mapping (oTimeout -> oKilled, oSignal -> oCrashed, §2).
+          let completedOutcome = deriveOutcome(result[completedIdx])
           let maxAttempts = p.entrypoints[completedIdx].retries + 1  # B1
 
           # C5: stamp peak RSS onto the EntrypointResult for observability.
@@ -1745,13 +1737,10 @@ proc execute*(
           # H1: with skip-ahead, finalized indices may be non-contiguous; emit only
           # entries actually completed (never-dispatched entries are omitted).
           var ran: seq[EntrypointResult]
-          var ranWindow: seq[ptypes.Rfc7Window]  # rfc-0007 A1b: filtered in lockstep
           for j in 0 ..< n:
             if finalized[j]:
               ran.add(result[j])
-              ranWindow.add(window[j])
           result = ran
-          window = ranWindow
           return
 
       # Avoid busy-spinning when all slots are live.
@@ -1805,8 +1794,6 @@ proc execute*(
       closeLedger(led)
     if memThrottledOut != nil:
       memThrottledOut[] = ac.memThrottledSlots
-    if windowOut != nil:
-      windowOut[] = window  # rfc-0007 A1b: mirrors memThrottledOut's out-param shape
 
 # ---------------------------------------------------------------------------
 # runEntrypoint — compile + run ONE entrypoint (M6: thin wrapper)
@@ -1870,8 +1857,11 @@ proc summarize*(results: seq[EntrypointResult]): Summary =
       of oSignal:        inc result.signaled
       of oSpawnError:    inc result.spawnErrors
       of oKilled, oCrashed:
-        discard  ## rfc-0007 window: not yet produced by any code path in this
-                 ## slice — Summary gains a derived counts array at A1c, which
-                 ## is where these get a real counter.
+        discard  ## legacy field never carries these; the counts array below
+                 ## (rfc-0007 A1c) is where a live killed/crashed result counts.
+      # rfc-0007 A1c: additive derived-outcome counts array — dual-counted
+      # alongside the scalar buckets above until A1e-i deletes them. Same
+      # quarantine exclusion (the `if` branch above already handled it).
+      inc result.counts[deriveOutcome(r)]
     if r.flaky: inc result.flaky  # B1: count flaky-passes
   result.noTestsRan = result.passed == 0 and result.total > 0

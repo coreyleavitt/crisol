@@ -6,15 +6,16 @@
 ## type or a pure function over value types — nothing here spawns, waits, or
 ## touches the filesystem.
 ##
-## Window note: this module's `Outcome` is `crisol/types.Outcome`, extended
-## (not redefined) by rfc-0007 with `oKilled`/`oCrashed` alongside the legacy
-## `oTimeout`/`oSignal` pair for the A1a-A1e dual-write window (see
-## crisol/types.nim). `deriveOutcome` below only ever produces the six values
-## named in §2 — the two legacy values are never returned by it.
+## Window note: `Outcome` and `HermeticLevel` are defined HERE (rfc-0007 A1c
+## dependency inversion) and re-exported by crisol/types.nim, not the other
+## way around — crisol/types.EntrypointResult carries `compile`/`run: Phase`
+## fields (this module's shape) directly, so process/types cannot import
+## crisol/types without cycling back through it. `deriveOutcome`/
+## `hasFailRecords` therefore live in crisol/types.nim (the module that owns
+## the real production EntrypointResult), not here — see that module for
+## both. `deriveOutcome` only ever produces six of Outcome's eight values —
+## the two legacy values (`oTimeout`/`oSignal`) are never returned by it.
 import std/[options, strutils, tables]
-import crisol/types as ctypes
-
-export ctypes.Outcome, ctypes.HermeticLevel
 
 # ---------------------------------------------------------------------------
 # Exit — LOSSLESS observation of how the child ended, and nothing else.
@@ -159,6 +160,24 @@ proc symbol*(e: Exit): string =
   of ekNtStatus:
     ntStatusNames.getOrDefault(e.status, "STATUS_0x" & e.status.toHex(8))
 
+proc causeLabel*(c: Cause): string =
+  ## Render a Cause as a short human-readable label — "runner timeout",
+  ## "runner interrupt (escalated)", "limit cpu", "external". Same rule as
+  ## `symbol`: a PROC over the case, serialized at render time (§2, A1c) —
+  ## consumed by render.nim and api.failureLine so the two never diverge.
+  case c.by
+  of cbProcess:
+    "process"
+  of cbRunner:
+    let base = case c.reason
+               of krTimeout:   "runner timeout"
+               of krInterrupt: "runner interrupt"
+    if c.escalated: base & " (escalated)" else: base
+  of cbLimit:
+    "limit " & $c.limit
+  of cbExternal:
+    "external"
+
 # ---------------------------------------------------------------------------
 # Rusage — a FOURTH axis, not part of Exit (§2).
 # ---------------------------------------------------------------------------
@@ -166,6 +185,34 @@ proc symbol*(e: Exit): string =
 type
   Rusage* = object
     maxRssBytes*, userCpuUs*, sysCpuUs*: int64
+
+# ---------------------------------------------------------------------------
+# HermeticLevel / Outcome — moved from crisol/types.nim (rfc-0007 A1c: the
+# dependency inversion). crisol/types.nim re-exports both so every existing
+# `import crisol/types` consumer keeps compiling unchanged.
+# ---------------------------------------------------------------------------
+
+type
+  HermeticLevel* = enum
+    ## Hermeticity levels, monotone — each is a strict superset of the one below.
+    ## hlNone  < hlIsolated (the default) < hlNetwork.
+    hlNone       ## today's behavior: full env inherited, parent cwd, no limits
+    hlIsolated   ## env allowlist, isolated tmpdir, config-declared rlimits; no net isolation
+    hlNetwork    ## superset of hlIsolated + unshare(CLONE_NEWNET) + loopback
+
+  Outcome* = enum
+    oPassed         ## exit 0, no protocol failure records
+    oFailed         ## exit non-zero, or ≥ 1 fail record from protocol
+    oCompileFailed  ## nim c exited non-zero or timed out during compile
+    oTimeout        ## LEGACY (rfc-0007 window): run phase exceeded timeout.
+                    ## Superseded by oKilled; removed at A1e-i.
+    oSignal         ## LEGACY (rfc-0007 window): run phase killed by a signal.
+                    ## Superseded by oCrashed; removed at A1e-i.
+    oSpawnError     ## fork/exec failed at the OS level
+    oKilled         ## rfc-0007: a runner-authored kill (timeout or interrupt) —
+                    ## cause.by == cbRunner.
+    oCrashed        ## rfc-0007: the process ended on a signal/ntstatus it did not
+                    ## request and the runner did not send.
 
 # ---------------------------------------------------------------------------
 # Evidence — what the runner can VOUCH for (§2). Backend-observed fields are
@@ -229,78 +276,7 @@ type
                                       ## derivation below deliberately treats
                                       ## it as pkRan (§2's one bend, visible).
 
-  EntrypointResult* = object
-    ## rfc-0007 §2 shape — NOT crisol/types.EntrypointResult (the legacy
-    ## producer field set). A1b dual-writes into the legacy type; this type
-    ## exists in A1a purely so deriveOutcome/hasFailRecords are the real,
-    ## spec-shaped functions from day one, with no consumer wired yet.
-    ep*: Entrypoint
-    compile*, run*: Phase
-    records*: seq[TestRecord]
-    output*: string
-    outputTruncated*: bool
-    attempts*: int
-    quarantined*: bool
-
   OutcomePolicy* = object    ## policy is a VALUE, not a positional bool (§2).
     strictHygiene*: bool
 
 const DefaultPolicy* = OutcomePolicy()
-
-proc hasFailRecords*(r: EntrypointResult): bool =
-  ## true iff any PARSED protocol record is a failure. A truncated/corrupt
-  ## stream never fabricates a failure — the reader stays conservative (§2).
-  for rec in r.records:
-    if rec.status == rsFail: return true
-  false
-
-type
-  Rfc7Window* = object
-    ## A1b-A1e dual-write carrier: pairs one legacy `crisol/types.EntrypointResult`
-    ## with the compile/run `Phase`s actually captured for it, so `runner.execute`
-    ## can populate the §2 shape ALONGSIDE the legacy fields without `crisol/types`
-    ## importing this module (that would cycle back through `ctypes` above).
-    ## Indexed identically to `execute()`'s returned `seq[EntrypointResult]`.
-    ## Exists only for the dual-write window — deleted at A1e-i once these
-    ## fields live directly on `EntrypointResult`.
-    compile*, run*: Phase
-
-proc deriveOutcome*(r: EntrypointResult; policy: OutcomePolicy = DefaultPolicy): Outcome =
-  ## PURE over (result, policy) — §2's total case expression, verbatim.
-  ## Named `deriveOutcome`, not `outcome`: while the legacy `outcome` FIELD
-  ## exists on crisol/types.EntrypointResult during the A1a-A1e window,
-  ## `r.outcome` on THAT type binds to the field — a "migrated" consumer
-  ## written against a same-named proc would silently read stale data.
-  case r.compile.kind
-  of pkSpawnFailed:
-    return oSpawnError
-  of pkRan, pkCached:
-    let c = r.compile.res
-    if c.cause.by == cbRunner and c.cause.reason == krInterrupt:
-      return oKilled              ## Ctrl-C mid-compile is not a compile failure
-    if c.cause.by != cbProcess or not c.exit.isSuccess:
-      return oCompileFailed       ## incl. compile timeout — the cause is
-                                   ## consulted, so a cooperative exit-0 inside
-                                   ## a compile-kill grace window cannot
-                                   ## masquerade as a good compile
-  of pkSkipped:
-    discard                       ## fresh — nothing to prove
-  case r.run.kind
-  of pkSpawnFailed:
-    oSpawnError
-  of pkSkipped:
-    oSpawnError                   ## unreachable in any EMITTED result: a good
-                                   ## compile is always followed by a run phase
-                                   ## (§2) — derives loudly rather than lying
-  of pkRan, pkCached:
-    let p = r.run.res
-    if p.cause.by == cbRunner:
-      oKilled
-    elif p.exit.kind != ekExited:
-      oCrashed                    ## signaled/ntstatus; cause may be limit
-                                   ## or external
-    elif p.exit.code == 0 and not r.hasFailRecords:
-      if policy.strictHygiene and p.evidence.escapees.len > 0: oFailed
-      else: oPassed
-    else:
-      oFailed

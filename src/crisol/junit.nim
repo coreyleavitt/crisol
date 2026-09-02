@@ -17,12 +17,18 @@
 ##   toJunitXml*(results: seq[EntrypointResult]; summary: Summary): string
 ##     Pure: returns a schema-valid JUnit XML string.  No I/O.
 ##
-## Outcome → XML element mapping (documented):
+## Outcome → XML element mapping (documented). rfc-0007 A1c: the outcome
+## consulted here is deriveOutcome(r), not the stored legacy field; oTimeout/
+## oSignal never come out of that derivation (superseded by oKilled/oCrashed).
 ##   oPassed        → no child failure/error element (testcase is clean)
 ##   oFailed        → <failure message="exit N"> (normal test failure)
 ##   oCompileFailed → <error message="compile failed"> (infrastructure)
-##   oTimeout       → <error message="timed out"> (infrastructure)
-##   oSignal        → <error message="killed by signal N"> (infrastructure)
+##   oKilled        → <error message="killed: <cause>"> (infrastructure) —
+##                    cause-aware when a live run-phase ProcessResult was
+##                    captured (e.g. "killed: runner timeout"), else "killed"
+##   oCrashed       → <error message="crashed: <symbol>"> (infrastructure) —
+##                    e.g. "crashed: SIGSEGV" when captured, else the legacy
+##                    "killed by signal N" text
 ##   oSpawnError    → <error message="spawn error"> (infrastructure)
 ##
 ## Rationale for failure vs error split:
@@ -69,6 +75,9 @@
 
 import std/[options, strutils]
 import crisol/types
+# rfc-0007 A1c: cause-aware <error> text for oKilled/oCrashed. `import nil`
+# so nothing unqualified leaks in.
+from crisol/process/types as ptypes import nil
 
 # ---------------------------------------------------------------------------
 # Single XML escape proc (the ONLY path for all character data)
@@ -199,10 +208,29 @@ proc fmtSecsUs(us: int64): string =
 # Outcome → failure/error XML fragment
 # ---------------------------------------------------------------------------
 
+proc killedMessage(r: EntrypointResult): string =
+  ## rfc-0007 A1c: cause-aware message for a runner-authored kill — "killed:
+  ## runner timeout", "killed: runner interrupt (escalated)" — when the run
+  ## phase captured a live ProcessResult (pkRan); "killed" alone otherwise
+  ## (the documented never-fabricate corners in runner.pollSlot, or the
+  ## legacy oTimeout arm predating this window).
+  if r.run.kind == ptypes.pkRan: "killed: " & ptypes.causeLabel(r.run.res.cause)
+  else: "killed"
+
+proc crashedMessage(r: EntrypointResult): string =
+  ## rfc-0007 A1c: cause-aware message for a signal/ntstatus the runner did
+  ## not send — "crashed: SIGSEGV" via the real Exit symbol when captured;
+  ## falls back to the legacy signal-number text otherwise.
+  if r.run.kind == ptypes.pkRan: "crashed: " & ptypes.symbol(r.run.res.exit)
+  else: "killed by signal " & $r.signal
+
 proc outcomeChildXml(r: EntrypointResult): string =
   ## Returns the inner child element for the synthetic opaque testcase, or ""
-  ## when the outcome is oPassed (clean testcase, no child needed).
-  case r.outcome
+  ## when the (derived) outcome is oPassed (clean testcase, no child needed).
+  ## rfc-0007 A1c: cased over deriveOutcome(r), not the stored legacy field;
+  ## oTimeout/oSignal are dead legacy arms (deriveOutcome never returns them)
+  ## kept only so this case stays exhaustive until A1e-i deletes them.
+  case deriveOutcome(r)
   of oPassed:
     ""
   of oFailed:
@@ -212,24 +240,14 @@ proc outcomeChildXml(r: EntrypointResult): string =
   of oCompileFailed:
     "        <error message=\"compile failed\">" &
     escapeXml(r.output) & "</error>\n"
-  of oTimeout:
-    "        <error message=\"timed out\">" &
-    escapeXml(r.output) & "</error>\n"
-  of oSignal:
-    let msg = "killed by signal " & $r.signal
-    "        <error message=\"" & escapeXml(msg) & "\">" &
-    escapeXml(r.output) & "</error>\n"
   of oSpawnError:
     "        <error message=\"spawn error\">" &
     escapeXml(r.output) & "</error>\n"
-  of oKilled:
-    ## rfc-0007 window: not yet produced. A1c adds cause-aware detail
-    ## ("oKilled/oCrashed → <error> with cause" per the RFC).
-    "        <error message=\"killed\">" &
+  of oTimeout, oKilled:
+    "        <error message=\"" & escapeXml(killedMessage(r)) & "\">" &
     escapeXml(r.output) & "</error>\n"
-  of oCrashed:
-    let msg = "killed by signal " & $r.signal
-    "        <error message=\"" & escapeXml(msg) & "\">" &
+  of oSignal, oCrashed:
+    "        <error message=\"" & escapeXml(crashedMessage(r)) & "\">" &
     escapeXml(r.output) & "</error>\n"
 
 proc recordChildXml(rec: TestRecord): string =
@@ -265,12 +283,13 @@ proc toJunitXml*(results: seq[EntrypointResult]; summary: Summary): string =
   for r in results:
     let epPath = escapeXml(r.ep.path)
     let timeSecs = fmtSecs(r.durationMs)
+    let derived = deriveOutcome(r)  # rfc-0007 A1c
 
     if r.records.len == 0:
       # Opaque entrypoint: one synthetic testcase
-      let isErr = r.outcome in {oCompileFailed, oTimeout, oSignal, oSpawnError}
+      let isErr = derived in {oCompileFailed, oKilled, oCrashed, oSpawnError}
       let errors   = if isErr: 1 else: 0
-      let failures = if r.outcome == oFailed: 1 else: 0
+      let failures = if derived == oFailed: 1 else: 0
 
       # testsuite: no cached attr (the testcase carries it for opaque)
       buf.add "  <testsuite name=\"" & epPath & "\""
@@ -318,7 +337,7 @@ proc toJunitXml*(results: seq[EntrypointResult]; summary: Summary): string =
       # with protocol records — oFailed — is represented via failures in the records;
       # but oCompileFailed etc. with records should not occur in practice since the
       # binary never ran; we handle it defensively by adding an error count).
-      if r.outcome in {oCompileFailed, oTimeout, oSignal, oSpawnError}:
+      if derived in {oCompileFailed, oKilled, oCrashed, oSpawnError}:
         inc errorsCount
 
       # testsuite: cached attr goes here for protocol entrypoints

@@ -38,7 +38,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_api.nim
 
-import std/[json, os, osproc, strutils, times, unittest]
+import std/[json, options, os, osproc, strutils, times, unittest]
 import crisol/api
 import crisol/types
 
@@ -503,6 +503,51 @@ suite "api type surface":
     let rr = RunReport()
     check pr.entrypoints.len == 0
     check rr.status == rsOk
+
+# ---------------------------------------------------------------------------
+# rfc-0007 A1c: runResult / failureLine digest helpers over a real Phase
+# ---------------------------------------------------------------------------
+
+suite "rfc-0007 A1c — runResult / failureLine over a captured run phase":
+  test "runResult(r): some(ProcessResult) for a live run (pkRan)":
+    var r = EntrypointResult(ep: Entrypoint(path: "t.nim", group: "unit"))
+    r.compile = Phase(kind: pkSkipped)
+    r.run = Phase(kind: pkRan, res: ProcessResult(
+      exit: Exit(kind: ekSignaled, sig: 11, coreDumped: false),
+      cause: Cause(by: cbProcess),
+      evidence: Evidence(),
+      rusage: none(Rusage),
+      durationUs: 1000,
+    ))
+    let rr = runResult(r)
+    check rr.isSome
+    check rr.get.exit.sig == 11
+    check failureLine(r) == "crashed: SIGSEGV"
+
+  test "failureLine 'killed: ...' for a runner-authored kill (cause.by == cbRunner)":
+    var r = EntrypointResult(ep: Entrypoint(path: "t.nim", group: "unit"))
+    r.compile = Phase(kind: pkSkipped)
+    r.run = Phase(kind: pkRan, res: ProcessResult(
+      exit: Exit(kind: ekSignaled, sig: 15, coreDumped: false),
+      cause: Cause(by: cbRunner, reason: krTimeout, escalated: false),
+      evidence: Evidence(),
+      rusage: none(Rusage),
+      durationUs: 1000,
+    ))
+    check runResult(r).isSome
+    check failureLine(r) == "killed: runner timeout"
+
+  test "failureLine(r) == \"\" for a passing result":
+    var r = EntrypointResult(ep: Entrypoint(path: "t.nim", group: "unit"))
+    r.compile = Phase(kind: pkSkipped)
+    r.run = Phase(kind: pkRan, res: ProcessResult(
+      exit: Exit(kind: ekExited, code: 0),
+      cause: Cause(by: cbProcess),
+      evidence: Evidence(),
+      rusage: none(Rusage),
+      durationUs: 1000,
+    ))
+    check failureLine(r) == ""
 
 # ---------------------------------------------------------------------------
 # Nim-version soundness seam (High finding): api MUST supply a REAL Nim

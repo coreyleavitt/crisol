@@ -49,9 +49,10 @@ import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, time
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals,
                sandbox, cachedispatch, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
-# rfc-0007 A1b: RunReport.procWindow carries the dual-write window through to
-# the CLI's --json path (see runner.execute's windowOut). `import nil` so
-# nothing unqualified leaks into this module's own namespace.
+# rfc-0007 A1c: the §2 result-model facade (Phase/ProcessResult/Exit/Cause/
+# Evidence/Rusage/OutcomePolicy) plus the runResult/failureLine digest
+# helpers below. `import nil` so nothing unqualified leaks into this
+# module's own namespace; the enumerated set is re-exported explicitly.
 from crisol/process/types as ptypes import nil
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,24 @@ export types.EntrypointResult
 export types.HermeticLevel
 export types.isFailure
 export types.exitCode
+export types.deriveOutcome
+export types.hasFailRecords
+
+# From process/types — the §2 result-model facade (rfc-0007 A1c), enumerated
+# exactly per the RFC's A1c bullet.
+export ptypes.Phase
+export ptypes.PhaseKind
+export ptypes.ProcessResult
+export ptypes.Exit
+export ptypes.ExitKind
+export ptypes.Cause
+export ptypes.CauseBy
+export ptypes.KillReason
+export ptypes.Evidence
+export ptypes.TreeObservation
+export ptypes.Rusage
+export ptypes.LimitsAchieved
+export ptypes.OutcomePolicy
 
 # From render — public rendering surface only (NOT ANSI internals, col, etc.)
 export render.render
@@ -282,13 +301,42 @@ type
                                   ## compile summary line without re-scanning the
                                   ## ledgers. nil when opts.persist is false, or when
                                   ## measureCompileReuse is not enabled (no telemetry).
-    procWindow*:        seq[ptypes.Rfc7Window]  ## rfc-0007 A1b: the dual-write window
-                                  ## from runner.execute (same index as `results`) —
-                                  ## threaded to the CLI's --json path for the advisory
-                                  ## exit/cause nodes (jsonout rev 15). Empty on every
-                                  ## early-return status (rsStructural/rsInterrupted/
-                                  ## zero-runnable). The A1a-A1e transitional carrying
-                                  ## mechanism — deleted at A1e-i.
+
+# ---------------------------------------------------------------------------
+# rfc-0007 A1c: result-model digest helpers — so a library consumer doesn't
+# hand-roll the same Phase-variant case expression render.nim/junit.nim do.
+# ---------------------------------------------------------------------------
+
+proc runResult*(r: EntrypointResult): Option[ptypes.ProcessResult] =
+  ## Absorbs the Phase variant check: `some()` iff the run phase actually
+  ## captured a ProcessResult (pkRan; a live run this invocation — pkCached
+  ## is a cachedispatch-synthesized minimal replay, not a real observation
+  ## until A1d-ii, so it reads as `none()` here too, same as jsonout's wire).
+  ## `none()` for pkSkipped/pkSpawnFailed — no observation to hand back.
+  if r.run.kind == ptypes.pkRan: some(r.run.res)
+  else: none(ptypes.ProcessResult)
+
+proc failureLine*(r: EntrypointResult): string =
+  ## Render-grade one-liner for a failing/non-passed result — the digest a
+  ## caller building its own UI needs without re-deriving cause/exit detail.
+  ## "" for a passing result (deriveOutcome(r) == oPassed).
+  case deriveOutcome(r)
+  of oPassed:
+    ""
+  of oFailed:
+    "exit " & $r.exitCode
+  of oCompileFailed:
+    "compile failed"
+  of oSpawnError:
+    "spawn error"
+  of oKilled, oTimeout:
+    let rr = runResult(r)
+    if rr.isSome: "killed: " & ptypes.causeLabel(rr.get.cause)
+    else: "killed"
+  of oCrashed, oSignal:
+    let rr = runResult(r)
+    if rr.isSome: "crashed: " & ptypes.symbol(rr.get.exit)
+    else: "crashed"
 
 # ---------------------------------------------------------------------------
 # Selection constructors — hide the GroupSelection discriminated-union syntax
@@ -692,7 +740,6 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
           protocolMajor = CrisolProtocolMajor,
         ))
 
-  var procWindow: seq[ptypes.Rfc7Window]  # rfc-0007 A1b: dual-write window
   try:
     results = execute(
       pv.plan,
@@ -706,7 +753,6 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       progressIntervalMs = opts.progressIntervalMs,
       memThrottledOut    = addr memThrottled,
       cache              = cacheCtx,
-      windowOut          = addr procWindow,
     )
   except CrisolInterrupted as e:
     # SIGINT/SIGTERM: release lock and report rsInterrupted.
@@ -799,5 +845,4 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     status:            rsOk,
     exitCode:          exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
     compileBlock:      compileBlock,
-    procWindow:        procWindow,  # rfc-0007 A1b
   )

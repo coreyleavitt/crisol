@@ -13,6 +13,7 @@
 import std/[options, streams, strutils, unittest, xmlparser, xmltree]
 import crisol/types
 import crisol/junit
+import crisol/process/types as ptypes  # rfc-0007 A1c: coherent Phase fixtures
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -32,12 +33,49 @@ proc makeRecord(name: string; status: RecordStatus;
     tags:       @[],
   )
 
+proc ranPhase(cause: ptypes.Cause; exit: ptypes.Exit): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: exit, cause: cause, evidence: default(ptypes.Evidence),
+    rusage: none(ptypes.Rusage), durationUs: 0))
+
+const skippedPhase = ptypes.Phase(kind: ptypes.pkSkipped)
+const cbProcess = ptypes.Cause(by: ptypes.cbProcess)
+
+proc stampPhase(r: var EntrypointResult; outcome: Outcome; exitCode, signal: int) =
+  ## rfc-0007 A1c: junit displays deriveOutcome(r), not the stored legacy
+  ## `outcome` field — stamp a coherent `compile`/`run: Phase` pair per the
+  ## legacy outcome each fixture names, mirroring runner.execute's real
+  ## dual-write shape (checkRfc7Coherence's mapping).
+  case outcome
+  of oPassed, oFailed:
+    r.compile = skippedPhase
+    r.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: exitCode))
+  of oCompileFailed:
+    # A "compile failed" fixture's exitCode param (when given) describes the
+    # RUN phase in other branches; here it may be left at its 0 default (the
+    # legacy field, not the compile's own code), which would derive as a
+    # SUCCESSFUL compile. Force a nonzero compile exit so deriveOutcome agrees.
+    let code = if exitCode != 0: exitCode else: 1
+    r.compile = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: code))
+    r.run = skippedPhase
+  of oTimeout, oKilled:
+    r.compile = skippedPhase
+    r.run = ranPhase(
+      ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: false),
+      ptypes.Exit(kind: ptypes.ekSignaled, sig: signal, coreDumped: false))
+  of oSignal, oCrashed:
+    r.compile = skippedPhase
+    r.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekSignaled, sig: signal, coreDumped: false))
+  of oSpawnError:
+    r.compile = skippedPhase
+    r.run = ptypes.Phase(kind: ptypes.pkSpawnFailed, spawnError: "spawn error")
+
 proc opaqueResult(path: string; outcome: Outcome;
                   exitCode: int = 0; signal: int = 0;
                   durationMs: int64 = 100;
                   output: string = "";
                   cached: bool = false): EntrypointResult =
-  EntrypointResult(
+  result = EntrypointResult(
     ep:         makeEp(path),
     outcome:    outcome,
     exitCode:   exitCode,
@@ -47,22 +85,25 @@ proc opaqueResult(path: string; outcome: Outcome;
     records:    @[],
     cached:     cached,
   )
+  stampPhase(result, outcome, exitCode, signal)
 
 proc recordResult(path: string; records: seq[TestRecord];
                   outcome: Outcome = oPassed;
                   durationMs: int64 = 200;
                   output: string = "";
                   cached: bool = false): EntrypointResult =
-  EntrypointResult(
+  let exitCode = if outcome == oPassed: 0 else: 1
+  result = EntrypointResult(
     ep:         makeEp(path),
     outcome:    outcome,
-    exitCode:   if outcome == oPassed: 0 else: 1,
+    exitCode:   exitCode,
     signal:     0,
     durationMs: durationMs,
     output:     output,
     records:    records,
     cached:     cached,
   )
+  stampPhase(result, outcome, exitCode, 0)
 
 proc parseDoc(xml: string): XmlNode =
   ## Parse xml via a StringStream so we get the errors parameter.
@@ -384,7 +425,7 @@ suite "junit - toJunitXml opaque failing/infrastructure":
             check inner.attr("message") == "compile failed"
     check found
 
-  test "oTimeout: testcase has <error message='timed out'>":
+  test "rfc-0007 A1c: oKilled (timeout) testcase has cause-aware <error message>":
     let r = opaqueResult("tests/integration/test_hang.nim", oTimeout)
     let xml = toJunitXml(@[r], Summary(total: 1, timedOut: 1))
     let doc = parseDoc(xml)
@@ -394,10 +435,10 @@ suite "junit - toJunitXml opaque failing/infrastructure":
         for inner in child:
           if inner.kind == xnElement and inner.tag == "error":
             found = true
-            check inner.attr("message") == "timed out"
+            check inner.attr("message") == "killed: runner timeout"
     check found
 
-  test "oSignal: testcase has <error message='killed by signal N'>":
+  test "rfc-0007 A1c: oCrashed (signal) testcase has cause-aware <error message>":
     let r = opaqueResult("tests/unit/test_segv.nim", oSignal, signal = 11)
     let xml = toJunitXml(@[r], Summary(total: 1, signaled: 1))
     let doc = parseDoc(xml)
@@ -407,7 +448,7 @@ suite "junit - toJunitXml opaque failing/infrastructure":
         for inner in child:
           if inner.kind == xnElement and inner.tag == "error":
             found = true
-            check inner.attr("message") == "killed by signal 11"
+            check inner.attr("message") == "crashed: SIGSEGV"
     check found
 
   test "oSpawnError: testcase has <error message='spawn error'>":

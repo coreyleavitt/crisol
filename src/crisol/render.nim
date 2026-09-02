@@ -58,6 +58,9 @@
 import std/[algorithm, monotimes, os, options, sequtils, strutils, times]
 import crisol/types
 import crisol/ioutils  # sanitizeControlBytes — issue #14: report-body field sanitization
+# rfc-0007 A1c: cause-aware detail for killed/crashed lines. `import nil` so
+# nothing unqualified leaks in.
+from crisol/process/types as ptypes import nil
 
 # ---------------------------------------------------------------------------
 # C3 pure filter predicates
@@ -167,28 +170,38 @@ proc formatProgressLine*(inFlight: seq[(string, int64)];
 # ---------------------------------------------------------------------------
 
 proc outcomeLabel(o: Outcome): string =
+  ## Called with deriveOutcome(r) (rfc-0007 A1c) — oTimeout/oSignal are LEGACY
+  ## arms kept only so this case stays exhaustive over Outcome's full value
+  ## set until A1e-i deletes them; deriveOutcome never actually returns them.
   case o
   of oPassed:        "[OK]     "
   of oFailed:        "[FAIL]   "
   of oCompileFailed: "[COMPILE]"
-  of oTimeout:       "[TIMEOUT]"
-  of oSignal:        "[SIGNAL] "
-  of oSpawnError:    "[SPAWN]  "
-  of oKilled:        "[KILLED] "  ## rfc-0007 window: supersedes oTimeout; not
-                                  ## yet produced by any A1a code path.
-  of oCrashed:       "[CRASH]  "  ## rfc-0007 window: supersedes oSignal; not
-                                  ## yet produced by any A1a code path.
+  of oTimeout, oKilled:  "[KILLED] "
+  of oSignal, oCrashed:  "[CRASH]  "
+  of oSpawnError:     "[SPAWN]  "
 
 proc outcomeColor(o: Outcome): string =
+  ## Same legacy-arm note as outcomeLabel above.
   case o
   of oPassed:        Ansi_Green
   of oFailed:        Ansi_Red
   of oCompileFailed: Ansi_Yellow
-  of oTimeout:       Ansi_Yellow
-  of oSignal:        Ansi_Red
-  of oSpawnError:    Ansi_Red
-  of oKilled:        Ansi_Yellow  ## mirrors oTimeout
-  of oCrashed:       Ansi_Red     ## mirrors oSignal
+  of oTimeout, oKilled: Ansi_Yellow
+  of oSignal, oCrashed: Ansi_Red
+  of oSpawnError:     Ansi_Red
+
+proc causeDetail(r: EntrypointResult): string =
+  ## rfc-0007 A1c: cause-aware one-line detail for a killed/crashed run, when
+  ## the run phase actually captured a live ProcessResult (pkRan — the common
+  ## path). "" when no observation exists yet: pkSkipped/pkSpawnFailed (the
+  ## documented never-fabricate corners in runner.pollSlot) or pkCached (a
+  ## cache-hit synthesis — never reaches here in practice, since only passes
+  ## are ever cached).
+  if r.run.kind == ptypes.pkRan:
+    ptypes.causeLabel(r.run.res.cause)
+  else:
+    ""
 
 # ---------------------------------------------------------------------------
 # Per-entrypoint record counts
@@ -277,8 +290,9 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
   # 1. Per-entrypoint lines
   # -------------------------------------------------------------------------
   for r in results:
-    let label     = outcomeLabel(r.outcome)
-    let labelCol  = col(label, outcomeColor(r.outcome), color)
+    let derived   = deriveOutcome(r)  # rfc-0007 A1c: display driven by the derivation, not the stored field
+    let label     = outcomeLabel(derived)
+    let labelCol  = col(label, outcomeColor(derived), color)
     # Issue #14: entrypoint paths (config/disk-origin) and protocol record
     # names/messages (test-binary-origin) are one-line identifiers headed for
     # a terminal or CI log — sanitize each at the render layer (the stdout
@@ -309,19 +323,18 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
         let durPart  = if durSec.len > 0: ", " & durSec else: ""
         " (" & failPart & skipPart & durPart & ")"
       else:
-        case r.outcome
+        # rfc-0007 A1c: cased over `derived`; oTimeout/oSignal are dead legacy
+        # arms (deriveOutcome never returns them) kept only for exhaustiveness.
+        case derived
         of oPassed:        " (" & $(r.durationMs div 1000) & "s)"
         of oCompileFailed: " (compile failed)"
-        of oTimeout:       " (exceeded timeout)"
-        of oSignal:
-          let sigName = if r.signal > 0: "SIG#" & $r.signal else: "signal"
-          " (" & sigName & ")"
         of oFailed:        " (exit " & $r.exitCode & ")"
         of oSpawnError:    " (spawn error)"
-        of oKilled:        " (killed)"  ## rfc-0007 window: not yet produced
-        of oCrashed:
+        of oTimeout, oKilled:
+          " (killed)"
+        of oSignal, oCrashed:
           let sigName = if r.signal > 0: "SIG#" & $r.signal else: "signal"
-          " (" & sigName & ")"  ## rfc-0007 window: mirrors oSignal; not yet produced
+          " (" & sigName & ")"
 
     # A8: mark results served from the ExecutionCache.  The [CACHED] tag sits
     # after the outcome label so a cached pass reads "[OK] … [CACHED]".  Cached
@@ -347,8 +360,10 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
 
     # -----------------------------------------------------------------------
     # Failure / compile-fail / signal detail block
+    # rfc-0007 A1c: cased over `derived`; oTimeout/oSignal are dead legacy
+    # arms (deriveOutcome never returns them) kept only for exhaustiveness.
     # -----------------------------------------------------------------------
-    case r.outcome
+    case derived
     of oFailed:
       # Show per-test failure messages first (from displayRecords).
       var failedRecords: seq[TestRecord]
@@ -387,18 +402,13 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
           if line.len > 0:
             buf.add "           " & line & "\n"
 
-    of oSignal:
-      if r.output.len > 0:
-        let maxDisplay = 1000
-        let outText = if r.output.len > maxDisplay:
-                        r.output[0..<maxDisplay] & "\n[...truncated...]"
-                      else: r.output
-        for line in outText.splitLines:
-          if line.len > 0:
-            buf.add "           " & line & "\n"
-
-    of oTimeout:
-      discard  # no extra detail needed; label is self-explanatory
+    of oTimeout, oKilled:
+      # rfc-0007 A1c: cause-aware detail when a run-phase ProcessResult was
+      # captured (the common live path); "" for the exempted never-fabricate
+      # corners (causeDetail's fallback), matching the pre-A1c self-explanatory label.
+      let cause = causeDetail(r)
+      if cause.len > 0:
+        buf.add "           " & col("cause: " & cause, Ansi_Dim, color) & "\n"
 
     of oPassed:
       # Skip details shown only in verbose (not implemented in B4).
@@ -418,11 +428,7 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
       if r.output.len > 0:
         buf.add "           " & r.output & "\n"
 
-    of oKilled:
-      discard  ## rfc-0007 window: not yet produced; mirrors oTimeout's
-               ## self-explanatory label. A1c adds cause-aware detail.
-
-    of oCrashed:
+    of oSignal, oCrashed:
       if r.output.len > 0:
         let maxDisplay = 1000
         let outText = if r.output.len > maxDisplay:
@@ -431,8 +437,10 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
         for line in outText.splitLines:
           if line.len > 0:
             buf.add "           " & line & "\n"
-      ## rfc-0007 window: not yet produced; mirrors oSignal. A1c adds
-      ## cause-aware detail.
+      # rfc-0007 A1c: cause-aware detail, same pattern as oTimeout/oKilled above.
+      let cause = causeDetail(r)
+      if cause.len > 0:
+        buf.add "           " & col("cause: " & cause, Ansi_Dim, color) & "\n"
 
   # -------------------------------------------------------------------------
   # 2. Slowest-N section

@@ -251,55 +251,51 @@ suite "protocol – readSink opaque fallback":
     check not data.hasProtocol
 
 # ---------------------------------------------------------------------------
-# Suite 6 — reconcile: OR rule (reader contract rule 2)
+# Suite 6 — reconcile: records-only predicate (rfc-0007 A1c)
+#
+# reconcile() shrank to a bool over records alone; the exit-code half of the
+# OR rule is now the CALLER's job (`reconcile(records) or exitCode != 0`,
+# runner.pollSlot) — deriveOutcome (§2) subsumes the old executor-precedence
+# rule, so reconcile no longer needs to know about exit codes at all.
 # ---------------------------------------------------------------------------
 
-suite "protocol – reconcile OR rule":
-  test "all-pass records + exit 0 → oPassed":
+suite "protocol – reconcile records-only predicate":
+  test "all-pass records → false":
     let recs = @[
       TestRecord(name: "t1", status: rsPass, durationUs: 0),
       TestRecord(name: "t2", status: rsPass, durationUs: 0),
     ]
-    check reconcile(recs, 0) == oPassed
+    check reconcile(recs) == false
 
-  test "all-skip records + exit 0 → oPassed":
+  test "all-skip records → false":
     let recs = @[
       TestRecord(name: "t1", status: rsSkip, durationUs: 0, msg: some("skip")),
     ]
-    check reconcile(recs, 0) == oPassed
+    check reconcile(recs) == false
 
-  test "mix pass+skip records + exit 0 → oPassed":
+  test "mix pass+skip records → false":
     let recs = @[
       TestRecord(name: "t1", status: rsPass, durationUs: 0),
       TestRecord(name: "t2", status: rsSkip, durationUs: 0),
     ]
-    check reconcile(recs, 0) == oPassed
+    check reconcile(recs) == false
 
-  test "any fail record + exit 0 → oFailed (OR rule)":
+  test "any fail record → true, regardless of position":
     let recs = @[
       TestRecord(name: "t1", status: rsPass, durationUs: 0),
       TestRecord(name: "t2", status: rsFail, durationUs: 0, msg: some("boom")),
     ]
-    check reconcile(recs, 0) == oFailed
+    check reconcile(recs) == true
 
-  test "all-pass records + non-zero exit → oFailed (OR rule)":
-    let recs = @[
-      TestRecord(name: "t1", status: rsPass, durationUs: 0),
-    ]
-    check reconcile(recs, 1) == oFailed
+  test "empty records (opaque fallback / truncated-to-nothing) → false":
+    ## Truncated-stream conservatism: zero parsed records never fabricates a
+    ## failure, whether from a genuinely opaque binary or a stream truncated
+    ## before any record was parsed.
+    check reconcile(@[]) == false
 
-  test "fail record + non-zero exit → oFailed":
-    let recs = @[
-      TestRecord(name: "t1", status: rsFail, durationUs: 0),
-    ]
-    check reconcile(recs, 1) == oFailed
-
-  test "opaque fallback path: no records + exit 0 → oPassed":
-    ## When the executor detects opaque fallback (hasProtocol=false), it
-    ## interprets exit code directly without calling reconcile.  But to verify
-    ## the rule is internally consistent: reconcile on empty records + exit 0
-    ## must also yield oPassed.
-    check reconcile(@[], 0) == oPassed
-
-  test "opaque fallback path: no records + non-zero exit → oFailed":
-    check reconcile(@[], 1) == oFailed
+  test "OR-rule composition at the call site (runner.pollSlot's pattern)":
+    let failing = @[TestRecord(name: "t1", status: rsFail, durationUs: 0)]
+    let passing = @[TestRecord(name: "t1", status: rsPass, durationUs: 0)]
+    check (reconcile(failing) or 0 != 0) == true    # fail record, exit 0
+    check (reconcile(passing) or 1 != 0) == true    # pass record, exit != 0
+    check (reconcile(passing) or 0 != 0) == false   # pass record, exit 0

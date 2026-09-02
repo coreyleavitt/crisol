@@ -27,6 +27,11 @@
 
 import std/[options, os, tables]
 import crisol/[types, keys, resultcache, sandbox, depgraph, planner]
+# rfc-0007 A1c: synthesize() dual-writes a minimal §2 Phase pair from the
+# CachedResult fields it already has, so deriveOutcome (which every consumer
+# now calls instead of trusting the stored `outcome` field) reads correctly
+# for a cache hit too — see synthesize's comment below.
+from crisol/process/types as ptypes import nil
 
 # ---------------------------------------------------------------------------
 # Policy
@@ -189,7 +194,23 @@ proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
   ## duration (cr.durationMs) and records; marks it cached with cacheDecision
   ## cdmHit.  `compileSkipped` is true (edCached skips both compile and run).
   ## `inputHash` is the soundnessKey string the hit was keyed on (A8).
-  EntrypointResult(
+  ##
+  ## rfc-0007 A1c: also dual-writes a minimal `run: Phase(kind: pkCached, …)`
+  ## so deriveOutcome — which every consumer now calls instead of trusting
+  ## the stored `outcome` field — reads this result correctly. This is NOT
+  ## A1d-ii's real cache-replay (the cache does not store Exit/Cause/Evidence
+  ## yet); it is an honest replay of the two fields we DO have:
+  ##   - Exit(ekExited, cr.exitCode): a real historical observation, not
+  ##     fabricated (CachedResult stores it).
+  ##   - Cause(cbProcess): true by construction — shouldStore only ever
+  ##     caches an `oPassed` result, which can only arise from a cause-less,
+  ##     self-terminated process (§2's derivation never reaches oPassed
+  ##     through cbRunner/cbLimit/cbExternal).
+  ## Evidence/rusage are NOT observed here (the cache doesn't carry them) and
+  ## stay at their honest weakest-claim defaults — same house rule as every
+  ## other interim-population corner in this RFC (§2). `compile` stays
+  ## pkSkipped: edCached genuinely never compiles.
+  result = EntrypointResult(
     ep:             pep.ep,
     outcome:        cr.outcome,
     exitCode:       cr.exitCode,
@@ -202,6 +223,14 @@ proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
     inputHash:      inputHash,     # A8: key the hit was served on
     cacheDecision:  cdmHit,
   )
+  result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
+  result.run = ptypes.Phase(kind: ptypes.pkCached, res: ptypes.ProcessResult(
+    exit:       ptypes.Exit(kind: ptypes.ekExited, code: cr.exitCode),
+    cause:      ptypes.Cause(by: ptypes.cbProcess),
+    evidence:   default(ptypes.Evidence),
+    rusage:     none(ptypes.Rusage),
+    durationUs: cr.durationMs * 1000,
+  ))
 
 proc lookupAtPlan*(
   pep:    PlannedEntrypoint;

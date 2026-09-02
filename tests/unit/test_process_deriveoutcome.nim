@@ -1,7 +1,12 @@
-## test_process_deriveoutcome.nim — rfc-0007 A1a: deriveOutcome(r, policy),
-## the pure total derivation over EntrypointResult (§2). Exhaustive over
-## every reachable PhaseKind × cause × exit cell of the case expression —
-## table-driven, not sampled.
+## test_process_deriveoutcome.nim — rfc-0007 §2: deriveOutcome(r, policy),
+## the pure total derivation over the real crisol/types.EntrypointResult.
+## Exhaustive over every reachable PhaseKind × cause × exit cell of the case
+## expression — table-driven, not sampled.
+##
+## A1c moved deriveOutcome/hasFailRecords onto crisol/types.EntrypointResult
+## itself (the dependency-inversion refactor — see crisol/types.nim's header
+## comment): they now operate on the SAME type the runner actually produces,
+## not a parallel A1a scaffold type.
 ##
 ## Named `deriveOutcome` (not `outcome`) deliberately: while the legacy
 ## `outcome` FIELD exists on crisol/types.EntrypointResult, that name must
@@ -39,8 +44,8 @@ proc cached(pr: ProcessResult): Phase = Phase(kind: pkCached, res: pr)
 const skippedPhase = Phase(kind: pkSkipped)
 const spawnFailedPhase = Phase(kind: pkSpawnFailed, spawnError: "fork failed")
 
-proc entrypointResult(compile, run: Phase; records: seq[TestRecord] = @[]): ptypes.EntrypointResult =
-  ptypes.EntrypointResult(
+proc entrypointResult(compile, run: Phase; records: seq[TestRecord] = @[]): EntrypointResult =
+  EntrypointResult(
     ep: anEp,
     compile: compile,
     run: run,

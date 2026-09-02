@@ -4,6 +4,20 @@
 ## defined here; later slices append without touching the existing definitions.
 
 import std/[options, sets]
+# rfc-0007 A1c: dependency inversion. Outcome/HermeticLevel now live in
+# process/types.nim (moved out of this module) because EntrypointResult below
+# carries `compile`/`run: Phase` fields directly — process/types cannot import
+# THIS module (that would cycle), so this module imports process/types
+# instead and re-exports exactly Outcome + HermeticLevel so every existing
+# `import crisol/types` consumer keeps compiling unchanged. A plain `import`
+# (not the house `from ... import nil` convention used elsewhere — runner.nim,
+# jsonout.nim, api.nim) is needed here: `Outcome`/`HermeticLevel` are used
+# unqualified throughout the rest of THIS file, and `export` alone does not
+# bind a name into its own defining module, only into importers. Everything
+# else from process/types (Phase, ProcessResult, OutcomePolicy, ...) is used
+# `ptypes.`-qualified below and is NOT re-exported.
+import crisol/process/types as ptypes
+export ptypes.Outcome, ptypes.HermeticLevel
 
 type
   IdentityKey* = distinct string
@@ -23,13 +37,6 @@ proc `$`*(k: IdentityKey): string {.borrow.}
 proc `$`*(k: SoundnessKey): string {.borrow.}
 
 type
-  HermeticLevel* = enum
-    ## Hermeticity levels, monotone — each is a strict superset of the one below.
-    ## hlNone  < hlIsolated (the default) < hlNetwork.
-    hlNone       ## today's behavior: full env inherited, parent cwd, no limits
-    hlIsolated   ## env allowlist, isolated tmpdir, config-declared rlimits; no net isolation
-    hlNetwork    ## superset of hlIsolated + unshare(CLONE_NEWNET) + loopback
-
   RlimitOverrides* = object
     ## Caller-supplied per-field rlimit overrides for ``resolveSandbox``.
     ## Bundling the five same-typed ``Option[int64]`` values into a named-field
@@ -413,24 +420,20 @@ type
     msg*:        Option[string]  # failure message or skip reason
     tags*:       seq[string]
 
-  Outcome* = enum
-    oPassed         ## exit 0, no protocol failure records
-    oFailed         ## exit non-zero, or ≥ 1 fail record from protocol
-    oCompileFailed  ## nim c exited non-zero or timed out during compile
-    oTimeout        ## LEGACY (rfc-0007 window): run phase exceeded timeout.
-                    ## Superseded by oKilled; removed at A1e-i.
-    oSignal         ## LEGACY (rfc-0007 window): run phase killed by a signal.
-                    ## Superseded by oCrashed; removed at A1e-i.
-    oSpawnError     ## fork/exec failed at the OS level
-    oKilled         ## rfc-0007: a runner-authored kill (timeout or interrupt) —
-                    ## cause.by == cbRunner. Not yet produced by any A1a code path.
-    oCrashed        ## rfc-0007: the process ended on a signal/ntstatus it did not
-                    ## request and the runner did not send. Not yet produced by
-                    ## any A1a code path.
-
   EntrypointResult* = object
     ## Canonical per-entrypoint result produced by execute().
     ep*:             Entrypoint
+    compile*, run*:  ptypes.Phase  ## rfc-0007 A1c: the §2 window-on-result.
+                                   ## Dual-written by runner.nim ALONGSIDE the
+                                   ## legacy fields below (checkRfc7Coherence
+                                   ## proves they agree); `deriveOutcome`
+                                   ## below reads these, never `outcome`.
+                                   ## Zero-value default (kind: pkSkipped for
+                                   ## both) for any result predating this
+                                   ## window (e.g. a cache-hit synthesis) —
+                                   ## cachedispatch.synthesize populates a
+                                   ## minimal honest replay from the fields
+                                   ## it has (see that module).
     outcome*:        Outcome
     exitCode*:       int           ## WEXITSTATUS when exited normally
     signal*:         int           ## POSIX signal number when outcome == oSignal
@@ -491,6 +494,15 @@ type
                          ## counted in failed/compileFailed/timedOut/signaled/spawnErrors.
                          ## Quarantined passes count normally in `passed`.
     noTestsRan*:   bool  ## e.g. every entrypoint failed to compile
+    counts*:       array[Outcome, int]
+                         ## rfc-0007 A1c: derived-outcome counts (deriveOutcome
+                         ## folded over every non-quarantined-failure result;
+                         ## same quarantine exclusion as the hand-maintained
+                         ## counters above). ADDITIVE: the scalar counters
+                         ## above stay dual-counted until A1e-i (jsonout still
+                         ## reads them until A1d-i). `counts[oTimeout]` and
+                         ## `counts[oSignal]` stay 0 — deriveOutcome never
+                         ## returns the legacy values.
 
   GateStateEntry* = tuple[name: string; value: string]
     ## Internal element of GateState; exported so discover.nim can read it.
@@ -635,6 +647,63 @@ proc outcomeString*(o: Outcome): string =
 proc isFailure*(o: Outcome): bool =
   ## Returns true for any outcome that contributes to a non-zero exit code.
   o in {oFailed, oCompileFailed, oTimeout, oSignal, oSpawnError, oKilled, oCrashed}
+
+# ---------------------------------------------------------------------------
+# rfc-0007 §2: the pure derivation over the real EntrypointResult (A1c).
+#
+# Lives HERE, not in process/types.nim: process/types cannot reference
+# EntrypointResult (it is defined in THIS module, and process/types must not
+# import this module — see the dependency-inversion note at the top of this
+# file). `deriveOutcome` is named, not `outcome`: while the legacy `outcome`
+# FIELD exists above, `r.outcome` binds to the field, so a same-named proc
+# would silently shadow-collide; A1e-i deletes the field and renames this.
+# ---------------------------------------------------------------------------
+
+proc hasFailRecords*(r: EntrypointResult): bool =
+  ## true iff any PARSED protocol record is a failure. A truncated/corrupt
+  ## stream never fabricates a failure — the reader stays conservative (§2).
+  for rec in r.records:
+    if rec.status == rsFail: return true
+  false
+
+proc deriveOutcome*(r: EntrypointResult;
+                    policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): Outcome =
+  ## PURE over (result, policy) — §2's total case expression, verbatim.
+  ## Recomputed at every crisol trust boundary (cache load, render, exit-code
+  ## derivation) rather than trusted from the stored `outcome` field.
+  case r.compile.kind
+  of ptypes.pkSpawnFailed:
+    return oSpawnError
+  of ptypes.pkRan, ptypes.pkCached:
+    let c = r.compile.res
+    if c.cause.by == ptypes.cbRunner and c.cause.reason == ptypes.krInterrupt:
+      return oKilled              ## Ctrl-C mid-compile is not a compile failure
+    if c.cause.by != ptypes.cbProcess or not ptypes.isSuccess(c.exit):
+      return oCompileFailed       ## incl. compile timeout — the cause is
+                                   ## consulted, so a cooperative exit-0 inside
+                                   ## a compile-kill grace window cannot
+                                   ## masquerade as a good compile
+  of ptypes.pkSkipped:
+    discard                       ## fresh — nothing to prove
+  case r.run.kind
+  of ptypes.pkSpawnFailed:
+    oSpawnError
+  of ptypes.pkSkipped:
+    oSpawnError                   ## unreachable in any EMITTED result: a good
+                                   ## compile is always followed by a run phase
+                                   ## (§2) — derives loudly rather than lying
+  of ptypes.pkRan, ptypes.pkCached:
+    let p = r.run.res
+    if p.cause.by == ptypes.cbRunner:
+      oKilled
+    elif p.exit.kind != ptypes.ekExited:
+      oCrashed                    ## signaled/ntstatus; cause may be limit
+                                   ## or external
+    elif p.exit.code == 0 and not r.hasFailRecords:
+      if policy.strictHygiene and p.evidence.escapees.len > 0: oFailed
+      else: oPassed
+    else:
+      oFailed
 
 proc exitCode*(s: Summary; failOnFlaky: bool = false): int =
   ## Returns 0 when all entrypoints passed; 1 when any failed.

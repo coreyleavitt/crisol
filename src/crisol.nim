@@ -1025,7 +1025,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
 
   if jsonMode:
     stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
-                              rr.memThrottledSlots, window = rr.procWindow))
+                              rr.memThrottledSlots))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,

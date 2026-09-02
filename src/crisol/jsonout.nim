@@ -239,8 +239,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              warnings: seq[ConfigWarning] = @[];
              memThrottledSlots: int = 0;
              compileBlock: JsonNode = nil;
-             reuseAlerts: JsonNode = nil;
-             window: seq[ptypes.Rfc7Window] = @[]): JsonNode =
+             reuseAlerts: JsonNode = nil): JsonNode =
   ## Pure: serialize to the crisol/run/v1 JsonNode.
   ## No I/O.
   ## C3: when filterTag is non-empty, each entrypoint's records array contains
@@ -257,11 +256,9 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## (crisol/compilereport.buildReuseAlerts). Unlike compileBlock, this field
   ## is ALWAYS PRESENT (mirrors `regressions`) -- nil/omitted is treated as an
   ## empty JArray, never omitted from the document.
-  ## window: rfc-0007 A1b dual-write carrier (runner.execute's windowOut),
-  ## same index as `results`. Empty (the default -- every pre-A1b caller)
-  ## means no advisory `exit`/`cause` nodes are emitted anywhere; a shorter-
-  ## than-`results` window (defensive only -- runner always sizes it to
-  ## match) is treated the same as "absent" for the entries past its end.
+  ## rfc-0007 A1c: the advisory `exit`/`cause` nodes (rev 15) now read
+  ## `r.run` directly off each EntrypointResult (the window lives on the
+  ## result itself) -- no separate window parameter.
 
   # Build summary object (always full-run counts)
   let summaryNode = newJObject()
@@ -337,11 +334,13 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     # Only true when perf-check is enabled AND this run exceeded median+k·MAD.
     epNode["regressed"]     = newJBool(r.regressed)
     epNode["records"]       = recordsNode
-    # rev 15 (rfc-0007 A1b): advisory exit/cause -- null when this entry has
-    # no captured run-phase ProcessResult (window absent/short, or a
-    # pkSkipped/pkSpawnFailed/pkCached run phase -- e.g. a cache hit, A1d-ii).
-    if i < window.len and window[i].run.kind in {ptypes.pkRan, ptypes.pkCached}:
-      let runRes = window[i].run.res
+    # rev 15 (rfc-0007 A1c): advisory exit/cause -- null when this entry has
+    # no captured LIVE run-phase ProcessResult (pkSkipped/pkSpawnFailed, or a
+    # cache hit's pkCached -- cachedispatch synthesizes a minimal Phase for
+    # deriveOutcome's benefit, A1c, but it is not a real replayed observation;
+    # the wire stays null until A1d-ii's genuine cache-replay dual-write).
+    if r.run.kind == ptypes.pkRan:
+      let runRes = r.run.res
       epNode["exit"]  = exitToJson(runRes.exit)
       epNode["cause"] = causeToJson(runRes.cause)
     else:
@@ -381,12 +380,11 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    warnings: seq[ConfigWarning] = @[];
                    memThrottledSlots: int = 0;
                    compileBlock: JsonNode = nil;
-                   reuseAlerts: JsonNode = nil;
-                   window: seq[ptypes.Rfc7Window] = @[]): string =
+                   reuseAlerts: JsonNode = nil): string =
   ## Pure: compact JSON string of the crisol/run/v1 document.
   ## C3: filterTag threads through to toJson.
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
-         reuseAlerts, window)
+         reuseAlerts)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
@@ -397,8 +395,7 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
                      warnings: seq[ConfigWarning] = @[];
                      memThrottledSlots: int = 0;
                      compileBlock: JsonNode = nil;
-                     reuseAlerts: JsonNode = nil;
-                     window: seq[ptypes.Rfc7Window] = @[]) =
+                     reuseAlerts: JsonNode = nil) =
   ## Write lastrun.json atomically to <projectRoot>/<stateDir>/lastrun.json.
   ## Creates the state directory if it does not exist.
   ## On any failure: prints a warning to stderr and returns -- never raises.
@@ -429,8 +426,7 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   let jsonStr = toJsonString(results, summary, warnings = warnings,
                              memThrottledSlots = memThrottledSlots,
                              compileBlock = compileBlock,
-                             reuseAlerts = reuseAlerts,
-                             window = window)
+                             reuseAlerts = reuseAlerts)
   var tmpFd: cint = -1
   try:
     let flags = O_CREAT or O_EXCL or O_WRONLY or O_CLOEXEC

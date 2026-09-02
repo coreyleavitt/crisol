@@ -3,7 +3,7 @@
 ## Positive: all contracted symbols must be importable from crisol/api.
 ## Negative: internal types (Config, RunPlan) must NOT be reachable.
 
-import std/unittest
+import std/[options, unittest]
 import crisol/api
 
 suite "api boundary — positive: contracted symbols reachable":
@@ -44,6 +44,31 @@ suite "api boundary — positive: contracted symbols reachable":
 
   test "ZeroRunnableReason":
     let _: ZeroRunnableReason = zrkNone
+
+  test "rfc-0007 A1c: result-model facade — the ENUMERATED re-export set":
+    # If any of these types/values stop being importable through crisol/api,
+    # this test fails to compile — the enumerated set from the RFC's A1c
+    # bullet (Outcome, Phase/PhaseKind, ProcessResult, Exit/ExitKind,
+    # Cause/CauseBy/KillReason, Evidence/TreeObservation, Rusage,
+    # LimitsAchieved, OutcomePolicy).
+    let _: Phase = Phase(kind: pkSkipped)
+    let _: PhaseKind = pkRan
+    let _: ProcessResult = ProcessResult()
+    let _: Exit = Exit(kind: ekExited, code: 0)
+    let _: ExitKind = ekSignaled
+    let _: Cause = Cause(by: cbProcess)
+    let _: CauseBy = cbRunner
+    let _: KillReason = krTimeout
+    let _: Evidence = Evidence()
+    let _: TreeObservation = toUnobservable
+    let _: Rusage = Rusage()
+    let _: LimitsAchieved = default(LimitsAchieved)
+    let _: OutcomePolicy = OutcomePolicy(strictHygiene: true)
+
+  test "rfc-0007 A1c: runResult/failureLine digest helpers are reachable":
+    let r = EntrypointResult()
+    check runResult(r).isNone         # default-constructed: no run phase captured
+    check failureLine(r) == "spawn error"  # pkSkipped run -> derives oSpawnError
 
   test "planToJsonString facade accepts PlanReport":
     let pr = PlanReport()

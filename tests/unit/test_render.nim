@@ -24,41 +24,69 @@ import crisol/types
 import crisol/render
 import crisol/terminal  # for shouldEnableColor
 import crisol/runner  # for summarize
+import crisol/process/types as ptypes  # rfc-0007 A1c: coherent Phase fixtures
 
 # ---------------------------------------------------------------------------
 # Helpers — build synthetic results
+#
+# rfc-0007 A1c: render now displays deriveOutcome(r), not the stored legacy
+# `outcome` field — every fixture below also stamps a coherent `compile`/
+# `run: Phase` pair (the same shape runner.execute's dual-write produces) so
+# deriveOutcome agrees with the legacy outcome each helper names.
 # ---------------------------------------------------------------------------
 
 proc makeEp(path: string; group = "unit"): Entrypoint =
   Entrypoint(path: path, group: group)
 
+proc ranPhase(cause: ptypes.Cause; exit: ptypes.Exit): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: exit, cause: cause, evidence: default(ptypes.Evidence),
+    rusage: none(ptypes.Rusage), durationUs: 0))
+
+const skippedPhase = ptypes.Phase(kind: ptypes.pkSkipped)
+const cbProcess = ptypes.Cause(by: ptypes.cbProcess)
+
 proc passedResult(path: string; durationMs: int64 = 100;
                   records: seq[TestRecord] = @[]): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oPassed,
+  result = EntrypointResult(ep: makeEp(path), outcome: oPassed,
                    exitCode: 0, durationMs: durationMs, records: records)
+  result.compile = skippedPhase
+  result.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: 0))
 
 proc failedResult(path: string; records: seq[TestRecord] = @[];
                   output = ""; durationMs: int64 = 50): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oFailed,
+  result = EntrypointResult(ep: makeEp(path), outcome: oFailed,
                    exitCode: 1, durationMs: durationMs,
                    records: records, output: output)
+  result.compile = skippedPhase
+  result.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: 1))
 
 proc compileFailedResult(path: string;
                           output = "error: undeclared id 'Foo'"): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oCompileFailed,
+  result = EntrypointResult(ep: makeEp(path), outcome: oCompileFailed,
                    exitCode: 1, output: output, durationMs: 200)
+  result.compile = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: 1))
+  result.run = skippedPhase
 
 proc timeoutResult(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oTimeout,
+  result = EntrypointResult(ep: makeEp(path), outcome: oTimeout,
                    signal: 9, durationMs: 300_000)
+  result.compile = skippedPhase
+  result.run = ranPhase(
+    ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: false),
+    ptypes.Exit(kind: ptypes.ekSignaled, sig: 9, coreDumped: false))
 
 proc signalResult(path: string; sig = 11): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oSignal,
+  result = EntrypointResult(ep: makeEp(path), outcome: oSignal,
                    signal: sig, durationMs: 80)
+  result.compile = skippedPhase
+  result.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekSignaled, sig: sig, coreDumped: false))
 
 proc spawnResult(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oSpawnError,
+  result = EntrypointResult(ep: makeEp(path), outcome: oSpawnError,
                    output: "fork failed", durationMs: 0)
+  result.compile = skippedPhase
+  result.run = ptypes.Phase(kind: ptypes.pkSpawnFailed, spawnError: "fork failed")
 
 proc passRecord(name: string; us: int64): TestRecord =
   TestRecord(name: name, status: rsPass, durationUs: us)
@@ -80,6 +108,9 @@ proc withColorOpts(): RenderOpts = RenderOpts(color: true, slowestN: 5)
 
 suite "render – outcome labels":
   test "all six outcome labels appear when each outcome is present":
+    ## rfc-0007 A1c: labels are driven by deriveOutcome, so a coherently
+    ## Phase-stamped timeoutResult/signalResult render as [KILLED]/[CRASH]
+    ## (the derived vocabulary), not the legacy [TIMEOUT]/[SIGNAL] text.
     let results = @[
       passedResult("tests/unit/test_a.nim"),
       failedResult("tests/unit/test_b.nim"),
@@ -94,8 +125,8 @@ suite "render – outcome labels":
     check "[OK]"      in rendered
     check "[FAIL]"    in rendered
     check "[COMPILE]" in rendered
-    check "[TIMEOUT]" in rendered
-    check "[SIGNAL]"  in rendered
+    check "[KILLED]"  in rendered
+    check "[CRASH]"   in rendered
     check "[SPAWN]"   in rendered
 
   test "entrypoint paths appear in output":
@@ -135,6 +166,18 @@ suite "render – failure detail":
                                   "CRASH: null pointer deref")]
     let rendered = render(results, summarize(results), noColorOpts())
     check "CRASH: null pointer deref" in rendered
+
+  test "rfc-0007 A1c: a killed result's detail line names the cause":
+    let results = @[timeoutResult("tests/unit/test_d.nim")]
+    let rendered = render(results, summarize(results), noColorOpts())
+    check "[KILLED]" in rendered
+    check "cause: runner timeout" in rendered
+
+  test "rfc-0007 A1c: a crashed result's detail line names the cause":
+    let results = @[signalResult("tests/unit/test_e.nim", sig = 11)]
+    let rendered = render(results, summarize(results), noColorOpts())
+    check "[CRASH]" in rendered
+    check "cause: process" in rendered
 
 # ---------------------------------------------------------------------------
 # Suite 3 — Skip reasons

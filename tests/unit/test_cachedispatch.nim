@@ -13,6 +13,7 @@
 
 import std/[options, unittest]
 import crisol/[types, sandbox, cachedispatch, resultcache, planner, depgraph]
+import crisol/process/types  # pkCached/pkSkipped (rfc-0007 A1c coherence test)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,6 +86,20 @@ suite "lookupAtPlan — promotion + decision":
     check s.compileSkipped              # edCached skips both phases
     check s.records.len == 1
     check c.loadCalls == 1
+
+  test "rfc-0007 A1c: synthesized cache hit derives oPassed (deriveOutcome coherence)":
+    ## A cache hit never goes through runner.execute's dual-write path, so
+    ## without cachedispatch.synthesize populating a minimal `run: Phase`,
+    ## deriveOutcome would wrongly read `run.kind == pkSkipped` and derive
+    ## oSpawnError for what is actually a passing cached result — exactly the
+    ## bug every consumer (render/junit/api/isQuarantined/Summary.counts)
+    ## would inherit the moment it stopped trusting the legacy `outcome` field.
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c, sampleCached()))
+    let s = look.synthesized.get
+    check deriveOutcome(s) == oPassed
+    check s.run.kind == pkCached
+    check s.compile.kind == pkSkipped
 
   test "edRunFresh miss → edRunFresh, cdmKeyMiss, no synthesis":
     var c: Calls

@@ -1315,10 +1315,11 @@ suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
   test "RunV1Revision is 15 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause)":
     check RunV1Revision == 15
 
-  test "rfc-0007 A1b: exit/cause are null when no dual-write window is supplied (back-compat default)":
-    ## window defaults to @[] -- every pre-A1b caller keeps emitting null
-    ## advisory nodes rather than omitting the keys (additive, not a schema
-    ## break: readers are unknown-tolerant, and `null` is a stable presence).
+  test "rfc-0007 A1c: exit/cause are null when the result carries no captured run phase (back-compat default)":
+    ## A default-constructed EntrypointResult's `run` Phase defaults to
+    ## pkSkipped (zero value) -- toJson emits null advisory nodes rather than
+    ## omitting the keys (additive, not a schema break: readers are
+    ## unknown-tolerant, and `null` is a stable presence).
     let node = toJson(@[EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
                                          outcome: oPassed, exitCode: 0)],
                       Summary(total: 1, passed: 1))

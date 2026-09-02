@@ -12,13 +12,17 @@
 ## Reader contract (from RFC §Result Protocol §Reader contract):
 ##   1. Truncated final line: an incomplete JSON fragment at EOF (no trailing
 ##      newline) is discarded silently; prior complete records are kept.
-##   2. Records + non-zero exit (OR rule): caller reconciles via reconcile().
+##   2. Records + non-zero exit (OR rule): caller applies
+##      `reconcile(records) or exitCode != 0`.
 ##   3. Opaque fallback: no sink file, empty file, or zero valid records →
 ##      SinkData.hasProtocol = false; executor falls back to exit-code-only.
 ##
-## Note: oTimeout and oSignal take precedence over oFailed when the executor
-## has already classified the outcome as one of those — reconcile() does NOT
-## override them; call it only when the process exited normally (no signal/timeout).
+## rfc-0007 A1c: reconcile() shrank to a records-only predicate (bool, not
+## Outcome) — the executor-precedence rule (a killed/signaled process's
+## records never override the executor's verdict) is now subsumed by
+## deriveOutcome (§2: `cause.by == cbRunner` dominates before records are
+## ever consulted), so it is no longer reconcile()'s job to encode. Call
+## reconcile() only when the process exited normally (no signal/timeout).
 ##
 ## All functions here are pure except readSink (reads one file).
 
@@ -237,22 +241,24 @@ proc readSink*(path: string; maxBytes: int = DefaultSinkMaxBytes): SinkData =
 # Reconciliation
 # ---------------------------------------------------------------------------
 
-proc reconcile*(records: seq[TestRecord]; exitCode: int): Outcome =
-  ## Apply the OR rule to produce an Outcome from protocol records + exit code.
+proc reconcile*(records: seq[TestRecord]): bool =
+  ## rfc-0007 A1c: shrunk to a records-only predicate — true iff any PARSED
+  ## record is rsFail. Feeds crisol/types.hasFailRecords' definition (the
+  ## same rule, over an EntrypointResult's stored records).
   ##
-  ## Rules (from RFC §Reader contract §Outcome precedence rule):
-  ##   • oFailed  if (≥ 1 rsFail record) OR (exitCode ≠ 0)
-  ##   • oPassed  if all records are rsPass/rsSkip AND exitCode = 0
+  ## The exit-code OR-rule and the oTimeout/oSignal executor-precedence rule
+  ## (a signaled/timed-out process's records never override the executor's
+  ## verdict) are now subsumed by deriveOutcome (§2): `cause.by == cbRunner`
+  ## dominates before records are ever consulted, so callers apply the OR-rule
+  ## themselves — `reconcile(records) or exitCode != 0` — only when the
+  ## process exited normally.
   ##
-  ## PRECONDITION: call this only when the process exited normally (not
-  ## oTimeout / oSignal).  oTimeout and oSignal take precedence and must be
-  ## decided by the executor before calling reconcile.
-  ##
-  ## When records is empty (opaque fallback), the caller should NOT call
-  ## reconcile — just use exit code 0 → oPassed, non-zero → oFailed directly.
+  ## Truncated-stream conservatism is preserved unchanged: this reads
+  ## whatever records were successfully parsed (readSink already dropped an
+  ## unparseable tail per the reader contract) and never fabricates a failure
+  ## from truncation itself — a truncated stream with zero parsed records
+  ## returns false, same as an empty stream.
   for rec in records:
     if rec.status == rsFail:
-      return oFailed
-  if exitCode != 0:
-    return oFailed
-  oPassed
+      return true
+  false

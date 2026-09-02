@@ -12,10 +12,11 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_B3_quarantine_render.nim
 
-import std/[strutils, unittest]
+import std/[options, strutils, unittest]
 import crisol/types
 import crisol/render
 import crisol/runner  # for summarize
+import crisol/process/types as ptypes  # rfc-0007 A1c: coherent Phase fixtures
 
 proc makeEp(path: string): Entrypoint =
   Entrypoint(path: path, group: "unit")
@@ -23,46 +24,64 @@ proc makeEp(path: string): Entrypoint =
 proc noColorOpts(): RenderOpts = RenderOpts(color: false, slowestN: 5)
 proc withColorOpts(): RenderOpts = RenderOpts(color: true, slowestN: 5)
 
+# rfc-0007 A1c: render displays deriveOutcome(r), not the stored legacy
+# `outcome` field — every fixture below also stamps a coherent `run: Phase`
+# (compile stays the pkSkipped zero-value default; only the run phase
+# matters for these fixtures' exitCode-only outcomes) so deriveOutcome
+# agrees with the legacy `outcome` each literal names.
+proc ranPhase(exitCode: int): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit:       ptypes.Exit(kind: ptypes.ekExited, code: exitCode),
+    cause:      ptypes.Cause(by: ptypes.cbProcess),
+    evidence:   default(ptypes.Evidence),
+    rusage:     none(ptypes.Rusage),
+    durationUs: 0))
+
 suite "B3 render — [QUARANTINED] label":
 
   test "quarantined FAILED result shows [QUARANTINED]":
-    let r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
+    var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
                              outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: true)
+    r.run = ranPhase(1)
     let s = summarize(@[r])
     let rendered = render(@[r], s, noColorOpts())
     check "[QUARANTINED]" in rendered
 
   test "quarantined PASSED result also shows [QUARANTINED]":
     ## A quarantined entrypoint is labeled regardless of outcome.
-    let r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
+    var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
                              outcome: oPassed, exitCode: 0,
                              durationMs: 100, quarantined: true)
+    r.run = ranPhase(0)
     let s = summarize(@[r])
     let rendered = render(@[r], s, noColorOpts())
     check "[QUARANTINED]" in rendered
 
   test "non-quarantined result does NOT show [QUARANTINED]":
-    let r = EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
+    var r = EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
                              outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: false)
+    r.run = ranPhase(1)
     let s = summarize(@[r])
     let rendered = render(@[r], s, noColorOpts())
     check "[QUARANTINED]" notin rendered
 
   test "quarantined failure shows outcome label AND [QUARANTINED] together":
-    let r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
+    var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
                              outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: true)
+    r.run = ranPhase(1)
     let s = summarize(@[r])
     let rendered = render(@[r], s, noColorOpts())
     check "[FAIL]"        in rendered
     check "[QUARANTINED]" in rendered
 
   test "quarantined with color=true shows [QUARANTINED] in ANSI-colored form":
-    let r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
+    var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
                              outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: true)
+    r.run = ranPhase(1)
     let s = summarize(@[r])
     let rendered = render(@[r], s, withColorOpts())
     # ANSI escapes present and the literal text is still there
@@ -70,9 +89,10 @@ suite "B3 render — [QUARANTINED] label":
     check "QUARANTINED" in rendered
 
   test "quarantined cached result shows both [CACHED] and [QUARANTINED]":
-    let r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
+    var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
                              outcome: oPassed, exitCode: 0,
                              durationMs: 100, cached: true, quarantined: true)
+    r.run = ranPhase(0)
     let s = summarize(@[r])
     let rendered = render(@[r], s, noColorOpts())
     check "[CACHED]"      in rendered
