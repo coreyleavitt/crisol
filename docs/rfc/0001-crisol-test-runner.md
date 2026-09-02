@@ -883,12 +883,12 @@ Deferred to v1.1. Core value (parallel continue-on-failure + impact selection) d
 Explicitly out of v1, acknowledged so consumers can plan:
 
 - **Watch mode** (`crisol watch`): FS-watcher + debounce + impact-selected re-runs (resolved Q4).
-- **JUnit XML output** (`--junit <path>`) and GitHub Actions annotations — CI-native formats beyond `--json`.
-- **Sharding** (`--shard <i>/<n>`): deterministic partition of the sorted entrypoint list for multi-machine CI.
+- **JUnit XML output** (`--junit <path>`) and GitHub Actions annotations — CI-native formats beyond `--json`. ✅ `--junit` shipped (crisol.nim `of "junit"`, junit.nim, test_junit.nim; cause-aware errors added in rfc-0007 A1c). GitHub annotations never requested since.
+- **Sharding** (`--shard <i>/<n>`): deterministic partition of the sorted entrypoint list for multi-machine CI. ✅ shipped (crisol.nim `of "shard"`, shard.nim balanced sharding, test_c3_balanced_shard/test_shard_pipeline).
 - **Compile-only mode** (`--check`): `nim check` sweep without running.
 - **`--tap` output format** (sink protocol unaffected).
 - **Compound/extended gates** (`file`, `cmd`, `all`/`any`) — the typed gate object is forward-compatible.
-- **Per-group env allowlists** (environment isolation beyond CRISOL_* stripping).
+- **Per-group env allowlists** (environment isolation beyond CRISOL_* stripping). ✅ the isolation itself landed as RFC-0004 F2 (hermetic env allowlist + isolated tmpdir, default hlIsolated); per-GROUP allowlist customization specifically remains unbuilt and unrequested.
 - **Auto-injected unittest shim** (zero-import structured output) — rejected for v1 as too magical.
 - **Sibling-consumer migrations** (lib/cel, lib/kdl, proptest, fresco) — after amoxtli proves the model; their patterns inform C1 *now* (see Stage C precondition).
 
