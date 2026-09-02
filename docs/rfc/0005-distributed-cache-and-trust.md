@@ -1,6 +1,6 @@
 # RFC-0005 — Distributed result cache, cryptographic trust & cache observability
 
-**Status:** Draft (stage 2 — architect rounds 1, 2 & **3** applied 2026-08-21; FORK-1 (crypto deps) resolved — see §Dependency decision; **FORK-2 (cold-host consult) OPEN — see §FORK-2**; everything else is ready for `/tdd`)
+**Status:** Ready (stage 2 — architect rounds 1, 2 & **3** applied 2026-08-21; FORK-1 (crypto deps) resolved — see §Dependency decision; **FORK-2 (cold-host consult) OPEN — see §FORK-2**). Build queued behind RFC-0007 Stage A — the A7-gate re-baselines this doc before the build starts
 **Depends on:** RFC-0004 (incremental hermetic execution — the `ExecutionCache`, `SoundnessKey`, `CacheSeams`/`cachedispatch` seam, `RunLedger`, and the `isFullyAchieved && attempt-1` publish gate this RFC extends); RFC-0006 (persistent per-entrypoint nimcache at `<stateDir>/cache/<slug>-<toolchainFp>/` — a *sibling* of the result cache under the same root; see §Local-fs root)
 **Scope owner:** Corey
 

@@ -1,6 +1,6 @@
 # RFC-0004 — Incremental, hermetic, observable execution
 
-**Status:** Draft (stage 2 — architect rounds 1 & 2 applied; ready for `/tdd`)
+**Status:** Implemented — closed: 27-slice build, review to floor (3 rounds, 0 critical/high), merged to main; follow-ons reconciled
 **Depends on:** RFC-0001 (runner + impact analysis), RFC-0002 (scheduling + config), RFC-0003 (library facade)
 **Scope owner:** Corey
 

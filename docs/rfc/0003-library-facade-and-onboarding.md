@@ -1,6 +1,6 @@
 # RFC-0003 — Library facade + onboarding + CLI papercuts
 
-**Status:** Draft — stage 1 (RFC + slicing); architect round 2 applied
+**Status:** Implemented — all four rfc-flow stages complete (all review findings closed); facade shipped, amoxtli onboarded
 **Date:** 2026-06-13
 **Author:** Corey Leavitt
 

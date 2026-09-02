@@ -1,6 +1,6 @@
 # RFC-0002 — Scheduling & config correctness
 
-**Status:** Draft — stage 1 (RFC + slicing); architect round 1+2 applied
+**Status:** Implemented — full rfc-flow complete; committed 5c4de13 and pushed 2026-06-13
 **Date:** 2026-06-13
 **Author:** Corey Leavitt
 

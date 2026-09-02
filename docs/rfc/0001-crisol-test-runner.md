@@ -1,6 +1,6 @@
 # RFC-0001 — crisol test runner
 
-**Status:** Draft — revised after architecture review rounds 1 and 2 (ready for implementation)
+**Status:** Implemented — all four rfc-flow stages complete (review floor reached: 0 critical/high/medium open); runner shipped and dogfooded
 **Date:** 2026-06-12
 **Author:** Corey Leavitt
 

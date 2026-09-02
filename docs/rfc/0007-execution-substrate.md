@@ -1,6 +1,6 @@
 # RFC-0007 — Execution substrate: process contract, honest results, platform backends
 
-**Status:** Draft (stage 2 — architect round 2 applied 2026-08-23)
+**Status:** In-progress — stage 3 slice grind (A0–A1b landed 2026-09-02, A1c underway; architect rounds 1–2 applied 2026-08-23)
 **Depends on:** RFC-0001 (runner), RFC-0002 (scheduling/admission), RFC-0004 (hermetic execution, `SandboxAchieved`, cache gate)
 **Precedes:** RFC-0005 *build* (the `StoredEntry` wire freezes on this RFC's result model — see §Contract impacts)
 **Followed by:** RFC-0008 (observed inputs — the input observer), RFC-0009 (path identity — `ProjectPath`; prerequisite for Windows green)
