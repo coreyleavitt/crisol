@@ -174,6 +174,10 @@ proc outcomeLabel(o: Outcome): string =
   of oTimeout:       "[TIMEOUT]"
   of oSignal:        "[SIGNAL] "
   of oSpawnError:    "[SPAWN]  "
+  of oKilled:        "[KILLED] "  ## rfc-0007 window: supersedes oTimeout; not
+                                  ## yet produced by any A1a code path.
+  of oCrashed:       "[CRASH]  "  ## rfc-0007 window: supersedes oSignal; not
+                                  ## yet produced by any A1a code path.
 
 proc outcomeColor(o: Outcome): string =
   case o
@@ -183,6 +187,8 @@ proc outcomeColor(o: Outcome): string =
   of oTimeout:       Ansi_Yellow
   of oSignal:        Ansi_Red
   of oSpawnError:    Ansi_Red
+  of oKilled:        Ansi_Yellow  ## mirrors oTimeout
+  of oCrashed:       Ansi_Red     ## mirrors oSignal
 
 # ---------------------------------------------------------------------------
 # Per-entrypoint record counts
@@ -312,6 +318,10 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
           " (" & sigName & ")"
         of oFailed:        " (exit " & $r.exitCode & ")"
         of oSpawnError:    " (spawn error)"
+        of oKilled:        " (killed)"  ## rfc-0007 window: not yet produced
+        of oCrashed:
+          let sigName = if r.signal > 0: "SIG#" & $r.signal else: "signal"
+          " (" & sigName & ")"  ## rfc-0007 window: mirrors oSignal; not yet produced
 
     # A8: mark results served from the ExecutionCache.  The [CACHED] tag sits
     # after the outcome label so a cached pass reads "[OK] … [CACHED]".  Cached
@@ -407,6 +417,22 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     of oSpawnError:
       if r.output.len > 0:
         buf.add "           " & r.output & "\n"
+
+    of oKilled:
+      discard  ## rfc-0007 window: not yet produced; mirrors oTimeout's
+               ## self-explanatory label. A1c adds cause-aware detail.
+
+    of oCrashed:
+      if r.output.len > 0:
+        let maxDisplay = 1000
+        let outText = if r.output.len > maxDisplay:
+                        r.output[0..<maxDisplay] & "\n[...truncated...]"
+                      else: r.output
+        for line in outText.splitLines:
+          if line.len > 0:
+            buf.add "           " & line & "\n"
+      ## rfc-0007 window: not yet produced; mirrors oSignal. A1c adds
+      ## cause-aware detail.
 
   # -------------------------------------------------------------------------
   # 2. Slowest-N section

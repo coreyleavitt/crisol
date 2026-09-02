@@ -222,6 +222,15 @@ proc outcomeChildXml(r: EntrypointResult): string =
   of oSpawnError:
     "        <error message=\"spawn error\">" &
     escapeXml(r.output) & "</error>\n"
+  of oKilled:
+    ## rfc-0007 window: not yet produced. A1c adds cause-aware detail
+    ## ("oKilled/oCrashed → <error> with cause" per the RFC).
+    "        <error message=\"killed\">" &
+    escapeXml(r.output) & "</error>\n"
+  of oCrashed:
+    let msg = "killed by signal " & $r.signal
+    "        <error message=\"" & escapeXml(msg) & "\">" &
+    escapeXml(r.output) & "</error>\n"
 
 proc recordChildXml(rec: TestRecord): string =
   ## Returns the inner child element for a protocol record testcase, or "".

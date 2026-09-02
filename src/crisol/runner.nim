@@ -1633,5 +1633,9 @@ proc summarize*(results: seq[EntrypointResult]): Summary =
       of oTimeout:       inc result.timedOut
       of oSignal:        inc result.signaled
       of oSpawnError:    inc result.spawnErrors
+      of oKilled, oCrashed:
+        discard  ## rfc-0007 window: not yet produced by any code path in this
+                 ## slice — Summary gains a derived counts array at A1c, which
+                 ## is where these get a real counter.
     if r.flaky: inc result.flaky  # B1: count flaky-passes
   result.noTestsRan = result.passed == 0 and result.total > 0

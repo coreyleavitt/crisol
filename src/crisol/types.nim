@@ -417,9 +417,16 @@ type
     oPassed         ## exit 0, no protocol failure records
     oFailed         ## exit non-zero, or ≥ 1 fail record from protocol
     oCompileFailed  ## nim c exited non-zero or timed out during compile
-    oTimeout        ## run phase exceeded timeout
-    oSignal         ## run phase killed by a signal (SIGSEGV, SIGABRT, …)
+    oTimeout        ## LEGACY (rfc-0007 window): run phase exceeded timeout.
+                    ## Superseded by oKilled; removed at A1e-i.
+    oSignal         ## LEGACY (rfc-0007 window): run phase killed by a signal.
+                    ## Superseded by oCrashed; removed at A1e-i.
     oSpawnError     ## fork/exec failed at the OS level
+    oKilled         ## rfc-0007: a runner-authored kill (timeout or interrupt) —
+                    ## cause.by == cbRunner. Not yet produced by any A1a code path.
+    oCrashed        ## rfc-0007: the process ended on a signal/ntstatus it did not
+                    ## request and the runner did not send. Not yet produced by
+                    ## any A1a code path.
 
   EntrypointResult* = object
     ## Canonical per-entrypoint result produced by execute().
@@ -622,10 +629,12 @@ proc outcomeString*(o: Outcome): string =
   of oTimeout:       "timedOut"
   of oSignal:        "signaled"
   of oSpawnError:    "spawnError"
+  of oKilled:        "killed"
+  of oCrashed:       "crashed"
 
 proc isFailure*(o: Outcome): bool =
   ## Returns true for any outcome that contributes to a non-zero exit code.
-  o in {oFailed, oCompileFailed, oTimeout, oSignal, oSpawnError}
+  o in {oFailed, oCompileFailed, oTimeout, oSignal, oSpawnError, oKilled, oCrashed}
 
 proc exitCode*(s: Summary; failOnFlaky: bool = false): int =
   ## Returns 0 when all entrypoints passed; 1 when any failed.
