@@ -8,6 +8,7 @@ import std/unittest
 import crisol/types
 import crisol/outcomestrings
 import crisol/jsonout
+import crisol/ledger
 
 suite "outcomestrings — single source of truth (types.outcomeString)":
 
@@ -62,6 +63,41 @@ suite "outcomestrings — single source of truth (types.outcomeString)":
       check isFailureOutcomeString(s)
     for s in failureOutcomeStrings:
       check s in FailureOutcomeStrings
+
+suite "rfc-0007 A1d-ii — ledger legacy-string compat rule":
+  ## A ledger row written by a pre-rfc-0007 crisol persists the OLD `outcome`
+  ## strings ("timedOut"/"signaled") forever — the ledger's own
+  ## `historyFormatVersion` does not change for this RFC.  shard.nim's
+  ## duration-median computation (isCompileFailedOutcomeString) and any other
+  ## string-domain ledger reader must keep classifying those legacy strings
+  ## exactly as before: `oTimeout`/`oSignal` stay in the Outcome enum (as
+  ## documented LEGACY variants) and stay `isFailure == true`, so
+  ## `failureOutcomeStrings`/`isFailureOutcomeString` — both DERIVED from
+  ## `isFailure` — classify them as failures with zero code change here.
+
+  test "legacy \"timedOut\" string is still classified as a failure":
+    check isFailureOutcomeString(types.outcomeString(oTimeout))
+    check types.outcomeString(oTimeout) == "timedOut"
+    check isFailureOutcomeString("timedOut")
+
+  test "legacy \"signaled\" string is still classified as a failure":
+    check isFailureOutcomeString(types.outcomeString(oSignal))
+    check types.outcomeString(oSignal) == "signaled"
+    check isFailureOutcomeString("signaled")
+
+  test "oTimeout/oSignal remain LEGACY (not produced by deriveOutcome) but stay isFailure":
+    ## deriveOutcome never returns these two (superseded by oKilled/oCrashed);
+    ## they exist ONLY for reading pre-rfc-0007 wire/ledger data.  Both facts
+    ## must hold simultaneously: legacy-only AND still classified as failures.
+    check oTimeout.isFailure
+    check oSignal.isFailure
+
+  test "ledger historyFormatVersion is NOT bumped by this RFC":
+    ## rfc-0007 A1d-ii changes nothing about how a ledger row is written or
+    ## read (only the result CACHE's format bumped) -- pinned so a future
+    ## change to this constant surfaces as an intentional decision, not a
+    ## silent side effect of an unrelated slice.
+    check historyFormatVersion == 1
 
 when isMainModule:
   echo "test_outcomestrings done"

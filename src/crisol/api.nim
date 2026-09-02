@@ -308,12 +308,12 @@ type
 # ---------------------------------------------------------------------------
 
 proc runResult*(r: EntrypointResult): Option[ptypes.ProcessResult] =
-  ## Absorbs the Phase variant check: `some()` iff the run phase actually
-  ## captured a ProcessResult (pkRan; a live run this invocation — pkCached
-  ## is a cachedispatch-synthesized minimal replay, not a real observation
-  ## until A1d-ii, so it reads as `none()` here too, same as jsonout's wire).
+  ## Absorbs the Phase variant check: `some()` iff the run phase carries a
+  ## real ProcessResult observation — `pkRan` (a live run this invocation)
+  ## OR `pkCached` (rfc-0007 A1d-ii: a cache hit now replays the REAL stored
+  ## observation, not a fabricated stand-in — see cachedispatch.synthesize).
   ## `none()` for pkSkipped/pkSpawnFailed — no observation to hand back.
-  if r.run.kind == ptypes.pkRan: some(r.run.res)
+  if r.run.kind in {ptypes.pkRan, ptypes.pkCached}: some(r.run.res)
   else: none(ptypes.ProcessResult)
 
 proc failureLine*(r: EntrypointResult): string =

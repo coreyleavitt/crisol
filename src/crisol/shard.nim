@@ -201,6 +201,11 @@ proc shardWithHistory*(
     var durs: seq[int64] = @[]
     for r in rows:
       # Exclude compile-fail rows — they do not represent test-binary run time.
+      # rfc-0007 A1d-ii: `r` here is a PERSISTED ledger row (scanLedger reads
+      # history off disk) -- not a live EntrypointResult -- so this stays on
+      # the outcome STRING (isCompileFailedOutcomeString), unaffected by the
+      # cache-replay/deriveOutcome boundary change; there is no live result
+      # to recompute here.
       if not isCompileFailedOutcomeString(r.outcome):
         durs.add r.durationUs
     if durs.len > 0:

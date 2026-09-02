@@ -13,6 +13,7 @@
 
 import std/[options, unittest]
 import crisol/[types, sandbox, cachedispatch, resultcache, planner, depgraph]
+import crisol/process/types as ptypes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,8 +45,15 @@ proc seamsHit(c: var Calls): CacheSeams =
              inc cp[].keyCalls; SoundnessKey("mk-" & pep.ep.path),
     load:  proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls
-             some(CachedResult(outcome: oPassed, exitCode: 0, durationMs: 100,
-                               records: @[], cachedAt: 1_700_000_000'i64)),
+             some(CachedResult(
+               run: ptypes.ProcessResult(
+                 exit:  ptypes.Exit(kind: ptypes.ekExited, code: 0),
+                 cause: ptypes.Cause(by: ptypes.cbProcess),
+                 evidence: default(ptypes.Evidence),
+                 rusage: none(ptypes.Rusage),
+                 durationUs: 100 * 1000,
+               ),
+               records: @[], cachedAt: 1_700_000_000'i64)),
     store: proc(key: SoundnessKey; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )

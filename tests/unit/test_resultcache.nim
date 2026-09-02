@@ -1,21 +1,29 @@
 ## test_resultcache.nim — A1a: ExecutionCache store (RFC-0004 F1).
+##                        rfc-0007 A1d-ii: the payload carries the REAL
+##                        stored `run` ProcessResult, not a derived
+##                        outcome/exitCode/signal projection.
 ##
 ## Tests written FIRST (TDD), then implementation written to make them pass.
 ##
 ## Coverage:
-##   1. roundtrip: store then load returns an equal CachedResult (incl. records,
-##      cachedAt).
+##   1. roundtrip: store then load returns an equal CachedResult (incl. the
+##      real `run` ProcessResult -- exit/cause/evidence/rusage/durationUs --
+##      records, cachedAt).
 ##   2. miss on absent key → none.
 ##   3. checksum mismatch (corrupt the payload bytes on disk) → none (MISS).
 ##   4. format-version mismatch (bumped version header) → none.
 ##   5. atomic write leaves no .tmp behind; a pre-existing stale .tmp is cleaned.
 ##   6. two different keys coexist; re-storing the same key is idempotent.
 ##   7. soft-cap: dir already at cap → store SKIPPED, returns false; entries intact.
+##   8. rfc-0007 A1d-ii: a structurally-bad `run` node (unparseable enum
+##      string) is a MISS, never a fabricated read (§2 own-reader posture).
 
 import std/[os, json, options, strutils]
 import std/posix as posix_m  # L10: getpid() for PID-unique tmp filename check
 import crisol/types
 import crisol/resultcache
+import crisol/process/types as ptypes
+import crisol/depgraph  # fnv1a64/toHex16 — recompute a matching checksum in test 8
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,12 +34,29 @@ proc freshStateDir(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc sampleResult(): CachedResult =
+proc sampleProcessResult(exitCode: int = 0): ptypes.ProcessResult =
+  ## A real, non-default observation -- exercises every ProcessResult field
+  ## with genuine (not zero-valued) data so a roundtrip proves the WHOLE
+  ## shape survives, not just the fields that happen to match a default.
+  ptypes.ProcessResult(
+    exit:  ptypes.Exit(kind: ptypes.ekExited, code: exitCode),
+    cause: ptypes.Cause(by: ptypes.cbProcess),
+    evidence: ptypes.Evidence(
+      killDomain: ptypes.kdsProcessGroup,
+      tree:       ptypes.toComplete,
+      escapees:   @[],
+      limits:     default(ptypes.LimitsAchieved),
+      hermetic:   ptypes.hlIsolated,
+      killSnapshot: @[],
+      cooperativeUnavailable: false,
+    ),
+    rusage: some(ptypes.Rusage(maxRssBytes: 4_096_000, userCpuUs: 1500, sysCpuUs: 300)),
+    durationUs: 1_234_000,
+  )
+
+proc sampleResult(exitCode: int = 0): CachedResult =
   CachedResult(
-    outcome:    oPassed,
-    exitCode:   0,
-    signal:     0,
-    durationMs: 1234,
+    run: sampleProcessResult(exitCode),
     records: @[
       TestRecord(name: "alpha", status: rsPass, durationUs: 50,
                  msg: none(string), tags: @["fast"]),
@@ -66,10 +91,14 @@ block test_roundtrip:
   assert loaded.isSome, "loadCached should return some after store"
   let got = loaded.get
 
-  assert got.outcome == res.outcome
-  assert got.exitCode == res.exitCode
-  assert got.signal == res.signal
-  assert got.durationMs == res.durationMs
+  assert got.run.exit.kind == ptypes.ekExited
+  assert got.run.exit.code == res.run.exit.code
+  assert got.run.cause.by == ptypes.cbProcess
+  assert got.run.evidence.tree == ptypes.toComplete
+  assert got.run.evidence.killDomain == ptypes.kdsProcessGroup
+  assert got.run.rusage.isSome
+  assert got.run.rusage.get.maxRssBytes == 4_096_000
+  assert got.run.durationUs == res.run.durationUs
   assert got.cachedAt == res.cachedAt
   assert got.records.len == 2, "records must round-trip"
   assert got.records[0].name == "alpha"
@@ -104,7 +133,7 @@ block test_checksum_mismatch:
   # Corrupt the payload (NOT the checksum field) on disk.
   let path = keyFile(sd, key)
   let node = parseJson(readFile(path))
-  node["payload"]["durationMs"] = newJInt(999999)  # tamper, checksum now stale
+  node["payload"]["cachedAt"] = newJInt(999999)  # tamper, checksum now stale
   writeFile(path, $node)
 
   let loaded = loadCached(sd, key)
@@ -177,23 +206,21 @@ block test_two_keys_coexist_idempotent:
   let k1 = SoundnessKey("aaaaaaaaaaaaaaaa")
   let k2 = SoundnessKey("bbbbbbbbbbbbbbbb")
 
-  var r1 = sampleResult()
-  r1.exitCode = 1
-  var r2 = sampleResult()
-  r2.exitCode = 2
+  let r1 = sampleResult(exitCode = 1)
+  let r2 = sampleResult(exitCode = 2)
 
   assert storeCached(sd, k1, r1)
   assert storeCached(sd, k2, r2)
 
   let l1 = loadCached(sd, k1)
   let l2 = loadCached(sd, k2)
-  assert l1.isSome and l1.get.exitCode == 1, "k1 must not be clobbered by k2"
-  assert l2.isSome and l2.get.exitCode == 2, "k2 distinct from k1"
+  assert l1.isSome and l1.get.run.exit.code == 1, "k1 must not be clobbered by k2"
+  assert l2.isSome and l2.get.run.exit.code == 2, "k2 distinct from k1"
 
   # Re-store same key with same content: idempotent (still loads, still one file).
   assert storeCached(sd, k1, r1)
   let l1b = loadCached(sd, k1)
-  assert l1b.isSome and l1b.get.exitCode == 1
+  assert l1b.isSome and l1b.get.run.exit.code == 1
 
 # ---------------------------------------------------------------------------
 # 7. soft-cap: dir at cap → store SKIPPED → false; existing entries intact
@@ -222,5 +249,33 @@ block test_soft_cap_skip:
   # Re-storing an EXISTING key at cap must still succeed (it replaces, not grows).
   let okReplace = storeCached(sd, kA, sampleResult(), maxCacheEntries = 2)
   assert okReplace, "re-storing an existing key at cap must not be soft-capped"
+
+# ---------------------------------------------------------------------------
+# 8. rfc-0007 A1d-ii: structurally-bad `run` node → MISS (own-reader posture)
+# ---------------------------------------------------------------------------
+#
+# Same rule process/resultjson.fromJson already enforces (§2): an unparseable
+# enum string is a STRUCTURAL parse failure, never a default-valued lie.
+# resultcache must propagate that as a cache MISS, not a load of garbage.
+
+block test_structurally_bad_run_node_is_a_miss:
+  let sd = freshStateDir("badrun")
+  defer: removeDir(sd)
+  let key = SoundnessKey("f00df00df00df00d")
+  assert storeCached(sd, key, sampleResult())
+
+  let path = keyFile(sd, key)
+  let node = parseJson(readFile(path))
+  # Corrupt the observation's `exit.kind` to an unparseable enum string, then
+  # recompute a MATCHING checksum — isolating the `run`-structural-parse
+  # failure from the checksum-mismatch path already covered by
+  # test_checksum_mismatch above: even a self-consistent (checksum-valid)
+  # entry with a structurally-bad `run` node must independently be a miss.
+  node["payload"]["run"]["exit"]["kind"] = newJString("not-a-real-exit-kind")
+  node["payloadChecksum"] = newJString(toHex16(fnv1a64($node["payload"])))
+  writeFile(path, $node)
+
+  let loaded = loadCached(sd, key)
+  assert loaded.isNone, "a structurally-bad `run` node must be a MISS"
 
 echo "test_resultcache: all blocks passed"

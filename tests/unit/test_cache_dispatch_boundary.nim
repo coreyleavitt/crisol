@@ -20,6 +20,7 @@
 
 import std/[options, os, tables, unittest]
 import crisol/[types, runner, planner, depgraph, sandbox, cachedispatch, resultcache]
+import crisol/process/types as ptypes
 
 # ---------------------------------------------------------------------------
 # Mock seam construction
@@ -45,8 +46,15 @@ proc mockSeams(ms: MockState): CacheSeams =
   )
 
 proc cachedPass(durationMs: int64): CachedResult =
-  CachedResult(outcome: oPassed, exitCode: 0, durationMs: durationMs,
-               records: @[], cachedAt: 1_700_000_000'i64)
+  CachedResult(
+    run: ptypes.ProcessResult(
+      exit:  ptypes.Exit(kind: ptypes.ekExited, code: 0),
+      cause: ptypes.Cause(by: ptypes.cbProcess),
+      evidence: default(ptypes.Evidence),
+      rusage: none(ptypes.Rusage),
+      durationUs: durationMs * 1000,
+    ),
+    records: @[], cachedAt: 1_700_000_000'i64)
 
 proc plannedFresh(path: string): PlannedEntrypoint =
   ## An edRunFresh planned entrypoint (binary fresh; eligible for cache).

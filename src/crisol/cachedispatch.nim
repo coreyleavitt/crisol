@@ -27,10 +27,11 @@
 
 import std/[options, os, tables]
 import crisol/[types, keys, resultcache, sandbox, depgraph, planner]
-# rfc-0007 A1c: synthesize() dual-writes a minimal §2 Phase pair from the
-# CachedResult fields it already has, so deriveOutcome (which every consumer
-# now calls instead of trusting the stored `outcome` field) reads correctly
-# for a cache hit too — see synthesize's comment below.
+# rfc-0007 A1d-ii: synthesize() replays the REAL stored `run` ProcessResult as
+# a `Phase(kind: pkCached, ...)` node -- deriveOutcome (which every consumer
+# calls instead of trusting a stored `outcome` field) is recomputed over it
+# at THIS boundary (lookupAtPlan), never trusted from storage -- see
+# synthesize's and lookupAtPlan's comments below.
 from crisol/process/types as ptypes import nil
 
 # ---------------------------------------------------------------------------
@@ -191,46 +192,44 @@ type
 proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
                 inputHash: string): EntrypointResult =
   ## Build an EntrypointResult from a CachedResult.  Carries the HISTORICAL
-  ## duration (cr.durationMs) and records; marks it cached with cacheDecision
-  ## cdmHit.  `compileSkipped` is true (edCached skips both compile and run).
-  ## `inputHash` is the soundnessKey string the hit was keyed on (A8).
+  ## duration (derived from cr.run.durationUs) and records; marks it cached
+  ## with cacheDecision cdmHit.  `compileSkipped` is true (edCached skips both
+  ## compile and run).  `inputHash` is the soundnessKey string the hit was
+  ## keyed on (A8).
   ##
-  ## rfc-0007 A1c: also dual-writes a minimal `run: Phase(kind: pkCached, …)`
-  ## so deriveOutcome — which every consumer now calls instead of trusting
-  ## the stored `outcome` field — reads this result correctly. This is NOT
-  ## A1d-ii's real cache-replay (the cache does not store Exit/Cause/Evidence
-  ## yet); it is an honest replay of the two fields we DO have:
-  ##   - Exit(ekExited, cr.exitCode): a real historical observation, not
-  ##     fabricated (CachedResult stores it).
-  ##   - Cause(cbProcess): true by construction — shouldStore only ever
-  ##     caches an `oPassed` result, which can only arise from a cause-less,
-  ##     self-terminated process (§2's derivation never reaches oPassed
-  ##     through cbRunner/cbLimit/cbExternal).
-  ## Evidence/rusage are NOT observed here (the cache doesn't carry them) and
-  ## stay at their honest weakest-claim defaults — same house rule as every
-  ## other interim-population corner in this RFC (§2). `compile` stays
-  ## pkSkipped: edCached genuinely never compiles.
+  ## rfc-0007 A1d-ii: `run` replays the REAL stored observation verbatim --
+  ## `Phase(kind: pkCached, res: cr.run)` -- superseding A1c's interim, which
+  ## could only fabricate a minimal Exit/Cause pair (Evidence/rusage stayed at
+  ## their zero-value defaults because the cache did not store them yet).
+  ## `outcome` is recomputed by the CALLER (`lookupAtPlan`) via deriveOutcome
+  ## over this Phase pair, never trusted from storage (§2) -- the legacy
+  ## `outcome` FIELD below is set to `oPassed` as a provable fact, not a
+  ## re-derivation: the only caller that keeps this synthesis (`lookupAtPlan`)
+  ## has ALREADY checked `deriveOutcome(this) == oPassed` before returning it
+  ## as a hit; a recompute-invalidated synthesis is discarded (cdmRecomputeMiss)
+  ## before any caller reads this field. `compile` stays pkSkipped: edCached
+  ## genuinely never compiles.
+  let exitCode = case cr.run.exit.kind
+                 of ptypes.ekExited:   cr.run.exit.code
+                 of ptypes.ekSignaled, ptypes.ekNtStatus: 0
+  let signal = case cr.run.exit.kind
+               of ptypes.ekSignaled: cr.run.exit.sig
+               of ptypes.ekExited, ptypes.ekNtStatus: 0
   result = EntrypointResult(
     ep:             pep.ep,
-    outcome:        cr.outcome,
-    exitCode:       cr.exitCode,
-    signal:         cr.signal,
+    outcome:        oPassed,
+    exitCode:       exitCode,
+    signal:         signal,
     records:        cr.records,
     output:         "",            # cached results carry no captured output
     compileSkipped: true,
-    durationMs:     cr.durationMs, # historical duration (round 1)
+    durationMs:     cr.run.durationUs div 1000, # historical duration
     cached:         true,
     inputHash:      inputHash,     # A8: key the hit was served on
     cacheDecision:  cdmHit,
   )
   result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
-  result.run = ptypes.Phase(kind: ptypes.pkCached, res: ptypes.ProcessResult(
-    exit:       ptypes.Exit(kind: ptypes.ekExited, code: cr.exitCode),
-    cause:      ptypes.Cause(by: ptypes.cbProcess),
-    evidence:   default(ptypes.Evidence),
-    rusage:     none(ptypes.Rusage),
-    durationUs: cr.durationMs * 1000,
-  ))
+  result.run = ptypes.Phase(kind: ptypes.pkCached, res: cr.run)
 
 proc lookupAtPlan*(
   pep:    PlannedEntrypoint;
@@ -245,7 +244,8 @@ proc lookupAtPlan*(
   ## On an eligible entrypoint:
   ##   - policy disabled (--no-cache) OR group cacheable #false
   ##                                      → cdmPolicyDisabled, run live.
-  ##   - cache hit                        → edCached, synthesize, cdmHit.
+  ##   - cache hit, recomputed outcome oPassed → edCached, synthesize, cdmHit.
+  ##   - cache hit, recomputed outcome NOT oPassed → cdmRecomputeMiss, run live.
   ##   - cache miss                       → cdmKeyMiss, run live.
   ##
   ## `--changed` is unaffected: a changed closure ⇒ different closureHash ⇒
@@ -266,12 +266,20 @@ proc lookupAtPlan*(
   let key  = seams.keyOf(pep)
   let kStr = $key
   let hit  = seams.load(key)
-  if hit.isSome:
-    PlanLookup(decision: edCached, cacheDecision: cdmHit, inputHash: kStr,
-               synthesized: some(synthesize(pep, hit.get, kStr)))
-  else:
-    PlanLookup(decision: edRunFresh, cacheDecision: cdmKeyMiss, inputHash: kStr,
-               synthesized: none(EntrypointResult))
+  if hit.isNone:
+    return PlanLookup(decision: edRunFresh, cacheDecision: cdmKeyMiss, inputHash: kStr,
+                      synthesized: none(EntrypointResult))
+
+  # rfc-0007 A1d-ii / §2: recompute the outcome at THIS trust boundary, never
+  # read it from storage.  A hit whose recomputed outcome is not oPassed is
+  # treated as a MISS and rerun — a derivation or policy change must never
+  # serve a stale/invalidated pass from cache forever with no rerun path.
+  let synth = synthesize(pep, hit.get, kStr)
+  if deriveOutcome(synth) != oPassed:
+    return PlanLookup(decision: edRunFresh, cacheDecision: cdmRecomputeMiss,
+                      inputHash: kStr, synthesized: none(EntrypointResult))
+  PlanLookup(decision: edCached, cacheDecision: cdmHit, inputHash: kStr,
+             synthesized: some(synth))
 
 # ---------------------------------------------------------------------------
 # Store gate — decide whether a freshly-run result should be cached
@@ -319,14 +327,17 @@ proc shouldStore*(
   StoreVerdict(store: true, decision: cdmKeyMiss)
 
 proc toCachedResult*(res: EntrypointResult; cachedAt: int64): CachedResult =
-  ## Project a live EntrypointResult into the on-disk CachedResult shape.
+  ## Project a live EntrypointResult into the on-disk CachedResult shape
+  ## (rfc-0007 A1d-ii): the REAL run-phase ProcessResult, not a derived
+  ## outcome/exitCode/signal projection.  Callers (the runner's store gate)
+  ## only ever reach this for a freshly-RUN result — never a cache hit — so
+  ## `res.run.kind` is `pkRan` here; asserted rather than silently defaulted.
+  doAssert res.run.kind == ptypes.pkRan,
+    "toCachedResult: expected a live run phase (pkRan), got " & $res.run.kind
   CachedResult(
-    outcome:    res.outcome,
-    exitCode:   res.exitCode,
-    signal:     res.signal,
-    durationMs: res.durationMs,
-    records:    res.records,
-    cachedAt:   cachedAt,
+    run:             res.run.res,
+    records:         res.records,
+    cachedAt:        cachedAt,
     payloadChecksum: "",   # filled by storeCached
   )
 

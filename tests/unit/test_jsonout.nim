@@ -441,6 +441,7 @@ suite "jsonout A8 — cache reporting fields":
   test "cacheDecisionString maps every enum value to a stable distinct string":
     ## M8 rev 6: cdmStored and cdmGroupOptOut added.
     ## R9: cdmClosureUnrecorded added; all 9 variants covered.
+    ## rfc-0007 A1d-ii (rev 17): cdmRecomputeMiss added; 10 variants covered.
     check cacheDecisionString(cdmNotEligible)       == "notEligible"
     check cacheDecisionString(cdmHit)               == "hit"
     check cacheDecisionString(cdmStored)            == "stored"
@@ -450,6 +451,7 @@ suite "jsonout A8 — cache reporting fields":
     check cacheDecisionString(cdmPolicyDisabled)    == "policyDisabled"
     check cacheDecisionString(cdmFlaky)             == "flaky"
     check cacheDecisionString(cdmClosureUnrecorded) == "closureUnrecorded"
+    check cacheDecisionString(cdmRecomputeMiss)     == "recomputeMiss"
 
   test "default-constructed result reports notEligible cacheDecision":
     let node = toJson(syntheticResults(), syntheticSummary())
@@ -1419,8 +1421,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 16 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover)":
-    check RunSchemaRevision == 16
+  test "RunSchemaRevision is 17 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\")":
+    check RunSchemaRevision == 17
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default

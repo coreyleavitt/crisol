@@ -368,6 +368,12 @@ type
                            ## closure could not be recorded (see depgraph.recordClosure)
                            ## — the key would carry an empty closureContentHash and
                            ## could never be looked up
+    cdmRecomputeMiss      ## rfc-0007 A1d-ii / §2: a cache entry EXISTED, but its
+                           ## recomputed outcome (deriveOutcome, recomputed at the
+                           ## trust boundary, never trusted from storage) is not
+                           ## oPassed — e.g. a derivation/policy change since the
+                           ## entry was stored.  Treated as a MISS and rerun; distinct
+                           ## from cdmKeyMiss (no entry was found at all).
 
   PlannedEntrypoint* = object
     ## A single entrypoint annotated with its compile decision and reason.

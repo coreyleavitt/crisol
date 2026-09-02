@@ -25,15 +25,28 @@ proc freshPep(dec: EntrypointDecision; path = "tests/unit/test_x.nim"): PlannedE
     edecision: dec,
   )
 
+proc sampleProcessResult(exitCode: int = 0): ProcessResult =
+  ## A real, non-default observation (rfc-0007 A1d-ii) -- distinct from the
+  ## fabricated-shim's constant Cause/default(Evidence)/none(Rusage) so a
+  ## coherence check that happened to pass under the OLD interim synthesize
+  ## cannot coincidentally pass here too.
+  ProcessResult(
+    exit:  Exit(kind: ekExited, code: exitCode),
+    cause: Cause(by: cbProcess),
+    evidence: Evidence(killDomain: kdsProcessGroup, tree: toComplete,
+                       escapees: @[], limits: default(LimitsAchieved),
+                       hermetic: hlIsolated, killSnapshot: @[],
+                       cooperativeUnavailable: false),
+    rusage: some(Rusage(maxRssBytes: 2_048_000, userCpuUs: 900, sysCpuUs: 100)),
+    durationUs: 4242 * 1000,
+  )
+
 proc sampleCached(): CachedResult =
   CachedResult(
-    outcome:    oPassed,
-    exitCode:   0,
-    signal:     0,
-    durationMs: 4242,
-    records:    @[TestRecord(name: "t1", status: rsPass, durationUs: 10,
-                             msg: none(string), tags: @[])],
-    cachedAt:   1_700_000_000'i64,
+    run:      sampleProcessResult(),
+    records:  @[TestRecord(name: "t1", status: rsPass, durationUs: 10,
+                           msg: none(string), tags: @[])],
+    cachedAt: 1_700_000_000'i64,
   )
 
 # A seam bundle whose load always hits / always misses, recording calls.
@@ -101,6 +114,19 @@ suite "lookupAtPlan — promotion + decision":
     check s.run.kind == pkCached
     check s.compile.kind == pkSkipped
 
+  test "rfc-0007 A1d-ii: the replayed run phase is the REAL stored observation, verbatim":
+    ## Unit-level complement to the integration hit-path E2E: cause, evidence,
+    ## and rusage are the exact stored values, not the A1c interim's constant
+    ## Cause(cbProcess)/default(Evidence)/none(Rusage) fabrication.
+    var c: Calls
+    let cr = sampleCached()
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c, cr))
+    let s = look.synthesized.get
+    check s.run.res == cr.run                 # byte-for-byte: the WHOLE stored ProcessResult
+    check s.run.res.evidence.tree == toComplete    # not the toUnobservable default
+    check s.run.res.rusage.isSome                   # not none() (the old shim's fabrication)
+    check s.run.res.rusage.get.maxRssBytes == 2_048_000
+
   test "edRunFresh miss → edRunFresh, cdmKeyMiss, no synthesis":
     var c: Calls
     let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsMiss(c))
@@ -153,6 +179,25 @@ suite "lookupAtPlan — promotion + decision":
     check look.cacheDecision == cdmPolicyDisabled
     check look.synthesized.isNone
     check c.loadCalls == 0
+
+  test "rfc-0007 A1d-ii / §2: recomputed-not-oPassed hit is a MISS, rerun (cdmRecomputeMiss)":
+    ## Store a pass, then simulate the stored observation having been
+    ## corrupted/replaced with one that no longer derives oPassed (e.g. a
+    ## derivation/policy change since the entry was written -- §2's honest
+    ## trap-closer: a cache entry existing is NOT enough; deriveOutcome is
+    ## recomputed at the trust boundary EVERY time, and a hit that no longer
+    ## earns oPassed must be treated exactly like a miss and rerun live.
+    var c: Calls
+    var badCr = sampleCached()
+    badCr.run.exit = Exit(kind: ekExited, code: 1)   # now derives oFailed, not oPassed
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c, badCr))
+    check look.decision == edRunFresh          # treated as a miss: run it live
+    check look.cacheDecision == cdmRecomputeMiss
+    check look.synthesized.isNone              # a discarded hit is never served
+    check look.inputHash.len > 0               # the cache WAS consulted (A8)
+    check c.loadCalls == 1                     # the entry was found; its
+                                                # recomputed outcome (not oPassed)
+                                                # disqualified it as a hit.
 
 # ---------------------------------------------------------------------------
 # shouldStore gate

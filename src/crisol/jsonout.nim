@@ -244,7 +244,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 16
+const RunSchemaRevision* = 17
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -355,6 +355,16 @@ const RunSchemaRevision* = 16
   ##                     per-entrypoint phase node); NO `substrate` key until
   ##                     A7.  See the field-mapping table above for the full,
   ##                     per-field disposition.
+  ##   rev 17 (rfc-0007 A1d-ii) — cacheDecision vocabulary gains
+  ##                     "recomputeMiss": a cache entry EXISTED, but its
+  ##                     recomputed outcome (deriveOutcome, recomputed at the
+  ##                     trust boundary) is not oPassed — treated as a miss
+  ##                     and rerun (§2); distinct from "keyMiss" (no entry
+  ##                     found at all).  Also: cache hits now replay the REAL
+  ##                     stored `run` Phase node (cause/evidence/rusage
+  ##                     byte-equal to what was originally observed), not the
+  ##                     A1c interim's minimal Exit/Cause-only fabrication —
+  ##                     no new field, an existing field's CONTENT changes.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -390,6 +400,11 @@ proc cacheDecisionString*(d: CacheDecision): string =
   ##   "policyDisabled"    — invocation --no-cache flag only (not config cacheable #false).
   ##   "closureUnrecorded" — fresh run; store refused because the entrypoint's
   ##                        source closure could not be recorded.
+  ## rfc-0007 A1d-ii (rev 17):
+  ##   "recomputeMiss"     — cdmRecomputeMiss: a cache entry EXISTED but its
+  ##                        recomputed outcome is not oPassed; treated as a
+  ##                        miss and rerun (§2) — distinct from "keyMiss"
+  ##                        (no entry was found at all).
   case d
   of cdmNotEligible:       "notEligible"
   of cdmHit:               "hit"
@@ -400,6 +415,7 @@ proc cacheDecisionString*(d: CacheDecision): string =
   of cdmPolicyDisabled:    "policyDisabled"
   of cdmFlaky:             "flaky"
   of cdmClosureUnrecorded: "closureUnrecorded"
+  of cdmRecomputeMiss:     "recomputeMiss"
 
 # ---------------------------------------------------------------------------
 # phaseToJson -- the ONE place a Phase (compile OR run) becomes a wire node

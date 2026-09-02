@@ -21,15 +21,22 @@
 ##
 ## ## File format
 ##
+## rfc-0007 A1d-ii: the payload carries the REAL stored observation — the
+## run-phase `ProcessResult` exactly as `process/resultjson` (the ONE wire
+## owner) would serialize it — not a derived outcome/exitCode/signal
+## projection.  `outcome` is deliberately ABSENT: the cache stores the
+## observation and never the verdict (§2); a hit's outcome is recomputed via
+## `deriveOutcome` at the trust boundary (`cachedispatch.lookupAtPlan`),
+## never read from disk.
+##
 ## ```json
 ## {
 ##   "header":  { "formatVersion": <int> },
 ##   "payloadChecksum": "<16 hex chars>",   -- FNV-1a over the serialized payload
 ##   "payload": {
-##     "outcome":    "<enum name>",
-##     "exitCode":   <int>,
-##     "signal":     <int>,
-##     "durationMs": <int64>,
+##     "run":        { "exit": {...}, "cause": {...}, "evidence": {...},
+##                     "rusage": {...} | null, "durationUs": <int64> },
+##                   -- process/resultjson.toJson's shape, verbatim
 ##     "cachedAt":   <int64>,
 ##     "records":    [ { "name", "status", "durationUs", "msg"?, "tags" }, ... ]
 ##   }
@@ -43,6 +50,10 @@
 ##   `DepGraphFormatVersion` already works.
 ## - **Checksum mismatch**: the `payloadChecksum` does not match an FNV-1a fold
 ##   over the (canonically re-serialized) payload — the file was torn or tampered.
+## - **Structural failure in the stored observation** (rfc-0007 A1d-ii): `run`
+##   fails `resultjson.fromJson` — a missing key, a wrong JSON kind, or an
+##   enum string that does not inhabit the Nim enum.  Same strict own-reader
+##   posture as `process/resultjson` itself (§2): never a default-valued lie.
 ##
 ## ## Atomic writes
 ##
@@ -65,17 +76,26 @@ import std/[algorithm, json, options, os, strutils]
 import crisol/types
 import crisol/depgraph   # re-uses fnv1a64, toHex16; never reimplement the hash
 import crisol/ioutils    # atomicPutFile: shared O_EXCL-tmp + writeAllFd + rename(2)
+import crisol/process/types as ptypes
+import crisol/process/resultjson  # the ONE ProcessResult<->JSON owner (§2)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-const resultCacheFormatVersion* = 1
+const resultCacheFormatVersion* = 2
   ## Increment when the cache JSON schema changes incompatibly.  A loaded file
   ## with a different formatVersion is treated as a MISS (discard-on-mismatch).
   ## Note: the version is part of the on-disk *path* (`cache/v<fmt>/`) AND the
   ## file header — the path partitions by version so old and new entries never
   ## share a directory, and the header is the authoritative deserialize check.
+  ##
+  ## rfc-0007 A1d-ii: bumped 1 -> 2.  The payload shape changed from a derived
+  ## {outcome,exitCode,signal,durationMs} projection to the REAL stored `run`
+  ## ProcessResult (process/resultjson's wire shape).  A pre-bump (v1) entry
+  ## lives under a different directory (`cache/v1/`) and its header
+  ## formatVersion (1) mismatches this binary's constant regardless — a v1
+  ## entry is a MISS here, never a fabricated read of the old shape.
 
 const DefaultMaxCacheEntries* = 10_000
   ## Interim soft cap on distinct cache entries (RFC-0004 F1, round 2).
@@ -86,13 +106,19 @@ const DefaultMaxCacheEntries* = 10_000
 
 type
   CachedResult* = object
-    ## A cached test-execution outcome, addressed by `SoundnessKey`.
+    ## A cached test-execution observation, addressed by `SoundnessKey`.
     ## `payloadChecksum` is computed on store and verified on load — a caller
     ## constructs the record with it empty; `storeCached` fills it.
-    outcome*:         Outcome
-    exitCode*:        int
-    signal*:          int
-    durationMs*:      int64
+    ##
+    ## rfc-0007 A1d-ii: `run` is the REAL run-phase `ProcessResult` — the
+    ## observation, not the verdict.  There is deliberately NO `outcome`
+    ## field here: the cache always stores the observation and NEVER the
+    ## derived verdict (§2) — `deriveOutcome` is recomputed over it at every
+    ## replay, at the trust boundary (`cachedispatch.lookupAtPlan`), never
+    ## trusted from storage.  `exitCode`/`signal`/`durationMs` are subsumed by
+    ## `run.exit`/`run.durationUs` — asking this type to carry both would be
+    ## two sources of truth for the same fact.
+    run*:             ptypes.ProcessResult
     records*:         seq[TestRecord]
     cachedAt*:        int64    ## unix epoch seconds at store time
     payloadChecksum*: string   ## FNV-1a (16 hex) over the serialized payload
@@ -152,10 +178,8 @@ proc payloadToJson(res: CachedResult): JsonNode =
     recsArr.add recNode
 
   result = newJObject()
-  result["outcome"]    = newJString($res.outcome)
-  result["exitCode"]   = newJInt(res.exitCode)
-  result["signal"]     = newJInt(res.signal)
-  result["durationMs"] = newJInt(res.durationMs)
+  # rfc-0007 A1d-ii: the REAL observation, via resultjson (the one wire owner).
+  result["run"]        = resultjson.toJson(res.run)
   result["cachedAt"]   = newJInt(res.cachedAt)
   result["records"]    = recsArr
 
@@ -166,31 +190,22 @@ proc parseStatus(s: string): Option[RecordStatus] =
   of "rsSkip": some(rsSkip)
   else:        none(RecordStatus)
 
-proc parseOutcome(s: string): Option[Outcome] =
-  case s
-  of "oPassed":        some(oPassed)
-  of "oFailed":        some(oFailed)
-  of "oCompileFailed": some(oCompileFailed)
-  of "oTimeout":       some(oTimeout)
-  of "oSignal":        some(oSignal)
-  of "oSpawnError":    some(oSpawnError)
-  else:                none(Outcome)
-
 proc payloadFromJson(node: JsonNode): Option[CachedResult] =
   ## Parse a payload node into a CachedResult.  Returns none on any structural
   ## problem (treated as a MISS by the caller) — never raises on bad data.
+  ##
+  ## rfc-0007 A1d-ii: `run` is parsed through `resultjson.fromJson` — crisol's
+  ## OWN reader (§2).  A structural problem in the stored observation (a
+  ## missing key, a wrong JSON kind, an enum string that does not inhabit the
+  ## Nim enum — e.g. a future crisol version's new Outcome-adjacent wire
+  ## value) is a MISS here too, never a default-valued lie.
   if node == nil or node.kind != JObject: return
-  let outcomeNode = node{"outcome"}
-  if outcomeNode == nil or outcomeNode.kind != JString: return
-  let outcome = parseOutcome(outcomeNode.getStr(""))
-  if outcome.isNone: return
+  let run = resultjson.fromJson(node{"run"})
+  if run.isNone: return
 
   var res = CachedResult(
-    outcome:    outcome.get,
-    exitCode:   node{"exitCode"}.getInt(0),
-    signal:     node{"signal"}.getInt(0),
-    durationMs: node{"durationMs"}.getBiggestInt(0),
-    cachedAt:   node{"cachedAt"}.getBiggestInt(0),
+    run:      run.get,
+    cachedAt: node{"cachedAt"}.getBiggestInt(0),
   )
 
   let recsNode = node{"records"}
@@ -231,7 +246,9 @@ proc loadCached*(stateDir: string; key: SoundnessKey): Option[CachedResult] =
   ##   - the file is unreadable or malformed JSON;
   ##   - the header `formatVersion` differs from `resultCacheFormatVersion`;
   ##   - the `payloadChecksum` does not match the re-serialized payload
-  ##     (torn or tampered file).
+  ##     (torn or tampered file);
+  ##   - the stored `run` observation fails `resultjson.fromJson` (rfc-0007
+  ##     A1d-ii's own-reader posture, §2).
   ##
   ## On a hit, returns `some(CachedResult)` with `payloadChecksum` populated.
   let path = keyFilePath(stateDir, key)

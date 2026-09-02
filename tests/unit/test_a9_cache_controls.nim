@@ -26,6 +26,7 @@
 
 import std/[options, os, tempfiles, unittest]
 import crisol/[types, config, cachedispatch, resultcache, sandbox, planner, depgraph]
+import crisol/process/types as ptypes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,10 +43,13 @@ proc freshPep(dec: EntrypointDecision;
 
 proc sampleCached(): CachedResult =
   CachedResult(
-    outcome:    oPassed,
-    exitCode:   0,
-    signal:     0,
-    durationMs: 1234,
+    run: ptypes.ProcessResult(
+      exit:  ptypes.Exit(kind: ptypes.ekExited, code: 0),
+      cause: ptypes.Cause(by: ptypes.cbProcess),
+      evidence: default(ptypes.Evidence),
+      rusage: none(ptypes.Rusage),
+      durationUs: 1234 * 1000,
+    ),
     records:    @[],
     cachedAt:   1_700_000_000'i64,
   )
