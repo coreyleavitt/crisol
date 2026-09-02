@@ -1,371 +1,593 @@
 # RFC-0005 — Distributed result cache, cryptographic trust & cache observability
 
-**Status:** Draft (stage 2 — architect round 1 applied; **one open fork awaiting Corey: crypto-dependency strategy** — see §Open forks)
-**Depends on:** RFC-0004 (incremental hermetic execution — the `ExecutionCache`, `SoundnessKey`, `CacheSeams`/`cachedispatch` seam, `RunLedger`, and the `isFullyAchieved && attempt-1` publish gate this RFC extends)
+**Status:** Draft (stage 2 — architect rounds 1, 2 & **3** applied 2026-08-21; FORK-1 (crypto deps) resolved — see §Dependency decision; **FORK-2 (cold-host consult) OPEN — see §FORK-2**; everything else is ready for `/tdd`)
+**Depends on:** RFC-0004 (incremental hermetic execution — the `ExecutionCache`, `SoundnessKey`, `CacheSeams`/`cachedispatch` seam, `RunLedger`, and the `isFullyAchieved && attempt-1` publish gate this RFC extends); RFC-0006 (persistent per-entrypoint nimcache at `<stateDir>/cache/<slug>-<toolchainFp>/` — a *sibling* of the result cache under the same root; see §Local-fs root)
 **Scope owner:** Corey
 
 ## Summary
 
-RFC-0004 made crisol an *incremental* engine: a test's outcome is content-addressed by a `SoundnessKey` and served from a local on-disk `ExecutionCache` when its inputs are provably unchanged. That cache is **single-host and single-tenant** — it never crosses the machine that produced it. The dominant remaining cost is the *cold* host: every CI runner, every fresh clone, every teammate re-runs work some *other* host already proved. The same `SoundnessKey` that makes the local cache sound makes it **portable** — equal key ⇒ equal result, on any host with the same toolchain (RFC-0004 already folds `nimVersion`/`ccVersion`/libc into the key precisely so cross-host reuse is sound by construction, not by luck).
+RFC-0004 made crisol an *incremental* engine: a test's outcome is content-addressed by a `SoundnessKey` and served from a local on-disk `ExecutionCache` when its inputs are provably unchanged. That cache is **single-host and single-tenant** — it never crosses the machine that produced it. The same `SoundnessKey` that makes the local cache sound makes it **portable**: equal key ⇒ equal result on any host with the same toolchain *binaries* and the same allowlisted environment values (RFC-0004 folds `nimVersion`/`ccVersion`/libc into the key, and — since commit `17c12e8` — `nimVersion` is the full `nim --version` text plus a content hash of the nim binary, so cross-host reuse is sound by construction, not by luck).
 
 This RFC spends that portability. It does three things, in the architectural class of Bazel Remote Execution's *cache-only* tier, `sccache`, `cargo`'s emerging registry cache, and Nix's binary caches:
 
-1. **Distributed result cache** — a **ports-and-adapters** `CacheBackend` boundary, a multi-tier `TieredCache` (L1 local → L2 shared → L3 …) with populate-on-hit backfill, and shippable `local-fs` / `http` / `s3` adapters behind a registry. The runner blocks on **none** of it: a remote miss, timeout, or offline backend is *exactly* a local miss — the run proceeds.
+1. **Distributed result cache** — a **ports-and-adapters** `CacheBackend` boundary, a multi-tier `TieredCache` (L1 local → L2 shared → L3 …) with backfill-on-hit, and shippable `local-fs` / `http` / `s3` adapters behind a registry. The runner blocks on **none** of it: a remote miss, timeout, or offline backend is *exactly* a local miss — the run proceeds. **Honest scope (round 3):** what a remote tier removes is *execution*. The `SoundnessKey` needs the closure content hash, which crisol learns from the nimcache *after* `nim c`; so a host with no warm `<stateDir>/bin` + depgraph still pays the compile, and today it never consults the cache at all (§FORK-2 decides whether 0005 adds the post-compile consult that makes the cold-host case real). Hosts whose binary + depgraph are warm (persistent runners, CI with a restored `<stateDir>`) skip both.
 2. **Cryptographic trust** — a `TrustPolicy` port (`none` / HMAC / **ed25519 signed attestation**), verify-on-read and sign-on-publish, so a shared cache served by infrastructure crisol does not control cannot inject a forged "this test passed" result. (REFERENCE.md category 3: *remote but owned* — the boundary is a port; the wire is attested.)
-3. **Cache observability** — `explainMiss` (which of the 9 key components changed, so a surprise miss is *legible*), hit-rate telemetry (a `TelemetrySink` port + summary line + `run/v1` field), and `--verify-cache` (a **post-run** re-execution sample that catches nondeterminism the hermeticity gate structurally cannot).
+3. **Cache observability** — `explainMiss` (which of the 9 key components changed — *and which env var*, so a surprise miss is *legible*), hit-rate telemetry (a `TelemetrySink` port + summary line + `run/v1` field), and `--verify-cache` (a **post-run** re-execution sample that catches nondeterminism the hermeticity gate structurally cannot). **Observability lands first** (§Stages): it is port-independent and is the earliest *realized* value for a single-host loop.
 
-Everything stays at **entrypoint-binary granularity** and **binary-opaque** identity (MEMORY.md → boundary-granularity-discriminator). This RFC adds *backends, trust, and visibility* to the existing cache; it does **not** add a new content-address key or a new soundness rule, and it does not add any sub-binary control. **`lookupAtPlan` / `shouldStore` / `CacheContext` / `inactiveDecision` keep their existing semantics** — the publish gate (`isFullyAchieved && attempt-1 pass`) still lives in `shouldStore`, *before* the trust layer ever sees a write. (`LoadProc`'s adapter and `CacheDecision` grow additively — see §Wiring; this is round-1's correction to an over-strong "byte-for-byte unchanged" claim.) Distributed *execution* (remote workers) remains a Non-Goal; `--shard` is still the only distribution primitive for *running*.
+Everything stays at **entrypoint-binary granularity** and **binary-opaque** identity (MEMORY.md → boundary-granularity-discriminator). This RFC adds *backends, trust, and visibility* to the existing cache; it does **not** add a new content-address key or a new soundness rule, and it does not add any sub-binary control. **`lookupAtPlan`'s decision logic / `shouldStore` / `CacheContext` / `inactiveDecision` keep their semantics**; the publish gate (`isFullyAchieved && attempt-1 pass`) still lives in `shouldStore`, *before* the trust layer ever sees a write. What does change at the seam (round 3, honestly): `CacheSeams`'s three closures are **re-shaped** so the seam derives *inputs* and returns *provenance* (`KeyDerivation` / `CacheLookup` — §Wiring), and `EntrypointResult` gains `cacheTier` + `cacheLookup` (no new `CacheDecision` variant — round 3 found `cdmTrustFail` cannot survive the live-result stamp). Distributed *execution* (remote workers) remains a Non-Goal; `--shard` is still the only distribution primitive for *running*.
 
 ## Motivation
 
-- **The cold host re-proves the warm host's work.** RFC-0004's cache is keyed by content, so a result computed on host A is *valid* on host B — but B can't see A's `<stateDir>/cache/`. CI runners are the acute case: N matrix shards, each cold, each re-running the full unchanged suite. A shared L2 turns "first runner pays, rest reuse" into the default.
+- **The warm host's work is re-proved elsewhere.** RFC-0004's cache is keyed by content, so a result computed on host A is *valid* on host B — but B can't see A's `<stateDir>/cache/`. CI runners are the acute case: N matrix shards, each re-running the full unchanged suite. A shared L2 turns "first runner pays, rest reuse" into the default — for the *run* phase unconditionally, and for the compile phase wherever `<stateDir>/bin` + depgraph are warm (§Summary, §FORK-2).
 - **A shared cache is an attack surface the local cache never was.** The moment a result crosses a trust boundary (a teammate's upload, an S3 bucket, a CI artifact store), "this entrypoint passed" becomes a claim crisol must *verify*, not assume. A forged pass is a silent test-suite bypass. RFC-0004's gate guarantees crisol only *publishes* sound results; it says nothing about whether a result crisol *reads back* was published by crisol under that gate. Trust closes that gap.
-- **The cache is currently a black box when it misses.** A developer who expects a hit and gets a miss has no way to ask *why* — which of `{closureContentHash, flagHash, nimVersion, ccVersion, fixtureHash, argv, rlimitConfig, hermeticEnvHash, protocolMajor}` moved. "Why did my whole suite re-run after a `glibc` bump?" should be a one-flag answer, not a `strace` session.
+- **The cache is currently a black box when it misses.** A developer who expects a hit and gets a miss has no way to ask *why* — which of `{closureContentHash, flagHash, nimVersion, ccVersion, fixtureHash, argv, rlimitConfig, hermeticEnvHash, protocolMajor}` moved, and for the env component *which variable*. "Why did my whole suite re-run after a `glibc` bump?" should be a one-flag answer, not a `strace` session.
 - **The soundness gate is necessary but not sufficient for determinism.** `isFullyAchieved` proves the *environment* was hermetic; it cannot prove the *binary* is deterministic given that environment (RFC-0004 §"Honesty about the limit"). A test that reads `/dev/urandom` and happens to pass on attempt 1 caches a coin-flip. `--verify-cache` is the empirical backstop: re-run a sample, compare, surface divergence.
 - **The unifying observation:** the local cache, the remote cache, and the verifier all want the *same* `(key → entry)` contract. Define that contract as a port once; local-fs, http, s3, and the in-memory test double are all just tenants. The runner's hot path depends on the *port*, never on a backend.
 
 ## The spine (dependency order)
 
 ```
-A  CacheBackend port  ──► B  observability  ──► C  remote + trust
-   (StoredEntry wire,      (explainMiss,          (crypto dep → http/s3
-    TieredCache w/          hit-rate telemetry,    adapters → registry
-    provenance, registry,   --verify-cache)        wiring → TrustPolicy:
-    in-mem + local-fs)                             none/HMAC/ed25519)
+A  CacheBackend port + seam re-shape  ──►  B  observability  ──►  C  trust, then remote
+   (StoredEntry wire + ONE serializer,       (--verify-cache,        (crypto dep → HMAC/ed25519
+    local-fs root, KeyContext/KeyDerivation/   explainMiss + sidecar,  policies (E2E-2 over file://)
+    CacheLookup seam, CacheRuntime)            hit-rate)               → http/s3 adapters → wiring)
 ```
 
-**The load-bearing refactor is A, and it is mostly plumbing.** `realSeams` today closes over `loadCached`/`storeCached` directly (`cachedispatch.nim:336`). Stage A re-expresses that *same* local behavior as a single-tier `TieredCache` over a `local-fs` `CacheBackend` adapter. The observable behavior is identical; only the indirection changes — but the change touches `cachedispatch.nim` (the `realSeams` signature), `api.nim` (the call site), and the **direct `realSeams` callers in `tests/unit/test_cachedispatch.nim` and `tests/unit/test_api.nim`**, which must be updated atomically (see slice A2b). B and C are then additive tiers and policies layered onto a boundary that already exists. Nothing downstream of the seam (`lookupAtPlan`, `shouldStore`, the `execute()` dispatch) changes shape.
+**Build order is value-arrival order, not dependency order (round 3).** Dependencies, honestly: `--verify-cache` (B3) depends on *nothing* in A; `explainMiss` + the sidecar (B1) depend only on the seam re-shape (A2b) — not on tiers or the registry; hit-rate (B2) is a fold over `EntrypointResult.cacheDecision` today and gains per-tier fields when A3 lands. So the slice order is **B3 → A1 → A2a → A2b → B1 → B2 → A3a → A3b → A3c → C**, and observability is usable on a single host before any remote tier exists. (Carving observability into its own RFC was considered and rejected: it reuses this RFC's types and fixture inventory and a separate RFC buys a review cycle for no boundary gain.)
+
+**The load-bearing refactor is A2b, and it is mostly plumbing.** `realSeams` today closes over `loadCached`/`storeCached` directly (`cachedispatch.nim:336`). Stage A re-expresses that *same* local behavior as a single-tier `TieredCache` over a `local-fs` `CacheBackend` adapter, and re-shapes the three seam closures once (§Wiring). The observable behavior is identical; the change touches `cachedispatch.nim`, `api.nim`, and **every `CacheSeams`/`LoadProc` literal in the suite** — `tests/unit/test_cachedispatch.nim` (4 `realSeams` calls at ~214/223/253/262 + 2 `load:` literals at ~49/60), `test_cache_dispatch_boundary.nim:~37`, `test_a9_cache_controls.nim:~63/74/517/529`, `test_m8_cache_decision.nim:~45/58` (grep-verified round 3: `grep -ln "CacheSeams(" tests/unit/`) — updated atomically in A2b via a one-line test helper. Nothing downstream of the seam (`lookupAtPlan`'s decision logic, `shouldStore`, the `execute()` dispatch) changes shape.
 
 **Soundness coupling (unchanged, restated):** the `SoundnessKey` remains the **sole content address**. A backend is a *transport* for `(key, CachedResult)`; it never participates in key derivation, never relaxes the gate. Only an entry that passed `shouldStore` (`isFullyAchieved && attempt-1`) is ever handed to a backend's `put`. Trust verification happens *on read*, after transport, before the entry is allowed to satisfy a lookup — a backend that returns a tampered or unsigned entry on a trust-requiring tier yields a **miss**, never a served result.
 
+## Key portability — what is and is not in the key (round 3, load-bearing)
+
+Everything in `KeyInputs` is host-independent **except the allowlisted environment values**. Verified against HEAD: the argv component is the machine-independent surrogate `<slug>/<binName>` (`cachedispatch.nim:395-403`); closure paths are project-relative (`closure.nim:36-39`); `nimVersion` is `nim --version` text + nim-binary hash (`nimprobe.nim`); `ccVersion` is the cc/ldd fingerprint; no stateDir/projectRoot/cwd enters the key. **But** `hermeticEnvHash` hashes *name=value* of every allowlisted variable that reaches the child (`sandbox.nim:271-306`), and the default allowlist is `HOME LANG LOGNAME NIM_CONFIG_DIR NIMBLE_DIR PATH TERM TMPDIR TZ USER` + `LC_*` (`sandbox.nim:19-38`; TMPDIR is name-only). RFC-0004 chose names+values deliberately (an allowlisted var is one tests may depend on ⇒ its value is a real input; "cross-host reuse is achieved by pinning the env, not by omitting values" — `sandbox.nim:260-262`). Consequences, stated plainly:
+
+- **Same-image CI runners match** (identical `HOME`/`PATH`/`USER`/…). **A laptop and a CI runner, or two differently-provisioned runners, never match** until their allowlisted values agree. Under `--hermetic none` the *entire* env is hashed, so even same-host hits are luck.
+- RFC-0004's "configurable passthroughs" never shipped as a KDL/CLI knob (`resolveSandbox` is called with no passthroughs — `api.nim:606-607`), and nothing in 0005 as of round 2 produced env parity. **Slice A0 ships the producer:** `env-pin` (repeatable KDL `env-pin "NAME" "VALUE"` + `--env-pin NAME=VALUE` + `RunOptions.envPins`) — the pinned value is injected into the child env in `filterEnv`'s tail *and* hashed as the pinned value, so pinned variables are key-stable across hosts. **Defaults are unchanged in 0005** (pinning `HOME`/`PATH`/`USER` by default is a hermeticity tightening that could break consumers that exec host tools or read `$USER`; promote defaults in a follow-on once amoxtli data is in). The operator guide tells a team exactly which variables to pin for cross-host hits, and `--explain-miss` names the offending variable (§Stage B).
+- `dep-roots` closure entries are stored as absolute paths (`closure.nim:73-83` fallback, `depgraph.nim:130` folds the path string) — projects using `dep-roots` at different absolute locations never share keys. Documented in the operator guide; fixing it (hash as `<depRootIdx>/<relative>`) is a follow-on.
+- A0 adds the invariance test: `keyOf` is invariant under {stateDir, projectRoot, cwd, TMPDIR value, pinned vars} and varies only on unpinned allowlisted values.
+
 ## The port: `CacheBackend` and `StoredEntry` (read this before Stage A)
 
-The boundary is a **closure-field object**, not a vtable or `method` dispatch — this matches the existing `CacheSeams` idiom exactly (`cachedispatch.nim:102`, three closure fields), stays zero-cost, and keeps adapters as plain data. All declared in a new **`cacheport.nim`** (imports `types` + `resultcache`'s `CachedResult`; sits one import level *below* `cachedispatch`, so `realSeams` composes a backend into the existing seams without any new dependency edge crossing the planner).
+The boundary is a **closure-field object**, not a vtable or `method` dispatch — this matches the existing `CacheSeams` idiom exactly (`cachedispatch.nim:102`, three closure fields), stays zero-cost, and keeps adapters as plain data. Closure fields are declared via `XxxProc` aliases, as every seam in the repo does (`KeyOfProc`, `FileReaderProc`, `RunCcProc`, `BinHashProc`, `IcRunProc`).
+
+**Module layout (round 3 — one concern per module, flat names like `resultcache`/`cachedispatch`/`shardedledger`).** The round-2 plan put ~22 types in one `cacheport.nim`; that would make every importer of the hot path and every engine test pull sello + nimcrypto. Split, with this import DAG (checked against the existing `depgraph → config`, `resultcache → depgraph`, `cachedispatch → planner` edges — no cycles):
+
+| module | owns | imports |
+|---|---|---|
+| `cacheport.nim` | `CacheVerdict` + sets, `Fetched[T]`, `StoredEntry`/`SigAlg`/`Attestation`, `CacheBackend`, `TrustPolicy` type + `nonePolicy`, `TelemetrySink` type + `NilSink`, `canonicalPayload`/`envelopeBytes` | `types`, `keys`, `resultcache` |
+| `cachetier.nim` | `Tier`, `TieredCache`, `TierHit`, `TierVerdict`, `CacheLookup`, `lookup`/`put`, backfill + put rules, circuit breaker | `cacheport` |
+| `cachewire.nim` | the JSON `CacheSerializer` (the ONE on-disk/on-wire format), `HttpRequest`/`HttpReply`/`HttpFetcher` | `cacheport` |
+| `cachememory.nim`, `cachelocalfs.nim`, `cachehttp.nim`, `caches3.nim` | one adapter each | `cacheport`, `cachewire` |
+| `cachetrust.nim` | `hmacPolicy`, `ed25519Policy` — the ONLY module importing sello/nimcrypto | `cacheport` |
+| `cachetelemetry.nim` | `TelemetryEvent` (variant), `InMemorySink`, summary sink, `CacheStats` aggregation | `cacheport`, `cachetier` |
+| `cacheregistry.nim` | `BackendRegistry`, `productionRegistry`/`testRegistry`, `CacheRuntime`, `CacheSecrets`, `localOnlyCache`/`configuredCache` | all of the above; imported by `api` only |
+| `keys.nim` (existing) | `KeyComponent`, `KeyDiff`, `explainMiss` — a pure diff over `KeyInputs`, which `keys.nim` owns | — |
+| `types.nim` (existing) | `CacheConfig`/`RemoteTier`/`TrustConfig` (parsed KDL; `config.nim` must not import the cache modules — `depgraph → config` would cycle) | — |
+
+`cachedispatch` imports `cacheport` + `cachetier`; `runner` is untouched by the port.
 
 ```nim
 type
+  CacheVerdict* = enum     ## get / put / verify share ONE vocabulary; ordered weakest→strongest for aggregation
+    cvOk, cvMiss, cvOffline, cvTimeout, cvVersionSkew, cvCorrupt, cvUnauthorized,
+    cvTrustNoAttestation, cvTrustUnknownAlg, cvTrustUnpinnedSigner, cvTrustSignerMismatch, cvTrustBadSignature
+
+  Fetched*[T] = object     ## a value exists iff cvOk — "hit with an error" is unrepresentable
+    case verdict*: CacheVerdict
+    of cvOk: value*: T
+    else:    discard
+
   StoredEntry* = object
-    key*:             SoundnessKey      ## the content address (sole soundness key — unchanged)
-    keyInputs*:       Option[KeyInputs] ## for explainMiss; adapters MAY omit on the wire (see B1)
-    result*:          CachedResult      ## the RFC-0004 payload, verbatim
-    payloadChecksum*: string            ## FNV over the canonical-serialized result (integrity; see below)
-    formatVersion*:   int               ## StoredEntry WIRE schema (storageFormatVersion); mismatch ⇒ miss
-    attestation*:     Option[Attestation]
+    key*:            SoundnessKey      ## the content address (sole soundness key — unchanged)
+    keyInputs*:      Option[KeyInputs] ## 0005 writers ALWAYS set it (seeds the explain sidecar on backfill); decoders tolerate absence (pre-0005 file)
+    result*:         CachedResult      ## the RFC-0004 payload, verbatim (its own payloadChecksum field is THE checksum — no duplicate here)
+    storageVersion*: int               ## StoredEntry wire schema (storageFormatVersion); mismatch ⇒ cvVersionSkew
+    attestation*:    Option[Attestation]
+
+  SigAlg* = enum           ## string on the wire, enum in memory (mirrors resultcache's parseOutcome/parseStatus)
+    saNone = "none", saHmacSha256 = "hmac-sha256", saEd25519 = "ed25519"
 
   Attestation* = object
-    sigAlg*:    string   ## "none" | "hmac-sha256" | "ed25519"
-    signer*:    string   ## key id / pinned-key fingerprint — SIGNED (binds claimed signer to key; see Trust)
+    sigAlg*:    SigAlg
+    signer*:    string   ## SIGNED. ed25519: base64(pubkey bytes) — the SAME string as the `pinned-key` config entry;
+                         ## HMAC: the operator-chosen `key-id` string. Never a hash/truncation (no collision surface).
     signature*: string   ## raw bytes, base64 on the wire
     signedAt*:  int64    ## unix seconds; informational ONLY — never used in verify, never in the signed bytes
 
-  BackendConfig* = object
-    ## ALL backend-specific config flows through here; a factory captures NOTHING
-    ## from wiring-time context (keeps buildBackend a pure fn of (name, cfg)).
-    url*:      string                 ## e.g. "file://<stateDir>/cache", "s3://bucket/prefix", "https://…"
-    settings*: seq[(string, string)]  ## adapter-specific (region, timeout-ms, …)
-
-  CacheError* = enum                  ## why a get/put returned none/false (for telemetry, NOT control flow)
-    ceNone, ceMiss, ceTimeout, ceOffline, ceCorrupt, ceVersionSkew, ceTrustFail, ceUnauthorized
-
+  BackendGetProc*   = proc(key: SoundnessKey): Fetched[StoredEntry] {.closure.}              ## NEVER raises
+  BackendPutProc*   = proc(entry: StoredEntry): CacheVerdict {.closure.}                      ## best-effort; NEVER raises; cvOk on success
+  BackendProbeProc* = proc(keys: openArray[SoundnessKey]): Fetched[HashSet[SoundnessKey]] {.closure.}
+                                                                                              ## optional bulk-existence (nil ⇒ per-key get)
   CacheBackend* = object
-    name*:   string                                                   ## registry id, telemetry label
-    get*:    proc(key: SoundnessKey): BackendGet {.closure.}          ## NEVER raises
-    put*:    proc(entry: StoredEntry): BackendPut {.closure.}         ## best-effort; NEVER raises
-    list*:   proc(): seq[SoundnessKey] {.closure.}                    ## optional (nil ⇒ GC/prefetch skip)
-    delete*: proc(key: SoundnessKey): bool {.closure.}                ## optional (nil ⇒ GC skips this tier)
+    scheme*: string            ## adapter kind: "file" | "http" | "s3" | "memory" (registry id); NOT the deployer's tier label
+    get*:    BackendGetProc
+    put*:    BackendPutProc
+    probe*:  BackendProbeProc  ## nil-able capability — checked in exactly ONE place (C3c prefetch)
 
-  BackendGet* = object
-    entry*: Option[StoredEntry]
-    err*:   CacheError          ## ceNone on a real hit; ceMiss/ceTimeout/… explain a none
-  BackendPut* = object
-    ok*:    bool
-    err*:   CacheError          ## ceNone on success; explains a false
+const transportVerdicts* = {cvOffline, cvTimeout, cvUnauthorized}
+const integrityVerdicts* = {cvVersionSkew, cvCorrupt}
+const trustVerdicts*     = {cvTrustNoAttestation .. cvTrustBadSignature}
+proc canProbe*(b: CacheBackend): bool {.inline.} = b.probe != nil
 ```
 
-**The total-function contract is the whole point.** `get`/`put` **never raise** and never block the run unboundedly: a miss, a corrupt payload, a checksum/format-version mismatch, a failed trust check, a network timeout, an offline backend, and an unauthorized write are **all** surfaced as `none`/`false` to the *control* path — the runner's hot path cannot tell a remote outage from a cache miss, by design ("run never blocks on remote" falls out of the type). **But the `err` field carries *why*** so the observability layer can distinguish a clean miss from an adapter failure (Breadth F2 — a typo'd S3 URL must not masquerade as a cold cache). Remote adapters wrap their own per-call deadline internally; the L1 local tier is synchronous with no timeout.
+**The total-function contract is the whole point.** `get`/`put` **never raise** and never block the run unboundedly: a miss, a corrupt payload, a version mismatch, a failed trust check, a network timeout, an offline backend, and an unauthorized write are **all** surfaced as a non-`cvOk` verdict to the *control* path — the runner's hot path cannot tell a remote outage from a cache miss, by design ("run never blocks on remote" falls out of the type). **But the verdict carries *why*** so the observability layer can distinguish a clean miss from an adapter failure (a typo'd S3 URL must not masquerade as a cold cache). Remote adapters wrap their own per-call deadline internally (**default 2000 ms**, hardcoded in 0005 — see B0); the L1 local tier is synchronous with no timeout. **`CacheVerdict` is ordered by diagnostic strength** (declaration order, `cvMiss` weakest) — an aggregate over several tiers reports the *strongest* code, and — round 3 — the per-tier verdicts are kept alongside the aggregate (`CacheLookup.verdicts`) so a tier that rejects 100 % of reads is attributable even when a later tier serves the hit.
 
-### Integrity vs. trust — two layers, one canonical hash (round-1 fix)
+**Round-3 removals:** `list`/`delete` are gone from the port — `list(): seq[SoundnessKey]` cannot carry `cachedAt`, so it could not drive `gcResultCache` (LRU-by-`cachedAt`, `resultcache.nim:406-468`); remote eviction is a Non-Goal; the only bulk consumer is the C3c prefetch, which is exactly `probe`. `BackendConfig.settings: Table[string,string]` + `settingGet/settingInt` are gone — the codebase's config layer is typed at parse time with `cfgErr` + unknown-key warnings (`config.nim:149-201`); factories take the typed `RemoteTier` (§Registry). `CacheBackend.name` split into `scheme` (adapter) vs `Tier.name` (deployer label). `StoredEntry.payloadChecksum` dropped (duplicated `CachedResult.payloadChecksum`, `resultcache.nim:98`); `formatVersion` renamed `storageVersion` (collided by name with the payload header's `formatVersion`).
 
-`payloadChecksum` and `Attestation.signature` are **not** redundant — they guard different transport layers (Design F2) — but they MUST agree on *what* they hash, and the verifier MUST recompute, never trust the stored field (Depth F2). The rule, spec-level and non-negotiable:
+### One format, everywhere (round 3 — replaces "local-fs bypasses the serializer / strips attestation")
 
-1. **Canonical payload hash is recomputed on every read.** An adapter that materializes a `StoredEntry` from bytes (http/s3) MUST: deserialize `result`, re-serialize it via the *same* canonical proc the writer used, recompute `FNV(canonical(result))`, and assert it equals `entry.payloadChecksum` — **before** the entry is eligible to be served or trust-verified. Mismatch ⇒ `BackendGet{none, ceCorrupt}`. (The `local-fs` adapter already does exactly this inside `loadCached` — `resultcache.nim:265`; the wire adapters replicate it.)
-2. **The signed envelope binds the recomputed hash, the key, the wire format, and the signer.** The bytes ed25519/HMAC sign are a deterministic serialization of exactly `(key, payloadChecksum, formatVersion, signer)` — where `payloadChecksum` is the value just *recomputed* in step 1, not the field as received. Including `signer` binds the claimed identity to the verifying key, defeating key-confusion (an attacker holding pinned key A cannot mint an entry attributed to signer B). `signedAt` is **never** signed and **never** consulted by `verify` (so clock skew across CI runners can never cause a spurious trust failure — Breadth F3).
+Round 2 had the `local-fs` adapter call `storeCached`/`loadCached` directly and *strip* the attestation for `verify-trust:false` tiers, "so Stage A is format-identical to RFC-0004." Round 3 found that makes E2E-2 impossible: a `file://` L2 with `verify-trust #true` would have nowhere to put an attestation. The rule now:
 
-This makes the two layers compose cleanly: integrity (FNV) catches bit-rot/in-transit corruption on every tier including untrusted local; trust (signature over the *recomputed* FNV) catches forgery on `requireTrust` tiers. A forger who swaps the payload but leaves `payloadChecksum` stale is caught at step 1; one who fixes the checksum too is caught at step 2 (no valid signature over the new hash).
+- **There is exactly one on-disk/on-wire encoding of `StoredEntry`, produced by the JSON `CacheSerializer` in `cachewire.nim`, and every adapter — `local-fs` included — uses it.** The encoding is the RFC-0004 file **plus optional top-level keys** `"keyInputs"`, `"attestation"`, and `"storage": {"version": N}`; `header`/`payloadChecksum`/`payload` are byte-identical to today. `loadCached` reads only those three keys (`resultcache.nim:255-264`), so **a pre-0005 crisol reads a 0005 L1 file unchanged**, `resultCacheFormatVersion` stays 1, and Stage A is behavior-identical — *format-compatible*, not format-identical.
+- `storeCached`/`loadCached` **become** the serializer's file I/O (refactored to take a *root*, §Local-fs root; `payloadToJson`/`payloadFromJson` exported). There is no double encode: the serializer *is* the code path. `canonicalPayload(res) = $payloadToJson(res)` is exported and `loadCached` calls the shared helper, so "one proc, shared by writer, reader, integrity, trust" is literally true.
+- The `memory` double is `Table[SoundnessKey, StoredEntry]` (objects) **and** a `memoryBytes` double (`Table[SoundnessKey, string]` through the serializer) runs the same boundary suite — so the wire shape is exercised in Stage A, before `StoredEntry` freezes, not first in C1.
+
+### Local-fs root (round 3, fresh fact from RFC-0006)
+
+`resultcache.nim` path helpers take a *stateDir* and append `cache/v<resultCacheFormatVersion>/<key>.json` (`:126-130`); RFC-0006 (commit `c17a1ca`) put the persistent nimcaches at `<stateDir>/cache/<slug>-<toolchainFp>/` — **siblings** under the same `<stateDir>/cache/` root, which `clean.nim`'s `pruneDir` already disambiguates via `isResultCacheRootName` (`clean.nim:63-92`). So "L1 = `<stateDir>/cache`" was ambiguous and a `file://<dir>` tier wrapping `loadCached(dir)` would write `<dir>/cache/v1/` (an operator-visible extra level). Rules:
+
+- `resultcache.nim` helpers take a **result-cache root**: `loadCachedAt(root, key)` / `storeCachedAt(root, key, res, maxEntries)` / `gcResultCacheAt(root, …)` store at `<root>/v<N>/<key>.json`; `loadCached(stateDir, …) = loadCachedAt(stateDir / "cache", …)` keeps every existing caller (`clean.nim:219`, `test_resultcache*.nim`, `test_a1c_gc.nim`, `test_c0_clean_stores.nim`) behavior-identical.
+- **L1 is never a URL**: `localOnlyCache(stateDir)` builds `localFsBackend(root = stateDir / "cache", autoCreate = true, maxEntries = <landed max-cache-entries>)`, tier name pinned **`"l1"`** (a configured remote named `l1` is a config error). A configured `file://<dir>` tier has `root = <dir>` ⇒ entries at `<dir>/v<N>/`, `autoCreate = false`, `maxEntries = 0` (the interim 10 000 soft cap is an O(n) `walkDir` per store, `resultcache.nim:281-294` — wrong for a shared NFS tier); a `file://` root inside `<stateDir>` is rejected (it would be pruned by `clean`).
+- **Offline semantics for `file://`:** a missing or non-directory root on a non-`autoCreate` tier ⇒ `cvOffline` on get/put (the offline fixture in the suite is a regular *file* at the URL path — `ENOTDIR`; `chmod` is unusable because `./dev` runs as root in-container). `storeCached`'s per-failure stderr warning (`resultcache.nim:361`) is rate-limited to once per run per tier so a full disk during N backfills does not emit N lines.
+- Sidecars (§Stage B) live in **`<root>/v<N>/inputs/`** — outside `countCacheEntries`'s `*.json` glob and `gcResultCache`'s LRU walk (both non-recursive), so they are neither counted against the cap nor evicted first. The nimcache slug dirs are **not the cache port's business**.
+- NFS note: `atomicPutFile`'s `<pid>.tmp` (`ioutils.nim:109`) can collide across *hosts*; O_EXCL fails closed ⇒ `put` returns `cvUnauthorized`-class false, acceptable. A `file://` L2 on a hung NFS mount has no deadline (local-fs is synchronous by spec) — documented in the operator guide.
+
+### Integrity vs. trust — two layers, two hashes, one canonical payload (round-1 + round-2 fix, round-3 tightened)
+
+`CachedResult.payloadChecksum` and `Attestation.signature` are **not** redundant — they guard different transport layers — and they are *not* the same hash: FNV-1a-64 is a 64-bit non-cryptographic hash, trivially second-preimage-able by an attacker with free-form bytes to play with (`records[].msg` is arbitrary text). The rule, spec-level and non-negotiable:
+
+1. **The canonical payload is `payloadToJson(result)` (`resultcache.nim:136`) — one proc, shared by writer, reader, integrity, and trust.** The serializer's `decode` deserializes `result` via `payloadFromJson`, re-serializes via `payloadToJson`, recomputes `FNV(canonical)` and asserts it equals the stored `payloadChecksum` — **before** the entry is eligible to be served or trust-verified. Mismatch ⇒ `cvCorrupt`. It also checks the embedded `resultCacheFormatVersion` (`loadCached`'s header check, `resultcache.nim:257`) ⇒ mismatch is `cvVersionSkew`; the outer `storageVersion` covers the envelope shape only.
+2. **The signed envelope binds a *cryptographic* hash of the recomputed canonical payload, the key, the storage version, the signer — and a domain-separation tag (round 3).** The bytes ed25519/HMAC sign are exactly
+   ```
+   envelope(key, result, storageVersion, signer) =
+     "crisol-cache-attest-v1" & "\0" & key.string & "\0" & hex(SHA256(canonical(result))) & "\0" & $storageVersion & "\0" & signer
+   ```
+   — NUL-delimited between *every* field (reusing `keys.nim`'s convention and its rule: variable-width fields are ambiguous unless delimited). The constant prefix means a CI ed25519 key reused elsewhere cannot produce a cross-protocol signature that verifies here. The SHA-256 is **recomputed** by both signer and verifier from the canonical payload (never stored, never trusted from the wire), so Stage A stays crypto-free: SHA-256 enters only with the trust policies (C4, via nimcrypto); `envelopeBytes(tag, key, payloadHashHex, storageVersion, signer)` is a pure NUL-joiner that takes the hash as input. Including `signer` binds the claimed identity to the verifying key, defeating key-confusion. `signedAt` is **never** signed and **never** consulted by `verify` (clock skew across CI runners can never cause a spurious trust failure).
+3. **Version coupling (round 3):** the URL/key carries only `storageVersion` and `SoundnessKey` excludes schema by design, so a `resultCacheFormatVersion` bump *without* a `storageVersion` bump would make a mixed fleet thrash one key with mutually-`cvVersionSkew` payloads. Rule: **any `resultCacheFormatVersion` bump MUST bump `storageFormatVersion`**, enforced by a `static: doAssert` in `cachewire.nim` tying the two constants.
+
+A forger who swaps the payload but leaves `payloadChecksum` stale is caught at step 1; one who fixes the checksum too is caught at step 2 (no valid signature over the new hash). **E2E-2 therefore flips a payload byte *and recomputes `payloadChecksum`*** (the test owns the FNV helper) so it exercises step 2; the bare byte-flip is the negative control (`cvCorrupt`, integrity not trust).
+
+**Honest correction to the idempotency argument (round 2).** The canonical payload includes `durationMs`, per-record `durationUs`, and `cachedAt` — wall-clock values that differ across hosts and runs — so "equal key ⇒ equal payload bytes" is **false**; two publishers of the same key mint two *different, equally valid* signed entries. The idempotency claim needs only the weaker, true statement: **equal key ⇒ semantically-equivalent result, and any entry that passes integrity + trust is a sound result for that key — so last-writer-wins among validly-attested entries is sound.** The timing fields are deliberately *kept inside* the signed payload (a signed subset would leave `durationMs`, which feeds `wall-time-saved` and shard balancing, tamperable for no gain).
 
 ### `TieredCache` — the composition, with provenance
 
-The central round-1 redesign (Depth F5 + Design F1 + Breadth F11, all independent): `get` must NOT discard which tier hit and whether trust passed — telemetry, `run/v1` provenance, and the backfill rule all need it. So the engine returns a rich `TierHit`, and the thin `LoadProc` adapter in `realSeams` projects it down to the unchanged `Option[CachedResult]`.
+`lookup` must NOT discard which tier hit, whether trust passed, or what each tier said — telemetry, `run/v1` provenance, the 100 %-error diagnostic, and the backfill rule all need it.
 
 ```nim
 type
-  TierConfig* = object
+  Tier* = object                 ## (was TierConfig — `*Config` means parsed-KDL in this codebase)
+    name*:          string       ## deployer label: "l1" (pinned) | the KDL remote-cache name
     backend*:       CacheBackend
-    backfillOnHit*: bool   ## write to THIS tier when a DOWNSTREAM tier serves the hit (renamed from populateOnHit)
-    verifyTrust*:   bool   ## reject entries READ from this tier that fail TrustPolicy (renamed from requireTrust)
+    backfillOnHit*: bool         ## write to THIS tier when a DOWNSTREAM tier serves the hit
+    verifyTrust*:   bool         ## reject entries READ from this tier that fail TrustPolicy; also: PUT here only attested entries
 
-  TieredCache* = object    ## a PURE lookup engine — no TelemetrySink field (moved to the realSeams adapter)
-    tiers*:  seq[TierConfig]    ## L1 → L2 → L3, searched in order
-    trust*:  TrustPolicy
+  TieredCache* = object          ## a PURE lookup engine — no TelemetrySink field (that lives on CacheRuntime)
+    tiers*:  seq[Tier]           ## L1 → L2 → L3, searched in order
+    trust*:  TrustPolicy         ## ONE policy per cache — shared by every verifyTrust tier
 
   TierHit* = object
-    result*:    CachedResult
-    tierName*:  string   ## which tier served it (for run/v1 provenance + telemetry)
-    tierIndex*: int      ## 0 = L1, 1 = L2, …
-    verified*:  bool     ## true iff the entry PASSED trust verification (NOT merely "the tier didn't require it")
+    result*:   CachedResult
+    tier*:     string            ## which tier served it (run/v1 provenance + telemetry)
+    verified*: bool              ## true iff the entry PASSED trust verification (NOT merely "the tier didn't require it")
 
-proc getWithProvenance*(tc: TieredCache; key: SoundnessKey): tuple[hit: Option[TierHit]; err: CacheError]
-proc put*(tc: TieredCache; entry: StoredEntry): seq[BackendPut]   ## one result per tier (for remoteErrors telemetry)
+  TierVerdict* = tuple[tier: string; verdict: CacheVerdict]
+  CacheLookup* = object
+    hit*:      Option[TierHit]
+    verdicts*: seq[TierVerdict]  ## one per tier CONSULTED, in search order (cvOk for the serving tier)
+  proc worst*(l: CacheLookup): CacheVerdict   ## strongest over verdicts; cvMiss when empty
+
+proc lookup*(tc: var TieredCache; key: SoundnessKey): CacheLookup
+proc put*(tc: var TieredCache; entry: StoredEntry): seq[TierVerdict]   ## one per tier (feeds published / remote-error telemetry)
 ```
 
-- **`getWithProvenance` (waterfall):** search tiers in order. On a tier `get`, if `verifyTrust`, run `tc.trust.verify(entry)`; **fail ⇒ treat as a miss on that tier and continue** (never serve a failed entry, never abort; the tier's `err` becomes `ceTrustFail`). Track the served entry's `verified` bit = *did it actually pass `verify`* (always run `verify` for the bit even on non-`verifyTrust` tiers where the result is advisory). On the first servable hit, **backfill** earlier `backfillOnHit` tiers subject to the rule below. Returns the `TierHit` and an aggregate `err` explaining a total miss (`ceMiss` if every tier was a clean miss; the strongest failure code otherwise, so 100%-`ceUnauthorized`/`ceTimeout` is diagnosable).
-- **`put` (fan-out):** the entry has *already* cleared `shouldStore`'s gate. Sign **once** via `tc.trust.sign` (if the policy signs). The `local-fs` L1 tier (with `verifyTrust:false`) is written via its existing RFC-0004 path which stores only the `CachedResult` — **the attestation is stripped for `verifyTrust:false` tiers** so Stage A is truly format-identical to RFC-0004 and `resultcache.nim`'s on-disk schema is untouched (Depth F8). `verifyTrust:true` tiers receive the full signed `StoredEntry`. Returns per-tier `BackendPut` so telemetry can count remote write failures.
+- **`lookup` (waterfall):** search tiers in order. On a tier `get`, run `tc.trust.verify(entry)`; if the tier has `verifyTrust` and the verdict is in `trustVerdicts`, **treat as a miss on that tier and continue** (never serve a failed entry, never abort; that tier's verdict is the specific trust code). Track the served entry's `verified` bit = *did it actually pass `verify`* (run for the bit even on non-`verifyTrust` tiers, where the verdict is advisory — one local computation over bytes already in hand, no I/O). On the first servable hit, **backfill** earlier `backfillOnHit` tiers subject to the rule below. **`verified` is a meaningful trust signal only when `tc.trust.name != "none"`** — under `nonePolicy` it is trivially `true`; `run/v1`/`--cache-stats` omit it under `nonePolicy`. It travels to `EntrypointResult` as part of `cacheLookup` (§Wiring), not as a separate field.
+- **`put` (fan-out):** the entry has *already* cleared `shouldStore`'s gate. Sign **once** via `tc.trust.sign` (if the policy holds a secret). Then the **put rule (round 3, mirrors backfill):** **write to tier `t` only if `entry.attestation.isSome OR not t.verifyTrust`** — a pinned-keys-only consumer (no signing secret) must never overwrite CI's valid signed object with an unverifiable one (last-writer-wins would otherwise let any read-only consumer DoS the shared cache into 100 % misses); a skipped tier returns `cvUnauthorized` ("no write credential") so `cacheStats.published` stays honest. Every tier receives the full `StoredEntry` in the one format. Returns per-tier verdicts so telemetry can count remote write failures.
+- **One `TrustPolicy` per `TieredCache`, by design (round 2).** A backfilled entry is re-stored *with the attestation it arrived with*; that attestation is valid at the destination only if the destination applies the *same* policy. Per-tier policies would make backfill into a `verifyTrust` tier impossible (can't re-sign without the secret) or rejected-on-read. So trust is **cache-global**: the KDL `cache-trust {}` block is top-level (§Configuration), every configured remote shares it. Per-tier policies are a follow-on.
+- **Per-tier circuit breaker (round 3, B0).** On a tier's first `cvOffline`/`cvTimeout` in a run, the tier is marked dead for the rest of the run: subsequent `get`/`put`/`probe` return `cvOffline` immediately, one stderr line is emitted, and the tier counts in `cacheStats.remoteErrors`. Total dead wall-clock per run per tier ≤ one deadline — "never blocks" holds by construction (deadline + breaker), not by a deferred mechanism. ~10 lines in `cachetier`, memory-testable with a fake clock.
+- **Deferred remote puts (round 3, B0).** Remote `put`s do **not** run inside the poll loop at every live finalize (they would stall dispatch up to one deadline per stored entry on a slow-but-alive remote). The L1 put is synchronous at finalize (as today); entries destined for remote tiers are queued and **flushed at the end-of-run join point** (after the poll loop drains, before `persistLastRun`), under the breaker and a total budget. A crash mid-run loses queued remote puts — acceptable (L1 is already written; the next run re-publishes on its own `cdmStored`s only, so the loss is warmth, never correctness).
 
-**The `verified`-bit backfill rule (Depth F4 + Feasibility F9 — the one real correctness subtlety, now enforceable).** `verifyTrust` is a *tier* predicate; it is NOT an entry's trust level. Backfill must key on the served entry's actual `verified` bit:
+**The `verified`-bit backfill rule — the one real correctness subtlety, enforceable.** `verifyTrust` is a *tier* predicate; it is NOT an entry's trust level. Backfill must key on the served entry's actual `verified` bit:
 
 > **Backfill tier `t` only if `hit.verified OR not t.verifyTrust`.**
 
-i.e. an unverified entry may populate only tiers that don't verify trust; a verified entry may populate any tier. This is three lines and is exhaustively boundary-tested across the 2×2×2 matrix (`source verified ∈ {T,F}` × `destination verifyTrust ∈ {T,F}` × tier ordering). **Because `nonePolicy.verify` always returns true, the security-meaningful cases (an *unverified* entry refused at a `verifyTrust:true` destination) cannot be exercised until a policy that can return `false` exists — so A3 tests the structural rule with an injected controllable mock `TrustPolicy` (two lines, since `TrustPolicy` is a closure-field object), and C4/C5 add the real-policy interaction tests** (Feasibility F9).
+i.e. an unverified entry may populate only tiers that don't verify trust; a verified entry may populate any tier. This is three lines and is exhaustively boundary-tested across the 2×2×2 matrix (`source verified ∈ {T,F}` × `destination verifyTrust ∈ {T,F}` × tier ordering), **plus the put rule's 2×2** (`attested` × `verifyTrust`). **Because `nonePolicy.verify` always returns `cvOk`, the security-meaningful cases cannot be exercised until a policy that can reject exists — so A3a tests the structural rules with an injected controllable mock `TrustPolicy` (two lines, since `TrustPolicy` is a closure-field object), and C4/C5 add the real-policy interaction tests.**
 
 ### `TrustPolicy` — the port
 
 ```nim
 type
+  VerifyProc* = proc(entry: StoredEntry): CacheVerdict {.closure.}   ## on-read; cvOk ⇒ entry may be served; else one of trustVerdicts
+  SignProc*   = proc(entry: var StoredEntry) {.closure.}              ## on-put; sets entry.attestation (no-op if no secret held)
   TrustPolicy* = object
-    name*:   string
-    verify*: proc(entry: StoredEntry): bool {.closure.}   ## on-read; true ⇒ entry may be served
-    sign*:   proc(entry: var StoredEntry)     {.closure.} ## on-put; sets entry.attestation
+    name*:   string        ## "none" | "hmac" | "ed25519"
+    verify*: VerifyProc
+    sign*:   SignProc
 
-proc nonePolicy*(): TrustPolicy                                    ## verify ⇒ true; sign ⇒ no-op
-proc tokenPolicy*(secret: string): TrustPolicy                     ## HMAC-SHA256 over the signed envelope
-proc signedPolicy*(signKey: Option[Ed25519Secret];
-                   pinned: seq[Ed25519Public]): TrustPolicy        ## ed25519: sign if we hold the key; verify against pinned set
+proc nonePolicy*(): TrustPolicy                                        ## verify ⇒ cvOk; sign ⇒ no-op
+proc hmacPolicy*(secret: sink string; keyId: string): TrustPolicy      ## HMAC-SHA256 (nimcrypto) over the envelope; signer = keyId
+proc ed25519Policy*(signSeed: Option[sello.Seed]; pinned: seq[PublicKey]): TrustPolicy
+                                                                       ## ed25519 (sello): sign iff a seed is given; verify against pinned
 ```
 
-- **The signed envelope is canonical, explicit, and recompute-bound** (see §Integrity vs. trust): the bytes signed are a deterministic serialization of `(key, recomputed-payloadChecksum, formatVersion, signer)`. The canonicalization proc is pure and shared by sign and verify (one function ⇒ they cannot disagree).
-- **`verify` is total and fail-closed:** a missing attestation, wrong `sigAlg`, unknown/unpinned `signer`, signer-mismatch, or bad signature all return `false`. A `verifyTrust` tier serving such an entry produces a miss. `nonePolicy.verify` is unconditionally `true` — trust is *opt-in per tier*, so a purely-local single-tier cache pays nothing.
-- **Multi-signer = multi-trust-domain (Depth F1, documented constraint).** Pinning a public key means *trusting that signer ran `shouldStore` honestly under a compatible config*. Two parties sharing one L2 and pinning each other's keys form one trust domain by construction; a malicious or misconfigured pinned signer can serve a result for a shared `SoundnessKey`. This is inherent to a shared cache and is the deployer's call — **pin only keys whose `shouldStore` discipline you trust.** crisol's job is to guarantee the signature genuinely came from a pinned signer (which `signer`-in-envelope now does); it cannot vouch for that signer's hermeticity config.
-- **HMAC vs ed25519 — both ship; the choice is the deployer's threat model, with a sharp caveat.** HMAC (`tokenPolicy`) is symmetric: simplest when every trusted party shares one CI secret; **anyone who can verify can forge.** It is appropriate ONLY when (a) the CI is fully trusted — *no untrusted PR builds*, since the "secrets in fork PRs" problem exposes the symmetric key to attacker-controlled test code — and (b) the secret is not readable by test binaries. ed25519 (`signedPolicy`) is asymmetric: publishers hold a secret, everyone else pins only public keys, so a read-only consumer (the common case) cannot forge — the right default for an open or multi-party cache.
-- **The signing/HMAC secret MUST be excluded from the hermetic env allowlist** (Depth F7). `$CRISOL_CACHE_SIGN_KEY` and any HMAC secret are *not* in RFC-0004's default passthrough set, and a deployer must never add them — otherwise a test binary `getenv`s the signing key and can forge. This is a documented hard constraint on both policies.
-- **Sigstore/Rekor** (keyless, transparency-log-backed) is the natural next tier; its `SigstorePolicy` type is named and locked but its implementation lives behind `when defined(crisolSigstore)` — **no empty stub ships** (RFC-0004 self-review correction #2). Follow-on, not 0005 scope.
+- **Verdicts, not booleans:** `verify` returns a `CacheVerdict` so a trust rejection is as *legible* as a miss — "no attestation" vs "unpinned signer" vs "bad signature" flow through the same verdict channel into `--cache-stats` and the 100 %-error warning; no parallel enum.
+- **The signed envelope is canonical, explicit, and recompute-bound** (§Integrity): `envelopeBytes` is pure and shared by sign and verify (one function ⇒ they cannot disagree).
+- **`verify` is total and fail-closed:** a missing attestation (`cvTrustNoAttestation`), unparseable/wrong `sigAlg` (`cvTrustUnknownAlg`), unknown/unpinned `signer` (`cvTrustUnpinnedSigner`), signer-mismatch (`cvTrustSignerMismatch`), or bad signature (`cvTrustBadSignature`) all reject. `nonePolicy.verify` is unconditionally `cvOk` — trust is *opt-in*, so a purely-local single-tier cache pays nothing.
+- **`signer` derivation is pinned.** ed25519: `signer = base64(toBytes(pk))` — byte-identical to the `pinned-key` config string, so `verify` is a string-set membership test and rotation is a seq add/remove. HMAC: `signer = keyId`, an operator-chosen label (`key-id` in config) — there is exactly one active secret; `signer` is carried for provenance and bound into the MAC, never derived from secret bytes.
+- **No `dispose` (round 3).** sello's `Seed`/`Keypair` are move-only (`=copy {.error.}`) **and carry `=destroy` wipes** (`sello/signing.nim`: "performs the same wipe automatically at scope exit"); under ORC the `Keypair` captured in the `sign` closure is destroyed when the `CacheRuntime` drops at the end of `runTests`. An explicit `dispose` duplicated that, and "wiping" an HMAC `string` that `getEnv` already copied is not achievable — the round-2 `dispose` plumbing is deleted. `api.nim` decodes `$CRISOL_CACHE_SIGN_KEY` straight into a `sello.Seed` and `move`s it into `ed25519Policy`, which builds `keypair(seed)` once inside the closure environment; `PublicKey` is copyable. HMAC secret lifetime is process lifetime, stated honestly. **The closure-captures-move-only-`Keypair` interaction is compile-verified in C-dep's smoke test** before C5a is written.
+- **Multi-signer = multi-trust-domain (documented constraint).** Pinning a public key means *trusting that signer ran `shouldStore` honestly under a compatible config*. Two parties sharing one L2 and pinning each other's keys form one trust domain by construction. **Pin only keys whose `shouldStore` discipline you trust.** crisol guarantees the signature genuinely came from a pinned signer; it cannot vouch for that signer's hermeticity config.
+- **HMAC vs ed25519 — both ship; the choice is the deployer's threat model, with a sharp caveat.** HMAC (`hmacPolicy`) is symmetric: simplest when every trusted party shares one CI secret; **anyone who can verify can forge.** Appropriate ONLY when (a) the CI is fully trusted — *no untrusted PR builds* — and (b) the secret is not readable by test binaries. ed25519 (`ed25519Policy`) is asymmetric: publishers hold a secret, everyone else pins only public keys, so a read-only consumer cannot forge — the right default for an open or multi-party cache.
+- **Secrets come from the environment, are resolved once in `api.nim`, are then *removed from the process environment* (round 3), and are injected — the cache modules never read env.** `$CRISOL_CACHE_SIGN_KEY` (base64 of the 32-byte ed25519 seed), `$CRISOL_CACHE_HMAC_KEY`, `$CRISOL_CACHE_TOKEN` / `$CRISOL_CACHE_TOKEN_<TIER>` (http bearer tokens; `<TIER>` = the KDL tier name upper-cased with `-`→`_`). None is in the default allowlist, but **"keep them out of the allowlist" is not sufficient: under `--hermetic none` the scrub is disabled and the whole parent env reaches test binaries** (`sandbox.nim:205-210`, `spawn.nim:289`), and `isFullyAchieved` is vacuously true for `hlNone` so such runs also publish. So `api.nim` `delEnv`s every `CRISOL_CACHE_*` variable immediately after building `CacheSecrets` (secrets live only in closure memory), `filterEnv`'s tail strips `CRISOL_CACHE_*` unconditionally at every hermeticity level, and C3b asserts the child env never contains them under `hlNone`.
+- **Misconfiguration is a config error, not a silent dead tier.** `configuredCache` rejects: `policy "ed25519"` with zero `pinned-key`s; `policy "hmac"` with no `$CRISOL_CACHE_HMAC_KEY`; an *explicit* `verify-trust #true` under `policy "none"`; unsigned `s3://` without a verifying policy. **Default (round 3): `verify-trust := (cache-trust.policy != "none")`** — so a `remote-cache` with no `cache-trust` block (E2E-1) is valid and unverified, and a configured policy verifies by default.
+- **Sigstore/Rekor** is the natural next tier; its `SigstorePolicy` type is named and locked behind `when defined(crisolSigstore)` — **no empty stub ships**. Follow-on.
 
 ### `BackendRegistry`, serializer, telemetry — and where each lives
 
 ```nim
-type CacheSerializer* = object        ## StoredEntry ⇄ bytes; JSON-only ships (msgpack deferred, port exists)
+# cachewire.nim
+type CacheSerializer* = object   ## StoredEntry ⇄ bytes; JSON-only ships (msgpack deferred, port exists)
   encode*: proc(e: StoredEntry): string {.closure.}
-  decode*: proc(s: string): Option[StoredEntry] {.closure.}
+  decode*: proc(s: string): Fetched[StoredEntry] {.closure.}   ## cvCorrupt / cvVersionSkew distinguishable (C1 needs both)
 
-type TelemetrySink* = object          ## NilSink default; LogSink + InMemorySink(tests)
-  emit*: proc(ev: TelemetryEvent) {.closure.}
+# cachetelemetry.nim
+type
+  TelemetryEventKind* = enum tekHit, tekMiss, tekRemoteErr, tekPublish, tekBackfillErr, tekVerifyFail
+  TelemetryEvent* = object       ## variant — the codebase idiom for kind-dependent fields (GroupSelection, types.nim:282)
+    case kind*: TelemetryEventKind
+    of tekHit:         tier*: string; durationMs*: int64
+    of tekMiss:        verdicts*: seq[TierVerdict]
+    of tekRemoteErr, tekBackfillErr:   putTier*: string; putVerdict*: CacheVerdict
+    of tekPublish:     publishedTo*: string
+    of tekVerifyFail:  path*: string
+  TelemetrySink* = object        ## NilSink default; summary sink (--cache-stats) + InMemorySink (tests)
+    emit*: proc(ev: TelemetryEvent) {.closure.}
 
-proc registerBackend*(reg: var BackendRegistry; scheme: string;
-                      factory: proc(cfg: BackendConfig): CacheBackend {.closure.})
-proc buildBackend*(reg: BackendRegistry; cfg: BackendConfig): Option[CacheBackend]
-  ## resolves the adapter by URL SCHEME (file/http/https/s3/memory) — see Config
+# cacheregistry.nim
+type BackendFactory* = proc(tier: RemoteTier; token: string): CacheBackend {.closure.}   ## typed config in, adapter out
+proc registerBackend*(reg: var BackendRegistry; scheme: string; factory: BackendFactory)
+proc buildBackend*(reg: BackendRegistry; tier: RemoteTier; token: string): Option[CacheBackend]
+  ## resolves the adapter by URL SCHEME (file/http/https/s3)
+proc productionRegistry*(fetcher = productionFetcher()): BackendRegistry   ## file (A2a), http/https (C1), s3 (C2) — NO memory
+proc testRegistry*(fetcher: HttpFetcher): BackendRegistry                   ## productionRegistry(fetcher) + memory:// + memoryBytes://
 ```
 
-- **Registry resolves by URL scheme**, not a redundant `backend` field (Design F5): `s3://…`→s3, `https://…`→http, `file://…`→local-fs, `memory://…`→test double. `buildBackend` is a pure function of `BackendConfig`; factories capture nothing (Feasibility F11). Adding a transport = one file + one `registerBackend(scheme, factory)`.
-- **`CacheSerializer` is consumed ONLY by the wire adapters (http/s3).** The `local-fs` adapter calls `storeCached`/`loadCached` directly and **bypasses the serializer** — no double encode/decode on the hot local path (Feasibility F8). The port exists so msgpack is a later adapter (Corey's locked Full-Flexible decision); only JSON ships. (Round-1 design lens flagged this port as shallow; it is retained per the accepted over-engineering trade-off, with the bypass making it zero-cost on the common path.)
-- **`TelemetrySink` lives at the `realSeams` adapter, NOT on `TieredCache`** (Design F1/F4). `TieredCache` is a pure lookup engine, testable with no sink. The `realSeams.load` adapter owns telemetry emission and tier-provenance population — it is the translation layer between the internal `getWithProvenance` and the external `CacheSeams.load`, which is exactly where an observation of the call belongs. `InMemorySink` (the test double) is wired at `realSeams`/api construction.
+- **Registry resolves by URL scheme**: `s3://…`→s3, `https://…`→http, `file://…`→local-fs. `buildBackend` is a pure function of `(RemoteTier, token)`; factories capture nothing else. Adding a transport = one file + one `registerBackend(scheme, factory)`. **`memory://` is registered only by `testRegistry()`**: a typo'd `memory://` URL in production KDL must be a config error, not a silently-empty per-process tier. The registry is **parameterized by the `HttpFetcher`** so E2E-3 drives the real KDL → `configuredCache` path with the fake fetcher (round 3 — the round-2 plan had no injection point that exercised the config path).
+- **`CacheSerializer` is consumed by every adapter** (§One format). The port exists so msgpack is a later adapter (Corey's locked Full-Flexible decision); only JSON ships.
+- **`TelemetrySink` lives on `CacheRuntime`, NOT on `TieredCache`.** `TieredCache` is a pure lookup engine, testable with no sink. The `realSeams.load`/`store` adapters own telemetry emission — the translation layer between the internal `lookup` and the external `CacheSeams`, which is exactly where an observation of the call belongs. **`cacheStats`, `cacheTier` and `cacheLookup` never carry backend URLs, credentials, or signer identifiers** — only aggregate counts, verdict names and the deployer-chosen tier label (`run/v1` is routinely archived as a CI artifact).
 
 ### Wiring — what changes at the seam (and what doesn't)
 
 ```nim
-proc realSeams*(tc: TieredCache; sink: TelemetrySink; stateDir: string;
-                graph: ptr DepGraph; ...): CacheSeams =
+type
+  KeyContext* = object           ## everything keyOf closes over except the live graph (round 3 — realSeams had 8 positional params)
+    nimVersion*, ccVersion*: string
+    spec*:            SandboxSpec
+    hermeticEnvHash*: string     ## = hermeticEnvHash(filterEnv(parentEnv, spec, @[])) with env-pins applied — computed ONCE
+    protocolMajor*:   int
+  proc keyContext*(nimVersion, ccVersion: string; spec: SandboxSpec;
+                   parentEnv: openArray[(string, string)]; envPins: openArray[(string, string)];
+                   protocolMajor: int): KeyContext
+
+  KeyDerivation* = object        ## the seam derives INPUTS; dispatch hashes them (pure, keys.nim)
+    inputs*: KeyInputs
+    key*:    SoundnessKey        ## = soundnessKey(inputs)
+
+  KeyOfProc*  = proc(pep: PlannedEntrypoint): KeyInputs {.closure.}                               ## WAS → SoundnessKey
+  LoadProc*   = proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup {.closure.}           ## WAS (key) → Option[CachedResult]
+  StoreProc*  = proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool {.closure.} ## WAS (key, res) → bool
+  CacheSeams* = object           ## still exactly three closures
+    keyOf*: KeyOfProc; load*: LoadProc; store*: StoreProc
+
+  CacheRuntime* = object         ## the cache-side bundle realSeams/api receive (one place for growth; no dispose)
+    cache*: TieredCache
+    sink*:  TelemetrySink
+
+proc derive*(seams: CacheSeams; pep: PlannedEntrypoint): KeyDerivation   ## inputs = seams.keyOf(pep); key = soundnessKey(inputs)
+proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc         ## what the 4 key-derivation tests call
+proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSeams =
   CacheSeams(
-    keyOf: <unchanged — derives SoundnessKey from PlannedEntrypoint>,
-    load:  proc(key: SoundnessKey): Option[CachedResult] =
-             let (hit, err) = tc.getWithProvenance(key)
-             if hit.isSome:
-               sink.emit(TelemetryEvent(kind: tekHit, tier: hit.get.tierName, durationMs: hit.get.result.durationMs))
-               # tier provenance + (if err==ceTrustFail upstream) reach the result via the plan-lookup path
-               some(hit.get.result)
+    keyOf: keyOfProc(ctx, graph),
+    load:  proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
+             let l = rt.cache.lookup(d.key)
+             if l.hit.isSome:
+               rt.sink.emit(TelemetryEvent(kind: tekHit, tier: l.hit.get.tier, durationMs: l.hit.get.result.durationMs))
+               # backfill-seeded sidecar + per-tier verdicts handled here (tier 0 = local-fs)
              else:
-               sink.emit(TelemetryEvent(kind: tekMiss, err: err))
-               none(CachedResult),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
-             let puts = tc.put(toStoredEntry(key, res, keyInputsFor(...)))
-             for p in puts:
-               if p.err in {ceUnauthorized, ceTimeout, ceOffline}: sink.emit(TelemetryEvent(kind: tekRemoteErr, err: p.err))
-             puts.anyIt(it.ok),
+               rt.sink.emit(TelemetryEvent(kind: tekMiss, verdicts: l.verdicts))
+             l,
+    store: proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool =
+             let vs = rt.cache.put(StoredEntry(key: d.key, keyInputs: some(d.inputs), result: res, storageVersion: storageFormatVersion))
+             for (tier, v) in vs:
+               if v == cvOk: rt.sink.emit(TelemetryEvent(kind: tekPublish, publishedTo: tier))
+               elif v in transportVerdicts: rt.sink.emit(TelemetryEvent(kind: tekRemoteErr, putTier: tier, putVerdict: v))
+             vs.anyIt(it.verdict == cvOk),   # L1 synchronous; remote puts queued (§TieredCache) — the fold sees the L1 verdict now
   )
 ```
 
-`realSeams` gains a `TieredCache` and a `TelemetrySink` parameter; it composes `load`/`store` as thin adapters. **`CacheSeams`'s three-closure shape, `LoadProc`/`StoreProc`'s signatures, `lookupAtPlan`, `shouldStore`, `CacheContext`, `cacheEnabled`/`cacheDisabled` are unchanged.** Two additive deltas (honest correction to the over-strong original claim): (a) `CacheDecision` gains a `cdmTrustFail` variant so a trust-rejected read is distinguishable from a clean key-miss in `run/v1` and `--cache-stats`; (b) `EntrypointResult` gains an optional `cacheTier: string` provenance field (which tier served a `cdmHit`), populated by the adapter. Both are additive under RFC-0004's `schemaRevision` discipline; the *enum's existing variants and `lookupAtPlan`'s logic are untouched*. A purely-local run (the default) builds `TieredCache{tiers: @[localFsTier], trust: nonePolicy()}` + `NilSink` via the `localOnlyCache` factory (below) — behaviorally identical to RFC-0004.
+**Why the seam re-shapes (round 3 — three lenses independently):** the round-2 text declared `StoreProc` "unchanged" (`(key, res)`) and then wrote `toStoredEntry(key, res, keyInputsFor(...))` and a *path-keyed* sidecar — but neither `KeyInputs` nor `ep.path` is recoverable from a `SoundnessKey` (a one-way FNV fold, `keys.nim:112-161`); `keyOf` derived the inputs and discarded them (`cachedispatch.nim:404-414`). A closure-local memo `Table[key → inputs]` was considered (no shape change) and rejected: hidden state keyed by the very value it explains. The clean design: **the seam derives *inputs*, dispatch hashes them** (`soundnessKey(inputs)` is already a pure proc in `keys.nim`), and `load`/`store` receive the `PlannedEntrypoint` (the runner has it at both call sites — `runner.nim:992`, `:1335`) plus the derivation — so the sidecar has its path, the wire entry has its inputs, and `explainMiss` has its `curr`. `lookupAtPlan` calls `derive` once and stamps `d.key` as `inputHash`.
+
+**The provenance thread (round 3 — corrected against the real stamp sites).** `lookupAtPlan` → `PlanLookup += tier: string, lookup: CacheVerdict` (the serving tier; `worst(l)` on a miss) → two stamp sites in `runner.nim`: the **hit stamp** (`:995-1007`, `synth.cacheTier = look.tier`) and the **live stamp** (`:1326-1356`, a new per-index `lookups[i]` seq next to `inputHashes[i]` ⇒ `result[i].cacheLookup`). New `EntrypointResult` fields, additive: **`cacheTier: string`** (`""` unless served) and **`cacheLookup: CacheVerdict`** (`cvOk` on hit; `cvMiss`/`cvOffline`/a trust code on a consulted miss; `cvOk` also when not consulted — the wire renders it as a string, absent when not consulted). **`cdmTrustFail` is dropped:** round 3 found the live stamp overwrites the plan-time decision with `shouldStore`'s verdict — a trust-rejected entry that runs live and passes is (correctly) re-published as `cdmStored`, so a `CacheDecision` variant could never be observed on the result. The trust rejection is carried by `cacheLookup` instead, independent of the store verdict; E2E-2 asserts `cacheLookup == "trustBadSignature" and cacheDecision == cdmStored` and notes the re-publish as intended self-healing of a tampered entry. `jsonout.nim` renders `cacheTier`/`cacheLookup` under `schemaRevision` 13 (current `RunV1Revision = 12`).
+
+**What does not change:** `CacheSeams`'s three-closure shape (re-typed, not re-shaped), `lookupAtPlan`'s decision logic (a hit is a hit; a miss is a miss), `shouldStore`, `CacheContext`, `inactiveDecision`, `cacheEnabled`/`cacheDisabled`, the `EntrypointDecision` sum (pending §FORK-2). A purely-local run (the default) builds `CacheRuntime{cache: TieredCache{@[l1Tier], nonePolicy()}, sink: NilSink}` via `localOnlyCache` — behaviorally identical to RFC-0004.
+
+**Test injection without a facade leak (round 3).** The round-2 `RunOptions.cacheRuntime: Option[CacheRuntime]` would have leaked `cacheport`'s whole type graph into the contracted `crisol/api` facade (a consumer could only construct it by importing uncontracted internals; amoxtli uses no Nim API — it parses `run/v1` JSON). Removed from 0005. Instead `api.nim` exposes an **internal, documented-uncontracted** `runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport` where `CacheDeps = {registry: BackendRegistry, secrets: CacheSecrets, sink: TelemetrySink}`; `runTests` calls it with `productionRegistry()`, env-resolved secrets and the flag-chosen sink. E2E tests inject `testRegistry(fakeFetcher)` + fixture secrets through it. Library-level injection can return as a follow-on once the port has survived Stage C.
 
 ### Construction ergonomics — factories keep `api.nim` thin
 
-To keep `api.nim`'s already-dense `runTests` from absorbing tier/registry/trust/credential assembly (Design F9), construction lives in `cacheport.nim`:
-
 ```nim
-proc localOnlyCache*(stateDir: string): TieredCache
-  ## single-tier local-fs, nonePolicy. The default for every run with no remote configured.
-proc configuredCache*(cfg: CacheConfig; stateDir: string; reg: BackendRegistry): TieredCache
-  ## build tiers from the parsed KDL `cache` block; returns localOnlyCache if no remote tier. Resolves
-  ## trust policy + credentials per tier. api.nim only decides WHICH factory to call.
+# types.nim — parsed KDL lives next to PerfCheckConfig/ReuseCheckConfig (config.nim cannot import the cache modules)
+type
+  RemoteTier* = object
+    name*, url*: string
+    endpoint*: Option[string]; pathStyle*: Option[bool]        # s3 only
+    verifyTrust*: Option[bool]                                  # absent ⇒ policy != "none"
+    backfillOnHit*: bool = true
+  TrustConfig* = object
+    policy*: string = "none"; pinnedKeys*: seq[string]; keyId*: string
+  CacheConfig* = object
+    remotes*: seq[RemoteTier]; trust*: TrustConfig
+    cacheStats*, explainMiss*: bool; verifyCachePct*: int = 5
+    envPins*: seq[(string, string)]
+
+# cacheregistry.nim
+type CacheSecrets* = object      ## resolved ONCE in api.nim from env (then delEnv'd); never inside the cache modules
+  signSeed*:   Option[sello.Seed]        ## $CRISOL_CACHE_SIGN_KEY (base64-decoded, moved)
+  hmacKey*:    Option[string]            ## $CRISOL_CACHE_HMAC_KEY
+  httpTokens*: Table[string, string]     ## tier name → $CRISOL_CACHE_TOKEN[_<TIER>]
+
+proc localOnlyCache*(stateDir: string; maxEntries: int): CacheRuntime
+  ## single-tier local-fs ("l1"), nonePolicy, NilSink. The default for every run with no remote configured.
+proc configuredCache*(cfg: CacheConfig; stateDir: string; reg: BackendRegistry;
+                      secrets: CacheSecrets; sink: TelemetrySink): CacheRuntime
+  ## build tiers from the parsed KDL; returns localOnlyCache if no remote tier. Resolves the cache-global trust
+  ## policy + per-tier credentials; REJECTS unverifiable trust config (raises CrisolError(cekConfig) ⇒ exit 3 via
+  ## the existing planImpl catch — so it is invoked INSIDE the plan try, BEFORE acquireLock, api.nim:527-546).
 ```
 
-## Stage B — observability (additive on the port)
+## Stage B — observability (port-independent; lands first)
 
 ### Miss-explanation — `explainMiss`
 
 ```nim
-type KeyComponent* = enum   ## renamed from MissReason — it names WHICH of the 9 key inputs differs (Design F7)
-  kcClosure, kcFlags, kcNimVersion, kcCcVersion, kcFixtures, kcArgv,
-  kcRlimit, kcHermeticEnv, kcProtocol
+# keys.nim
+type KeyComponent* = enum   ## names WHICH of the 9 key inputs differs
+  kcClosure, kcFlags, kcNimVersion, kcCcVersion, kcFixtures, kcArgv, kcRlimit, kcHermeticEnv, kcProtocol
 type KeyDiff* = object
   component*: KeyComponent
   prev*, curr*: string
+  envNames*: seq[string]     ## kcHermeticEnv only: the variable NAMES whose value/presence differs (never values)
 
-proc explainMiss*(prev, curr: KeyInputs): seq[KeyDiff]   ## PURE; diffs the 9 components
+proc explainMiss*(prev, curr: KeyInputs; prevEnv, currEnv: seq[(string, string)]): seq[KeyDiff]   ## PURE
 ```
 
-A miss is *legible* only if you can recover the *previous* inputs for the *same test*. The mechanism: the local tier writes a **`KeyInputs` sidecar keyed by PATH** — *not* `identityKey(path, flagHash)`. Keying by the full identity key would make a flag change (the single most common deliberate miss) produce a *different* sidecar key ⇒ "no prior inputs" instead of the answer "your flags changed" (Depth F6). Keyed by path, the sidecar stores a small map `flagHash → KeyInputs` (most-recent-per-flagHash, pruned on write); on a miss, crisol loads the path's sidecar, picks the most-recent prior `KeyInputs`, and diffs against `curr` — correctly surfacing `kcFlags`. Absent any sidecar (older writer or first-ever run) it **degrades gracefully** to "no prior inputs recorded." `--explain-miss` renders the `KeyDiff`s.
+A miss is *legible* only if you can recover the *previous* inputs for the *same test*. Mechanism: tier 0 (the local-fs L1 — **never** a shared `file://` L2, which must not host per-host history) writes a **sidecar keyed by PATH** at `<root>/v<N>/inputs/<fnv(path)>.json` — *not* by `identityKey(path, flagHash)`: keying by the full identity key would make a flag change (the most common deliberate miss) produce a *different* sidecar ⇒ "no prior inputs" instead of "your flags changed". The sidecar stores a small map `flagHash → {inputs: KeyInputs, envDigest: seq[(name, hash16(value))]}` (most-recent-per-flagHash, pruned on write). **`envDigest` is what makes the dominant cross-host miss legible (round 3):** `hermeticEnvHash` is one FNV over all names+values, so without per-name digests `kcHermeticEnv` would render as `a1b2… ≠ c3d4…` with no variable named — precisely the miss §Key portability predicts. Values are never stored. On a miss, the `load` adapter reads the path's sidecar, picks the most-recent prior record, diffs against `curr`, and attaches `seq[KeyDiff]` to the lookup; `--explain-miss` renders them. Absent any sidecar (older writer, first-ever run) it **degrades gracefully** to "no prior inputs recorded."
 
-Sidecar mechanics, pinned (Breadth F8, Feasibility F7): it is a **local-fs-adapter implementation detail, not a `CacheBackend` contract** (the `memory` test double does not exercise it; B1 tests it via the local-fs boundary suite). Serialize via hand-written `keyInputsToJson`/`keyInputsFromJson` in `cacheport.nim` following `resultcache.nim`'s `payloadToJson` pattern (`Option[int64]` → absent-on-`none`); **do not** reach for `std/jsonutils` (no new stdlib dep, consistent with the codebase). Sidecar content is **portable** (equal identity ⇒ equal `KeyInputs` on any host), so a backfill may legitimately write it. Sidecar files carry a distinguishable name prefix and are included in the local-fs `list`/`delete` capability so `gcResultCache` (RFC-0004 A1c) prunes them; absent GC they are bounded by the count of distinct paths. Rename-collision (a path reused by a different entrypoint) overwrites the stale sidecar on next `put` — documented, low-impact.
+**Rendering (round 3, fresh fact #2):** `kcNimVersion` prev/curr are now multi-line `nim --version` text + `|` + binary hash; `kcCcVersion` likewise; `kcClosure`/`kcFlags` are opaque hashes. The renderer is component-aware: first line of the version text + 8-hex of the binary hash ("compiler binary differs"); `argv` joined; `rlimitConfig` field-diffed; `kcHermeticEnv` lists `envNames`; opaque hashes render as "changed (`a1b2…` → `c3d4…`)". Full values only under `--explain-miss-verbose`.
+
+**Honest scope:** `explainMiss` needs *local history* — informative on persistent dev machines and self-hosted runners; an ephemeral CI runner has nothing to diff against. The remote tier does not help here (a remote miss means *no entry for the current key*, and the remote is not path-indexed). What the remote *does* do: every `StoredEntry` carries `keyInputs`, and a backfill-on-hit **seeds the local sidecar** from it — so a fresh host's *next* miss on that path is explainable. Cross-host explanation of a remote miss is an explicit Non-Goal.
+
+Sidecar mechanics, pinned: it is a **local-fs-adapter implementation detail, not a `CacheBackend` contract** (the `memory` double does not exercise it; B1 tests it via the local-fs boundary suite). Serialize via hand-written `keyInputsToJson`/`keyInputsFromJson` in `cachewire.nim` following `resultcache.nim`'s `payloadToJson` pattern; **do not** reach for `std/jsonutils`. Sidecar content is **portable** (equal identity ⇒ equal `KeyInputs` on any host), so a backfill may legitimately write it. Sidecars live under `inputs/` (outside the entry cap and LRU — §Local-fs root); `gcResultCache` prunes `inputs/` records whose path no longer has any live entry (B1 owns this, inside the existing walk). Rename-collision (a path reused by a different entrypoint) overwrites the stale sidecar on next `put`. Two crisol processes on one stateDir cannot race the sidecar — `runTests` holds the whole-run F_SETLK lock (`api.nim:545`, `lock.nim:29`). The KDL `explain-miss` key is parsed in B1 (config < CLI).
 
 ### Hit-rate telemetry
 
-A `TelemetrySink` aggregates events emitted by the `realSeams` adapter (hit + tier, miss + `err`, remote-error, publish). At run end crisol emits one summary line — **L1 hits / remote hits / misses / remote-errors / total / hit-% / wall-time-saved / published** — and a structured `cacheStats` object in `crisol/run/v1`. `remote-errors` (Breadth F2) makes a misconfigured remote (100% `ceUnauthorized`/`ceTimeout`/`ceOffline`) diagnosable instead of masquerading as a cold cache; crisol additionally writes a **stderr warning when a configured remote tier errored on every call** in a run. `wall-time-saved` sums the `durationMs` of served `cdmHit` entries. Default sink `NilSink`; `--cache-stats` installs the summary sink; `InMemorySink` is the test double.
+A `TelemetrySink` aggregates events emitted by the `realSeams` adapters (hit + tier, miss + per-tier verdicts, remote-error, backfill-error, publish). At run end crisol emits one summary line — **L1 hits / remote hits / misses / remote-errors / total / hit-% / wall-time-saved / published / verifyFails** — and a structured `cacheStats` object in `crisol/run/v1`. **`total` = lookups actually consulted** (hit + keyMiss + stored + hermeticityDegraded + flaky + closureUnrecorded + trust-rejected); a separate **`notConsulted`** (notEligible / groupOptOut / policyDisabled, `cachedispatch.nim:74-80`) keeps `hitPct` from being diluted by `cacheable #false` groups. `remote-errors` makes a misconfigured remote (100 % `cvUnauthorized`/`cvTimeout`/`cvOffline`) diagnosable instead of masquerading as a cold cache; crisol additionally writes a **stderr warning when a configured remote tier errored on every call** in a run — where "errored" includes the trust codes and `cvCorrupt` (a tier that rejects 100 % of reads is as dead as one that times out), attributed per tier via `CacheLookup.verdicts` even when a later tier served. `wall-time-saved` sums the `durationMs` of served `cdmHit` entries. Default sink `NilSink`; `--cache-stats` installs the summary sink; `InMemorySink` is the test double. **Output channels (round 3):** in `--json` mode the run/v1 document owns stdout (amoxtli `parseJson`s it verbatim — `crisol_json.nim:172-178`), so every human summary/explain line goes to **stderr** in `--json` mode and to stdout otherwise; the structured data lives in `cacheStats`/per-result fields. There is no `--quiet`; warnings (100 %-error, verifyFail) are unconditional stderr.
 
 ### `--verify-cache` — the determinism backstop
 
-`isFullyAchieved` proves hermeticity, not determinism. `--verify-cache[=PCT]` (default sample 5%) re-executes a random sample of entrypoints that were served `cdmHit` this run, compares the fresh outcome+records to the cached one, and on divergence reports it. It is a **post-run pass**, never in the hot path (self-review correction #3): the run completes and reports on cached results immediately; verification is a trailing pass. Hard requirements (Depth F3 + Feasibility F6 + Breadth F9):
+`isFullyAchieved` proves hermeticity, not determinism. `--verify-cache` (sample size `--verify-cache-pct N`, default 5; KDL `verify-cache-pct`) re-executes a sample of entrypoints that were served `cdmHit` this run, compares the fresh outcome+records to the cached one, and on divergence reports it. It is a **post-run pass**, never in the hot path: the run completes and reports on cached results immediately; verification is a trailing pass. Hard requirements:
 
 - **No cache writes during verify.** The verify pass is constructed with `cache = cacheDisabled(spec)` so `shouldStore`/`put` are never reached — it cannot overwrite the entry it is checking, reset LRU age, or re-publish a divergent result.
-- **`--retries 0` for the verify pass.** A retry would mask the very flakiness verify exists to find (a fail-then-pass would compare pass-vs-cached-pass — no signal). Single attempt makes divergence observable (Depth F9).
-- **Synthetic plan, not a re-`plan()`.** The pass builds a `RunPlan` directly from the sampled subset of the first run's `PlanReport.entrypoints` (already-available `PlannedEntrypoint` values), `jobs = 1` for determinism; it does not re-discover entrypoints or mutate/save the depgraph.
+- **Single attempt.** `retries` is per-`PlannedEntrypoint` (`types.nim:369`; `runner.nim:1224` `maxAttempts = pep.retries + 1`), not a run knob — the pass sets **`pep.retries = 0`** on each synthetic entry. A retry would mask the very flakiness verify exists to find.
+- **Synthetic plan, not a re-`plan()`.** The pass builds a `RunPlan` directly from the sampled subset of the first run's `PlanReport.entrypoints` (already-available `PlannedEntrypoint` values, selected by `EntrypointResult.cacheDecision == cdmHit` and paired by index), `jobs = 1` for determinism; it does not re-discover entrypoints or mutate/save the depgraph. (Round 3 correction: `edecision` is never written back after plan — the promotion lives only in `PlanLookup.decision` — so no reset is needed; the sampled entries are still `edRunFresh` and dispatch to `spawnRunDirect`, asserted.) **Binary precondition:** a `cdmHit` this run implies `edRunFresh` at plan ⇒ `<stateDir>/bin/<slug>/<bin>` existed (`planner.nim:177`) and the stateDir lock is held for the whole run, so `clean` cannot remove it — the pass runs **before `releaseLock`, after `persistLastRun`** (lastrun.json must reflect the main run only; `--failed` narrowing reads it). If §FORK-2's post-compile consult lands, a hit may precede the stable-binary copy — the consult copies the binary before synthesizing, preserving this invariant.
+- **`execute()` re-entrancy is confirmed but leaky without three guards (round 3):** (1) `execute` fires `onResult` for every result (`runner.nim:1360`) — the pass passes a no-op (`onVerify` is a follow-on); (2) `appendAttemptRow` fires on every live attempt (`:1229-1237`) — verify re-runs would pollute `--order failed-first`/`medianDur`, perf-check history and `--shard` LPT samples ⇒ `execute()` gains `recordLedger: bool = true`, `false` for the pass; (3) verify results are never merged into `RunReport.results` — they live only in `RunReport.verifyDivergences`. `failFast = false`. The pass re-opens a fresh ledger shard name (`ledger.nim:141-146`, per-process `shardSeq`) — fine.
+- **Sampling:** seeded PRNG; the seed defaults to a per-run value (reported in the summary line) so coverage broadens across runs in expectation, and `--verify-cache-seed N` reproduces a specific sample. `max(1, pct·hits/100)` entries are sampled whenever `pct > 0` and there is at least one hit.
 - **Isolated telemetry.** A fresh/filtered sink so verify events don't double-count into the main run's `cacheStats`.
-- **Divergence is user-visible, not swallowed** (Breadth F9): a `verifyFail` produces a **stderr warning even under `NilSink`**, a `verifyFails` count in the `--cache-stats` summary, and the human render names the entrypoint. `--verify-cache-strict` makes a divergence set exit code 1 (CI gate); default `--verify-cache` reports without failing. It **never evicts** (a divergence is a human signal — "set `cacheable #false`" — not an automatic action).
+- **Divergence is user-visible, not swallowed:** a `verifyFail` produces a **stderr warning even under `NilSink`**, a `verifyFails` count in `cacheStats`, and the human render names the entrypoint. `--verify-cache-strict` makes a divergence set exit code 1 (CI gate) and **requires `--verify-cache`** (exit `ExitEnvironment` otherwise, same shape as `--base` requiring `--changed`, `crisol.nim:~723`). It **never evicts**.
+- **Facade (round 3):** `RunOptions.verifyCache: VerifyCache` — an object `{enabled, pct = 5, seed: Option[int64], strict}` built via `noVerify()` / `verifySample(pct, seed, strict)` so "strict without enabled" is unconstructable (the `RunNarrowing` constructor idiom, `api.nim:151-156`).
 
-**Concurrency reconciliation (self-review correction #5 — load-bearing).** crisol's runner is a single-threaded fork/poll loop (`execute()`), *not* an async runtime. `--verify-cache` introduces no competing primitive: it runs *after* the main poll loop drains, as a second bounded `execute()` over the sampled subset. (`execute()` re-entrancy: it re-opens a fresh ledger shard — fine — and the synthetic plan carries only `edRunFresh` entries so no compile/graph-write occurs; C0 verifies these properties before B3 is written.) Remote backend I/O (Stage C) follows the same discipline — a remote `get`/`put` is either a **synchronous call with an internal deadline** (default) or, for opt-in plan-time prefetch, a **bounded worker pool drained at a defined join point** — never an event loop bolted alongside the fork/poll core. C0 pins this with a written rationale before any network code.
+**Concurrency reconciliation (load-bearing).** crisol's runner is a single-threaded fork/poll loop (`execute()`), *not* an async runtime. `--verify-cache` introduces no competing primitive: it runs *after* the main poll loop drains, as a second bounded `execute()` over the sampled subset. Remote backend I/O (Stage C) follows the same discipline — see **B0**.
 
-## Stage C — remote + trust (the network-touching tail)
+### B0 — remote-I/O concurrency and the deadline mechanism (design slice; round 3 rewrite)
 
-> **C depends on a crypto-dependency decision (see §Open forks).** HMAC-SHA256 (C4, and AWS SigV4 for authenticated S3) and ed25519 (C5) are **absent from the Nim stdlib**; crisol currently depends only on `nkdl`. The slices below assume the recommended resolution (nimcrypto for HMAC/SHA-256; a dedicated ed25519 source; initial S3 scoped to unsigned/MinIO). **The exact libraries and the S3-auth scope are the open fork awaiting Corey** — slice ordering and `milpa.kdl`/Dockerfile deltas finalize once chosen.
+Facts: (1) `runner.nim:966-1010` runs the cache-consultation loop **serially, before** dispatch — N remote lookups without mitigation is N × deadline of dead wall-clock at the front of every run; (2) `std/httpclient`'s `timeout` bounds only post-connect `recv`s; `newConnection` calls `net.dial`, which has **no timeout** — DNS + TCP connect to a black-holed host hangs indefinitely; (3) **TLS on `std/net` has no deadline either** (round 3): `wrapConnectedSocket` calls `SSL_connect` on a *blocking* fd (`net.nim:856-880`) — a server that accepts TCP and stalls the handshake hangs the run; and `SSL_ERROR_WANT_READ/WRITE` on non-blocking sockets raise unless `socketError(async=true)` is used, which the high-level `recv`/`readLine` paths do not expose — a hand-rolled non-blocking TLS state machine is far beyond a "minimal client"; (4) a `select`-drained concurrent lookup pass needs a *second*, incremental HTTP state machine plus a new port capability — a round, not a slice. Decisions:
 
-- **`HttpFetcher` transport seam** (Feasibility F3): the http/s3 adapters take an injected `HttpFetcher = proc(meth, url, body: string; headers: seq[(string,string)]): tuple[status: int; body: string] {.closure.}`. Production wires it to `std/httpclient` (with `-d:ssl`); tests wire a pure in-memory proc — **no socket in the suite** (satisfies the "no real network" hard constraint cleanly, vs. a loopback server). HTTPS needs OpenSSL in the podman image (the base has only gcc/git/Nim) — slice **C1a** adds `libssl-dev` to the Dockerfile + the `-d:ssl` build flag and verifies the build *before* adapter logic.
-- **Adapters:** `local-fs` (Stage A, shipped), then `http` (GET/PUT/HEAD over a content-addressed URL `<base>/<storageFormatVersion>/<soundnessKey>`, `Content-Type: application/json`, internal deadline, total-function with `CacheError` on every failure) and `s3` (same contract over the S3 object API). **`storageFormatVersion` is a NEW integer covering the `StoredEntry` wire shape — distinct from RFC-0004's `resultCacheFormatVersion` (the `CachedResult` payload)** (Breadth F10). The in-process **fake server** double (the `memory` backend behind the http/s3 codec) validates method/status/Content-Type/auth-header so C1/C6 catch real-server mismatches.
-- **Concurrent PUT idempotency** (Breadth F1): the wire key is `<storageFormatVersion>/<soundnessKey>` only; `signedAt` varies across writes to the same key but is excluded from the signed bytes and from key identity, so last-writer-wins is sound (equal key ⇒ equal payload ⇒ equal signature-over-payload). The S3 adapter relies on S3 last-writer-wins; the http adapter treats a 409/`ceUnauthorized`/duplicate as a best-effort `false` (first publisher wins, swallowed) — documented, not an error.
-- **`TieredCache` wiring in `api.nim`** via `configuredCache`; populate-on-hit + `verified`-bit backfill active. `--no-remote-cache` drops all non-L1 tiers (local cache still active).
-- **Trust:** `none` → HMAC → ed25519, in that slice order (each independently testable).
-- **Plan-time remote prefetch (latency)** (Breadth F14): naïve per-entrypoint serial remote GETs cost one round-trip × N entrypoints; for a 200-test suite at 150 ms that is minutes or an N-wide request burst. Mitigation: at plan time, when a remote tier exposes `list()` (or a bulk-existence endpoint), crisol fetches the key set **once** and resolves lookups locally; otherwise it bounds concurrency via the C0 worker pool with a per-run deadline. A bloom-filter/negative-cache is deferred (documented in §Alternatives). The hot-path "never blocks" guarantee is preserved by the per-call deadline regardless.
+- **(a)** The production `HttpFetcher` is a minimal raw-`std/net` HTTP/1.1 client — `Socket.connect(host, port, timeout)` (non-blocking connect + poll, `net.nim:2126`), **`SO_RCVTIMEO`/`SO_SNDTIMEO` set to the deadline remainder before `wrapConnectedSocket` and before each `recv`** (the only way to bound the blocking SSL path), `Content-Length` framing plus chunked-response decoding, TLS via `wrapConnectedSocket` under `-d:ssl`, **no redirect following**, a **body size cap** (default 8 MiB — `records[].msg` is unbounded test output; `maxOutputBytes` is 10 MiB per entrypoint), `EINTR` ⇒ transport failure (`select` is never restarted under `SA_RESTART`). Residual: synchronous DNS resolution inside `connect` (bounded by the resolver's own timeout, documented).
+- **(b)** Default per-call deadline **2000 ms** (connect + TLS + response), hardcoded in 0005 (a KDL knob is a follow-on).
+- **(c) Plan-time lookups: circuit breaker + probe, not a select loop.** The per-tier **circuit breaker** (§TieredCache) bounds the *offline* case to one deadline per tier per run. For the *alive* case, when a tier `canProbe` the key set is resolved **once** at plan time (`probe(keys)` — s3 via a ListObjectsV2 prefix listing under `<ver>/`, a `<Key>`-extraction over the response, no general XML parser; http has no standard bulk-existence so `probe = nil`) and `lookup` consults the probe result before any per-key `get`; without `probe`, per-key `get`s are sequential and each bounded by the deadline — N × RTT on a slow-but-alive remote, **stated honestly** in the operator guide. The **select-drained concurrent pass is deferred** (§Non-Goals, §Alternatives). The prefetch loop checks `pendingSignal()` per iteration (the existing check lives only inside the poll loop, `runner.nim:1046`) and raises `CrisolInterrupted`.
+- **(d) Deferred remote puts** (§TieredCache): remote writes leave the poll loop and flush at the end-of-run join point under the breaker and a total budget.
+- **(e)** `execute()` re-entrancy for B3 confirmed with the three guards above. Written rationale lands in the RFC + `cachetier` doc comment; no functional code in B0.
+
+## Stage C — trust first, then the network-touching tail
+
+> **Crypto dependencies (FORK-1, resolved 2026-08-21; C-dep simplified round 3 — see §Dependency decision).** **ed25519 via [sello](https://github.com/coreyleavitt/sello)** — `v0.4.0` is tagged and pushed and already exports `Seed`/`Keypair`/`toSeed`/`keypair`/`sign`/`verify`/`PublicKey`/`toBytes`/`wipe` (pure Nim by default; libsodium only under `-d:selloLibsodium`), so crisol pins **`v0.4.0` by git ref** — no local-path pin, no `./dev` sibling-mount machinery — and bumps to `v0.5.0` when Corey tags it. **HMAC-SHA256 + SHA-256 via nimcrypto `v0.7.3`** (pure Nim, already in the milpa CAS as sello's own dependency). **Both `hmacPolicy` and `ed25519Policy` ship.** Initial S3 is **unsigned/MinIO path-style** (no SigV4) — authenticated S3 (SigV4, reusing the nimcrypto HMAC) is a follow-on. No Dockerfile delta for crypto; C1a's `libssl-dev` remains for TLS only.
+
+**Order (round 3): trust before transports.** Trust has zero network dependency, unsigned `s3` is *unusable* without a verifying policy (§Secure-by-default), and `configuredCache` cannot wire `policy "hmac"` before `hmacPolicy` exists — so C-dep → C4 (E2E-2 over `file://`) → C5 → then http/s3. And the trust-*reject* path is live from Stage A: A3b runs a mock-policy E2E through `runTests` (two `memory` tiers + the controllable mock returning `cvTrustBadSignature` ⇒ live execution, `cacheLookup == trustBadSignature`, the rejected entry never served).
+
+- **`HttpFetcher` transport seam (round 3 shape):**
+  ```nim
+  HttpRequest* = object
+    meth*, url*: string; headers*: seq[(string, string)]; body*: string   # named fields — no three positional same-typed strings
+  TransportOutcome* = enum toOk, toTimeout, toUnreachable
+  HttpReply* = object
+    case transport*: TransportOutcome
+    of toOk: status*: int; headers*: seq[(string, string)]; body*: string
+    else:    discard
+  HttpFetcher* = proc(req: HttpRequest): HttpReply {.closure.}
+  ```
+  — `toTimeout`/`toUnreachable` are the **only** transport-failure signals (⇒ `cvTimeout`/`cvOffline`), so the adapter's mapping falls out of the seam's own total-function contract. Production wires the raw-`std/net` client from B0 (C1b); tests wire a pure in-memory proc — **no socket in the suite** for the adapters. HTTPS needs OpenSSL in the podman image — slice **C1a** adds `libssl-dev` to the Dockerfile + `-d:ssl` (in a project `config.nims` — `nim.cfg` is milpa-generated) and verifies the build *before* adapter logic.
+- **Adapters:** `local-fs` (Stage A), then `http` (GET/PUT over a content-addressed URL `<base>/<storageFormatVersion>/<soundnessKey>`, `Content-Type: application/json`, `Authorization: Bearer <token>` when configured, deadline, total-function) with a **pinned status table (round 3):** 200 ⇒ decode; 404/410 ⇒ `cvMiss`; 401/403 ⇒ `cvUnauthorized`; 408/429/5xx ⇒ `cvOffline` (transient, trips the breaker); 3xx ⇒ `cvOffline` + one-time stderr hint ("remote redirected; use the final URL"); 2xx with wrong `Content-Type` / undecodable / oversized body ⇒ `cvCorrupt`; PUT 2xx ⇒ `cvOk`, 409/412 ⇒ best-effort non-ok (first publisher wins, documented), 413 ⇒ `cvCorrupt`; a `put` pre-check skips entries over the body cap. **No HEAD** (conditional GET is folded in; nothing calls HEAD). `s3` (same contract over the S3 object API; settings `endpoint` — absent ⇒ AWS default host, present ⇒ e.g. `http://minio.local:9000` — and `path-style` — default `#true` when `endpoint` is set; `probe` via ListObjectsV2 prefix listing). **`storageFormatVersion` is a NEW integer covering the `StoredEntry` wire shape — distinct from RFC-0004's `resultCacheFormatVersion` and coupled to it by the §Integrity rule.** Because the version is a URL path segment, **a format bump is transparent to a mixed fleet**: old binaries keep reading/writing `<base>/<N>/…`, new ones `<base>/<N+1>/…`; the old prefix is cleaned by a backend lifecycle rule once the fleet has rolled (operator guide). The in-process **fake server** double (configurable status/headers/body/size per call; validates method/Content-Type/auth header) catches real-server mismatches.
+- **Concurrent PUT idempotency:** the wire key is `<storageFormatVersion>/<soundnessKey>` only; two publishers may mint different-but-equally-valid attested entries for one key; last-writer-wins among entries that pass integrity + trust is sound (§Integrity). The put rule guarantees an *unattested* entry never overwrites an attested one on a `verifyTrust` tier.
+- **`TieredCache` wiring in `api.nim`** via `configuredCache`; backfill-on-hit + `verified`-bit rule active. `--no-remote-cache` drops all non-L1 tiers (local cache still active). (The `file://` two-tier path lands in **A3c**; C3 extends the same wiring to http/s3 and the trust block.)
+- **Ledger staleness under high hit rates (resolved, documented).** `appendAttemptRow` fires only on live execution; a `cdmHit` never refreshes the ledger, so `--shard`'s LPT balancing reads older duration samples as hit rates rise. Shard *correctness* is unaffected; an unchanged test's duration is stable, so the degradation is marginal. 0005 **accepts this** (the ledger records executions, not cache events). If ledger pruning ever evicts a cached test's last sample, `durationOf` may fall back to the hit's `CachedResult.durationMs` at plan time — a follow-on. Clock-skew corollary: a skewed publisher's `cachedAt` would drive L1 age-GC after backfill ⇒ `gcResultCache` orders LRU by local file mtime, not payload `cachedAt` (B1, same walk).
 
 ### Secure-by-default (a soundness/security stance, not a fork — [[no-fake-forks-soundness]])
 
-**Reading** a remote tier needs only a read-scoped credential; **publishing** requires a *write-scoped* credential, and there is **no `--publish` flag** — you publish iff you hold a write credential (`ceUnauthorized` `put` → no-op `false`, run still serves reads). This makes "poison the shared cache from a dev laptop" structurally impossible. The publish gate (`isFullyAchieved && attempt-1`) is *upstream* of credentials — credentials gate *transport*, the gate decides *storability*; an entry must clear both. Signing/read keys come from **environment**, never config files.
+**Reading** a remote tier needs only a read-scoped credential; **publishing** requires a *write-scoped* credential, and there is **no `--publish` flag** — you publish iff you hold a write credential (`cvUnauthorized` `put` → no-op, run still serves reads). This makes "poison the shared cache from a dev laptop" structurally impossible. The publish gate (`isFullyAchieved && attempt-1`) is *upstream* of credentials — credentials gate *transport*, the gate decides *storability*; an entry must clear both. Signing/read keys come from **environment**, never config files, and are removed from the process env once resolved (§TrustPolicy).
 
-### Configuration
+**Unsigned S3/MinIO has no transport-level write authorization.** Without SigV4 no credential is ever transmitted, so the IAM read/write split does not exist for this adapter; anyone who can reach the bucket can PUT. Therefore: **a verifying tier with a non-`none` policy is a hard requirement whenever the unsigned-`s3` adapter is used** (`configuredCache` rejects `s3://` + `policy "none"` / explicit `verify-trust #false`), and in that mode **the signing key *is* the effective write credential**: an unattested or foreign-signed object is never served (and — put rule — never written by crisol itself), so poisoning degrades to storage litter, which is the bucket/network ACL's job. The IAM-policy story applies only to the SigV4 follow-on.
+
+### Configuration (round 3 — flat top-level grammar, matching the landed config and RFC-0006 D6)
+
+The landed KDL grammar is **flat scalars** (`max-cache-entries`, `cache-max-age-days`, `ledger-max-age-days`, `rlimit-nofile` — `config.nim:505-527`) plus **1-deep blocks** (`group "unit" { }`, `perf-check { }`, `reuse-check { }`), with **config key == CLI flag name** (`retries`, `jobs`, `rlimit-nofile`). RFC-0006 round 2 (D6) explicitly chose flat scalars "to match LANDED resultcache, NOT the unlanded 0005 block." A nested `cache { remote … trust … telemetry … }` would be the first 2-deep block, would break key==flag naming, and would leave two cache knobs flat and the rest nested — the one wrong answer. So:
 
 ```kdl
-cache {
-    remote "team-s3" {                 // a named tier appended after local L1
-        url "s3://ci-cache/crisol"     // SCHEME selects the adapter; no redundant `backend` field
-        trust {
-            policy "ed25519"           // none | hmac | ed25519
-            pinned-key "…base64…"      // repeatable; verify against this set
-            // sign-key from $CRISOL_CACHE_SIGN_KEY (env, never config) when publishing
-        }
-        verify-trust #true             // this tier's entries must verify (default #true for a configured remote)
-        backfill-on-hit #true
-    }
-    telemetry {
-        hit-rate #true
-        explain-miss #true
-        verify-cache-pct 5
-    }
+remote-cache "team-s3" {            // a named tier appended after local L1; repeatable (modelled on `group`)
+    url "s3://ci-cache/crisol"      // SCHEME selects the adapter
+    endpoint "http://minio.local:9000"   // s3 only; absent ⇒ AWS default host
+    path-style #true                // s3 only; default #true iff endpoint set
+    verify-trust #true              // default: (cache-trust.policy != "none")
+    backfill-on-hit #true
 }
+remote-cache "mirror" {
+    url "https://cache.example.com/crisol"   // http: bearer token from $CRISOL_CACHE_TOKEN_MIRROR (or $CRISOL_CACHE_TOKEN)
+}
+cache-trust {                       // CACHE-GLOBAL (one policy per TieredCache); optional, default none
+    policy "ed25519"                // none | hmac | ed25519
+    pinned-key "…base64…"           // repeatable; ed25519 verifies against this set (signer == this string)
+    // key-id "ci-2026"             // hmac only: the operator-chosen signer label
+}
+cache-stats #true                   // ↔ --cache-stats
+explain-miss #true                  // ↔ --explain-miss
+verify-cache-pct 5                  // ↔ --verify-cache-pct
+env-pin "TERM" "dumb"               // repeatable; ↔ --env-pin NAME=VALUE (§Key portability)
 ```
 
-Flags: `--no-remote-cache`, `--explain-miss`, `--verify-cache[=PCT]`, `--verify-cache-strict`, `--cache-stats`. CLI > env > config.
+Flags: `--no-remote-cache`, `--explain-miss`, `--explain-miss-verbose`, `--verify-cache`, `--verify-cache-pct N`, `--verify-cache-seed N`, `--verify-cache-strict` (requires `--verify-cache`), `--cache-stats`, `--env-pin NAME=VALUE` (repeatable). CLI > env > config. Flag grammar matches `src/crisol.nim`'s existing parser (bare booleans + required-value flags). `file://` URLs follow crisol's POSIX-only execution model. An older crisol reading a config with these keys only *warns* on unknown top-level nodes (`config.nim:533`) — graceful. Each slice that adds a key/flag also updates `usage()` (`crisol.nim:138-220`) and `config.nim`'s header KDL reference.
 
-### Remote cache deployment (operator guide — Breadth F12)
+### Remote cache deployment (operator guide)
 
-Analogous to RFC-0004's §CI deployment. To stand up a shared cache:
-- **S3:** create a bucket; a **read** IAM policy (`s3:GetObject`, `s3:ListBucket` on the prefix) for consumers; a **write** policy (adds `s3:PutObject`) for publishers; supply creds via standard AWS env (`AWS_*`). Read-only consumers get the read policy only — they cannot publish regardless of flags.
-- **ed25519 keys:** generate a keypair (e.g. `openssl genpkey -algorithm ed25519`); the secret goes in the publisher's `$CRISOL_CACHE_SIGN_KEY` (CI secret); the public key(s) go in every consumer's `pinned-key` config. **Never** add `$CRISOL_CACHE_SIGN_KEY` to the env allowlist.
-- **Key rotation** (Breadth F4): add the new public key to `pinned-key` alongside the old (dual-pinned window), cut publishers over to the new secret, then drop the old public key. Entries signed with the dropped key become misses (self-healing: re-run re-publishes under the new key) — costs cache warmth, never correctness. **ed25519 rotation is incremental; HMAC rotation is a full cold-cache event** (all prior HMACs invalid at once) — a concrete argument for ed25519.
-- **Compromise / poison response** (Breadth F5): crisol has no `put`-time poisoning path (the gate), but a storage-layer compromise or a pre-`verify-trust` bad entry is purged **backend-side** (delete the S3 object / HTTP resource), or globally via key rotation (drops every old-key entry on `verify-trust` tiers). `CacheBackend.delete` exists but a `crisol cache <delete|stat|push>` CLI is a **deferred follow-on**, not 0005 scope — documented so operators know the manual path.
-- **`--shard` × remote** (Breadth F7): shard selection determines which entrypoints *reach* the cache lookup; the cache is keyed by `SoundnessKey` (not shard membership), so any shard can hit any entry. A full-coverage warm-up requires a full (unsharded) run or all shards completing — documented so "warm cache, still cold for my shard's-complement" is not a surprise.
+- **Toolchain identity (round 3):** all hosts sharing an L2 must run the **same nim build artifact** (the key includes a content hash of the nim binary — two distro packages of "2.2.10" never match) and the same cc + libc. Pin the toolchain image. `--explain-miss` names `kcNimVersion`/`kcCcVersion` when this is the cause.
+- **Environment parity (round 3):** cross-host hits require equal values for every allowlisted variable (`HOME LANG LOGNAME NIM_CONFIG_DIR NIMBLE_DIR PATH TERM TZ USER LC_*`). Same-image CI runners match by construction; for laptop↔CI or heterogeneous runners, `env-pin` the ones that differ (typically `USER`, `LOGNAME`, `TERM`, `TZ`, `LANG`, and `PATH`/`HOME` if they differ). `--explain-miss` lists the offending names. `dep-roots` at different absolute locations never share keys (follow-on).
+- **S3 (unsigned/MinIO, what ships in 0005):** create a bucket; restrict reachability by network/bucket policy (the *only* transport-level control); **configure `cache-trust` with a verifying policy** (required); give publishers the signing secret, consumers only the pinned public keys. **Local dev:** `podman run -p 9000:9000 minio/minio server /data`, `url "s3://crisol/cache"`, `endpoint "http://localhost:9000"`. The **SigV4 follow-on** adds the IAM story: a **read** policy (`s3:GetObject`, `s3:ListBucket` on the prefix) for consumers; a **write** policy (adds `s3:PutObject`) for publishers; creds via standard `AWS_*` env.
+- **http:** any content-addressed blob store that accepts `GET`/`PUT` on `<base>/<storageFormatVersion>/<key>`; read-only consumers get a read token (or none, for a public read mirror), publishers a write token, via `$CRISOL_CACHE_TOKEN[_<TIER>]`. Redirects are not followed — configure the final URL.
+- **Latency:** with `probe` (s3) one listing per run; without (http) one bounded round-trip per consulted entrypoint on a slow-alive remote; an offline remote costs one deadline per run (breaker). Remote writes flush at end of run.
+- **Multi-project buckets:** one project's entry served to another with *identical* `SoundnessKey` inputs is **sound by construction**. Nonetheless give each project its own URL prefix (`s3://bucket/<project>`) as operational hygiene: separate write credentials, rotation/deletion/lifecycle blast radius.
+- **ed25519 keys:** the secret is a **32-byte seed** (RFC 8032; sello's `keypair(seed)` derives the public key) — generate with `head -c 32 /dev/urandom | base64`, or extract from an OpenSSL key (`openssl genpkey -algorithm ed25519 -outform DER | tail -c 32 | base64`). The seed goes in the publisher's `$CRISOL_CACHE_SIGN_KEY` (CI secret); the public key(s) go in every consumer's `pinned-key` config. **Never** add `$CRISOL_CACHE_SIGN_KEY` (or `$CRISOL_CACHE_HMAC_KEY`, `$CRISOL_CACHE_TOKEN*`) to any env passthrough; crisol strips `CRISOL_CACHE_*` from child envs at every hermeticity level anyway.
+- **Key rotation:** add the new public key to `pinned-key` alongside the old (dual-pinned window), cut publishers over, then drop the old key. Entries signed with the dropped key become misses (self-healing: re-run re-publishes). **ed25519 rotation is incremental; HMAC rotation is a full cold-cache event.**
+- **Format bumps:** transparent to a mixed fleet (version is a URL path segment); once rolled, add a lifecycle/expiry rule for `<base>/<old-N>/`.
+- **Compromise / poison response:** crisol has no `put`-time poisoning path (the gate + put rule), but a storage-layer compromise is purged **backend-side** (delete the object), or globally via key rotation. A `crisol cache <delete|stat|push>` CLI is a **deferred follow-on** — documented so operators know the manual path.
+- **Concurrency one-liners:** two `crisol run`s on one project/host ⇒ exit 3 via the stateDir lock (unchanged); two projects on one host sharing a `file://` L2 ⇒ safe by `<key>.<pid>.tmp` + `rename` (NFSv3+ required for `O_EXCL`); CI matrix shards sharing one L2 publish disjoint subsets; a `file://` L2 on a hung NFS mount has no deadline (use http/s3 for anything non-local).
+- **`--shard` × remote:** shard selection determines which entrypoints *reach* the cache lookup; the cache is keyed by `SoundnessKey`, so any shard can hit any entry. A full-coverage warm-up requires a full run or all shards completing.
+- **Backup / sizing / monitoring:** an L2 is a cache — never back it up; ~1–5 KB per entry × (entrypoints × distinct keys per toolchain/flag set); a 30-day lifecycle/TTL is a sane default; archive `cacheStats` from run/v1 and alert on `remoteErrors == total`.
+
+## FORK-2 (OPEN — Corey) — the cold-host consult
+
+**Finding (round 3, five lenses, verified at HEAD).** `lookupAtPlan` consults the cache only for `edRunFresh` (`cachedispatch.nim:225-227`); `edRunFresh` requires the stable binary to exist *and* a fresh depgraph entry (`planner.nim:175-187` — "binary absent ⇒ cdNeverBuilt"; "with an empty graph, every entrypoint is cdNeverBuilt"); and the key's `closureContentHash` is extracted from the nimcache *after* `nim c` (`closure.nim`, `runner.nim:1307-1312`). So a genuinely cold host (no `<stateDir>/bin`, no depgraph — fresh clone, fresh CI runner, empty `CRISOL_STATE_DIR`) **never consults L1 or L2**, compiles and runs everything, and publishes. The round-2 E2E-1 "passes" only because "delete L1" leaves `bin/` + depgraph intact — it proves the multi-tier waterfall, not host-independence. As specified through round 2, the remote tier serves only hosts that already hold a fresh binary + graph but lack the L1 entry. The locked "dispatch UNCHANGED" item in the handoff was accepted on the belief that cold hosts would hit; that belief was wrong — hence an escalation, not an edit.
+
+**Option (a) — ship the post-compile consult in 0005 (stage A2c, 3 sub-slices).** In `pollSlot` on compile exit 0 (`runner.nim:781-785`), *before* `spawnRun`: extract the closure from `slot.cacheDir` + update the graph entry (move the post-run block at `:1306-1315` to run for compiled slots first — a behavior-preserving reorder, A2c-i), derive `d = derive(seams, pep)` from the now-fresh graph and call `seams.load` (A2c-ii, memory seams); on hit: copy the binary to the stable path (`:1296-1304`, preserving the "every `cdmHit` has a stable binary" invariant B3 relies on), synthesize (`cached = true, compileSkipped = false, cacheDecision = cdmHit, cacheTier`), finalize without spawning the run, write no ledger attempt row (the ledger records executions; the RFC-0006 compile-cost row is still written); on miss: `spawnRun` as today; trust codes flow to `cacheLookup`. `EntrypointDecision` stays a plan-time sum (the result fields already represent "compiled, run skipped"). A2c-iii = the real cold-host E2E-1 (below). C3c's prefetch must also cover these post-compile keys (`probe` once at plan time over *all* eligible keys; nil-probe tiers pay one bounded GET per compiled entrypoint on that slot's path). Cost: runner hot-path surgery (`pollSlot`), overlap with RFC-0006's compile machinery, ~3 slices. Payoff: the CI-matrix headline becomes true for the *run* phase on a truly cold host; compile is still paid (the key is a compile byproduct) — and per MEMORY amoxtli is compile-bound, so the realized win there is modest until RFC-0006's nimcache reuse is itself shareable (out of scope).
+
+**Option (b) — rescope 0005 honestly; open the post-compile consult as its own small RFC.** Keep dispatch untouched; the Summary/Motivation already state the honest scope (applied in round 3 regardless of this fork); E2E-1 becomes the "lost-L1, warm-bin" test plus an explicit "cold stateDir ⇒ `cdmNotEligible`, remote never read" negative assertion so nobody mistakes it for cross-host proof; Non-Goals gains "cold-host consult". The follow-on RFC gets its own design pass on `pollSlot`.
+
+**Recommendation:** **(a)**. The liveness standing order is exactly this case — a mechanism whose producer is not on a named slice ships green-but-inert; the post-compile consult *is* the producer of the RFC's load-bearing property, it is first-principles correct (a hit never needs a run; the post-compile key equals the store-key by construction), and its soundness is the same gate. The cost is real (runner surgery) and it is Corey's risk call because it reverses a locked item, so it is surfaced rather than applied. **E2E-1 under (a):** Run 1 in project P1 / stateDir S1 (live, `cdmStored`, entry in L1+L2). Run 2 in a *copy* of the project at P2 with `CRISOL_STATE_DIR=S2`, different cwd: `compileSkipped == false`, `cacheDecision == cdmHit`, `cacheTier == "l2"`, `attempts == 0`, binary now present in `S2/bin`, S2's L1 backfilled. Run 3 in P2/S2: `cacheTier == "l1"`, `compileSkipped == true`. Secondary: delete `S2/cache/v<N>/` only ⇒ `cacheTier == "l2"` again. **Under (b):** the secondary assertion is E2E-1 entire, plus the negative cold-stateDir assertion.
 
 ## Hard constraints (every slice respects)
 
-- **`SoundnessKey` = sole content address.** No backend, tier, trust policy, or serializer participates in key derivation. The 9-component `KeyInputs` is untouched.
-- **Only `isFullyAchieved && attempt-1 pass` may PUBLISH.** `shouldStore` is unchanged and runs *before* `put`; the trust layer only *signs* what the gate already approved.
-- **Run NEVER blocks on remote.** Timeout/offline/miss are indistinguishable to the *control* path (the `CacheBackend` total-function contract); the `err` field feeds observability only, never control flow.
-- **No network or hot-path disk in the test suite.** Boundary tests use the `memory` adapter; http/s3 test against the injected in-memory `HttpFetcher`/fake server. `--verify-cache` runs off the hot path.
-- **Entrypoint-granularity / binary-opaque identity preserved** (MEMORY.md → [[boundary-granularity-discriminator]]). No per-test/sub-binary anything; trust/attestation never reaches into test internals (it signs the opaque `(key, payload-hash)`, nothing test-semantic).
-- **`lookupAtPlan` / `shouldStore` / `CacheContext` / `inactiveDecision` unchanged.** Additive only: `CacheDecision += cdmTrustFail`; `EntrypointResult += cacheTier`.
-- **Secrets never in config files; signing keys never in the env allowlist.**
+- **`SoundnessKey` = sole content address.** No backend, tier, trust policy, or serializer participates in key derivation. The 9-component `KeyInputs` is untouched (A0's `env-pin` changes the *values* the existing component hashes, not the components).
+- **Only `isFullyAchieved && attempt-1 pass` may PUBLISH.** `shouldStore` is unchanged and runs *before* `put`; the trust layer only *signs* what the gate already approved; the put rule additionally refuses unattested writes to verifying tiers.
+- **Run NEVER blocks on remote.** Deadline per call + per-tier circuit breaker + deferred remote puts; timeout/offline/miss are indistinguishable to the *control* path; verdicts feed observability only.
+- **No network or hot-path disk in the test suite.** Boundary tests use the `memory`/`memoryBytes` adapters; http/s3 test against the injected in-memory `HttpFetcher`/fake server; C1b's loopback listener is the single sanctioned socket. `--verify-cache` runs off the hot path.
+- **Entrypoint-granularity / binary-opaque identity preserved** ([[boundary-granularity-discriminator]]). No per-test/sub-binary anything; trust signs the opaque `(key, payload-hash)`.
+- **`lookupAtPlan`'s decision logic / `shouldStore` / `CacheContext` / `inactiveDecision` unchanged.** The seam re-types to `KeyDerivation`/`CacheLookup`; additive: `EntrypointResult += cacheTier, cacheLookup`; no new `CacheDecision` variant. (`pollSlot` changes only under FORK-2 (a).)
+- **One on-disk/on-wire format** (`CacheSerializer`), backward-readable by RFC-0004 readers; `resultCacheFormatVersion` bump ⇒ `storageFormatVersion` bump (static assert).
+- **Secrets never in config files; resolved once in `api.nim`, then removed from the process env; `CRISOL_CACHE_*` stripped from every child env at every hermeticity level; the cache modules never read env.**
+- **A shipped mechanism has a producer slice.** Every flag, KDL key, telemetry event, fixture, and latency mitigation named in this RFC is assigned to a slice in §Stages & slices; "documented optimization" is not a slice.
 
 ## Non-Goals (explicit for 0005)
 
-- **Distributed *execution*** (remote workers running tests). `--shard` remains the only run-distribution primitive; crisol distributes the *cache*, not the *work*.
+- **Distributed *execution*** (remote workers). `--shard` remains the only run-distribution primitive.
+- **Cold-host *compile* reuse.** The key is a compile byproduct; a truly cold host always compiles. (Whether 0005 ships the post-compile *run* consult is FORK-2.)
+- **Default env pinning** (`HOME`/`PATH`/`USER`…): the `env-pin` knob ships; defaults stay RFC-0004's. **`dep-roots` absolute-path portability** — follow-on.
 - **Full Sigstore/Rekor.** ed25519 ships; `SigstorePolicy` type-locked behind `when defined(crisolSigstore)` — no stub.
 - **msgpack (or any non-JSON) serializer.** The port exists; only JSON ships.
-- **A `crisol cache` introspection/purge CLI.** `backend.delete` exists; the CLI surface (push/pull/stat/delete a key) is a follow-on. Poison cleanup is backend-side or via rotation (documented).
-- **`TestRecord.msg` redaction before remote publish** (Breadth F6, documented consumer contract): crisol is binary-opaque and does **not** filter captured test output before shipping `CachedResult.records` to a shared tier. Teams whose test output may contain secrets/PII must set `cacheable #false`, omit a remote tier for those groups, or not emit sensitive data. (A future `obfuscate-records` tier option — ship key+outcome+duration, drop messages — is noted as a candidate, deferred.)
+- **A `crisol cache` introspection/purge CLI.** Poison cleanup is backend-side or via rotation (documented).
+- **`TestRecord.msg` redaction before remote publish** (documented consumer contract): crisol is binary-opaque and does **not** filter captured test output before shipping `CachedResult.records` to a shared tier. Teams whose test output may contain secrets/PII must set `cacheable #false`, omit a remote tier for those groups, or not emit sensitive data. (A future `obfuscate-records` tier option is noted, deferred.)
 - **History dashboards / OTel span export.** Telemetry is a `TelemetrySink` + summary line + `run/v1` field; rich sinks follow on.
-- **Remote-tier eviction/TTL.** A backend concern (S3 lifecycle, server TTL); `--verify-cache` never evicts; local GC stays RFC-0004 A1c.
+- **Remote-tier eviction/TTL/GC.** A backend concern (S3 lifecycle, server TTL); `--verify-cache` never evicts; local GC stays RFC-0004 A1c (local-fs-internal; `list`/`delete` are not on the port).
+- **Select-drained concurrent remote lookups / a configurable remote deadline / SigV4 S3** (follow-on slices; see §Alternatives).
 - **Negative-cache / bloom filter for misses** (deferred; see §Alternatives).
+- **Cross-host `explainMiss`** (explaining a *remote* miss): the remote is not path-indexed; B1's sidecar explains same-host misses, seeded from remote hits on backfill.
+- **Ledger rows for cache hits** (shard-balance freshness under high hit rates): accepted staleness, documented in §Stage C.
+- **Per-tier trust policies** (trust is cache-global; per-tier would require backfill to re-sign).
+- **Library-level `RunOptions.cacheRuntime` injection** (follow-on once the port survives Stage C; tests use the internal `runTestsWith`).
 - **Any per-test / sub-binary feature** (standing crisol Non-Goal).
 
-## Alternatives considered (Breadth F14)
+## Alternatives considered
 
-- **Negative-cache / bloom filter for known-misses.** Would eliminate the per-miss remote round-trip on a cold suite. Deferred: the plan-time `list()` prefetch already collapses N lookups to one call where the backend supports it, and the sync-with-deadline contract bounds the worst case; a bloom filter adds staleness/complexity for a marginal gain over prefetch. Reopen if large-suite cold-start latency proves dominant.
-- **Conditional GET (ETag / `If-None-Match`).** Collapses HEAD-then-GET into one round-trip per miss. Folded into the `http` adapter as an internal optimization (the content-addressed URL makes the key its own ETag), not a separate design axis.
-- **Content-addressed dedup / payload compression over the wire.** The `SoundnessKey` already deduplicates by content; gzip on the JSON payload is an adapter-internal `Content-Encoding` concern, deferred.
-- **Single shared integrity-or-trust mechanism.** Considered collapsing `payloadChecksum` into the signature (drop FNV when signed). Rejected: FNV guards *untrusted* tiers (local L1, `verify-trust:false`) where no signature exists; the two layers guard different transports and are reconciled by the recompute-bound canonical hash (§Integrity vs. trust).
+- **Negative-cache / bloom filter for known-misses.** Would eliminate the per-miss remote round-trip on a cold suite. Deferred: `probe` collapses N lookups to one call where the backend supports it, and the deadline + breaker bound the worst case; a bloom filter adds staleness/complexity for a marginal gain. Reopen if large-suite cold-start latency proves dominant.
+- **Select-drained concurrent lookup pass (round 2's B0 (c)).** Rejected for 0005 (round 3): needs a second, incremental HTTP state machine, a new port capability, and a non-blocking TLS path `std/net` does not expose — a round, not a slice. Breaker + probe + honest per-key latency replace it; revisit with measurements.
+- **Conditional GET (ETag / `If-None-Match`).** The content-addressed URL makes the key its own ETag; no separate design axis — not implemented in 0005 (nothing calls it), noted for the http adapter.
+- **Content-addressed dedup / payload compression over the wire.** The `SoundnessKey` already deduplicates; gzip is an adapter-internal `Content-Encoding` concern, deferred.
+- **Single shared integrity-or-trust mechanism.** Rejected: FNV guards *untrusted* tiers where no signature exists; the two layers guard different transports and are reconciled by the recompute-bound canonical hash.
+- **Dual on-disk format for local-fs (bare RFC-0004 file for `verify-trust:false`, `StoredEntry` for `verify-trust:true`).** Rejected (round 3): two codecs for one adapter; the superset-with-optional-keys format is backward-readable and single.
+- **Closure-local `key → KeyInputs` memo in `realSeams` to avoid re-typing the seam.** Rejected (round 3): hidden state keyed by the value it explains; the seam re-type is one atomic slice and gives the wire entry, the sidecar, and `explainMiss` their inputs honestly.
+- **`RunOptions.cacheRuntime` for test injection.** Rejected (round 3): leaks internals into the contracted facade before they have survived Stage C.
 
 ## Stages & slices
 
-**Stage A leaves the suite green at every slice** (port refactor; behavior-identical local path); **B is additive observability** (may interleave once A3 lands); **C is the network-touching tail, gated on the crypto decision.** Prereq: **issue #1** (`SlotState` enum dispatch hardening) lands first, independently.
+**Order (round 3): B3 → A0 → A1 → A2a → A2b → B1 → B2a/B2b → A3a → A3b → A3c → [A2c under FORK-2 (a)] → C-dep → C4 → C5a/b/c → C1a → C1 → C1b → C2 → C3a/C3b → C3c → C6.** Every slice leaves the suite green; each is one `/tdd` vertical slice (one agent, one commit). Prereq: **issue #1** (`SlotState` enum dispatch hardening) lands first, independently. **Pre-flight before A1 (round 3):** `milpa verify` currently fails (`LOCK-DEP-IDENTITY-INVALID`, stale epoch-1 identity; `_deps/nkdl` is a dangling absolute symlink to the old CAS layout) — run `milpa fetch`, which re-links `_deps/*` as *relative* symlinks; `./dev` must then mount `$PROJECT_DIR` at `$PROJECT_DIR` (`--volume "$PROJECT_DIR:$PROJECT_DIR" --workdir "$PROJECT_DIR"`) so relative CAS links resolve in-container (its "symlinks use ABSOLUTE host paths" comment is now false).
 
-**Fixture/double inventory (build before consuming slices):** the `memory` `CacheBackend` (`Table[SoundnessKey, StoredEntry]`); a **controllable mock `TrustPolicy`** (verify-returns-configurable — for A3's security-rule tests before real crypto exists); the in-memory **`HttpFetcher`/fake server** (validates method/status/Content-Type/auth — for C1/C6); a **nondeterministic fixture** (passes attempt 1, diverges on re-run — feeds `--verify-cache`); an **ed25519 keypair fixture** (signer secret + its public + a *second, unpinned* public for the reject test) — *built in C5 once the crypto dep is chosen*.
+**Definition of done — end-to-end, through `runTests`/the CLI, not a passing unit suite:**
+- **E2E-B (observability; lands across B1/B2b/B3):** run 1 live; run 2 with `--cache-stats` shows 1 L1 hit / 0 misses; change a flag, run 3 with `--explain-miss` prints `kcFlags` with prev/curr; change an allowlisted env var, run 4 prints `kcHermeticEnv` naming the variable; `--verify-cache --verify-cache-pct 100` on the nondeterministic fixture reports a divergence and `--verify-cache-strict` exits 1; deterministic fixture ⇒ no event; `--json` keeps stdout parseable.
+- **E2E-1 (two-tier `file://`; lands in A3c — form depends on FORK-2, see there):** under (a) the cold-host three-run sequence with a second stateDir/project copy; under (b) the lost-L1 sequence plus the negative cold-stateDir assertion. Both: offline variant (`url` → a regular *file* at the path ⇒ `ENOTDIR` ⇒ run proceeds live, `cacheLookup == "offline"`, the 100 %-error warning fires). Zero network, zero crypto.
+- **E2E-A-trust (mock policy; lands in A3b):** two `memory` tiers via `runTestsWith`, mock `TrustPolicy` returning `cvTrustBadSignature` ⇒ live execution, `cacheLookup == "trustBadSignature"`, `cacheDecision == cdmStored`, the rejected entry never served.
+- **E2E-2 (a forged entry is never served; lands in C4, repeated in C5b):** two `file://` tiers, `cache-trust { policy "hmac" key-id "t" }`, secret via env, L2 verifying (default). Run 1 publishes an attested entry to L2. **Flip one payload byte in the L2 file and recompute `payloadChecksum`**; delete `S/cache/v<N>/` only. Run 2: `verify` fails ⇒ miss ⇒ live ⇒ `cacheLookup == "trustBadSignature"`, `cacheDecision == cdmStored` (self-heal re-publish), `cacheStats` distinguishes it from a cold miss. Negative control: bare byte-flip ⇒ `cacheLookup == "corrupt"`. C5b repeats under ed25519 with an unpinned second signer (`"trustUnpinnedSigner"`). Also: a no-secret consumer run against the verifying L2 ⇒ `published == 0` for that tier (put rule).
+- **E2E-3 (remote over the wire; lands in C3b):** `http`/`s3` remote configured in KDL, driven through `runTestsWith(testRegistry(fakeFetcher))` — hit / miss / offline (breaker trips once) / unauthorized-put / oversized-body paths; `--no-remote-cache` reverts to local-only.
 
-**Stage A — port skeleton (green throughout):**
-- [ ] **A1** `cacheport.nim`: all port types (`CacheBackend`/`BackendGet`/`BackendPut`/`CacheError`/`StoredEntry`/`Attestation`/`BackendConfig`/`TierConfig`/`TieredCache`/`TierHit`/`TrustPolicy`/`CacheSerializer`/`TelemetrySink`) + `memory` adapter + `nonePolicy` + `NilSink` + the canonical payload-hash recompute helper. `getWithProvenance`/`put` over a single `memory` tier. Boundary-tested: roundtrip, miss→`(none, ceMiss)`, checksum-recompute-mismatch→`(none, ceCorrupt)`, storageFormatVersion-mismatch→miss. Pure module.
-- [ ] **A2a** `local-fs` adapter wrapping `loadCached`/`storeCached` (bypasses `CacheSerializer`; strips attestation for `verify-trust:false`). Satisfies the *same* roundtrip/miss/corrupt boundary suite as `memory`. No `realSeams`/`api` change yet — suite green.
-- [ ] **A2b** *(atomic multi-file)* `realSeams` gains `(TieredCache, TelemetrySink)` params, composes `load`/`store` over `tc`; `api.nim` builds `localOnlyCache(stateDir)` + `NilSink`; **update the direct `realSeams` callers in `tests/unit/test_cachedispatch.nim` and `test_api.nim` in the same commit.** ALL existing RFC-0004 cache tests green. (Characterize call sites first — confirmed: those two test files.)
-- [ ] **A3** multi-tier `getWithProvenance`: waterfall + `backfill-on-hit` + **`verified`-bit backfill rule**, via two `memory` tiers and the **controllable mock `TrustPolicy`** (so the security case — unverified entry refused at a `verify-trust:true` destination — is actually exercised). `BackendRegistry` + scheme-resolved `buildBackend`. Exhaustive 2×2×2 backfill matrix. Add `cdmTrustFail` to `CacheDecision`; populate `cacheTier`.
-- [ ] **A4** point `gcResultCache`/orphan-clean at `backend.list`/`backend.delete` (nil-capability tiers skipped; sidecar files included once B1 lands). Boundary-tested against `memory` + the nil-capability case.
+**Fixture/double inventory (built in the slice that first consumes each):** `memory` + `memoryBytes` backends (A1); the controllable mock `TrustPolicy` (A3a); the `ENOTDIR` offline fixture (A3c); the **nondeterministic fixture** (passes attempt 1, diverges on re-run — the inverse of `tests/fixtures/flaky_once.nim`) (B3); the configurable **fake server** behind `HttpFetcher` (status/headers/body/size per call; validates method/Content-Type/auth; `toUnreachable`/`toTimeout` on demand) + a large-`records[]` fixture (C1); the **ed25519 keypair fixture** (fixed 32-byte seeds through sello's `keypair(seed)`: signer + a *second, unpinned* key) (C5a); a `CacheSecrets` env-scrub assertion helper (C3b). Test files grow in place — one `test_cachetier.nim` across A1/A3a, one `test_cachelocalfs.nim` across A2a/B1, one `test_cachetrust.nim` across C4/C5a/b/c, one `test_cachehttp.nim` across C1/C6 — each new test file is a full `nim r` compile in `./dev test`, and sello's field arithmetic is not cheap to compile.
 
-**Stage B — observability (additive; may interleave with A3+):**
-- [ ] **B1** path-keyed `KeyInputs` sidecar (local tier, `flagHash→KeyInputs` map) + `keyInputs{To,From}Json` (manual, no jsonutils) + `explainMiss(prev,curr)` (PURE) + `--explain-miss` render + graceful degrade. `explainMiss` exhaustively vector-tested (each of 9 components; flag-change case; multi-component; no-diff); sidecar roundtrip + flag-change-surfaced tested via the local-fs boundary suite.
-- [ ] **B2** telemetry: adapter-emitted events aggregated into the summary line (L1/remote/miss/**remote-errors**/%/wall-saved/published) + `cacheStats` in `run/v1` + `--cache-stats` + stderr warning on 100%-remote-error. Tested via `InMemorySink`.
-- [ ] **B3** `--verify-cache[=PCT]` + `--verify-cache-strict`: deterministic-seeded sample of `cdmHit` entrypoints, **synthetic `RunPlan` from first-run `PlannedEntrypoint`s**, `cache=cacheDisabled`, `--retries 0`, isolated sink, **post-run**, `verifyFail`→stderr+summary+(strict⇒exit 1), never-evict. Integration-tested with the nondeterministic fixture (divergence⇒signal; deterministic⇒none). (C0 must land first — re-entrancy.)
+**Stage B first — `--verify-cache` (zero port dependency):**
+- [ ] **B3a** *(`api.nim` + `runner.nim` + `types.nim`)* pure sampler (seeded, `max(1, …)`) + synthetic-plan builder (`RunPlan(entrypoints: sampled, jobs: 1)`, `pep.retries = 0`) + `execute(recordLedger = false)` knob + `VerifyCache` options object. Unit-tested (sampler vectors; synthetic plan shape; ledger untouched).
+- [ ] **B3b** *(`api.nim` + fixture + integration test)* the post-run pass: `cache = cacheDisabled`, no-op `onResult`, isolated sink, placement after `persistLastRun` and before `releaseLock`, `RunReport.verifyDivergences`, `tekVerifyFail` ⇒ stderr even under `NilSink`. Nondeterministic fixture ⇒ divergence; deterministic ⇒ none; sampled entries take `spawnRunDirect` (asserted).
+- [ ] **B3c** *(`crisol.nim` + `config.nim` + `jsonout.nim`)* `--verify-cache`, `--verify-cache-pct N`, `--verify-cache-seed N`, `--verify-cache-strict` (requires `--verify-cache`, `ExitEnvironment` otherwise), KDL `verify-cache-pct`, `verifyFails` in run/v1 (`schemaRevision` 13 — see A3b for the shared bump), `usage()` + config header. E2E-B verify half.
 
-**Stage C — remote + trust (network-touching tail; gated on §Open forks):**
-- [ ] **C0** *(design slice)* pin remote-I/O concurrency: sync-with-deadline default vs. opt-in bounded prefetch pool; verify `execute()` re-entrancy for B3's synthetic-plan pass. Written rationale in RFC + `cacheport` doc comment. No functional code.
-- [ ] **C-dep** *(dependency-decision slice — RESOLVE §Open forks FIRST)* add the chosen crypto lib(s) to `milpa.kdl` (+ Dockerfile if FFI/system lib); compile-only smoke test importing the primitives against a known test vector (HMAC-SHA256 + ed25519 sign/verify). Gate for C4/C5.
-- [ ] **C1a** Dockerfile `libssl-dev` + `-d:ssl` build flag; verify the image builds and `std/httpclient` links. No adapter logic.
-- [ ] **C1** `http` adapter via injected `HttpFetcher` (GET/PUT/HEAD, `<base>/<storageFormatVersion>/<key>`, `Content-Type: application/json`, deadline, total-function `CacheError`) + JSON `CacheSerializer`. Tested against the in-memory fake server (no socket).
-- [ ] **C2** `s3` adapter (same contract). **Scope per §Open forks:** unsigned/MinIO path-style first (no SigV4), OR SigV4 (needs C-dep HMAC, reorder after C4). Tested against the fake (S3 codec).
-- [ ] **C3** `configuredCache` wiring in `api.nim` + KDL `cache { remote { … } }` parse + CLI/env override. Integration-tested: configured tier participates; `--no-remote-cache` reverts to local-only; offline remote ⇒ miss (`ceOffline` in stats), run proceeds.
-- [ ] **C4** `TrustPolicy`: `nonePolicy` + `tokenPolicy` (HMAC-SHA256 via C-dep), canonical signed-envelope `(key,recomputed-checksum,formatVersion,signer)` (shared sign/verify), verify-on-read miss-on-fail, sign-on-put. Boundary-tested: HMAC roundtrip; tamper⇒`ceCorrupt`@step1 / `ceTrustFail`@step2; `verify-trust` tier rejects unsigned.
-- [ ] **C5a** ed25519 `signedPolicy` sign/verify happy path + no-key no-op; `SigstorePolicy` type-locked behind `when defined(crisolSigstore)`. (Keypair fixture built here.)
-- [ ] **C5b** ed25519 rejection cases: tamper-reject, unpinned-signer-reject, signer-mismatch-reject (shared fixture).
-- [ ] **C5c** ed25519 × `verified`-bit backfill interaction (a real-policy unverified entry must not backfill a `verify-trust:true` tier) — the A3 mock replaced by the real policy.
-- [ ] **C6** secure-by-default credential scopes: read vs write; publish iff write-credentialed (`ceUnauthorized` `put`⇒no-op, reads still serve); keys from env only. Tested against the auth-validating fake server.
+**Stage A — port skeleton → seam re-shape → end-to-end spine (green throughout):**
+- [ ] **A0** *(`sandbox.nim` + `config.nim` + `types.nim` + `crisol.nim` + `api.nim`)* `env-pin`: KDL `env-pin "NAME" "VALUE"` (repeatable) + `--env-pin NAME=VALUE` + `RunOptions.envPins`; pins injected in `filterEnv`'s tail and hashed as pinned; `CRISOL_CACHE_*` stripped unconditionally in the same tail. **Key-portability invariance test:** `keyOf` invariant under {stateDir, projectRoot, cwd, TMPDIR value, pinned vars}, varies on an unpinned allowlisted value. `usage()` + header.
+- [ ] **A1** *(`cacheport.nim` + `cachetier.nim` + `cachewire.nim` + `cachememory.nim` + `resultcache.nim` exports)* port types (`CacheVerdict`+sets, `Fetched`, `StoredEntry`/`SigAlg`/`Attestation`, `CacheBackend`+procs, `TrustPolicy`+`nonePolicy`, `TelemetrySink`+`NilSink`, `canonicalPayload`/`envelopeBytes`), the JSON `CacheSerializer` (superset format, `storageFormatVersion`, FNV recompute ⇒ `cvCorrupt`, embedded `resultCacheFormatVersion` ⇒ `cvVersionSkew`, `keyInputs{To,From}Json`, the static version-coupling assert), `Tier`/`TieredCache`/`TierHit`/`CacheLookup` with single-tier `lookup`/`put`, `memory` + `memoryBytes` doubles. `payloadToJson`/`payloadFromJson`/`canonicalPayload` exported from `resultcache.nim` (`loadCached` calls the shared helper). Boundary-tested over both doubles: roundtrip, miss ⇒ `cvMiss`, checksum-recompute mismatch ⇒ `cvCorrupt`, storage/payload version mismatch ⇒ `cvVersionSkew`, pre-0005 file (no optional keys) decodes.
+- [ ] **A2a** *(`resultcache.nim` + `cachelocalfs.nim` + `clean.nim:219` caller + `test_resultcache*.nim`/`test_a1c_gc.nim`/`test_c0_clean_stores.nim`)* root-taking helpers (`loadCachedAt`/`storeCachedAt`/`gcResultCacheAt`; stateDir forms delegate); `localFsBackend(root, autoCreate, maxEntries)` over the serializer; offline semantics (`ENOTDIR` ⇒ `cvOffline`); rate-limited store warning. Satisfies the *same* boundary suite as `memory`/`memoryBytes` + the offline case. No `realSeams`/`api` change yet — suite green.
+- [ ] **A2b** *(atomic: `cachedispatch.nim` + `api.nim` + `cacheregistry.nim` + `tests/support/helpers.nim` + the 4 test files listed in §The spine)* `KeyContext`/`keyContext`/`keyOfProc`; `KeyOfProc → KeyInputs`, `LoadProc`/`StoreProc` → `(pep, KeyDerivation[, res])`, `derive`; `CacheLookup` return; `CacheRuntime{cache, sink}`; `realSeams(ctx, graph, rt)`; `lookupAtPlan` calls `derive` + stamps `d.key`; `api.nim` builds `keyContext(...)` once + `localOnlyCache(stateDir, maxCacheEntries)`; the runner's two call sites pass `pep` + derivation; a test helper wraps the 9 old-shape literals. ALL existing RFC-0004 cache tests green.
+- [ ] **B1** *(`keys.nim` + `cachelocalfs.nim` + `cachewire.nim` + `cachedispatch.nim` adapter + `crisol.nim` + `config.nim` + `types.nim` + render)* — split as **B1a** pure `explainMiss` (+`envDigest` names) in `keys.nim`, exhaustively vector-tested (each of 9 components; flag-change; env-name; multi-component; no-diff); **B1b** the path-keyed sidecar under `inputs/` (tier 0 only; seeded on backfill; pruned in `gcResultCache`'s walk; mtime-ordered LRU) + `CacheLookup.explain` attached on miss — local-fs boundary suite; **B1c** `--explain-miss`/`--explain-miss-verbose` + KDL `explain-miss` + component-aware render (multi-line nimVersion rule) + `usage()`/header. E2E-B explain half.
+- [ ] **B2a** *(`cachetelemetry.nim` + `cachedispatch.nim` adapter)* `tekHit/tekMiss/tekRemoteErr/tekBackfillErr/tekPublish` emitted by the `realSeams` adapters; `CacheStats` aggregation (L1/remote/miss/remote-errors incl. trust codes/total/notConsulted/%/wall-saved/published/verifyFails) — via `InMemorySink`. **B2b** *(`api.nim` + `jsonout.nim` + `crisol.nim` + `config.nim`)* `RunReport.cacheStats` + run/v1 `cacheStats` (`schemaRevision` 14) + `--cache-stats` + KDL `cache-stats` + summary line (stderr in `--json` mode) + the per-tier 100 %-error warning + `usage()`/header. E2E-B stats half.
+- [ ] **A3a** *(`cachetier.nim` only)* multi-tier `lookup`: waterfall + backfill-on-hit + **`verified`-bit backfill rule** + **put rule** + per-tier `verdicts` + `worst` + **circuit breaker** (fake clock) + deferred-put queue, via two `memory` tiers and the **controllable mock `TrustPolicy`**. Exhaustive 2×2×2 backfill matrix + 2×2 put matrix. `cacheregistry.nim`: `BackendRegistry` + scheme-resolved `buildBackend(RemoteTier, token)`; `productionRegistry(fetcher)` (file) / `testRegistry(fetcher)` (+memory/memoryBytes).
+- [ ] **A3b** *(`types.nim` + `cachedispatch.nim` + `runner.nim` + `jsonout.nim` + `api.nim`)* `PlanLookup += tier, lookup`; `EntrypointResult += cacheTier, cacheLookup` threaded to the hit stamp (`runner.nim:995-1007`) and the live stamp (`:1326-1356`, new `lookups[i]`); `jsonout` render + `schemaRevision` 13 doc-comment entry; internal `runTestsWith(opts, CacheDeps)`. **E2E-A-trust** through `runTestsWith` with two `memory` tiers + the mock policy.
+- [ ] **A3c** *(`types.nim` + `config.nim` + `cacheregistry.nim` + `api.nim` + `crisol.nim` + test_config + E2E-1)* — split as **A3c-i** `CacheConfig`/`RemoteTier` parse (`remote-cache "<name>" { url / verify-trust / backfill-on-hit }` modelled on `parseGroup`; `n.children` makes it trivial) + `test_config`; **A3c-ii** minimal `configuredCache` for the `file` scheme (`verify-trust` default rule; reject `l1` name, root-inside-stateDir) invoked inside the plan `try` before the lock + `--no-remote-cache` + `usage()`/header + **E2E-1** (form per FORK-2).
+- [ ] **A2c** *(FORK-2 (a) only — `runner.nim` `pollSlot` + `closure`/graph update reorder + E2E-1 cold-host form)* — A2c-i behavior-preserving reorder (closure extraction + graph update right after compile), A2c-ii post-compile `derive`+`load` with memory seams (hit ⇒ copy stable binary, synthesize, no run; miss ⇒ `spawnRun`), A2c-iii the three-run cold-host E2E-1.
 
-(Sequence A→B→C; B interleaves; C is the only network/crypto stage. Remote GC/TTL out of scope; local GC stays RFC-0004 A1c.)
+**Stage C — trust first (file://, zero network), then the network-touching tail:**
+- [ ] **C-dep** *(`milpa.kdl` + smoke test)* `milpa add sello --git https://github.com/coreyleavitt/sello.git --ref v0.4.0` + `milpa add nimcrypto --git https://github.com/cheatfate/nimcrypto.git --ref v0.7.3` (bump sello to `v0.5.0` when tagged). No Dockerfile delta (both pure Nim). **Compile-smoke test** against known vectors: RFC 4231 HMAC-SHA256 case; an RFC 8032 §7.1 ed25519 sign/verify vector; **and a closure capturing a `sello.Keypair` built from a fixed seed, invoked twice** (the move-only-capture spike). Gate for C4/C5.
+- [ ] **C4** *(`cachetrust.nim` + `cacheregistry.nim` + `config.nim`/`types.nim` for `cache-trust` + E2E-2)* `hmacPolicy` (HMAC-SHA256 via nimcrypto) + the shared `envelope` with its SHA-256 and domain tag; verify-on-read reject-on-fail with granular verdicts; sign-on-put; `cache-trust { policy / key-id }` parse + rejections (hmac without secret; explicit `verify-trust #true` under none); `CacheSecrets` resolved in `api.nim` + `delEnv`. Boundary-tested: HMAC roundtrip; tamper+checksum-fix ⇒ `cvTrustBadSignature`; bare tamper ⇒ `cvCorrupt`; unattested on a verifying tier ⇒ `cvTrustNoAttestation`; wrong `key-id` ⇒ `cvTrustSignerMismatch`; put rule with the real policy. **E2E-2** as acceptance.
+- [ ] **C5a** ed25519 `ed25519Policy` via sello (`Option[Seed]` moved in → `keypair` built inside the closure; `kp.sign(envelope)`; `pk.verify` against the pinned set, `signer == base64(pk)`) — sign/verify happy path + no-seed verify-only; `pinned-key` parse + zero-pinned rejection; `SigstorePolicy` type-locked behind `when defined(crisolSigstore)`. (Keypair fixture built here.) **C5b** rejection cases: tamper ⇒ `cvTrustBadSignature`, unpinned ⇒ `cvTrustUnpinnedSigner`, signer-mismatch ⇒ `cvTrustSignerMismatch`, unknown alg ⇒ `cvTrustUnknownAlg`; E2E-2 repeated under ed25519 with the unpinned second key. **C5c** ed25519 × backfill/put rules (the A3a mock replaced by the real policy).
+- [ ] **C1a** Dockerfile `libssl-dev` + `-d:ssl` in a project `config.nims`; verify the image builds and `wrapConnectedSocket` links. No adapter logic.
+- [ ] **C1** *(`cachehttp.nim` + fake server)* `http` adapter via injected `HttpFetcher` (GET/PUT, `<base>/<storageFormatVersion>/<key>`, `Content-Type`, bearer header, the pinned status table, body cap, put pre-check, total-function) over the A1 serializer. Tested against the fake server (no socket).
+- [ ] **C1b** *(`httpraw.nim`)* production `HttpFetcher` — split as **C1b-i** plaintext GET/PUT + Content-Length + connect/recv timeouts + `SO_RCVTIMEO`/`SO_SNDTIMEO` + body cap + EINTR, with **the single sanctioned socket test**: one in-process loopback listener on an ephemeral 127.0.0.1 port covering a 200, a 404, a connect-timeout to a non-listening port, and "TCP accept then silent server ⇒ deadline fires"; **C1b-ii** chunked decoder (pure, vector-tested); **C1b-iii** TLS under `-d:ssl` (manual/out-of-suite).
+- [ ] **C2** *(`caches3.nim`)* `s3` adapter (same contract; unsigned/MinIO path-style only; `endpoint`/`path-style`; `probe` via ListObjectsV2 `<Key>` extraction). Tested against the fake (S3 codec + listing).
+- [ ] **C3a** *(config)* extend A3c-i: per-remote `endpoint`/`path-style`, scheme validation against `knownCacheSchemes` in `types.nim` (`memory://` ⇒ config error), unsigned-`s3`-without-verifying-policy rejection. **C3b** *(wiring)* `configuredCache` for http/s3 + per-tier tokens + CLI/env override + the child-env `CRISOL_CACHE_*` scrub assertion under `hlNone`. **E2E-3** as acceptance through `runTestsWith(testRegistry(fake))`.
+- [ ] **C3c** *(prefetch)* plan-time `probe` when `canProbe` (resolved once; `lookup` consults the probe set before per-key `get`s); per-key bounded `get`s otherwise; `pendingSignal()` in the loop. Acceptance: call-counting `memory`/fake backend over N synthetic entrypoints ⇒ `probe` 1× and `get` ≤ |keys ∩ probed| (probe branch); N bounded `get`s, breaker trips after the first `cvOffline` ⇒ total wall ≤ one deadline + ε (offline branch).
+- [ ] **C6** secure-by-default credential scopes end-to-end: read vs write tokens; publish iff write-credentialed (`cvUnauthorized` `put` ⇒ no-op, reads still serve); secrets from env only. Tested against the auth-validating fake server (folds into `test_cachehttp.nim`).
+
+(Remote GC/TTL out of scope; local GC stays RFC-0004 A1c inside the local-fs adapter.)
 
 ## Testing strategy
 
-Boundary tests at the `CacheBackend` port via `memory`: waterfall, backfill-on-hit, **`verified`-bit backfill** (exhaustive 2×2×2, via the controllable mock policy — the high-risk case), trust verify+reject, miss→next-tier, offline→miss-with-`ceOffline`, the publish gate (unchanged — re-assert `shouldStore` still gates `put`). `explainMiss` pure ⇒ exhaustive `KeyInputs`-diff vectors incl. the flag-change case. ed25519 sign/verify roundtrip + tamper + unpinned + signer-mismatch + backfill interaction. `--verify-cache` divergence via the nondeterministic fixture; determinism ⇒ no event. http/s3 against the injected in-memory `HttpFetcher`/fake server — **no real network, no hot-path disk**. RFC-0004's direct `loadCached`/`storeCached` tests fold into the `local-fs` adapter's boundary suite. Per [[dev-test-verification-gotchas]]: `./dev test` EXIT is unreliable — grep output (and have B3/C1/C2 tests emit an explicit success marker), excluding the expected-failure fixtures.
+Boundary tests at the `CacheBackend` port via `memory`/`memoryBytes`: waterfall, backfill-on-hit, **`verified`-bit backfill** (exhaustive 2×2×2, via the controllable mock policy), **put rule** (2×2), trust verify+reject, miss→next-tier, offline→`cvOffline` + breaker, the publish gate (unchanged — re-assert `shouldStore` still gates `put`). `explainMiss` pure ⇒ exhaustive `KeyInputs`-diff vectors incl. flag-change and env-name cases. ed25519 sign/verify roundtrip + tamper + unpinned + signer-mismatch + backfill/put interaction. `--verify-cache` divergence via the nondeterministic fixture; determinism ⇒ no event; ledger untouched. http/s3 against the injected in-memory `HttpFetcher`/fake server — **no real network, no hot-path disk**. RFC-0004's direct `loadCached`/`storeCached` tests fold into the `local-fs` adapter's boundary suite. C1b's loopback test is the single sanctioned socket. Per [[dev-test-verification-gotchas]]: `./dev test` EXIT is unreliable — grep output (and have every E2E test emit an explicit success marker), excluding the expected-failure fixtures. Suite-runtime discipline: grow test files in place (§Fixture inventory) — each new file is a full compile.
 
 ## Contract impacts
 
-- **Schemas:** `crisol/run/v1` gains additive `cacheStats` (`{l1Hits, remoteHits, misses, remoteErrors, total, hitPct, wallSavedMs, published, verifyFails}`) and per-result `cacheTier` provenance; `CacheDecision` gains `cdmTrustFail` (additive variant). Behind the existing `schemaRevision` bump (RFC-0004). No `v2`.
-- **CLI additions:** `--no-remote-cache`, `--explain-miss`, `--verify-cache[=PCT]`, `--verify-cache-strict`, `--cache-stats`. All additive; default (no flags, no `cache { remote }`) is identical to RFC-0004.
-- **Config additions:** `cache { remote "<name>" { url / trust { policy / pinned-key } / verify-trust / backfill-on-hit } telemetry { hit-rate / explain-miss / verify-cache-pct } }`. Additive; absent ⇒ single-tier local.
-- **Env:** `$CRISOL_CACHE_SIGN_KEY` (publish; never in the env allowlist), read creds per-backend (adapter-native, e.g. standard AWS env for `s3`). Secrets never in config files.
-- **New wire-format axis:** `storageFormatVersion` (the `StoredEntry` wire shape) — distinct from RFC-0004's `resultCacheFormatVersion` (the `CachedResult` payload).
-- **`realSeams` signature** gains `(TieredCache, TelemetrySink)` params (internal plumbing; crisol has no consumers; the two direct test callers update atomically in A2b). `CacheSeams`, `LoadProc`, `StoreProc`, `lookupAtPlan`, `shouldStore`, `CacheContext`, `inactiveDecision` unchanged.
-- **Library facade** (`crisol/api`): `RunOptions` gains `remoteCache`/`explainMiss`/`verifyCachePct`/`verifyCacheStrict`/`cacheStats`; `RunReport` gains `cacheStats`; `EntrypointResult` gains `cacheTier`. Additive.
+- **Schemas:** `crisol/run/v1` gains, additively: per-result `cacheTier` + `cacheLookup` (rev **13**, A3b; B3c's `verifyFails` rides the same rev), `cacheStats` `{l1Hits, remoteHits, misses, remoteErrors, total, notConsulted, hitPct, wallSavedMs, published, verifyFails}` (rev **14**, B2b), per-result `keyDiff[]` present only under `--explain-miss` (rev **15**, B1c). Each rev is appended to `jsonout.nim`'s documented list (`RunV1Revision` is 12 today). **No new `CacheDecision` variant.** amoxtli compatibility verified: it keeps `cacheDecision` as a free string and flags `newerSchema` (`crisol_json.nim:57,157-158`), so additive fields are safe. No `v2`.
+- **CLI additions:** `--no-remote-cache`, `--explain-miss`, `--explain-miss-verbose`, `--verify-cache`, `--verify-cache-pct N`, `--verify-cache-seed N`, `--verify-cache-strict`, `--cache-stats`, `--env-pin NAME=VALUE`. All additive; default is identical to RFC-0004. In `--json` mode all human lines go to stderr.
+- **Config additions (flat, top-level):** `remote-cache "<name>" { url / endpoint / path-style / verify-trust / backfill-on-hit }` (repeatable), `cache-trust { policy / pinned-key / key-id }`, `cache-stats`, `explain-miss`, `verify-cache-pct`, `env-pin`. Additive; absent ⇒ single-tier local. Parsed types live in `types.nim`.
+- **Env:** `$CRISOL_CACHE_SIGN_KEY` (ed25519 seed, base64), `$CRISOL_CACHE_HMAC_KEY`, `$CRISOL_CACHE_TOKEN` / `$CRISOL_CACHE_TOKEN_<TIER>` — resolved once in `api.nim` into `CacheSecrets`, then `delEnv`'d; `CRISOL_CACHE_*` stripped from every child env. Secrets never in config files. (`AWS_*` arrives with the SigV4 follow-on.)
+- **New wire-format axis:** `storageFormatVersion` (the `StoredEntry` envelope) — distinct from and coupled to `resultCacheFormatVersion` (static assert). The on-disk L1 file is a backward-readable superset of RFC-0004's.
+- **`realSeams` signature** becomes `realSeams(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime)`; **`KeyOfProc` returns `KeyInputs`; `LoadProc`/`StoreProc` take `(pep, KeyDerivation[, res])`; `LoadProc` returns `CacheLookup`** (internal plumbing; the 4 test files update atomically in A2b via a helper). `CacheSeams`'s three-closure shape, `lookupAtPlan`'s decision logic, `shouldStore`, `CacheContext`, `inactiveDecision` unchanged. `execute()` gains `recordLedger: bool = true`. (`pollSlot` changes only under FORK-2 (a).)
+- **Library facade** (`crisol/api`): `RunOptions` gains `noRemoteCache`, `explainMiss`, `cacheStats`, `verifyCache: VerifyCache` (constructor-built), `envPins`; `RunReport` gains `cacheStats` + `verifyDivergences`; `EntrypointResult` gains `cacheTier` + `cacheLookup`. Additive. **No `RunOptions.cacheRuntime`** (internal `runTestsWith` instead).
 
-## Open forks (awaiting Corey)
+## Dependency decision (FORK-1 — RESOLVED 2026-08-21; C-dep simplified round 3)
 
-**FORK-1 — Crypto-dependency strategy (blocks Stage C only; A and B proceed now).** "ed25519 signed attestation NOW" was selected without the dependency reality surfacing: **Nim's stdlib has no SHA-256, no HMAC, and no ed25519**, and crisol currently depends only on `nkdl`. This is a genuine dependency/risk-appetite call (FFI vs pure-Nim, Dockerfile delta, the milpa+podman/no-host-nim toolchain) that is yours, not a soundness question I should pre-decide. My recommendation, with trade-offs, is in the chat message accompanying this round. The decision sets: (a) HMAC-SHA256 + SHA-256 source, (b) ed25519 source, (c) whether initial S3 is unsigned/MinIO (no SigV4) or authenticated (SigV4 ⇒ reorder C4 before C2). A and B are fully unblocked regardless.
+**Context.** Nim's stdlib has no SHA-256, no HMAC, and no ed25519; crisol depended only on `nkdl`. At round 1 the ecosystem had no pure-Nim ed25519, so "ed25519 NOW" implied an FFI + Dockerfile + unaudited-C trust tax. That premise changed: **sello** (Corey's sibling library) provides pure-Nim ed25519 sign + verify with zero runtime dependencies, validated against RFC 8032/Wycheproof/NIST CAVP/libsodium-differential suites.
+
+**Decision (Corey, 2026-08-21):**
+- **(b) ed25519 source = sello** — pure Nim, no FFI, no Dockerfile delta. **Round 3:** `v0.4.0` is already tagged and pushed with the full needed surface, so crisol pins **`v0.4.0` by git ref** (janus already pins sello this way) and bumps to `v0.5.0` when Corey tags it; the round-2 `local="../sello"` pin + generic `./dev` sibling-mount is retired (a local pin is needed only if the C-dep smoke test finds v0.4.0 insufficient).
+- **(a) HMAC-SHA256 source = nimcrypto `v0.7.3`** (pure Nim; already in the milpa CAS as sello's own dependency). `hmacPolicy` ships alongside `ed25519Policy`. An in-house HMAC-SHA256 may replace nimcrypto later behind the same call sites — sello deliberately does **not** export a hash.
+- **(c) Initial S3 = unsigned/MinIO path-style** (no SigV4). Authenticated S3 via SigV4 is a follow-on reusing the C-dep HMAC-SHA256; the `http` adapter with a bearer token covers authenticated remotes in 0005.
+
+**Consequences:** crisol's dependency set becomes `nkdl` + `sello` + `nimcrypto`. Slice C-dep is two `milpa add` lines + a smoke test. C4 before C5 (HMAC is the simpler policy and exercises the shared canonical envelope first). **Open forks: FORK-2 only.**
