@@ -1,0 +1,22 @@
+# quipu work-status tracker config (tool source: ~/projects/quipu; instance:
+# quipu.leavitt.dev). This file owns the REPO-side conventions; where the
+# tracker runs, and which repos it mounts, is the instance config's business.
+title = "crisol"
+label = "RFC"
+docs_dir = "docs/rfc"
+
+# crisol blocking state follows the rfc-flow "Open forks" convention plus
+# "awaiting Corey" / "Corey-owned" gates in handoff checkpoints (e.g. the
+# RFC-0007 A7-gate and RFC-0005 FORK-2).
+awaiting_pattern = "awaiting|needs[ -]corey|owner[- ]call|open forks|corey[- ]owned"
+
+# Synced mode, not push: the hub runs on this same host and bind-mounts this
+# repo read-only, so there is no token and no client-side parse. `push` is
+# deliberately absent -- setting it true would make the hub refuse, since a
+# locally-mounted project may not also be pushed to (one source of truth).
+# This host's stub resolver blocks *.leavitt.dev (tailnet-only name), so
+# every generated curl pins the tailscale IP; regeneration preserves this.
+[hub]
+url = "https://quipu.leavitt.dev"
+curl_args = "--resolve quipu.leavitt.dev:443:100.101.212.69"
+project = "crisol"
