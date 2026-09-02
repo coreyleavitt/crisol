@@ -22,112 +22,112 @@ import crisol/process/types as ptypes
 
 proc exitKindStr(k: ExitKind): string =
   case k
-  of ekExited:   "ekExited"
-  of ekSignaled: "ekSignaled"
-  of ekNtStatus: "ekNtStatus"
+  of ekExited:   "exited"
+  of ekSignaled: "signaled"
+  of ekNtStatus: "ntstatus"
 
 proc parseExitKind(s: string): Option[ExitKind] =
   case s
-  of "ekExited":   some(ekExited)
-  of "ekSignaled": some(ekSignaled)
-  of "ekNtStatus": some(ekNtStatus)
+  of "exited":   some(ekExited)
+  of "signaled": some(ekSignaled)
+  of "ntstatus": some(ekNtStatus)
   else:            none(ExitKind)
 
 proc causeByStr(b: CauseBy): string =
   case b
-  of cbProcess:  "cbProcess"
-  of cbRunner:   "cbRunner"
-  of cbLimit:    "cbLimit"
-  of cbExternal: "cbExternal"
+  of cbProcess:  "process"
+  of cbRunner:   "runner"
+  of cbLimit:    "limit"
+  of cbExternal: "external"
 
 proc parseCauseBy(s: string): Option[CauseBy] =
   case s
-  of "cbProcess":  some(cbProcess)
-  of "cbRunner":   some(cbRunner)
-  of "cbLimit":    some(cbLimit)
-  of "cbExternal": some(cbExternal)
+  of "process":  some(cbProcess)
+  of "runner":   some(cbRunner)
+  of "limit":    some(cbLimit)
+  of "external": some(cbExternal)
   else:            none(CauseBy)
 
 proc killReasonStr(r: KillReason): string =
   case r
-  of krTimeout:   "krTimeout"
-  of krInterrupt: "krInterrupt"
+  of krTimeout:   "timeout"
+  of krInterrupt: "interrupt"
 
 proc parseKillReason(s: string): Option[KillReason] =
   case s
-  of "krTimeout":   some(krTimeout)
-  of "krInterrupt": some(krInterrupt)
+  of "timeout":   some(krTimeout)
+  of "interrupt": some(krInterrupt)
   else:             none(KillReason)
 
 proc limitKindStr(k: LimitKind): string =
   case k
-  of lkAddressSpace: "lkAddressSpace"
-  of lkCpu:           "lkCpu"
-  of lkFileSize:       "lkFileSize"
-  of lkOpenFiles:      "lkOpenFiles"
-  of lkCore:           "lkCore"
+  of lkAddressSpace: "addressSpace"
+  of lkCpu:           "cpu"
+  of lkFileSize:       "fileSize"
+  of lkOpenFiles:      "openFiles"
+  of lkCore:           "core"
 
 proc parseLimitKind(s: string): Option[LimitKind] =
   case s
-  of "lkAddressSpace": some(lkAddressSpace)
-  of "lkCpu":           some(lkCpu)
-  of "lkFileSize":       some(lkFileSize)
-  of "lkOpenFiles":      some(lkOpenFiles)
-  of "lkCore":            some(lkCore)
+  of "addressSpace": some(lkAddressSpace)
+  of "cpu":           some(lkCpu)
+  of "fileSize":       some(lkFileSize)
+  of "openFiles":      some(lkOpenFiles)
+  of "core":            some(lkCore)
   else:                   none(LimitKind)
 
 proc limitStatusStr(s: LimitStatus): string =
   case s
-  of lsNotRequested: "lsNotRequested"
-  of lsUnsupported:  "lsUnsupported"
-  of lsFailed:       "lsFailed"
-  of lsApplied:      "lsApplied"
+  of lsNotRequested: "notRequested"
+  of lsUnsupported:  "unsupported"
+  of lsFailed:       "failed"
+  of lsApplied:      "applied"
 
 proc parseLimitStatus(s: string): Option[LimitStatus] =
   case s
-  of "lsNotRequested": some(lsNotRequested)
-  of "lsUnsupported":  some(lsUnsupported)
-  of "lsFailed":       some(lsFailed)
-  of "lsApplied":      some(lsApplied)
+  of "notRequested": some(lsNotRequested)
+  of "unsupported":  some(lsUnsupported)
+  of "failed":       some(lsFailed)
+  of "applied":      some(lsApplied)
   else:                none(LimitStatus)
 
 proc killDomainStr(d: KillDomainStrength): string =
   case d
-  of kdsProcessGroup:          "kdsProcessGroup"
-  of kdsProcessGroupSubreaper: "kdsProcessGroupSubreaper"
-  of kdsCgroup:                "kdsCgroup"
-  of kdsJobObject:             "kdsJobObject"
+  of kdsProcessGroup:          "processGroup"
+  of kdsProcessGroupSubreaper: "processGroupSubreaper"
+  of kdsCgroup:                "cgroup"
+  of kdsJobObject:             "jobObject"
 
 proc parseKillDomain(s: string): Option[KillDomainStrength] =
   case s
-  of "kdsProcessGroup":          some(kdsProcessGroup)
-  of "kdsProcessGroupSubreaper": some(kdsProcessGroupSubreaper)
-  of "kdsCgroup":                some(kdsCgroup)
-  of "kdsJobObject":             some(kdsJobObject)
+  of "processGroup":          some(kdsProcessGroup)
+  of "processGroupSubreaper": some(kdsProcessGroupSubreaper)
+  of "cgroup":                some(kdsCgroup)
+  of "jobObject":             some(kdsJobObject)
   else:                          none(KillDomainStrength)
 
 proc treeObservationStr(t: TreeObservation): string =
   case t
-  of toUnobservable: "toUnobservable"
-  of toComplete:      "toComplete"
+  of toUnobservable: "unobservable"
+  of toComplete:      "complete"
 
 proc parseTreeObservation(s: string): Option[TreeObservation] =
   case s
-  of "toUnobservable": some(toUnobservable)
-  of "toComplete":      some(toComplete)
+  of "unobservable": some(toUnobservable)
+  of "complete":      some(toComplete)
   else:                 none(TreeObservation)
 
 proc hermeticLevelStr(h: HermeticLevel): string =
   case h
-  of hlNone:     "hlNone"
-  of hlIsolated: "hlIsolated"
-  of hlNetwork:  "hlNetwork"
+  of hlNone:     "none"
+  of hlIsolated: "isolated"
+  of hlNetwork:  "network"
 
 proc parseHermeticLevel(s: string): Option[HermeticLevel] =
   case s
-  of "hlNone":     some(hlNone)
-  of "hlIsolated": some(hlIsolated)
-  of "hlNetwork":  some(hlNetwork)
+  of "none":     some(hlNone)
+  of "isolated": some(hlIsolated)
+  of "network":  some(hlNetwork)
   else:            none(HermeticLevel)
 
 # ---------------------------------------------------------------------------

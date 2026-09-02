@@ -81,8 +81,8 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
     # Wire strings are resultjson's own Nim-identifier convention (A1a,
     # locked) — cbRunner/krTimeout, not a paraphrase.
     check ep.hasKey("cause")
-    check ep["cause"]["by"].getStr == "cbRunner"
-    check ep["cause"]["reason"].getStr == "krTimeout"
+    check ep["cause"]["by"].getStr == "runner"
+    check ep["cause"]["reason"].getStr == "timeout"
     check ep["cause"]["escalated"].getBool == false
 
     # hang_forever has default signal dispositions — it dies on the FIRST
@@ -90,7 +90,7 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
     # pollSlot synthesized SIGKILL unconditionally regardless of what
     # actually happened — this is the fabrication being fixed.
     check ep.hasKey("exit")
-    check ep["exit"]["kind"].getStr == "ekSignaled"
+    check ep["exit"]["kind"].getStr == "signaled"
     check ep["exit"]["sig"].getInt == int(SIGTERM)
 
   test "term_ignores: SIGTERM-ignoring child forces escalation to SIGKILL":
@@ -101,11 +101,11 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
     let ep = firstEntrypoint(output)
 
     check ep["outcome"].getStr == "timedOut"
-    check ep["cause"]["by"].getStr == "cbRunner"
-    check ep["cause"]["reason"].getStr == "krTimeout"
+    check ep["cause"]["by"].getStr == "runner"
+    check ep["cause"]["reason"].getStr == "timeout"
     check ep["cause"]["escalated"].getBool == true
 
-    check ep["exit"]["kind"].getStr == "ekSignaled"
+    check ep["exit"]["kind"].getStr == "signaled"
     check ep["exit"]["sig"].getInt == int(SIGKILL)
 
   test "pass_always: exit.code == 0":
@@ -117,6 +117,6 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
     let ep = firstEntrypoint(output)
     check ep["outcome"].getStr == "passed"
     check ep.hasKey("exit")
-    check ep["exit"]["kind"].getStr == "ekExited"
+    check ep["exit"]["kind"].getStr == "exited"
     check ep["exit"]["code"].getInt == 0
-    check ep["cause"]["by"].getStr == "cbProcess"
+    check ep["cause"]["by"].getStr == "process"

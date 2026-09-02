@@ -96,10 +96,10 @@ suite "resultjson — roundtrip":
   test "enums serialize as strings on the wire":
     let node = toJson(sampleResult())
     check node["exit"]["kind"].kind == JString
-    check node["exit"]["kind"].getStr == "ekSignaled"
-    check node["cause"]["by"].getStr == "cbRunner"
-    check node["evidence"]["tree"].getStr == "toUnobservable"
-    check node["evidence"]["hermetic"].getStr == "hlIsolated"
+    check node["exit"]["kind"].getStr == "signaled"
+    check node["cause"]["by"].getStr == "runner"
+    check node["evidence"]["tree"].getStr == "unobservable"
+    check node["evidence"]["hermetic"].getStr == "isolated"
 
 # ---------------------------------------------------------------------------
 # Structural failure (crisol's own reader) — the fuzz test's oracle.
@@ -168,7 +168,7 @@ suite "resultjson — own-reader structural failure (fuzz oracle)":
   test "unknown limits[] key in evidence.limits object -> none":
     var n = copy(toJson(sampleResult()))
     n["evidence"]["limits"] = newJObject()
-    n["evidence"]["limits"]["lkAddressSpace"] = newJString("lsBogus")
+    n["evidence"]["limits"]["addressSpace"] = newJString("lsBogus")
     check fromJson(n) == none(ProcessResult)
 
   test "wrong-typed field (exit.kind as int, not string) -> none":
