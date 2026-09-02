@@ -30,5 +30,16 @@ nim.cfg
 /tests/unit/*
 !/tests/unit/*.nim
 !/tests/unit/*/
+/tests/timing/*
+!/tests/timing/*.nim
+!/tests/timing/*/
+/tests/meta/*
+!/tests/meta/*.nim
+!/tests/meta/*/
 # Scratch tmp dir some fixtures write into.
 tests/fixtures/tmp/
+# ci/run-tests.sh's pass/fail marker (see that script's header for why it
+# exists — nimble's own custom-task exit code is not trustworthy).
+/.crisol-test-result
+# CI nimcache cache dir (actions/cache@v4 target, mounted as XDG_CACHE_HOME).
+.ci-nimcache/

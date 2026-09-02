@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch vendored deps (milpa.lock)
+        run: bash ci/fetch-deps.sh
+
+      - name: Cache nim compile cache
+        uses: actions/cache@v4
+        with:
+          path: .ci-nimcache
+          key: nimcache-${{ runner.os }}-${{ hashFiles('milpa.lock', 'crisol.nimble') }}
+          restore-keys: |
+            nimcache-${{ runner.os }}-
+
+      # ci/run-tests.sh, not bare `nimble test`: nimble 0.22.2's custom-task
+      # dispatch does not turn a failing task into a nonzero process exit
+      # code (see that script's header for the full mechanism, verified
+      # against nimble's own source). The script is the only trustworthy
+      # exit-code signal — this step is what actually proves it, over the
+      # deliberately-failing dummy in tests/meta/.
+      - name: Meta-test — assert a failing test fails the harness
+        run: |
+          if docker run --rm \
+              -v "$PWD:/workspace" -w /workspace \
+              -e CRISOL_TEST_DIRS=tests/meta \
+              -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+              ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh; then
+            echo "META-TEST FAILED: harness exited 0 on a failing test"
+            exit 1
+          else
+            echo "META-TEST OK: nonzero exit propagated"
+          fi
+
+      - name: Run test suite
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh
+
+  timing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch vendored deps (milpa.lock)
+        run: bash ci/fetch-deps.sh
+
+      - name: Cache nim compile cache
+        uses: actions/cache@v4
+        with:
+          path: .ci-nimcache
+          key: nimcache-${{ runner.os }}-${{ hashFiles('milpa.lock', 'crisol.nimble') }}
+          restore-keys: |
+            nimcache-${{ runner.os }}-
+
+      # Serial by design: the timing/rlimits suite (tests/timing/) is
+      # deadline- and scheduling-sensitive and flakes under any concurrent
+      # host load, this job included — it never shares a runner with `test`.
+      - name: Run timing suite (serial)
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -e CRISOL_TIMING_TESTS=1 \
+            -e CRISOL_TEST_DIRS=tests/timing \
+            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh

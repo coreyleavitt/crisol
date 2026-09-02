@@ -12,7 +12,7 @@
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
-##         tests/integration/test_max_jobs_overlap.nim
+##         tests/timing/test_max_jobs_overlap.nim
 
 import std/[options, os, sequtils, strutils, tables, tempfiles, times, unittest]
 import crisol/types

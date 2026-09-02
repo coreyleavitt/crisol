@@ -10,7 +10,7 @@
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
-##         tests/integration/test_per_group_timeout.nim
+##         tests/timing/test_per_group_timeout.nim
 
 import std/[os, times, unittest]
 import crisol/types

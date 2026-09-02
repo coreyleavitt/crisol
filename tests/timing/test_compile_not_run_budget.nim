@@ -40,7 +40,7 @@
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
-##         tests/integration/test_compile_not_run_budget.nim
+##         tests/timing/test_compile_not_run_budget.nim
 
 import std/[os, times, unittest]
 import crisol/types

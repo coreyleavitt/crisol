@@ -7,7 +7,12 @@
 # Usage:
 #   ./dev image          (re)build the dev image
 #   ./dev check          nim check (fast type/syntax verification)
-#   ./dev test           nimble test (serial bootstrap suite)
+#   ./dev test           nimble test (serial bootstrap suite; excludes
+#                        tests/timing — see `./dev timing`)
+#   ./dev timing         nimble test over tests/timing only, serially, with
+#                        CRISOL_TIMING_TESTS=1 (the timing/rlimits suite;
+#                        never part of `./dev test` — parallel host load
+#                        flakes these)
 #   ./dev build          compile the package
 #   ./dev run <args…>    run an arbitrary toolchain command in the container
 #   ./dev shell          interactive shell inside the container
@@ -39,6 +44,12 @@ milpa_mount() {
     fi
 }
 
+# Extra --env flags forwarded into the container by podman_run, e.g.
+# EXTRA_ENV=(--env CRISOL_TIMING_TESTS=1). Podman does NOT forward host env
+# vars on its own, so any case arm that needs one set in the container must
+# populate this array before calling podman_run. Empty by default.
+EXTRA_ENV=()
+
 # Rootless podman maps the host user to root-in-container by default, so we do
 # NOT pass --user; files created in the bind mount come back owned by the host
 # user via the userns mapping. HOME points at a mounted dir so nimble/choosenim
@@ -52,6 +63,7 @@ podman_run() {
         --volume "${DOCKER_HOME}:/dockerhome" \
         "${_milpa[@]}" \
         --env HOME=/dockerhome \
+        "${EXTRA_ENV[@]}" \
         --workdir "${PROJECT_DIR}" \
         "${IMAGE}" "$@"
 }
@@ -67,7 +79,14 @@ case "${cmd}" in
         podman_run nim check --hints:off src/crisol.nim
         ;;
     test)
-        podman_run nimble test
+        # ci/run-tests.sh, not bare `nimble test`: nimble's custom-task exit
+        # code is not trustworthy (see the script's header) — the wrapper is
+        # the only honest signal.
+        podman_run bash ci/run-tests.sh
+        ;;
+    timing)
+        EXTRA_ENV=(--env CRISOL_TIMING_TESTS=1 --env CRISOL_TEST_DIRS=tests/timing)
+        podman_run bash ci/run-tests.sh
         ;;
     build)
         podman_run nimble build
@@ -91,6 +110,6 @@ case "${cmd}" in
         rm -rf "${PROJECT_DIR}/nimcache" "${PROJECT_DIR}/bin" "${PROJECT_DIR}/.crisol"
         ;;
     help|*)
-        sed -n '4,18p' "$0"
+        sed -n '4,20p' "$0"
         ;;
 esac

@@ -6,6 +6,58 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### ci: Linux CI baseline — honest exit codes, meta-test mechanism, serial timing leg (rfc-0007 slice A0)
+
+crisol had no CI. `.github/workflows/ci.yml` now runs the suite on every push
+to `main` and every pull request, two jobs (`test`, `timing`) each invoking
+the toolchain image directly via `docker run` (not a `container:` job) so the
+repo can be bind-mounted at `/workspace`, matching the paths baked into golden
+fixtures and absolute-path-sensitive unit tests. `ci/fetch-deps.sh` reads
+`milpa.lock` (the single source of truth) and clones the locked commit of
+each dep straight from its git remote into `_deps/`, since CI has no milpa
+CAS to symlink from.
+
+**The nimble `test` task now honors `CRISOL_TEST_DIRS`** (colon-separated),
+overriding the default `["tests/unit", "tests/integration"]` dir list. It
+also now runs every discovered file to completion even after an earlier one
+fails — no more truncation at the first failing file — and prints a
+`FAILED: N file(s)` / `OK: N file(s)` summary.
+
+**Load-bearing finding:** nimble 0.22.2's custom-task dispatch does not
+propagate a failing task into a nonzero *process* exit code — a failing
+task surfaces internally as `NimbleError` (`object of CatchableError`),
+which nimble's own top-level handler displays but never turns into a
+nonzero `exitCode` (only `NimbleQuit`, `object of Defect`, does that, and
+it is unreachable from inside a task body). `nimble test` therefore always
+exits 0 regardless of what the task itself does, `quit(1)` included —
+confirmed by reading nimble's source and reproduced with a two-line
+throwaway task. `ci/run-tests.sh` works around this: the `test` task writes
+an explicit `OK`/`FAIL` marker file as its last action, and the wrapper
+script — not bare `nimble test` — is what `./dev test`, `./dev timing`, and
+every CI step now actually invoke; it derives the real exit code from the
+marker and treats a missing marker as failure (fail-closed).
+
+The mechanism is proven mechanically, not just asserted: `tests/meta/`
+holds a single always-failing dummy (`test_fail_dummy.nim`), deliberately
+outside the default `CRISOL_TEST_DIRS`, that only a CI meta-step (pointing
+`CRISOL_TEST_DIRS` at `tests/meta`) ever runs — the meta-step requires that
+run to fail, i.e. it asserts the *absence* of the historical "exit 0 on a
+real failure" bug.
+
+The six timing/rlimits-sensitive integration tests (`test_headofline`,
+`test_mem_throttle`, `test_compile_not_run_budget`, `test_per_group_timeout`,
+`test_max_jobs_overlap`, `test_rlimits_timing`) move from
+`tests/integration/` to `tests/timing/` — they are deadline- and
+scheduling-sensitive and flake under concurrent host load. `tests/timing/`
+is outside the default dirs, so `./dev test` / a normal `nimble test` never
+runs them; CI's `timing` job runs them serially and alone
+(`CRISOL_TIMING_TESTS=1 CRISOL_TEST_DIRS=tests/timing`), never sharing a
+runner with `test`. `./dev timing` gives the same leg locally.
+
+Nim's compile cache (`~/.cache/nim`, redirected to `.ci-nimcache/` via
+`XDG_CACHE_HOME`) is cached across CI runs with `actions/cache@v4`, keyed on
+`milpa.lock` + `crisol.nimble`.
+
 ### BREAKING CHANGE — dependency graph format 5: the headers a `{.compile.}`d source `#include`s are tracked compile inputs; one-time full recompile (issue #16)
 
 **Prior behaviour:** a `{.compile.}`d C/C++ source was in the closure

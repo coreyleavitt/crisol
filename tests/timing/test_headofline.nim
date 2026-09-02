@@ -27,7 +27,7 @@
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
-##         tests/integration/test_headofline.nim
+##         tests/timing/test_headofline.nim
 
 import std/[options, os, strutils, tables, tempfiles, times, unittest]
 import crisol/types

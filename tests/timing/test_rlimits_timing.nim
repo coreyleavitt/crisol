@@ -8,10 +8,14 @@
 ##
 ## GATING: This file quits 0 immediately when CRISOL_TIMING_TESTS is unset or
 ## empty.  The env var is NOT forwarded by ./dev run (podman only sets HOME), so
-## the normal ./dev test run always skips these tests.  To run them manually:
+## the normal ./dev test run always skips these tests (tests/timing/ is also
+## outside the default CRISOL_TEST_DIRS list, so they aren't even discovered).
+## Use `./dev timing` (sets both CRISOL_TIMING_TESTS=1 and
+## CRISOL_TEST_DIRS=tests/timing for the whole serial timing leg), or to run
+## this file alone:
 ##
-##   CRISOL_TIMING_TESTS=1 ./dev run nim r --path:src \
-##     tests/integration/test_rlimits_timing.nim
+##   ./dev run env CRISOL_TIMING_TESTS=1 nim r --path:src \
+##     tests/timing/test_rlimits_timing.nim
 ##
 ## Note: CRISOL_TIMING_TESTS must be explicitly passed via --env if using podman:
 ##   podman run --env CRISOL_TIMING_TESTS=1 ...

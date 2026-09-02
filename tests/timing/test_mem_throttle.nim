@@ -20,7 +20,7 @@
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
-##         tests/integration/test_mem_throttle.nim
+##         tests/timing/test_mem_throttle.nim
 
 import std/[json, options, os, strutils, tables, tempfiles, unittest]
 import crisol/types

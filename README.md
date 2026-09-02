@@ -359,6 +359,20 @@ absolute (`--noAbsolutePaths`). Not tracked by design: `gorge` (a shell
 command, not a file) and the C headers a `{.compile.}`d source `#include`s
 (Nim's own external-object cache ignores headers as well).
 
+## Development
+
+crisol dogfoods itself via a `nimble test` task (self-discovering
+`tests/unit/test_*.nim` + `tests/integration/test_*.nim`, run serially).
+All toolchain commands run in a containerized dev image (see `./dev help`):
+
+- `./dev test` — the main suite (unit + integration).
+- `./dev timing` — the serial, deadline-sensitive `tests/timing/` leg
+  (excluded from `./dev test`; flakes under concurrent host load).
+- `./dev check` / `./dev build` — type-check / compile the package.
+
+CI (`.github/workflows/ci.yml`) runs both legs on every push to `main` and
+every pull request.
+
 ## License
 
 MIT
