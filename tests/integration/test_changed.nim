@@ -280,12 +280,10 @@ suite "crisol D5 — --failed --changed union":
     createDir(repo / ".crisol")
     let results = @[
       EntrypointResult(
-        ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]),
-        outcome: oFailed, exitCode: 1, signal: 0, durationMs: 10, records: @[],
+        ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase(1)),
       EntrypointResult(
-        ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit", flags: @[]),
-        outcome: oPassed, exitCode: 0, signal: 0, durationMs: 10, records: @[],
+        ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit", flags: @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase()),
     ]
     let summary = Summary(total: 2, passed: 1, failed: 1)

@@ -26,7 +26,7 @@
 ## owner) would serialize it — not a derived outcome/exitCode/signal
 ## projection.  `outcome` is deliberately ABSENT: the cache stores the
 ## observation and never the verdict (§2); a hit's outcome is recomputed via
-## `deriveOutcome` at the trust boundary (`cachedispatch.lookupAtPlan`),
+## `outcome(r)` at the trust boundary (`cachedispatch.lookupAtPlan`),
 ## never read from disk.
 ##
 ## ```json
@@ -113,9 +113,9 @@ type
     ## rfc-0007 A1d-ii: `run` is the REAL run-phase `ProcessResult` — the
     ## observation, not the verdict.  There is deliberately NO `outcome`
     ## field here: the cache always stores the observation and NEVER the
-    ## derived verdict (§2) — `deriveOutcome` is recomputed over it at every
+    ## derived verdict (§2) — `outcome(r)` is recomputed over it at every
     ## replay, at the trust boundary (`cachedispatch.lookupAtPlan`), never
-    ## trusted from storage.  `exitCode`/`signal`/`durationMs` are subsumed by
+    ## trusted from storage.  The exit code/signal/durationMs are subsumed by
     ## `run.exit`/`run.durationUs` — asking this type to carry both would be
     ## two sources of truth for the same fact.
     run*:             ptypes.ProcessResult

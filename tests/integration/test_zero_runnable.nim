@@ -190,8 +190,7 @@ suite "crisol zero-runnable — branch 2: --failed no prior failures":
     # Seed lastrun.json: test_a passed (no failures).
     let results = @[
       EntrypointResult(
-        ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]),
-        outcome: oPassed, exitCode: 0, signal: 0, durationMs: 10, records: @[],
+        ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase()),
     ]
     persistLastRun(results, Summary(total: 1, passed: 1), cfg)

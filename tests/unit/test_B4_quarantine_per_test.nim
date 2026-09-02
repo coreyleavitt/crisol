@@ -19,9 +19,10 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_B4_quarantine_per_test.nim
 
-import std/[sets, unittest, options]
+import std/[options, sets, unittest]
 import crisol/types
 import crisol/runner  # for isQuarantined
+from crisol/process/types as ptypes import nil
 
 proc makeEp(path: string): Entrypoint =
   Entrypoint(path: path, group: "unit")
@@ -35,11 +36,26 @@ proc passRec(name: string): TestRecord =
 proc skipRec(name: string): TestRecord =
   TestRecord(name: name, status: rsSkip, durationUs: 1)
 
+## rfc-0007 A1e-i: outcome is derived from compile/run Phase — isQuarantined's
+## B4 rule branches on outcome(res).isFailure, so these fixtures must carry a
+## real Phase pair that derives the outcome each helper's name promises.
+proc ranPhase(exit: ptypes.Exit): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: exit, cause: ptypes.Cause(by: ptypes.cbProcess),
+    evidence: default(ptypes.Evidence), rusage: none(ptypes.Rusage),
+    durationUs: 0))
+
+const skippedPhase = ptypes.Phase(kind: ptypes.pkSkipped)
+
 proc failResult(ep: Entrypoint; recs: seq[TestRecord]): EntrypointResult =
-  EntrypointResult(ep: ep, outcome: oFailed, exitCode: 1, records: recs)
+  result = EntrypointResult(ep: ep, records: recs)
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 1))
 
 proc passResult(ep: Entrypoint; recs: seq[TestRecord]): EntrypointResult =
-  EntrypointResult(ep: ep, outcome: oPassed, exitCode: 0, records: recs)
+  result = EntrypointResult(ep: ep, records: recs)
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 0))
 
 # ---------------------------------------------------------------------------
 # Suite 1: B3 path-match rule (both rules share one helper)

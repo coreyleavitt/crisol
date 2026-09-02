@@ -42,10 +42,9 @@ const skippedPhase = ptypes.Phase(kind: ptypes.pkSkipped)
 const cbProcess = ptypes.Cause(by: ptypes.cbProcess)
 
 proc stampPhase(r: var EntrypointResult; outcome: Outcome; exitCode, signal: int) =
-  ## rfc-0007 A1c: junit displays deriveOutcome(r), not the stored legacy
-  ## `outcome` field — stamp a coherent `compile`/`run: Phase` pair per the
-  ## legacy outcome each fixture names, mirroring runner.execute's real
-  ## dual-write shape (checkRfc7Coherence's mapping).
+  ## rfc-0007 §2: junit displays outcome(r), not a stored field — stamp a
+  ## coherent `compile`/`run: Phase` pair that derives the outcome each
+  ## fixture names, mirroring runner.execute's real captured shape.
   case outcome
   of oPassed, oFailed:
     r.compile = skippedPhase
@@ -54,16 +53,16 @@ proc stampPhase(r: var EntrypointResult; outcome: Outcome; exitCode, signal: int
     # A "compile failed" fixture's exitCode param (when given) describes the
     # RUN phase in other branches; here it may be left at its 0 default (the
     # legacy field, not the compile's own code), which would derive as a
-    # SUCCESSFUL compile. Force a nonzero compile exit so deriveOutcome agrees.
+    # SUCCESSFUL compile. Force a nonzero compile exit so outcome(r) agrees.
     let code = if exitCode != 0: exitCode else: 1
     r.compile = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: code))
     r.run = skippedPhase
-  of oTimeout, oKilled:
+  of oKilled:
     r.compile = skippedPhase
     r.run = ranPhase(
       ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: false),
       ptypes.Exit(kind: ptypes.ekSignaled, sig: signal, coreDumped: false))
-  of oSignal, oCrashed:
+  of oCrashed:
     r.compile = skippedPhase
     r.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekSignaled, sig: signal, coreDumped: false))
   of oSpawnError:
@@ -77,15 +76,16 @@ proc opaqueResult(path: string; outcome: Outcome;
                   cached: bool = false): EntrypointResult =
   result = EntrypointResult(
     ep:         makeEp(path),
-    outcome:    outcome,
-    exitCode:   exitCode,
-    signal:     signal,
     durationMs: durationMs,
     output:     output,
-    records:    @[],
-    cached:     cached,
-  )
+    records:    @[])
   stampPhase(result, outcome, exitCode, signal)
+  # rfc-0007 A1e-i: cached(r) derives from run.kind == pkCached -- the `cached`
+  # param used to set a legacy stored field; now it re-kinds the SAME
+  # ProcessResult stampPhase just built (a cache hit replays the real
+  # observation verbatim, never a fabricated one -- pass-only store, §2).
+  if cached:
+    result.run = ptypes.Phase(kind: ptypes.pkCached, res: result.run.res)
 
 proc recordResult(path: string; records: seq[TestRecord];
                   outcome: Outcome = oPassed;
@@ -95,15 +95,12 @@ proc recordResult(path: string; records: seq[TestRecord];
   let exitCode = if outcome == oPassed: 0 else: 1
   result = EntrypointResult(
     ep:         makeEp(path),
-    outcome:    outcome,
-    exitCode:   exitCode,
-    signal:     0,
     durationMs: durationMs,
     output:     output,
-    records:    records,
-    cached:     cached,
-  )
+    records:    records)
   stampPhase(result, outcome, exitCode, 0)
+  if cached:
+    result.run = ptypes.Phase(kind: ptypes.pkCached, res: result.run.res)
 
 proc parseDoc(xml: string): XmlNode =
   ## Parse xml via a StringStream so we get the errors parameter.
@@ -426,8 +423,8 @@ suite "junit - toJunitXml opaque failing/infrastructure":
     check found
 
   test "rfc-0007 A1c: oKilled (timeout) testcase has cause-aware <error message>":
-    let r = opaqueResult("tests/integration/test_hang.nim", oTimeout)
-    let xml = toJunitXml(@[r], Summary(total: 1, timedOut: 1))
+    let r = opaqueResult("tests/integration/test_hang.nim", oKilled)
+    let xml = toJunitXml(@[r], Summary(total: 1))
     let doc = parseDoc(xml)
     var found = false
     for child in doc[0]:
@@ -439,8 +436,8 @@ suite "junit - toJunitXml opaque failing/infrastructure":
     check found
 
   test "rfc-0007 A1c: oCrashed (signal) testcase has cause-aware <error message>":
-    let r = opaqueResult("tests/unit/test_segv.nim", oSignal, signal = 11)
-    let xml = toJunitXml(@[r], Summary(total: 1, signaled: 1))
+    let r = opaqueResult("tests/unit/test_segv.nim", oCrashed, signal = 11)
+    let xml = toJunitXml(@[r], Summary(total: 1))
     let doc = parseDoc(xml)
     var found = false
     for child in doc[0]:
@@ -663,8 +660,8 @@ suite "junit - parseXml well-formedness round-trip":
       opaqueResult("tests/unit/fail\"x\".nim", oFailed,        exitCode = 1,
                    output = "<fail>\"bad\"</fail>"),
       opaqueResult("tests/unit/ce'y'.nim",      oCompileFailed, output = "err&amp;"),
-      opaqueResult("tests/unit/timeout.nim",    oTimeout,       output = ""),
-      opaqueResult("tests/unit/signal.nim",     oSignal,        signal = 11),
+      opaqueResult("tests/unit/timeout.nim",    oKilled,        output = ""),
+      opaqueResult("tests/unit/signal.nim",     oCrashed,       signal = 11),
     ]
     let proto = recordResult(
       "tests/unit/proto_hostile.nim",
@@ -678,7 +675,7 @@ suite "junit - parseXml well-formedness round-trip":
     )
     let allResults = results & @[proto]
     let summary = Summary(total: allResults.len, failed: 2,
-                          compileFailed: 1, timedOut: 1, signaled: 1)
+                          compileFailed: 1)
     let xml = toJunitXml(allResults, summary)
     let doc = parseDoc(xml)
     check doc.tag == "testsuites"

@@ -87,7 +87,9 @@ export types.EntrypointResult
 export types.HermeticLevel
 export types.isFailure
 export types.exitCode
-export types.deriveOutcome
+export types.outcome
+export types.cached
+export types.flaky
 export types.hasFailRecords
 
 # From process/types — the §2 result-model facade (rfc-0007 A1c), enumerated
@@ -319,21 +321,23 @@ proc runResult*(r: EntrypointResult): Option[ptypes.ProcessResult] =
 proc failureLine*(r: EntrypointResult): string =
   ## Render-grade one-liner for a failing/non-passed result — the digest a
   ## caller building its own UI needs without re-deriving cause/exit detail.
-  ## "" for a passing result (deriveOutcome(r) == oPassed).
-  case deriveOutcome(r)
+  ## "" for a passing result (outcome(r) == oPassed).
+  case outcome(r)
   of oPassed:
     ""
   of oFailed:
-    "exit " & $r.exitCode
+    let rr = runResult(r)
+    let code = if rr.isSome and rr.get.exit.kind == ptypes.ekExited: rr.get.exit.code else: 0
+    "exit " & $code
   of oCompileFailed:
     "compile failed"
   of oSpawnError:
     "spawn error"
-  of oKilled, oTimeout:
+  of oKilled:
     let rr = runResult(r)
     if rr.isSome: "killed: " & ptypes.causeLabel(rr.get.cause)
     else: "killed"
-  of oCrashed, oSignal:
+  of oCrashed:
     let rr = runResult(r)
     if rr.isSome: "crashed: " & ptypes.symbol(rr.get.exit)
     else: "crashed"
@@ -782,10 +786,10 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     for i in 0 ..< results.len:
       let r = results[i]
       # Skip cached results — no fresh measurement, never flag.
-      if r.cached:
+      if cached(r):
         continue
       # Skip compile-failed — no run duration to compare.
-      if r.outcome == oCompileFailed:
+      if outcome(r) == oCompileFailed:
         continue
       # Build identity key for this entrypoint.
       let ikey = identityKey(r.ep.path, flagHash(r.ep.flags))

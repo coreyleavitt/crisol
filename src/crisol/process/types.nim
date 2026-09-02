@@ -10,11 +10,10 @@
 ## dependency inversion) and re-exported by crisol/types.nim, not the other
 ## way around — crisol/types.EntrypointResult carries `compile`/`run: Phase`
 ## fields (this module's shape) directly, so process/types cannot import
-## crisol/types without cycling back through it. `deriveOutcome`/
+## crisol/types without cycling back through it. `outcome`/
 ## `hasFailRecords` therefore live in crisol/types.nim (the module that owns
 ## the real production EntrypointResult), not here — see that module for
-## both. `deriveOutcome` only ever produces six of Outcome's eight values —
-## the two legacy values (`oTimeout`/`oSignal`) are never returned by it.
+## both.
 import std/[options, strutils, tables]
 
 # ---------------------------------------------------------------------------
@@ -204,10 +203,6 @@ type
     oPassed         ## exit 0, no protocol failure records
     oFailed         ## exit non-zero, or ≥ 1 fail record from protocol
     oCompileFailed  ## nim c exited non-zero or timed out during compile
-    oTimeout        ## LEGACY (rfc-0007 window): run phase exceeded timeout.
-                    ## Superseded by oKilled; removed at A1e-i.
-    oSignal         ## LEGACY (rfc-0007 window): run phase killed by a signal.
-                    ## Superseded by oCrashed; removed at A1e-i.
     oSpawnError     ## fork/exec failed at the OS level
     oKilled         ## rfc-0007: a runner-authored kill (timeout or interrupt) —
                     ## cause.by == cbRunner.

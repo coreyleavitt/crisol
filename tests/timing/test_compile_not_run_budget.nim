@@ -15,13 +15,13 @@
 ##
 ##   With the CORRECT implementation, the deadline for the run phase is set fresh
 ##   in spawnRun() at the compile→run transition.  When hang_forever is killed,
-##   the slot is in spRunning phase → outcome is oTimeout (not oCompileFailed).
+##   the slot is in spRunning phase → outcome is oKilled (not oCompileFailed).
 ##
 ## Test 1 (direct regression check):
 ##   Run hang_forever.nim with ep.runTimeoutSecs = 2, compileTimeoutSecs = 60.
-##   Assert outcome == oTimeout (NOT oCompileFailed).
+##   Assert outcome == oKilled (NOT oCompileFailed).
 ##   oCompileFailed would mean the timeout fired during compile → wrong anchoring.
-##   oTimeout means the timeout fired during run → correct anchoring.
+##   oKilled means the timeout fired during run → correct anchoring.
 ##
 ##   Limitation: this test is deterministic ONLY if compile of hang_forever.nim
 ##   finishes within 2 seconds.  In practice, a trivial Nim file compiles in
@@ -34,7 +34,7 @@
 ##
 ## Test 2 (non-regression — normal run succeeds):
 ##   Run pass_always.nim with ep.runTimeoutSecs = 2, compileTimeoutSecs = 60.
-##   Assert outcome == oPassed (not oTimeout, not oCompileFailed).
+##   Assert outcome == oPassed (not oKilled, not oCompileFailed).
 ##   If the deadline were anchored at compile-start and compile > 2s, this would
 ##   give oCompileFailed.  Since compile << 2s here, this is a safety check.
 ##
@@ -80,7 +80,7 @@ proc runWithTimeouts(ep: Entrypoint;
   var g = emptyDepGraph()
   let results = execute(p, config = cfg, graph = g, showProgress = false)
   if results.len > 0: results[0]
-  else: EntrypointResult(ep: ep, outcome: oSpawnError)
+  else: EntrypointResult(ep: ep)
 
 # ---------------------------------------------------------------------------
 # Suite
@@ -88,10 +88,10 @@ proc runWithTimeouts(ep: Entrypoint;
 
 suite "Feature A — run deadline anchored at run-start, not compile-start":
 
-  test "hang_forever with 2s run timeout → oTimeout (not oCompileFailed)":
+  test "hang_forever with 2s run timeout → oKilled (not oCompileFailed)":
     ## If run deadline were set at compile-start + 2s, and compile takes > 2s,
     ## the deadline would fire during spCompiling → pollSlot returns oCompileFailed.
-    ## With correct implementation, deadline is set at run-start → oTimeout.
+    ## With correct implementation, deadline is set at run-start → oKilled.
     ##
     ## Limitation: conclusive only when hang_forever.nim compiles in < 2s.
     ## In practice, a trivial Nim file always compiles well under 2s in the
@@ -103,16 +103,16 @@ suite "Feature A — run deadline anchored at run-start, not compile-start":
     let res = runWithTimeouts(ep, compileTimeoutSecs = 60)
     let elapsed = epochTime() - t0
 
-    # The outcome must be oTimeout — not oCompileFailed.
+    # The outcome must be oKilled — not oCompileFailed.
     # oCompileFailed would indicate the deadline fired during compile (wrong anchoring).
-    check res.outcome == oTimeout
+    check outcome(res) == oKilled
     ## Non-vacuity: if spawnRun forgot to set slot.deadline (leaving it at the
     ## compile deadline = compile_start + 60s), hang_forever would never time out
     ## in 2s → this check would fail (wrong outcome or too slow).
     ##
     ## Regression: if the deadline were moved to compile-start with the run budget,
-    ## AND compile takes < 2s, outcome would still be oTimeout (same phase at kill
-    ## time).  The oCompileFailed vs oTimeout distinction catches regressions only
+    ## AND compile takes < 2s, outcome would still be oKilled (same phase at kill
+    ## time).  The oCompileFailed vs oKilled distinction catches regressions only
     ## when compile takes > run_timeout_ms.  This is the fundamental limitation —
     ## documented here rather than masked.
 
@@ -130,10 +130,10 @@ suite "Feature A — run deadline anchored at run-start, not compile-start":
     let res = runWithTimeouts(ep, compileTimeoutSecs = 60)
 
     # Fast binary must complete within the run budget.
-    check res.outcome == oPassed
+    check outcome(res) == oPassed
     ## Non-vacuity: if the run deadline were set to an instant (e.g. a bug set
     ## deadline = getMonoTime() in spawnRun without adding the budget), the binary
-    ## would immediately time out → oTimeout, and this check would fail.
+    ## would immediately time out → oKilled, and this check would fail.
 
 when isMainModule:
   echo "Feature A deadline tests done."

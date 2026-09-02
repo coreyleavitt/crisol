@@ -3,8 +3,8 @@
 ## Covers:
 ##   1. Quarantined FAILED result → Summary.quarantined=1, failed=0
 ##   2. Quarantined compileFailed → quarantined=1, compileFailed=0
-##   3. Quarantined timedOut     → quarantined=1, timedOut=0
-##   4. Quarantined signaled     → quarantined=1, signaled=0
+##   3. Quarantined killed       → quarantined=1, counts[oKilled]=0
+##   4. Quarantined crashed      → quarantined=1, counts[oCrashed]=0
 ##   5. Quarantined spawnError   → quarantined=1, spawnErrors=0
 ##   6. Quarantined PASSED result → passed=1, quarantined=0 (pass is benign)
 ##   7. exitCode 0 when the only failure is quarantined
@@ -16,39 +16,72 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_B3_quarantine_summary.nim
 
-import std/[unittest]
+import std/[options, unittest]
 import crisol/types
 import crisol/runner  # for summarize
+from crisol/process/types as ptypes import nil
 
 proc makeEp(path: string): Entrypoint =
   Entrypoint(path: path, group: "unit")
 
+## rfc-0007 A1e-i: outcome is derived from compile/run Phase, not stored —
+## each helper below builds the Phase pair that derives the outcome its name
+## promises, so these tests still discriminate by failure KIND, not just by
+## "some failure or other" (quarantine doesn't care which kind, but the test
+## names — and the exercised summarize() case arms — do).
+const skippedPhase = ptypes.Phase(kind: ptypes.pkSkipped)
+
+proc ranPhase(exit: ptypes.Exit; cause: ptypes.Cause): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: exit, cause: cause, evidence: default(ptypes.Evidence),
+    rusage: none(ptypes.Rusage), durationUs: 0))
+
 proc quarFail(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oFailed,
-                   exitCode: 1, quarantined: true)
+  result = EntrypointResult(ep: makeEp(path), quarantined: true)
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 1),
+                        ptypes.Cause(by: ptypes.cbProcess))
 
 proc quarCompileFail(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oCompileFailed,
-                   exitCode: 1, quarantined: true)
+  result = EntrypointResult(ep: makeEp(path), quarantined: true)
+  result.compile = ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 1),
+                            ptypes.Cause(by: ptypes.cbProcess))
+  result.run = skippedPhase
 
-proc quarTimeout(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oTimeout, quarantined: true)
+proc quarKilled(path: string): EntrypointResult =
+  result = EntrypointResult(ep: makeEp(path), quarantined: true)
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 15, coreDumped: false),
+                        ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: false))
 
-proc quarSignal(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oSignal, signal: 11, quarantined: true)
+proc quarCrashed(path: string): EntrypointResult =
+  result = EntrypointResult(ep: makeEp(path), quarantined: true)
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 11, coreDumped: false),
+                        ptypes.Cause(by: ptypes.cbProcess))
 
 proc quarSpawn(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oSpawnError, quarantined: true)
+  result = EntrypointResult(ep: makeEp(path), quarantined: true)
+  result.compile = skippedPhase
+  result.run = ptypes.Phase(kind: ptypes.pkSpawnFailed, spawnError: "test")
 
 proc quarPass(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oPassed,
-                   exitCode: 0, quarantined: true)
+  result = EntrypointResult(ep: makeEp(path), quarantined: true)
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 0),
+                        ptypes.Cause(by: ptypes.cbProcess))
 
 proc plainFail(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oFailed, exitCode: 1)
+  result = EntrypointResult(ep: makeEp(path))
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 1),
+                        ptypes.Cause(by: ptypes.cbProcess))
 
 proc plainPass(path: string): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oPassed, exitCode: 0)
+  result = EntrypointResult(ep: makeEp(path))
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 0),
+                        ptypes.Cause(by: ptypes.cbProcess))
 
 # ---------------------------------------------------------------------------
 
@@ -66,16 +99,16 @@ suite "B3 summarize — quarantine bucketing":
     check s.compileFailed == 0
     check s.total         == 1
 
-  test "quarantined oTimeout → quarantined=1, timedOut=0":
-    let s = summarize(@[quarTimeout("tests/a.nim")])
+  test "quarantined killed → quarantined=1, counts[oKilled]=0":
+    let s = summarize(@[quarKilled("tests/a.nim")])
     check s.quarantined == 1
-    check s.timedOut    == 0
+    check s.counts[oKilled] == 0
     check s.total       == 1
 
-  test "quarantined oSignal → quarantined=1, signaled=0":
-    let s = summarize(@[quarSignal("tests/a.nim")])
+  test "quarantined crashed → quarantined=1, counts[oCrashed]=0":
+    let s = summarize(@[quarCrashed("tests/a.nim")])
     check s.quarantined == 1
-    check s.signaled    == 0
+    check s.counts[oCrashed] == 0
     check s.total       == 1
 
   test "quarantined oSpawnError → quarantined=1, spawnErrors=0":
@@ -102,8 +135,13 @@ suite "B3 summarize — quarantine bucketing":
 
   test "exitCode 1 when quarantined but --fail-on-flaky and a flaky result exists":
     ## Quarantine must not break the flaky exit path.
-    let flakyPass = EntrypointResult(ep: makeEp("tests/c.nim"), outcome: oPassed,
-                                     exitCode: 0, flaky: true)
+    ## rfc-0007 A1e-i: flaky(r) derives from outcome(r)==oPassed and attempts>1
+    ## — there is no stored `flaky` field to stamp directly any more.
+    var flakyPass = EntrypointResult(ep: makeEp("tests/c.nim"), attempts: 2)
+    flakyPass.compile = skippedPhase
+    flakyPass.run = ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 0),
+                             ptypes.Cause(by: ptypes.cbProcess))
+    check flaky(flakyPass)
     let s = summarize(@[quarFail("tests/a.nim"), flakyPass])
     check exitCode(s, failOnFlaky = true) == 1
 

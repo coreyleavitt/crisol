@@ -315,12 +315,10 @@ suite "crisol CLI — B7 --failed":
     # Seed: fail_always failed, pass_always passed.
     let results = @[
       EntrypointResult(
-        ep:       Entrypoint(path: failRelPath, group: "paths", flags: @[]),
-        outcome:  oFailed, exitCode: 1, signal: 0, durationMs: 100, records: @[],
+        ep:       Entrypoint(path: failRelPath, group: "paths", flags: @[]), durationMs: 100, records: @[],
         compile: okPhase(), run: okPhase(1)),
       EntrypointResult(
-        ep:       Entrypoint(path: passRelPath, group: "paths", flags: @[]),
-        outcome:  oPassed, exitCode: 0, signal: 0, durationMs: 50, records: @[],
+        ep:       Entrypoint(path: passRelPath, group: "paths", flags: @[]), durationMs: 50, records: @[],
         compile: okPhase(), run: okPhase()),
     ]
     let summary = Summary(total: 2, passed: 1, failed: 1)
@@ -379,8 +377,7 @@ suite "crisol CLI — B7 --failed":
     let results = @[
       EntrypointResult(
         ep:      Entrypoint(path: "tests/fixtures/nonexistent_xyzzy.nim",
-                            group: "paths", flags: @[]),
-        outcome: oFailed, exitCode: 1, signal: 0, durationMs: 10, records: @[],
+                            group: "paths", flags: @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase(1)),
     ]
     let summary = Summary(total: 1, passed: 0, failed: 1)

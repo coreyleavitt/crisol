@@ -1,7 +1,7 @@
 ## test_per_group_timeout.nim — S2b integration test: per-group run deadline.
 ##
 ## Verifies that an entrypoint placed in a group with a short `timeout-secs`
-## is classified `oTimeout` according to *that group's* budget, while the
+## is classified `oKilled` according to *that group's* budget, while the
 ## global run timeout is set much larger (60 s).  This distinguishes the
 ## per-group wiring from the pre-existing global-only behaviour.
 ##
@@ -73,7 +73,7 @@ suite "S2b — per-group run timeout wiring":
     let elapsed = epochTime() - t0
 
     check results.len == 1
-    check results[0].outcome == oTimeout
+    check outcome(results[0]) == oKilled
 
     # Must complete well under the global 60 s budget.
     # Allow up to 15 s total (generous compile headroom + 1 s run limit).
@@ -88,7 +88,7 @@ suite "S2b — per-group run timeout wiring":
     ]
     let results = runWith(eps, jobs = 1, globalRunSecs = 60)
     check results.len == 1
-    check results[0].outcome == oPassed
+    check outcome(results[0]) == oPassed
 
   test "group timeout fires earlier than global (comparative)":
     ## Run the same hanging fixture twice: once with the group timeout at 1 s,
@@ -104,6 +104,6 @@ suite "S2b — per-group run timeout wiring":
     let resTimed = runWith(epsTimed, jobs = 1, globalRunSecs = 60)
     let elapsedTimed = epochTime() - t0
 
-    check resTimed[0].outcome == oTimeout
+    check outcome(resTimed[0]) == oKilled
     # Must finish well before the 60 s global would fire (< 15 s is generous).
     check elapsedTimed < 15.0

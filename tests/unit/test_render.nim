@@ -48,42 +48,37 @@ const cbProcess = ptypes.Cause(by: ptypes.cbProcess)
 
 proc passedResult(path: string; durationMs: int64 = 100;
                   records: seq[TestRecord] = @[]): EntrypointResult =
-  result = EntrypointResult(ep: makeEp(path), outcome: oPassed,
-                   exitCode: 0, durationMs: durationMs, records: records)
+  result = EntrypointResult(ep: makeEp(path), durationMs: durationMs, records: records)
   result.compile = skippedPhase
   result.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: 0))
 
 proc failedResult(path: string; records: seq[TestRecord] = @[];
                   output = ""; durationMs: int64 = 50): EntrypointResult =
-  result = EntrypointResult(ep: makeEp(path), outcome: oFailed,
-                   exitCode: 1, durationMs: durationMs,
+  result = EntrypointResult(ep: makeEp(path), durationMs: durationMs,
                    records: records, output: output)
   result.compile = skippedPhase
   result.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: 1))
 
 proc compileFailedResult(path: string;
                           output = "error: undeclared id 'Foo'"): EntrypointResult =
-  result = EntrypointResult(ep: makeEp(path), outcome: oCompileFailed,
-                   exitCode: 1, output: output, durationMs: 200)
+  result = EntrypointResult(ep: makeEp(path), output: output, durationMs: 200)
   result.compile = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekExited, code: 1))
   result.run = skippedPhase
 
 proc timeoutResult(path: string): EntrypointResult =
-  result = EntrypointResult(ep: makeEp(path), outcome: oTimeout,
-                   signal: 9, durationMs: 300_000)
+  result = EntrypointResult(ep: makeEp(path), durationMs: 300_000)
   result.compile = skippedPhase
   result.run = ranPhase(
     ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: false),
     ptypes.Exit(kind: ptypes.ekSignaled, sig: 9, coreDumped: false))
 
 proc signalResult(path: string; sig = 11): EntrypointResult =
-  result = EntrypointResult(ep: makeEp(path), outcome: oSignal,
-                   signal: sig, durationMs: 80)
+  result = EntrypointResult(ep: makeEp(path), durationMs: 80)
   result.compile = skippedPhase
   result.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekSignaled, sig: sig, coreDumped: false))
 
 proc spawnResult(path: string): EntrypointResult =
-  result = EntrypointResult(ep: makeEp(path), outcome: oSpawnError,
+  result = EntrypointResult(ep: makeEp(path),
                    output: "fork failed", durationMs: 0)
   result.compile = skippedPhase
   result.run = ptypes.Phase(kind: ptypes.pkSpawnFailed, spawnError: "fork failed")
@@ -293,7 +288,10 @@ suite "render – summary footer":
     check "FAILED"          in rendered
     check "1 failed"        in rendered
     check "1 compile-failed" in rendered
-    check "1 timed-out"     in rendered
+    # rfc-0007 §2: "timed-out" was the legacy scalar-counter label; a
+    # runner-authored kill now renders under the honest "killed" bucket
+    # (summary.counts[oKilled] — there is no scalar counterpart any more).
+    check "1 killed"        in rendered
 
 # ---------------------------------------------------------------------------
 # Suite 8 & 9 — Color on / off

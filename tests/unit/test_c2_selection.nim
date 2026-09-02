@@ -190,7 +190,7 @@ suite "C2 gate skip — applyGates gatedOut":
     ## Gate-skips are never failures.  A Summary with only passed entrypoints
     ## should exit 0 regardless of how many gated-out entries exist.
     let s = Summary(total: 2, passed: 2, failed: 0, compileFailed: 0,
-                    timedOut: 0, signaled: 0, spawnErrors: 0)
+                    spawnErrors: 0)
     check exitCode(s) == 0
 
   test "gate-skip message helper produces correct format":

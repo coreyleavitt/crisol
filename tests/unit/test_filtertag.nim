@@ -57,12 +57,12 @@ proc phase(code: int): ptypes.Phase =
   ))
 
 proc passedEp(path: string; records: seq[TestRecord]): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oPassed, exitCode: 0,
+  EntrypointResult(ep: makeEp(path),
                    compile: phase(0), run: phase(0),
                    durationMs: 50, records: records)
 
 proc failedEp(path: string; records: seq[TestRecord]): EntrypointResult =
-  EntrypointResult(ep: makeEp(path), outcome: oFailed, exitCode: 1,
+  EntrypointResult(ep: makeEp(path),
                    compile: phase(0), run: phase(1),
                    durationMs: 50, records: records)
 
@@ -166,20 +166,22 @@ suite "render – filter-tag visibility":
 # ---------------------------------------------------------------------------
 
 suite "render – verdict invariant":
-  test "PASSED verdict unchanged even when failing records are filtered away":
-    # A failing record tagged 'slow' exists.  Filter for 'fast' hides it.
-    # The RUN itself still passes (no oFailed outcome in the results).
-    # Verdict must remain PASSED.
-    let fastRec  = taggedRecord("fast_ok",    @["fast"])
-    let slowFail = taggedRecord("slow_fail",  @["slow"], status = rsFail)
-    # Make an entrypoint that PASSED overall (outcome=oPassed) but has a fail record
-    # tagged "slow".  After filtering for "fast" only fast_ok is shown, but the
-    # PASSED verdict comes from the summary (which reflects full run).
-    let ep = EntrypointResult(
-      ep: makeEp("tests/unit/ep.nim"), outcome: oPassed, exitCode: 0,
-      durationMs: 10, records: @[fastRec, slowFail])
+  test "PASSED verdict unchanged even when ALL records are filtered away":
+    ## rfc-0007 A1e-i: outcome(r) derives from the FULL (unfiltered) records
+    ## via hasFailRecords — a genuine rsFail record always forces oFailed
+    ## (the OR-rule is now baked into the derivation, not a separate,
+    ## independently-stampable legacy field), so "passed overall despite a
+    ## real fail record" is no longer a constructible state; that soundness
+    ## tightening is the point of §2. The still-realizable analog: an
+    ## entrypoint that genuinely passed (no fail records at all) whose every
+    ## record happens to be tagged "slow" — filtering for "fast" leaves ZERO
+    ## visible records for it, and the verdict must not read "nothing shown"
+    ## as suspicious; PASSED still comes from the full-run summary.
+    let slowPass = taggedRecord("slow_ok",   @["slow"])
+    let slowSkip = taggedRecord("slow_skip", @["slow"], status = rsSkip)
+    let ep = passedEp("tests/unit/ep.nim", @[slowPass, slowSkip])
     let results  = @[ep]
-    let s        = summarize(results)  # summarize uses outcome=oPassed → passed
+    let s        = summarize(results)  # outcome(ep) == oPassed → passed
     let rendered = render(results, s, filterOpts("fast"))
     check "PASSED" in rendered
     check "FAILED" notin rendered

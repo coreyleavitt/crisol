@@ -240,13 +240,9 @@ suite "planTests — failedOnly() narrowing":
       # Seed: test_a failed, test_b passed.
       let results = @[
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"),
-          outcome: oFailed, compile: okPhase(), run: okPhase(1),
-        ),
+          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"), compile: okPhase(), run: okPhase(1)),
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit"),
-          outcome: oPassed, compile: okPhase(), run: okPhase(),
-        ),
+          ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit"), compile: okPhase(), run: okPhase()),
       ]
       let summary = Summary(total: 2, passed: 1, failed: 1)
       seedLastRun(projectRoot, results, summary)
@@ -265,9 +261,7 @@ suite "planTests — failedOnly() narrowing":
       # Seed: everything passed.
       let results = @[
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"),
-          outcome: oPassed, compile: okPhase(), run: okPhase(),
-        ),
+          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"), compile: okPhase(), run: okPhase()),
       ]
       let summary = Summary(total: 1, passed: 1)
       seedLastRun(projectRoot, results, summary)
@@ -367,13 +361,9 @@ suite "planTests — changedOnly / failedOrChanged narrowing":
       # Seed: only test_b failed; test_a passed.
       let results = @[
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"),
-          outcome: oPassed, compile: okPhase(), run: okPhase(),
-        ),
+          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"), compile: okPhase(), run: okPhase()),
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit"),
-          outcome: oFailed, compile: okPhase(), run: okPhase(1),
-        ),
+          ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit"), compile: okPhase(), run: okPhase(1)),
       ]
       seedLastRun(gitRoot, results, Summary(total: 2, passed: 1, failed: 1))
       # failedOnly → test_b only (1 entrypoint).

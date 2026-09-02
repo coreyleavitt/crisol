@@ -2,8 +2,11 @@
 ##
 ## Tests:
 ##   1. rss_hog fixture: ledger row rssBytes > 0 and > 1 MiB after a live run.
-##      EntrypointResult.peakRssBytes > 0 and > 1 MiB.
-##   2. edCached: no ledger row; peakRssBytes == 0 on the synthesized result.
+##      (rfc-0007 A1e-i: EntrypointResult.peakRssBytes is gone — the ledger
+##      row is the only surviving carrier of this scheduler-sampled quantity;
+##      see runner.nim's summarize()-adjacent comment.)
+##   2. edCached: no ledger row; the served result is cached(r) — no live
+##      measurement was taken for it.
 ##   3. Per-attempt: each retry attempt carries its own peakRssBytes in its row.
 ##
 ## RSS assertions are LOOSE (floor checks only) to avoid environment flakiness.
@@ -40,7 +43,7 @@ proc baseOpts(projectRoot: string; retries: int = 0): RunOptions =
 
 suite "C5 — rss_hog: ledger row rssBytes > 1 MiB":
 
-  test "live rss_hog run: ledger row rssBytes > 1 MiB and EntrypointResult.peakRssBytes > 1 MiB":
+  test "live rss_hog run: ledger row rssBytes > 1 MiB":
     withTempProject:
       let src = fixtureDir / "rss_hog.nim"
       let dst = projectRoot / "tests" / "unit" / "test_rss_hog.nim"
@@ -51,10 +54,8 @@ suite "C5 — rss_hog: ledger row rssBytes > 1 MiB":
       check rr.exitCode == 0
       require rr.results.len == 1
 
-      # EntrypointResult carries peakRssBytes > 1 MiB.
-      check rr.results[0].peakRssBytes > OneMiB
-
-      # Ledger row carries the same measurement.
+      # rfc-0007 A1e-i: EntrypointResult no longer carries peakRssBytes — the
+      # ledger row below is the only surviving carrier of this quantity.
       let ep   = rr.results[0].ep
       let iKey = identityKey(ep.path, flagHash(ep.flags))
       let rows = scanLedger(projectRoot / ".crisol", iKey)
@@ -62,12 +63,12 @@ suite "C5 — rss_hog: ledger row rssBytes > 1 MiB":
       check rows[0].rssBytes > OneMiB
 
 # ---------------------------------------------------------------------------
-# Suite 2: edCached — no ledger row; peakRssBytes == 0 on synthesized result
+# Suite 2: edCached — no ledger row; the served result is cached(r)
 # ---------------------------------------------------------------------------
 
-suite "C5 — edCached: no new ledger row, peakRssBytes=0 on cached result":
+suite "C5 — edCached: no new ledger row; served result is cached":
 
-  test "edCached hit produces no new ledger row and peakRssBytes=0":
+  test "edCached hit produces no new ledger row and cached(r) == true":
     withTempProject:
       let src = fixtureDir / "pass_always.nim"
       let dst = projectRoot / "tests" / "unit" / "test_pass_always.nim"
@@ -90,8 +91,10 @@ suite "C5 — edCached: no new ledger row, peakRssBytes=0 on cached result":
       check rr2.exitCode == 0
       require rr2.results.len == 1
 
-      # edCached result must have peakRssBytes == 0 (no measurement taken).
-      check rr2.results[0].peakRssBytes == 0
+      # edCached result carries no live measurement — rfc-0007 A1e-i:
+      # peakRssBytes is gone; `cached(r)` is the honest derived fact instead
+      # (run.kind == pkCached).
+      check cached(rr2.results[0])
 
       # No new ledger rows written (B2 already governs this; C5 must not regress it).
       let rows2 = scanLedger(stateDir, iKey)

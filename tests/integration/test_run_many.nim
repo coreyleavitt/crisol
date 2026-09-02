@@ -15,9 +15,10 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_run_many.nim
 
-import std/[os, unittest]
+import std/[options, os, unittest]
 import crisol/types
 import crisol/runner
+from crisol/process/types as ptypes import nil
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,6 +31,31 @@ proc fixtureDir(): string =
 
 proc mkEp(path: string): Entrypoint =
   Entrypoint(path: path, group: "test", flags: @[])
+
+## rfc-0007 A1e-i: EntrypointResult.outcome is gone — outcome(r) derives from
+## compile/run Phase. These helpers build a hand-fixture Phase pair for the
+## "summarize — pure aggregate counts" suite below, which tests the fold
+## directly rather than through a live execute() run.
+proc ranPhase(exit: ptypes.Exit; cause: ptypes.Cause): ptypes.Phase =
+  ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: exit, cause: cause, evidence: default(ptypes.Evidence),
+    rusage: none(ptypes.Rusage), durationUs: 0))
+
+const skippedPhase = ptypes.Phase(kind: ptypes.pkSkipped)
+const processCause = ptypes.Cause(by: ptypes.cbProcess)
+
+proc passedResult(ep: Entrypoint): EntrypointResult =
+  result = EntrypointResult(ep: ep, compile: skippedPhase,
+    run: ranPhase(ptypes.Exit(kind: ptypes.ekExited, code: 0), processCause))
+
+proc killedResult(ep: Entrypoint): EntrypointResult =
+  result = EntrypointResult(ep: ep, compile: skippedPhase,
+    run: ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 15, coreDumped: false),
+                  ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: false)))
+
+proc crashedResult(ep: Entrypoint): EntrypointResult =
+  result = EntrypointResult(ep: ep, compile: skippedPhase,
+    run: ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 11, coreDumped: false), processCause))
 
 # ---------------------------------------------------------------------------
 # Suites
@@ -83,7 +109,7 @@ suite "execute — continue-on-failure aggregation":
     let results = execute(p, config = cfg, graph = g)
     check results.len == 2
     for r in results:
-      check r.outcome == oPassed
+      check outcome(r) == oPassed
     let s = summarize(results)
     check s.total  == 2
     check s.passed == 2
@@ -113,9 +139,9 @@ suite "execute — continue-on-failure aggregation":
     check callbackFired == 3
 
     # Check individual outcomes in plan order.
-    check results[0].outcome == oPassed
-    check results[1].outcome == oFailed
-    check results[2].outcome == oCompileFailed
+    check outcome(results[0]) == oPassed
+    check outcome(results[1]) == oFailed
+    check outcome(results[2]) == oCompileFailed
 
     # Summary counts.
     let s = summarize(results)
@@ -123,8 +149,8 @@ suite "execute — continue-on-failure aggregation":
     check s.passed        == 1
     check s.failed        == 1
     check s.compileFailed == 1
-    check s.timedOut      == 0
-    check s.signaled      == 0
+    check s.counts[oKilled]  == 0
+    check s.counts[oCrashed] == 0
 
     # Non-zero exit when any entrypoint failed.
     check exitCode(s) == 1
@@ -161,29 +187,29 @@ suite "summarize — pure aggregate counts":
   test "all passed → exitCode 0":
     let ep0 = Entrypoint(path: "x.nim", group: "g", flags: @[])
     let results = @[
-      EntrypointResult(ep: ep0, outcome: oPassed),
-      EntrypointResult(ep: ep0, outcome: oPassed),
+      passedResult(ep0),
+      passedResult(ep0),
     ]
     let s = summarize(results)
     check s.total  == 2
     check s.passed == 2
     check exitCode(s) == 0
 
-  test "one timeout → exitCode 1":
+  test "one killed → exitCode 1":
     let ep0 = Entrypoint(path: "x.nim", group: "g", flags: @[])
     let results = @[
-      EntrypointResult(ep: ep0, outcome: oPassed),
-      EntrypointResult(ep: ep0, outcome: oTimeout),
+      passedResult(ep0),
+      killedResult(ep0),
     ]
     let s = summarize(results)
-    check s.timedOut == 1
+    check s.counts[oKilled] == 1
     check exitCode(s) == 1
 
-  test "one signal → exitCode 1":
+  test "one crashed → exitCode 1":
     let ep0 = Entrypoint(path: "x.nim", group: "g", flags: @[])
     let results = @[
-      EntrypointResult(ep: ep0, outcome: oSignal, signal: 11),
+      crashedResult(ep0),
     ]
     let s = summarize(results)
-    check s.signaled == 1
+    check s.counts[oCrashed] == 1
     check exitCode(s) == 1

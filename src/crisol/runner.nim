@@ -107,11 +107,11 @@ proc isQuarantined*(ep: Entrypoint; res: EntrypointResult;
   ##     binary is also marked (harmless — summarize only suppresses failures).
   ##
   ##   B4 (per-test name rule):
-  ##     res.outcome is a failure AND res.records contains ≥ 1 rsFail record AND
+  ##     outcome(res) is a failure AND res.records contains ≥ 1 rsFail record AND
   ##     every rsFail record's name ∈ q  → quarantined.
   ##     If ANY failing record's name is NOT in q, the rule does NOT fire.
   ##     If the entrypoint failed with NO rsFail records (opaque binary, exit
-  ##     nonzero without protocol, oTimeout, oSignal, etc.) this rule does NOT
+  ##     nonzero without protocol, killed, crashed, etc.) this rule does NOT
   ##     apply — only the B3 path rule can downgrade such results.
   ##
   ## One flat set:
@@ -125,8 +125,8 @@ proc isQuarantined*(ep: Entrypoint; res: EntrypointResult;
 
   # B4: per-test name-match.
   # Preconditions: must be a failure with ≥ 1 rsFail record.
-  # rfc-0007 A1c: derived, not the stored legacy field.
-  if not deriveOutcome(res).isFailure:
+  # rfc-0007 §2: derived — there is no stored legacy field.
+  if not outcome(res).isFailure:
     return false  # passed result — nothing to downgrade
 
   # Collect failing records. If none, per-test rule does not apply.
@@ -165,7 +165,7 @@ proc appendAttemptRow(led: var Ledger; ep: Entrypoint; attemptNum: int;
     identity:   iKey,
     timestamp:  int64(epochTime() * 1_000_000),  # unix epoch microseconds
     inputHash:  inputHash,
-    outcome:    types.outcomeString(res.outcome),
+    outcome:    types.outcomeString(outcome(res)),
     attempt:    attemptNum,
     durationUs: res.durationMs * 1000,
     rssBytes:   peakRssBytes,  # C5: peak RSS bytes for this attempt
@@ -335,36 +335,6 @@ proc killAndReap(pid: Pid): KillCapture =
   result = reapBlocking(pid)
   result.escalated = true
 
-# ---------------------------------------------------------------------------
-# rfc-0007 A1b: dual-write coherence — a debug-gated postcondition asserting
-# the legacy outcome and the newly-captured compile/run Phase pair agree
-# under §2's documented retry mapping (oTimeout -> oKilled, oSignal ->
-# oCrashed). Runs in the normal test path (every execute() call, not a
-# bespoke test) so a regression in the new capture chain cannot hide behind
-# a green legacy assertion. Deleted at A1e-i once the legacy fields are gone.
-# ---------------------------------------------------------------------------
-
-proc mapLegacyOutcomeForward(o: Outcome): Outcome =
-  case o
-  of oTimeout: oKilled
-  of oSignal:  oCrashed
-  else:        o
-
-proc checkRfc7Coherence(legacy: EntrypointResult) =
-  ## rfc-0007 A1c: the window now lives directly on `legacy` (compile/run
-  ## Phase fields) — no more shaping a parallel process/types.EntrypointResult
-  ## to derive over.
-  let derived  = deriveOutcome(legacy)
-  let expected = mapLegacyOutcomeForward(legacy.outcome)
-  doAssert derived == expected,
-    "rfc-0007 A1b dual-write coherence: " & legacy.ep.path & " legacy outcome=" &
-    $legacy.outcome & " (mapped " & $expected & ") but derived=" & $derived &
-    " from the captured compile/run Phase"
-
-template rfc7Check(legacy: EntrypointResult) =
-  when not defined(danger):
-    checkRfc7Coherence(legacy)
-
 proc teardownLiveSlots(slots: var seq[Slot]) =
   ## M6: Graceful shutdown of all live slots — shared by handleInterrupt and the
   ## exception finally path.  Mirrors the three-phase approach used in the
@@ -442,25 +412,14 @@ proc teardownLiveSlots(slots: var seq[Slot]) =
     slots[i].pepIdx = -1  # mark idle so a second call is a no-op
 
 proc classifyRunResult(
-  exitCode: int; signal: int; timedOut: bool;
   ep: Entrypoint; output: string; elapsed: int64; compileSkipped: bool;
 ): EntrypointResult =
-  if timedOut:
-    EntrypointResult(ep: ep, outcome: oTimeout, signal: int(SIGKILL),
-                     output: output, durationMs: elapsed,
-                     compileSkipped: compileSkipped)
-  elif signal != 0:
-    EntrypointResult(ep: ep, outcome: oSignal, signal: signal,
-                     output: output, durationMs: elapsed,
-                     compileSkipped: compileSkipped)
-  elif exitCode == 0:
-    EntrypointResult(ep: ep, outcome: oPassed, exitCode: 0,
-                     output: output, durationMs: elapsed,
-                     compileSkipped: compileSkipped)
-  else:
-    EntrypointResult(ep: ep, outcome: oFailed, exitCode: exitCode,
-                     output: output, durationMs: elapsed,
-                     compileSkipped: compileSkipped)
+  ## rfc-0007 A1e-i: what used to select a legacy Outcome/exitCode/signal
+  ## value is now just the plain opaque-fallback construction — `outcome(r)`
+  ## derives pass/fail from the res.compile/res.run Phase set right after this
+  ## returns (below, at the call site), never from a value computed here.
+  EntrypointResult(ep: ep, output: output, durationMs: elapsed,
+                   compileSkipped: compileSkipped)
 
 proc warnMeasureCompileReuseNoWorkerOnce() =
   ## One-shot (per process, not per entrypoint) warning for the degraded-mode
@@ -926,11 +885,11 @@ proc pollSlot(
   ## onResult is called ONCE by the execute loop after that decision.
   ##
   ## Records the result in `results[slot.pepIdx]`; execute loop calls onResult.
-  ## rfc-0007 A1c: `results[slot.pepIdx].compile`/`.run` (the §2 window) are
-  ## dual-written alongside every legacy-field write below EXCEPT two
-  ## documented, never-fabricated corners: a genuinely unreaped kill (the
-  ## "unkillable child" case) and ECHILD (truly no child to observe) — both
-  ## leave `compile`/`run` at their pkSkipped zero-value default.
+  ## rfc-0007 §2: `results[slot.pepIdx].compile`/`.run` are populated below on
+  ## every path EXCEPT two documented, never-fabricated corners: a genuinely
+  ## unreaped kill (the "unkillable child" case) and ECHILD (truly no child to
+  ## observe) — both leave `compile`/`run` at their pkSkipped zero-value
+  ## default, and `outcome(r)` derives loudly (oSpawnError) rather than lying.
 
   var wstatus: cint = 0
   var ru: Rusage
@@ -954,11 +913,7 @@ proc pollSlot(
         readCapped(slot.compOut, maxOutputBytes) & "\n[compile timed out]"
       else:
         readCapped(slot.runOut, maxOutputBytes)
-    let outcome =
-      if slot.phase == spCompiling: oCompileFailed
-      else:                         oTimeout
-    var res = EntrypointResult(ep: pep.ep, outcome: outcome,
-                               signal: int(SIGKILL), output: output,
+    var res = EntrypointResult(ep: pep.ep, output: output,
                                durationMs: elapsed,
                                compileSkipped: slot.compileSkipped)
     # M15: clean up per-slot bin dir on timeout during compile.
@@ -972,10 +927,10 @@ proc pollSlot(
     if slot.phase == spCompiling and slot.cacheDir.len > 0:
       try: removeDir(slot.cacheDir) except: discard
     cleanupSlotTmp(slot)
-    # rfc-0007 A1c: the honest observation. `cap.reaped == false` is the
+    # rfc-0007 §2: the honest observation. `cap.reaped == false` is the
     # RFC's "unkillable child" corner — never fabricate a Phase for it;
     # `res.compile`/`.run` are simply left at their pkSkipped zero-value
-    # default for this pepIdx (the legacy result above is unaffected either way).
+    # default for this pepIdx.
     if cap.reaped:
       let killedRes = buildProcResult(cap.exit, cap.rusage,
         some((reason: ptypes.krTimeout, escalated: cap.escalated)), elapsed * 1000)
@@ -989,7 +944,6 @@ proc pollSlot(
           else:
             ptypes.Phase(kind: ptypes.pkSkipped)
         res.run = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
-      rfc7Check(res)
     results[slot.pepIdx] = res
     return true  # execute loop calls onResult after retry decision
 
@@ -1001,7 +955,7 @@ proc pollSlot(
     # R10: EINTR is now retried above; this branch is only ECHILD (truly no child).
     let pep    = plan.entrypoints[slot.pepIdx]
     let elapsed = int64((epochTime() - slot.t0) * 1000)
-    var res = EntrypointResult(ep: pep.ep, outcome: oFailed, exitCode: 1,
+    var res = EntrypointResult(ep: pep.ep,
                                output: "waitpid error (ECHILD)",
                                durationMs: elapsed,
                                compileSkipped: slot.compileSkipped)
@@ -1025,8 +979,7 @@ proc pollSlot(
       # Compile failed.
       let output  = readCapped(slot.compOut, maxOutputBytes)
       let elapsed = int64((epochTime() - slot.t0) * 1000)
-      var res = EntrypointResult(ep: pep.ep, outcome: oCompileFailed,
-                                 exitCode: exitedCode, signal: sigNum,
+      var res = EntrypointResult(ep: pep.ep,
                                  output: output, durationMs: elapsed)
       # M15: clean up per-slot cache and bin dirs on compile failure.
       if slot.cacheDir.len > 0:
@@ -1037,14 +990,13 @@ proc pollSlot(
       let failedRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000)
       res.compile = ptypes.Phase(kind: ptypes.pkRan, res: failedRes)
       res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
-      rfc7Check(res)
       results[slot.pepIdx] = res
       return true  # execute loop calls onResult after retry decision
     else:
-      # Compile succeeded → transition to running phase. rfc-0007 A1b:
+      # Compile succeeded → transition to running phase. rfc-0007 §2:
       # capture the compile's own observation onto the slot BEFORE spawning
       # the run child, so the eventual run-phase result (below, or the
-      # timeout branch above) can dual-write BOTH phases.
+      # timeout branch above) can carry BOTH phases.
       let elapsedCompile = int64((epochTime() - slot.t0) * 1000)
       slot.compileProcRes = some(buildProcResult(
         reapedExit, reapedRusage, NoRfc7Stop, elapsedCompile * 1000))
@@ -1054,7 +1006,7 @@ proc pollSlot(
       if not ok:
         # Run spawn failed.
         let elapsed = int64((epochTime() - slot.t0) * 1000)
-        var res = EntrypointResult(ep: pep.ep, outcome: oSpawnError,
+        var res = EntrypointResult(ep: pep.ep,
                                    output: "fork failed during run phase",
                                    durationMs: elapsed)
         # M15: clean up the scratch bin dir only. cacheDir is intentionally
@@ -1069,7 +1021,6 @@ proc pollSlot(
         res.compile = ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
         res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
                                    spawnError: "fork failed during run phase")
-        rfc7Check(res)
         results[slot.pepIdx] = res
         return true  # execute loop calls onResult after retry decision
       # Slot is now in spRunning; not yet done.
@@ -1084,49 +1035,36 @@ proc pollSlot(
       else:
         ptypes.Phase(kind: ptypes.pkSkipped)  # cdSkipFresh: no compile this run
 
-    # R1: Precedence rule — oTimeout/oSignal/oSpawnError are decided by the
-    # executor (above).  Here the process exited normally; apply the OR-rule.
+    # rfc-0007 §2: the process exited or was signaled — outcome(res) derives
+    # the verdict below from res.compile/res.run + res.records; there is no
+    # executor-precedence legacy value to compute here. The sink is
+    # read/reconciled on EVERY run end, signaled included — records from a
+    # signaled process are diagnostic only (cause.by == cbRunner / a non-
+    # ekExited Exit dominates the derivation before records are consulted)
+    # but must not be silently dropped just because the process was signaled.
     var res: EntrypointResult
     let runRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000)
     if sigNum != 0:
-      # Killed by signal — oSignal takes precedence. rfc-0007 A1b (§2): the
-      # sink is read/reconciled on EVERY run end, killed included — records
-      # from a signaled process are diagnostic only (they never flip the
-      # legacy verdict decided by sigNum above) but must not be silently
-      # dropped just because the process was signaled.
       let sinkData = readSink(slot.sinkPath, maxOutputBytes)
-      res = EntrypointResult(ep: pep.ep, outcome: oSignal, signal: sigNum,
+      res = EntrypointResult(ep: pep.ep,
                              output: output, durationMs: elapsed,
                              compileSkipped: slot.compileSkipped,
                              records: sinkData.records)
     else:
-      # Normal exit — read the sink and apply the OR-rule (R1).
+      # Normal exit — read the sink.
       let sinkData = readSink(slot.sinkPath, maxOutputBytes)
       if sinkData.hasProtocol:
-        # Structured protocol: OR-rule over exit code + fail records.
-        # rfc-0007 A1c: the OR-rule itself now lives here (protocol.reconcile
-        # shrank to a records-only predicate — the executor-precedence rule
-        # is subsumed by deriveOutcome, §2).
-        let outcome =
-          if reconcile(sinkData.records) or exitedCode != 0: oFailed
-          else: oPassed
-        res = EntrypointResult(ep: pep.ep, outcome: outcome,
-                               exitCode: exitedCode, output: output,
+        res = EntrypointResult(ep: pep.ep, output: output,
                                durationMs: elapsed,
                                compileSkipped: slot.compileSkipped,
                                records: sinkData.records)
       else:
-        # Opaque fallback: use exit-code-only classification.
-        res = classifyRunResult(exitedCode, 0, false,
-                                pep.ep, output, elapsed, slot.compileSkipped)
+        # Opaque fallback: no protocol records to carry.
+        res = classifyRunResult(pep.ep, output, elapsed, slot.compileSkipped)
 
-    # A4d/A6: carry the hermeticity actually achieved by this run so the
-    # execute loop's cache-store gate can apply isFullyAchieved.
-    res.achieved = slot.achieved
     cleanupSlotTmp(slot)
     res.compile = compilePhase
     res.run     = ptypes.Phase(kind: ptypes.pkRan, res: runRes)
-    rfc7Check(res)
     results[slot.pepIdx] = res
     return true  # execute loop calls onResult after retry decision
 
@@ -1427,16 +1365,15 @@ proc execute*(
             let ok = spawnRunDirect(slots[i], pepIdx, pep, config, cache.spec, attemptNum)
             if not ok:
               ac.release(tok.get)  # S3: rollback admission on spawn failure
-              var res = EntrypointResult(ep: pep.ep, outcome: oSpawnError,
+              var res = EntrypointResult(ep: pep.ep,
                                          output: "fork or file-open failed for skip-fresh run",
                                          durationMs: 0,
                                          compileSkipped: true,
                                          attempts: attemptNum)
-              # rfc-0007 A1c: no process was ever spawned for either phase.
+              # rfc-0007 §2: no process was ever spawned for either phase.
               res.compile = ptypes.Phase(kind: ptypes.pkSkipped)
               res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
                                 spawnError: "fork or file-open failed for skip-fresh run")
-              rfc7Check(res)
               result[pepIdx] = res
               onResult(res)
               finalized[pepIdx] = true
@@ -1452,15 +1389,14 @@ proc execute*(
             if not ok:
               ac.release(tok.get)  # S3: rollback admission on spawn failure
               # Fork/resource failure: record oSpawnError immediately.
-              var res = EntrypointResult(ep: pep.ep, outcome: oSpawnError,
+              var res = EntrypointResult(ep: pep.ep,
                                          output: "fork or file-open failed before compile",
                                          durationMs: 0,
                                          attempts: attemptNum)
-              # rfc-0007 A1c: no process was ever spawned for either phase.
+              # rfc-0007 §2: no process was ever spawned for either phase.
               res.compile = ptypes.Phase(kind: ptypes.pkSpawnFailed,
                                 spawnError: "fork or file-open failed before compile")
               res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
-              rfc7Check(res)
               result[pepIdx] = res
               onResult(res)
               finalized[pepIdx] = true
@@ -1502,6 +1438,10 @@ proc execute*(
         let slotToken       = slots[i].token          # S3: capture before slot cleared
         let slotPid         = int(slots[i].pid)       # S6b: capture pid before slot cleared
         let slotAttempt     = slots[i].attempt        # B0/B1: current attempt number
+        let slotAchieved    = slots[i].achieved       # A4d/A6: hermeticity achieved this run;
+                                                       # captured before slot cleared (A1e-i: no
+                                                       # longer copied onto EntrypointResult — the
+                                                       # cache-store gate reads it from here).
 
         # C5: pre-poll RSS sampling for already-running slots.
         # Sample BEFORE pollSlot so the child is definitely live (WNOHANG inside
@@ -1535,14 +1475,16 @@ proc execute*(
           # behavior is unaffected by C5's sampling.
           ac.onSlotFinish(slotToken, procGroupRssBytes(slotPid))
 
-          # rfc-0007 A1c: retry/flaky/quarantine decisions read the DERIVED
-          # outcome, not the stored legacy field — preserved 1:1 under the
-          # documented mapping (oTimeout -> oKilled, oSignal -> oCrashed, §2).
-          let completedOutcome = deriveOutcome(result[completedIdx])
+          # rfc-0007 §2: retry/flaky/quarantine decisions read the pure
+          # derivation — there is no stored legacy field to read instead.
+          let completedOutcome = outcome(result[completedIdx])
           let maxAttempts = p.entrypoints[completedIdx].retries + 1  # B1
 
-          # C5: stamp peak RSS onto the EntrypointResult for observability.
-          result[completedIdx].peakRssBytes = slotPeakRss
+          # C5: peak RSS is no longer stamped onto the EntrypointResult (the
+          # field is gone, A1e-i — it was a scheduler-sampled quantity with no
+          # Phase/ProcessResult counterpart, distinct from `rusage.maxRssBytes`;
+          # §7 gives it a mechanism-tagged ledger column). `slotPeakRss` still
+          # feeds the ledger row below — the ledger's own quantity is unaffected.
 
           # B2: append one ledger row per live attempt — including intermediate
           # failed attempts that will be retried.  inputHash for intermediate
@@ -1558,7 +1500,7 @@ proc execute*(
           # B1: retry decision — re-dispatch if the result is a failure AND we
           # have remaining attempts.  Compile failures and spawn errors are NOT
           # retried (retrying a compile failure is useless; only run failures
-          # benefit from retry).  oTimeout and oSignal ARE retried (transient
+          # benefit from retry).  oKilled and oCrashed ARE retried (transient
           # infrastructure noise).
           #
           # "Failure eligible for retry" = outcome is NOT oPassed AND NOT
@@ -1580,9 +1522,9 @@ proc execute*(
             inc done
             finalized[completedIdx] = true
 
-            # B1: stamp attempts and flaky onto the final result.
+            # B1: stamp attempts onto the final result; flaky is derived
+            # from attempts (A1e-i: `flaky(r, policy)`, no field to stamp).
             result[completedIdx].attempts = slotAttempt
-            result[completedIdx].flaky    = (completedOutcome == oPassed and slotAttempt > 1)
             # B3/B4: apply quarantine overlay — pure reporting, not cache or execution logic.
             # At the live-finalize site, result[completedIdx] carries the final records
             # (protocol or empty), so the B4 per-test rule has full information.
@@ -1675,7 +1617,8 @@ proc execute*(
             # ALWAYS stamp the live result's CacheDecision for reporting (A8).
             # ---------------------------------------------------------------
             if cacheActive:
-              let verdict = shouldStore(result[completedIdx], cache.spec, slotAttempt, cache.policy,
+              let verdict = shouldStore(result[completedIdx], cache.spec, slotAchieved,
+                                        slotAttempt, cache.policy,
                                         p.entrypoints[completedIdx].cacheable)
               # R9: a store is permitted only when BOTH the policy verdict AND
               # the closure recording (above) agree. A result whose closure
@@ -1829,7 +1772,9 @@ proc runEntrypoint*(
   if results.len > 0:
     result = results[0]
   else:
-    result = EntrypointResult(ep: ep, outcome: oSpawnError,
+    # rfc-0007 §2: compile/run both stay pkSkipped (the zero-value default)
+    # — outcome(r) derives oSpawnError from that, same as before.
+    result = EntrypointResult(ep: ep,
                               output: "execute returned no results")
 
 # ---------------------------------------------------------------------------
@@ -1840,28 +1785,25 @@ proc summarize*(results: seq[EntrypointResult]): Summary =
   ## Pure: fold a result sequence into aggregate counts.
   ##
   ## B3: a quarantined FAILURE is excluded from all exit-contributing buckets
-  ## (failed/compileFailed/timedOut/signaled/spawnErrors) and counted in
-  ## Summary.quarantined instead.  A quarantined PASS counts normally in
-  ## `passed` — quarantine only suppresses the failure; it's harmless on pass.
+  ## (failed/compileFailed/spawnErrors/counts[oKilled]/counts[oCrashed]) and
+  ## counted in Summary.quarantined instead.  A quarantined PASS counts
+  ## normally in `passed` — quarantine only suppresses the failure; it's
+  ## harmless on pass.
   result.total = results.len
   for r in results:
-    if r.quarantined and r.outcome.isFailure:
+    let o = outcome(r)
+    if r.quarantined and o.isFailure:
       # B3: quarantined failure — report it but exclude from exit-1 buckets.
       inc result.quarantined
     else:
-      case r.outcome
+      case o
       of oPassed:        inc result.passed
       of oFailed:        inc result.failed
       of oCompileFailed: inc result.compileFailed
-      of oTimeout:       inc result.timedOut
-      of oSignal:        inc result.signaled
       of oSpawnError:    inc result.spawnErrors
       of oKilled, oCrashed:
-        discard  ## legacy field never carries these; the counts array below
-                 ## (rfc-0007 A1c) is where a live killed/crashed result counts.
-      # rfc-0007 A1c: additive derived-outcome counts array — dual-counted
-      # alongside the scalar buckets above until A1e-i deletes them. Same
-      # quarantine exclusion (the `if` branch above already handled it).
-      inc result.counts[deriveOutcome(r)]
-    if r.flaky: inc result.flaky  # B1: count flaky-passes
+        discard  ## no scalar counterpart — `counts` (below) is the ONLY
+                 ## accounting for the killed/crashed buckets (rfc-0007 §2).
+      inc result.counts[o]
+    if flaky(r): inc result.flaky  # B1: count flaky-passes
   result.noTestsRan = result.passed == 0 and result.total > 0

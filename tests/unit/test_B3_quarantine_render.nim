@@ -37,11 +37,20 @@ proc ranPhase(exitCode: int): ptypes.Phase =
     rusage:     none(ptypes.Rusage),
     durationUs: 0))
 
+proc cachedPhase(exitCode: int): ptypes.Phase =
+  ## rfc-0007 A1e-i: `cached(r)` derives from `run.kind == pkCached` — there
+  ## is no separate `cached` field to stamp any more.
+  ptypes.Phase(kind: ptypes.pkCached, res: ptypes.ProcessResult(
+    exit:       ptypes.Exit(kind: ptypes.ekExited, code: exitCode),
+    cause:      ptypes.Cause(by: ptypes.cbProcess),
+    evidence:   default(ptypes.Evidence),
+    rusage:     none(ptypes.Rusage),
+    durationUs: 0))
+
 suite "B3 render — [QUARANTINED] label":
 
   test "quarantined FAILED result shows [QUARANTINED]":
     var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
-                             outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: true)
     r.run = ranPhase(1)
     let s = summarize(@[r])
@@ -51,7 +60,6 @@ suite "B3 render — [QUARANTINED] label":
   test "quarantined PASSED result also shows [QUARANTINED]":
     ## A quarantined entrypoint is labeled regardless of outcome.
     var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
-                             outcome: oPassed, exitCode: 0,
                              durationMs: 100, quarantined: true)
     r.run = ranPhase(0)
     let s = summarize(@[r])
@@ -60,7 +68,6 @@ suite "B3 render — [QUARANTINED] label":
 
   test "non-quarantined result does NOT show [QUARANTINED]":
     var r = EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
-                             outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: false)
     r.run = ranPhase(1)
     let s = summarize(@[r])
@@ -69,7 +76,6 @@ suite "B3 render — [QUARANTINED] label":
 
   test "quarantined failure shows outcome label AND [QUARANTINED] together":
     var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
-                             outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: true)
     r.run = ranPhase(1)
     let s = summarize(@[r])
@@ -79,7 +85,6 @@ suite "B3 render — [QUARANTINED] label":
 
   test "quarantined with color=true shows [QUARANTINED] in ANSI-colored form":
     var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
-                             outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: true)
     r.run = ranPhase(1)
     let s = summarize(@[r])
@@ -90,9 +95,8 @@ suite "B3 render — [QUARANTINED] label":
 
   test "quarantined cached result shows both [CACHED] and [QUARANTINED]":
     var r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
-                             outcome: oPassed, exitCode: 0,
-                             durationMs: 100, cached: true, quarantined: true)
-    r.run = ranPhase(0)
+                             durationMs: 100, quarantined: true)
+    r.run = cachedPhase(0)
     let s = summarize(@[r])
     let rendered = render(@[r], s, noColorOpts())
     check "[CACHED]"      in rendered

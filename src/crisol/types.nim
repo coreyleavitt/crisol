@@ -369,7 +369,7 @@ type
                            ## — the key would carry an empty closureContentHash and
                            ## could never be looked up
     cdmRecomputeMiss      ## rfc-0007 A1d-ii / §2: a cache entry EXISTED, but its
-                           ## recomputed outcome (deriveOutcome, recomputed at the
+                           ## recomputed outcome (outcome(r), recomputed at the
                            ## trust boundary, never trusted from storage) is not
                            ## oPassed — e.g. a derivation/policy change since the
                            ## entry was stored.  Treated as a MISS and rerun; distinct
@@ -429,26 +429,22 @@ type
   EntrypointResult* = object
     ## Canonical per-entrypoint result produced by execute().
     ep*:             Entrypoint
-    compile*, run*:  ptypes.Phase  ## rfc-0007 A1c: the §2 window-on-result.
-                                   ## Dual-written by runner.nim ALONGSIDE the
-                                   ## legacy fields below (checkRfc7Coherence
-                                   ## proves they agree); `deriveOutcome`
-                                   ## below reads these, never `outcome`.
+    compile*, run*:  ptypes.Phase  ## rfc-0007 §2: the ONE observation this result
+                                   ## carries — every reported verdict (outcome,
+                                   ## exit code, signal, cause, cached-ness, flaky-
+                                   ## ness) is derived from these two Phase values
+                                   ## (+ attempts, below), never stored redundantly.
                                    ## Zero-value default (kind: pkSkipped for
                                    ## both) for any result predating this
                                    ## window (e.g. a cache-hit synthesis) —
                                    ## cachedispatch.synthesize populates a
                                    ## minimal honest replay from the fields
                                    ## it has (see that module).
-    outcome*:        Outcome
-    exitCode*:       int           ## WEXITSTATUS when exited normally
-    signal*:         int           ## POSIX signal number when outcome == oSignal
     records*:        seq[TestRecord]  ## empty when the protocol was not used
     output*:         string        ## captured stdout+stderr, capped at maxOutputBytes
     outputTruncated*: bool         ## maxOutputBytes cap hit
     compileSkipped*: bool          ## cdSkipFresh: nim c was not invoked
     durationMs*:     int64         ## wall-clock milliseconds (A3 uses ms; A4+ switches to Us)
-    cached*:         bool          ## RFC F3: result served from the ExecutionCache (edCached)
     inputHash*:      string        ## RFC F3 (A8): the soundnessKey string for this entrypoint —
                                    ## the content fingerprint over all soundness inputs.  Wire/JSON
                                    ## name "inputHash".  Populated wherever the key is derived
@@ -459,24 +455,15 @@ type
                                    ## Default field value is cdmNotEligible (enum ord 0, the
                                    ## safe "cache not consulted" default); the runner sets it
                                    ## explicitly on every result it produces.
-    achieved*:       SandboxAchieved  ## what hermeticity the run actually delivered (A4d);
-                                      ## gates the cache write (isFullyAchieved).
     attempts*:       int              ## B1: how many attempts were made (1 on a clean pass;
                                       ## > 1 means at least one prior attempt failed).
                                       ## Populated by execute(); 0 for cached results (no run).
-    flaky*:          bool             ## B1: true iff outcome == oPassed AND attempts > 1.
-                                      ## A flaky-pass counts toward exit 0 by default;
-                                      ## --fail-on-flaky promotes it to exit 1.
     quarantined*:    bool             ## B3: true iff ep.path ∈ Config.quarantine.
                                       ## A quarantined failure is REPORTED but excluded from
                                       ## Summary.failed and the exit-1 decision.
                                       ## A quarantined pass is harmless (quarantined=true, passes
                                       ## normally).  Set by execute() post-result, not by compile
                                       ## or run logic — pure reporting overlay.
-    peakRssBytes*:   int64            ## C5: peak RSS in bytes for this entrypoint run, sampled
-                                      ## across all poll-loop ticks while the run slot was live.
-                                      ## 0 for cached results (edCached — no live run) and for
-                                      ## any entrypoint where RSS sampling returned none.
     regressed*:      bool             ## C6: true iff perf-check is enabled AND this entrypoint's
                                       ## current duration exceeded median+k·MAD of its prior history.
                                       ## Always false when perf-check is disabled or edCached.
@@ -491,24 +478,20 @@ type
     passed*:       int
     failed*:       int
     compileFailed*: int
-    timedOut*:     int
-    signaled*:     int
     spawnErrors*:  int
     flaky*:        int   ## B1: count of flaky-passes (passed AND attempts > 1)
     quarantined*:  int   ## B3: count of FAILED results whose failure is excluded from exit-1
                          ## because ep.path ∈ Config.quarantine.  Quarantined failures are NOT
-                         ## counted in failed/compileFailed/timedOut/signaled/spawnErrors.
-                         ## Quarantined passes count normally in `passed`.
+                         ## counted in failed/compileFailed/spawnErrors/counts[oKilled]/
+                         ## counts[oCrashed]. Quarantined passes count normally in `passed`.
     noTestsRan*:   bool  ## e.g. every entrypoint failed to compile
     counts*:       array[Outcome, int]
-                         ## rfc-0007 A1c: derived-outcome counts (deriveOutcome
+                         ## rfc-0007 A1e-i: derived-outcome counts (outcome(r)
                          ## folded over every non-quarantined-failure result;
                          ## same quarantine exclusion as the hand-maintained
-                         ## counters above). ADDITIVE: the scalar counters
-                         ## above stay dual-counted until A1e-i (jsonout still
-                         ## reads them until A1d-i). `counts[oTimeout]` and
-                         ## `counts[oSignal]` stay 0 — deriveOutcome never
-                         ## returns the legacy values.
+                         ## counters above). The ONLY accounting for the killed/
+                         ## crashed buckets — there is no scalar counterpart
+                         ## (the legacy timedOut/signaled counters are gone).
     notStarted*:   int   ## rfc-0007 A1d-i: count of entries OMITTED from the
                          ## emission set because their next phase never
                          ## started (queued, or compile-done-run-unstarted) —
@@ -653,25 +636,24 @@ proc outcomeString*(o: Outcome): string =
   of oPassed:        "passed"
   of oFailed:        "exitNonZero"
   of oCompileFailed: "compileFailed"
-  of oTimeout:       "timedOut"
-  of oSignal:        "signaled"
   of oSpawnError:    "spawnError"
   of oKilled:        "killed"
   of oCrashed:       "crashed"
 
 proc isFailure*(o: Outcome): bool =
   ## Returns true for any outcome that contributes to a non-zero exit code.
-  o in {oFailed, oCompileFailed, oTimeout, oSignal, oSpawnError, oKilled, oCrashed}
+  o in {oFailed, oCompileFailed, oSpawnError, oKilled, oCrashed}
 
 # ---------------------------------------------------------------------------
-# rfc-0007 §2: the pure derivation over the real EntrypointResult (A1c).
+# rfc-0007 §2: the pure derivation over the real EntrypointResult (A1e-i).
 #
 # Lives HERE, not in process/types.nim: process/types cannot reference
 # EntrypointResult (it is defined in THIS module, and process/types must not
 # import this module — see the dependency-inversion note at the top of this
-# file). `deriveOutcome` is named, not `outcome`: while the legacy `outcome`
-# FIELD exists above, `r.outcome` binds to the field, so a same-named proc
-# would silently shadow-collide; A1e-i deletes the field and renames this.
+# file). Named `outcome` — safe now that the legacy `outcome` FIELD is gone
+# (it used to silently shadow-collide with a same-named proc, hence this proc
+# carried a differently-named placeholder during the A1a..A1d window; A1e-i
+# is the rename to its permanent name).
 # ---------------------------------------------------------------------------
 
 proc hasFailRecords*(r: EntrypointResult): bool =
@@ -681,11 +663,11 @@ proc hasFailRecords*(r: EntrypointResult): bool =
     if rec.status == rsFail: return true
   false
 
-proc deriveOutcome*(r: EntrypointResult;
-                    policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): Outcome =
+proc outcome*(r: EntrypointResult;
+             policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): Outcome =
   ## PURE over (result, policy) — §2's total case expression, verbatim.
   ## Recomputed at every crisol trust boundary (cache load, render, exit-code
-  ## derivation) rather than trusted from the stored `outcome` field.
+  ## derivation) — there is no stored field to trust instead (A1e-i deleted it).
   case r.compile.kind
   of ptypes.pkSpawnFailed:
     return oSpawnError
@@ -720,10 +702,23 @@ proc deriveOutcome*(r: EntrypointResult;
     else:
       oFailed
 
+proc cached*(r: EntrypointResult): bool =
+  ## Derived (A1e-i): RFC F3 — true iff this result replays a stored
+  ## ExecutionCache observation (edCached) rather than a live run this
+  ## invocation. `run.kind == pkCached` IS the fact; no separate bit to drift.
+  r.run.kind == ptypes.pkCached
+
+proc flaky*(r: EntrypointResult;
+           policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): bool =
+  ## Derived (B1, A1e-i): true iff outcome(r, policy) == oPassed AND
+  ## attempts > 1. A flaky-pass counts toward exit 0 by default;
+  ## --fail-on-flaky promotes it to exit 1.
+  r.attempts > 1 and outcome(r, policy) == oPassed
+
 proc exitCode*(s: Summary; failOnFlaky: bool = false): int =
   ## Returns 0 when all entrypoints passed; 1 when any failed.
   ## When failOnFlaky is true, flaky-passes also contribute to exit 1.
-  if s.failed > 0 or s.compileFailed > 0 or s.timedOut > 0 or
-     s.signaled > 0 or s.spawnErrors > 0: return 1
+  if s.failed > 0 or s.compileFailed > 0 or s.spawnErrors > 0 or
+     s.counts[oKilled] > 0 or s.counts[oCrashed] > 0: return 1
   if failOnFlaky and s.flaky > 0: return 1
   0

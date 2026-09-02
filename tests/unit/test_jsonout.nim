@@ -43,7 +43,7 @@ proc makeRecord(name: string; status: RecordStatus;
 # ---------------------------------------------------------------------------
 # rfc-0007 A1d-i: coherent Phase builders.  run/v2's `outcome`/`flaky` (and
 # Summary.counts, populated by the real summarize()) are all sourced from
-# deriveOutcome(r), which walks compile/run's real Phase pair -- a fixture
+# outcome(r), which walks compile/run's real Phase pair -- a fixture
 # must carry one, not just the legacy `outcome` field, for the two to agree.
 # ---------------------------------------------------------------------------
 
@@ -71,91 +71,67 @@ proc spawnFailedPhase(msg: string = "fork failed"): ptypes.Phase =
   ptypes.Phase(kind: ptypes.pkSpawnFailed, spawnError: msg)
 
 proc syntheticResults(): seq[EntrypointResult] =
-  ## One result per distinct Outcome deriveOutcome can produce; each with
-  ## representative records.  Legacy `outcome`/`exitCode`/`signal` fields are
-  ## still set (dual-write window; other modules still read them) but the
-  ## coherent compile/run Phase pair is what run/v2's wire actually reflects.
+  ## One result per distinct Outcome outcome(r) can produce; each with
+  ## representative records.  There is no legacy `outcome`/`exitCode`/`signal`
+  ## field any more (rfc-0007 A1e-i) -- the compile/run Phase pair IS the
+  ## observation, and outcome(r)/run/v2's wire both derive from it alone.
   result = @[
     # Passed -- rsPass + rsSkip records
     EntrypointResult(
       ep:         makeEp("tests/unit/test_alpha.nim"),
-      outcome:    oPassed,
-      exitCode:   0,
-      signal:     0,
       compile:    okPhase(),
       run:        okPhase(),
       durationMs: 123,
       records:    @[
         makeRecord("alpha passes",  rsPass),
         makeRecord("alpha skipped", rsSkip, "not applicable"),
-      ],
-    ),
+      ]),
     # Failed -- rsFail record with msg
     EntrypointResult(
       ep:         makeEp("tests/unit/test_beta.nim"),
-      outcome:    oFailed,
-      exitCode:   1,
-      signal:     0,
       compile:    okPhase(),
       run:        okPhase(1),
       durationMs: 456,
       records:    @[
         makeRecord("beta passes",  rsPass),
         makeRecord("beta fails",   rsFail, "expected 1 got 2"),
-      ],
-    ),
+      ]),
     # CompileFailed -- no records; the compile phase itself failed.
     EntrypointResult(
       ep:         makeEp("tests/unit/test_gamma.nim"),
-      outcome:    oCompileFailed,
-      exitCode:   1,
-      signal:     0,
       compile:    okPhase(1),
       run:        skippedPhase,
       durationMs: 789,
-      records:    @[],
-    ),
+      records:    @[]),
     # Killed (rfc-0007's honest replacement for the legacy "timedOut") --
     # runner-authored kill: cause cbRunner/krTimeout, exit signaled SIGTERM.
     EntrypointResult(
       ep:         makeEp("tests/integration/test_delta.nim", "integration"),
-      outcome:    oTimeout,
-      exitCode:   0,
-      signal:     0,
       compile:    okPhase(),
       run:        ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 15, coreDumped: false),
                            ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: false)),
       durationMs: 300_000,
-      records:    @[],
-    ),
+      records:    @[]),
     # Crashed (rfc-0007's honest replacement for the legacy "signaled") --
     # a signal we did NOT send classifies as cbProcess (§2's documented
     # heuristic for default-disposition crash signals).
     EntrypointResult(
-      ep:         makeEp("tests/unit/test_epsilon.nim"),
-      outcome:    oSignal,
-      exitCode:   0,
-      signal:     11,   # SIGSEGV
+      ep:         makeEp("tests/unit/test_epsilon.nim"),   # SIGSEGV
       compile:    okPhase(),
       run:        ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 11, coreDumped: false)),
       durationMs: 50,
-      records:    @[],
-    ),
+      records:    @[]),
     # SpawnError -- compile succeeded, the run phase failed to spawn.
     EntrypointResult(
       ep:         makeEp("tests/unit/test_zeta.nim"),
-      outcome:    oSpawnError,
-      exitCode:   0,
-      signal:     0,
       compile:    okPhase(),
       run:        spawnFailedPhase(),
       durationMs: 0,
-      records:    @[],
-    ),
+      records:    @[]),
   ]
 
 proc syntheticSummary(): Summary =
-  ## Real counts, not hand-guessed: summarize() folds deriveOutcome over
+  ## Real counts, not hand-guessed: summarize() folds outcome(r) over
   ## syntheticResults() the same way the runner does, so this Summary agrees
   ## with what toJson(syntheticResults(), ...) actually emits.
   summarize(syntheticResults())
@@ -219,8 +195,6 @@ suite "jsonout - toJson schema":
     check sum["counts"]["passed"].getInt        == s.counts[oPassed]
     check sum["counts"]["exitNonZero"].getInt   == s.counts[oFailed]
     check sum["counts"]["compileFailed"].getInt == s.counts[oCompileFailed]
-    check sum["counts"]["timedOut"].getInt      == s.counts[oTimeout]
-    check sum["counts"]["signaled"].getInt      == s.counts[oSignal]
     check sum["counts"]["spawnError"].getInt    == s.counts[oSpawnError]
     check sum["counts"]["killed"].getInt        == s.counts[oKilled]
     check sum["counts"]["crashed"].getInt       == s.counts[oCrashed]
@@ -230,9 +204,10 @@ suite "jsonout - toJson schema":
     check sum["noTestsRan"].getBool    == s.noTestsRan
 
   test "summary.counts reflects the real per-outcome tallies from syntheticResults":
-    ## syntheticResults(): 1 passed, 1 failed, 1 compileFailed, 1 killed
-    ## (legacy "timedOut" fixture), 1 crashed (legacy "signaled" fixture),
-    ## 1 spawnError -- deriveOutcome never returns oTimeout/oSignal.
+    ## syntheticResults(): 1 passed, 1 failed, 1 compileFailed, 1 killed,
+    ## 1 crashed, 1 spawnError. rfc-0007 A1e-i: "timedOut"/"signaled" are not
+    ## even valid keys any more -- the legacy Outcome values are gone, not
+    ## just unproduced.
     let node = toJson(syntheticResults(), syntheticSummary())
     let counts = node["summary"]["counts"]
     check counts["passed"].getInt        == 1
@@ -241,8 +216,8 @@ suite "jsonout - toJson schema":
     check counts["killed"].getInt        == 1
     check counts["crashed"].getInt       == 1
     check counts["spawnError"].getInt    == 1
-    check counts["timedOut"].getInt      == 0
-    check counts["signaled"].getInt      == 0
+    check not counts.hasKey("timedOut")
+    check not counts.hasKey("signaled")
 
   test "entrypoints array has correct length":
     let results = syntheticResults()
@@ -254,10 +229,10 @@ suite "jsonout - toJson schema":
     for ep in node["entrypoints"]:
       check ep["outcome"].kind == JString
 
-  test "outcome string values are stable expected strings (rev 16: deriveOutcome-sourced)":
-    ## rfc-0007 A1d-i: `outcome` is now deriveOutcome(r), not the legacy
-    ## stored field -- the legacy "timedOut"/"signaled" fixtures now read
-    ## "killed"/"crashed", deriveOutcome's honest replacements (§2).
+  test "outcome string values are stable expected strings (rev 16: outcome(r)-sourced)":
+    ## rfc-0007 A1d-i/A1e-i: `outcome` is produced by outcome(r) -- there is
+    ## no stored field any more. The genuinely-killed/crashed fixtures read
+    ## "killed"/"crashed", outcome(r)'s honest values (§2).
     let results = syntheticResults()
     let node    = toJson(results, syntheticSummary())
     let eps     = node["entrypoints"]
@@ -342,10 +317,8 @@ suite "jsonout - toJson schema":
     ## S2a: EntrypointResult.compileSkipped already exists but toJson never
     ## emitted it.  This completes the schema.
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"), outcome: oPassed,
-                       exitCode: 0, durationMs: 10, compileSkipped: true, records: @[]),
-      EntrypointResult(ep: makeEp("tests/unit/test_b.nim"), outcome: oPassed,
-                       exitCode: 0, durationMs: 10, compileSkipped: false, records: @[]),
+      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"), durationMs: 10, compileSkipped: true, records: @[]),
+      EntrypointResult(ep: makeEp("tests/unit/test_b.nim"), durationMs: 10, compileSkipped: false, records: @[]),
     ]
     let node = toJson(results, Summary(total: 2, passed: 2))
     check node["entrypoints"][0].hasKey("compileSkipped")
@@ -380,16 +353,20 @@ suite "jsonout - toJson schema":
 suite "jsonout A8 — cache reporting fields":
 
   proc cachedResult(): EntrypointResult =
-    EntrypointResult(
-      ep: makeEp("tests/unit/test_cached.nim"), outcome: oPassed,
-      exitCode: 0, durationMs: 999, records: @[],
-      cached: true, inputHash: "deadbeefcafef00d", cacheDecision: cdmHit)
+    ## rfc-0007 A1e-i: `cached(r)` derives from `run.kind == pkCached` — a
+    ## pkRan phase (even one deriving oPassed) would NOT show [CACHED].
+    result = EntrypointResult(
+      ep: makeEp("tests/unit/test_cached.nim"), durationMs: 999, records: @[],
+      inputHash: "deadbeefcafef00d", cacheDecision: cdmHit)
+    result.compile = skippedPhase
+    result.run = ptypes.Phase(kind: ptypes.pkCached, res: okPhase().res)
 
   proc liveResult(): EntrypointResult =
-    EntrypointResult(
-      ep: makeEp("tests/unit/test_live.nim"), outcome: oPassed,
-      exitCode: 0, durationMs: 12, records: @[],
-      cached: false, inputHash: "0011223344556677", cacheDecision: cdmKeyMiss)
+    result = EntrypointResult(
+      ep: makeEp("tests/unit/test_live.nim"), durationMs: 12, records: @[],
+      inputHash: "0011223344556677", cacheDecision: cdmKeyMiss)
+    result.compile = skippedPhase
+    result.run = okPhase()
 
   test "run/v2 carries an integer schemaRevision alongside schema string":
     let node = toJson(syntheticResults(), syntheticSummary())
@@ -1082,11 +1059,9 @@ suite "jsonout - loadLastRun (B7)":
     # One failed, one passed.
     let results = @[
       EntrypointResult(ep: Entrypoint(path: "tests/unit/test_alpha.nim", group: "unit", flags: @[]),
-                       outcome: oFailed, exitCode: 1, signal: 0,
                        compile: okPhase(), run: okPhase(1),
                        durationMs: 100, records: @[]),
       EntrypointResult(ep: Entrypoint(path: "tests/unit/test_beta.nim", group: "unit", flags: @[]),
-                       outcome: oPassed, exitCode: 0, signal: 0,
                        compile: okPhase(), run: okPhase(),
                        durationMs: 50, records: @[]),
     ]
@@ -1430,8 +1405,7 @@ suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
     ## "skipped" with no exit/cause/evidence/rusage/durationUs keys at all
     ## (there is no observation to report -- the honest posture, not a null
     ## placeholder for every possible field).
-    let node = toJson(@[EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
-                                         outcome: oPassed, exitCode: 0)],
+    let node = toJson(@[EntrypointResult(ep: makeEp("tests/unit/test_a.nim"))],
                       Summary(total: 1, passed: 1))
     check node["entrypoints"][0]["run"]["kind"].getStr == "skipped"
     check not node["entrypoints"][0]["run"].hasKey("exit")

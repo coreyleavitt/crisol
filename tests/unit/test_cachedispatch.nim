@@ -93,24 +93,24 @@ suite "lookupAtPlan — promotion + decision":
     check look.cacheDecision == cdmHit
     check look.synthesized.isSome
     let s = look.synthesized.get
-    check s.cached
-    check s.outcome == oPassed
+    check cached(s)
+    check outcome(s) == oPassed
     check s.durationMs == 4242          # HISTORICAL duration
     check s.compileSkipped              # edCached skips both phases
     check s.records.len == 1
     check c.loadCalls == 1
 
-  test "rfc-0007 A1c: synthesized cache hit derives oPassed (deriveOutcome coherence)":
+  test "rfc-0007 A1c: synthesized cache hit derives oPassed (outcome coherence)":
     ## A cache hit never goes through runner.execute's dual-write path, so
     ## without cachedispatch.synthesize populating a minimal `run: Phase`,
-    ## deriveOutcome would wrongly read `run.kind == pkSkipped` and derive
+    ## outcome(r) would wrongly read `run.kind == pkSkipped` and derive
     ## oSpawnError for what is actually a passing cached result — exactly the
     ## bug every consumer (render/junit/api/isQuarantined/Summary.counts)
     ## would inherit the moment it stopped trusting the legacy `outcome` field.
     var c: Calls
     let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c, sampleCached()))
     let s = look.synthesized.get
-    check deriveOutcome(s) == oPassed
+    check outcome(s) == oPassed
     check s.run.kind == pkCached
     check s.compile.kind == pkSkipped
 
@@ -210,34 +210,47 @@ suite "shouldStore — cache-write gate":
   let fullAchieved = SandboxAchieved(envScrubbed: true, tmpdirIso: true,
                                      rlimitsApplied: true, netIso: false)
 
-  proc passResult(ach: SandboxAchieved): EntrypointResult =
-    EntrypointResult(ep: Entrypoint(path: "p"), outcome: oPassed, achieved: ach)
+  proc passResult(): EntrypointResult =
+    ## rfc-0007 A1e-i: outcome is derived, not stored — a passing Phase pair
+    ## makes outcome(r) == oPassed. `achieved` is no longer carried on the
+    ## result either; shouldStore takes it as its own explicit parameter.
+    result = EntrypointResult(ep: Entrypoint(path: "p"))
+    result.compile = Phase(kind: pkSkipped)
+    result.run = Phase(kind: pkRan, res: ProcessResult(
+      exit: Exit(kind: ekExited, code: 0), cause: Cause(by: cbProcess),
+      evidence: default(Evidence), rusage: none(Rusage), durationUs: 0))
+
+  proc failResult(): EntrypointResult =
+    result = EntrypointResult(ep: Entrypoint(path: "p"))
+    result.compile = Phase(kind: pkSkipped)
+    result.run = Phase(kind: pkRan, res: ProcessResult(
+      exit: Exit(kind: ekExited, code: 1), cause: Cause(by: cbProcess),
+      evidence: default(Evidence), rusage: none(Rusage), durationUs: 0))
 
   test "pass + fully achieved + attempt 1 → store":
-    let v = shouldStore(passResult(fullAchieved), isoSpec, 1, defaultCachePolicy())
+    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, defaultCachePolicy())
     check v.store
 
   test "policy disabled → no store, cdmPolicyDisabled":
-    let v = shouldStore(passResult(fullAchieved), isoSpec, 1, CachePolicy(enabled: false))
+    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, CachePolicy(enabled: false))
     check not v.store
     check v.decision == cdmPolicyDisabled
 
   test "non-pass outcome → no store":
-    var r = passResult(fullAchieved)
-    r.outcome = oFailed
-    let v = shouldStore(r, isoSpec, 1, defaultCachePolicy())
+    let r = failResult()
+    let v = shouldStore(r, isoSpec, fullAchieved, 1, defaultCachePolicy())
     check not v.store
 
   test "hermeticity degraded → no store, cdmHermeticityDeg":
     # envScrub requested by isoSpec but not achieved.
     let degraded = SandboxAchieved(envScrubbed: false, tmpdirIso: true,
                                    rlimitsApplied: true, netIso: false)
-    let v = shouldStore(passResult(degraded), isoSpec, 1, defaultCachePolicy())
+    let v = shouldStore(passResult(), isoSpec, degraded, 1, defaultCachePolicy())
     check not v.store
     check v.decision == cdmHermeticityDeg
 
   test "flaky-pass (attempt > 1) → no store, cdmFlaky":
-    let v = shouldStore(passResult(fullAchieved), isoSpec, 2, defaultCachePolicy())
+    let v = shouldStore(passResult(), isoSpec, fullAchieved, 2, defaultCachePolicy())
     check not v.store
     check v.decision == cdmFlaky
 

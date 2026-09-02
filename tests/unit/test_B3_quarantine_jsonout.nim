@@ -21,9 +21,9 @@ proc makeEp(path: string): Entrypoint =
   Entrypoint(path: path, group: "unit", flags: @[])
 
 proc okPhase(code: int = 0): ptypes.Phase =
-  ## rfc-0007 A1d-i: `flaky` is now the DERIVED value (deriveOutcome==oPassed
-  ## and attempts>1), so a fixture claiming to be a clean pass must carry a
-  ## coherent compile/run Phase pair, not just the legacy `outcome` field.
+  ## rfc-0007 A1e-i: `flaky` is the DERIVED value (outcome(r)==oPassed and
+  ## attempts>1) — a fixture claiming to be a clean pass must carry a
+  ## coherent compile/run Phase pair; there is no stored `outcome` field.
   ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
     exit: ptypes.Exit(kind: ptypes.ekExited, code: code),
     cause: ptypes.Cause(by: ptypes.cbProcess),
@@ -42,7 +42,6 @@ suite "B3 jsonout — quarantine + flaky/attempts fields":
 
   test "non-quarantined result has quarantined=false":
     let r = EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
-                             outcome: oPassed, exitCode: 0,
                              durationMs: 100, quarantined: false)
     let node = toJson(@[r], Summary(total: 1, passed: 1))
     let ep = node["entrypoints"][0]
@@ -51,7 +50,6 @@ suite "B3 jsonout — quarantine + flaky/attempts fields":
 
   test "quarantined result has quarantined=true":
     let r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
-                             outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: true)
     let s = Summary(total: 1, quarantined: 1)
     let node = toJson(@[r], s)
@@ -59,20 +57,17 @@ suite "B3 jsonout — quarantine + flaky/attempts fields":
     check ep["quarantined"].getBool == true
 
   test "default EntrypointResult has quarantined=false (absence-default)":
-    let r = EntrypointResult(ep: makeEp("tests/unit/test_b.nim"),
-                             outcome: oPassed, exitCode: 0, durationMs: 10)
+    let r = EntrypointResult(ep: makeEp("tests/unit/test_b.nim"), durationMs: 10)
     let node = toJson(@[r], Summary(total: 1, passed: 1))
     check node["entrypoints"][0]["quarantined"].getBool == false
 
   test "each entrypoint carries flaky boolean (B1 field, now in run/v2)":
     let rFlaky = EntrypointResult(ep: makeEp("tests/unit/test_c.nim"),
-                                  outcome: oPassed, exitCode: 0,
                                   compile: okPhase(), run: okPhase(),
-                                  durationMs: 100, flaky: true, attempts: 2)
+                                  durationMs: 100, attempts: 2)
     let rClean = EntrypointResult(ep: makeEp("tests/unit/test_d.nim"),
-                                  outcome: oPassed, exitCode: 0,
                                   compile: okPhase(), run: okPhase(),
-                                  durationMs: 50, flaky: false, attempts: 1)
+                                  durationMs: 50, attempts: 1)
     let node = toJson(@[rFlaky, rClean], Summary(total: 2, passed: 2, flaky: 1))
     check node["entrypoints"][0].hasKey("flaky")
     check node["entrypoints"][0]["flaky"].getBool == true
@@ -80,7 +75,6 @@ suite "B3 jsonout — quarantine + flaky/attempts fields":
 
   test "each entrypoint carries attempts integer (B1 field, now in run/v2)":
     let r = EntrypointResult(ep: makeEp("tests/unit/test_e.nim"),
-                             outcome: oPassed, exitCode: 0,
                              durationMs: 80, attempts: 3)
     let node = toJson(@[r], Summary(total: 1, passed: 1))
     check node["entrypoints"][0].hasKey("attempts")
@@ -88,15 +82,15 @@ suite "B3 jsonout — quarantine + flaky/attempts fields":
 
   test "default attempts is 0 (not yet run / cached)":
     ## Cached results have attempts=0 per the B1 spec.
-    let r = EntrypointResult(ep: makeEp("tests/unit/test_f.nim"),
-                             outcome: oPassed, exitCode: 0,
-                             durationMs: 20, cached: true, attempts: 0)
+    var r = EntrypointResult(ep: makeEp("tests/unit/test_f.nim"),
+                             durationMs: 20, attempts: 0)
+    r.run = ptypes.Phase(kind: ptypes.pkCached, res: okPhase().res)
+    check cached(r)
     let node = toJson(@[r], Summary(total: 1, passed: 1))
     check node["entrypoints"][0]["attempts"].getInt == 0
 
   test "summary carries quarantined integer count":
     let r = EntrypointResult(ep: makeEp("tests/integration/test_x.nim"),
-                             outcome: oFailed, exitCode: 1,
                              durationMs: 50, quarantined: true)
     let s = Summary(total: 1, quarantined: 1)
     let node = toJson(@[r], s)

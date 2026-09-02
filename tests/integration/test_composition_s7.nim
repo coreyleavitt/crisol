@@ -341,11 +341,12 @@ proc testPerGroupTimeoutInComposedRun() =
 
   check results.len == 2
 
-  # hang_forever in the timed group must have timed out.
-  check results[0].outcome == oTimeout
+  # hang_forever in the timed group must have been killed (rfc-0007: a
+  # runner-authored timeout kill derives to oKilled, not the legacy oTimeout).
+  check outcome(results[0]) == oKilled
 
   # pass_always in the fast group must have passed.
-  check results[1].outcome == oPassed
+  check outcome(results[1]) == oPassed
 
   # Must complete well under the global 60 s budget.
   # Allow up to 30 s (generous compile headroom + 2 s run limit).

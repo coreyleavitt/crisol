@@ -204,7 +204,7 @@ proc shardWithHistory*(
       # rfc-0007 A1d-ii: `r` here is a PERSISTED ledger row (scanLedger reads
       # history off disk) -- not a live EntrypointResult -- so this stays on
       # the outcome STRING (isCompileFailedOutcomeString), unaffected by the
-      # cache-replay/deriveOutcome boundary change; there is no live result
+      # cache-replay/outcome-recomputation boundary change; there is no live result
       # to recompute here.
       if not isCompileFailedOutcomeString(r.outcome):
         durs.add r.durationUs

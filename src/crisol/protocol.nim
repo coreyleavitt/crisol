@@ -17,11 +17,11 @@
 ##   3. Opaque fallback: no sink file, empty file, or zero valid records →
 ##      SinkData.hasProtocol = false; executor falls back to exit-code-only.
 ##
-## rfc-0007 A1c: reconcile() shrank to a records-only predicate (bool, not
+## rfc-0007 §2: reconcile() shrank to a records-only predicate (bool, not
 ## Outcome) — the executor-precedence rule (a killed/signaled process's
-## records never override the executor's verdict) is now subsumed by
-## deriveOutcome (§2: `cause.by == cbRunner` dominates before records are
-## ever consulted), so it is no longer reconcile()'s job to encode. Call
+## records never override the executor's verdict) is now subsumed by the
+## `outcome(r)` derivation (`cause.by == cbRunner` dominates before records
+## are ever consulted), so it is no longer reconcile()'s job to encode. Call
 ## reconcile() only when the process exited normally (no signal/timeout).
 ##
 ## All functions here are pure except readSink (reads one file).
@@ -246,12 +246,12 @@ proc reconcile*(records: seq[TestRecord]): bool =
   ## record is rsFail. Feeds crisol/types.hasFailRecords' definition (the
   ## same rule, over an EntrypointResult's stored records).
   ##
-  ## The exit-code OR-rule and the oTimeout/oSignal executor-precedence rule
-  ## (a signaled/timed-out process's records never override the executor's
-  ## verdict) are now subsumed by deriveOutcome (§2): `cause.by == cbRunner`
-  ## dominates before records are ever consulted, so callers apply the OR-rule
-  ## themselves — `reconcile(records) or exitCode != 0` — only when the
-  ## process exited normally.
+  ## The exit-code OR-rule and the former executor-precedence rule (a
+  ## killed/crashed process's records never override the executor's verdict)
+  ## are now subsumed by the `outcome(r)` derivation (§2): `cause.by ==
+  ## cbRunner` dominates before records are ever consulted, so callers apply
+  ## the OR-rule themselves — `reconcile(records) or exitCode != 0` — only
+  ## when the process exited normally.
   ##
   ## Truncated-stream conservatism is preserved unchanged: this reads
   ## whatever records were successfully parsed (readSink already dropped an

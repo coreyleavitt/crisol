@@ -28,17 +28,22 @@ suite "outcomestrings — single source of truth (types.outcomeString)":
       else:
         check types.outcomeString(o) notin failureOutcomeStrings
 
-  test "failureOutcomeStrings has NO extra strings beyond what isFailure covers":
+  test "failureOutcomeStrings has NO extra strings beyond isFailure + the two sanctioned legacy strings":
     ## No string should be in failureOutcomeStrings unless it maps back to an
-    ## isFailure Outcome.  Guards against stale constants staying after a rename.
+    ## isFailure Outcome — OR is one of the two rfc-0007 A1e-i legacy-string
+    ## exceptions (see the dedicated suite below), which by construction have
+    ## no Outcome value to map back to any more (the enum values are gone).
+    ## Guards against stale constants staying after a rename.
     for s in failureOutcomeStrings:
+      if s in [LegacyTimedOutOutcomeString, LegacySignaledOutcomeString]:
+        continue
       var found = false
       for o in Outcome:
         if types.outcomeString(o) == s:
           check o.isFailure
           found = true
           break
-      check found  # every failure string must be reachable from the enum
+      check found  # every non-legacy failure string must be reachable from the enum
 
   test "passedOutcomeString NOT in failureOutcomeStrings":
     check passedOutcomeString notin failureOutcomeStrings
@@ -64,33 +69,44 @@ suite "outcomestrings — single source of truth (types.outcomeString)":
     for s in failureOutcomeStrings:
       check s in FailureOutcomeStrings
 
-suite "rfc-0007 A1d-ii — ledger legacy-string compat rule":
+suite "rfc-0007 A1e-i — ledger legacy-string compat rule":
   ## A ledger row written by a pre-rfc-0007 crisol persists the OLD `outcome`
   ## strings ("timedOut"/"signaled") forever — the ledger's own
-  ## `historyFormatVersion` does not change for this RFC.  shard.nim's
+  ## `historyFormatVersion` does not change for this RFC.  A1e-i deleted the
+  ## legacy `oTimeout`/`oSignal` Outcome VALUES outright (superseded by
+  ## `oKilled`/`oCrashed`), so `failureOutcomeStrings` can no longer derive
+  ## these two wire strings from the enum — they are the ONE sanctioned
+  ## exception, hardcoded in outcomestrings.nim as
+  ## `LegacyTimedOutOutcomeString`/`LegacySignaledOutcomeString`. shard.nim's
   ## duration-median computation (isCompileFailedOutcomeString) and any other
-  ## string-domain ledger reader must keep classifying those legacy strings
-  ## exactly as before: `oTimeout`/`oSignal` stay in the Outcome enum (as
-  ## documented LEGACY variants) and stay `isFailure == true`, so
-  ## `failureOutcomeStrings`/`isFailureOutcomeString` — both DERIVED from
-  ## `isFailure` — classify them as failures with zero code change here.
+  ## string-domain ledger reader must keep classifying them exactly as before.
 
   test "legacy \"timedOut\" string is still classified as a failure":
-    check isFailureOutcomeString(types.outcomeString(oTimeout))
-    check types.outcomeString(oTimeout) == "timedOut"
+    check LegacyTimedOutOutcomeString == "timedOut"
+    check isFailureOutcomeString(LegacyTimedOutOutcomeString)
     check isFailureOutcomeString("timedOut")
 
   test "legacy \"signaled\" string is still classified as a failure":
-    check isFailureOutcomeString(types.outcomeString(oSignal))
-    check types.outcomeString(oSignal) == "signaled"
+    check LegacySignaledOutcomeString == "signaled"
+    check isFailureOutcomeString(LegacySignaledOutcomeString)
     check isFailureOutcomeString("signaled")
 
-  test "oTimeout/oSignal remain LEGACY (not produced by deriveOutcome) but stay isFailure":
-    ## deriveOutcome never returns these two (superseded by oKilled/oCrashed);
-    ## they exist ONLY for reading pre-rfc-0007 wire/ledger data.  Both facts
-    ## must hold simultaneously: legacy-only AND still classified as failures.
-    check oTimeout.isFailure
-    check oSignal.isFailure
+  test "the two legacy strings are the ONLY failureOutcomeStrings entries not reachable from Outcome":
+    ## Every OTHER entry in failureOutcomeStrings must still be reachable
+    ## from a real Outcome value (guards against unrelated stale constants);
+    ## the two legacy strings are the one documented, named exception.
+    var unreachable: seq[string]
+    for s in failureOutcomeStrings:
+      var found = false
+      for o in Outcome:
+        if types.outcomeString(o) == s:
+          found = true
+          break
+      if not found:
+        unreachable.add s
+    check unreachable.len == 2
+    check LegacyTimedOutOutcomeString in unreachable
+    check LegacySignaledOutcomeString in unreachable
 
   test "ledger historyFormatVersion is NOT bumped by this RFC":
     ## rfc-0007 A1d-ii changes nothing about how a ledger row is written or

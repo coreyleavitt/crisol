@@ -27,10 +27,9 @@
 
 import std/[options, os, tables]
 import crisol/[types, keys, resultcache, sandbox, depgraph, planner]
-# rfc-0007 A1d-ii: synthesize() replays the REAL stored `run` ProcessResult as
-# a `Phase(kind: pkCached, ...)` node -- deriveOutcome (which every consumer
-# calls instead of trusting a stored `outcome` field) is recomputed over it
-# at THIS boundary (lookupAtPlan), never trusted from storage -- see
+# rfc-0007 §2: synthesize() replays the REAL stored `run` ProcessResult as
+# a `Phase(kind: pkCached, ...)` node -- `outcome(r)` (there is no stored
+# field) is recomputed over it at THIS boundary (lookupAtPlan) -- see
 # synthesize's and lookupAtPlan's comments below.
 from crisol/process/types as ptypes import nil
 
@@ -197,34 +196,19 @@ proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
   ## compile and run).  `inputHash` is the soundnessKey string the hit was
   ## keyed on (A8).
   ##
-  ## rfc-0007 A1d-ii: `run` replays the REAL stored observation verbatim --
-  ## `Phase(kind: pkCached, res: cr.run)` -- superseding A1c's interim, which
-  ## could only fabricate a minimal Exit/Cause pair (Evidence/rusage stayed at
-  ## their zero-value defaults because the cache did not store them yet).
-  ## `outcome` is recomputed by the CALLER (`lookupAtPlan`) via deriveOutcome
-  ## over this Phase pair, never trusted from storage (§2) -- the legacy
-  ## `outcome` FIELD below is set to `oPassed` as a provable fact, not a
-  ## re-derivation: the only caller that keeps this synthesis (`lookupAtPlan`)
-  ## has ALREADY checked `deriveOutcome(this) == oPassed` before returning it
-  ## as a hit; a recompute-invalidated synthesis is discarded (cdmRecomputeMiss)
-  ## before any caller reads this field. `compile` stays pkSkipped: edCached
-  ## genuinely never compiles.
-  let exitCode = case cr.run.exit.kind
-                 of ptypes.ekExited:   cr.run.exit.code
-                 of ptypes.ekSignaled, ptypes.ekNtStatus: 0
-  let signal = case cr.run.exit.kind
-               of ptypes.ekSignaled: cr.run.exit.sig
-               of ptypes.ekExited, ptypes.ekNtStatus: 0
+  ## rfc-0007 §2: `run` replays the REAL stored observation verbatim --
+  ## `Phase(kind: pkCached, res: cr.run)` -- so `outcome(this)`/`cached(this)`
+  ## derive genuinely from it, not from a re-stated value here. The CALLER
+  ## (`lookupAtPlan`) has ALREADY checked `outcome(this) == oPassed` before
+  ## returning this synthesis as a hit; a recompute-invalidated synthesis is
+  ## discarded (cdmRecomputeMiss) before any caller sees it. `compile` stays
+  ## pkSkipped: edCached genuinely never compiles.
   result = EntrypointResult(
     ep:             pep.ep,
-    outcome:        oPassed,
-    exitCode:       exitCode,
-    signal:         signal,
     records:        cr.records,
     output:         "",            # cached results carry no captured output
     compileSkipped: true,
     durationMs:     cr.run.durationUs div 1000, # historical duration
-    cached:         true,
     inputHash:      inputHash,     # A8: key the hit was served on
     cacheDecision:  cdmHit,
   )
@@ -275,7 +259,7 @@ proc lookupAtPlan*(
   # treated as a MISS and rerun — a derivation or policy change must never
   # serve a stale/invalidated pass from cache forever with no rerun path.
   let synth = synthesize(pep, hit.get, kStr)
-  if deriveOutcome(synth) != oPassed:
+  if outcome(synth) != oPassed:
     return PlanLookup(decision: edRunFresh, cacheDecision: cdmRecomputeMiss,
                       inputHash: kStr, synthesized: none(EntrypointResult))
   PlanLookup(decision: edCached, cacheDecision: cdmHit, inputHash: kStr,
@@ -295,15 +279,19 @@ type
 proc shouldStore*(
   res:       EntrypointResult;
   spec:      SandboxSpec;
+  achieved:  SandboxAchieved;
   attempt:   int;
   policy:    CachePolicy;
   cacheable: CacheableState = csDefault;
 ): StoreVerdict =
   ## Gate a freshly-run result for caching (RFC-0004 F3).  Store ONLY when:
   ##   (a) per-group cacheable is not csFalse AND global policy permits, and
-  ##   (b) hermeticity was *achieved* (isFullyAchieved spec vs res.achieved), and
+  ##   (b) hermeticity was *achieved* (isFullyAchieved spec vs achieved), and
   ##   (c) it PASSED on attempt 1 (never cache a flaky-pass from attempt > 1, or
   ##       it freezes as PASS forever).
+  ##
+  ## `achieved` is threaded in explicitly (A1e-i: EntrypointResult no longer
+  ## carries it — the runner reads it off the Slot that produced `res`).
   ##
   ## v1 caches passes only; a failing outcome is simply not eligible.  The
   ## returned CacheDecision is the MISS reason for the live result so the
@@ -313,12 +301,12 @@ proc shouldStore*(
     # M8: propagate the resolved decision (cdmGroupOptOut or cdmPolicyDisabled)
     # so callers can distinguish config-declared opt-out from invocation --no-cache.
     return StoreVerdict(store: false, decision: res2.decision)
-  if res.outcome != oPassed:
+  if outcome(res) != oPassed:
     # Not a pass: not eligible to cache (v1 caches passes only).  A miss for a
     # fresh run is cdmKeyMiss; a fresh FAIL is simply not stored — we keep the
     # key-miss label (it was a fresh run that found no entry and produced none).
     return StoreVerdict(store: false, decision: cdmKeyMiss)
-  if not isFullyAchieved(spec, res.achieved):
+  if not isFullyAchieved(spec, achieved):
     return StoreVerdict(store: false, decision: cdmHermeticityDeg)
   if attempt != 1:
     return StoreVerdict(store: false, decision: cdmFlaky)

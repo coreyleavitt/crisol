@@ -52,7 +52,7 @@
 ##       { path, group, flags, outcome (string, advisory),
 ##         compile: <PhaseNode>, run: <PhaseNode>,
 ##         compileSkipped, cached, inputHash, cacheDecision, flaky, attempts,
-##         quarantined, peakRssBytes, regressed,
+##         quarantined, regressed,
 ##         records: [{ name, status (string), durationUs (int),
 ##                     msg (string|null), tags ([string]) }] }
 ##     ],
@@ -92,11 +92,12 @@
 ##   oPassed        -> "passed"
 ##   oFailed        -> "exitNonZero"
 ##   oCompileFailed -> "compileFailed"
-##   oTimeout       -> "timedOut"
-##   oSignal        -> "signaled"
 ##   oSpawnError    -> "spawnError"
 ##   oKilled        -> "killed"
 ##   oCrashed       -> "crashed"
+## ("timedOut"/"signaled" are PERSISTED-STRING-domain only, rfc-0007 A1e-i —
+## the ledger's outcomestrings compat classifies them if read back from an
+## old row; no live Outcome value ever produces them again.)
 ##
 ## RecordStatus string values (stable):
 ##   rsPass -> "pass"
@@ -134,10 +135,11 @@
 ##   passed         DROPPED   superseded by summary.counts["passed"]
 ##   failed         DROPPED   superseded by summary.counts["exitNonZero"]
 ##   compileFailed  DROPPED   superseded by summary.counts["compileFailed"]
-##   timedOut       DROPPED   superseded by summary.counts["timedOut"] (always
-##                            0 — deriveOutcome never produces the legacy value)
-##   signaled       DROPPED   superseded by summary.counts["signaled"] (always
-##                            0, same reason)
+##   timedOut       DROPPED   no successor key (rfc-0007 A1e-i deleted the
+##                            legacy Outcome value outright — counts["timedOut"]
+##                            is not even a valid key any more; oKilled/its
+##                            "killed" counts key are the real thing)
+##   signaled       DROPPED   same story, superseded by counts["crashed"]
 ##   spawnErrors    DROPPED   superseded by summary.counts["spawnError"]
 ##   quarantined    KEPT      moved under summary; unchanged meaning
 ##   noTestsRan     KEPT      unchanged
@@ -159,7 +161,7 @@
 ##   group           KEPT
 ##   flags           KEPT
 ##   outcome         KEPT (RE-SOURCED)  same advisory string; now produced by
-##                            deriveOutcome(r) (rfc-0007 §2's total recomputation)
+##                            outcome(r) (rfc-0007 §2's total recomputation)
 ##                            instead of the legacy stored field — the wire
 ##                            cutover itself.  For a real runner-authored kill
 ##                            this now reads "killed", not "timedOut" — the
@@ -183,7 +185,7 @@
 ##                            cache-diagnostic field
 ##   cacheDecision   KEPT      "carried under its real name" — unchanged
 ##   flaky           KEPT (RE-SOURCED)  now serialized as the DERIVED value
-##                            (deriveOutcome(r)==oPassed and r.attempts > 1)
+##                            (flaky(r) — outcome(r)==oPassed and r.attempts > 1)
 ##                            rather than the stored field — a stored bool
 ##                            over a policy-dependent quantity would
 ##                            contradict recomputation (rfc-0007 §2)
@@ -191,7 +193,13 @@
 ##   quarantined     KEPT      unchanged (stays STORED: deriving it needs the
 ##                            Config overlay, not the result — §2's one
 ##                            deliberate exemption from the derived-field rule)
-##   peakRssBytes    KEPT      unchanged
+##   peakRssBytes    DROPPED   rfc-0007 A1e-i deleted the field outright — it
+##                            was a scheduler-sampled quantity with no
+##                            Phase/ProcessResult counterpart (distinct from
+##                            wait4's rusage.maxRssBytes, already on the wire
+##                            nested under the run phase's "res" node — §7
+##                            gives peak RSS a mechanism-tagged LEDGER column,
+##                            not a v2 top-level key); no successor key here
 ##   regressed       KEPT      unchanged
 ##   records         KEPT      unchanged (name/status/durationUs/msg/tags)
 ##   exit (rev15)    RENAMED   absorbed into the nested "run" Phase node's
@@ -340,7 +348,7 @@ const RunSchemaRevision* = 17
   ##                     by real nested `compile`/`run` Phase nodes (kind +
   ##                     exit/cause/evidence/rusage/durationUs, sourced from
   ##                     process/resultjson — the one wire owner); `outcome`
-  ##                     is now produced by deriveOutcome(r) instead of the
+  ##                     is now produced by outcome(r) instead of the
   ##                     legacy stored field (a genuine kill now reads
   ##                     "killed", not "timedOut"); per-entrypoint `exitCode`/
   ##                     `signal`/`durationMs` are dropped (derivable from
@@ -357,7 +365,7 @@ const RunSchemaRevision* = 17
   ##                     per-field disposition.
   ##   rev 17 (rfc-0007 A1d-ii) — cacheDecision vocabulary gains
   ##                     "recomputeMiss": a cache entry EXISTED, but its
-  ##                     recomputed outcome (deriveOutcome, recomputed at the
+  ##                     recomputed outcome (outcome(r), recomputed at the
   ##                     trust boundary) is not oPassed — treated as a miss
   ##                     and rerun (§2); distinct from "keyMiss" (no entry
   ##                     found at all).  Also: cache hits now replay the REAL
@@ -365,6 +373,19 @@ const RunSchemaRevision* = 17
   ##                     byte-equal to what was originally observed), not the
   ##                     A1c interim's minimal Exit/Cause-only fabrication —
   ##                     no new field, an existing field's CONTENT changes.
+  ##   (rfc-0007 A1e-i, no rev bump) — `outcome`/`flaky` keep serializing the
+  ##                     same VALUES (now sourced from the renamed `outcome(r)`
+  ##                     proc; the legacy stored fields are gone from the Nim
+  ##                     type, not from the wire). Two things DO drop off the
+  ##                     wire as a direct, reported consequence of deleting
+  ##                     their Nim source: per-entrypoint `peakRssBytes` (no
+  ##                     successor key — see the field-mapping table above),
+  ##                     and `summary.counts["timedOut"]`/`["signaled"]` (the
+  ##                     legacy Outcome values no longer exist to iterate;
+  ##                     both keys were always 0). Not treated as rev-worthy:
+  ##                     both are the disappearance of an always-zero/no-op
+  ##                     key, and unknown-tolerant readers never depended on
+  ##                     their ABSENCE meaning anything.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -466,8 +487,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## (crisol/compilereport.buildReuseAlerts). Unlike compileBlock, this field
   ## is ALWAYS PRESENT (mirrors `regressions`) -- nil/omitted is treated as an
   ## empty JArray, never omitted from the document.
-  ## rfc-0007 A1d-i: `outcome`/`flaky` are now sourced from deriveOutcome(r)
-  ## (§2's total recomputation), not the legacy stored fields; `compile`/
+  ## rfc-0007 §2: `outcome`/`flaky` are sourced from outcome(r)/flaky(r)
+  ## (the pure derivation — there is no stored field any more); `compile`/
   ## `run` are real Phase nodes read directly off each EntrypointResult.
 
   # Build summary object (counts array + scalars; see the field-mapping table)
@@ -508,7 +529,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
       recNode["tags"] = tagsNode
       recordsNode.add recNode
 
-    let derived = deriveOutcome(r)
+    let derived = outcome(r)
 
     # Build entrypoint object
     let epNode = newJObject()
@@ -518,28 +539,28 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     let flagsNode = newJArray()
     for f in r.ep.flags: flagsNode.add newJString(f)
     epNode["flags"]         = flagsNode
-    # rev 16: advisory `outcome` is now deriveOutcome(r), not the legacy
-    # stored field -- the wire cutover itself (see the field-mapping table).
+    # rev 16: advisory `outcome` is outcome(r), not a legacy stored field --
+    # the wire cutover itself (see the field-mapping table).
     epNode["outcome"]       = newJString(outcomeString(derived))
     epNode["compileSkipped"] = newJBool(r.compileSkipped)  # S2a: complete the schema
     # A8 (rev 2): cache observability.  `cached` absence-default false;
     # `inputHash` is the soundnessKey string ("" when caching not consulted);
     # `cacheDecision` is the stable string form of the always-populated enum.
-    epNode["cached"]        = newJBool(r.cached)
+    epNode["cached"]        = newJBool(cached(r))
     epNode["inputHash"]     = newJString(r.inputHash)
     epNode["cacheDecision"] = newJString(cacheDecisionString(r.cacheDecision))
-    # B1 (rev 3, rev 16): per-entrypoint retry observability.  `flaky` is now
-    # the DERIVED value (deriveOutcome==oPassed and attempts>1), not the
+    # B1 (rev 3, rev 16): per-entrypoint retry observability.  `flaky` is the
+    # DERIVED value (flaky(r): outcome(r)==oPassed and attempts>1), not a
     # stored field -- see the field-mapping table.  `attempts` stays stored:
     # 0 for cached results (no live run), 1 for a clean first-pass, >1 if retried.
-    epNode["flaky"]         = newJBool(derived == oPassed and r.attempts > 1)
+    epNode["flaky"]         = newJBool(flaky(r))
     epNode["attempts"]      = newJInt(r.attempts)
     # B3 (rev 3): quarantine overlay — true iff ep.path ∈ Config.quarantine.
     # Absence-default false; only quarantined entrypoints carry true.
     epNode["quarantined"]   = newJBool(r.quarantined)
-    # C5 (rev 4): per-entrypoint peak RSS in bytes.  0 for cached results or
-    # when RSS sampling was unavailable.  Absence-default 0.
-    epNode["peakRssBytes"]  = newJInt(r.peakRssBytes)
+    # rfc-0007 A1e-i: `peakRssBytes` DROPPED from the wire — its source field
+    # is gone (see the field-mapping table above; the data already on the
+    # wire nested under run.res.rusage.maxRssBytes is the honest successor).
     # C6 (rev 5): per-entrypoint regression flag.  Absence-default false.
     # Only true when perf-check is enabled AND this run exceeded median+k·MAD.
     epNode["regressed"]     = newJBool(r.regressed)

@@ -43,8 +43,7 @@ suite "C6 — run/v1 regressions + render":
 
   test "regressions array present and empty when no regressions":
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 100,
+      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"), durationMs: 100,
                        regressed: false, records: @[]),
     ]
     let node = toJson(results, Summary(total: 1, passed: 1))
@@ -54,8 +53,7 @@ suite "C6 — run/v1 regressions + render":
 
   test "regressed=false → not in regressions array":
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 200,
+      EntrypointResult(ep: makeEp("tests/unit/test_a.nim"), durationMs: 200,
                        regressed: false, perfBaselineUs: 0, perfThresholdUs: 0,
                        records: @[]),
     ]
@@ -64,8 +62,7 @@ suite "C6 — run/v1 regressions + render":
 
   test "regressed=true → entry in regressions array with correct fields":
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 500,
+      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"), durationMs: 500,
                        regressed: true,
                        perfBaselineUs: 100_000'i64,
                        perfThresholdUs: 115_000'i64,
@@ -81,8 +78,7 @@ suite "C6 — run/v1 regressions + render":
 
   test "per-entrypoint regressed field present (false by default)":
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_b.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 50,
+      EntrypointResult(ep: makeEp("tests/unit/test_b.nim"), durationMs: 50,
                        records: @[]),
     ]
     let node = toJson(results, Summary(total: 1, passed: 1))
@@ -92,8 +88,7 @@ suite "C6 — run/v1 regressions + render":
 
   test "per-entrypoint regressed field true when regressed":
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 500,
+      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"), durationMs: 500,
                        regressed: true,
                        perfBaselineUs: 100_000'i64,
                        perfThresholdUs: 115_000'i64,
@@ -104,17 +99,14 @@ suite "C6 — run/v1 regressions + render":
 
   test "multiple results: only regressed ones appear in regressions array":
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_fast.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 100,
+      EntrypointResult(ep: makeEp("tests/unit/test_fast.nim"), durationMs: 100,
                        regressed: false, records: @[]),
-      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 900,
+      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"), durationMs: 900,
                        regressed: true,
                        perfBaselineUs: 200_000'i64,
                        perfThresholdUs: 250_000'i64,
                        records: @[]),
-      EntrypointResult(ep: makeEp("tests/unit/test_medium.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 300,
+      EntrypointResult(ep: makeEp("tests/unit/test_medium.nim"), durationMs: 300,
                        regressed: false, records: @[]),
     ]
     let node = toJson(results, Summary(total: 3, passed: 3))
@@ -123,8 +115,7 @@ suite "C6 — run/v1 regressions + render":
 
   test "render: no [SLOW] tag when regressed=false":
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_ok.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 100,
+      EntrypointResult(ep: makeEp("tests/unit/test_ok.nim"), durationMs: 100,
                        regressed: false, records: @[]),
     ]
     let s = render(results, Summary(total: 1, passed: 1), defaultOpts())
@@ -132,8 +123,7 @@ suite "C6 — run/v1 regressions + render":
 
   test "render: [SLOW] tag present when regressed=true":
     let results = @[
-      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"),
-                       outcome: oPassed, exitCode: 0, durationMs: 500,
+      EntrypointResult(ep: makeEp("tests/unit/test_slow.nim"), durationMs: 500,
                        regressed: true,
                        perfBaselineUs: 100_000'i64,
                        perfThresholdUs: 115_000'i64,

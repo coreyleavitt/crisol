@@ -3,7 +3,7 @@
 ## Drives runEntrypoint over the three A2b fixtures and asserts expected outcomes:
 ##   pass_always   → oPassed  (exit 0)
 ##   fail_compile  → oCompileFailed  (captured compiler output non-empty)
-##   hang_forever  → oTimeout  (within ~3 s total wall time)
+##   hang_forever  → oKilled  (within ~3 s total wall time)
 ##
 ## Fixture sources are compiled on demand by runEntrypoint — no pre-build step
 ## required for this test to run.
@@ -15,6 +15,7 @@
 import std/[os, times, unittest]
 import crisol/types   # Outcome, EntrypointResult
 import crisol/runner  # runEntrypoint
+from crisol/process/types as ptypes import nil  # ekExited (Exit.kind)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -40,18 +41,19 @@ suite "runEntrypoint — A2b/A3 supervised compile+run":
     let src = fixtureDir() / "pass_always.nim"
     check fileExists(src)
     let o = runEntrypoint(ep(src), compileTimeoutMs = 30_000, runTimeoutMs = 10_000)
-    check o.outcome  == oPassed
-    check o.exitCode == 0
+    check outcome(o) == oPassed
+    check o.run.res.exit.kind == ptypes.ekExited
+    check o.run.res.exit.code == 0
 
   test "fail_compile → oCompileFailed, output non-empty":
     let src = fixtureDir() / "fail_compile.nim"
     check fileExists(src)
     let o = runEntrypoint(ep(src), compileTimeoutMs = 30_000, runTimeoutMs = 10_000)
-    check o.outcome  == oCompileFailed
+    check outcome(o) == oCompileFailed
     # The compiler must have emitted something about the undeclared identifier.
     check o.output.len > 0
 
-  test "hang_forever → oTimeout, returns within ~35 s":
+  test "hang_forever → oKilled, returns within ~35 s":
     let src = fixtureDir() / "hang_forever.nim"
     check fileExists(src)
     let t0 = epochTime()
@@ -59,7 +61,7 @@ suite "runEntrypoint — A2b/A3 supervised compile+run":
     let o = runEntrypoint(ep(src), compileTimeoutMs = 30_000, runTimeoutMs = 1_500)
     let elapsed = epochTime() - t0
 
-    check o.outcome == oTimeout
+    check outcome(o) == oKilled
 
     # Total wall time must be well under 3 s of run time plus compile time.
     # compile may take a few seconds, but run timeout is 1.5 s.
