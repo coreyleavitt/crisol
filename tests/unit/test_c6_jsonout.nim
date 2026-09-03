@@ -39,8 +39,9 @@ suite "C6 — run/v1 regressions + render":
     ## rfc-0007 A1b bumped 14->15 (advisory per-entrypoint `exit`/`cause`);
     ## rfc-0007 A1d-i bumped 15->16 (the run/v2 wire cutover);
     ## rfc-0007 A1d-ii bumped 16->17 (cacheDecision "recomputeMiss");
-    ## rfc-0007 A7 bumped 17->18 (top-level `substrate` node).
-    check RunSchemaRevision == 18
+    ## rfc-0007 A7 bumped 17->18 (top-level `substrate` node);
+    ## rfc-0005 B3c bumped 18->19 (top-level `verifyFails`).
+    check RunSchemaRevision == 19
 
   test "regressions array present and empty when no regressions":
     let results = @[

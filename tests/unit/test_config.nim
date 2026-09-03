@@ -1282,5 +1282,72 @@ group "unit" {
     check caught
     check kind == cekConfig
 
+# ---------------------------------------------------------------------------
+# RFC-0005 B3c — verify-cache-pct config plumbing
+# ---------------------------------------------------------------------------
+
+suite "config — verify-cache-pct (RFC-0005 B3c: --verify-cache sample-% default)":
+
+  test "absent verify-cache-pct -> cfg.verifyCachePct == DefaultVerifyCachePct (5)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.verifyCachePct == DefaultVerifyCachePct
+    check cfg.verifyCachePct == 5
+
+  test "verify-cache-pct N round-trips to cfg.verifyCachePct == N":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+verify-cache-pct 25
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.verifyCachePct == 25
+
+  test "no config file (convention fallback) -> cfg.verifyCachePct == DefaultVerifyCachePct":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check cfg.verifyCachePct == DefaultVerifyCachePct
+
+  test "verify-cache-pct 0 is accepted (a legitimate 'sample nothing' config)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+verify-cache-pct 0
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.verifyCachePct == 0
+
+  test "verify-cache-pct -1 is rejected (must be >= 0)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+verify-cache-pct -1
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
 when isMainModule:
   echo "All config tests passed."

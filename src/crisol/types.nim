@@ -293,6 +293,15 @@ type
                                 ## when set, mirroring jobs/timeoutSecs precedence in planImpl).
                                 ## Lets a consumer with an fd-heavy workload (e.g. one eventfd per
                                 ## in-flight async call) raise the ceiling without patching crisol.
+    verifyCachePct*: int        ## RFC-0005 B3c: the `--verify-cache` sample-percentage DEFAULT a
+                                ## config file can set (`verify-cache-pct N` KDL node) so an
+                                ## invocation-time `--verify-cache` (with no `--verify-cache-pct`
+                                ## override) samples at the project's chosen rate rather than the
+                                ## built-in 5. Only `pct` is a config key -- `enabled`/`seed`/
+                                ## `strict` stay CLI-only per the RFC's config-additions list.
+                                ## Always resolved to a concrete value by config.loadConfig
+                                ## (defaults to config.DefaultVerifyCachePct when the KDL node is
+                                ## absent) -- never a sentinel, mirroring timeoutSecs.
     workerBinary*: string       ## INTERNAL plumbing (not user-facing; no KDL node). Absolute path
                                 ## to a binary whose `main()` dispatches the
                                 ## `--internal-measure-compile` token (see measureworker.nim /

@@ -16,6 +16,7 @@
 ## dep-roots "../sibling/src"           // repeated node = more dep roots
 ## quarantine "tests/integration/test_x.nim"  // B3: failure excluded from exit-1
 ## rlimit-nofile 2048                   // Fix 1: override sandbox RLIMIT_NOFILE (default 1024)
+## verify-cache-pct 5                   // RFC-0005 B3c: --verify-cache sample-percent default
 ##
 ## group "unit" {
 ##     globs "tests/unit/test_*.nim"
@@ -74,6 +75,8 @@ const DefaultTimeoutSecs*        = 300
 const DefaultCompileTimeoutSecs* = 600
 const DefaultMaxOutputBytes*     = 10 * 1024 * 1024   # 10 MiB
 const DefaultStateDir*           = ".crisol"
+const DefaultVerifyCachePct*     = 5   # RFC-0005 B3c: --verify-cache-pct's default;
+                                        # matches api.verifySample's own pct default.
 
 let DefaultGroups*: seq[Group] = @[
   Group(name: "unit",        globs: @["tests/unit/test_*.nim"]),
@@ -95,6 +98,7 @@ proc conventionConfig(root: string): Config =
     projectRoot:        root,
     perfCheck:          PerfCheckConfig(enabled: false),
     reuseCheck:         ReuseCheckConfig(enabled: false),
+    verifyCachePct:     DefaultVerifyCachePct,
     workerBinary:       "",
   )
 
@@ -460,6 +464,10 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # Fix 1 (RLIMIT_NOFILE plumbing): config-declared override for the
     # sandbox's max-open-fds ceiling. none = use sandbox.DefaultRlimitNofile.
     rlimitNofile: Option[int64] = none(int64)
+    # RFC-0005 B3c: --verify-cache-pct's config-file default. Always a
+    # concrete value (never a sentinel) -- DefaultVerifyCachePct until the
+    # KDL node overrides it, mirroring timeoutSecs above.
+    verifyCachePct: int = DefaultVerifyCachePct
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -537,6 +545,15 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v < 1:
         cfgErr("config: 'rlimit-nofile' must be >= 1, got " & $v)
       rlimitNofile = some(int64(v))
+    of "verify-cache-pct":
+      # RFC-0005 B3c: sample-percentage default for --verify-cache; only
+      # meaningful when --verify-cache is passed on the CLI (enabled is
+      # CLI-only, per the RFC's config-additions list) and no
+      # --verify-cache-pct override was given.
+      let v = requireIntArg(n, "verify-cache-pct")
+      if v < 0:
+        cfgErr("config: 'verify-cache-pct' must be >= 0, got " & $v)
+      verifyCachePct = v
     of "group":        discard
     of "perf-check":   discard  # C6: parsed in second pass (has children)
     of "reuse-check":  discard  # M-report (b1): parsed in second pass (has children)
@@ -579,6 +596,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     measureCompileReuse: measureCompileReuse,
     strictHygiene:      strictHygiene,
     rlimitNofile:       rlimitNofile,
+    verifyCachePct:     verifyCachePct,
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).
   )

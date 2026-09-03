@@ -153,6 +153,8 @@ Usage:
               [--order <recent-fail|duration|none>]
               [--hermetic <none|isolated|network>]
               [--rlimit-nofile <N>]
+              [--verify-cache [--verify-cache-pct <N>]
+                              [--verify-cache-seed <N>] [--verify-cache-strict]]
   crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
   crisol closure <entrypoint>... [--json] [--config <path>]
   crisol closure --all [--json] [--config <path>]
@@ -226,6 +228,23 @@ Additional options for 'run':
                   Diagnostic: run compile slots through the measurement
                   worker and emit the `compile` block's segmented cc%/
                   r_time/r_size stats to the run report (no caching).
+  --verify-cache  The determinism backstop: after the run completes, re-
+                  executes a sample of this run's cache hits and compares
+                  the fresh observation against the stored one. Divergence
+                  is never silent — a stderr warning names the entrypoint
+                  and the JSON `verifyFails` count reflects it. Never
+                  evicts. Off by default.
+  --verify-cache-pct N
+                  Sample size as a percentage of this run's cache hits
+                  (default 5, or crisol.kdl's `verify-cache-pct`).
+                  Requires --verify-cache.
+  --verify-cache-seed N
+                  Pins the sampler's seed for a reproducible sample
+                  (default: a per-run value). Requires --verify-cache.
+  --verify-cache-strict
+                  A divergence found by the pass sets the process exit
+                  code to 1 (CI gate) in addition to the stderr warning.
+                  Requires --verify-cache.
 
 Additional options for 'list':
   --json          Emit the crisol/plan/v1 JSON document instead of human output.
@@ -640,6 +659,10 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     measureCompileReuse: bool = false  # RFC-0006: --measure-compile-reuse: gate the
                                         # measurement worker into the compile slot
     rlimitNofile: int = 0        # Fix 1: --rlimit-nofile N; 0 = not specified (use config/built-in)
+    verifyCache:       bool = false  # RFC-0005 B3c: --verify-cache: enable the post-run pass
+    verifyCachePctFlag: int  = 0     # --verify-cache-pct N; 0 = not specified (use config/built-in)
+    verifyCacheSeed:   Option[int64] = none(int64)  # --verify-cache-seed N
+    verifyCacheStrict: bool = false  # --verify-cache-strict: a divergence flips the exit code
 
   let runArgs = args[1..^1]
   var i = 0
@@ -669,7 +692,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                  "base", "force-compile", "no-cache", "filter-tag",
                  "retries", "fail-on-flaky", "strict-hygiene", "junit", "shard", "order",
                  "perf-check", "hermetic", "measure-compile-reuse",
-                 "rlimit-nofile"] and isList:
+                 "rlimit-nofile", "verify-cache", "verify-cache-pct",
+                 "verify-cache-seed", "verify-cache-strict"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
         stderr.write(usage())
         return ExitEnvironment
@@ -808,6 +832,32 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         except ValueError:
           stderr.write("crisol: --rlimit-nofile: invalid integer '" & raw & "'\n")
           return ExitEnvironment
+      of "verify-cache":
+        verifyCache = true
+      of "verify-cache-pct":
+        let raw = nextVal("verify-cache-pct")
+        if raw == "":
+          stderr.write("crisol: --verify-cache-pct requires an integer value\n")
+          return ExitEnvironment
+        try:
+          verifyCachePctFlag = parseInt(raw)
+          if verifyCachePctFlag < 1:
+            stderr.write("crisol: --verify-cache-pct must be >= 1\n"); return ExitEnvironment
+        except ValueError:
+          stderr.write("crisol: --verify-cache-pct: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
+      of "verify-cache-seed":
+        let raw = nextVal("verify-cache-seed")
+        if raw == "":
+          stderr.write("crisol: --verify-cache-seed requires an integer value\n")
+          return ExitEnvironment
+        try:
+          verifyCacheSeed = some(int64(parseBiggestInt(raw)))
+        except ValueError:
+          stderr.write("crisol: --verify-cache-seed: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
+      of "verify-cache-strict":
+        verifyCacheStrict = true
       else:
         stderr.write("crisol: unknown flag '--" & key & "'\n\n")
         stderr.write(usage())
@@ -893,6 +943,52 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                  "(a base ref without impact selection has no effect)\n")
     return ExitEnvironment
 
+  # RFC-0005 B3c: each --verify-cache-* PARAMETER flag requires --verify-cache
+  # itself — same shape as --base requiring --changed above (a parameter
+  # without the pass it configures has no effect and is always a mistake).
+  if verifyCachePctFlag > 0 and not verifyCache:
+    stderr.write("crisol: error: --verify-cache-pct requires --verify-cache\n")
+    return ExitEnvironment
+  if verifyCacheSeed.isSome and not verifyCache:
+    stderr.write("crisol: error: --verify-cache-seed requires --verify-cache\n")
+    return ExitEnvironment
+  if verifyCacheStrict and not verifyCache:
+    stderr.write("crisol: error: --verify-cache-strict requires --verify-cache\n")
+    return ExitEnvironment
+
+  # RFC-0005 B3c: resolve the sample percentage. --verify-cache-pct (when
+  # given) always wins; otherwise fall back to the config file's
+  # `verify-cache-pct` (defaulting to config.DefaultVerifyCachePct when the
+  # KDL node itself is absent). This is a SECOND, lightweight loadConfig
+  # call, deliberately scoped to just this one field — mirrors the `clean`
+  # subcommand's own early loadConfig above, and keeps this slice's touched
+  # surface to crisol.nim/config.nim/jsonout.nim (the actual pipeline load
+  # inside runTests/planTests, below, still owns the real Config used to
+  # run). A library caller going through crisol/api directly (not this CLI)
+  # does not get this config-file fallback — verifySample()'s own default
+  # (5) applies instead; documented on VerifyCache/RunOptions in api.nim.
+  var verifyCachePctResolved = verifyCachePctFlag
+  if verifyCache and verifyCachePctFlag == 0:
+    try:
+      let (cfgPeek, _) = loadConfig(configPath = configPath)
+      verifyCachePctResolved = cfgPeek.verifyCachePct
+    except CrisolError as e:
+      case e.kind
+      of cekEnvironment:
+        writeStderr("crisol: environment error: " & e.msg)
+        return ExitEnvironment
+      of cekConfig:
+        writeStderr("crisol: config error: " & e.msg)
+        return ExitEnvironment
+      of cekInternal:
+        writeStderr("crisol: internal error: " & e.msg)
+        return ExitInternal
+
+  let verifyCacheOpts =
+    if verifyCache: verifySample(pct = verifyCachePctResolved, seed = verifyCacheSeed,
+                                 strict = verifyCacheStrict)
+    else: noVerify()
+
   # Build narrowing.
   var narrowing: RunNarrowing
   if useFailed and useChanged:
@@ -929,6 +1025,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     rlimitNofile:        if rlimitNofile > 0: some(int64(rlimitNofile)) else: none(int64),
                                          # Fix 1: --rlimit-nofile override
     measureCompileReuse: measureCompileReuse,  # RFC-0006: gate measurement worker into compile slot
+    verifyCache:         verifyCacheOpts,  # RFC-0005 B3c: --verify-cache facade
     workerBinary:        selfWorkerBinary,  # "" unless the real CLI entrypoint (below) passed
                                              # its own getAppFilename() — see runMain's doc above
                                              # for why this must never be resolved in here.
@@ -1031,7 +1128,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
   if jsonMode:
     stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
                               rr.memThrottledSlots, interrupted = rr.interrupted,
-                              policy = policy, substrate = process.capabilities()))
+                              policy = policy, substrate = process.capabilities(),
+                              verifyFails = rr.verifyDivergences.len))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,
@@ -1055,6 +1153,14 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     except OSError as e:
       writeStderr("crisol: warning: could not write junit report to '" &
                    junitPath & "': " & e.msg)
+
+  # RFC-0005 B3c: --verify-cache-strict — a divergence set is a CI-gate
+  # failure. The pass never runs on a structural/interrupted return (both
+  # already returned above), so rr.exitCode here is always the plain 0/1
+  # from types.exitCode; strict only ever STRENGTHENS 0 -> 1, never masks
+  # an already-nonzero code from an unrelated entrypoint failure.
+  if opts.verifyCache.strict and rr.verifyDivergences.len > 0:
+    return ExitTestFailure
 
   return rr.exitCode
 

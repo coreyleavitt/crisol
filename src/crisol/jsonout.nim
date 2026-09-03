@@ -250,7 +250,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 18
+const RunSchemaRevision* = 19
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -417,6 +417,28 @@ const RunSchemaRevision* = 18
   ##                     platform-inapplicable fields are absent, never a
   ##                     greyed-out `false`). Supersedes rev 16's deliberate
   ##                     absence. Mirrors plan/v1 rev 4's own `substrate`.
+  ##   rev 19 (RFC-0005) — top-level `verifyFails` (int): the `--verify-cache`
+  ##                     post-run pass's divergence count (RunReport.
+  ##                     verifyDivergences.len). ALWAYS present, defaulting
+  ##                     to 0 (same "always-present, zero-value-is-honest"
+  ##                     convention as `interrupted`, rev 16) -- 0 means
+  ##                     EITHER the pass ran clean OR --verify-cache was
+  ##                     never enabled; the two are indistinguishable on the
+  ##                     wire by design (no separate "ran" bit -- a consumer
+  ##                     that cares can already tell from cacheDecision/hit
+  ##                     counts + the CLI flags it itself passed). CONTROL-
+  ##                     LOOP STAGING NOTE (rfc-0005 build order: B3c lands
+  ##                     BEFORE A3b): the RFC's §Schemas bullet assigns rev
+  ##                     19 to A3b's per-result `cacheTier`/`cacheLookup`
+  ##                     fields, "riding the same rev" as B3c's `verifyFails`
+  ##                     -- but B3c is the slice that actually PERFORMS the
+  ##                     18 -> 19 bump (it lands first in build order). When
+  ##                     A3b lands, it does NOT bump to rev 20 for its own
+  ##                     fields -- it adds `cacheTier`/`cacheLookup` under
+  ##                     this SAME rev 19 and appends its own bullet here
+  ##                     documenting them, exactly as this bullet documents
+  ##                     `verifyFails`. rev 20 is reserved for B2b's
+  ##                     `cacheStats` object (see the RFC's §Schemas list).
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -504,9 +526,13 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              reuseAlerts: JsonNode = nil;
              interrupted: bool = false;
              policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
-             substrate: ptypes.Capabilities = ptypes.Capabilities()): JsonNode =
+             substrate: ptypes.Capabilities = ptypes.Capabilities();
+             verifyFails: int = 0): JsonNode =
   ## Pure: serialize to the crisol/run/v2 JsonNode.
   ## No I/O.
+  ## verifyFails: RFC-0005 B3c (rev 19) — RunReport.verifyDivergences.len.
+  ## Always emitted, 0 by default (see the rev-19 schema-history entry above
+  ## for why 0 is ambiguous-by-design between "ran clean" and "never ran").
   ## interrupted: rfc-0007 A1e-ii — true iff this run was cut short by
   ## SIGINT/SIGTERM (§2). `results` is expected to already be the emission
   ## set (killed finals included, never-started entries omitted) and
@@ -657,6 +683,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   # rendered as a platform-shaped node (resultjson.capabilitiesToJson) --
   # supersedes rev 16's deliberate absence.
   result["substrate"] = resultjson.capabilitiesToJson(substrate)
+  # rev 19 (RFC-0005 B3c): --verify-cache's divergence count, always present.
+  result["verifyFails"] = newJInt(verifyFails)
 
 proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    filterTag: string = "";
@@ -666,13 +694,15 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    reuseAlerts: JsonNode = nil;
                    interrupted: bool = false;
                    policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
-                   substrate: ptypes.Capabilities = ptypes.Capabilities()): string =
+                   substrate: ptypes.Capabilities = ptypes.Capabilities();
+                   verifyFails: int = 0): string =
   ## Pure: compact JSON string of the crisol/run/v2 document.
   ## C3: filterTag threads through to toJson.
   ## policy: rfc-0007 A6b — threads through to toJson unchanged (see there).
   ## substrate: rfc-0007 A7 — threads through to toJson unchanged (see there).
+  ## verifyFails: RFC-0005 B3c — threads through to toJson unchanged (see there).
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
-         reuseAlerts, interrupted, policy, substrate)
+         reuseAlerts, interrupted, policy, substrate, verifyFails)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
