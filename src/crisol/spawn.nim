@@ -21,7 +21,7 @@
 ##       retired (forkExecEnvScratch with a hlNone/no-scratch spec subsumes them).
 ##   supervise*(pid, timeoutMs)                              → (exitCode, signal, timedOut)
 
-import std/[os, monotimes, times, envvars, sequtils, options]
+import std/[os, envvars, sequtils, options]
 import std/posix
 import crisol/[types, sandbox]
 
@@ -504,77 +504,17 @@ proc forkExecEnvScratch*(
   result = (pid: childPid, achieved: got)
 
 # ---------------------------------------------------------------------------
-# supervise
+# GracePeriodMs
 # ---------------------------------------------------------------------------
+# rfc-0007 A2a-i: `supervise` (the raw Pid-based poll/kill/reap helper) is
+# DELETED here — it had zero `src/` callers (runner.nim runs its own
+# wait4/killpg loops; see runner.nim's teardownLiveSlots/pollSlot) and its
+# only callers were five integration test files, which now drive a
+# `process.nim` Supervisor directly (process/posix.nim's `next`/requestStop/
+# forceKill/reap) instead of this raw Pid polling helper. `GracePeriodMs`
+# stays — runner.nim still reads it directly for its own grace-window
+# arithmetic (A2b migrates the runner onto the Supervisor and retires it).
 
 const GracePeriodMs* = 400
   ## Time (ms) to wait after SIGTERM before escalating to SIGKILL.
   ## Reused by the execute handleInterrupt template.
-
-proc supervise*(pid: Pid; timeoutMs: int): tuple[exitCode: int; signal: int; timedOut: bool] =
-  ## Poll waitpid(WNOHANG) every ~25 ms until the child exits or the deadline
-  ## is reached.  On timeout: SIGTERM → grace period → SIGKILL if still alive.
-  ##
-  ## R10: waitpid returning EINTR is retried (not treated as child exit).
-  ## R11: deadline computed with monotonic time; wall clock used only for
-  ##      human-facing durationMs (handled by the caller).
-  ## M11: SIGTERM → 400 ms grace → SIGKILL escalation on timeout.
-  ##
-  ## Returns:
-  ##   exitCode  — WEXITSTATUS when exited normally; 0 otherwise
-  ##   signal    — WTERMSIG when killed by signal; 0 otherwise
-  ##   timedOut  — true when timeout expired and we killed the group
-
-  let stepMs   = 25
-  let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
-
-  while true:
-    var wstatus: cint = 0
-    var r: Pid
-
-    # R10: retry on EINTR.
-    while true:
-      r = waitpid(pid, wstatus, WNOHANG)
-      if r >= Pid(0) or errno != EINTR:
-        break
-
-    if r == pid:
-      # Child has exited.
-      if WIFEXITED(wstatus):
-        return (exitCode: int(WEXITSTATUS(wstatus)), signal: 0, timedOut: false)
-      elif WIFSIGNALED(wstatus):
-        return (exitCode: 0, signal: int(WTERMSIG(wstatus)), timedOut: false)
-      else:
-        # Stopped or continued — should not happen in our usage; keep polling.
-        discard
-    elif r < Pid(0):
-      # ECHILD (truly no child) — treat as exit 1.
-      return (exitCode: 1, signal: 0, timedOut: false)
-
-    # Check deadline AFTER the waitpid so we always attempt at least one poll.
-    if getMonoTime() >= deadline:
-      # M11: SIGTERM → grace period → SIGKILL escalation.
-      discard killpg(pid, SIGTERM)
-      # Drain up to GracePeriodMs with WNOHANG polls.
-      let graceDeadline = getMonoTime() + initDuration(milliseconds = GracePeriodMs)
-      while getMonoTime() < graceDeadline:
-        var ws2: cint = 0
-        var r2: Pid
-        while true:
-          r2 = waitpid(pid, ws2, WNOHANG)
-          if r2 >= Pid(0) or errno != EINTR:
-            break
-        if r2 == pid:
-          # Exited during grace.
-          return (exitCode: 0, signal: int(SIGTERM), timedOut: true)
-        os.sleep(20)
-      # Still alive — escalate to SIGKILL and reap (EINTR-guarded like elsewhere).
-      discard killpg(pid, SIGKILL)
-      var ws2: cint = 0
-      while true:
-        let rk = waitpid(pid, ws2, 0)
-        if rk >= Pid(0) or errno != EINTR:
-          break
-      return (exitCode: 0, signal: int(SIGKILL), timedOut: true)
-
-    os.sleep(stepMs)

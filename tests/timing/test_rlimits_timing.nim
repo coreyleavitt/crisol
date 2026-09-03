@@ -6,6 +6,9 @@
 ##   - RLIMIT_AS: a large-allocation fixture fails deterministically when AS is
 ##     capped at/above MinSafeRlimitAs (safe for ORC) but below the requested alloc.
 ##
+## rfc-0007 A2a-i: migrated off `spawn.forkExecEnvScratch` + the deleted
+## `spawn.supervise` onto process.nim's Supervisor — see `../support/spawnhelpers`.
+##
 ## GATING: This file quits 0 immediately when CRISOL_TIMING_TESTS is unset or
 ## empty.  The env var is NOT forwarded by ./dev run (podman only sets HOME), so
 ## the normal ./dev test run always skips these tests (tests/timing/ is also
@@ -28,8 +31,10 @@
 ##   4. RLIMIT_AS unset (rlimits=false) → as fixture's alloc succeeds (exits 0)
 ##   5. Gating: with CRISOL_TIMING_TESTS empty the file quits 0 immediately
 
-import std/[os, osproc, posix, options, unittest]
-import crisol/[types, sandbox, spawn]
+import std/[os, osproc, options, unittest, monotimes, times]
+import crisol/[types, sandbox]
+import crisol/process
+import "../support/spawnhelpers"
 
 # ---------------------------------------------------------------------------
 # GATE: quit 0 immediately when env var is unset or empty.
@@ -44,31 +49,21 @@ if getEnv("CRISOL_TIMING_TESTS") == "":
 # Constants
 # ---------------------------------------------------------------------------
 
-const SIGXCPU = cint(24)  ## Linux signal number for CPU time limit exceeded
-  ## POSIX value; present in std/posix on Linux but we spell it out for clarity.
+const SIGXCPU = 24  ## Linux signal number for CPU time limit exceeded
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-proc tmpOutputFile(): (cint, string) =
-  let path = getTempDir() / "crisol_timing_test_" & $getpid() & ".txt"
-  let fd = posix.open(path.cstring, O_RDWR or O_CREAT or O_TRUNC or O_CLOEXEC, 0o600)
-  doAssert fd >= 0, "failed to open temp file: " & path
-  (fd, path)
-
 proc runFixture(bin: string; spec: SandboxSpec; timeoutMs: int = 10_000):
-    tuple[exitCode: int; signal: int; timedOut: bool; scratchDir: string] =
-  ## Fork-exec `bin` under `spec`; return the supervise result + scratchDir.
-  let (fd, outPath) = tmpOutputFile()
+    tuple[ok: bool; report: ReapReport; scratchDir: string] =
+  var sv = initSupervisor(installSignals = false)
+  let outPath = getTempDir() / "crisol_timing_test_" & $getCurrentProcessId() & ".txt"
   var scratchDir = ""
-  let (pid, _) = forkExecEnvScratch(@[bin], fd, @[], spec, scratchDir)
-  discard posix.close(fd)
+  let cs = buildChildSpec(bin, [], spec, outPath, scratchDir)
+  let (ok, report) = spawnAndWait(sv, cs, timeoutMs)
   removeFile(outPath)
-  if pid <= Pid(0):
-    return (exitCode: -1, signal: 0, timedOut: false, scratchDir: scratchDir)
-  let (ec, sig, timedOut) = supervise(pid, timeoutMs)
-  result = (exitCode: ec, signal: sig, timedOut: timedOut, scratchDir: scratchDir)
+  (ok, report, scratchDir)
 
 # ---------------------------------------------------------------------------
 # Compile fixtures at module load time
@@ -112,24 +107,45 @@ suite "A4c timing/privilege-sensitive rlimits (RLIMIT_CPU, RLIMIT_AS)":
       rlimits = RlimitOverrides(limitCpu: some(int64(1))),  # 1 CPU-second
     )
     let r = runFixture(cpuBin, spec, timeoutMs = 10_000)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
-    # Must be killed by SIGXCPU; may not exit normally.
-    check r.signal == int(SIGXCPU)
-    check not r.timedOut
+    cleanupScratch(r.scratchDir)
+    check r.ok
+    check r.report.limits[lkCpu] == lsApplied
+    # Must be killed by SIGXCPU.
+    check r.report.exit.kind == ekSignaled
+    check r.report.exit.sig == SIGXCPU
 
   test "RLIMIT_CPU unset (rlimits=false) → cpu fixture runs until wall timeout":
     ## Without RLIMIT_CPU the fixture spins forever.  We give it a short wall
-    ## timeout (2s) — it must time out, NOT exit with SIGXCPU, demonstrating
-    ## no CPU limit was imposed.
+    ## timeout (2s) — it must NOT exit on its own (weDeadline, not
+    ## weChildExited), demonstrating no CPU limit was imposed. Unlike
+    ## runFixture/spawnAndWait (which never sends a stop act), this case
+    ## drives the Supervisor directly: it MUST clean up the still-alive
+    ## child itself before `sv` goes out of scope, or the Supervisor's own
+    ## misuse Defect fires ("destroyed with live children", §1 lifecycle
+    ## rule) — a real guard, not test friction, and the same requestStop/
+    ## forceKill drain the RLIMIT_CPU=1s case above never needed because
+    ## SIGXCPU already ended that child.
     let spec = resolveSandbox(level = hlNone)  # no rlimits
     doAssert not spec.rlimits
-    let r = runFixture(cpuBin, spec, timeoutMs = 2_000)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
-    # The fixture must NOT exit via SIGXCPU — it should time out instead.
-    check r.timedOut
-    check r.signal != int(SIGXCPU)
+    var sv = initSupervisor(installSignals = false)
+    let outPath = getTempDir() / "crisol_timing_test_" & $getCurrentProcessId() & ".txt"
+    var scratchDir = ""
+    let cs = buildChildSpec(cpuBin, [], spec, outPath, scratchDir)
+    let sr = sv.spawn(cs)
+    check sr.ok
+    let deadline = getMonoTime() + initDuration(milliseconds = 2_000)
+    let ev = sv.next(deadline)
+    check ev.kind == weDeadline   # must NOT have exited on its own
+
+    sv.requestStop(sr.id, krTimeout)
+    var ev2 = sv.next(getMonoTime() + initDuration(milliseconds = 500))
+    if ev2.kind != weChildExited:
+      sv.forceKill(sr.id)
+      ev2 = sv.next(getMonoTime() + initDuration(seconds = 5))
+    check ev2.kind == weChildExited
+    discard sv.reap(ev2.id)
+    removeFile(outPath)
+    cleanupScratch(scratchDir)
 
   test "RLIMIT_AS at MinSafeRlimitAs → as fixture's 2 GiB alloc fails/aborts":
     ## MinSafeRlimitAs is generous enough for ORC's arena + normal test startup,
@@ -144,10 +160,12 @@ suite "A4c timing/privilege-sensitive rlimits (RLIMIT_CPU, RLIMIT_AS)":
       rlimits = RlimitOverrides(limitAs: some(MinSafeRlimitAs)),  # ceiling at the documented safe min
     )
     let r = runFixture(asBin, spec, timeoutMs = 15_000)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
+    cleanupScratch(r.scratchDir)
+    check r.ok
+    check r.report.limits[lkAddressSpace] == lsApplied
     # The fixture must NOT succeed: either killed by signal or exits non-zero.
-    let hitLimit = r.signal != 0 or r.exitCode != 0
+    let hitLimit = r.report.exit.kind == ekSignaled or
+                   (r.report.exit.kind == ekExited and r.report.exit.code != 0)
     check hitLimit
 
   test "RLIMIT_AS unset (rlimits=false) → as fixture's 2 GiB alloc succeeds":
@@ -161,11 +179,10 @@ suite "A4c timing/privilege-sensitive rlimits (RLIMIT_CPU, RLIMIT_AS)":
     let spec = resolveSandbox(level = hlNone)  # no rlimits
     doAssert not spec.rlimits
     let r = runFixture(asBin, spec, timeoutMs = 15_000)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
-    check r.exitCode == 0
-    check r.signal == 0
-    check not r.timedOut
+    cleanupScratch(r.scratchDir)
+    check r.ok
+    check r.report.exit.kind == ekExited
+    check r.report.exit.code == 0
 
 when isMainModule:
   echo "test_rlimits_timing done"

@@ -1,24 +1,26 @@
 ## test_env_scrub_integration.nim — A5 end-to-end env filtering test
 ##
-## Tests that the spec-driven spawn entry (forkExecEnvScratch — the single
-## run-path spawn after the A6 consolidation) actually filters the child
-## environment at the OS level.  The env_probe fixture binary prints specific
-## env vars so we can assert which are present/absent in the child.
+## Tests that the runner-resolved env (env scrub + injection, §1
+## ChildSpec.env) actually filters the child environment at the OS level
+## when spawned through process.nim's Supervisor. The env_probe fixture
+## binary prints specific env vars so we can assert which are present/absent
+## in the child.
+##
+## rfc-0007 A2a-i: migrated off `spawn.forkExecEnvScratch` + the deleted
+## `spawn.supervise` onto the Supervisor — see `../support/spawnhelpers`.
 
-import std/[unittest, os, osproc, posix, strutils]
-import crisol/[types, sandbox, spawn]
+import std/[unittest, os, osproc, posix, options, strutils]
+import crisol/[types, sandbox]
+import crisol/process
+import "../support/spawnhelpers"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-proc tmpOutputFile(): (cint, string) =
-  ## Open a temp file for capturing child stdout+stderr.
-  ## Returns (fd, path).
-  let path = getTempDir() / "crisol_envscrub_" & $getpid() & ".txt"
-  let fd = posix.open(path.cstring, O_RDWR or O_CREAT or O_TRUNC or O_CLOEXEC, 0o600)
-  doAssert fd >= 0, "failed to open temp file: " & path
-  (fd, path)
+proc tmpOutputFile(): (string) =
+  ## Path for capturing child stdout+stderr.
+  getTempDir() / "crisol_envscrub_" & $getpid() & ".txt"
 
 proc readOutputFile(path: string): string =
   readFile(path)
@@ -43,7 +45,7 @@ doAssert compileRc == 0,
 # Integration tests
 # ---------------------------------------------------------------------------
 
-suite "forkExecEnv with SandboxSpec (end-to-end)":
+suite "spawn with SandboxSpec env resolution (end-to-end)":
 
   test "hlIsolated spec: CRISOL_SECRET_XYZ absent in child, PATH present":
     # Plant a forbidden var in the parent environment.
@@ -53,19 +55,17 @@ suite "forkExecEnv with SandboxSpec (end-to-end)":
     # DefaultEnvAllowlist includes PATH but not CRISOL_SECRET_XYZ.
     let spec = resolveSandbox(level = hlIsolated)
 
-    let (fd, outPath) = tmpOutputFile()
-    var scratch: string
-    let (pid, _) = forkExecEnvScratch(@[probeBin], fd,
-                                      @[("CRISOL_SINK", "/dev/null")], spec, scratch)
-    check pid > Pid(0)
-    discard posix.close(fd)
-    defer:
-      if scratch.len > 0: removeDir(scratch)
+    var sv = initSupervisor(installSignals = false)
+    let outPath = tmpOutputFile()
+    var scratch = ""
+    let cs = buildChildSpec(probeBin, [("CRISOL_SINK", "/dev/null")], spec, outPath, scratch)
+    defer: cleanupScratch(scratch)
 
-    let (exitCode, sig, timedOut) = supervise(pid, 5000)
-    check exitCode == 0
-    check sig == 0
-    check not timedOut
+    let (ok, report) = spawnAndWait(sv, cs, 5000)
+    check ok
+    check report.exit.kind == ekExited
+    check report.exit.code == 0
+    check report.stop.isNone
 
     let output = readOutputFile(outPath)
     removeFile(outPath)
@@ -80,18 +80,17 @@ suite "forkExecEnv with SandboxSpec (end-to-end)":
 
     let spec = resolveSandbox(level = hlNone)
 
-    let (fd, outPath) = tmpOutputFile()
-    var scratch: string
-    let (pid, _) = forkExecEnvScratch(@[probeBin], fd, @[], spec, scratch)
-    check pid > Pid(0)
-    discard posix.close(fd)
-    defer:
-      if scratch.len > 0: removeDir(scratch)
+    var sv = initSupervisor(installSignals = false)
+    let outPath = tmpOutputFile()
+    var scratch = ""
+    let cs = buildChildSpec(probeBin, [], spec, outPath, scratch)
+    defer: cleanupScratch(scratch)
 
-    let (exitCode, sig, timedOut) = supervise(pid, 5000)
-    check exitCode == 0
-    check sig == 0
-    check not timedOut
+    let (ok, report) = spawnAndWait(sv, cs, 5000)
+    check ok
+    check report.exit.kind == ekExited
+    check report.exit.code == 0
+    check report.stop.isNone
 
     let output = readOutputFile(outPath)
     removeFile(outPath)

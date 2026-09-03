@@ -1,58 +1,33 @@
-## test_sandbox_achieved.nim — A4d integration tests
+## test_sandbox_achieved.nim — A4d integration tests, rfc-0007 A2a-i migrated
 ##
-## Verifies the SandboxAchieved IPC: a pre-fork status pipe over which the child
-## writes a small status word (async-signal-safe) before execvpe, encoding which
-## hermeticity controls it actually delivered.  The parent reads the word and
-## populates a SandboxAchieved record, returned alongside the child Pid from
-## forkExecEnvScratch.
+## The original A4d status-pipe IPC (envScrubbed/tmpdirIso/rlimitsApplied/
+## netIso bits, `isFullyAchieved`) belonged to `spawn.forkExecEnvScratch` —
+## `runner.nim`'s still-live path (untouched this slice; A2b retires it).
+## Under the §1 process contract that mechanism is SUPERSEDED, not merely
+## relocated: `ChildSpec.env`/`cwd` are explicit, so env/tmpdir are achieved
+## BY CONSTRUCTION (no probe, no partial-failure state — §1 doc comment);
+## only rlimits still need readback, and that readback is now PER-LIMIT
+## (`ReapReport.limits: LimitsAchieved`) rather than one aggregate bit.
 ##
-## Status-word bit encoding (uint8, child→parent over the pre-fork pipe):
-##   bit 0 (0x01) envScrubbed     — env allowlist filter applied
-##   bit 1 (0x02) tmpdirIso       — isolated TMPDIR scratch dir created
-##   bit 2 (0x04) rlimitsApplied  — config rlimits set AND getrlimit read-back confirmed
-##   bit 3 (0x08) netIso          — CLONE_NEWNET applied (never set today; degrades)
+## What this file verifies through the Supervisor:
+##   1. every rlimit kind requested SIMULTANEOUSLY reads back lsApplied —
+##      the old "all controls OK -> isFullyAchieved true" case, broader than
+##      test_rlimits_safe.nim's one-kind-at-a-time coverage.
+##   2. the hlNone control: nothing requested -> every kind lsNotRequested.
+##   3. env/cwd are achieved BY CONSTRUCTION: the child sees EXACTLY the
+##      resolved env/cwd, deterministically — no probe, nothing to degrade.
 ##
-## Behaviors tested:
-##   1. hlIsolated + all controls OK → envScrubbed/tmpdirIso/rlimitsApplied true;
-##      isFullyAchieved(spec, got) == true
-##   2. getrlimit read-back: RLIMIT_FSIZE configured → rlimitsApplied true
-##   3. forced degradation: netIso requested (hlNetwork) → netIso bit FALSE,
-##      isFullyAchieved FALSE (netIso is not wired in spawn → never achieved)
-##   4. child dies before write (exec of nonexistent binary) → parent does not
-##      hang; EOF on the pipe → all bits false / not-achieved
+## The old case 4 ("child dies before write -> EOF -> not achieved") never
+## actually reached a live child even before migration: a bogus absolute
+## path fails `findExe` in the PARENT on both the old and new spawn entries,
+## so it never forks at all. That "spawn error, never hangs" behavior is
+## covered by test_rfc0007_a2a_supervisor.nim's dedicated case instead of
+## being duplicated here.
 
-import std/[unittest, os, osproc, posix, options]
-import crisol/[types, sandbox, spawn]
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-proc tmpOutputFile(): (cint, string) =
-  let path = getTempDir() / "crisol_achieved_test_" & $getpid() & ".txt"
-  let fd = posix.open(path.cstring, O_RDWR or O_CREAT or O_TRUNC or O_CLOEXEC, 0o600)
-  doAssert fd >= 0, "failed to open temp file: " & path
-  (fd, path)
-
-proc runAchieved(bin: string; spec: SandboxSpec; timeoutMs: int = 5000):
-    tuple[exitCode: int; signal: int; timedOut: bool;
-          achieved: SandboxAchieved; scratchDir: string] =
-  ## Fork-exec `bin` under `spec`; return supervise result + achieved + scratchDir.
-  let (fd, outPath) = tmpOutputFile()
-  var scratchDir = ""
-  let (pid, achieved) = forkExecEnvScratch(@[bin], fd, @[], spec, scratchDir)
-  discard posix.close(fd)
-  removeFile(outPath)
-  if pid <= Pid(0):
-    return (exitCode: -1, signal: 0, timedOut: false,
-            achieved: achieved, scratchDir: scratchDir)
-  let (ec, sig, timedOut) = supervise(pid, timeoutMs)
-  result = (exitCode: ec, signal: sig, timedOut: timedOut,
-            achieved: achieved, scratchDir: scratchDir)
-
-proc cleanup(scratchDir: string) =
-  if scratchDir.len > 0:
-    try: removeDir(scratchDir) except: discard
+import std/[unittest, os, osproc, options, strutils]
+import crisol/[types, sandbox]
+import crisol/process
+import "../support/spawnhelpers"
 
 # ---------------------------------------------------------------------------
 # Compile fixtures at module load time
@@ -64,7 +39,6 @@ let nimcacheDir  = fixtureDir / "nimcache"
 
 createDir(binDir)
 
-# A small, clean-exit fixture: env_probe reads env and exits 0.
 let probeSrc   = fixtureDir / "env_probe.nim"
 let probeBin   = binDir / "env_probe"
 let probeCache = nimcacheDir / "env_probe"
@@ -76,83 +50,80 @@ doAssert cpRc == 0, "env_probe compile failed:\n" & cpOut
 # Suite
 # ---------------------------------------------------------------------------
 
-suite "A4d SandboxAchieved IPC (pre-fork status pipe)":
+suite "A4d rlimit + env/cwd achievement through the Supervisor":
 
-  test "hlIsolated all controls OK → achieved bits set; isFullyAchieved true":
-    ## Under the default isolated spec every requested control succeeds in a
-    ## normal environment: env scrub, scratch TMPDIR, and config rlimits (with
-    ## getrlimit read-back) are all delivered.  netIso is NOT requested here.
-    let spec = resolveSandbox(level = hlIsolated)
-    doAssert spec.envScrub and spec.tmpdir and spec.rlimits
-    doAssert not spec.netIso
-
-    let r = runAchieved(probeBin, spec)
-    cleanup(r.scratchDir)
-    check r.exitCode == 0
-
-    check r.achieved.envScrubbed
-    check r.achieved.tmpdirIso
-    check r.achieved.rlimitsApplied
-    check not r.achieved.netIso          # not requested → not delivered
-    check isFullyAchieved(spec, r.achieved)
-
-  test "getrlimit read-back: RLIMIT_FSIZE configured → rlimitsApplied true":
-    ## With an explicit (kernel-acceptable) RLIMIT_FSIZE, the child sets it and
-    ## confirms via getrlimit read-back that the soft limit reads back equal.
+  test "every rlimit kind requested simultaneously reads back lsApplied":
+    ## Generous values that no fixture behavior can trip — this is purely
+    ## about readback confirmation, not enforcement.
     let spec = resolveSandbox(
       level = hlIsolated,
-      rlimits = RlimitOverrides(limitFsize: some(1_048_576'i64)),   # 1 MiB — comfortably acceptable
+      rlimits = RlimitOverrides(
+        limitAs:     some(MinSafeRlimitAs),
+        limitCpu:    some(30'i64),
+        limitFsize:  some(DefaultRlimitFsize),
+        limitNofile: some(DefaultRlimitNofile),
+        limitCore:   some(0'i64),
+      ),
     )
-    doAssert spec.rlimits
-    doAssert spec.rlimitConfig.limitFsize == some(1_048_576'i64)
+    doAssert spec.rlimitConfig.limitAs.isSome
+    doAssert spec.rlimitConfig.limitCpu.isSome
 
-    let r = runAchieved(probeBin, spec)
-    cleanup(r.scratchDir)
-    check r.exitCode == 0
-    check r.achieved.rlimitsApplied
-    check isFullyAchieved(spec, r.achieved)
+    var sv = initSupervisor(installSignals = false)
+    let outPath = getTempDir() / "crisol_achieved_test_" & $getCurrentProcessId() & ".txt"
+    var scratchDir = ""
+    let cs = buildChildSpec(probeBin, [], spec, outPath, scratchDir)
+    let (ok, report) = spawnAndWait(sv, cs, 5000)
+    removeFile(outPath)
+    cleanupScratch(scratchDir)
 
-  test "forced degradation: netIso requested (hlNetwork) → netIso FALSE, gate FALSE":
-    ## hlNetwork requests CLONE_NEWNET.  spawn does NOT implement netIso, so the
-    ## child never sets that bit → achieved.netIso is false and isFullyAchieved
-    ## is false (the gate blocks caching for a degraded run).  The other controls
-    ## still succeed.
-    let spec = resolveSandbox(level = hlNetwork)
-    doAssert spec.netIso, "hlNetwork must request netIso"
+    check ok
+    check report.exit.kind == ekExited
+    check report.exit.code == 0
+    for lk in LimitKind:
+      check report.limits[lk] == lsApplied
 
-    let r = runAchieved(probeBin, spec)
-    cleanup(r.scratchDir)
-    check r.exitCode == 0
+  test "hlNone: nothing requested -> every kind reads lsNotRequested":
+    let spec = resolveSandbox(level = hlNone)
+    doAssert not spec.rlimits
 
-    check not r.achieved.netIso            # degraded — not wired in spawn
-    check not isFullyAchieved(spec, r.achieved)
-    # The non-net controls still succeeded:
-    check r.achieved.envScrubbed
-    check r.achieved.tmpdirIso
-    check r.achieved.rlimitsApplied
+    var sv = initSupervisor(installSignals = false)
+    let outPath = getTempDir() / "crisol_achieved_test_" & $getCurrentProcessId() & ".txt"
+    var scratchDir = ""
+    let cs = buildChildSpec(probeBin, [], spec, outPath, scratchDir)
+    let (ok, report) = spawnAndWait(sv, cs, 5000)
+    removeFile(outPath)
+    cleanupScratch(scratchDir)
 
-  test "child dies before write (nonexistent binary) → EOF → not achieved":
-    ## execvpe of a nonexistent path fails; the child writes its status word
-    ## BEFORE execvpe, so in the normal flow the parent still reads it.  But to
-    ## exercise the EOF / child-died path robustly we point at a path that the
-    ## child cannot reach — and assert the parent does NOT hang and returns a
-    ## well-formed (not-fully-achieved is acceptable) result without blocking
-    ## forever.
-    ##
-    ## Primary guarantee under test: the parent's blocking read of the status
-    ## byte terminates (either it reads the pre-exec byte, or it gets EOF when
-    ## the child's write-end closes on _exit).  Either way it must not hang.
-    let spec = resolveSandbox(level = hlIsolated)
-    let bogus = binDir / "this_binary_does_not_exist_zzzz"
-    doAssert not fileExists(bogus)
+    check ok
+    check report.exit.code == 0
+    for lk in LimitKind:
+      check report.limits[lk] == lsNotRequested
 
-    let r = runAchieved(bogus, spec, timeoutMs = 5000)
-    cleanup(r.scratchDir)
-    # The child exec fails and _exit(127)s; supervise sees a non-zero exit.
-    # The key assertion is that we got HERE (no hang) with a decoded record.
-    check not r.timedOut
-    # netIso is never achieved regardless.
-    check not r.achieved.netIso
+  test "env/cwd achieved BY CONSTRUCTION: child sees exactly the resolved values":
+    let spec = resolveSandbox(level = hlIsolated, chdirIntoScratch = true)
+    var sv = initSupervisor(installSignals = false)
+    let outPath = getTempDir() / "crisol_achieved_test_" & $getCurrentProcessId() & ".txt"
+    var scratchDir = ""
+    let cs = buildChildSpec(probeBin, [("CRISOL_SINK", "/dev/null")], spec, outPath, scratchDir)
+    let (ok, report) = spawnAndWait(sv, cs, 5000)
+    check ok
+    check report.exit.code == 0
+
+    let output = readFile(outPath)
+    removeFile(outPath)
+    let capturedScratch = scratchDir
+    cleanupScratch(scratchDir)
+
+    # No probe, no bit to read — the resolved ChildSpec.env/cwd ARE what the
+    # child saw, deterministically. cwd == the scratch dir (chdirIntoScratch);
+    # TMPDIR == the same scratch dir (the pair the old tmpdirIso bit vouched
+    # for, now true by construction rather than confirmed post-hoc).
+    var tmpdirLine, cwdLine: string
+    for line in output.splitLines():
+      if line.startsWith("TMPDIR="): tmpdirLine = line["TMPDIR=".len .. ^1]
+      elif line.startsWith("CWD="):  cwdLine = line["CWD=".len .. ^1]
+    check tmpdirLine == capturedScratch
+    check cwdLine == capturedScratch
 
 when isMainModule:
   echo "test_sandbox_achieved done"

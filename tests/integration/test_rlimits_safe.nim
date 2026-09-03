@@ -1,15 +1,16 @@
 ## test_rlimits_safe.nim — A4b integration tests
 ##
 ## Verifies that safe config-declared rlimits (RLIMIT_CORE=0, RLIMIT_NOFILE,
-## RLIMIT_FSIZE) are applied in the child async-signal-safe window when
-## spec.rlimits is true.
+## RLIMIT_FSIZE) are applied via process.nim's Supervisor — the §1
+## `ReapReport.limits` per-limit readback — the same requested-and-achieved
+## semantics `spawn.forkExecEnvScratch`'s A4d status pipe used to report as
+## a single aggregate bit.
 ##
-## RLIMIT_CPU and RLIMIT_AS are deferred to A4c — NOT tested here.
+## rfc-0007 A2a-i: migrated off `spawn.forkExecEnvScratch` + the deleted
+## `spawn.supervise` onto the Supervisor — see `../support/spawnhelpers`.
 ##
-## Constant-availability notes:
-##   - RLIMIT_NOFILE: present in Nim 2.2 std/posix (Linux) — no importc needed.
-##   - RLIMIT_CORE:   MISSING from Nim 2.2 std/posix — importc'd in spawn.nim.
-##   - RLIMIT_FSIZE:  MISSING from Nim 2.2 std/posix — importc'd in spawn.nim.
+## RLIMIT_CPU and RLIMIT_AS are deferred to A4c-equivalent coverage in
+## test_rlimits_timing.nim — NOT tested here.
 ##
 ## Behaviors tested (vertical slices):
 ##   1. RLIMIT_FSIZE small → fsize fixture is killed/fails deterministically
@@ -19,31 +20,26 @@
 ##   5. RLIMIT_CORE=0 applied → crashing child leaves no core file in scratch dir
 ##   6. spec.rlimits=false (hlNone) → child is unaffected by any limit
 
-import std/[unittest, os, osproc, posix, strutils, options]
-import crisol/[types, sandbox, spawn]
+import std/[unittest, os, osproc, options, strutils]
+import crisol/[types, sandbox]
+import crisol/process
+import "../support/spawnhelpers"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-proc tmpOutputFile(): (cint, string) =
-  let path = getTempDir() / "crisol_rlimit_test_" & $getpid() & ".txt"
-  let fd = posix.open(path.cstring, O_RDWR or O_CREAT or O_TRUNC or O_CLOEXEC, 0o600)
-  doAssert fd >= 0, "failed to open temp file: " & path
-  (fd, path)
-
 proc runFixture(bin: string; spec: SandboxSpec; timeoutMs: int = 5000):
-    tuple[exitCode: int; signal: int; timedOut: bool; scratchDir: string] =
-  ## Fork-exec `bin` under `spec`; return the supervise result + scratchDir.
-  let (fd, outPath) = tmpOutputFile()
+    tuple[ok: bool; report: ReapReport; scratchDir: string] =
+  ## Spawn `bin` under `spec` through the Supervisor; return the ReapReport +
+  ## scratchDir (caller cleans it up).
+  var sv = initSupervisor(installSignals = false)
+  let outPath = getTempDir() / "crisol_rlimit_test_" & $getCurrentProcessId() & ".txt"
   var scratchDir = ""
-  let (pid, _) = forkExecEnvScratch(@[bin], fd, @[], spec, scratchDir)
-  discard posix.close(fd)
+  let cs = buildChildSpec(bin, [], spec, outPath, scratchDir)
+  let (ok, report) = spawnAndWait(sv, cs, timeoutMs)
   removeFile(outPath)
-  if pid <= Pid(0):
-    return (exitCode: -1, signal: 0, timedOut: false, scratchDir: scratchDir)
-  let (ec, sig, timedOut) = supervise(pid, timeoutMs)
-  result = (exitCode: ec, signal: sig, timedOut: timedOut, scratchDir: scratchDir)
+  (ok, report, scratchDir)
 
 # ---------------------------------------------------------------------------
 # Compile fixtures at module load time
@@ -85,10 +81,12 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
       rlimits = RlimitOverrides(limitFsize: some(smallFsize)),
     )
     let r = runFixture(fsizeBin, spec)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
+    cleanupScratch(r.scratchDir)
+    check r.ok
+    check r.report.limits[lkFileSize] == lsApplied
     # The fixture must NOT succeed: either killed by signal or exits non-zero.
-    let hitLimit = r.signal != 0 or r.exitCode != 0
+    let hitLimit = r.report.exit.kind == ekSignaled or
+                   (r.report.exit.kind == ekExited and r.report.exit.code != 0)
     check hitLimit
 
   test "RLIMIT_FSIZE unset (rlimits=false) → fsize fixture succeeds (control)":
@@ -96,10 +94,11 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
     let spec = resolveSandbox(level = hlNone)
     doAssert not spec.rlimits
     let r = runFixture(fsizeBin, spec)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
-    check r.exitCode == 0
-    check r.signal == 0
+    cleanupScratch(r.scratchDir)
+    check r.ok
+    check r.report.limits[lkFileSize] == lsNotRequested
+    check r.report.exit.kind == ekExited
+    check r.report.exit.code == 0
 
   test "RLIMIT_NOFILE small → nofile fixture hits the ceiling deterministically":
     ## With RLIMIT_NOFILE = 10 the fixture (which opens fds until EMFILE)
@@ -110,47 +109,40 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
       rlimits = RlimitOverrides(limitNofile: some(smallNofile)),
     )
     let r = runFixture(nofileBin, spec)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
+    cleanupScratch(r.scratchDir)
+    check r.ok
+    check r.report.limits[lkOpenFiles] == lsApplied
     # The fixture exits 1 when it hits EMFILE.
-    check r.exitCode == 1
+    check r.report.exit.kind == ekExited
+    check r.report.exit.code == 1
 
   test "RLIMIT_NOFILE unset (rlimits=false) → nofile fixture succeeds (control)":
     ## Without a limit, the fixture opens 2048 fds and exits 0.
     let spec = resolveSandbox(level = hlNone)
     doAssert not spec.rlimits
     let r = runFixture(nofileBin, spec)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
-    check r.exitCode == 0
-    check r.signal == 0
+    cleanupScratch(r.scratchDir)
+    check r.ok
+    check r.report.exit.kind == ekExited
+    check r.report.exit.code == 0
 
   test "RLIMIT_CORE=0 applied → no core file left in scratch dir after crash":
     ## We can observe RLIMIT_CORE=0 indirectly: a process that receives SIGABRT
     ## (via abort(3)) would normally write a core file, but with RLIMIT_CORE=0
     ## no core file is written.
     ##
-    ## Strategy: build a small crash fixture inline, run it under hlIsolated
-    ## (which sets RLIMIT_CORE=0 by default), and verify no core.* / core
-    ## file appears in the scratch dir.
-    ##
-    ## We use fail_always as a proxy — it exits non-zero but does not crash.
-    ## To properly test RLIMIT_CORE=0 we use the existing fail_always fixture
-    ## and check the scratch dir has no core file (which it would produce if
-    ## RLIMIT_CORE > 0 AND the process crashed, but fail_always just exits 1
-    ## cleanly). We also check that the scratch dir itself exists during the
-    ## run and is empty of core dumps.
-    ##
-    ## For a stronger assertion: run the nofile fixture (which exits cleanly),
-    ## then verify the scratch dir (under our cleanup path) has no core.* files.
-    ## This is admittedly a weak observable for RLIMIT_CORE=0, but it is the
-    ## best available without a bespoke crash binary at this slice.
+    ## Strategy: run the nofile fixture (clean exit) under hlIsolated (which
+    ## sets RLIMIT_CORE=0 by default) and verify the scratch dir carries no
+    ## core.* files and lkCore reads back lsApplied — the same weak-but-best-
+    ## available observable the pre-migration test used.
     let spec = resolveSandbox(level = hlIsolated)  # RLIMIT_CORE=0 by default
     doAssert spec.rlimits
     doAssert spec.rlimitConfig.limitCore.isSome
     doAssert spec.rlimitConfig.limitCore.get() == 0
 
     let r = runFixture(nofileBin, spec)  # exits 0 normally (no limit here — default nofile is 1024)
+    check r.ok
+    check r.report.limits[lkCore] == lsApplied
     if r.scratchDir.len > 0:
       # Check for core files before cleanup
       var coreFound = false
@@ -158,7 +150,7 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
         for kind, path in walkDir(r.scratchDir):
           if path.extractFilename().startsWith("core"):
             coreFound = true
-      try: removeDir(r.scratchDir) except: discard
+      cleanupScratch(r.scratchDir)
       check not coreFound  # RLIMIT_CORE=0 must suppress any core dump
 
   test "spec.rlimits=false (hlNone) → child runs without imposed limits":
@@ -168,11 +160,12 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
     let spec = resolveSandbox(level = hlNone)
     doAssert not spec.rlimits
     let r = runFixture(nofileBin, spec)
-    if r.scratchDir.len > 0:
-      try: removeDir(r.scratchDir) except: discard
-    check r.exitCode == 0
-    check r.signal == 0
-    check not r.timedOut
+    cleanupScratch(r.scratchDir)
+    check r.ok
+    check r.report.exit.kind == ekExited
+    check r.report.exit.code == 0
+    for lk in LimitKind:
+      check r.report.limits[lk] == lsNotRequested
 
 when isMainModule:
   echo "test_rlimits_safe done"

@@ -275,3 +275,87 @@ type
     strictHygiene*: bool
 
 const DefaultPolicy* = OutcomePolicy()
+
+# ---------------------------------------------------------------------------
+# §1 The process contract — platform-neutral shapes only. process.nim (the
+# backend-selection ladder) and each backend module (posixcore/posix/linux)
+# are A2a-i; this module stays types + pure helpers, same rule as above.
+# ---------------------------------------------------------------------------
+
+type
+  StdioSink* = object        ## by PATH, never by fd (§1) — ONE combined
+    path*: string            ## stdout+stderr sink; stdin is always /dev/null
+                              ## | NUL (contract invariant, not an option).
+
+proc combinedSink*(path: string): StdioSink =
+  ## The only constructor — call sites never build the object literally (§1).
+  StdioSink(path: path)
+
+type
+  ChildSpec* = object
+    argv*: seq[string]
+    cwd*: string              ## resolved by the RUNNER before spawn (§1/#17).
+    env*: seq[(string, string)]  ## EXPLICIT, always (§1).
+    sinks*: StdioSink
+    limits*: Limits
+
+  ChildId* = distinct int32   ## stable token, valid spawn..reap (§1). The
+                               ## fd/HANDLE never leaves the backend.
+
+proc `==`*(a, b: ChildId): bool {.borrow.}
+proc `$`*(id: ChildId): string = "ChildId(" & $int32(id) & ")"
+
+type
+  SpawnResult* = object       ## a real sum type, not tuple-with-empty-string (§1)
+    case ok*: bool
+    of true:  id*: ChildId
+    of false: error*: string
+
+  ShutdownSignal* = object    ## carries the signal identity RFC-0003's
+    signum*: int              ## 128+n needs (§1). No `reason` field — a
+                               ## one-value enum would be a dark value.
+
+  WaitEventKind* = enum weChildExited, weOrphanReaped, weDeadline, weShutdown
+  WaitEvent* = object
+    case kind*: WaitEventKind
+    of weChildExited:
+      id*: ChildId             ## exited, not yet reaped. LEVEL-TRIGGERED (§1):
+                                ## reported again on every `next` until reaped.
+    of weOrphanReaped:
+      orphan*: ProcSnapshot     ## subreaper tier only (B1).
+      ownedBy*: Option[ChildId]
+    of weShutdown:
+      signal*: ShutdownSignal   ## the shutdown signal is IN the wait set (§1).
+                                 ## EDGE-triggered, once per delivered signal.
+    of weDeadline:
+      discard
+
+  ReapReport* = object        ## the ONE report (§1): the backend's complete
+    exit*: Exit                ## observation record for this child, including
+    rusage*: Option[Rusage]    ## its act ledger.
+    stop*: Option[tuple[reason: KillReason, escalated: bool]]
+                                ## THE authorship record — `some` iff a stop
+                                ## act was recorded before the backend observed
+                                ## the exit.
+    killDomain*: KillDomainStrength  ## the PER-SPAWN achieved domain.
+    limits*: LimitsAchieved     ## per-limit readback, delivered at reap.
+    killSnapshot*: seq[ProcSnapshot]  ## taken at the first stop act, refreshed
+                                ## at forceKill; empty iff no stop act.
+    tree*: TreeObservation      ## §2 — observability of the domain.
+    escapees*: seq[ProcSnapshot]  ## survivors observed at kill/reap time.
+    cooperativeUnavailable*: bool  ## Windows: cooperative stop undeliverable
+                                    ## (console topology, §3). Always false on
+                                    ## POSIX — cooperative (SIGTERM) is always
+                                    ## deliverable there.
+
+  Capabilities* = object      ## §4 — probed once, memoised, reported. A flat
+    pidfd*: bool               ## object of per-mechanism booleans;
+    subreaper*: bool           ## platform-inapplicable fields are simply
+    cgroupDelegation*: bool    ## absent from the SERIALIZED node (resultjson/
+    cgroupKill*: bool          ## jsonout own that rule — this is the value
+    memoryPeak*: bool          ## shape only). Nothing here is required to be
+    kqueue*: bool               ## true (§4) — a degraded-everywhere host is
+    jobObjectNesting*: bool     ## honest, not a failure.
+    ctrlBreakDeliverable*: bool
+    flock*: bool
+    wait4Rusage*: bool
