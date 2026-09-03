@@ -45,6 +45,8 @@
 
 import std/[json, options, os, sets, strutils]
 import crisol/[types, config, render, ioutils]
+import crisol/process/resultjson  # capabilitiesToJson: the ONE substrate-node owner (rfc-0007 A7)
+from crisol/process/types import Capabilities
 
 # GatedEntry is defined in types.nim and re-exported from there.
 
@@ -57,7 +59,7 @@ const PlanV1Schema* = "crisol/plan/v1"
   ## Import crisol/api (or crisol/planview directly) to reference this constant
   ## rather than duplicating the string literal.
 
-const PlanV1Revision* = 3
+const PlanV1Revision* = 4
   ## Integer minor revision of the crisol/plan/v1 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/plan/v1"; this integer is bumped each time
   ## additive optional fields land so a consumer can gate on feature presence
@@ -67,6 +69,10 @@ const PlanV1Revision* = 3
   ##   rev 3           — per-entrypoint `flags` (issue #10): the EFFECTIVE,
   ##                     ordered compile-flag list (global then group) that
   ##                     identifies this leg — exactly what `slug` hashes.
+  ##   rev 4 (rfc-0007 A7) — top-level `substrate` node: the process
+  ##                     backend's `capabilities()` snapshot (§4), same
+  ##                     shape and renderer as run/v2 rev 18's own
+  ##                     `substrate` node.
   ## A reader seeing `schemaRevision > PlanV1Revision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.
 
@@ -182,11 +188,17 @@ proc warningsToJsonArray*(warns: seq[ConfigWarning]): JsonNode =
     result.add wNode
 
 proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
-                 warnings: seq[ConfigWarning] = @[]): JsonNode =
+                 warnings: seq[ConfigWarning] = @[];
+                 substrate: Capabilities = Capabilities()): JsonNode =
   ## Pure: serialize the PLAN phase to the crisol/plan/v1 JsonNode.  No I/O.
   ##
   ## S2a/S3: runTimeoutMs and maxJobs are precomputed fields on PlannedEntrypoint
   ## (set by plan() in planner.nim); no config parameter needed here.
+  ##
+  ## substrate: rfc-0007 A7 (§4) — the process backend's `capabilities()`
+  ## snapshot, mirrors run/v2's own top-level `substrate` node (same
+  ## `resultjson.capabilitiesToJson` renderer, same default: an all-false
+  ## `Capabilities()` for callers that never populate it for real).
 
   let entrypointsNode = newJArray()
   for pep in plan.entrypoints:
@@ -224,11 +236,13 @@ proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
   result["entrypoints"]    = entrypointsNode
   result["gatedOut"]       = gatedNode
   result["warnings"]       = warningsToJsonArray(warnings)
+  result["substrate"]      = resultjson.capabilitiesToJson(substrate)  # rev 4 (A7)
 
 proc planToJsonString*(plan: RunPlan; gatedOut: seq[GatedEntry];
-                       warnings: seq[ConfigWarning] = @[]): string =
+                       warnings: seq[ConfigWarning] = @[];
+                       substrate: Capabilities = Capabilities()): string =
   ## Pure: compact JSON string of the crisol/plan/v1 document.
-  $planToJson(plan, gatedOut, warnings)
+  $planToJson(plan, gatedOut, warnings, substrate)
 
 # ---------------------------------------------------------------------------
 # loadLastPlan — A8: forward/backward-tolerant plan reader

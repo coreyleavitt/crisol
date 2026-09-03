@@ -250,7 +250,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 17
+const RunSchemaRevision* = 18
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -409,6 +409,14 @@ const RunSchemaRevision* = 17
   ##                     producer yet — a separate, not-yet-scheduled gap).
   ##                     No new field, an existing field's CONTENT changes —
   ##                     same rationale as A5's entry above.
+  ##   rev 18 (rfc-0007 A7) — top-level `substrate` node: the process
+  ##                     backend's `capabilities()` snapshot (§4), platform-
+  ##                     shaped (`resultjson.capabilitiesToJson` — a Linux
+  ##                     node carries `pidfd`/`subreaper`/`cgroupDelegation`/
+  ##                     `cgroupKill`/`memoryPeak`/`flock`/`wait4Rusage`;
+  ##                     platform-inapplicable fields are absent, never a
+  ##                     greyed-out `false`). Supersedes rev 16's deliberate
+  ##                     absence. Mirrors plan/v1 rev 4's own `substrate`.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -495,7 +503,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              compileBlock: JsonNode = nil;
              reuseAlerts: JsonNode = nil;
              interrupted: bool = false;
-             policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): JsonNode =
+             policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
+             substrate: ptypes.Capabilities = ptypes.Capabilities()): JsonNode =
   ## Pure: serialize to the crisol/run/v2 JsonNode.
   ## No I/O.
   ## interrupted: rfc-0007 A1e-ii — true iff this run was cut short by
@@ -510,6 +519,12 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## `summary.counts`/`summary.flaky`. Defaults to DefaultPolicy (unstrict)
   ## so every existing caller (tests, lastrun.json's own default) is
   ## unchanged.
+  ## substrate: rfc-0007 A7 (§4) — the process backend's `capabilities()`
+  ## snapshot, rendered as the top-level `substrate` node. The CLI (the only
+  ## caller that should ever populate this for real) passes
+  ## `process.capabilities()`; every other caller defaults to an all-false
+  ## `Capabilities()`, which is itself an honest value (§4: "a degraded-
+  ## everywhere host is honest, not a failure"), not a placeholder.
   ## C3: when filterTag is non-empty, each entrypoint's records array contains
   ## only records whose tags include filterTag.  The summary block always
   ## reflects the full unfiltered run (no re-counting from filtered records).
@@ -638,8 +653,10 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
                                             # now belongs to the per-entrypoint phase node.
   # M-report pass (b1): always present, empty by default (mirrors `regressions`).
   result["reuseAlerts"] = if reuseAlerts != nil: reuseAlerts else: newJArray()
-  # rev 16: deliberately NO "substrate" key -- absence is the honest
-  # placeholder until A7 lands the substrate-identity block.
+  # rev 18 (rfc-0007 A7, §4): the process backend's real capabilities(),
+  # rendered as a platform-shaped node (resultjson.capabilitiesToJson) --
+  # supersedes rev 16's deliberate absence.
+  result["substrate"] = resultjson.capabilitiesToJson(substrate)
 
 proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    filterTag: string = "";
@@ -648,12 +665,14 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    compileBlock: JsonNode = nil;
                    reuseAlerts: JsonNode = nil;
                    interrupted: bool = false;
-                   policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): string =
+                   policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
+                   substrate: ptypes.Capabilities = ptypes.Capabilities()): string =
   ## Pure: compact JSON string of the crisol/run/v2 document.
   ## C3: filterTag threads through to toJson.
   ## policy: rfc-0007 A6b — threads through to toJson unchanged (see there).
+  ## substrate: rfc-0007 A7 — threads through to toJson unchanged (see there).
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
-         reuseAlerts, interrupted, policy)
+         reuseAlerts, interrupted, policy, substrate)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful

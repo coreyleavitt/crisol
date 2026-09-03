@@ -333,6 +333,35 @@ proc rusageFromJson(node: JsonNode): Option[Rusage] =
               sysCpuUs: sysN.getBiggestInt))
 
 # ---------------------------------------------------------------------------
+# Capabilities — the `substrate` node (rfc-0007 A7, §4), rendered in
+# run/v2 and plan/v1. Platform-inapplicable fields are simply ABSENT from
+# the serialized node (never a greyed-out `false`) — a macOS node carries
+# `kqueue` and never the Linux-only cgroup/pidfd/subreaper fields; a
+# Windows node carries `jobObjectNesting`/`ctrlBreakDeliverable` and never
+# the POSIX-named `flock`/`wait4Rusage`. The included-field set is a
+# compile-time platform fact, not a property of any particular probe
+# result.
+# ---------------------------------------------------------------------------
+
+proc capabilitiesToJson*(c: Capabilities): JsonNode =
+  result = newJObject()
+  when defined(windows):
+    result["jobObjectNesting"]     = newJBool(c.jobObjectNesting)
+    result["ctrlBreakDeliverable"] = newJBool(c.ctrlBreakDeliverable)
+  elif defined(macosx):
+    result["kqueue"]       = newJBool(c.kqueue)
+    result["flock"]        = newJBool(c.flock)
+    result["wait4Rusage"]  = newJBool(c.wait4Rusage)
+  else:   # linux (and, until a dedicated backend exists, any other posix)
+    result["pidfd"]            = newJBool(c.pidfd)
+    result["subreaper"]        = newJBool(c.subreaper)
+    result["cgroupDelegation"] = newJBool(c.cgroupDelegation)
+    result["cgroupKill"]       = newJBool(c.cgroupKill)
+    result["memoryPeak"]       = newJBool(c.memoryPeak)
+    result["flock"]            = newJBool(c.flock)
+    result["wait4Rusage"]      = newJBool(c.wait4Rusage)
+
+# ---------------------------------------------------------------------------
 # ProcessResult — public surface
 # ---------------------------------------------------------------------------
 

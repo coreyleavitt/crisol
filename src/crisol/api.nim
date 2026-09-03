@@ -426,10 +426,13 @@ proc toRunPlan(report: PlanReport): RunPlan =
   ## Private helper: reconstruct a RunPlan from the inlined PlanReport fields.
   RunPlan(entrypoints: report.entrypoints, jobs: report.jobs)
 
-proc planToJsonString*(report: PlanReport): string =
+proc planToJsonString*(report: PlanReport; substrate: ptypes.Capabilities = ptypes.Capabilities()): string =
   ## Facade: serialize the plan to crisol/plan/v1 JSON from a PlanReport.
   ## PlanReport carries its own warnings; no separate warnings param needed.
-  planview.planToJsonString(report.toRunPlan, report.gatedOut, report.warnings)
+  ## substrate: rfc-0007 A7 — threads through to planview.planToJsonString
+  ## unchanged; defaults to an all-false Capabilities() for callers that
+  ## never populate it for real (see planview.planToJson's doc comment).
+  planview.planToJsonString(report.toRunPlan, report.gatedOut, report.warnings, substrate)
 
 proc renderPlan*(report: PlanReport; opts: RenderOpts): string =
   ## Facade: human-readable plan rendering from a PlanReport.

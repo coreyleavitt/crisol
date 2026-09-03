@@ -534,7 +534,20 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
     exit: entry.exit,
     rusage: entry.rusage,
     stop: entry.stop,
-    killDomain: kdsProcessGroup,     # interim table: kdsProcessGroup until A7
+    killDomain: kdsProcessGroup,     # A7 (§4): the per-spawn ACHIEVED domain —
+                                      # genuinely always kdsProcessGroup on
+                                      # THIS backend, even now that subreaper
+                                      # is really enabled (capabilitiesCore's
+                                      # `subreaper` probe, above): the kernel
+                                      # reparents orphans to us, but
+                                      # scanProcessGroup (above) is still
+                                      # pgid-only — it does not walk the
+                                      # reparented-orphan ppid chain, so the
+                                      # kill/tree GUARANTEE this backend can
+                                      # actually back is unchanged until B1
+                                      # wires that consumer. Capability true,
+                                      # no elevated consumer yet — the same
+                                      # posture §4 sanctions for cgroup.
     limits: entry.achieved,
     killSnapshot: entry.killSnapshot,
     tree: treeObservationFor(kdsProcessGroup),
@@ -545,18 +558,172 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
   dec core.liveCount
 
 # ---------------------------------------------------------------------------
-# capabilities — probed once by the caller and memoised there (§4). Honest,
-# minimal claims for this slice's poll-based backend: only mechanisms this
-# module genuinely provides are true. pidfd/subreaper/cgroup/kqueue/Job
-# nesting/CTRL_BREAK are B1-D1 territory and stay false — "nothing in this
-# RFC is required to be present" (§4), not a placeholder.
+# capabilities — rfc-0007 A7 (§4): EVERY field below is a REAL, live probe
+# (attempt the mechanism, verify it worked; never an assumed/hardcoded
+# literal) — pidfd/subreaper/cgroup are Linux-only kernel features (prctl(2)
+# and pidfd_open(2) do not exist on Darwin), so they are `when defined(linux)`
+# gated; this same file is also today's macOS backend (§1 module-layout
+# comment: "macosx maps to process/posix until C1b"), and an unconditional
+# importc of a Linux-only syscall constant would fail `nim check --os:macosx`
+# outright, not just report false at runtime. flock/wait4 are genuinely
+# POSIX-portable (both probed for real on any posix target this file backs).
+# kqueue/jobObjectNesting/ctrlBreakDeliverable are the OTHER backends' own
+# fields (windows.nim/darwin.nim) — always false here, never this module's
+# claim to make.
+#
+# Probed exactly once per process (`cachedCapabilities`, ccprobe/nimprobe's
+# `cachedX` idiom) — every real probe below does actual I/O (fork+wait4,
+# flock a tempfile, mkdir+write under /sys/fs/cgroup) so re-running it on
+# every `capabilities()` call would be wasteful, not merely un-idiomatic.
 # ---------------------------------------------------------------------------
 
-proc capabilitiesCore*(core: PosixCore): Capabilities =
+when defined(linux):
+  # pidfd_open(2): needs no privilege, only kernel >= 5.3 (§4). No Nim
+  # wrapper exists (even std/posix's own `syscall` helper is `when
+  # defined(android)`-only) — importc syscall(2) directly, exactly the
+  # duplicate-importc idiom this module's header sanctions.
+  proc c_syscall(number: clong): clong {.importc: "syscall", varargs,
+                                         header: "<unistd.h>".}
+  var SYS_pidfd_open {.importc: "SYS_pidfd_open", header: "<sys/syscall.h>".}: clong
+
+  proc probePidfd(): bool =
+    let r = c_syscall(SYS_pidfd_open, clong(getpid()), 0.clong)
+    if r < 0: return false
+    discard posix.close(cint(r))
+    true
+
+  # PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER: unprivileged since
+  # Linux 3.4. Set-then-read-back is the real verification (not "the set
+  # call returned 0, therefore assume it worked") — and this DELIBERATELY
+  # stays set for the rest of the process: §4's dev-loop line says the
+  # rootless-podman tier "runs the processGroup+subreaper tier and says
+  # so" — present tense. B1 wires the orphan-adoption consumer; until then
+  # this is a real, live kernel-side effect (orphans reparent to us, not
+  # init) with no reader yet, same "capability true, no consumer until
+  # Stage B" posture §4 sanctions for the cgroup fields below.
+  proc c_prctl(option: cint): cint {.importc: "prctl", varargs,
+                                     header: "<sys/prctl.h>".}
+  var PR_SET_CHILD_SUBREAPER {.importc, header: "<sys/prctl.h>".}: cint
+  var PR_GET_CHILD_SUBREAPER {.importc, header: "<sys/prctl.h>".}: cint
+
+  proc probeSubreaper(): bool =
+    if c_prctl(PR_SET_CHILD_SUBREAPER, 1.cint) != 0: return false
+    var val: cint = -1
+    if c_prctl(PR_GET_CHILD_SUBREAPER, addr val) != 0: return false
+    val == 1
+
+  # cgroup v2 delegation (§4): "mkdir a leaf + write cgroup.procs" is the
+  # RFC's own recipe, tried on THIS process (moved back to its original
+  # cgroup and the leaf removed afterward, on every path). A delegated
+  # 5.15 LTS host must probe green for delegation and red for the files it
+  # lacks — cgroup.kill/memory.peak are only even CHECKED inside a leaf
+  # that delegation itself proved writable; never probed independently
+  # (never "fail per-file at spawn time" — §4).
+  proc ownCgroupV2Path(): string =
+    ## Reads /proc/self/cgroup's unified (v2) line: "0::<path>".
+    try:
+      for line in lines("/proc/self/cgroup"):
+        if line.startsWith("0::"):
+          return line[3 .. ^1]
+    except CatchableError:
+      discard
+    ""
+
+  proc probeCgroupV2(): tuple[delegation, kill, memoryPeak: bool] =
+    result = (delegation: false, kill: false, memoryPeak: false)
+    let relPath = ownCgroupV2Path()
+    if relPath.len == 0: return
+    let base = "/sys/fs/cgroup" & relPath
+    let leaf = base / ("crisol-probe-" & $getpid())
+    try:
+      createDir(leaf)
+    except CatchableError:
+      return   # not writable here (e.g. rootless podman: read-only cgroupfs)
+    try:
+      writeFile(leaf / "cgroup.procs", $getpid() & "\n")
+      result.delegation = true
+      result.kill = fileExists(leaf / "cgroup.kill")
+      result.memoryPeak = fileExists(leaf / "memory.peak")
+    except CatchableError:
+      discard   # mkdir succeeded but the move failed — honestly not delegated
+    try: writeFile(base / "cgroup.procs", $getpid() & "\n")   # move back FIRST —
+    except CatchableError: discard                             # a non-empty
+    try: removeDir(leaf)                                       # cgroup can't rmdir
+    except CatchableError: discard
+else:
+  proc probePidfd(): bool = false
+  proc probeSubreaper(): bool = false
+  proc probeCgroupV2(): tuple[delegation, kill, memoryPeak: bool] =
+    (delegation: false, kill: false, memoryPeak: false)
+
+# flock(2) is BSD/Linux, not POSIX, and absent from std/posix — same
+# duplicate-importc idiom lock.nim already uses (safe: no C definition is
+# emitted, only a reference through the header).
+proc c_flock(fd: cint; operation: cint): cint {.importc: "flock",
+                                                header: "<sys/file.h>".}
+var LOCK_EX {.importc, header: "<sys/file.h>".}: cint
+var LOCK_UN {.importc, header: "<sys/file.h>".}: cint
+var LOCK_NB {.importc, header: "<sys/file.h>".}: cint
+
+proc probeFlock(): bool =
+  let path = getTempDir() / ("crisol-flock-probe-" & $getpid())
+  try:
+    let f = open(path, fmWrite)
+    defer:
+      close(f)
+      try: removeFile(path)
+      except CatchableError: discard
+    let fd = getFileHandle(f).cint
+    if c_flock(fd, LOCK_EX or LOCK_NB) != 0: return false
+    discard c_flock(fd, LOCK_UN)
+    true
+  except CatchableError:
+    false
+
+proc probeWait4Rusage(): bool =
+  ## A throwaway fork+wait4 (not "wait4 is called elsewhere in this module,
+  ## therefore assume true") — some sandboxes filter wait4/rusage collection
+  ## via seccomp; this actually exercises the syscall once and checks the
+  ## real return value.
+  let pid = fork()
+  if pid == 0:
+    exitnow(0)   # async-signal-safe: no Nim runtime after fork in the child
+  elif pid > 0:
+    var status: cint
+    var ru: posix.Rusage
+    let r = wait4(pid, addr status, 0.cint, addr ru)
+    r == pid
+  else:
+    false
+
+proc probeCapabilities*(): Capabilities =
+  ## The raw, seam-free probe — real I/O, freely callable (mirrors
+  ## `ccprobe.ccVersion` / `nimprobe.nimFingerprint`: the pure-ish real
+  ## probe stays exported and un-memoised; `cachedCapabilities` below is
+  ## the memoised wrapper every production call site actually uses).
+  let cg = probeCgroupV2()
   Capabilities(
-    pidfd: false, subreaper: false, cgroupDelegation: false, cgroupKill: false,
-    memoryPeak: false, kqueue: false, jobObjectNesting: false,
-    ctrlBreakDeliverable: false,
-    flock: true,          # flock(2) is always available on Linux (A4 wires lock.nim)
-    wait4Rusage: true,    # wait4 is used at every reap site in this module
+    pidfd: probePidfd(),
+    subreaper: probeSubreaper(),
+    cgroupDelegation: cg.delegation,
+    cgroupKill: cg.kill,
+    memoryPeak: cg.memoryPeak,
+    kqueue: false,              # darwin.nim's field (C1b), never this module's
+    jobObjectNesting: false,    # windows.nim's field (Stage D), never this module's
+    ctrlBreakDeliverable: false,# windows.nim's field (Stage D), never this module's
+    flock: probeFlock(),
+    wait4Rusage: probeWait4Rusage(),
   )
+
+var capabilitiesMemo: Option[Capabilities] = none(Capabilities)
+
+proc cachedCapabilities*(): Capabilities =
+  ## Probed exactly once per process; every later caller — Supervisor-
+  ## backed (`capabilities(sv)`) or not (the plan/list CLI path, which
+  ## never spawns anything) — reads the SAME memoised value (§4).
+  if capabilitiesMemo.isNone:
+    capabilitiesMemo = some(probeCapabilities())
+  capabilitiesMemo.get
+
+proc capabilitiesCore*(core: PosixCore): Capabilities =
+  cachedCapabilities()

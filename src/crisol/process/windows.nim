@@ -317,6 +317,17 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
                          # this field means "wait4 the syscall", not "no rusage".
   )
 
+proc capabilities*(): Capabilities =
+  ## rfc-0007 A7: the same value `capabilities(sv)` returns, for callers
+  ## with no live Supervisor (the plan/list CLI path never spawns anything)
+  ## — mirrors posix.nim's parameterless overload. This backend's probe is
+  ## genuinely per-Supervisor-instance (`initSupervisor` computes it once,
+  ## eagerly), so the standalone accessor spins up a throwaway, signal-
+  ## handler-free Supervisor purely to read it; `=destroy` is a no-op here
+  ## (no children were ever spawned).
+  let sv = initSupervisor(installSignals = false)
+  sv.capsCache
+
 # ---------------------------------------------------------------------------
 # spawn — CreateProcessW (suspended) + a real Job Object with
 # KILL_ON_JOB_CLOSE, assigned before the child's main thread ever runs.

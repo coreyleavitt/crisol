@@ -49,8 +49,20 @@ proc globalShutdownSignal*(): Option[ShutdownSignal] =
   globalShutdownSignalCore()
 
 proc capabilities*(sv: Supervisor): Capabilities =
-  ## Probed once by the caller and memoised there (§4).
+  ## Probed once per PROCESS, memoised (§4) — `sv` is accepted for
+  ## interface symmetry with the Windows backend (whose probe genuinely
+  ## needs a live Supervisor to spawn its Job Object test child against)
+  ## but is not otherwise consulted; posixcore's probes are self-contained
+  ## environment facts, not properties of any one Supervisor instance.
   capabilitiesCore(sv.core)
+
+proc capabilities*(): Capabilities =
+  ## The same memoised value, for callers with no live Supervisor at all —
+  ## the plan/list CLI path never spawns anything, so building a whole
+  ## event-loop Supervisor (self-pipe, signal handlers) just to read
+  ## `capabilities()` would be backwards. Same probe, same cache, same
+  ## value `capabilities(sv)` would return once a Supervisor exists.
+  cachedCapabilities()
 
 proc spawn*(sv: var Supervisor; spec: ChildSpec): SpawnResult =
   spawnChild(sv.core, spec)

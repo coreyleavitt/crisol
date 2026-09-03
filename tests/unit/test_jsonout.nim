@@ -160,10 +160,20 @@ suite "jsonout - toJson schema":
     check node["interrupted"].kind == JBool
     check node["interrupted"].getBool == false
 
-  test "top-level has NO substrate key (rev 16)":
-    ## rfc-0007 A1d-i: absence IS the honest placeholder until A7.
+  test "top-level substrate key is present (rev 18, rfc-0007 A7) -- an all-false default for a caller that never populates it":
+    ## rfc-0007 A7 supersedes rev 16's deliberate absence: `substrate` is
+    ## now ALWAYS rendered. A caller (like this synthetic test) that never
+    ## passes a real `capabilities()` snapshot gets the honest all-false
+    ## default -- §4: "a degraded-everywhere host is honest, not a failure" --
+    ## never an absent key again.
     let node = toJson(syntheticResults(), syntheticSummary())
-    check not node.hasKey("substrate")
+    require node.hasKey("substrate")
+    let sub = node["substrate"]
+    check sub.kind == JObject
+    for key in ["pidfd", "subreaper", "cgroupDelegation", "cgroupKill",
+               "memoryPeak", "flock", "wait4Rusage"]:
+      require sub.hasKey(key)
+      check sub[key].getBool == false
 
   test "run/v2 warnings array is empty when no warnings passed":
     let node = toJson(syntheticResults(), syntheticSummary())
@@ -1484,8 +1494,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 17 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\")":
-    check RunSchemaRevision == 17
+  test "RunSchemaRevision is 18 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node)":
+    check RunSchemaRevision == 18
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default

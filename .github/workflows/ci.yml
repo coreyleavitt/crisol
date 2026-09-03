@@ -46,10 +46,17 @@ jobs:
           fi
 
       - name: Run test suite
+        # CRISOL_TIER=ci-linux (rfc-0007 A7): tells the substrate acceptance
+        # test (tests/integration/test_rfc0007_a7_substrate_cli.nim) which
+        # tier's capabilities() pins to check — GITHUB_ACTIONS itself is a
+        # runner-HOST fact, not forwarded into this container by `docker run`
+        # unless named explicitly, same convention as CRISOL_TIMING_TESTS/
+        # CRISOL_TEST_DIRS below.
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
             -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            -e CRISOL_TIER=ci-linux \
             ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh
 
   timing:
