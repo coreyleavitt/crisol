@@ -94,7 +94,6 @@
 ## `/proc/sys/kernel/random/boot_id` reads.
 
 import std/[algorithm, json, os, strutils, times]
-import std/posix as posix_mod
 import crisol/types
 import crisol/ioutils
 
@@ -131,16 +130,12 @@ type
 
 proc genericBootIdFallback(): string =
   let nowUs = int64(epochTime() * 1_000_000)
-  let fd = posix_mod.open("/dev/urandom".cstring, posix_mod.O_RDONLY)
-  if fd >= 0:
-    var buf: array[8, uint8]
-    let n = posix_mod.read(fd, addr buf[0], 8)
-    discard posix_mod.close(fd)
-    if n == 8:
-      var rndVal: int64 = 0
-      for i in 0 ..< 8:
-        rndVal = rndVal or (int64(buf[i]) shl (i * 8))
-      return toHex(rndVal xor nowUs, 16)
+  let randBytes = readRandomBytes(8)
+  if randBytes.len == 8:
+    var rndVal: int64 = 0
+    for i in 0 ..< 8:
+      rndVal = rndVal or (int64(randBytes[i]) shl (i * 8))
+    return toHex(rndVal xor nowUs, 16)
   result = $nowUs
 
 proc genericReadBootId(): string =
@@ -167,10 +162,10 @@ proc nextStreamShardSeq[T](): int =
   result = counter
 
 proc shardFileName[T](): string =
-  $posix_mod.getpid() & "-" & streamBootId[T]() & "-" & $nextStreamShardSeq[T]() & ".ndjson"
+  $getCurrentProcessId() & "-" & streamBootId[T]() & "-" & $nextStreamShardSeq[T]() & ".ndjson"
 
 proc compactFileName[T](): string =
-  "compact-" & $posix_mod.getpid() & "-" & streamBootId[T]() & "-c.ndjson"
+  "compact-" & $getCurrentProcessId() & "-" & streamBootId[T]() & "-c.ndjson"
 
 # ---------------------------------------------------------------------------
 # Path helper
@@ -221,22 +216,19 @@ proc openShardedLedger*[T](spec: ShardedLedgerSpec[T]; stateDir: string): Sharde
     return ShardedLedger[T](shardPath: "", fd: -1, closed: true)
 
   let path = dir / shardFileName[T]()
-  let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_APPEND or
-              posix_mod.O_CLOEXEC
-  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(0o600))
+  let (fd, openErr) = appendOpen(path)
   if fd < 0:
-    let err = $posix_mod.strerror(posix_mod.errno)
     stderr.write("crisol: warning: could not open " & spec.streamLabel & " shard '" &
-                 path & "': " & err & "\n")
+                 path & "': " & openErr & "\n")
     return ShardedLedger[T](shardPath: path, fd: -1, closed: true)
 
   result = ShardedLedger[T](shardPath: path, fd: fd, closed: false)
   let hdr = makeShardedHeaderLine(spec)
   if not writeAllFd(fd, hdr):
-    let err = $posix_mod.strerror(posix_mod.errno)
+    let err = lastErrorString()
     stderr.write("crisol: warning: could not write " & spec.streamLabel & " header to '" &
                  path & "': " & err & "\n")
-    discard posix_mod.close(fd)
+    closeFd(fd)
     result.fd = -1
     result.closed = true
 
@@ -251,7 +243,7 @@ proc appendRow*[T](spec: ShardedLedgerSpec[T]; led: var ShardedLedger[T]; row: T
     return
   let line = shardedRowToJsonLine(spec, row)
   if not writeAllFd(led.fd, line):
-    let err = $posix_mod.strerror(posix_mod.errno)
+    let err = lastErrorString()
     stderr.write("crisol: warning: could not write to " & spec.streamLabel & " shard '" &
                  led.shardPath & "': " & err & "\n")
 
@@ -260,7 +252,7 @@ proc closeShardedLedger*[T](led: var ShardedLedger[T]) =
   if led.closed or led.fd < 0:
     led.closed = true
     return
-  discard posix_mod.close(led.fd)
+  closeFd(led.fd)
   led.fd = -1
   led.closed = true
 
@@ -430,14 +422,10 @@ proc compactShardedLedger*[T](spec: ShardedLedgerSpec[T]; stateDir: string;
 
   let compactedPath = dir / compactFileName[T]()
 
-  var compactedFd: cint = -1
-  let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_TRUNC or
-              posix_mod.O_CLOEXEC
-  compactedFd = posix_mod.open(compactedPath.cstring, flags, posix_mod.Mode(0o600))
+  let (compactedFd, openErr, _) = createOverwrite(compactedPath)
   if compactedFd < 0:
-    let err = $posix_mod.strerror(posix_mod.errno)
     stderr.write("crisol: warning: could not create compacted " & spec.streamLabel &
-                 " file '" & compactedPath & "': " & err & "\n")
+                 " file '" & compactedPath & "': " & openErr & "\n")
     return (shardsRemoved: 0, rowsKept: 0)
 
   var writeOk = true
@@ -452,7 +440,7 @@ proc compactShardedLedger*[T](spec: ShardedLedgerSpec[T]; stateDir: string;
         writeOk = false
         break
 
-  discard posix_mod.close(compactedFd)
+  closeFd(compactedFd)
 
   if not writeOk:
     stderr.write("crisol: warning: error writing compacted " & spec.streamLabel &

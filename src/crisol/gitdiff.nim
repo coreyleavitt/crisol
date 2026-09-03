@@ -30,7 +30,7 @@
 ## raised.  The CLI maps that to exit 3, consistent with every other
 ## environment failure.
 
-import std/[os, osproc, sets, streams, strutils]
+import std/[os, osproc, sets, streams, strutils]  # process-contract-exempt: git is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
 import crisol/types
 
 # ---------------------------------------------------------------------------

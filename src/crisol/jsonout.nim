@@ -218,7 +218,6 @@
 ## ---------------------------------------------------------------------------
 
 import std/[json, options, os, sets]
-import std/posix as posix_mod
 import crisol/types
 import crisol/config  # for stateDirOf
 import crisol/render  # for filterRecordsByTag
@@ -227,7 +226,8 @@ import crisol/outcomestrings  # re-exports FailureOutcomeStrings (the only symbo
                               # used from this module); imported separately from
                               # types so the dependency on the wire-string set is
                               # explicit rather than hidden inside a bulk import.
-import crisol/ioutils  # R2-a: writeAllFd replaces bare write() (EINTR/short-write safe)
+import crisol/ioutils  # atomicPublish: shared O_EXCL-tmp + writeAllFd + rename(2)
+                        # (RFC-0007 A3; was a hand-rolled inline copy through R2-a)
 # rfc-0007 A1b: advisory `exit`/`cause` nodes (§2) — `import nil` so nothing
 # unqualified leaks into this module's own Outcome/etc namespace.
 from crisol/process/types as ptypes import nil
@@ -651,47 +651,19 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
                  "': " & e.msg & "\n")
     return
 
-  # Write to a temp file in the same directory, then rename (atomic on POSIX).
-  # Use O_CREAT|O_EXCL|O_WRONLY so the open fails if a file (or symlink) already
-  # exists at the temp path — prevents a pre-planted symlink from redirecting our
-  # write to an attacker-chosen path (symlink write-through attack on shared fs).
-  # If a stale .tmp from a previous crashed run exists, we remove it first.
-  let tmpPath = finalPath & ".tmp"
-  try: removeFile(tmpPath) except: discard
+  # Write via ioutils.atomicPublish (RFC-0007 A3): a PID-suffixed temp file
+  # opened O_CREAT|O_EXCL|O_WRONLY (fails if a file or symlink already exists
+  # there — prevents a pre-planted symlink from redirecting our write to an
+  # attacker-chosen path), writeAllFd (EINTR-safe, short-write-retry loop),
+  # then rename(2) into place. A stale temp file from a previous crashed run
+  # in THIS process is removed first.
   let jsonStr = toJsonString(results, summary, warnings = warnings,
                              memThrottledSlots = memThrottledSlots,
                              compileBlock = compileBlock,
                              reuseAlerts = reuseAlerts)
-  var tmpFd: cint = -1
-  try:
-    let flags = O_CREAT or O_EXCL or O_WRONLY or O_CLOEXEC
-    tmpFd = posix_mod.open(tmpPath.cstring, flags, Mode(0o600))
-    if tmpFd < 0:
-      let err = $strerror(errno)
-      stderr.write("crisol: warning: could not create temp file for lastrun.json: " &
-                   err & "\n")
-      return
-    # R2-a: use writeAllFd (EINTR-safe, short-write-retry loop) instead of a
-    # bare write() call — matches the same pattern used in resultcache/ledger.
-    let ok = writeAllFd(tmpFd, jsonStr)
-    discard posix_mod.close(tmpFd)
-    tmpFd = -1
-    if not ok:
-      stderr.write("crisol: warning: short write to lastrun.json temp file\n")
-      try: removeFile(tmpPath) except: discard
-      return
-    moveFile(tmpPath, finalPath)
-  except OSError as e:
-    if tmpFd >= 0:
-      discard posix_mod.close(tmpFd)
-    stderr.write("crisol: warning: could not write lastrun.json: " & e.msg & "\n")
-    try: removeFile(tmpPath) except: discard
-  except Exception as e:
-    if tmpFd >= 0:
-      discard posix_mod.close(tmpFd)
-    stderr.write("crisol: warning: unexpected error writing lastrun.json: " &
-                 e.msg & "\n")
-    try: removeFile(tmpPath) except: discard
+  let (ok, err) = atomicPublish(finalPath, jsonStr)
+  if not ok:
+    stderr.write("crisol: warning: could not write lastrun.json: " & err & "\n")
 
 # ---------------------------------------------------------------------------
 # loadLastRun -- B7: read back the failed (path,group) set

@@ -7,6 +7,52 @@
 ## here rather than in render: crisol.nim, render.nim and depgraph.nim all
 ## need it and depgraph must not depend on render.
 ##
+## ## RFC-0007 A3 — sole owner of raw file I/O
+##
+## `ioutils` is the ONE place in `src/` (outside `crisol/process/`, `lock.nim`
+## and `signals.nim` — the process-supervision/locking/signal-handling posix
+## usage the RFC keeps separate on purpose) that calls `posix.open`/`write`/
+## `close` directly. `depgraph`, `jsonout`, `ledger`, `shardedledger`, and
+## `crisol.nim`'s `init` writer all migrated their hand-rolled opens onto the
+## primitives below — see `tests/unit/test_rfc7_a3_ioutils_ownership.nim` for
+## the grep-test that keeps this true. The four RFC-pinned primitives are
+## `exclusiveCreate`, `appendOpen`, `atomicPublish`, `writeAllFd`; four more
+## were added because real call sites needed them and an exemption marker
+## would have been a lie about what the code does (deep module, small
+## interface — each earns its place below with the site that needs it):
+##
+##   - `closeFd`         — close a raw fd. `ledger`/`shardedledger` keep an
+##                          fd open across many appends (not a single
+##                          open-write-close), so they need to close it
+##                          themselves without importing `std/posix` just for
+##                          that one call.
+##   - `lastErrorString` — `strerror(errno)`, captured by THIS module
+##                          immediately when called. Lets a caller that just
+##                          got `false` back from `writeAllFd` (a cross-module
+##                          call already, even before A3) report the specific
+##                          OS reason without importing posix itself — errno
+##                          survives the plain Nim proc-call boundary in
+##                          between, the same assumption `ledger.nim` already
+##                          made about `writeAllFd` pre-A3, now made explicit.
+##   - `createOverwrite`  — `O_CREAT|O_WRONLY|O_TRUNC` open (no `O_EXCL`):
+##                          ledger/shardedledger compaction writes a
+##                          freshly-named, process-owned compacted shard and
+##                          wants "create or replace", not "must not already
+##                          exist".
+##   - `readRandomBytes`  — `/dev/urandom` read for the boot-id fallback.
+##                          `ledger.nim` and `shardedledger.nim` had BYTE-FOR-
+##                          BYTE identical open/read/close blocks for this;
+##                          consolidating them here is the same "exactly one
+##                          correct implementation" motive as `writeAllFd`.
+##   - `writeGuardedFile` — `crisol.nim init`'s writer: create-or-truncate
+##                          (per `--force`) while refusing to follow a
+##                          symlink at the final path component
+##                          (`O_NOFOLLOW`), then write and close. Composed
+##                          from `exclusiveCreate`/`createOverwrite` +
+##                          `writeAllFd` + `closeFd` rather than hand-rolled,
+##                          so `crisol.nim` itself needs zero posix calls of
+##                          its own.
+##
 ## ## sanitizeControlBytes
 ##
 ## Per-line control-byte neutralizer for untrusted-origin diagnostic text
@@ -35,14 +81,16 @@
 ## Both ledger.nim and resultcache.nim replace their write calls with this
 ## helper so that there is exactly ONE correct implementation.
 ##
-## ## atomicPutFile
+## ## atomicPublish
 ##
 ## The atomic "write a whole file into place" mechanic that resultcache.nim
 ## implemented inline for its per-key JSON entries: write `data` to a
 ## PID-suffixed temp path with `O_CREAT|O_EXCL` (fails closed on a planted
 ## symlink/file), `writeAllFd` the bytes, then `moveFile`/`rename(2)` into
-## place.  Lifted here (RFC-0006 R1) so resultcache.nim has exactly one
-## correct implementation instead of an inline copy.
+## place.  Lifted here (RFC-0006 R1, named `atomicPublish` per RFC-0007 A3)
+## so resultcache.nim has exactly one correct implementation instead of an
+## inline copy; A3 additionally migrated depgraph.nim's and jsonout.nim's own
+## near-identical inline copies onto this same call.
 ##
 ## Never raises: any open/write/rename failure returns `ok=false` (with a
 ## non-empty `error` naming the failing step and the underlying OS reason —
@@ -58,7 +106,7 @@
 ## OSError message on a failed write (`"could not write cache entry '…': " &
 ## e.msg`).  Returning a bare `bool` regressed that diagnostic —
 ## exactly the detail an operator needs to tell "permission denied" from "disk full" from
-## "EXDEV" from "a planted symlink" apart.  `atomicPutFile` now returns
+## "EXDEV" from "a planted symlink" apart.  `atomicPublish` now returns
 ## `tuple[ok: bool; error: string]`: `error` is `""` on success, and on
 ## failure names the step (create temp / write temp / rename into place) and
 ## carries the OS reason — `strerror(errno)` for the raw posix open/write
@@ -69,6 +117,13 @@
 
 import std/os
 import std/posix as posix_mod
+
+# O_NOFOLLOW is a Linux extension not declared in Nim's std/posix. Pulled
+# from <fcntl.h> via the emit+importc pattern — formerly crisol.nim's own
+# declaration (its `init` writer was the only user); A3 moved it here so
+# `crisol.nim` itself needs zero raw file-open machinery of its own.
+{.emit: "#include <fcntl.h>".}
+var O_NOFOLLOW_FLAG {.importc: "O_NOFOLLOW", nodecl.}: cint
 
 proc sanitizeControlBytes*(s: string): string =
   ## Sanitize untrusted-origin text before it reaches a terminal or CI log.
@@ -154,7 +209,112 @@ proc writeAllFd*(fd: cint; data: string): bool =
     remaining -= n
   true
 
-proc atomicPutFile*(finalPath: string; data: string): tuple[ok: bool; error: string] =
+proc closeFd*(fd: cint) =
+  ## Close a raw posix fd. Idempotent is the CALLER's responsibility (mirrors
+  ## `posix.close`'s own contract — calling this twice on the same fd number
+  ## is undefined once the fd has been reused by another open). Exists so
+  ## that a module holding an fd obtained from `appendOpen`/`exclusiveCreate`/
+  ## `createOverwrite` (e.g. `ledger`/`shardedledger`, which keep one open
+  ## across many appends rather than a single open-write-close) never needs
+  ## `import std/posix` merely to close it.
+  discard posix_mod.close(fd)
+
+proc lastErrorString*(): string =
+  ## `strerror(errno)`, read the instant this is called. Only meaningful
+  ## immediately after a failing ioutils call with no OTHER syscall run in
+  ## between (the same "capture errno before anything else can clobber it"
+  ## discipline every proc in this module already follows internally) — lets
+  ## a caller that just got `false`/`fd < 0` back from `writeAllFd`/an open
+  ## primitive report the specific OS reason without importing `std/posix`
+  ## itself for `strerror`/`errno`.
+  $posix_mod.strerror(posix_mod.errno)
+
+proc exclusiveCreate*(path: string; mode: int = 0o600; noFollow = false):
+    tuple[fd: cint; error: string; alreadyExists: bool] =
+  ## Open `path` for writing with `O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC`: fails
+  ## closed if ANYTHING already exists at `path` — a file, a directory, or a
+  ## symlink, even a dangling one (POSIX `open(2)` makes `O_EXCL` fail on any
+  ## of these without needing `O_NOFOLLOW`). `noFollow` additionally sets
+  ## `O_NOFOLLOW` — redundant with `O_EXCL` for the "nothing exists yet" case
+  ## this proc is for, but kept as an explicit opt-in so the flag is visible
+  ## at the call site rather than silently assumed.
+  ##
+  ## On success `fd >= 0`, `error == ""`, `alreadyExists == false`. On
+  ## failure `fd == -1`; `error` names the OS reason (`strerror(errno)`,
+  ## captured immediately after the failing `open(2)`); `alreadyExists` is
+  ## true iff the failure was `EEXIST` or `ELOOP` — letting a caller phrase
+  ## "already exists" distinctly from a genuine I/O error without importing
+  ## `std/posix` for the errno constants itself.
+  var flags = posix_mod.O_CREAT or posix_mod.O_EXCL or posix_mod.O_WRONLY or
+              posix_mod.O_CLOEXEC
+  if noFollow: flags = flags or O_NOFOLLOW_FLAG
+  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
+  if fd < 0:
+    let err = posix_mod.errno
+    return (cint(-1), $posix_mod.strerror(err), err == EEXIST or err == ELOOP)
+  (fd, "", false)
+
+proc createOverwrite*(path: string; mode: int = 0o600; noFollow = false):
+    tuple[fd: cint; error: string; alreadyExists: bool] =
+  ## Open `path` for writing with `O_CREAT|O_WRONLY|O_TRUNC|O_CLOEXEC`,
+  ## overwriting any existing regular file in place (no `O_EXCL`: unlike
+  ## `exclusiveCreate`, an existing file at `path` is expected and fine).
+  ## `noFollow` sets `O_NOFOLLOW` so a symlink at `path` is refused rather
+  ## than followed and written through — REQUIRED whenever `path` might be
+  ## attacker- or accident-planted (`crisol.nim init --force`, via
+  ## `writeGuardedFile`); harmless, and left off by default, when the caller
+  ## already owns the path outright (ledger/shardedledger compaction, whose
+  ## compacted-shard name is a fresh `<pid>-<bootId>` composite only this
+  ## process could have produced).
+  ##
+  ## Same success/failure shape as `exclusiveCreate`; `alreadyExists` here is
+  ## true iff the failure was `ELOOP` (an `O_TRUNC` open never fails with
+  ## `EEXIST` — that errno is specifically `O_EXCL`'s signal).
+  var flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_TRUNC or
+              posix_mod.O_CLOEXEC
+  if noFollow: flags = flags or O_NOFOLLOW_FLAG
+  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
+  if fd < 0:
+    let err = posix_mod.errno
+    return (cint(-1), $posix_mod.strerror(err), err == ELOOP)
+  (fd, "", false)
+
+proc appendOpen*(path: string; mode: int = 0o600): tuple[fd: cint; error: string] =
+  ## Open `path` for writing with `O_CREAT|O_WRONLY|O_APPEND|O_CLOEXEC`,
+  ## creating it if absent and appending to any existing content — the
+  ## ledger/shardedledger shard-file open (one fd held open across many
+  ## `writeAllFd` appends, then closed via `closeFd`).
+  ##
+  ## On success `fd >= 0` and `error == ""`. On failure `fd == -1` and
+  ## `error` names the OS reason (`strerror(errno)`, captured immediately
+  ## after the failing `open(2)`).
+  let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_APPEND or
+              posix_mod.O_CLOEXEC
+  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
+  if fd < 0:
+    return (cint(-1), $posix_mod.strerror(posix_mod.errno))
+  (fd, "")
+
+proc readRandomBytes*(n: Natural): seq[byte] =
+  ## Best-effort read of up to `n` bytes from `/dev/urandom`. Returns fewer
+  ## than `n` bytes — possibly an empty seq — if the device cannot be opened
+  ## or the read is short; NEVER raises. `ledger.nim`'s and
+  ## `shardedledger.nim`'s boot-id fallback (used when
+  ## `/proc/sys/kernel/random/boot_id` is unreadable) both had a
+  ## byte-for-byte identical inline open/read/close block for this before
+  ## A3; consolidated here for the same "exactly one correct implementation"
+  ## reason as `writeAllFd`. Callers already degrade gracefully (falling
+  ## back to the epoch-microsecond timestamp alone) on a short/empty result.
+  if n == 0: return @[]
+  let fd = posix_mod.open("/dev/urandom".cstring, posix_mod.O_RDONLY)
+  if fd < 0: return @[]
+  result = newSeq[byte](n)
+  let got = posix_mod.read(fd, addr result[0], n)
+  discard posix_mod.close(fd)
+  if got != n:
+    result = if got > 0: result[0 ..< got] else: @[]
+
+proc atomicPublish*(finalPath: string; data: string): tuple[ok: bool; error: string] =
   ## Atomically write `data` into `finalPath`.
   ##
   ## Mechanic (identical to resultcache.storeCached's former inline block):
@@ -183,34 +343,68 @@ proc atomicPutFile*(finalPath: string; data: string): tuple[ok: bool; error: str
 
   var tmpFd: cint = -1
   try:
-    let flags = posix_mod.O_CREAT or posix_mod.O_EXCL or posix_mod.O_WRONLY or
-                posix_mod.O_CLOEXEC
-    tmpFd = posix_mod.open(tmpPath.cstring, flags, posix_mod.Mode(0o600))
+    let (fd, openErr, _) = exclusiveCreate(tmpPath)
+    tmpFd = fd
     if tmpFd < 0:
-      # Capture errno IMMEDIATELY — no other posix call happens between the
-      # failing open(2) and this read, mirroring ledger.openLedger's idiom.
-      let err = $posix_mod.strerror(posix_mod.errno)
-      return (false, "could not create temp file '" & tmpPath & "': " & err)
+      return (false, "could not create temp file '" & tmpPath & "': " & openErr)
 
     let writeOk = writeAllFd(tmpFd, data)
     if not writeOk:
-      # Same immediate-errno-capture idiom: writeAllFd's own failing write(2)
-      # is the last posix call before we read errno here.
-      let err = $posix_mod.strerror(posix_mod.errno)
-      discard posix_mod.close(tmpFd)
+      # Immediate-errno-capture idiom: writeAllFd's own failing write(2) is
+      # the last posix call before we read errno here — closeFd (a bare
+      # close(2)) does not clobber it before the read completes.
+      let err = lastErrorString()
+      closeFd(tmpFd)
       tmpFd = -1
       try: removeFile(tmpPath) except CatchableError: discard
       return (false, "could not write temp file '" & tmpPath & "': " & err)
 
-    discard posix_mod.close(tmpFd)
+    closeFd(tmpFd)
     tmpFd = -1
     moveFile(tmpPath, finalPath)
     return (true, "")
   except OSError as e:
-    if tmpFd >= 0: discard posix_mod.close(tmpFd)
+    if tmpFd >= 0: closeFd(tmpFd)
     try: removeFile(tmpPath) except CatchableError: discard
     return (false, "could not rename temp file to '" & finalPath & "': " & e.msg)
   except Exception as e:
-    if tmpFd >= 0: discard posix_mod.close(tmpFd)
+    if tmpFd >= 0: closeFd(tmpFd)
     try: removeFile(tmpPath) except CatchableError: discard
     return (false, e.msg)
+
+proc writeGuardedFile*(path: string; data: string; mode: int; overwrite: bool):
+    tuple[ok: bool; error: string; alreadyExists: bool] =
+  ## Write `data` to a fresh file at `path`, refusing to follow a symlink at
+  ## the final path component (`O_NOFOLLOW`) on every branch. This is
+  ## `crisol.nim init`'s writer: a human-authored template file, not
+  ## machine-managed state, so it wants the symlink guard but NOT
+  ## `atomicPublish`'s tmp+rename dance — nothing else is concurrently
+  ## reading this path mid-write, so there is no torn-read hazard to protect
+  ## against, and `init` writes exactly the path the user named, never a
+  ## sibling tmp file.
+  ##
+  ##   `overwrite == false`: `exclusiveCreate` — fails (`alreadyExists =
+  ##     true`) if ANYTHING already exists at `path` (file, dir, or symlink,
+  ##     even dangling).
+  ##   `overwrite == true`:  `createOverwrite` — replaces an existing regular
+  ##     file in place; a symlink at `path` is still refused
+  ##     (`alreadyExists = true`) rather than written through.
+  ##
+  ## Returns `(true, "", false)` on success. On any failure returns
+  ## `(false, <reason>, <alreadyExists>)` and never raises; `<reason>` is
+  ## `strerror(errno)` for the failing open/write syscall, captured
+  ## immediately after it.
+  let (fd, openErr, alreadyExists) =
+    if overwrite: createOverwrite(path, mode, noFollow = true)
+    else:         exclusiveCreate(path, mode, noFollow = true)
+  if fd < 0:
+    return (false, openErr, alreadyExists)
+
+  let writeOk = writeAllFd(fd, data)
+  if not writeOk:
+    let err = lastErrorString()
+    closeFd(fd)
+    return (false, err, false)
+
+  closeFd(fd)
+  (true, "", false)

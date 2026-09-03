@@ -51,7 +51,7 @@
 ## means the option was accepted but the build itself failed under
 ## `--mm:orc --incremental`, captured in `errorMsg`.
 
-import std/[monotimes, os, osproc, streams, strutils, times]
+import std/[monotimes, os, osproc, streams, strutils, times]  # process-contract-exempt: icbaseline is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
 
 # ---------------------------------------------------------------------------
 # Seam types

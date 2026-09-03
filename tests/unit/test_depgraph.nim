@@ -284,8 +284,8 @@ block test_updateEntry_upsert:
 # ---------------------------------------------------------------------------
 
 block test_saveDepGraph_symlink_write_through_protection:
-  ## A pre-existing <depgraph>.tmp symlink pointing to a sentinel file must NOT
-  ## cause saveDepGraph to overwrite the sentinel.
+  ## A pre-existing <depgraph>.<pid>.tmp symlink pointing to a sentinel file
+  ## must NOT cause saveDepGraph to overwrite the sentinel.
   ## Mirror of the jsonout P3 test.
   let root = getTempDir() / "crisol_depgraph_p5sym"
   createDir(root)
@@ -295,7 +295,11 @@ block test_saveDepGraph_symlink_write_through_protection:
 
   let cfg        = makeTmpConfig(root)
   let finalPath  = stateDir / "depgraph"
-  let tmpPath    = finalPath & ".tmp"
+  # RFC-0007 A3: saveDepGraph now writes via ioutils.atomicPublish, whose
+  # temp path is PID-suffixed (`<finalPath>.<pid>.tmp`), not a bare
+  # `<finalPath>.tmp` — plant the symlink at the REAL path atomicPublish
+  # will actually open.
+  let tmpPath    = finalPath & "." & $posix_mod.getpid() & ".tmp"
 
   # Plant a sentinel and a symlink at the .tmp location.
   let sentinel = root / "sentinel_must_not_be_overwritten.txt"

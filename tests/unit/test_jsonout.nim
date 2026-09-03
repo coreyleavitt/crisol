@@ -1186,12 +1186,16 @@ suite "jsonout - P3 symlink-safe temp write":
     createDir(tmpDir / stateDir)
 
     let finalPath = tmpDir / stateDir / "lastrun.json"
-    let tmpPath   = finalPath & ".tmp"
+    # RFC-0007 A3: persistLastRun now writes via ioutils.atomicPublish, whose
+    # temp path is PID-suffixed (`<finalPath>.<pid>.tmp`), not a bare
+    # `<finalPath>.tmp` — plant the symlink at the REAL path atomicPublish
+    # will actually open.
+    let tmpPath   = finalPath & "." & $posix_mod.getpid() & ".tmp"
 
     # Plant a sentinel file and a symlink pointing to it at the .tmp location.
     let sentinel = tmpDir / "sentinel_must_not_be_overwritten.txt"
     writeFile(sentinel, "ORIGINAL")
-    # Create a symlink: lastrun.json.tmp -> sentinel
+    # Create a symlink: lastrun.json.<pid>.tmp -> sentinel
     discard posix_mod.symlink(sentinel.cstring, tmpPath.cstring)
 
     let cfg = Config(

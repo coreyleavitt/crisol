@@ -20,12 +20,15 @@
 ## `cdNeverBuilt` instead of trusting a binary the depgraph does not
 ## describe.
 ##
-## Fault injection: `createDir(depgraphPath(cfg) & ".tmp")`. `saveDepGraph`
-## opens its temp file with O_CREAT|O_EXCL, which fails with EEXIST when a
-## directory already occupies that path, and its best-effort
-## `removeFile(tmpPath)` cannot remove a directory — so the write reliably
-## fails without needing filesystem permissions (the container runs as
-## root, so a chmod-based fault would not work).
+## Fault injection: `createDir(depgraphPath(cfg))`. `saveDepGraph` (via
+## `ioutils.atomicPublish` as of RFC-0007 A3) writes to a PID-suffixed temp
+## file first — unpredictable from outside the subprocess, so this fault
+## cannot target it directly — then `rename(2)`s that temp file onto
+## `depgraphPath(cfg)`. `rename(2)` reliably fails with `EISDIR` when the
+## destination is an existing directory and the source is a regular file,
+## so the final commit step fails deterministically without needing to
+## predict the subprocess's PID or filesystem permissions (the container
+## runs as root, so a chmod-based fault would not work).
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
@@ -155,7 +158,11 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
     # must discard the stable binary so its provenance is never
     # mismatched against what the depgraph records.
     writeFile(epPath, markerBody(root, "2"))
-    let tmpFaultDir = depgraphPath(cfg) & ".tmp"
+    let tmpFaultDir = depgraphPath(cfg)
+    # Step 1's successful run already persisted a real depgraph FILE at this
+    # exact path — remove it first (createDir raises if a non-directory
+    # already occupies the path) before occupying it with a directory.
+    removeFile(tmpFaultDir)
     createDir(tmpFaultDir)
 
     let broken = captureBoth(@["run", "--config", root / "crisol.kdl", "--json"])

@@ -75,7 +75,7 @@
 import std/[algorithm, json, options, os, strutils]
 import crisol/types
 import crisol/depgraph   # re-uses fnv1a64, toHex16; never reimplement the hash
-import crisol/ioutils    # atomicPutFile: shared O_EXCL-tmp + writeAllFd + rename(2)
+import crisol/ioutils    # atomicPublish: shared O_EXCL-tmp + writeAllFd + rename(2)
 import crisol/process/types as ptypes
 import crisol/process/resultjson  # the ONE ProcessResult<->JSON owner (§2)
 
@@ -339,7 +339,7 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
   ## is best-effort and never aborts a run.
   let verDir    = cacheVersionDir(stateDir)
   let finalPath = keyFilePath(stateDir, key)
-  # L10: atomicPutFile (ioutils) writes to `<finalPath>.<pid>.tmp` — the
+  # L10: atomicPublish (ioutils) writes to `<finalPath>.<pid>.tmp` — the
   # writer's PID in the tmp filename means concurrent writers for the same
   # key each operate on their own tmp file, no collision on the stale-tmp
   # removal or the O_EXCL open.  Each writer's tmp is renamed to `<key>.json`;
@@ -376,12 +376,12 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
   let jsonStr = $fileNode
 
   # RFC-0006 R1: the O_EXCL-tmp + writeAllFd + rename(2) mechanic is factored
-  # into ioutils.atomicPutFile — this call is
-  # behaviorally identical to the block it replaces. RFC-0006 review R10:
-  # atomicPutFile now reports the specific OS failure reason instead of a
-  # bare bool, restoring the diagnostic this module logged before the R1
+  # into ioutils.atomicPublish (renamed from atomicPutFile at RFC-0007 A3) —
+  # this call is behaviorally identical to the block it replaces. RFC-0006
+  # review R10: atomicPublish reports the specific OS failure reason instead
+  # of a bare bool, restoring the diagnostic this module logged before the R1
   # factor-out.
-  let (ok, err) = atomicPutFile(finalPath, jsonStr)
+  let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
     stderr.write("crisol: warning: could not write cache entry '" & finalPath &
                  "': " & err & "\n")

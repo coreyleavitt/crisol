@@ -36,13 +36,17 @@
 ##       --failed with no prior run (lastrun.json absent)
 
 import std/[options, os, strutils]
-import std/posix
+import std/terminal as stdterm  # isatty(File) — cross-platform TTY check, no
+                                # std/posix needed (RFC-0007 A3); distinct
+                                # from crisol/terminal (color rendering) below
 import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe, render, ioutils]
 
-# O_NOFOLLOW is a Linux extension not declared in Nim's std/posix.
-# Pull it from <fcntl.h> via the emit+importc pattern.
-{.emit: "#include <fcntl.h>".}
-var O_NOFOLLOW_FLAG {.importc: "O_NOFOLLOW", nodecl.}: cint
+# `_exit(2)`: skips Nim's exitprocs/GC-finalize cleanup on the int8-overflow
+# exit-code bypass below. A raw single-symbol libc import (not a
+# `std/posix` module dependency) — same pattern runner.nim already uses for
+# `mkdtemp` (RFC-0007 A2b), kept here rather than moved to `ioutils` because
+# it is process-exit, not file I/O.
+proc exitnow(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 
 # ---------------------------------------------------------------------------
 # Exit codes (RFC §CLI Surface)
@@ -251,7 +255,7 @@ Exit codes:
 
 proc computeColorEnabled(): bool =
   ## Returns true iff stdout is a TTY AND NO_COLOR is unset.
-  let tty = isatty(1.cint) != 0   # fd 1 = stdout
+  let tty = stdterm.isatty(stdout)
   shouldEnableColor(tty)
 
 type ConfigFlagOutcome = enum
@@ -470,52 +474,29 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     let absTarget = if isAbsolute(targetPath): targetPath
                     else: getCurrentDir() / targetPath
 
-    # Single atomic open() — no TOCTOU, no symlink follow-through.
+    # ioutils.writeGuardedFile: single atomic open() — no TOCTOU, no symlink
+    # follow-through (RFC-0007 A3).
     #
-    # O_NOFOLLOW: refuse to follow a symlink at the final path component on
-    #             every branch, including --force (no write-through).
-    # O_EXCL:     atomically refuse if ANYTHING already exists (without --force).
-    # O_TRUNC:    truncate an existing regular file when --force is set.
+    # noFollow=true: refuse to follow a symlink at the final path component
+    #                on every branch, including --force (no write-through).
+    # overwrite=false (not forceInit): O_EXCL — atomically refuse if
+    #                ANYTHING already exists.
+    # overwrite=true  (forceInit):     O_TRUNC — truncate an existing
+    #                regular file.
     # Mode 0o644: owner rw, group r, other r.
-    let baseFlags = O_CREAT or O_WRONLY or O_NOFOLLOW_FLAG
-    let openFlags = if forceInit: baseFlags or O_TRUNC
-                    else:         baseFlags or O_EXCL
-    let fd = posix.open(absTarget.cstring, openFlags, 0o644.Mode)
-
-    if fd < 0:
-      let err = errno
-      if err == EEXIST or err == ELOOP:
-        # EEXIST: file exists and --force not given (O_EXCL triggered).
-        # ELOOP:  O_NOFOLLOW caught a symlink (both with and without --force).
-        if err == ELOOP or (not forceInit):
-          stderr.write("crisol: init: '" & absTarget & "' already exists; " &
-                       "use --force to overwrite\n")
-        else:
-          stderr.write("crisol: init: cannot write '" & absTarget & "': " &
-                       $strerror(err) & "\n")
-      else:
-        stderr.write("crisol: init: cannot write '" & absTarget & "': " &
-                     $strerror(err) & "\n")
-      return ExitEnvironment
-
-    # Write InitTemplate in a short-write-safe loop, then close on every path.
-    let content = InitTemplate
-    let contentLen = content.len
-    var written = 0
-    var writeOk = true
-    while written < contentLen:
-      let n = posix.write(fd, cast[pointer](unsafeAddr content[written]),
-                          contentLen - written)
-      if n < 0:
-        let err = errno
-        stderr.write("crisol: init: cannot write '" & absTarget & "': " &
-                     $strerror(err) & "\n")
-        writeOk = false
-        break
-      written += n.int
-    discard posix.close(fd)
+    let (writeOk, writeErr, alreadyExists) =
+      ioutils.writeGuardedFile(absTarget, InitTemplate, 0o644, overwrite = forceInit)
 
     if not writeOk:
+      if alreadyExists:
+        # Set on EEXIST (file exists and --force not given, O_EXCL
+        # triggered) or ELOOP (O_NOFOLLOW caught a symlink, both with and
+        # without --force).
+        stderr.write("crisol: init: '" & absTarget & "' already exists; " &
+                     "use --force to overwrite\n")
+      else:
+        stderr.write("crisol: init: cannot write '" & absTarget & "': " &
+                     writeErr & "\n")
       return ExitEnvironment
 
     stdout.write("crisol: init: wrote " & absTarget & "\n")

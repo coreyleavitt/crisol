@@ -59,7 +59,7 @@
 ## caller that does `import crisol/artifactid` and calls them unqualified
 ## keeps compiling unchanged.
 
-import std/[osproc, streams, strutils]
+import std/[osproc, streams, strutils]  # process-contract-exempt: cc/nim probes are short-lived tool invocations, not compile/run children (RFC-0007 §Scope)
 
 # ---------------------------------------------------------------------------
 # Sentinels

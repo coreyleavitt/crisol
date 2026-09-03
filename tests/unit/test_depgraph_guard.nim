@@ -180,10 +180,15 @@ suite "recordClosure — recovery policy (R5)":
     check ("tests/rec_fail.nim", fh) notin loadDepGraph(cfg, "").entries
 
   test "persist failure (issue #13.3): a manifest that would otherwise succeed still returns ok=false":
-    ## Fault injection: `createDir(depgraphPath(cfg) & ".tmp")`. `saveDepGraph`
-    ## opens its temp file with O_CREAT|O_EXCL, which fails with EEXIST when a
-    ## directory already occupies the .tmp path — reliable without needing
-    ## filesystem permissions the container's root user would bypass anyway.
+    ## Fault injection: `createDir(depgraphPath(cfg))`. `saveDepGraph` (via
+    ## `ioutils.atomicPublish` as of RFC-0007 A3) writes its content to a
+    ## PID-suffixed temp file (which this fault never touches, so that step
+    ## succeeds) and then `rename(2)`s the temp file onto `depgraphPath(cfg)`
+    ## — `rename(2)` reliably fails with `EISDIR` when the destination is an
+    ## existing directory and the source is a regular file, so the final
+    ## commit step fails deterministically without needing filesystem
+    ## permissions the container's root user would bypass anyway (and
+    ## without needing to predict a PID-suffixed filename in advance).
     let root = recRoot("persistfail")
     defer: removeDir(root)
     let ep = root / "tests" / "rec_persistfail.nim"
@@ -192,7 +197,7 @@ suite "recordClosure — recovery policy (R5)":
     writeManifest(nc, "rec_persistfail", link = @[nc / "@mrec_persistfail.nim.c.o"])
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
-    createDir(depgraphPath(cfg) & ".tmp")
+    createDir(depgraphPath(cfg))
 
     var graph = initDepGraph("")
     let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_persistfail.nim", group: "t"),
@@ -210,12 +215,12 @@ suite "recordClosure — recovery policy (R5)":
 
 suite "saveDepGraph — return value (issue #13.3)":
 
-  test "returns false and leaves no depgraph file when the .tmp path is occupied by a directory":
+  test "returns false and leaves no depgraph file when the destination path is occupied by a directory":
     let root = graphRoot("savefail")
     defer: removeDir(root)
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
-    createDir(depgraphPath(cfg) & ".tmp")
+    createDir(depgraphPath(cfg))
 
     var g = initDepGraph("2.2.10")
     g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)

@@ -30,8 +30,9 @@
 ##
 ## ## Writes
 ##
-## Raw posix.write partial-write loop (not buffered writeLine) matching
-## crisol's hardened-IO aesthetic in spawn.nim.
+## Raw posix.write partial-write loop (not buffered writeLine), via
+## `ioutils.writeAllFd` — the shared EINTR/short-write-safe implementation
+## every raw-fd writer in crisol uses (RFC-0007 A3).
 ##
 ## ## Corruption-resilient reads
 ##
@@ -41,7 +42,6 @@
 ##   with resultcache whole-file discard).
 
 import std/[algorithm, json, os, sequtils, sets, strutils, tables, times]
-import std/posix as posix_mod
 import crisol/types
 import crisol/ioutils
 import crisol/outcomestrings  # for passedOutcomeString
@@ -94,16 +94,12 @@ proc bootIdFallback(): string =
   ## shard names (L11 fix).  If /dev/urandom is also unavailable, falls back
   ## to epoch µs alone (same as before, last resort).
   let nowUs = int64(epochTime() * 1_000_000)
-  let fd = posix_mod.open("/dev/urandom".cstring, posix_mod.O_RDONLY)
-  if fd >= 0:
-    var buf: array[8, uint8]
-    let n = posix_mod.read(fd, addr buf[0], 8)
-    discard posix_mod.close(fd)
-    if n == 8:
-      var rndVal: int64 = 0
-      for i in 0 ..< 8:
-        rndVal = rndVal or (int64(buf[i]) shl (i * 8))
-      return toHex(rndVal xor nowUs, 16)
+  let randBytes = readRandomBytes(8)
+  if randBytes.len == 8:
+    var rndVal: int64 = 0
+    for i in 0 ..< 8:
+      rndVal = rndVal or (int64(randBytes[i]) shl (i * 8))
+    return toHex(rndVal xor nowUs, 16)
   # Last resort: epoch µs only (same as original behaviour).
   result = $nowUs
 
@@ -145,7 +141,7 @@ proc shardName(): string =
   ## The sequence counter distinguishes multiple openLedger calls within the
   ## same process (e.g. in tests simulating concurrent invocations).
   inc shardSeq
-  result = $posix_mod.getpid() & "-" & bootId & "-" & $shardSeq & ".ndjson"
+  result = $getCurrentProcessId() & "-" & bootId & "-" & $shardSeq & ".ndjson"
 
 proc compactName(): string =
   ## Returns a filename-safe name for a compacted shard:
@@ -156,7 +152,7 @@ proc compactName(): string =
   ## side-effect in a "stable name" context.  The "c" suffix makes it
   ## deterministic within a process (only one compaction runs per cleanOrphans
   ## call) and the compact- prefix prevents confusion with live shards.
-  result = "compact-" & $posix_mod.getpid() & "-" & bootId & "-c.ndjson"
+  result = "compact-" & $getCurrentProcessId() & "-" & bootId & "-c.ndjson"
 
 # ---------------------------------------------------------------------------
 # Internal: raw posix.write partial-write loop — delegates to ioutils
@@ -212,23 +208,20 @@ proc openLedger*(stateDir: string): Ledger =
     return Ledger(shardPath: "", fd: -1, closed: true)
 
   let path = ledgerDir / shardName()
-  let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_APPEND or
-              posix_mod.O_CLOEXEC
-  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(0o600))
+  let (fd, openErr) = appendOpen(path)
   if fd < 0:
-    let err = $posix_mod.strerror(posix_mod.errno)
     stderr.write("crisol: warning: could not open ledger shard '" & path &
-                 "': " & err & "\n")
+                 "': " & openErr & "\n")
     return Ledger(shardPath: path, fd: -1, closed: true)
 
   result = Ledger(shardPath: path, fd: fd, closed: false)
   # Write the header line.
   let hdr = makeHeaderLine()
   if not writeAll(fd, hdr):
-    let err = $posix_mod.strerror(posix_mod.errno)
+    let err = lastErrorString()
     stderr.write("crisol: warning: could not write ledger header to '" & path &
                  "': " & err & "\n")
-    discard posix_mod.close(fd)
+    closeFd(fd)
     result.fd = -1
     result.closed = true
 
@@ -238,13 +231,13 @@ proc openLedger*(stateDir: string): Ledger =
 
 proc append*(led: var Ledger; row: LedgerRow) =
   ## Append one row to the ledger shard.
-  ## Uses a raw posix.write partial-write loop (not buffered writeLine).
+  ## Uses ioutils.writeAllFd's partial-write loop (not buffered writeLine).
   ## No-ops silently if the ledger is closed or the fd is invalid.
   if led.closed or led.fd < 0:
     return
   let line = rowToJsonLine(row)
   if not writeAll(led.fd, line):
-    let err = $posix_mod.strerror(posix_mod.errno)
+    let err = lastErrorString()
     stderr.write("crisol: warning: could not write to ledger shard '" &
                  led.shardPath & "': " & err & "\n")
 
@@ -257,7 +250,7 @@ proc closeLedger*(led: var Ledger) =
   if led.closed or led.fd < 0:
     led.closed = true
     return
-  discard posix_mod.close(led.fd)
+  closeFd(led.fd)
   led.fd = -1
   led.closed = true
 
@@ -577,14 +570,10 @@ proc compactLedger*(stateDir: string; maxAgeSecs: int64; nowSecs: int64):
   # live shards.  ledgerDir already exists (guaranteed by the dirExists check above).
   let compactedPath = ledgerDir / compactName()
 
-  var compactedFd: cint = -1
-  let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_TRUNC or
-              posix_mod.O_CLOEXEC
-  compactedFd = posix_mod.open(compactedPath.cstring, flags, posix_mod.Mode(0o600))
+  let (compactedFd, openErr, _) = createOverwrite(compactedPath)
   if compactedFd < 0:
-    let err = $posix_mod.strerror(posix_mod.errno)
     stderr.write("crisol: warning: could not create compacted ledger file '" &
-                 compactedPath & "': " & err & "\n")
+                 compactedPath & "': " & openErr & "\n")
     return (shardsRemoved: 0, rowsKept: 0)
 
   var writeOk = true
@@ -599,7 +588,7 @@ proc compactLedger*(stateDir: string; maxAgeSecs: int64; nowSecs: int64):
         writeOk = false
         break
 
-  discard posix_mod.close(compactedFd)
+  closeFd(compactedFd)
 
   if not writeOk:
     stderr.write("crisol: warning: error writing compacted ledger; keeping originals\n")

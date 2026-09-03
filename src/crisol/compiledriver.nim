@@ -59,7 +59,7 @@
 ## phases that DID complete before the failure are preserved (e.g. a link
 ## failure still reports real codegen/cc spans).
 
-import std/[monotimes, os, osproc, sequtils, streams, tables, times]
+import std/[monotimes, os, osproc, sequtils, streams, tables, times]  # process-contract-exempt: measure-mode realCompileOnly/cc/link, aligned at A2c — not the entrypoint compile/run children (RFC-0007 §Scope)
 import crisol/closure
 
 # ---------------------------------------------------------------------------

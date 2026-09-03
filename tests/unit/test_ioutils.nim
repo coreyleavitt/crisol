@@ -1,4 +1,4 @@
-## test_ioutils.nim — unit tests for ioutils.writeAllFd + ioutils.atomicPutFile
+## test_ioutils.nim — unit tests for ioutils.writeAllFd + ioutils.atomicPublish
 ##
 ## TDD: written RED before the implementation exists.
 ##
@@ -7,15 +7,15 @@
 ##   2. writeAllFd on a closed/bad fd returns false (error path).
 ##   3. writeAllFd handles a zero-length string (no-op, returns true).
 ##   4. writeAllFd via a pipe: simulate the normal full-write path.
-##   5. atomicPutFile writes content atomically and returns ok=true with an
+##   5. atomicPublish writes content atomically and returns ok=true with an
 ##      empty error; content round-trips byte-for-byte; no writer-own
 ##      `.pid.tmp` remains.
-##   6. atomicPutFile: a second put to the same finalPath replaces the content.
-##   7. atomicPutFile: a pre-planted tmp file at OUR OWN pid-suffixed path is
+##   6. atomicPublish: a second put to the same finalPath replaces the content.
+##   7. atomicPublish: a pre-planted tmp file at OUR OWN pid-suffixed path is
 ##      best-effort removed first, then the put still succeeds (RFC-0006 R1).
-##   8. atomicPutFile into a NONEXISTENT parent dir -> ok=false and a
+##   8. atomicPublish into a NONEXISTENT parent dir -> ok=false and a
 ##      non-empty error string naming the OS reason (RFC-0006 review R10).
-##   9. atomicPutFile into an UNWRITABLE (mode 0o500) parent dir -> ok=false
+##   9. atomicPublish into an UNWRITABLE (mode 0o500) parent dir -> ok=false
 ##      and a non-empty error string containing the OS reason (permission
 ##      denied) (RFC-0006 review R10).
 ##  10. sanitizeControlBytes: ESC/TAB/DEL -> '?'; '\n' preserved; UTF-8
@@ -107,7 +107,7 @@ block test_writeallfd_pipe:
   assert buf == payload, "pipe payload mismatch: " & buf.repr
 
 # ---------------------------------------------------------------------------
-# 5. atomicPutFile: writes atomically, returns (true, ""), round-trips, no
+# 5. atomicPublish: writes atomically, returns (true, ""), round-trips, no
 #    tmp left
 # ---------------------------------------------------------------------------
 
@@ -116,18 +116,18 @@ block test_atomicputfile_roundtrip:
   defer: (try: removeFile(path) except CatchableError: discard)
   (try: removeFile(path) except CatchableError: discard)
 
-  let data = "atomicPutFile payload — first write\n"
-  let (ok, error) = atomicPutFile(path, data)
-  assert ok, "atomicPutFile must return ok=true on success"
-  assert error.len == 0, "atomicPutFile error must be empty on success, got: " & error
-  assert fileExists(path), "final file must exist after atomicPutFile"
+  let data = "atomicPublish payload — first write\n"
+  let (ok, error) = atomicPublish(path, data)
+  assert ok, "atomicPublish must return ok=true on success"
+  assert error.len == 0, "atomicPublish error must be empty on success, got: " & error
+  assert fileExists(path), "final file must exist after atomicPublish"
   assert readFile(path) == data, "round-trip mismatch"
 
   let myPidTmp = path & "." & $posix_mod.getpid() & ".tmp"
   assert not fileExists(myPidTmp), "writer-own .tmp must not exist after rename"
 
 # ---------------------------------------------------------------------------
-# 6. atomicPutFile: a second put replaces the content
+# 6. atomicPublish: a second put replaces the content
 # ---------------------------------------------------------------------------
 
 block test_atomicputfile_replace:
@@ -135,15 +135,15 @@ block test_atomicputfile_replace:
   defer: (try: removeFile(path) except CatchableError: discard)
   (try: removeFile(path) except CatchableError: discard)
 
-  assert atomicPutFile(path, "version one").ok
+  assert atomicPublish(path, "version one").ok
   assert readFile(path) == "version one"
 
-  assert atomicPutFile(path, "version two — longer than the first").ok
+  assert atomicPublish(path, "version two — longer than the first").ok
   assert readFile(path) == "version two — longer than the first",
-    "second atomicPutFile must replace the first content"
+    "second atomicPublish must replace the first content"
 
 # ---------------------------------------------------------------------------
-# 7. atomicPutFile: a pre-planted OWN-pid tmp is best-effort removed first
+# 7. atomicPublish: a pre-planted OWN-pid tmp is best-effort removed first
 # ---------------------------------------------------------------------------
 
 block test_atomicputfile_preplanted_own_tmp:
@@ -158,14 +158,14 @@ block test_atomicputfile_preplanted_own_tmp:
   # attempt in this same process crashed mid-write before rename).
   writeFile(myPidTmp, "stale leftover from a previous attempt in this pid")
 
-  let (ok, error) = atomicPutFile(path, "fresh content wins")
-  assert ok, "atomicPutFile must succeed even with a pre-planted own-pid tmp"
-  assert error.len == 0, "atomicPutFile error must be empty on success, got: " & error
+  let (ok, error) = atomicPublish(path, "fresh content wins")
+  assert ok, "atomicPublish must succeed even with a pre-planted own-pid tmp"
+  assert error.len == 0, "atomicPublish error must be empty on success, got: " & error
   assert readFile(path) == "fresh content wins"
   assert not fileExists(myPidTmp), "the pid-tmp must not survive a successful put"
 
 # ---------------------------------------------------------------------------
-# 8. atomicPutFile into a NONEXISTENT parent dir -> ok=false, non-empty
+# 8. atomicPublish into a NONEXISTENT parent dir -> ok=false, non-empty
 #    error naming the OS reason (RFC-0006 review R10 — the underlying OSError
 #    must no longer be swallowed).
 # ---------------------------------------------------------------------------
@@ -175,14 +175,14 @@ block test_atomicputfile_nonexistent_dir_reports_error:
   (try: removeDir(missingDir) except CatchableError: discard)
   let path = missingDir / "target.txt"
 
-  let (ok, error) = atomicPutFile(path, "should never land")
-  assert not ok, "atomicPutFile into a nonexistent dir must return ok=false"
+  let (ok, error) = atomicPublish(path, "should never land")
+  assert not ok, "atomicPublish into a nonexistent dir must return ok=false"
   assert error.len > 0,
-    "atomicPutFile must report a NON-EMPTY error naming the OS reason, got empty string"
+    "atomicPublish must report a NON-EMPTY error naming the OS reason, got empty string"
   assert not fileExists(path), "no file may be created on a create-temp-file failure"
 
 # ---------------------------------------------------------------------------
-# 9. atomicPutFile into an UNWRITABLE parent dir -> ok=false, non-empty error
+# 9. atomicPublish into an UNWRITABLE parent dir -> ok=false, non-empty error
 #    string containing the OS reason (permission denied) (RFC-0006 review
 #    R10). Skipped when running as root — root bypasses permission bits, so
 #    this specific failure mode cannot be exercised as root.
@@ -201,10 +201,10 @@ block test_atomicputfile_unwritable_dir_reports_error:
       (try: removeDir(roDir) except CatchableError: discard)
     let path = roDir / "target.txt"
 
-    let (ok, error) = atomicPutFile(path, "should never land")
-    assert not ok, "atomicPutFile into an unwritable dir must return ok=false"
+    let (ok, error) = atomicPublish(path, "should never land")
+    assert not ok, "atomicPublish into an unwritable dir must return ok=false"
     assert error.len > 0,
-      "atomicPutFile must report a NON-EMPTY error naming the OS reason, got empty string"
+      "atomicPublish must report a NON-EMPTY error naming the OS reason, got empty string"
     assert not fileExists(path), "no file may be created on a create-temp-file failure"
 
 # ---------------------------------------------------------------------------
@@ -280,5 +280,173 @@ block test_sanitizecontrolbytes_lone_trailing_c2_unchanged:
   let s = "trailing\xc2"
   assert sanitizeControlBytes(s) == s,
     "a lone trailing 0xC2 byte must be left alone"
+
+# ---------------------------------------------------------------------------
+# 12. exclusiveCreate: fresh path succeeds; a path that already exists fails
+#     with alreadyExists=true (RFC-0007 A3).
+# ---------------------------------------------------------------------------
+
+block test_exclusivecreate_fresh_path_succeeds:
+  let path = getTempDir() / "crisol_ioutils_test_exclusivecreate.txt"
+  (try: removeFile(path) except CatchableError: discard)
+  defer: (try: removeFile(path) except CatchableError: discard)
+
+  let (fd, error, alreadyExists) = exclusiveCreate(path)
+  assert fd >= 0, "exclusiveCreate on a fresh path must return fd >= 0, error: " & error
+  assert error.len == 0
+  assert not alreadyExists
+  assert writeAllFd(fd, "payload")
+  closeFd(fd)
+  assert readFile(path) == "payload"
+
+block test_exclusivecreate_existing_path_reports_alreadyexists:
+  let path = getTempDir() / "crisol_ioutils_test_exclusivecreate_exists.txt"
+  writeFile(path, "pre-existing")
+  defer: (try: removeFile(path) except CatchableError: discard)
+
+  let (fd, error, alreadyExists) = exclusiveCreate(path)
+  assert fd < 0, "exclusiveCreate on an existing path must fail"
+  assert error.len > 0, "exclusiveCreate must report a non-empty OS reason"
+  assert alreadyExists, "exclusiveCreate on an existing path must set alreadyExists=true"
+  assert readFile(path) == "pre-existing", "existing content must survive a failed exclusiveCreate"
+
+# ---------------------------------------------------------------------------
+# 13. createOverwrite: fresh path succeeds; an existing regular file is
+#     truncated and replaced (RFC-0007 A3).
+# ---------------------------------------------------------------------------
+
+block test_createoverwrite_replaces_existing_content:
+  let path = getTempDir() / "crisol_ioutils_test_createoverwrite.txt"
+  writeFile(path, "old content — long enough to prove truncation happened")
+  defer: (try: removeFile(path) except CatchableError: discard)
+
+  let (fd, error, alreadyExists) = createOverwrite(path)
+  assert fd >= 0, "createOverwrite on an existing regular file must succeed, error: " & error
+  assert error.len == 0
+  assert not alreadyExists
+  assert writeAllFd(fd, "new")
+  closeFd(fd)
+  assert readFile(path) == "new", "createOverwrite must truncate the prior content"
+
+block test_createoverwrite_nofollow_refuses_symlink:
+  let target = getTempDir() / "crisol_ioutils_test_createoverwrite_target.txt"
+  let link   = getTempDir() / "crisol_ioutils_test_createoverwrite_link.txt"
+  writeFile(target, "target content")
+  (try: removeFile(link) except CatchableError: discard)
+  createSymlink(target, link)
+  defer:
+    (try: removeFile(link) except CatchableError: discard)
+    (try: removeFile(target) except CatchableError: discard)
+
+  let (fd, error, alreadyExists) = createOverwrite(link, noFollow = true)
+  assert fd < 0, "createOverwrite(noFollow=true) must refuse to follow a symlink"
+  assert error.len > 0
+  assert alreadyExists, "a refused symlink must report alreadyExists=true"
+  assert readFile(target) == "target content", "the symlink target must be untouched"
+
+# ---------------------------------------------------------------------------
+# 14. appendOpen: creates on first open, appends on a second open of the
+#     same path (RFC-0007 A3 — the ledger/shardedledger shard-open primitive).
+# ---------------------------------------------------------------------------
+
+block test_appendopen_creates_then_appends:
+  let path = getTempDir() / "crisol_ioutils_test_appendopen.txt"
+  (try: removeFile(path) except CatchableError: discard)
+  defer: (try: removeFile(path) except CatchableError: discard)
+
+  block:
+    let (fd, error) = appendOpen(path)
+    assert fd >= 0, "appendOpen must create a missing path, error: " & error
+    assert writeAllFd(fd, "first\n")
+    closeFd(fd)
+
+  block:
+    let (fd, error) = appendOpen(path)
+    assert fd >= 0, "appendOpen on an existing path must succeed, error: " & error
+    assert writeAllFd(fd, "second\n")
+    closeFd(fd)
+
+  assert readFile(path) == "first\nsecond\n",
+    "a second appendOpen must append, not truncate"
+
+# ---------------------------------------------------------------------------
+# 15. readRandomBytes: returns exactly the requested count from a real
+#     /dev/urandom (RFC-0007 A3 — the ledger/shardedledger boot-id fallback
+#     primitive); zero is a no-op.
+# ---------------------------------------------------------------------------
+
+block test_readrandombytes_returns_requested_count:
+  let bytes = readRandomBytes(8)
+  assert bytes.len == 8, "readRandomBytes(8) on a normal host must return 8 bytes"
+
+block test_readrandombytes_zero_is_empty:
+  let bytes = readRandomBytes(0)
+  assert bytes.len == 0, "readRandomBytes(0) must return an empty seq"
+
+block test_readrandombytes_two_calls_differ:
+  # Not a statistical randomness test — just confirms this isn't reading a
+  # fixed/zeroed buffer.
+  let a = readRandomBytes(16)
+  let b = readRandomBytes(16)
+  assert a != b, "two independent readRandomBytes(16) calls must not collide"
+
+# ---------------------------------------------------------------------------
+# 16. writeGuardedFile: crisol.nim init's writer primitive (RFC-0007 A3) —
+#     exclusive-create by default, overwrite opt-in, symlink always refused.
+# ---------------------------------------------------------------------------
+
+block test_writeguardedfile_fresh_path_succeeds:
+  let path = getTempDir() / "crisol_ioutils_test_writeguarded.txt"
+  (try: removeFile(path) except CatchableError: discard)
+  defer: (try: removeFile(path) except CatchableError: discard)
+
+  let (ok, error, alreadyExists) =
+    writeGuardedFile(path, "template content\n", 0o644, overwrite = false)
+  assert ok, "writeGuardedFile on a fresh path must succeed, error: " & error
+  assert error.len == 0
+  assert not alreadyExists
+  assert readFile(path) == "template content\n"
+  assert (getFilePermissions(path) * {fpUserRead, fpUserWrite}) ==
+         {fpUserRead, fpUserWrite}, "mode 0o644 must include owner rw"
+
+block test_writeguardedfile_existing_path_without_force_fails:
+  let path = getTempDir() / "crisol_ioutils_test_writeguarded_exists.txt"
+  writeFile(path, "already here")
+  defer: (try: removeFile(path) except CatchableError: discard)
+
+  let (ok, error, alreadyExists) =
+    writeGuardedFile(path, "new content", 0o644, overwrite = false)
+  assert not ok, "writeGuardedFile without overwrite must refuse an existing path"
+  assert error.len > 0
+  assert alreadyExists
+  assert readFile(path) == "already here", "existing content must survive"
+
+block test_writeguardedfile_overwrite_true_replaces_content:
+  let path = getTempDir() / "crisol_ioutils_test_writeguarded_force.txt"
+  writeFile(path, "stale template")
+  defer: (try: removeFile(path) except CatchableError: discard)
+
+  let (ok, error, alreadyExists) =
+    writeGuardedFile(path, "fresh template", 0o644, overwrite = true)
+  assert ok, "writeGuardedFile(overwrite=true) must replace an existing file, error: " & error
+  assert not alreadyExists
+  assert readFile(path) == "fresh template"
+
+block test_writeguardedfile_overwrite_true_still_refuses_symlink:
+  let target = getTempDir() / "crisol_ioutils_test_writeguarded_target.txt"
+  let link   = getTempDir() / "crisol_ioutils_test_writeguarded_link.txt"
+  writeFile(target, "target content")
+  (try: removeFile(link) except CatchableError: discard)
+  createSymlink(target, link)
+  defer:
+    (try: removeFile(link) except CatchableError: discard)
+    (try: removeFile(target) except CatchableError: discard)
+
+  let (ok, error, alreadyExists) =
+    writeGuardedFile(link, "should not land", 0o644, overwrite = true)
+  assert not ok, "writeGuardedFile must refuse a symlink even with overwrite=true"
+  assert error.len > 0
+  assert alreadyExists
+  assert readFile(target) == "target content", "the symlink target must be untouched"
 
 echo "test_ioutils: all blocks passed"
