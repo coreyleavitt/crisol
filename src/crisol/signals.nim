@@ -1,57 +1,46 @@
-## signals.nim — async-signal-safe flag for SIGINT/SIGTERM (A6).
+## signals.nim — rfc-0007 A4: process-global shutdown-signal query.
 ##
-## Design invariants:
-##   • The handler ONLY sets a volatile flag — no Nim runtime, no GC, no alloc,
-##     no string ops.  All cleanup work runs in the poll loop's normal context.
-##   • Installation is opt-in via installSignalHandlers().  Tests that call
-##     execute() directly never install the handler and therefore never hit the
-##     interrupted path.
-##   • gotSignal is a volatile cint (equivalent to sig_atomic_t).  The
-##     {.volatile.} pragma prevents the compiler from caching the value.
+## Before A4 this module owned its OWN sigaction install (`gotSignal`,
+## `installSignalHandlers`, `pendingSignal`, `clearSignal`) — a second,
+## independent signal-handling mechanism that `runner.execute`'s Supervisor
+## (`process/posixcore.nim`) never touched. A2b moved SIGINT/SIGTERM
+## installation onto each `execute()` call's own Supervisor
+## (`initSupervisor(installSignals)`, §1) and this module's old surface
+## went unused in production — its only remaining callers were tests.
+##
+## A4 unifies the seam "for real" (posixcore.nim's own words): there is now
+## exactly ONE sigaction install site (`process/posixcore.shutdownSigHandler`,
+## wired through `initSupervisor(installSignals = true)`), and this module
+## is a THIN VIEW over the same state that handler stamps — the process-
+## global, level-triggered mirror that also feeds the Supervisor's
+## `weShutdown` wait event and RFC-0003's `128+n` exit-code derivation.
+##
+## `shutdownRequested()` exists for library callers whose OWN `execute()`
+## call passes `installSignals = false` (opting out — they don't want
+## crisol replacing their host application's handlers for that call) but
+## who still want to observe, from anywhere in the process, whether SOME
+## Supervisor elsewhere (installSignals = true) has seen a shutdown signal
+## — without needing a reference to that Supervisor, which `execute()`
+## never exposes.
 ##
 ## Public surface:
-##   installSignalHandlers*()   — install for SIGINT and SIGTERM
-##   pendingSignal*(): cint     — 0 when no signal received; signal number otherwise
-##   clearSignal*()             — reset flag to 0 (for testing)
+##   shutdownRequested*(): Option[ShutdownSignal]  — `some` iff some
+##     installSignals=true Supervisor in this process has observed
+##     SIGINT/SIGTERM; carries the real signum (RFC-0003's 128+n needs
+##     `n`). Sticky: once set, stays set for the life of the process —
+##     there is no `clearSignal()` counterpart (nothing in production
+##     reads this to decide whether to run; it is a pure observability
+##     query for library callers).
 
-import std/posix
+import std/options
+import crisol/process
 
-# ---------------------------------------------------------------------------
-# Module-level volatile flag
-# ---------------------------------------------------------------------------
+export ShutdownSignal   # so callers can use the return value without a
+                         # separate `import crisol/process/types`
 
-var gotSignal {.global, volatile.}: cint = 0
-
-# ---------------------------------------------------------------------------
-# Handler — only writes to the flag; MUST be async-signal-safe
-# ---------------------------------------------------------------------------
-
-proc sigHandler(signum: cint) {.noconv.} =
-  ## Only stores the signal number.  No Nim runtime, no alloc, no GC, no IO.
-  gotSignal = signum
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-proc installSignalHandlers*() =
-  ## Install sigHandler for SIGINT and SIGTERM using sigaction.
-  ## SA_RESTART is set as defense-in-depth: blocked syscalls (e.g. waitpid in
-  ## the poll loop) are automatically restarted so EINTR is rare, but the poll
-  ## loop still handles EINTR explicitly for defense-in-depth.
-  ## Safe to call multiple times; subsequent calls just re-install.
-  var sa: Sigaction
-  sa.sa_handler = sigHandler
-  discard sigemptyset(sa.sa_mask)
-  sa.sa_flags = SA_RESTART
-  discard sigaction(SIGINT,  sa, nil)
-  discard sigaction(SIGTERM, sa, nil)
-
-proc pendingSignal*(): cint =
-  ## Returns the signal number that was received (SIGINT=2, SIGTERM=15),
-  ## or 0 if no signal has been received.
-  gotSignal
-
-proc clearSignal*() =
-  ## Reset the flag.  Intended for testing only.
-  gotSignal = 0
+proc shutdownRequested*(): Option[ShutdownSignal] =
+  ## Process-global, level-triggered: `some(sig)` once any
+  ## installSignals=true Supervisor in this process has observed
+  ## SIGINT/SIGTERM, `none` otherwise. See module doc for the unification
+  ## this delegates onto.
+  process.globalShutdownSignal()

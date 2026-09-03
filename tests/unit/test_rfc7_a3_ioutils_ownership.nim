@@ -8,8 +8,12 @@
 ## compiler, so only a scan of the text itself can catch a violation:
 ##
 ##   1. `std/posix` import count outside `crisol/process/*`, `ioutils.nim`,
-##      `lock.nim`, `signals.nim` is zero — the A3 bullet's own acceptance
-##      test. `crisol.nim`, `depgraph.nim`, `jsonout.nim`, `ledger.nim`, and
+##      `lock.nim` is zero — the A3 bullet's own acceptance test (A4 drops
+##      `signals.nim` from this allow-list: it delegates onto
+##      `crisol/process.globalShutdownSignal()` instead of installing its own
+##      handler, so it no longer needs `std/posix` directly — see A4's
+##      handler↔Supervisor unification in `process/posixcore.nim`).
+##      `crisol.nim`, `depgraph.nim`, `jsonout.nim`, `ledger.nim`, and
 ##      `shardedledger.nim` are the five modules this slice migrates off
 ##      hand-rolled `posix.open`/`write`/`close`/`getpid` onto the four named
 ##      `ioutils` primitives (`exclusiveCreate`, `appendOpen`,
@@ -40,7 +44,6 @@ const SrcDir = CrisolRoot / "src"
 const AllowedPosixFiles = [
   "crisol/ioutils.nim",
   "crisol/lock.nim",
-  "crisol/signals.nim",
 ]
 
 proc allNimFiles(): seq[string] =

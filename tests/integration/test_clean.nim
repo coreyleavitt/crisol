@@ -379,6 +379,55 @@ suite "crisol advisory lock":
         discard
       check acquired
 
+  test "close-any-fd hazard: an unrelated in-process open+close of the lock path does not drop the lock":
+    ## fcntl(2) POSIX record locks are associated with (process, inode): ANY
+    ## close() of ANY fd this process holds open on the locked file drops
+    ## every lock the process holds on that file -- even a fd opened for a
+    ## completely unrelated purpose (e.g. some other module in the same
+    ## binary stat'ing or reading the lock path). flock(2) locks are
+    ## associated with the OPEN FILE DESCRIPTION instead of the process, so
+    ## an unrelated open+close of the same path in the same process must
+    ## NOT release the lock (RFC-0007 A4).
+    let root = makeTempRoot()
+    defer: removeDir(root)
+
+    let stateDir = root / ".crisol"
+    let lockPath = stateDir / "lock"
+
+    var h = acquireLock(stateDir)
+    check h.fd >= 0
+
+    # A "helper": unrelated code in THIS process opens the same lock path
+    # (e.g. to stat it) and closes it. Under fcntl F_SETLK this alone drops
+    # the lock `h` still believes it holds.
+    let helperFd = posix.open(lockPath.cstring, O_RDONLY)
+    check helperFd >= 0
+    check posix.close(helperFd) == 0
+
+    # The lock must STILL be held: a forked child's acquireLock must still
+    # observe contention.
+    let resultFile = root / "hazard_result.txt"
+    let childPid = fork()
+    if childPid == 0:
+      var gotContention = false
+      try:
+        var h2 = acquireLock(stateDir)
+        releaseLock(h2)
+      except CrisolError as e:
+        if e.kind == cekEnvironment:
+          gotContention = true
+      except:
+        discard
+      writeFile(resultFile, if gotContention: "1" else: "0")
+      quit(0)
+    else:
+      var ws: cint = 0
+      discard waitpid(childPid, ws, 0)
+      releaseLock(h)
+
+      check fileExists(resultFile)
+      check readFile(resultFile).strip() == "1"
+
 # ---------------------------------------------------------------------------
 # Suite 6 — read-only commands do not acquire the lock
 # ---------------------------------------------------------------------------

@@ -1,8 +1,13 @@
 ## test_run_tests.nim — boundary tests for runTests() (S2a–S2d, F1).
 ##
 ## Tests observable behavior through the public crisol/api surface only.
-## No internal call sequences; no process spawning for signal tests
-## (signal delivery is covered by the existing test_signal.nim integration).
+## No internal call sequences; end-to-end SIGINT/SIGTERM-through-execute()
+## behavior is covered by the existing test_signal.nim integration suite.
+## The one S2d test that forks and signals itself does so ONLY to exercise
+## `crisol/signals.shutdownRequested()`'s process-global isolation from a
+## fresh runTests() call (rfc-0007 A4) — real signal delivery stays
+## confined to that forked child so this file's other tests never observe
+## process-global signal state.
 ##
 ## Covers (S2a):
 ##   - runTests happy path: all-pass fixture → rsOk, exitCode 0, populated results + settings
@@ -24,17 +29,22 @@
 ## Covers (S2d):
 ##   - manageLock:false skips lock entirely (runs without a state dir)
 ##   - memThrottledSlots surfaced on RunReport (0 when mem-aware off)
-##   - clearSignal at entry: setting signal flag before runTests does NOT interrupt it
-##     (observable: runTests returns rsOk, not rsInterrupted)
+##   - rfc-0007 A4: a STALE `shutdownRequested()` (some OTHER
+##     installSignals=true Supervisor in this process saw a signal earlier)
+##     does NOT interrupt a later runTests(installSignals:false) call —
+##     each execute() call owns its OWN fresh Supervisor/pendingShutdown
+##     queue (A2b), so the process-global sticky flag `signals.nim` exposes
+##     is never consulted by interrupted-detection.
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_run_tests.nim
 
-import std/[options, os, osproc, strutils, unittest]
+import std/[options, os, osproc, posix, strutils, unittest]
 import crisol/api
 import crisol/types
 import crisol/signals
+import crisol/process
 
 import crisol/process/types as ptypes
 
@@ -326,10 +336,10 @@ group "unit" {
     check rr.results.len == 0
 
 # ---------------------------------------------------------------------------
-# S2d — manageLock + memThrottledSlots + clearSignal at entry
+# S2d — manageLock + memThrottledSlots + stale shutdownRequested()
 # ---------------------------------------------------------------------------
 
-suite "runTests — S2d lock lifecycle + clearSignal + memThrottledSlots":
+suite "runTests — S2d lock lifecycle + shutdownRequested isolation + memThrottledSlots":
 
   test "manageLock:false skips lock — runs successfully without state dir lock":
     withTempProject:
@@ -353,29 +363,49 @@ suite "runTests — S2d lock lifecycle + clearSignal + memThrottledSlots":
       let rr = runTests(opts)
       check rr.memThrottledSlots == 0
 
-  test "clearSignal at entry: stale signal flag does NOT interrupt the next runTests call":
-    ## If a signal was recorded (e.g. from a prior call) the flag should be
-    ## cleared at the start of runTests so the current call is not instantly
-    ## interrupted.  We set the flag manually, call runTests, and assert rsOk.
+  test "rfc-0007 A4: a stale process-global shutdownRequested() does NOT interrupt a fresh runTests call":
+    ## Real signal delivery happens in a FORKED child so the process-global
+    ## flag `crisol/signals` reads is never mutated in the test runner's own
+    ## process. Inside the child: install a Supervisor with
+    ## installSignals=true and self-signal SIGTERM (so shutdownRequested()
+    ## goes `some` — simulating "some earlier Supervisor elsewhere in this
+    ## process saw a shutdown signal"), THEN run runTests(installSignals:
+    ## false) in that SAME process. If the stale global leaked into the new
+    ## call's interrupted-detection, this run would report rsInterrupted;
+    ## it must not, because each execute() call owns its own fresh
+    ## Supervisor/pendingShutdown queue (A2b) — shutdownRequested()'s
+    ## global is a separate, sticky, read-only mirror, never consulted by
+    ## the poll loop.
     withTempProject:
       writePassFixture(projectRoot / "tests" / "unit", "test_pass.nim")
-      # Simulate a stale signal from a prior call.
-      installSignalHandlers()   # ensure handler installed so gotSignal is writable
-      # We cannot set gotSignal directly (it's module-private), but we can use
-      # clearSignal to verify the clearing behavior is idempotent.  The real
-      # guarantee is tested by checking that runTests returns rsOk when no signal
-      # arrives during the current call.
-      clearSignal()  # explicit pre-clear (mirrors what runTests does internally)
-      let opts = RunOptions(
-        configPath:     projectRoot / "crisol.kdl",
-        installSignals: false,   # don't replace the handler we installed above
-        persist:        false,
-      )
-      let rr = runTests(opts)
-      # If clearSignal at entry were NOT called and gotSignal were already set,
-      # the execute poll loop would immediately report rr.interrupted == true
-      # (rfc-0007 A1e-ii: CrisolInterrupted is retired) instead of running.
-      # This test verifies the happy path still works when clearSignal was called.
-      check rr.status   == rsOk
-      check rr.exitCode == 0
-      clearSignal()  # cleanup
+      let resultFile = projectRoot / "a4_result.txt"
+
+      let childPid = fork()
+      if childPid == 0:
+        var sv = initSupervisor(installSignals = true)
+        discard sv   # keep the handler installed for the life of this child
+        discard kill(getpid(), SIGTERM)
+        var waited = 0
+        while shutdownRequested().isNone and waited < 2000:
+          os.sleep(10)
+          waited += 10
+        let sawStale = shutdownRequested().isSome
+
+        let opts = RunOptions(
+          configPath:     projectRoot / "crisol.kdl",
+          installSignals: false,
+          persist:        false,
+        )
+        let rr = runTests(opts)
+        let outcome = (if sawStale: "1" else: "0") & "," &
+                      (if rr.status == rsOk: "1" else: "0") & "," & $rr.exitCode
+        writeFile(resultFile, outcome)
+        quit(0)
+      else:
+        var ws: cint = 0
+        discard waitpid(childPid, ws, 0)
+        check fileExists(resultFile)
+        let parts = readFile(resultFile).strip().split(',')
+        check parts[0] == "1"   # the stale global really was observed
+        check parts[1] == "1"   # rr.status == rsOk (not rsInterrupted)
+        check parts[2] == "0"   # rr.exitCode == 0

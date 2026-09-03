@@ -38,6 +38,16 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
   ## with `signals.nim`/`shutdownRequested()` for library callers that opt out.
   Supervisor(core: initPosixCore(installSignals))
 
+proc globalShutdownSignal*(): Option[ShutdownSignal] =
+  ## §1/A4: process-global, level-triggered view of the last shutdown signal
+  ## observed by ANY installSignals=true Supervisor in this process — a
+  ## thin delegation onto posixcore's `gShutdownSignum`, stamped by the
+  ## SAME handler that feeds `next()`'s `weShutdown` event. `crisol/signals`
+  ## is the RFC-named public surface (`shutdownRequested()`, distinct name
+  ## to avoid an ambiguous-call clash for code that imports both modules);
+  ## this proc is what it delegates onto.
+  globalShutdownSignalCore()
+
 proc capabilities*(sv: Supervisor): Capabilities =
   ## Probed once by the caller and memoised there (§4).
   capabilitiesCore(sv.core)

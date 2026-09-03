@@ -66,17 +66,42 @@ type
 # sigaction handlers cannot capture state, so the write end lives in a
 # module-level global — exactly the "process-global handler must reach a
 # per-run Supervisor's pipe" seam §1's lifecycle rules name. One Supervisor
-# with installSignals=true is the supported configuration per process; A4
-# is where signals.nim and this seam get unified for real.
+# with installSignals=true is the supported configuration per process.
+#
+# rfc-0007 A4: the handler ALSO stamps `gShutdownSignum`, a second,
+# sticky, async-signal-safe global — the same write(2) syscall that wakes a
+# blocked `next()` cannot be "the" state on its own, because it is drained
+# per-instance (`PosixCore.pendingShutdown`, consumed edge-triggered, once
+# per delivered signal — §1's weShutdown contract) and unreachable from
+# outside the owning Supervisor. `gShutdownSignum` is the process-global,
+# level-triggered mirror `crisol/signals.shutdownRequested()` reads: ONE
+# handler, ONE signal delivery, two consumption models over the same fact
+# — never two independent `sigaction` installs racing to overwrite each
+# other. This is the seam A4 unifies signals.nim onto for real.
 # ---------------------------------------------------------------------------
 
 var gShutdownWriteFd {.global.}: cint = -1
+var gShutdownSignum {.global, volatile.}: cint = 0
 
 proc shutdownSigHandler(signum: cint) {.noconv.} =
-  ## Async-signal-safe: a single write(2) of the signal number, nothing else.
+  ## Async-signal-safe: writes the signal number to the self-pipe (Supervisor
+  ## wakeup) and stamps the sticky global (shutdownRequested()). No Nim
+  ## runtime, no alloc, no GC — a volatile store and a write(2), nothing else.
+  gShutdownSignum = signum
   if gShutdownWriteFd >= 0:
     var b = uint8(signum)
     discard posix.write(gShutdownWriteFd, addr b, 1)
+
+proc globalShutdownSignalCore*(): Option[ShutdownSignal] =
+  ## Process-global, level-triggered view of the last shutdown signal any
+  ## installSignals=true Supervisor in THIS process has observed (§1's
+  ## `shutdownRequested()` seam) — sticky by design: unlike `next()`'s
+  ## per-instance `weShutdown` (edge-triggered, consumed once), a caller
+  ## with no Supervisor reference at all must still be able to ask "was a
+  ## shutdown ever requested here" at any later point.
+  let s = gShutdownSignum
+  if s != 0: some(ShutdownSignal(signum: int(s)))
+  else: none(ShutdownSignal)
 
 proc initPosixCore*(installSignals: bool): PosixCore =
   ## `initSupervisor` can fail (§1) — this raises OSError (a structural
