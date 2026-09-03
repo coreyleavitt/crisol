@@ -33,6 +33,9 @@ nim.cfg
 /tests/timing/*
 !/tests/timing/*.nim
 !/tests/timing/*/
+/tests/conformance/*
+!/tests/conformance/*.nim
+!/tests/conformance/*/
 /tests/meta/*
 !/tests/meta/*.nim
 !/tests/meta/*/

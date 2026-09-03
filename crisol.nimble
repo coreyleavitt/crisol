@@ -18,10 +18,15 @@ requires "nim >= 2.0"
 # Self-discovering so new test files need no manual registration.
 #
 # CRISOL_TEST_DIRS (colon-separated, optional): overrides the default dir
-# list (["tests/unit", "tests/integration"]) when set. Used by CI to point
-# the harness at tests/meta (the deliberately-failing dummy, proving honest
-# exit-code propagation) and tests/timing (the serial timing leg) without
-# ever letting those dirs leak into a default `nimble test` run.
+# list (["tests/unit", "tests/integration", "tests/conformance"]) when set.
+# Used by CI to point the harness at tests/meta (the deliberately-failing
+# dummy, proving honest exit-code propagation) and tests/timing (the serial
+# timing leg) without ever letting those dirs leak into a default `nimble
+# test` run. tests/conformance (rfc-0007 A2a-ii) IS a default dir — its
+# TIMING-SENSITIVE files self-gate on CRISOL_TIMING_TESTS (quit 0 when
+# unset), same convention as tests/timing/, so the main leg stays
+# deterministic while still compiling+running the non-timing conformance
+# cases here.
 #
 # Honest-exit contract: every discovered file runs, even after an earlier
 # one fails (NimScript's `exec` raises `OSError` on a nonzero child exit —
@@ -49,7 +54,8 @@ const resultMarker = ".crisol-test-result"
 
 task test, "run the unit + integration suites serially (bootstrap runner)":
   let dirsEnv = getEnv("CRISOL_TEST_DIRS")
-  let dirs = if dirsEnv.len > 0: dirsEnv.split(':') else: @["tests/unit", "tests/integration"]
+  let dirs = if dirsEnv.len > 0: dirsEnv.split(':')
+             else: @["tests/unit", "tests/integration", "tests/conformance"]
   var files: seq[string]
   for dir in dirs:
     if dirExists(dir):

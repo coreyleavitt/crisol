@@ -71,11 +71,15 @@ jobs:
       # Serial by design: the timing/rlimits suite (tests/timing/) is
       # deadline- and scheduling-sensitive and flakes under any concurrent
       # host load, this job included — it never shares a runner with `test`.
+      # tests/conformance rides along (rfc-0007 A2a-ii): its TIMING-SENSITIVE
+      # cases (shared grace window, shutdown wakeup, timeout-kill grace
+      # timing) are CRISOL_TIMING_TESTS-gated in-file and only actually run
+      # here — the `test` job's leg quits them out at 0 immediately.
       - name: Run timing suite (serial)
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
             -e CRISOL_TIMING_TESTS=1 \
-            -e CRISOL_TEST_DIRS=tests/timing \
+            -e CRISOL_TEST_DIRS=tests/timing:tests/conformance \
             -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
             ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh

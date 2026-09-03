@@ -85,7 +85,11 @@ case "${cmd}" in
         podman_run bash ci/run-tests.sh
         ;;
     timing)
-        EXTRA_ENV=(--env CRISOL_TIMING_TESTS=1 --env CRISOL_TEST_DIRS=tests/timing)
+        # tests/conformance (rfc-0007 A2a-ii) rides along: its TIMING-SENSITIVE
+        # cases (shared grace window, shutdown wakeup, timeout-kill grace
+        # timing) are gated on CRISOL_TIMING_TESTS and only actually run here;
+        # its non-timing cases re-run harmlessly.
+        EXTRA_ENV=(--env CRISOL_TIMING_TESTS=1 --env CRISOL_TEST_DIRS=tests/timing:tests/conformance)
         podman_run bash ci/run-tests.sh
         ;;
     build)
