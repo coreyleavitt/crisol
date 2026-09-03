@@ -12,7 +12,7 @@ crisol discovers test entrypoints, compiles and runs them in parallel with per-e
 
 ## Status
 
-v0.1.0 — implemented and usable. Reviewed under RFC-0001, RFC-0002, and RFC-0003. Pre-1.0: the public API and config format may change before a stable release.
+v0.1.0 — implemented and usable. Reviewed under RFC-0001 through RFC-0004; RFC-0007 Stage A (the execution substrate: process contract, honest result model, `crisol/run/v2` wire) has landed. Pre-1.0: the public API and config format may change before a stable release.
 
 ## Install
 
@@ -116,7 +116,7 @@ crisol run  [<path>...] [--group <name>]... [--all-groups]
             [--jobs <N>] [--timeout <secs>] [--fail-fast]
             [--dry-run] [--json] [--force-compile]
             [--failed] [--changed [--base <ref>]]
-            [--filter-tag <tag>]
+            [--filter-tag <tag>] [--strict-hygiene]
 crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
 crisol clean [--all] [--config <path>]
 crisol init [<path>] [--force]
@@ -153,12 +153,13 @@ crisol --version | -V | version
 | `--timeout <secs>` | `-t` | Per-entrypoint run-timeout override in seconds. Default: 300. |
 | `--fail-fast` | | Stop launching new entrypoints after the first failure. |
 | `--dry-run` | | Compute and print the plan; compile and run nothing. |
-| `--json` | | Emit machine-readable `crisol/run/v1` JSON to stdout. |
+| `--json` | | Emit machine-readable `crisol/run/v2` JSON to stdout (per-phase `compile`/`run` observation nodes, derived `outcome` strings, `summary.counts`, top-level `substrate` capability node). |
 | `--force-compile` | | Force recompilation of all entrypoints even when the binary is fresh. |
 | `--failed` | | Re-run only entrypoints that failed in the last run (reads `.crisol/lastrun.json`; exit 3 if absent). |
 | `--changed` | | Impact selection: run only entrypoints whose dependency closure intersects the git diff. Requires a git work tree (exit 3 otherwise). |
 | `--base <ref>` | | With `--changed`: diff against `<ref>` instead of HEAD. **Requires `--changed`; supplying `--base` without it is an error (exit 3).** |
 | `--filter-tag <tag>` | | Reporting-level filter: show only test records tagged `<tag>`. Entrypoints still run in full; only the report is filtered. Emits a warning to stderr when no records match. Exit code is unchanged. |
+| `--strict-hygiene` | | A would-be pass with an **observed escapee** (a leaked same-process-group descendant still running at reap time) is reported as a failure (exit 1) instead of a pass — at every reporting boundary: exit code, render, JSON/JUnit, `lastrun.json`. Off by default: the escapee is still shown (`[ESCAPEE]` tag, `evidence.escapees` in JSON) but does not fail the run. Also settable via `crisol.kdl`'s `strict-hygiene #true`; the flag can only strengthen a config value. The result cache always stores and derives unstrict — strictness is re-applied when results are reported, so toggling it never invalidates cached results. |
 
 ### Additional flag for `list`
 
@@ -173,12 +174,14 @@ Each plan row is one leg — `path  [group]  <effective flags>  decision` — an
 | Code | Meaning |
 |---|---|
 | `0` | All selected entrypoints passed (or a pure listing succeeded). |
-| `1` | One or more entrypoints failed, compile-failed, timed out, or were signaled. |
+| `1` | One or more entrypoints failed: exited non-zero (or emitted a failing test record), failed to compile, failed to spawn, were **killed** by crisol (a runner-authored timeout or interrupt kill), or **crashed** (ended on a fatal signal crisol did not send). Under `--strict-hygiene`, an escapee-bearing pass also lands here. |
 | `2` | crisol internal error — should not occur in normal operation. |
 | `3` | Environment or configuration error: bad args, no entrypoints found, `--failed` with no prior run, `--changed` outside a git repo, etc. |
-| `128+n` | Run interrupted by signal `n` (SIGINT / SIGTERM). |
+| `128+n` | Run interrupted by signal `n` (SIGINT / SIGTERM), per RFC-0003 — e.g. 130 for SIGINT, 143 for SIGTERM. Takes precedence over exit 1 when an interrupted run also saw failures. |
 
 The data-vs-structural distinction: exit 1 is a *data* result (tests ran, some failed); exit 3 is a *structural* problem (crisol could not set up or interpret the run).
+
+An interrupted run is not discarded: results for every entrypoint that completed before the signal are still reported (human, `--json`, JUnit), the JSON document carries `"interrupted": true` plus a `summary.notStarted` count of entries that never started, and `lastrun.json` is deliberately **not** persisted — `--failed` keeps anchoring on the last complete run, so entrypoints the interrupted run never observed are not silently dropped from its selection.
 
 ## Config reference
 
@@ -196,6 +199,7 @@ All global keys are optional.
 | `max-output-bytes` | int | `10485760` | stdout+stderr capture cap per entrypoint (10 MiB). |
 | `state-dir` | string | `".crisol"` | State directory, relative to the project root (the directory containing `crisol.kdl`). |
 | `flags` | strings | (none) | Extra Nim compile flags applied to every entrypoint. Repeatable (each `flags` node appends). A relative path inside a flag (e.g. `--path:src`) resolves against the project root — see below. |
+| `strict-hygiene` | bool | `#false` | When `#true`, an escapee-bearing pass is reported as a failure — same semantics as the `--strict-hygiene` flag (which can only strengthen this value, never weaken it). The result cache stays unstrict either way. |
 | `dep-roots` | strings | (none) | Additional source roots tracked for impact analysis (`--changed`). Repeatable. |
 
 #### Memory-aware scheduling keys (optional)
@@ -284,17 +288,20 @@ for ep in plan.entrypoints:
 
 Key types in `crisol/api`:
 
-- `RunOptions` — all inputs to `planTests`/`runTests` (config path, group selection, narrowing, jobs, timeout, callbacks, etc.).
-- `RunReport` — output of `runTests`: `.status` (`rsOk`/`rsStructural`/`rsInterrupted`), `.exitCode`, `.summary`, `.results`, `.error`.
+- `RunOptions` — all inputs to `planTests`/`runTests` (config path, group selection, narrowing, jobs, timeout, callbacks, `strictHygiene`, `installSignals`, etc.).
+- `RunReport` — output of `runTests`: `.status` (`rsOk`/`rsStructural`/`rsInterrupted`), `.exitCode`, `.summary`, `.results`, `.error`, `.interrupted`.
+- `EntrypointResult` — one result per leg. It stores the **observation** (`compile` and `run`, each a `Phase` holding a `ProcessResult`: `Exit`, `Cause`, `Evidence`, `Rusage`, `durationUs`); every verdict is **derived** from it, never stored: `outcome(r)`, `cached(r)`, `flaky(r)`, `hasFailRecords(r)`, plus the digest helpers `runResult(r)` (unwraps the run phase's `ProcessResult`, if any) and `failureLine(r)` (render-grade one-liner). There are no stored `outcome`/`exitCode`/`signal` fields; read exit detail off `runResult(r).get.exit`. The `Outcome` enum is `oPassed`/`oFailed`/`oCompileFailed`/`oSpawnError`/`oKilled` (runner-authored kill: timeout or interrupt)/`oCrashed` (fatal signal the runner did not send).
 - `PlanReport` — output of `planTests`: `.entrypoints`, `.jobs`, `.gatedOut`, `.warnings`, `.settings`.
 - `defaultGroups()`, `namedGroups(...)`, `allGroups()`, `filesSelection(...)` — group-selection constructors.
 - `noNarrowing()`, `failedOnly()`, `changedOnly(baseRef="")`, `failedOrChanged(baseRef="")` — narrowing constructors.
 
 `runTests` never raises for expected conditions (structural problems are encoded in `RunReport.status`/`.error`/`.exitCode`). `planTests` raises `CrisolError` on structural problems.
 
+**Interrupts (SIGINT/SIGTERM).** An interrupt never raises either — there is no `CrisolInterrupted` exception. Signal handling is opt-in: with `RunOptions(installSignals: true)` the run's own supervisor installs SIGINT/SIGTERM handlers for the duration of the call (the library default is `false`, so a host application's handlers are left alone). On an interrupt, `runTests` returns normally with `.status == rsInterrupted`, `.interrupted == true`, and `.exitCode == 128 + n` (RFC-0003); `.results`/`.summary` carry the honest partial set — every entrypoint that ran to completion plus those killed at shutdown (reported `oKilled`, cause "runner interrupt"); entrypoints that never started are omitted and counted in `.summary.notStarted` — and `lastrun.json` is not persisted for that run. `crisol/signals`' `shutdownRequested(): Option[ShutdownSignal]` lets code anywhere in the process observe whether some `installSignals: true` run has seen a shutdown signal (sticky; carries the real signum).
+
 The schema-version constants for the JSON documents are exported from `crisol/api`:
 
-- `RunV1Schema = "crisol/run/v1"` (from `crisol/jsonout`)
+- `RunSchema = "crisol/run/v2"` (from `crisol/jsonout`)
 - `PlanV1Schema = "crisol/plan/v1"` (from `crisol/planview`)
 
 ## Structured results — concrete recipe
@@ -356,7 +363,12 @@ closure contains:
   `nim.cfg`/`config.nims` files the compiler read (crisol compiles with
   `-d:nimBetterRun` so Nim records them; the define is not part of the
   entrypoint's flags or identity);
-- every `{.compile: "file.c".}` C/C++/ObjC source and every `{.link: "file.o".}` prebuilt object.
+- every `{.compile: "file.c".}` C/C++/ObjC source and every `{.link: "file.o".}` prebuilt object;
+- every header a `{.compile.}`d source `#include`s that resolves under a
+  tracked root (discovered via a `cc -M` probe of the recorded compile
+  command; a header edit both recompiles the entrypoint — crisol evicts the
+  stale external object so the new bytes reach the binary — and selects it
+  under `--changed`).
 
 Editing any tracked file recompiles the entrypoint on the next run and
 selects it under `--changed`. Two shapes cannot be tracked and are handled
@@ -365,8 +377,9 @@ entrypoint on every run until fixed: the tuple form
 `{.compile: ("pattern*.c", "$1.o").}` (Nim erases the source path from the
 object name; use the single-path form), and object paths that are not
 absolute (`--noAbsolutePaths`). Not tracked by design: `gorge` (a shell
-command, not a file) and the C headers a `{.compile.}`d source `#include`s
-(Nim's own external-object cache ignores headers as well).
+command, not a file) and headers outside every tracked root (system and
+toolchain headers — a toolchain change is keyed by the nimcache's toolchain
+fingerprint, not by the closure).
 
 ## Development
 

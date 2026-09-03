@@ -6,6 +6,137 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### BREAKING CHANGE — run/v1 → run/v2 on the wire; the library result model rebuilt on the process contract (rfc-0007 Stage A, 2026-09-03)
+
+Stage A of RFC-0007 replaces crisol's stored, advisory result fields with
+one platform-neutral observation model — a per-phase `ProcessResult`
+carrying `Exit` (lossless: how the child ended), `Cause` (authorship: who
+ended it), `Evidence` (what the runner can vouch for) and `Rusage` — and
+derives every reported verdict from that observation at each trust
+boundary instead of trusting a stored field.  Both the JSON wire and the
+library API break.  Consumers of `crisol run --json` / `lastrun.json` and
+library embedders are both affected; migration guidance for each is below.
+
+**The JSON wire: `crisol/run/v1` → `crisol/run/v2`.**  The `schema` string
+changes; `schemaRevision` continues its integer scheme (v1 ended at 15, v2
+spans 16–18).  The complete per-field v1→v2 mapping table lives at the top
+of `src/crisol/jsonout.nim`; the substance:
+
+- Each entrypoint gains two **Phase nodes**, `compile` and `run` — the same
+  shape for both (`kind`: `"skipped"`/`"spawnFailed"`/`"ran"`/`"cached"`;
+  when ran/cached: `exit`, `cause`, `evidence`, `rusage`, `durationUs`).
+  A compile timeout/kill is now visible on the wire exactly like a run
+  timeout/kill.  `evidence` carries the real per-limit achieved statuses,
+  the kill-domain/tree observation, observed escapees, the kill-time
+  process snapshot, and the hermetic level the child ran under; `rusage`
+  is wait4's `maxRssBytes`/`userCpuUs`/`sysCpuUs`.
+- The per-entrypoint `outcome` string keeps its key and value domain but is
+  now **derived from the observation** at emission time: a runner-authored
+  kill reads `"killed"` (never `"timedOut"`) and an uncommanded fatal
+  signal reads `"crashed"` (never `"signaled"`) — those two legacy strings
+  no longer appear on any live wire.
+- `summary` drops its scalar `passed`/`failed`/`compileFailed`/`timedOut`/
+  `signaled`/`spawnErrors` counters for a `counts` object keyed by outcome
+  string (`passed`, `exitNonZero`, `compileFailed`, `spawnError`, `killed`,
+  `crashed`), and gains `flaky` and `notStarted` (entries omitted because
+  an interrupt arrived before their next phase started).
+- Top level: `compile` (the telemetry block) is **renamed `compileStats`**,
+  freeing `compile` for the phase node; `interrupted` (bool) is added; and
+  rev 18 adds `substrate` — the process backend's probed capability
+  snapshot, platform-shaped (a Linux node carries `pidfd`/`subreaper`/
+  `cgroupDelegation`/`cgroupKill`/`memoryPeak`/`flock`/`wait4Rusage`;
+  inapplicable fields are absent, never `false`).
+
+**Migrating from run/v1** (old key → new source):
+
+- `entrypoints[].exitCode` → `run.exit.code` when `run.exit.kind == "exited"`
+- `entrypoints[].signal` → `run.exit.sig` when `run.exit.kind == "signaled"`
+- `entrypoints[].durationMs` → per-phase `compile.durationUs` /
+  `run.durationUs` (microseconds; sum them for the old combined figure)
+- `entrypoints[].peakRssBytes` → dropped, no successor key
+  (`run.rusage.maxRssBytes` is the related wait4 figure)
+- rev-15's flat advisory `entrypoints[].exit`/`cause` → absorbed into the
+  `run` phase node, real rather than advisory
+- `summary.passed`/`failed`/`spawnErrors` → `summary.counts["passed"]` /
+  `["exitNonZero"]` / `["spawnError"]`; `summary.timedOut`/`signaled` →
+  `counts["killed"]` / `counts["crashed"]` (new, honest attribution)
+- `compile` (top level) → `compileStats`
+
+A `lastrun.json` written by run/v1 is read as **no data** (cold start, no
+error): the first `--failed` after upgrading exits 3 until a fresh run
+writes a v2 file.  `crisol/plan/v1` keeps its schema string but bumps
+`schemaRevision` 3 → 4: `crisol list --json` / `run --dry-run --json` gain
+the same top-level `substrate` node (additive; older readers unaffected).
+
+**The library API break** (import surface: `crisol/api`):
+
+- **`Outcome` loses `oTimeout` and `oSignal`.**  Their replacements carry
+  the honest attribution: `oKilled` (a runner-authored kill — timeout or
+  interrupt; `cause.by == cbRunner`) and `oCrashed` (the process
+  ended on a signal/NT status the runner did not send).
+  `outcomeString`/`isFailure` stay total over the remaining six values.
+- **`EntrypointResult` loses its stored `outcome`, `exitCode`, `signal`,
+  `achieved`, `peakRssBytes`, `cached`, and `flaky` fields.**  It now
+  carries `compile`/`run: Phase`, and everything is derived: `outcome(r,
+  policy)`, `cached(r)`, `flaky(r, policy)`, `hasFailRecords(r)`,
+  `runResult(r)` (`Option[ProcessResult]` — absorbs the Phase variant
+  check), and `failureLine(r, policy)` (render-grade one-liner).  `Summary`
+  likewise drops `timedOut`/`signaled` for the `counts` array (indexed by
+  `Outcome`) plus `notStarted`.
+- **`CrisolInterrupted` is retired.**  A SIGINT/SIGTERM no longer raises:
+  `runTests` returns normally with `RunReport.interrupted == true`
+  (`status == rsInterrupted`, in lockstep), `exitCode == 128 + n` per
+  RFC-0003, and `results`/`summary` populated with the honest partial
+  emission set — entrypoints that completed plus those killed at shutdown
+  (`oKilled`, cause "runner interrupt"); never-started entries are omitted
+  and counted in `summary.notStarted` — instead of being lost.  `lastrun.json` is deliberately never persisted for an interrupted
+  run, so `--failed` keeps anchoring on the last complete run.  The CLI
+  binary now genuinely exits 130/143 — previously Nim's `quit()` saturated
+  every code above 127 to 127 before it reached the real `exit()`.
+- **`api.RunV1Schema` → `api.RunSchema`** (value `"crisol/run/v2"`).  The
+  constant is deliberately unversioned: future RFCs extend v2 additively.
+- **`crisol/api` re-exports the result-model facade:** `Phase`, `PhaseKind`,
+  `ProcessResult`, `Exit`, `ExitKind`, `Cause`, `CauseBy`, `KillReason`,
+  `Evidence`, `TreeObservation`, `Rusage`, `LimitsAchieved`,
+  `OutcomePolicy` (all from `crisol/process/types`), plus the derived
+  accessors above.
+- **`runner.execute()` (uncontracted but embedded by some consumers)**
+  gains `installSignals` (this call's own Supervisor installs and owns
+  SIGINT/SIGTERM for the duration; library default off), plus the out
+  parameters `interruptedOut`, `notStartedOut`, and `shutdownSignalOut`
+  (the observed signum RFC-0003's `128+n` needs); it no longer raises
+  `CrisolInterrupted`.  `crisol/signals`' `installSignalHandlers`/
+  `pendingSignal`/`clearSignal` are gone — the sticky observability query
+  `shutdownRequested(): Option[ShutdownSignal]` replaces them.
+- **`crisol/spawn.nim` is deleted.**  Spawn/wait/kill live behind
+  `crisol/process`'s Supervisor contract (backend ladder over
+  `process/posixcore`/`posix`/`linux`/`windows`).  `spawn` was never part
+  of the contracted `api` surface, but anything importing it directly must
+  move to `crisol/process`.
+- **`resultCacheFormatVersion` 1 → 3** (two bumps: the payload now stores
+  the real run-phase `ProcessResult` and replays it byte-equal on a hit;
+  the soundness-key fold shape changed with the limits re-home).  Existing
+  cached results are discarded on upgrade (version-partitioned directory +
+  header mismatch = miss); budget one full rerun of previously cached
+  entrypoints.  Compile avoidance and the depgraph are unaffected.
+- Children (compile and run) now spawn with **`projectRoot` as their working
+  directory**, never the invoking shell's cwd (issue #17) — a root-relative
+  compile flag such as `--path:src` now resolves identically from any
+  invocation directory.  A test that read files relative to the crisol
+  process's own cwd was already unsound; it now consistently sees
+  `projectRoot` (isolated runs still chdir into their scratch dir).
+
+**Added — `--strict-hygiene`** (CLI), `strict-hygiene #true` (crisol.kdl),
+`RunOptions.strictHygiene` (library).  A would-be pass with an observed
+escapee — a leaked same-process-group descendant still running at reap
+time — is reported as a failure at every reporting boundary (exit code,
+render, JSON/JUnit wire, `lastrun.json`).  Off by default: the escapee is
+still visible (`[ESCAPEE]` tag, `evidence.escapees` on the wire) but does
+not fail the run.  The CLI flag can only strengthen a config-file value
+(true wins).  The result cache always stores and derives **unstrict**, so
+flipping the flag never invalidates or poisons cached results — strictness
+is re-applied at read-back time.
+
 ### ci: Linux CI baseline — honest exit codes, meta-test mechanism, serial timing leg (rfc-0007 slice A0)
 
 crisol had no CI. `.github/workflows/ci.yml` now runs the suite on every push
