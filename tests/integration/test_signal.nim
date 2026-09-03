@@ -113,13 +113,19 @@ suite "signal handling — SIGINT kills pool and exits 130":
 
       try:
         var g = emptyDepGraph()
-        discard execute(p, config = cfg, graph = g, cache = cacheDisabled(hangSpec))
-        # If execute returned normally (shouldn't happen with a hung fixture),
-        # exit 0 — parent will see this as a test failure.
-        exitnow(0)
-      except CrisolInterrupted as e:
-        # Correct path: exit 128 + signum so parent can verify.
-        exitnow(cint(128 + int(e.signum)))
+        # rfc-0007 A1e-ii: CrisolInterrupted is retired — execute() returns
+        # NORMALLY on SIGINT/SIGTERM now; `interruptedOut` is the real signal.
+        var interrupted = false
+        discard execute(p, config = cfg, graph = g, cache = cacheDisabled(hangSpec),
+                        interruptedOut = addr interrupted)
+        if interrupted:
+          # Correct path: exit 128 + signum so parent can verify.
+          exitnow(cint(128 + int(pendingSignal())))
+        else:
+          # execute() returned normally WITHOUT being interrupted (shouldn't
+          # happen with a hung fixture) — exit 0, parent sees this as a
+          # test failure.
+          exitnow(0)
       except:
         exitnow(cint(1))
       # =====================================================================
@@ -190,12 +196,9 @@ suite "signal handling — normal run with handlers installed":
     let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30)
     let p    = plan(cfg, eps, emptyDepGraph())
 
-    var results: seq[EntrypointResult]
     var g = emptyDepGraph()
-    try:
-      results = execute(p, config = cfg, graph = g)
-    except CrisolInterrupted:
-      check false  # should never happen in this test
+    # rfc-0007 A1e-ii: no CrisolInterrupted to catch any more — a plain call.
+    let results = execute(p, config = cfg, graph = g)
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -212,12 +215,8 @@ suite "signal handling — normal run with handlers installed":
     let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30)
     let p    = plan(cfg, eps, emptyDepGraph())
 
-    var results: seq[EntrypointResult]
     var g = emptyDepGraph()
-    try:
-      results = execute(p, config = cfg, graph = g)
-    except CrisolInterrupted:
-      check false
+    let results = execute(p, config = cfg, graph = g)
 
     check results.len == 1
     check results[0].outcome == oFailed

@@ -154,9 +154,7 @@ suite "jsonout - toJson schema":
     check node.hasKey("entrypoints")
     check node.hasKey("warnings")
 
-  test "top-level interrupted field is false on the normal path (rev 16)":
-    ## rfc-0007 A1d-i: always false this slice -- real interrupt values are
-    ## A1e-ii's.  Placeholder, not a fabricated claim.
+  test "top-level interrupted field defaults to false when not passed (rev 16 field, A1e-ii real value)":
     let node = toJson(syntheticResults(), syntheticSummary())
     check node.hasKey("interrupted")
     check node["interrupted"].kind == JBool
@@ -345,6 +343,92 @@ suite "jsonout - toJson schema":
     check node["schema"].getStr == "crisol/run/v2"
     check node["entrypoints"].len == 0
     check node["summary"]["noTestsRan"].getBool == true
+
+# ---------------------------------------------------------------------------
+# rfc-0007 A1e-ii — interrupt emission rules, PURE (no real signal involved).
+# toJson/toJsonString only SERIALIZE what the caller (runner.execute() +
+# api.runTests()) already computed -- these tests pin that serialization
+# contract directly against hand-built inputs, independent of the real SIGINT/
+# SIGTERM E2E in tests/timing/test_interrupt_e2e.nim.
+# ---------------------------------------------------------------------------
+
+suite "jsonout rfc-0007 A1e-ii — interrupt emission":
+
+  proc killedByInterruptDuringRun(): EntrypointResult =
+    ## Last-started phase = run (compile already finished normally): §2's
+    ## emission rule keeps this entry IN the emission set.
+    EntrypointResult(
+      ep:         makeEp("tests/fixtures/hang_forever.nim"),
+      compile:    okPhase(),
+      run:        ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 15, coreDumped: false),
+                           ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krInterrupt,
+                                       escalated: false)),
+      durationMs: 42,
+      records:    @[])
+
+  proc killedByInterruptDuringCompile(): EntrypointResult =
+    ## Last-started phase = compile (run never started): still IN the
+    ## emission set (compile reached pkRan), but `run` stays "skipped".
+    EntrypointResult(
+      ep:         makeEp("tests/fixtures/slow_compile.nim"),
+      compile:    ranPhase(ptypes.Exit(kind: ptypes.ekSignaled, sig: 15, coreDumped: false),
+                           ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krInterrupt,
+                                       escalated: false)),
+      run:        skippedPhase,
+      durationMs: 7,
+      records:    @[])
+
+  test "interrupted: true threads through when passed explicitly":
+    let node = toJson(syntheticResults(), syntheticSummary(), interrupted = true)
+    check node["interrupted"].getBool == true
+
+  test "toJsonString also threads interrupted through":
+    let s = toJsonString(syntheticResults(), syntheticSummary(), interrupted = true)
+    check parseJson(s)["interrupted"].getBool == true
+
+  test "a run-phase interrupt-killed entry: outcome killed, run.cause {by: runner, reason: interrupt}":
+    let r    = killedByInterruptDuringRun()
+    let node = toJson(@[r], summarize(@[r]), interrupted = true)
+    let ep   = node["entrypoints"][0]
+    check ep["outcome"].getStr       == "killed"
+    check ep["run"]["kind"].getStr   == "ran"
+    check ep["run"]["cause"]["by"].getStr     == "runner"
+    check ep["run"]["cause"]["reason"].getStr == "interrupt"
+
+  test "a compile-phase interrupt-killed entry: outcome killed, compile.cause carries it, run stays skipped":
+    let r    = killedByInterruptDuringCompile()
+    let node = toJson(@[r], summarize(@[r]), interrupted = true)
+    let ep   = node["entrypoints"][0]
+    check ep["outcome"].getStr           == "killed"
+    check ep["compile"]["kind"].getStr   == "ran"
+    check ep["compile"]["cause"]["by"].getStr     == "runner"
+    check ep["compile"]["cause"]["reason"].getStr == "interrupt"
+    check ep["run"]["kind"].getStr       == "skipped"
+
+  test "summary.counts.killed and .passed both reflect a mixed interrupted run":
+    let killed = killedByInterruptDuringRun()
+    let passed = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                                  compile: okPhase(), run: okPhase(), durationMs: 5)
+    let s      = summarize(@[passed, killed])
+    let node   = toJson(@[passed, killed], s, interrupted = true)
+    check node["summary"]["counts"]["killed"].getInt == 1
+    check node["summary"]["counts"]["passed"].getInt == 1
+
+  test "notStarted omission: entries never claimed by a slot are NOT padded into `entrypoints`, only counted":
+    ## §2: the emission set is `results` itself (killed finals included);
+    ## entries whose next phase never started never make it into `results`
+    ## at all -- there is no "notStarted" placeholder entry on the wire, only
+    ## the scalar summary.notStarted count. This mirrors exactly what
+    ## runner.execute()'s post-loop trim does: `results` already excludes
+    ## them, `notStartedOut` carries the count separately.
+    let passed = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                                  compile: okPhase(), run: okPhase(), durationMs: 5)
+    let killed = killedByInterruptDuringRun()
+    var s = summarize(@[passed, killed])
+    s.notStarted = 2   # two entrypoints never dispatched before the interrupt
+    let node = toJson(@[passed, killed], s, interrupted = true)
+    check node["entrypoints"].len == 2   # NOT 4 -- no fabricated entries
+    check node["summary"]["notStarted"].getInt == 2
 
 # ---------------------------------------------------------------------------
 # A8 — cached / inputHash / cacheDecision / schemaRevision

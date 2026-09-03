@@ -335,12 +335,48 @@ proc killAndReap(pid: Pid): KillCapture =
   result = reapBlocking(pid)
   result.escalated = true
 
-proc teardownLiveSlots(slots: var seq[Slot]) =
-  ## M6: Graceful shutdown of all live slots — shared by handleInterrupt and the
-  ## exception finally path.  Mirrors the three-phase approach used in the
-  ## supervise helper and in handleInterrupt (SIGTERM → grace drain → SIGKILL),
-  ## so test children can flush output/protocol records before being killed.
+type
+  SlotKillCapture = object
+    ## What Phase 2/3 below actually observed for one live slot — never
+    ## fabricated (mirrors KillCapture's "reaped == false ⇒ no Phase" rule).
+    pepIdx:    int
+    slotPhase: SlotPhase
+    exit:      ptypes.Exit
+    rusage:    ptypes.Rusage
+    escalated: bool   ## true iff SIGKILL was sent before this exit was
+                       ## observed — same §2 definition killAndReap uses.
+
+proc teardownLiveSlots(
+  slots:          var seq[Slot];
+  plan:           RunPlan;
+  results:        var seq[EntrypointResult];
+  onResult:       ResultCallback;
+  maxOutputBytes: int;
+  attribute:      bool = false;
+): seq[int] =
+  ## M6: Graceful shutdown of all live slots — shared by the SIGINT/SIGTERM
+  ## path and the exception finally path.  Mirrors the three-phase approach
+  ## used in the supervise helper (SIGTERM → grace drain → SIGKILL), so test
+  ## children can flush output/protocol records before being killed.
   ##
+  ## rfc-0007 A1e-ii: `attribute` distinguishes the two callers.
+  ##   true  (the real interrupt path): every slot actually reaped here is
+  ##         attributed `cbRunner/krInterrupt` and stamped into an honest
+  ##         partial `EntrypointResult` — §2's emission rule (an entry is
+  ##         emitted iff its last-started phase is pkRan/pkCached/
+  ##         pkSpawnFailed; compiling→pkRan+run pkSkipped, running→run pkRan
+  ##         with compile carried from slot.compileProcRes) — fired through
+  ##         `onResult` exactly like a live completion, and its pepIdx is
+  ##         returned so the caller can mark it finalized (§2: "onResult
+  ##         fires for killed finals like any other completion").
+  ##   false (the shared finally-block safety net for the normal/exception
+  ##         paths): reaps still happen for correctness, but the observation
+  ##         is DISCARDED, same as before this slice — an exception mid-run
+  ##         (e.g. a raising onResult callback) has no KillReason to author
+  ##         honestly (that is the A2b runner rewrite's job: "exception
+  ##         teardown records NOTHING").
+  var captures = newSeq[Option[SlotKillCapture]](slots.len)
+
   ## Phase 1: SIGTERM all live process groups.
   for s in slots:
     if s.pepIdx != -1:
@@ -363,13 +399,12 @@ proc teardownLiveSlots(slots: var seq[Slot]) =
         allDead = false                   # still alive; keep draining
       elif r > Pid(0):
         reapedInGrace[i] = true           # exited cleanly during grace; do NOT SIGKILL
-        # rfc-0007 A1b: captured (decoded), not discarded — a real Exit, not
-        # a fabricated one. Attribution to an EntrypointResult and emission
-        # on the wire are A1e-ii's job: interrupt-killed results are OMITTED
-        # from the emission set (§2), so there is no result to attach this
-        # to yet.
-        discard decodeExit(ws)
-        discard decodeRusage(ru)
+        # rfc-0007 A1b/A1e-ii: captured (decoded) — a real Exit, not a
+        # fabricated one. No SIGKILL was sent to reach this exit, so
+        # escalated:false (same definition killAndReap uses).
+        captures[i] = some(SlotKillCapture(
+          pepIdx: slots[i].pepIdx, slotPhase: slots[i].phase,
+          exit: decodeExit(ws), rusage: decodeRusage(ru), escalated: false))
     if allDead: break
     os.sleep(20)
 
@@ -383,13 +418,57 @@ proc teardownLiveSlots(slots: var seq[Slot]) =
     let r = wait4(slots[i].pid, addr ws, WNOHANG, addr ru)
     if r == Pid(0):
       discard killpg(slots[i].pid, SIGKILL)
-      discard reapBlocking(slots[i].pid)  # rfc-0007 A1b: captures via wait4; see above
+      let cap = reapBlocking(slots[i].pid)  # rfc-0007 A1b: captures via wait4; see above
+      if cap.reaped:
+        captures[i] = some(SlotKillCapture(
+          pepIdx: slots[i].pepIdx, slotPhase: slots[i].phase,
+          exit: cap.exit, rusage: cap.rusage, escalated: true))
+      # else: truly unreaped (the RFC's "unkillable child" corner, e.g. a
+      # wedged D-state process) — no Phase is fabricated for it; it simply
+      # never appears in `captures`, so it is never attributed and never
+      # joins the emission set (§2: the honest "the run does not complete").
     # else: exited between Phase 2 end and Phase 3 check — already reaped, no SIGKILL
     elif r > Pid(0):
-      # rfc-0007 A1b: captured, not discarded — same deferred-attribution
-      # note as Phase 2 above.
-      discard decodeExit(ws)
-      discard decodeRusage(ru)
+      # rfc-0007 A1b/A1e-ii: captured — same as the Phase 2 branch above,
+      # no SIGKILL was sent to THIS process, so escalated:false.
+      captures[i] = some(SlotKillCapture(
+        pepIdx: slots[i].pepIdx, slotPhase: slots[i].phase,
+        exit: decodeExit(ws), rusage: decodeRusage(ru), escalated: false))
+
+  ## Phase 3.5 (rfc-0007 A1e-ii): attribute captured kills to honest partial
+  ## EntrypointResults and fire onResult — skipped entirely when `attribute`
+  ## is false (the captures above were still needed to reap correctly; only
+  ## their USE as a result is conditional).
+  if attribute:
+    for i in 0 ..< slots.len:
+      if captures[i].isNone: continue
+      let cap = captures[i].get
+      let pep = plan.entrypoints[cap.pepIdx]
+      let elapsed = int64((epochTime() - slots[i].t0) * 1000)
+      let output =
+        if cap.slotPhase == spCompiling:
+          readCapped(slots[i].compOut, maxOutputBytes) & "\n[interrupted]"
+        else:
+          readCapped(slots[i].runOut, maxOutputBytes)
+      var res = EntrypointResult(ep: pep.ep, output: output,
+                                 durationMs: elapsed,
+                                 compileSkipped: slots[i].compileSkipped,
+                                 attempts: slots[i].attempt)
+      let killedRes = buildProcResult(cap.exit, cap.rusage,
+        some((reason: ptypes.krInterrupt, escalated: cap.escalated)), elapsed * 1000)
+      if cap.slotPhase == spCompiling:
+        res.compile = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
+        res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
+      else:
+        res.compile =
+          if slots[i].compileProcRes.isSome:
+            ptypes.Phase(kind: ptypes.pkRan, res: slots[i].compileProcRes.get)
+          else:
+            ptypes.Phase(kind: ptypes.pkSkipped)  # cdSkipFresh: no compile this run
+        res.run = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
+      results[cap.pepIdx] = res
+      onResult(res)
+      result.add cap.pepIdx
 
   ## Phase 4: cleanup temp dirs and clear slot so loops are idempotent on
   ## double-invocation (e.g. interrupt path marks slots idle before finally runs).
@@ -1087,6 +1166,17 @@ proc execute*(
   showProgress:     bool = true;
   progressIntervalMs: int = 30_000;
   memThrottledOut:  ptr int = nil;  ## S6b: if non-nil, written with ac.memThrottledSlots on return
+  interruptedOut:   ptr bool = nil;  ## rfc-0007 A1e-ii: if non-nil, written true iff
+                                    ## a SIGINT/SIGTERM cut this run short (§2) —
+                                    ## CrisolInterrupted is retired; this is its
+                                    ## replacement signal. The raw signal number is
+                                    ## still readable via signals.pendingSignal()
+                                    ## once this is true (nothing clears it in between).
+  notStartedOut:    ptr int = nil;  ## rfc-0007 A1e-ii: if non-nil, written with the
+                                    ## count of entries OMITTED from the returned
+                                    ## seq because their next phase never started
+                                    ## (§2's emission-set rule) — 0 on a normal
+                                    ## (non-interrupted) completion.
   cache:            CacheContext = cacheDisabled(resolveSandbox());  ## M4: cohesive cache bundle
 ): seq[EntrypointResult] =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
@@ -1109,7 +1199,11 @@ proc execute*(
   ## failFast=true: once any completed entrypoint has a failure outcome, no NEW
   ## entrypoints are dispatched.  In-flight entrypoints drain to completion.
   ##
-  ## Results are returned in deterministic plan order (index == pepIdx).
+  ## Results are returned in deterministic plan order (index == pepIdx) — EXCEPT
+  ## on an interrupted run (rfc-0007 A1e-ii, §2): entries whose next phase never
+  ## started are OMITTED entirely (counted in `notStartedOut` instead), so the
+  ## returned seq is shorter than `p.entrypoints` and no longer index-aligned
+  ## to it; relative order among the entries that ARE returned is preserved.
 
   # M1: derive timeouts from config, applying defaults for zero values.
   let compileTimeoutMs =
@@ -1267,14 +1361,12 @@ proc execute*(
   # Cleared when: a fill pass makes dispatch progress OR no longer idle+live+mem-blocked.
   var throttledSince: Option[MonoTime] = none(MonoTime)
 
-  # ---------------------------------------------------------------------------
-  # R2/A6: Signal-interrupt helper — calls teardownLiveSlots (TERM→drain→KILL),
-  # then raises CrisolInterrupted.  teardownLiveSlots marks all slots idle so
-  # the finally block is a no-op for the interrupt path (MED-1).
-  # ---------------------------------------------------------------------------
-  template handleInterrupt(signo: cint) =
-    teardownLiveSlots(slots)
-    raise newCrisolInterrupted(signo)
+  # rfc-0007 A1e-ii: CrisolInterrupted is retired — an interrupt is no longer
+  # an exception, it is a HONEST PARTIAL RESULT (§2).  `wasInterrupted` is
+  # reported to the caller via `interruptedOut`; the loop below `break`s
+  # instead of raising once teardownLiveSlots(attribute = true) has stamped
+  # and emitted every in-flight slot's killed final.
+  var wasInterrupted = false
 
   # ---------------------------------------------------------------------------
   # M12: wrap entire dispatch loop in try/finally so any exception (e.g. from
@@ -1282,13 +1374,6 @@ proc execute*(
   # ---------------------------------------------------------------------------
   try:
     while done < n:
-      # -----------------------------------------------------------------------
-      # A6/R2: check for pending signal before doing any other work this iteration.
-      # -----------------------------------------------------------------------
-      let sig = pendingSignal()
-      if sig != 0:
-        handleInterrupt(sig)
-
       # -----------------------------------------------------------------------
       # Fill idle slots from the queue.
       # Stop pulling new work when failFast and any failure has been recorded.
@@ -1663,6 +1748,29 @@ proc execute*(
             onResult(result[completedIdx])
 
       # -----------------------------------------------------------------------
+      # A6/R2: check for pending signal AFTER polling live slots, not before.
+      # rfc-0007 A1e-ii: a process that already exited during the PREVIOUS
+      # iteration's sleep is reaped by the "Poll all live slots" pass just
+      # above — checking the signal before that pass would misattribute an
+      # already-finished-but-not-yet-reaped entrypoint as interrupt-killed
+      # (the RFC's documented race, narrowed here to the true kernel window
+      # by draining ready exits first — §2's "next drains ready exits before
+      # weDeadline" spec-level narrowing, applied to today's poll loop ahead
+      # of the A2b Supervisor rewrite). teardownLiveSlots(attribute = true)
+      # SIGTERMs/drains/SIGKILLs every REMAINING live slot, stamps + emits
+      # each as a killed final (cbRunner/krInterrupt), and returns their
+      # pepIdxs so this loop can mark them finalized before breaking — the
+      # §2 emission-set bookkeeping the post-loop trim reads.
+      # -----------------------------------------------------------------------
+      let sig = pendingSignal()
+      if sig != 0:
+        wasInterrupted = true
+        for idx in teardownLiveSlots(slots, p, result, onResult, maxOutputBytes,
+                                     attribute = true):
+          finalized[idx] = true
+        break
+
+      # -----------------------------------------------------------------------
       # failFast early-exit: if no slots are live and we would not dispatch any
       # more work, break now — remaining entrypoints were never started.
       # Return only entries from finalized[] so summarize sees only ran
@@ -1728,15 +1836,38 @@ proc execute*(
     # the normal/early-return path (no-ops when all slots are already idle).
     # teardownLiveSlots gives children SIGTERM → GracePeriodMs drain → SIGKILL
     # so they can flush output/protocol records before being killed (M6 fix).
-    # The interrupt path (handleInterrupt) already called teardownLiveSlots and
-    # marked all slots idle, so this call is a no-op for it (MED-1).
+    # The interrupt path above already called teardownLiveSlots(attribute =
+    # true) and marked all slots idle, so this call (attribute defaults to
+    # false: discard, not attribute — see teardownLiveSlots' doc comment) is
+    # a no-op for it (MED-1).
     # S6b: always write memThrottledSlots (normal, early-return, and exception paths).
     # B2: close the ledger shard on all exit paths (normal, early-return, exception).
-    teardownLiveSlots(slots)
+    discard teardownLiveSlots(slots, p, result, onResult, maxOutputBytes)
     if ledgerActive:
       closeLedger(led)
     if memThrottledOut != nil:
       memThrottledOut[] = ac.memThrottledSlots
+
+  # rfc-0007 A1e-ii: trim `result` to the §2 emission set — entries whose
+  # last-started phase is pkRan/pkCached/pkSpawnFailed, i.e. `finalized`.
+  # On a normal (non-interrupted) completion `done == n` is the while loop's
+  # only exit condition, and `done` only ever advances alongside
+  # `finalized[i] = true`, so every index is finalized here and this is a
+  # transparent reshuffle. On an interrupted run, entries never claimed by a
+  # slot (queued, or the RFC's "compile-done-run-unstarted" corner) stay
+  # unfinalized and are OMITTED here rather than emitted as a fabricated
+  # "run never started" lie — counted in notStartedOut instead.
+  var notStarted = 0
+  var emitted: seq[EntrypointResult]
+  for i in 0 ..< n:
+    if finalized[i]: emitted.add result[i]
+    else: inc notStarted
+  result = emitted
+
+  if interruptedOut != nil:
+    interruptedOut[] = wasInterrupted
+  if notStartedOut != nil:
+    notStartedOut[] = notStarted
 
 # ---------------------------------------------------------------------------
 # runEntrypoint — compile + run ONE entrypoint (M6: thin wrapper)

@@ -992,8 +992,13 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     writeStderr("crisol: " & rr.error)
     return rr.exitCode
 
-  if rr.status == rsInterrupted:
-    return rr.exitCode
+  # rfc-0007 A1e-ii: the old early return here (`rsInterrupted -> return
+  # rr.exitCode`, skipping stdout entirely) is RETIRED — that was the second
+  # of the two discard points this slice closes. An interrupted run now
+  # falls through the SAME reporting path as a normal one: rr.results/
+  # rr.summary already carry §2's honest partial emission set, so the JSON/
+  # render/junit writers below need no special-casing beyond threading
+  # rr.interrupted into the wire (see the --json branch below).
 
   # Zero-runnable exit-0 branches: rsOk with zero results.
   if rr.results.len == 0 and rr.status == rsOk:
@@ -1025,7 +1030,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
 
   if jsonMode:
     stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
-                              rr.memThrottledSlots))
+                              rr.memThrottledSlots, interrupted = rr.interrupted))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,
@@ -1064,4 +1069,22 @@ when isMainModule:
   # is the ONLY call site allowed to pass a non-empty selfWorkerBinary — see
   # runMain's doc.
   let code = runMain(commandLineParams(), selfWorkerBinary = getAppFilename())
-  quit(code)
+  # rfc-0007 A1e-ii: system.quit() SATURATES its argument to signed int8
+  # range (-128..127) on POSIX before it ever reaches the real exit()
+  # syscall (system.nim's own doc comment: "quit(int(0x100000000)) is equal
+  # to quit(127) on Linux") — so `quit(130)`/`quit(143)` (RFC-0003's
+  # SIGINT/SIGTERM 128+n codes) would silently both collapse to 127 on the
+  # wire that actually reaches the parent process, discovered by this
+  # slice's SIGINT/SIGTERM E2E (tests/timing/test_interrupt_e2e.nim) —
+  # every exit code crisol ever produces below 128 is unaffected, so this
+  # bypass is scoped to exactly the values that would otherwise be silently
+  # wrong. exitnow (posix `_exit()`) skips Nim's exitprocs/GC-finalize
+  # cleanup, so stdout/stderr are flushed explicitly first — everything
+  # meaningful (the JSON/render output, junit file) is already written by
+  # this point; there is nothing else exitprocs would need to do.
+  if code > high(int8).int:
+    stdout.flushFile()
+    stderr.flushFile()
+    exitnow(cint(code))
+  else:
+    quit(code)

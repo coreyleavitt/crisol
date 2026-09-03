@@ -33,7 +33,7 @@
 ## From types: GroupSelection, GroupSelectionKind, PlannedEntrypoint, Entrypoint,
 ##   Outcome (+ oPassed/oFailed/etc values), TestRecord, RecordStatus, Summary,
 ##   GatedEntry, ConfigWarning, CompileDecision, CrisolError, CrisolErrorKind,
-##   CrisolInterrupted, ResultCallback, EntrypointResult, isFailure, exitCode
+##   ResultCallback, EntrypointResult, isFailure, exitCode
 ## From render: render, gateSkipMessages, pathFlagsWarnings, filterRecordsByTag,
 ##   hasZeroTagMatches, RenderOpts, defaultOpts
 ## From jsonout: toJsonString, RunSchema
@@ -41,7 +41,7 @@
 ##
 ## NOT re-exported: Config, Gate, Group, GateState, GateStateEntry, DiscoveredSet,
 ##   SelectionReason, SelectionResult, RunPlan, persistLastRun, loadLastRun,
-##   newCrisolError, newCrisolInterrupted, ANSI internals (col, Ansi_*, etc.),
+##   newCrisolError, ANSI internals (col, Ansi_*, etc.),
 ##   memThrottleActive, formatProgressLine, planview internals (planToJson,
 ##   decisionStringEd, decisionLabelEd, warningsToJsonArray)
 
@@ -81,7 +81,6 @@ export types.EntrypointDecision
 export types.CacheDecision
 export types.CrisolError
 export types.CrisolErrorKind
-export types.CrisolInterrupted
 export types.ResultCallback
 export types.EntrypointResult
 export types.HermeticLevel
@@ -296,6 +295,14 @@ type
     status*:            RunStatus
     exitCode*:          int   ## ALWAYS set: 0/1 (rsOk), 3 (rsStructural; 2 internal), 128+n (rsInterrupted)
     error*:             string ## non-empty iff status == rsStructural
+    interrupted*:       bool  ## rfc-0007 A1e-ii: true iff a SIGINT/SIGTERM cut this
+                              ## run short. CrisolInterrupted is retired — this bool
+                              ## (status == rsInterrupted, in lockstep) is the
+                              ## replacement signal; results/summary are populated
+                              ## with §2's emission set rather than left empty, and
+                              ## lastrun.json is deliberately never persisted for
+                              ## this run (an entrypoint never observed must not
+                              ## silently leave the --failed selection).
     zeroRunnableReason*: ZeroRunnableReason
     compileBlock*:      JsonNode  ## the SAME `compile` block persisted to
                                   ## lastrun.json (compilereport.readCompileBlock), exposed here
@@ -610,8 +617,11 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   ##   → map exitCode (0 all-passed / 1 any-failure)
   ##
   ## Lock released explicitly on EVERY exit branch (success / structural / interrupt).
-  ## SIGINT/SIGTERM → CrisolInterrupted → rsInterrupted, 128+signum,
-  ##   results = @[], summary = Summary() (zero-initialized).
+  ## rfc-0007 A1e-ii: SIGINT/SIGTERM → rsInterrupted, `interrupted: true`,
+  ##   exitCode = 128 + signum. CrisolInterrupted is retired — execute()
+  ##   returns normally with §2's emission set: `results`/`summary` are
+  ##   populated (not empty), `onResult` already fired for every killed
+  ##   final, and lastrun.json is deliberately never persisted for this run.
 
   # S2d: clear any stale signal from a prior call so sequential runTests calls
   # are safe.
@@ -744,6 +754,12 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
           protocolMajor = CrisolProtocolMajor,
         ))
 
+  # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
+  # are written by execute() itself (via ptr out-params) rather than caught as
+  # an exception; a SIGINT/SIGTERM no longer unwinds this call at all.
+  var interrupted     = false
+  var notStartedCount = 0
+
   try:
     results = execute(
       pv.plan,
@@ -756,16 +772,9 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       showProgress       = opts.showProgress,
       progressIntervalMs = opts.progressIntervalMs,
       memThrottledOut    = addr memThrottled,
+      interruptedOut     = addr interrupted,
+      notStartedOut      = addr notStartedCount,
       cache              = cacheCtx,
-    )
-  except CrisolInterrupted as e:
-    # SIGINT/SIGTERM: release lock and report rsInterrupted.
-    # results and summary are empty / zero per RFC.
-    releaseLock(lockHandle)
-    return RunReport(
-      plan:     pr,
-      status:   rsInterrupted,
-      exitCode: 128 + int(e.signum),
     )
   except CrisolError as e:
     releaseLock(lockHandle)
@@ -775,7 +784,11 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     releaseLock(lockHandle)
     return structuralResultWithPlan("unexpected error during execute: " & e.msg, 2, pr)
 
-  let s = summarize(results)
+  var s = summarize(results)
+  # rfc-0007 A1e-ii §2: notStarted is bookkeeping about entries OMITTED from
+  # `results` (never a fold over `results` itself), so it is stamped on here
+  # rather than inside summarize().
+  s.notStarted = notStartedCount
 
   # C6: Annotate results with regression info (if perf-check is enabled).
   # edCached results are excluded (no fresh measurement; never flag a cache hit).
@@ -817,8 +830,12 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       results[i].perfThresholdUs = verdict.thresholdUs
 
   # Persist lastrun.json if requested.
+  # rfc-0007 A1e-ii §2: NEVER on an interrupted run, regardless of
+  # opts.persist (the CLI always passes persist:true) — an entrypoint that
+  # was never observed this run must not silently leave the --failed
+  # selection, so the last COMPLETE run stays the anchor.
   var compileBlock: JsonNode = nil
-  if opts.persist:
+  if opts.persist and not interrupted:
     # RFC-0006 M-report pass (a): the segmented `compile` block
     # only carries data when the telemetry stream was actually written
     # this run -- avoids a needless ledger disk scan on every ordinary
@@ -841,12 +858,18 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
 
   releaseLock(lockHandle)
 
+  # rfc-0007 A1e-ii: an interrupted run still returns through this ONE
+  # normal-return path (no more early exception-driven return above) — only
+  # the status/exitCode/interrupted trio differ; results/summary already
+  # carry §2's honest partial emission set.
   RunReport(
     plan:              pr,
     summary:           s,
     results:           results,
     memThrottledSlots: memThrottled,
-    status:            rsOk,
-    exitCode:          exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
+    status:            if interrupted: rsInterrupted else: rsOk,
+    exitCode:          if interrupted: 128 + int(pendingSignal())
+                        else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
     compileBlock:      compileBlock,
+    interrupted:       interrupted,
   )

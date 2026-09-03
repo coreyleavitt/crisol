@@ -373,7 +373,8 @@ suite "runTests — S2d lock lifecycle + clearSignal + memThrottledSlots":
       )
       let rr = runTests(opts)
       # If clearSignal at entry were NOT called and gotSignal were already set,
-      # the execute poll loop would immediately raise CrisolInterrupted.
+      # the execute poll loop would immediately report rr.interrupted == true
+      # (rfc-0007 A1e-ii: CrisolInterrupted is retired) instead of running.
       # This test verifies the happy path still works when clearSignal was called.
       check rr.status   == rsOk
       check rr.exitCode == 0

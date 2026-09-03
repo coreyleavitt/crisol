@@ -599,13 +599,10 @@ type
   CrisolError* = object of CatchableError
     kind*: CrisolErrorKind
 
-  CrisolInterrupted* = object of CatchableError
-    ## Raised by execute() when a signal (SIGINT or SIGTERM) is received while
-    ## the poll loop is running.  The signum field carries the raw signal number
-    ## (e.g. 2 for SIGINT, 15 for SIGTERM) so the CLI can compute 128+signum.
-    ## Tests that call execute() without installing signal handlers never see
-    ## this exception.
-    signum*: cint
+  # rfc-0007 A1e-ii: CrisolInterrupted is RETIRED — a SIGINT/SIGTERM is no
+  # longer an exception, it is an honest partial result (§2). execute()
+  # reports it via the `interruptedOut: ptr bool` out-param instead, and
+  # api.nim's RunReport gains `interrupted: bool` (see api.nim/runner.nim).
 
   ResultCallback* = proc(r: EntrypointResult) {.closure.}
     ## Per-entrypoint progress callback.  Called by execute() with the result
@@ -615,13 +612,6 @@ type
 proc newCrisolError*(kind: CrisolErrorKind; msg: string): ref CrisolError =
   ## Construct a CrisolError ready for `raise`.
   result = (ref CrisolError)(kind: kind, msg: msg)
-
-proc newCrisolInterrupted*(signum: cint): ref CrisolInterrupted =
-  ## Construct a CrisolInterrupted ready for `raise`.
-  result = (ref CrisolInterrupted)(
-    signum: signum,
-    msg: "interrupted by signal " & $int(signum),
-  )
 
 # ---------------------------------------------------------------------------
 # Outcome helpers

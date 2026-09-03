@@ -39,10 +39,9 @@
 ##   {
 ##     "schema":      "crisol/run/v2",
 ##     "schemaRevision": <int>,
-##     "interrupted": bool,          // rev 16: true iff this run was cut short
-##                                   // by Ctrl-C; ALWAYS false on the normal
-##                                   // path in this slice — real values are
-##                                   // A1e-ii's (rfc-0007 §2 interrupt bullet).
+##     "interrupted": bool,          // rev 16 (field), A1e-ii (real values):
+##                                   // true iff this run was cut short by
+##                                   // SIGINT/SIGTERM (rfc-0007 §2).
 ##     "summary": {
 ##       total, counts: { passed, exitNonZero, compileFailed, timedOut,
 ##                        signaled, spawnError, killed, crashed },
@@ -123,9 +122,8 @@
 ##   compile           RENAMED KEY     -> "compileStats" (frees "compile" for
 ##                                     the per-entrypoint Phase node)
 ##   reuseAlerts       KEPT            unchanged
-##   (new) interrupted ADDED           top-level bool; false on the normal
-##                                     path this slice; A1e-ii wires real
-##                                     interrupt values (rfc-0007 §2)
+##   (new) interrupted ADDED           top-level bool; true iff a SIGINT/
+##                                     SIGTERM cut this run short (rfc-0007 §2)
 ##   (new) substrate   NOT ADDED       deliberately absent until A7 — no key,
 ##                                     not even null; the honest placeholder
 ##
@@ -150,8 +148,8 @@
 ##   (new) flaky       ADDED  Summary.flaky (count of flaky passes) was never
 ##                            surfaced in v1's summary node; it is now
 ##   (new) notStarted  ADDED  count of entries omitted from the emission set
-##                            on interrupt (rfc-0007 §2); always 0 until
-##                            A1e-ii, an honest placeholder like `interrupted`
+##                            on interrupt (rfc-0007 §2); 0 on any run that
+##                            was not cut short
 ##
 ## PER-ENTRYPOINT (v1: path, group, flags, outcome, exitCode, signal,
 ##                 durationMs, compileSkipped, cached, inputHash,
@@ -470,9 +468,16 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              warnings: seq[ConfigWarning] = @[];
              memThrottledSlots: int = 0;
              compileBlock: JsonNode = nil;
-             reuseAlerts: JsonNode = nil): JsonNode =
+             reuseAlerts: JsonNode = nil;
+             interrupted: bool = false): JsonNode =
   ## Pure: serialize to the crisol/run/v2 JsonNode.
   ## No I/O.
+  ## interrupted: rfc-0007 A1e-ii — true iff this run was cut short by
+  ## SIGINT/SIGTERM (§2). `results` is expected to already be the emission
+  ## set (killed finals included, never-started entries omitted) and
+  ## `summary.notStarted` the omitted count — this proc does not derive
+  ## either, it only serializes what the caller (runner.execute() +
+  ## api.runTests()) already computed.
   ## C3: when filterTag is non-empty, each entrypoint's records array contains
   ## only records whose tags include filterTag.  The summary block always
   ## reflects the full unfiltered run (no re-counting from filtered records).
@@ -588,8 +593,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   result = newJObject()
   result["schema"]           = newJString(RunSchema)
   result["schemaRevision"]   = newJInt(RunSchemaRevision)  # A8: additive minor revision
-  # rev 16: always false on the normal path -- A1e-ii wires real interrupt values.
-  result["interrupted"]      = newJBool(false)
+  # rev 16 introduced the key; rev 17 (A1e-ii) wires the real value through.
+  result["interrupted"]      = newJBool(interrupted)
   result["summary"]          = summaryNode
   result["entrypoints"]      = entrypointsNode
   result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
@@ -609,11 +614,12 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    warnings: seq[ConfigWarning] = @[];
                    memThrottledSlots: int = 0;
                    compileBlock: JsonNode = nil;
-                   reuseAlerts: JsonNode = nil): string =
+                   reuseAlerts: JsonNode = nil;
+                   interrupted: bool = false): string =
   ## Pure: compact JSON string of the crisol/run/v2 document.
   ## C3: filterTag threads through to toJson.
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
-         reuseAlerts)
+         reuseAlerts, interrupted)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
