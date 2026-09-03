@@ -9,12 +9,20 @@
 ##     Pure — no subprocess.  Annotates every entrypoint with a CompileDecision.
 ##     With no graph all entrypoints are annotated cdNeverBuilt.
 ##
-##   execute*(p, config, graph, nimVersion, onResult, ...): seq[EntrypointResult]
+##   execute*(p, config, graph, nimVersion, onResult, ..., recordLedger): seq[EntrypointResult]
 ##     Effectful.  Runs entrypoints with a bounded-parallel poll-loop scheduler
 ##     honouring plan.jobs (A4).  Continue-on-failure: one failure never stops
 ##     the pool.  Results returned in deterministic plan order.
 ##     After each successful compile, records closure + content-hash in graph.
 ##     For cdSkipFresh entrypoints: compile phase is skipped entirely.
+##     recordLedger=false (RFC-0005 B3a) suppresses ledger attempt rows for
+##     this call — the --verify-cache pass's re-runs must not pollute
+##     --order/perf-check/--shard history.
+##
+##   buildVerifyPlan*(entrypoints, indices): RunPlan
+##     Pure.  RFC-0005 B3a: builds a synthetic RunPlan (jobs=1, retries=0)
+##     from the sampled subset of an already-planned run's entrypoints — no
+##     re-discovery, no depgraph mutation.
 ##
 ##   summarize*(results): Summary
 ##     Pure aggregate counts over a result sequence.
@@ -1117,6 +1125,34 @@ proc cleanupSlotTmp(slot: Slot) =
     try: removeDir(slot.testScratchDir) except: discard
 
 # ---------------------------------------------------------------------------
+# RFC-0005 B3a: --verify-cache synthetic plan builder
+# ---------------------------------------------------------------------------
+
+proc buildVerifyPlan*(entrypoints: seq[PlannedEntrypoint];
+                      indices: seq[int]): RunPlan =
+  ## Build a `RunPlan` DIRECTLY from the sampled subset of an already-planned
+  ## run's `PlannedEntrypoint` values (RFC-0005 §Stage B "Synthetic plan, not
+  ## a re-`plan()`") — no re-discovery, no depgraph mutation/save. `indices`
+  ## is normally `sampleHitIndices`'s output (types.nim), but this proc takes
+  ## plain indices so it stays independently shape-testable.
+  ##
+  ## `jobs = 1` (determinism — the RFC requires the verify pass to run
+  ## serially) and each sampled entry's `retries` is forced to 0 (single
+  ## attempt: a retry would mask the very flakiness verify exists to find).
+  ## Every other `PlannedEntrypoint` field is carried through unchanged —
+  ## the sampled entries are still `edRunFresh` at this point (the promotion
+  ## to `edCached` lives only in `PlanLookup.decision`, never written back to
+  ## `edecision`) and dispatch to `spawnRunDirect` exactly like the original
+  ## run's cache hits did.
+  ##
+  ## Pure: never mutates `entrypoints` (the caller's original plan/report).
+  result = RunPlan(jobs: 1)
+  for i in indices:
+    var e = entrypoints[i]
+    e.retries = 0
+    result.entrypoints.add e
+
+# ---------------------------------------------------------------------------
 # execute — bounded-parallel continue-on-failure runner
 # ---------------------------------------------------------------------------
 
@@ -1162,6 +1198,17 @@ proc execute*(
                                     ## a caller that never asks for interrupt
                                     ## handling gets none installed, same as before.
   cache:            CacheContext = cacheDisabled(resolveSandbox());  ## M4: cohesive cache bundle
+  recordLedger:     bool = true;  ## RFC-0005 B3a: default true (existing
+                                  ## behavior unchanged). false suppresses
+                                  ## appendAttemptRow for every attempt this
+                                  ## call makes — the --verify-cache pass sets
+                                  ## this so its re-runs don't pollute
+                                  ## --order/perf-check/--shard ledger history.
+                                  ## The ledger shard is still opened/closed
+                                  ## as normal (harmless — a fresh, empty
+                                  ## per-process shard, per the RFC's
+                                  ## `ledger.nim` shardSeq note); only the
+                                  ## per-attempt row write is gated.
 ): seq[EntrypointResult] =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
   ## scheduler honouring p.jobs (A4).  At most p.jobs child processes alive at
@@ -1438,7 +1485,7 @@ proc execute*(
             # inputHash will be stamped later by the cache-store gate if caching
             # is active, but for observability we record the plan-time key here
             # (consistent: the build identity is the same across all attempts).
-            if ledgerActive:
+            if ledgerActive and recordLedger:
               appendAttemptRow(led, p.entrypoints[completedIdx].ep, slotAttempt,
                                result[completedIdx], inputHashes[completedIdx],
                                slots[idx].peakRssBytes)

@@ -3,7 +3,7 @@
 ## All types shared by discover, plan, and execute. Only what A1–A3 needs is
 ## defined here; later slices append without touching the existing definitions.
 
-import std/[options, sets]
+import std/[algorithm, options, random, sets]
 # rfc-0007 A1c: dependency inversion. Outcome/HermeticLevel now live in
 # process/types.nim (moved out of this module) because EntrypointResult below
 # carries `compile`/`run: Phase` fields directly — process/types cannot import
@@ -764,3 +764,37 @@ proc exitCode*(s: Summary; failOnFlaky: bool = false): int =
      s.counts[oKilled] > 0 or s.counts[oCrashed] > 0: return 1
   if failOnFlaky and s.flaky > 0: return 1
   0
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B3a: pure --verify-cache sampler
+# ---------------------------------------------------------------------------
+
+proc sampleHitIndices*(decisions: openArray[CacheDecision]; pct: int;
+                       seed: int64): seq[int] =
+  ## Pure, deterministic sampler for the `--verify-cache` post-run pass
+  ## (RFC-0005 Stage B). `decisions[i]` is the `cacheDecision` of the i'th
+  ## entrypoint of the run being verified; the caller hands the parallel seq
+  ## (never a PlannedEntrypoint/EntrypointResult directly) so this proc stays
+  ## fixture-vector testable.
+  ##
+  ## Selection basis: the "hit set" is every index i where
+  ## `decisions[i] == cdmHit`. Sample size is `max(1, pct*hits/100)`,
+  ## applied whenever `pct > 0` AND the hit set is non-empty; the result is
+  ## `@[]` otherwise (`pct <= 0`, or no hits at all — a caller must never see
+  ## a synthetic 1-entry sample float out of a run with zero cache hits).
+  ##
+  ## Deterministic: the SAME `(decisions, pct, seed)` always returns the SAME
+  ## seq, in ascending index order — no wall-clock/PID entropy anywhere in
+  ## the selection, matching the RFC's "seeded PRNG" requirement (the default
+  ## per-run seed is the CALLER's concern — B3c reports it in the summary
+  ## line; this proc only consumes whatever seed it is given).
+  var hits: seq[int]
+  for i, d in decisions:
+    if d == cdmHit: hits.add i
+  if pct <= 0 or hits.len == 0:
+    return @[]
+  let sampleSize = max(1, (pct * hits.len) div 100)
+  var rng = initRand(seed)
+  rng.shuffle(hits)
+  result = hits[0 ..< min(sampleSize, hits.len)]
+  result.sort()

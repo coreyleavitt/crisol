@@ -28,6 +28,11 @@
 ##   changedOnly(baseRef="")     → nkChanged; "" = working tree vs HEAD
 ##   failedOrChanged(baseRef="") → nkFailedOrChanged (UNION; wider, not narrower)
 ##
+## ## VerifyCache constructors (RFC-0005 B3a; make strict-without-enabled unconstructable)
+##
+##   noVerify()                          → disabled (RunOptions.verifyCache default)
+##   verifySample(pct=5, seed=none, strict=false) → enabled; --verify-cache facade
+##
 ## ## Public re-exports (selective — see H1)
 ##
 ## From types: GroupSelection, GroupSelectionKind, PlannedEntrypoint, Entrypoint,
@@ -190,6 +195,27 @@ type
     baseRef*: string          ## "" → working tree vs HEAD; only meaningful when
                               ## kind includes nkChanged
 
+  VerifyCache* = object
+    ## RFC-0005 Stage B `--verify-cache` facade ("Facade (round 3)"): the
+    ## determinism backstop re-executes a sample of this run's `cdmHit`
+    ## entries and compares fresh observations against the stored ones.
+    ## Constructed via `noVerify()` / `verifySample(pct, seed, strict)` — do
+    ## NOT construct directly: "strict without enabled" is structurally
+    ## unconstructable via the library API, mirroring `RunNarrowing` above.
+    ## B3a ships only this data shape + the pure sampler/synthetic-plan
+    ## pieces that will consume it; the post-run pass itself is B3b, the CLI
+    ## is B3c.
+    enabled*: bool         ## false (default, via noVerify()) = no verify pass
+    pct*:     int          ## sample percentage of the hit set; see
+                           ## types.sampleHitIndices (max(1, pct*hits/100))
+    seed*:    Option[int64] ## none() = a per-run default seed (the CALLER
+                            ## reports it in the summary line, B3c); some(n)
+                            ## reproduces a specific sample (--verify-cache-seed)
+    strict*:  bool         ## a divergence set exits 1 (CI gate); meaningless
+                           ## when enabled == false — verifySample() is the
+                           ## only way to set it true, and it always implies
+                           ## enabled == true
+
   RunOptions* = object
     ## All options accepted by planTests / runTests.
     ##
@@ -270,6 +296,11 @@ type
     ## this explicitly to get measurement — leaving it unset is always safe
     ## (degrades to monolithic compile, never fork-bombs).
     workerBinary*:        string = ""
+    ## RFC-0005 B3a: the --verify-cache facade. Default-constructed =
+    ## noVerify() (VerifyCache's zero value: enabled=false, strict=false —
+    ## same "zero value IS the disabled state" convention as narrowing*
+    ## above). Nothing consumes this yet; B3b wires the post-run pass.
+    verifyCache*:         VerifyCache
 
   ResolvedSettings* = object
     ## Slim projection of the resolved Config (NOT the full Config).
@@ -417,6 +448,25 @@ proc failedOrChanged*(baseRef: string = ""): RunNarrowing =
   ## UNION of failedOnly and changedOnly — wider, not narrower.
   ## An entrypoint runs if EITHER criterion selects it.
   RunNarrowing(kind: nkFailedOrChanged, baseRef: baseRef)
+
+# ---------------------------------------------------------------------------
+# VerifyCache constructors — RFC-0005 B3a
+# ---------------------------------------------------------------------------
+
+proc noVerify*(): VerifyCache =
+  ## No --verify-cache pass (the default).
+  VerifyCache(enabled: false, pct: 0, seed: none(int64), strict: false)
+
+proc verifySample*(pct: int = 5; seed: Option[int64] = none(int64);
+                   strict: bool = false): VerifyCache =
+  ## Enable the --verify-cache pass. `pct` (default 5, matching
+  ## --verify-cache-pct's default) is the sample percentage of the hit set;
+  ## `pct <= 0` disables sampling regardless of `enabled` (see
+  ## types.sampleHitIndices). `seed` none() = a per-run default (the caller
+  ## reports it in the summary line); some(n) reproduces one specific
+  ## sample. `strict` = a divergence set exits 1 — always paired with
+  ## enabled == true here, so "strict without enabled" never arises.
+  VerifyCache(enabled: true, pct: pct, seed: seed, strict: strict)
 
 # ---------------------------------------------------------------------------
 # H2 — PlanReport-typed facade overloads for planview procs
