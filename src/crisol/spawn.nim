@@ -14,16 +14,25 @@
 ##   forkExec*(args, outputFd)                               → Pid   (< 0 on fork failure)
 ##       The COMPILE path only: no env injection, no sandbox.
 ##   forkExecEnvScratch*(args, outputFd, extraEnv, spec,
-##                       outScratchDir)        → (pid, achieved)     (A4a+A4b+A4d)
-##       The SINGLE spec-driven RUN entry: env scrub + isolated TMPDIR + rlimits
-##       + SandboxAchieved IPC.  A6 threaded this into the live runner dispatch
-##       (spawnRunDirect / spawnRun); the legacy `forkExecEnv` overloads were
-##       retired (forkExecEnvScratch with a hlNone/no-scratch spec subsumes them).
+##                       outScratchDir)        → (pid, achieved)     (A4a+A4b+A4d, A2a-iii)
+##       The SINGLE spec-driven RUN entry: env scrub + isolated TMPDIR (achieved
+##       BY CONSTRUCTION, rfc-0007 §5 — no IPC needed for either) + per-limit
+##       readback over a shrunk pre-fork pipe (rfc-0007 A2a-iii: one status
+##       byte per LimitKind, replacing the old single aggregate rlimitsApplied
+##       bit + SandboxAchieved, which is deleted).  A6 threaded this into the
+##       live runner dispatch (spawnRunDirect / spawnRun); the legacy
+##       `forkExecEnv` overloads were retired (forkExecEnvScratch with a
+##       hlNone/no-scratch spec subsumes them).
 ##   supervise*(pid, timeoutMs)                              → (exitCode, signal, timedOut)
 
 import std/[os, envvars, sequtils, options]
 import std/posix
 import crisol/[types, sandbox]
+from crisol/process/types as ptypes import nil  ## qualified access to the
+  ## §1 Limits/LimitKind/LimitStatus/LimitsAchieved shape (rfc-0007 A2a-iii).
+  ## Deliberately NOT `import crisol/process` — this module stays
+  ## dependency-free of the Supervisor contract until A2b folds the runner
+  ## onto it (see the GracePeriodMs note at the bottom of this file).
 
 proc mkdtemp(tmpl: cstring): cstring
   {.importc: "mkdtemp", header: "<stdlib.h>".}
@@ -74,7 +83,7 @@ var RLIMIT_CPU* {.importc: "RLIMIT_CPU", header: "<sys/resource.h>".}: cint
   ## Resource limit resource ID for CPU time (seconds).
   ## Linux: 0.  When the soft limit is exceeded the kernel sends SIGXCPU
   ## (signal 24 on Linux); when the hard limit is hit the process is killed.
-  ## Applied in the child async-signal-safe window when spec.rlimitConfig.limitCpu
+  ## Applied in the child async-signal-safe window when spec.limits.req[lkCpu]
   ## is some(n).
 
 var RLIMIT_AS* {.importc: "RLIMIT_AS", header: "<sys/resource.h>".}: cint
@@ -180,7 +189,8 @@ proc forkExec*(args: openArray[string]; outputFd: cint): Pid =
 # A6 spawn consolidation: the only spawn entries are now
 #   • forkExec            — compile path (no env injection, no sandbox).
 #   • forkExecEnvScratch  — the SINGLE spec-driven run entry (env scrub +
-#                           isolated TMPDIR + rlimits + SandboxAchieved IPC).
+#                           isolated TMPDIR by construction + per-limit
+#                           readback IPC, rfc-0007 A2a-iii).
 # The legacy `forkExecEnv` overloads (R1 plain-env, A5 spec-env without scratch)
 # were retired in A6: `forkExecEnvScratch` subsumes both (a hlNone spec with no
 # scratch reduces to the plain behavior).  No production or test code calls them.
@@ -191,27 +201,27 @@ proc forkExec*(args: openArray[string]; outputFd: cint): Pid =
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# A4d: SandboxAchieved status-word bit encoding (child → parent over a pre-fork
-# pipe).  The child performs each control, sets the matching bit, and write(2)s
-# this single byte BEFORE execve.  The parent reads it and decodes it into a
-# SandboxAchieved record.  EOF (0 bytes read) ⇒ child died before writing ⇒ all
-# bits false (not achieved).
+# rfc-0007 A2a-iii: per-limit status-byte encoding (child → parent over a
+# pre-fork pipe) — replaces the old single aggregate rlimitsApplied bit AND
+# the env/tmpdir bits (env/tmpdir are achieved BY CONSTRUCTION, §5: the
+# parent resolves the filtered envp and mkdtemp's the scratch dir BEFORE
+# fork, deterministically, so there is nothing left for the child to report).
+# The child writes ONE byte per ``LimitKind`` (its ordinal offset, in enum
+# order) BEFORE execve; the parent reads all of them post-fork and decodes
+# directly into ``LimitsAchieved``.  EOF (fewer than nLimits bytes read) ⇒
+# child died before finishing the write ⇒ every REQUESTED kind reads
+# ``lsFailed`` (never fabricated as applied, never silently downgraded to
+# ``lsNotRequested`` — the ord-0 house rule, §2).
+#
+# Mirrors process/posixcore.nim's ``applyLimitsChildSide``/readback loop
+# (duplicated, not imported — this module stays dependency-free of
+# crisol/process until A2b folds the runner onto the Supervisor and this
+# whole file retires; see the GracePeriodMs note at the bottom).
 # ---------------------------------------------------------------------------
 
-const
-  AchEnvScrubbed*    = uint8(0x01)  ## bit 0 — env allowlist filter applied
-  AchTmpdirIso*      = uint8(0x02)  ## bit 1 — isolated TMPDIR scratch dir created
-  AchRlimitsApplied* = uint8(0x04)  ## bit 2 — rlimits set + getrlimit read-back confirmed
-  AchNetIso*         = uint8(0x08)  ## bit 3 — CLONE_NEWNET applied (not wired today)
-
-proc decodeAchieved(word: uint8): SandboxAchieved =
-  ## Decode the child's status word into a SandboxAchieved record.
-  SandboxAchieved(
-    envScrubbed:    (word and AchEnvScrubbed)    != 0,
-    tmpdirIso:      (word and AchTmpdirIso)      != 0,
-    rlimitsApplied: (word and AchRlimitsApplied) != 0,
-    netIso:         (word and AchNetIso)         != 0,
-  )
+const nLimits = ord(ptypes.LimitKind.high) + 1
+  ## Cardinality of LimitKind — the fixed size of the child→parent readback
+  ## byte buffer (one byte per kind, at its ordinal offset).
 
 proc rlimitReadbackOk(res: cint; want: int64): bool =
   ## Async-signal-safe: after setrlimit, getrlimit and check the soft limit read
@@ -226,13 +236,43 @@ proc rlimitReadbackOk(res: cint; want: int64): bool =
     return false
   rl.rlim_cur == clong(want)
 
+proc applyLimitsChildSide(limits: ptypes.Limits; achieved: var array[nLimits, uint8]) =
+  ## Async-signal-safe: setrlimit + getrlimit read-back only, no heap.
+  ## rfc-0007 A2a-iii: LOOP-DRIVEN over LimitKind — replaces the five
+  ## copied per-field stanzas this proc's predecessor hand-rolled inline.
+  ## Order: RLIMIT_AS last (see the ORDER note this replaces) so earlier
+  ## setrlimit calls are never constrained by the AS ceiling.
+  template applyOne(kind: ptypes.LimitKind; rlimitConst: cint; hardBumpSecs: int64) =
+    if limits.req[kind].isSome:
+      let want = limits.req[kind].get()
+      var rl: RLimit
+      rl.rlim_cur = clong(want)
+      rl.rlim_max = clong(want + hardBumpSecs)
+      if setrlimit(rlimitConst, rl) == 0 and rlimitReadbackOk(rlimitConst, want):
+        achieved[ord(kind)] = uint8(ptypes.lsApplied)
+      else:
+        achieved[ord(kind)] = uint8(ptypes.lsFailed)
+    else:
+      achieved[ord(kind)] = uint8(ptypes.lsNotRequested)
+
+  # A4b: RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE — safe deterministic defaults.
+  # A4c: RLIMIT_CPU, RLIMIT_AS — timing/privilege-sensitive; applied when set.
+  # RLIMIT_CPU's hard limit is set 1s above the soft limit so SIGXCPU fires
+  # first (at the soft limit), giving the caller a distinguishable signal
+  # instead of an immediate/implementation-defined SIGKILL.
+  applyOne(ptypes.lkCore, RLIMIT_CORE, 0)
+  applyOne(ptypes.lkOpenFiles, RLIMIT_NOFILE, 0)
+  applyOne(ptypes.lkFileSize, RLIMIT_FSIZE, 0)
+  applyOne(ptypes.lkCpu, RLIMIT_CPU, 1)
+  applyOne(ptypes.lkAddressSpace, RLIMIT_AS, 0)
+
 proc forkExecEnvScratch*(
   args:         openArray[string];
   outputFd:     cint;
   extraEnv:     openArray[(string, string)];
   spec:         SandboxSpec;
   outScratchDir: var string;
-): tuple[pid: Pid; achieved: SandboxAchieved] =
+): tuple[pid: Pid; achieved: ptypes.LimitsAchieved] =
   ## Like the spec-based forkExecEnv but additionally implements A4a:
   ##
   ## When ``spec.tmpdir == true`` (hlIsolated / hlNetwork):
@@ -257,7 +297,7 @@ proc forkExecEnvScratch*(
   ## ``slot.testScratchDir`` cleaned in cleanupSlotTmp + handleInterrupt.
 
   outScratchDir = ""
-  result = (pid: Pid(-1), achieved: SandboxAchieved())
+  result = (pid: Pid(-1), achieved: default(ptypes.LimitsAchieved))
 
   if args.len == 0:
     return
@@ -318,9 +358,9 @@ proc forkExecEnvScratch*(
       outScratchDir = ""
     return
 
-  # A4d: pre-fork status pipe.  The child write(2)s a single status byte
-  # (achieved-bits) before exec; the parent reads it post-fork.  Both ends are
-  # inherited across fork.  We mark BOTH ends FD_CLOEXEC (cloexecPipe):
+  # A2a-iii: pre-fork status pipe.  The child write(2)s one per-limit status
+  # byte per LimitKind before exec; the parent reads them post-fork.  Both
+  # ends are inherited across fork.  We mark BOTH ends FD_CLOEXEC (cloexecPipe):
   #   - FD_CLOEXEC closes fds at EXEC (not at fork), so the child can STILL
   #     write pipeWrite post-fork/pre-exec.
   #   - At execve the write end auto-closes, so the parent's blocking read()
@@ -353,8 +393,6 @@ proc forkExecEnvScratch*(
 
   if childPid == 0:
     # CHILD — only async-signal-safe operations from here to execve/_exit.
-    # A4d: track achieved-hermeticity bits in a stack uint8 (no heap, no GC).
-    var statusWord: uint8 = 0
 
     # Close the read end in the child immediately — child only writes.
     discard posix.close(pipeRead)
@@ -365,104 +403,33 @@ proc forkExecEnvScratch*(
     discard dup2(outputFd, cint(STDOUT_FILENO))
     discard dup2(outputFd, cint(STDERR_FILENO))
 
-    # A4d: env scrub and tmpdir isolation were performed by the parent BEFORE
-    # fork (the filtered envp and the mkdtemp scratch dir).  The child reports
-    # them honestly: envScrubbed iff the spec requested it (the filtered cenv is
-    # what we exec with); tmpdirIso iff a scratch dir was actually created.
-    if spec.envScrub:
-      statusWord = statusWord or AchEnvScrubbed
-    if scratchCstr != nil:
-      statusWord = statusWord or AchTmpdirIso
+    # rfc-0007 §5: env scrub and tmpdir isolation were performed by the
+    # PARENT before fork (the filtered envp and the mkdtemp scratch dir) —
+    # achieved BY CONSTRUCTION, nothing to report back for either.
 
     # A4a: opt-in chdir into the scratch dir (async-signal-safe chdir(2)).
     # chdir(2) is listed in POSIX as async-signal-safe.
     if doChdirIntoScratch:
       discard posix.chdir(scratchCstr)
 
-    # A4b + A4c: apply config-declared rlimits when spec.rlimits is true.
-    # setrlimit(2) is async-signal-safe.
-    # Strategy: set both soft and hard to the configured value.
-    # Failures are silently discarded — a failed setrlimit should not abort
-    # the run; A4d's SandboxAchieved IPC will report non-achievement.
-    #
-    # A4b: RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE — safe deterministic defaults.
-    # A4c: RLIMIT_CPU, RLIMIT_AS — timing/privilege-sensitive; applied when set.
-    #
-    # ORDER: apply RLIMIT_AS last so that earlier setrlimit calls (which themselves
-    # may briefly touch virtual memory via the kernel's internal path) are not
-    # constrained by the AS limit.  This is a belt-and-suspenders precaution;
-    # setrlimit itself does not allocate user-space memory, but ordering AS last
-    # is conventional and safe.
-    # A4d: rlimitsApplied is confirmed by a getrlimit READ-BACK after every
-    # setrlimit — the bit is set only if EVERY configured limit reads back with
-    # the requested soft value (so the hash/gate reflect what the kernel actually
-    # accepted, not what we asked for).  Any single read-back miss clears the bit.
-    if spec.rlimits:
-      var rl: RLimit
-      var rlimitsOk = true     # cleared if any setrlimit/getrlimit read-back fails
-      if spec.rlimitConfig.limitCore.isSome:
-        let want = spec.rlimitConfig.limitCore.get()
-        rl.rlim_cur = clong(want)
-        rl.rlim_max = clong(want)
-        if setrlimit(RLIMIT_CORE, rl) != 0 or not rlimitReadbackOk(RLIMIT_CORE, want):
-          rlimitsOk = false
-      if spec.rlimitConfig.limitNofile.isSome:
-        let want = spec.rlimitConfig.limitNofile.get()
-        rl.rlim_cur = clong(want)
-        rl.rlim_max = clong(want)
-        if setrlimit(RLIMIT_NOFILE, rl) != 0 or not rlimitReadbackOk(RLIMIT_NOFILE, want):
-          rlimitsOk = false
-      if spec.rlimitConfig.limitFsize.isSome:
-        let want = spec.rlimitConfig.limitFsize.get()
-        rl.rlim_cur = clong(want)
-        rl.rlim_max = clong(want)
-        if setrlimit(RLIMIT_FSIZE, rl) != 0 or not rlimitReadbackOk(RLIMIT_FSIZE, want):
-          rlimitsOk = false
-      # A4c: RLIMIT_CPU — CPU time ceiling (seconds).
-      # When the soft limit is hit the kernel sends SIGXCPU (signal 24).
-      # When the hard limit is hit the kernel sends SIGKILL unconditionally.
-      #
-      # We set soft = limitCpu and hard = limitCpu + 1 so that SIGXCPU fires
-      # first (at the soft limit) and the child terminates with signal 24,
-      # giving the caller a meaningful, distinguishable signal number.  If we
-      # set soft == hard the kernel delivers SIGKILL immediately after SIGXCPU
-      # (or even instead of it, implementation-defined), making it impossible
-      # for the caller to distinguish a CPU limit from other kills.
-      #
-      # The hard limit is set one second above the soft limit.  The child
-      # will be killed by SIGXCPU's default action (terminate) before the hard
-      # limit is ever reached in practice.
-      if spec.rlimitConfig.limitCpu.isSome:
-        let cpuSecs = spec.rlimitConfig.limitCpu.get()
-        rl.rlim_cur = clong(cpuSecs)        # soft: SIGXCPU fires here
-        rl.rlim_max = clong(cpuSecs + 1)    # hard: SIGKILL failsafe (+1s grace)
-        # Read-back confirms the SOFT limit (== cpuSecs); the hard limit is +1s.
-        if setrlimit(RLIMIT_CPU, rl) != 0 or not rlimitReadbackOk(RLIMIT_CPU, cpuSecs):
-          rlimitsOk = false
-      # A4c: RLIMIT_AS — virtual address space ceiling (bytes).
-      # Applied last (see ORDER note above).  When limitAs < MinSafeRlimitAs
-      # ORC's arena mmap()s will fail and the child may SIGSEGV before main()
-      # returns — this is a consumer mis-configuration, not a crisol bug.
-      if spec.rlimitConfig.limitAs.isSome:
-        let want = spec.rlimitConfig.limitAs.get()
-        rl.rlim_cur = clong(want)
-        rl.rlim_max = clong(want)
-        if setrlimit(RLIMIT_AS, rl) != 0 or not rlimitReadbackOk(RLIMIT_AS, want):
-          rlimitsOk = false
-      if rlimitsOk:
-        statusWord = statusWord or AchRlimitsApplied
+    # A2a-iii: apply every config-declared limit, loop-driven, one per-limit
+    # readback byte each — replaces the old single `if spec.rlimits:` gate +
+    # aggregate bit (a kind not requested reads lsNotRequested regardless of
+    # `spec.rlimits`; hlNone's all-none Limits therefore needs no separate
+    # gate at all). setrlimit(2)/getrlimit(2) are async-signal-safe.
+    var achieved: array[nLimits, uint8]
+    applyLimitsChildSide(spec.limits, achieved)
 
-    # A4d: netIso is NOT wired in spawn yet (no unshare(CLONE_NEWNET)); the bit
-    # therefore stays clear, so a hlNetwork request degrades and isFullyAchieved
-    # returns false.  When netIso is implemented it sets AchNetIso here on success.
+    # netIso is NEVER wired in spawn (no unshare(CLONE_NEWNET)) — never-goal,
+    # §5/§6 — so a hlNetwork request always degrades isFullyAchieved to false.
 
-    # A4d: write the status word to the pipe BEFORE execve (partial-write loop).
-    # write(2) is async-signal-safe.  After this the write-end is closed so the
-    # parent's read observes EOF cleanly even if execve somehow leaves the fd open.
-    var wbuf = statusWord
+    # A2a-iii: write the per-limit status bytes to the pipe BEFORE execve
+    # (partial-write loop). write(2) is async-signal-safe. After this the
+    # write-end is closed so the parent's read observes EOF cleanly even if
+    # execve somehow leaves the fd open.
     var off = 0
-    while off < 1:
-      let n = posix.write(pipeWrite, addr wbuf, 1 - off)
+    while off < achieved.len:
+      let n = posix.write(pipeWrite, addr achieved[off], achieved.len - off)
       if n > 0:
         off += int(n)
       elif n < 0 and errno == EINTR:
@@ -478,30 +445,40 @@ proc forkExecEnvScratch*(
 
   # PARENT.
   discard posix.close(nullFd)
-  # A4d: close the write end so our read() sees EOF when the child closes its copy.
+  # Close the write end so our read() sees EOF when the child closes its copy.
   discard posix.close(pipeWrite)
   discard setpgid(childPid, childPid)
 
-  # A4d: blocking read of the single status byte.  EOF (0 bytes) ⇒ child died
-  # before writing ⇒ all bits false (not achieved).  EINTR is retried.
-  var rbuf: uint8 = 0
-  var got: SandboxAchieved
-  while true:
-    let n = posix.read(pipeRead, addr rbuf, 1)
-    if n == 1:
-      got = decodeAchieved(rbuf)
-      break
+  # A2a-iii: blocking read of the per-limit status bytes. A short read (incl.
+  # EOF at 0 bytes) ⇒ child died before finishing the write ⇒ honest
+  # degradation below. EINTR is retried.
+  var rbuf: array[nLimits, uint8]
+  var got = 0
+  while got < rbuf.len:
+    let n = posix.read(pipeRead, addr rbuf[got], rbuf.len - got)
+    if n > 0:
+      got += int(n)
     elif n == 0:
-      got = SandboxAchieved()   # EOF — child died before write; all false
-      break
+      break            # EOF — child died before writing all bytes
     elif n < 0 and errno == EINTR:
       continue
     else:
-      got = SandboxAchieved()   # read error — treat as not achieved
       break
   discard posix.close(pipeRead)
 
-  result = (pid: childPid, achieved: got)
+  var achievedOut: ptypes.LimitsAchieved
+  if got == rbuf.len:
+    for lk in ptypes.LimitKind:
+      achievedOut[lk] = ptypes.LimitStatus(rbuf[ord(lk)])
+  else:
+    # Honest degradation: a REQUESTED limit whose readback never arrived is
+    # `lsFailed` (we cannot vouch it applied), never fabricated as applied
+    # and never silently downgraded to `lsNotRequested` (that would claim
+    # nothing was ever asked for).
+    for lk in ptypes.LimitKind:
+      achievedOut[lk] = if spec.limits.req[lk].isSome: ptypes.lsFailed else: ptypes.lsNotRequested
+
+  result = (pid: childPid, achieved: achievedOut)
 
 # ---------------------------------------------------------------------------
 # GracePeriodMs

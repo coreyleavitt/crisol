@@ -12,19 +12,6 @@ import std/[os, envvars, sequtils, options, monotimes, times, tempfiles]
 import crisol/[types, sandbox]
 import crisol/process
 
-proc limitsFromSpec*(spec: SandboxSpec): Limits =
-  ## Maps SandboxSpec.rlimitConfig onto the §1 `Limits` shape. A spec with
-  ## rlimits=false (hlNone) yields an all-none Limits — "no limits requested".
-  if not spec.rlimits:
-    return Limits()
-  var lim = Limits()
-  lim.req[lkAddressSpace] = spec.rlimitConfig.limitAs
-  lim.req[lkCpu]          = spec.rlimitConfig.limitCpu
-  lim.req[lkFileSize]     = spec.rlimitConfig.limitFsize
-  lim.req[lkOpenFiles]    = spec.rlimitConfig.limitNofile
-  lim.req[lkCore]         = spec.rlimitConfig.limitCore
-  lim
-
 proc buildChildSpec*(bin: string; extraEnv: openArray[(string, string)];
                      spec: SandboxSpec; outPath: string;
                      scratchDir: var string): ChildSpec =
@@ -33,6 +20,10 @@ proc buildChildSpec*(bin: string; extraEnv: openArray[(string, string)];
   ## the backend (§1: "achieved by construction"). `scratchDir` is an out
   ## param so the caller can assert on / clean up the path, mirroring the
   ## old `forkExecEnvScratch(..., outScratchDir)` signature these tests used.
+  ##
+  ## rfc-0007 A2a-iii: `SandboxSpec.limits` IS the §1 `Limits` shape now
+  ## (the old `rlimitConfig`-to-`Limits` mapping this helper used to do —
+  ## `limitsFromSpec` — is gone; there is nothing left to map).
   scratchDir = ""
   var cwd = ""
   var allExtra: seq[(string, string)] = @[]
@@ -44,7 +35,7 @@ proc buildChildSpec*(bin: string; extraEnv: openArray[(string, string)];
       cwd = scratchDir
   let envList = filterEnv(toSeq(envPairs()), spec, allExtra)
   ChildSpec(argv: @[bin], cwd: cwd, env: envList,
-            sinks: combinedSink(outPath), limits: limitsFromSpec(spec))
+            sinks: combinedSink(outPath), limits: spec.limits)
 
 proc spawnAndWait*(sv: var Supervisor; spec: ChildSpec; timeoutMs: int):
     tuple[ok: bool; report: ReapReport] =

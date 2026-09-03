@@ -279,7 +279,7 @@ type
 proc shouldStore*(
   res:       EntrypointResult;
   spec:      SandboxSpec;
-  achieved:  SandboxAchieved;
+  achieved:  ptypes.LimitsAchieved;
   attempt:   int;
   policy:    CachePolicy;
   cacheable: CacheableState = csDefault;
@@ -382,7 +382,7 @@ proc realSeams*(
   ##                        (`<stateDir>/bin/<slug>/<binName>`).  Two entrypoints
   ##                        with the same basename but different paths get different
   ##                        slugs and therefore different argv components.
-  ##   rlimitConfig       ← spec.rlimitConfig
+  ##   limits             ← spec.limits (rfc-0007 §1 enum-indexed Limits home)
   ##   hermeticEnvHash    ← hash of names+values of every env var that actually
   ##                        reaches the hermetic child (post-allowlist-filter),
   ##                        EXCLUDING TMPDIR value (per-run random suffix) and
@@ -436,7 +436,7 @@ proc realSeams*(
       ccVersion:          ccVersion,
       fixtureHash:        "",
       argv:               @[epArgv],
-      rlimitConfig:       spec.rlimitConfig,
+      limits:             spec.limits,
       hermeticEnvHash:    hEnvHash,
       protocolMajor:      protocolMajor,
     ))

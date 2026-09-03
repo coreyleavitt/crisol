@@ -18,6 +18,9 @@ import std/options
 import std/strutils
 import crisol/types
 import crisol/depgraph   # re-uses fnv1a64, toHex16, fnvOffset64; never reimplement
+from crisol/process/types as ptypes import nil  ## qualified access to the
+  ## §1 Limits/LimitKind shape (rfc-0007 A2a-iii) — house convention (see
+  ## runner.nim/jsonout.nim/api.nim); NOT re-exported from crisol/types.
 
 # ---------------------------------------------------------------------------
 # Sentinel for an empty fixture glob set (no files → deterministic constant).
@@ -52,8 +55,13 @@ type KeyInputs* = object
     ## Empty string ⇒ EmptyFixtureSentinel is substituted.
   argv*:               seq[string]
     ## Exact argv the test binary is invoked with.
-  rlimitConfig*:       RlimitConfig
-    ## Config-declared resource limit constants (NOT kernel-achieved limits).
+  limits*:             ptypes.Limits
+    ## Config-declared resource limit REQUESTS (NOT kernel-achieved limits) —
+    ## the §1 enum-indexed shape (rfc-0007 A2a-iii; formerly `rlimitConfig:
+    ## RlimitConfig`, folded into the single `Limits` home SandboxSpec now
+    ## carries). The re-homing changes this fold-input's shape deliberately —
+    ## free under the `resultCacheFormatVersion` bump (§5), which discards
+    ## every existing cache entry regardless.
   hermeticEnvHash*:    string
     ## Hash of the names+values of every env var that actually reaches the
     ## hermetic child (post-allowlist-filter), computed by
@@ -121,16 +129,18 @@ proc soundnessKey*(inp: KeyInputs): SoundnessKey =
   let fixH = if inp.fixtureHash == "": EmptyFixtureSentinel
              else:                     inp.fixtureHash
 
-  # Derive a stable serialisation of RlimitConfig so it participates cleanly.
-  # Format: "as=<v>|cpu=<v>|fsize=<v>|nofile=<v>|core=<v>" with each field
-  # rendered as a decimal or the literal "-" when none.
+  # Derive a stable serialisation of `Limits` so it participates cleanly.
+  # rfc-0007 A2a-iii: LOOP-DRIVEN over LimitKind (no five copied stanzas) —
+  # format "<kindName>=<v>|..." in enum order, each value rendered as a
+  # decimal or the literal "-" when none.  Adding a LimitKind (B3's lkMemory)
+  # is therefore a compiler-forced, automatic addition to this fold, never a
+  # silently-missed sixth stanza.
   proc optStr(o: Option[int64]): string =
     if o.isSome: $o.get else: "-"
-  let rlStr = "as=" & optStr(inp.rlimitConfig.limitAs) & "|" &
-              "cpu=" & optStr(inp.rlimitConfig.limitCpu) & "|" &
-              "fsize=" & optStr(inp.rlimitConfig.limitFsize) & "|" &
-              "nofile=" & optStr(inp.rlimitConfig.limitNofile) & "|" &
-              "core=" & optStr(inp.rlimitConfig.limitCore)
+  var rlStr = ""
+  for kind in ptypes.LimitKind:
+    if rlStr.len > 0: rlStr.add("|")
+    rlStr.add($kind & "=" & optStr(inp.limits.req[kind]))
 
   # Argv is serialised as NUL-joined elements so per-element boundaries are
   # captured within the component value before the per-component wrapping.
@@ -151,7 +161,7 @@ proc soundnessKey*(inp: KeyInputs): SoundnessKey =
   running = chainComponent(running, fixH)
   # 6. argvHash (derived inline from argv seq)
   running = chainComponent(running, argvStr)
-  # 7. rlimitHash (derived inline from RlimitConfig)
+  # 7. rlimitHash (derived inline from Limits, loop-driven over LimitKind)
   running = chainComponent(running, rlStr)
   # 8. hermeticEnvHash
   running = chainComponent(running, inp.hermeticEnvHash)

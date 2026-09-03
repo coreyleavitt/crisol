@@ -17,6 +17,7 @@
 import std/[options, strutils]
 import crisol/keys
 import crisol/types
+import crisol/process/types  ## unqualified Limits/LimitKind (rfc-0007 A2a-iii)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,7 +31,7 @@ proc baseInputs(): KeyInputs =
     ccVersion:          "gcc 13.2.0|ldd 2.39",
     fixtureHash:        "fedcba9876543210",
     argv:               @["./test_foo", "--seed=42"],
-    rlimitConfig:       RlimitConfig(),
+    limits:             Limits(),
     hermeticEnvHash:    "1122334455667788",
     protocolMajor:      1,
   )
@@ -102,10 +103,11 @@ block test_soundness_key_each_component_matters:
   inp.argv = @["./test_foo", "--seed=99"]
   assert soundnessKey(inp) != kBase, "argv must be load-bearing"
 
-  # 7. rlimitConfig — change limitAs
+  # 7. limits — change limitAs (pins: the key changes when a limit changes)
   inp = base
-  inp.rlimitConfig = RlimitConfig(limitAs: some(512 * 1024 * 1024'i64))
-  assert soundnessKey(inp) != kBase, "rlimitConfig must be load-bearing"
+  inp.limits = Limits()
+  inp.limits.req[lkAddressSpace] = some(512 * 1024 * 1024'i64)
+  assert soundnessKey(inp) != kBase, "limits must be load-bearing"
 
   # 8. hermeticEnvHash
   inp = base
@@ -218,7 +220,7 @@ const ExpectedRfc0004Fields = [
   "ccVersion",
   "fixtureHash",
   "argv",
-  "rlimitConfig",
+  "limits",
   "hermeticEnvHash",
   "protocolMajor",
 ]

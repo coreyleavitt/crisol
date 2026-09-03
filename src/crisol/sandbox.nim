@@ -11,6 +11,9 @@ import std/[algorithm, sequtils, strutils]
 import std/options
 import crisol/types
 import crisol/depgraph
+from crisol/process/types as ptypes import nil  ## qualified access to the
+  ## §1 Limits/LimitKind shape (rfc-0007 A2a-iii) — house convention (see
+  ## runner.nim/jsonout.nim/api.nim); NOT re-exported from crisol/types.
 
 # ---------------------------------------------------------------------------
 # Published constant: the default env allowlist
@@ -151,6 +154,13 @@ proc resolveSandbox*(
   let activeNofile = if rlimits.limitNofile.isSome: rlimits.limitNofile else: some(DefaultRlimitNofile)
   let activeCore   = if rlimits.limitCore.isSome:   rlimits.limitCore   else: some(DefaultRlimitCore)
 
+  var lim: ptypes.Limits
+  lim.req[ptypes.lkAddressSpace] = rlimits.limitAs    # default none(int64) per RFC
+  lim.req[ptypes.lkCpu]          = rlimits.limitCpu   # default none(int64) per RFC
+  lim.req[ptypes.lkFileSize]     = activeFsize
+  lim.req[ptypes.lkOpenFiles]    = activeNofile
+  lim.req[ptypes.lkCore]         = activeCore
+
   SandboxSpec(
     level:                level,
     envScrub:             true,
@@ -160,13 +170,7 @@ proc resolveSandbox*(
     chdirIntoScratch:     chdirIntoScratch,
     envAllowlist:         allowlist,
     envAllowlistPrefixes: DefaultEnvAllowlistPrefixes,
-    rlimitConfig: RlimitConfig(
-      limitAs:     rlimits.limitAs,    # default none(int64) per RFC
-      limitCpu:    rlimits.limitCpu,   # default none(int64) per RFC
-      limitFsize:  activeFsize,
-      limitNofile: activeNofile,
-      limitCore:   activeCore,
-    ),
+    limits:               lim,
   )
 
 # ---------------------------------------------------------------------------

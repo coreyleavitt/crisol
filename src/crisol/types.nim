@@ -50,74 +50,55 @@ type
     limitNofile*: Option[int64]   ## override for RLIMIT_NOFILE (max open fds)
     limitCore*:   Option[int64]   ## override for RLIMIT_CORE (core dump size)
 
-  RlimitConfig* = object
-    ## Config-declared resource limit constants for a sandboxed child.
-    ## ``none`` = not set (kernel inherits parent limits).
-    ## ``RLIMIT_AS`` and ``RLIMIT_CPU`` default unset (see RFC-0004 §F2).
-    ## ``RLIMIT_CORE = 0`` (disable core dumps), ``RLIMIT_FSIZE`` and
-    ## ``RLIMIT_NOFILE`` carry safe deterministic defaults when rlimits are active.
-    limitAs*:     Option[int64]   ## RLIMIT_AS  — virtual address space ceiling (bytes); default none
-    limitCpu*:    Option[int64]   ## RLIMIT_CPU — CPU time ceiling (seconds); default none
-    limitFsize*:  Option[int64]   ## RLIMIT_FSIZE — max file size (bytes)
-    limitNofile*: Option[int64]   ## RLIMIT_NOFILE — max open file descriptors
-    limitCore*:   Option[int64]   ## RLIMIT_CORE — core dump size; default some(0) = disabled
-
   SandboxSpec* = object
     ## Resolved specification for a child sandbox.  Produced by ``resolveSandbox``.
-    ## All boolean flags express what is *requested*; what was *achieved* is
-    ## carried by ``SandboxAchieved`` (populated post-fork, slice A4d).
+    ## All boolean flags express what is *requested*.
+    ##
+    ## rfc-0007 A2a-iii (the Limits re-home, §1/§5): resource limits live in
+    ## exactly ONE home — ``limits: Limits``, the enum-indexed shape shared
+    ## with the process contract (``ChildSpec.limits``, ``ReapReport.limits``).
+    ## The old ``rlimitConfig: RlimitConfig`` five-parallel-field struct is
+    ## gone; ``core`` included in the single home like every other kind.
+    ##
+    ## ``SandboxAchieved`` is DELETED outright (§5): env/tmpdir are achieved
+    ## BY CONSTRUCTION — the runner resolves them deterministically before
+    ## the child exists (filtered env, mkdtemp'd scratch dir), nothing to
+    ## probe or degrade — and only limits require kernel readback
+    ## (``LimitsAchieved``, produced per-limit at spawn time and threaded
+    ## through ``isFullyAchieved`` below). ``netIso`` is NEVER wired
+    ## (never-goal, §5/§6) — see ``isFullyAchieved``'s note.
     level*:                HermeticLevel
     envScrub*:             bool          ## apply env allowlist filter
     tmpdir*:               bool          ## create isolated per-entrypoint scratch tmpdir
-    rlimits*:              bool          ## apply config-declared rlimits
+    rlimits*:              bool          ## apply config-declared rlimits (request gate;
+                                         ## the per-kind ``limits.req`` Options are the
+                                         ## load-bearing source of truth — this mirrors
+                                         ## ``envScrub``/``tmpdir`` as a request flag, not
+                                         ## a limit value)
     netIso*:               bool          ## unshare(CLONE_NEWNET) + loopback
     chdirIntoScratch*:     bool          ## chdir into scratch tmpdir (opt-in, default off)
     envAllowlist*:         seq[string]   ## exact env-var names to pass through (sorted)
     envAllowlistPrefixes*: seq[string]   ## prefix patterns (e.g. "LC_") to pass through
-    rlimitConfig*:         RlimitConfig  ## config-declared resource limit constants
+    limits*:               ptypes.Limits ## the SINGLE home for resource limits (§1)
 
-  SandboxAchieved* = object
-    ## What was actually delivered by the child sandbox (populated post-fork, A4d).
-    envScrubbed*:    bool   ## allowlist actually applied
-    tmpdirIso*:      bool   ## isolated TMPDIR actually created
-    rlimitsApplied*: bool   ## config-declared rlimits actually set (getrlimit-readback confirmed)
-    netIso*:         bool   ## CLONE_NEWNET actually applied
-
-proc isFullyAchieved*(spec: SandboxSpec; got: SandboxAchieved): bool =
-  ## Cache gate: true iff every requested control was delivered.
-  (not spec.envScrub or got.envScrubbed)    and
-  (not spec.tmpdir   or got.tmpdirIso)      and
-  (not spec.rlimits  or got.rlimitsApplied) and
-  (not spec.netIso   or got.netIso)
-
-proc interimLimits*(spec: SandboxSpec; got: SandboxAchieved):
-    tuple[limits: ptypes.Limits; achieved: ptypes.LimitsAchieved] =
-  ## rfc-0007 A1f: the INTERIM (pre-A2a-iii) approximation classifyCause's
-  ## cbLimit branch runs on — the RFC's "interim evidence population" table
-  ## (§2). Today's sandbox reports only ONE aggregate `rlimitsApplied` bit
-  ## (all-or-nothing across every rlimit the spec requested), not a
-  ## per-limit getrlimit readback (that is A2a-iii's job — enum-indexed
-  ## `LimitsAchieved`, one status per kind, loop-driven off the existing
-  ## readback). Until then, the aggregate bit is fanned UNIFORMLY over every
-  ## kind the spec actually REQUESTED:
-  ##   requested  + bit true  -> lsApplied
-  ##   requested  + bit false -> lsFailed   (a real request that did not
-  ##                                         confirm — never silently
-  ##                                         promoted to lsApplied)
-  ##   never requested        -> lsNotRequested (the array's ord-0 zero
-  ##                                             value — never a fabricated
-  ##                                             vouch, §2's house rule)
-  result.limits.req[ptypes.lkAddressSpace] = spec.rlimitConfig.limitAs
-  result.limits.req[ptypes.lkCpu]          = spec.rlimitConfig.limitCpu
-  result.limits.req[ptypes.lkFileSize]     = spec.rlimitConfig.limitFsize
-  result.limits.req[ptypes.lkOpenFiles]    = spec.rlimitConfig.limitNofile
-  result.limits.req[ptypes.lkCore]         = spec.rlimitConfig.limitCore
-
-  result.achieved = default(ptypes.LimitsAchieved)  # every kind starts lsNotRequested
+proc isFullyAchieved*(spec: SandboxSpec; achieved: ptypes.LimitsAchieved): bool =
+  ## Cache gate: true iff every REQUESTED limit was delivered (kernel
+  ## readback confirmed it — ``lsApplied``).  env/tmpdir are achieved BY
+  ## CONSTRUCTION (rfc-0007 §5) — the runner resolves them deterministically
+  ## before the child exists, so there is nothing left to probe for either.
+  ##
+  ## ``netIso`` is NEVER wired (never-goal, §5) — a ``netIso`` request can
+  ## never be vouched for, so it unconditionally fails the gate.  This
+  ## matches the pre-A2a-iii behavior exactly (the old ``SandboxAchieved.netIso``
+  ## bit was likewise never set) and RFC-0007 §6's explicit rule: "hlNetwork
+  ## runs remain uncacheable until RFC-0008's observer exists" — caching on a
+  ## bare assertion is the one thing the gate must not do.
+  if spec.netIso:
+    return false
   for kind in ptypes.LimitKind:
-    if result.limits.req[kind].isSome:
-      result.achieved[kind] =
-        if got.rlimitsApplied: ptypes.lsApplied else: ptypes.lsFailed
+    if spec.limits.req[kind].isSome and achieved[kind] != ptypes.lsApplied:
+      return false
+  true
 
 type
   Gate* = object

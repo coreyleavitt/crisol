@@ -65,8 +65,8 @@ suite "A4d rlimit + env/cwd achievement through the Supervisor":
         limitCore:   some(0'i64),
       ),
     )
-    doAssert spec.rlimitConfig.limitAs.isSome
-    doAssert spec.rlimitConfig.limitCpu.isSome
+    doAssert spec.limits.req[lkAddressSpace].isSome
+    doAssert spec.limits.req[lkCpu].isSome
 
     var sv = initSupervisor(installSignals = false)
     let outPath = getTempDir() / "crisol_achieved_test_" & $getCurrentProcessId() & ".txt"
@@ -84,7 +84,7 @@ suite "A4d rlimit + env/cwd achievement through the Supervisor":
 
   test "hlNone: nothing requested -> every kind reads lsNotRequested":
     let spec = resolveSandbox(level = hlNone)
-    doAssert not spec.rlimits
+    doAssert spec.limits == Limits()
 
     var sv = initSupervisor(installSignals = false)
     let outPath = getTempDir() / "crisol_achieved_test_" & $getCurrentProcessId() & ".txt"

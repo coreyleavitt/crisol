@@ -32,6 +32,12 @@ import crisol/process/types as ptypes
 # Helpers
 # ---------------------------------------------------------------------------
 
+proc allApplied(): ptypes.LimitsAchieved =
+  ## A fully-achieved per-limit record (rfc-0007 A2a-iii: SandboxAchieved is
+  ## deleted; env/tmpdir are achieved by construction, so only limits are
+  ## threaded through shouldStore now).
+  for k in ptypes.LimitKind: result[k] = ptypes.lsApplied
+
 proc freshPep(dec: EntrypointDecision;
               cs:  CacheableState = csDefault;
               path = "tests/unit/test_x.nim"): PlannedEntrypoint =
@@ -224,8 +230,7 @@ suite "A9 lookupAtPlan — csTrue/csDefault with global-off":
 suite "A9 shouldStore — csFalse blocks write":
 
   let isoSpec     = resolveSandbox(hlIsolated)
-  let fullAchieved = SandboxAchieved(envScrubbed: true, tmpdirIso: true,
-                                     rlimitsApplied: true, netIso: false)
+  let fullAchieved = allApplied()
 
   proc passResult(): EntrypointResult =
     ## rfc-0007 A1e-i: outcome is derived, not stored — a passing Phase pair
@@ -439,8 +444,7 @@ suite "A9 --force-compile × --no-cache orthogonality":
   test "(a) forceCompile alone: shouldStore fires normally for an edStale live pass":
     ## After forceCompile, a live pass DOES get stored (if hermeticity achieved).
     let isoSpec     = resolveSandbox(hlIsolated)
-    let fullAchieved = SandboxAchieved(envScrubbed: true, tmpdirIso: true,
-                                       rlimitsApplied: true, netIso: false)
+    let fullAchieved = allApplied()
     var r = EntrypointResult(ep: Entrypoint(path: "t.nim"))
     r.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     r.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
@@ -499,8 +503,7 @@ suite "A9 --force-compile × --no-cache orthogonality":
 
     # Store-time: noCache blocks write
     let isoSpec     = resolveSandbox(hlIsolated)
-    let fullAchieved = SandboxAchieved(envScrubbed: true, tmpdirIso: true,
-                                       rlimitsApplied: true, netIso: false)
+    let fullAchieved = allApplied()
     var r = EntrypointResult(ep: Entrypoint(path: "t.nim"))
     r.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     r.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(

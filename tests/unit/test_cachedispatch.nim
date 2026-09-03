@@ -206,9 +206,14 @@ suite "lookupAtPlan — promotion + decision":
 suite "shouldStore — cache-write gate":
 
   let isoSpec = resolveSandbox(hlIsolated)
-  # A fully-achieved hermeticity record for the isolated spec.
-  let fullAchieved = SandboxAchieved(envScrubbed: true, tmpdirIso: true,
-                                     rlimitsApplied: true, netIso: false)
+
+  proc allApplied(): LimitsAchieved =
+    for k in LimitKind: result[k] = lsApplied
+
+  # A fully-achieved per-limit record for the isolated spec (rfc-0007 A2a-iii:
+  # SandboxAchieved is deleted; env/tmpdir are achieved by construction, so
+  # only limits are threaded through shouldStore now).
+  let fullAchieved = allApplied()
 
   proc passResult(): EntrypointResult =
     ## rfc-0007 A1e-i: outcome is derived, not stored — a passing Phase pair
@@ -242,9 +247,10 @@ suite "shouldStore — cache-write gate":
     check not v.store
 
   test "hermeticity degraded → no store, cdmHermeticityDeg":
-    # envScrub requested by isoSpec but not achieved.
-    let degraded = SandboxAchieved(envScrubbed: false, tmpdirIso: true,
-                                   rlimitsApplied: true, netIso: false)
+    # A requested limit (lkCore, requested by default under hlIsolated) whose
+    # kernel readback did not confirm.
+    var degraded = allApplied()
+    degraded[lkCore] = lsFailed
     let v = shouldStore(passResult(), isoSpec, degraded, 1, defaultCachePolicy())
     check not v.store
     check v.decision == cdmHermeticityDeg

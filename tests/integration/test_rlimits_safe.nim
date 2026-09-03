@@ -2,9 +2,10 @@
 ##
 ## Verifies that safe config-declared rlimits (RLIMIT_CORE=0, RLIMIT_NOFILE,
 ## RLIMIT_FSIZE) are applied via process.nim's Supervisor — the §1
-## `ReapReport.limits` per-limit readback — the same requested-and-achieved
-## semantics `spawn.forkExecEnvScratch`'s A4d status pipe used to report as
-## a single aggregate bit.
+## `ReapReport.limits` per-limit readback, the same per-limit semantics
+## `spawn.forkExecEnvScratch`'s status pipe now reports too (rfc-0007
+## A2a-iii replaced its old single aggregate bit with the same per-`LimitKind`
+## shape this Supervisor path already used).
 ##
 ## rfc-0007 A2a-i: migrated off `spawn.forkExecEnvScratch` + the deleted
 ## `spawn.supervise` onto the Supervisor — see `../support/spawnhelpers`.
@@ -92,7 +93,7 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
   test "RLIMIT_FSIZE unset (rlimits=false) → fsize fixture succeeds (control)":
     ## Without a limit, the fixture writes 1 MiB and exits 0.
     let spec = resolveSandbox(level = hlNone)
-    doAssert not spec.rlimits
+    doAssert spec.limits == Limits()
     let r = runFixture(fsizeBin, spec)
     cleanupScratch(r.scratchDir)
     check r.ok
@@ -119,7 +120,7 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
   test "RLIMIT_NOFILE unset (rlimits=false) → nofile fixture succeeds (control)":
     ## Without a limit, the fixture opens 2048 fds and exits 0.
     let spec = resolveSandbox(level = hlNone)
-    doAssert not spec.rlimits
+    doAssert spec.limits == Limits()
     let r = runFixture(nofileBin, spec)
     cleanupScratch(r.scratchDir)
     check r.ok
@@ -136,9 +137,9 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
     ## core.* files and lkCore reads back lsApplied — the same weak-but-best-
     ## available observable the pre-migration test used.
     let spec = resolveSandbox(level = hlIsolated)  # RLIMIT_CORE=0 by default
-    doAssert spec.rlimits
-    doAssert spec.rlimitConfig.limitCore.isSome
-    doAssert spec.rlimitConfig.limitCore.get() == 0
+    doAssert spec.limits != Limits()
+    doAssert spec.limits.req[lkCore].isSome
+    doAssert spec.limits.req[lkCore].get() == 0
 
     let r = runFixture(nofileBin, spec)  # exits 0 normally (no limit here — default nofile is 1024)
     check r.ok
@@ -158,7 +159,7 @@ suite "A4b safe rlimits (RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_FSIZE)":
     ## Both fixtures must complete normally (we already verified the fsize
     ## fixture above; use nofile here as a clean "runs to completion" proxy).
     let spec = resolveSandbox(level = hlNone)
-    doAssert not spec.rlimits
+    doAssert spec.limits == Limits()
     let r = runFixture(nofileBin, spec)
     cleanupScratch(r.scratchDir)
     check r.ok

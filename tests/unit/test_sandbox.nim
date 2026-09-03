@@ -14,6 +14,7 @@
 import std/[sequtils, unittest, options]
 import crisol/[types, sandbox]
 import crisol/api
+import crisol/process/types  ## unqualified Limits/LimitKind (rfc-0007 A2a-iii)
 
 # ---------------------------------------------------------------------------
 # 1. hlIsolated sets envScrub=true, tmpdir=true, rlimits=true, netIso=false
@@ -141,47 +142,43 @@ suite "sandbox — rlimit defaults":
 
   test "RLIMIT_AS defaults to none(int64)":
     let spec = resolveSandbox(level = hlIsolated)
-    check spec.rlimitConfig.limitAs.isNone
+    check spec.limits.req[lkAddressSpace].isNone
 
   test "RLIMIT_CPU defaults to none(int64)":
     let spec = resolveSandbox(level = hlIsolated)
-    check spec.rlimitConfig.limitCpu.isNone
+    check spec.limits.req[lkCpu].isNone
 
   test "RLIMIT_FSIZE has a safe non-none default":
     let spec = resolveSandbox(level = hlIsolated)
-    check spec.rlimitConfig.limitFsize.isSome
+    check spec.limits.req[lkFileSize].isSome
 
   test "RLIMIT_NOFILE has a safe non-none default":
     let spec = resolveSandbox(level = hlIsolated)
-    check spec.rlimitConfig.limitNofile.isSome
+    check spec.limits.req[lkOpenFiles].isSome
 
   test "RLIMIT_CORE defaults to some(0) (disable core dumps)":
     let spec = resolveSandbox(level = hlIsolated)
-    check spec.rlimitConfig.limitCore == some(0'i64)
+    check spec.limits.req[lkCore] == some(0'i64)
 
-  test "hlNone rlimitConfig fields are all none":
+  test "hlNone limits.req fields are all none":
     let spec = resolveSandbox(level = hlNone)
-    check spec.rlimitConfig.limitAs.isNone
-    check spec.rlimitConfig.limitCpu.isNone
-    check spec.rlimitConfig.limitFsize.isNone
-    check spec.rlimitConfig.limitNofile.isNone
-    check spec.rlimitConfig.limitCore.isNone
+    check spec.limits == Limits()
 
 # ---------------------------------------------------------------------------
-# 9. RlimitOverrides bundle (L13): named-field override → rlimitConfig
+# 9. RlimitOverrides bundle (L13): named-field override → limits.req
 # ---------------------------------------------------------------------------
 
 suite "sandbox — RlimitOverrides bundle":
 
   test "default RlimitOverrides() leaves RFC defaults intact":
     let spec = resolveSandbox(level = hlIsolated, rlimits = RlimitOverrides())
-    check spec.rlimitConfig.limitAs.isNone
-    check spec.rlimitConfig.limitCpu.isNone
-    check spec.rlimitConfig.limitFsize.isSome
-    check spec.rlimitConfig.limitNofile.isSome
-    check spec.rlimitConfig.limitCore == some(0'i64)
+    check spec.limits.req[lkAddressSpace].isNone
+    check spec.limits.req[lkCpu].isNone
+    check spec.limits.req[lkFileSize].isSome
+    check spec.limits.req[lkOpenFiles].isSome
+    check spec.limits.req[lkCore] == some(0'i64)
 
-  test "each named override lands in the matching rlimitConfig field":
+  test "each named override lands in the matching limits.req field":
     let spec = resolveSandbox(
       level   = hlIsolated,
       rlimits = RlimitOverrides(
@@ -192,11 +189,11 @@ suite "sandbox — RlimitOverrides bundle":
         limitCore:   some(11'i64),
       ),
     )
-    check spec.rlimitConfig.limitAs     == some(7'i64)
-    check spec.rlimitConfig.limitCpu    == some(8'i64)
-    check spec.rlimitConfig.limitFsize  == some(9'i64)
-    check spec.rlimitConfig.limitNofile == some(10'i64)
-    check spec.rlimitConfig.limitCore   == some(11'i64)
+    check spec.limits.req[lkAddressSpace] == some(7'i64)
+    check spec.limits.req[lkCpu]          == some(8'i64)
+    check spec.limits.req[lkFileSize]     == some(9'i64)
+    check spec.limits.req[lkOpenFiles]    == some(10'i64)
+    check spec.limits.req[lkCore]         == some(11'i64)
 
 # ---------------------------------------------------------------------------
 # 10. RunOptions.hermeticLevel → resolved SandboxSpec.level (L14)
@@ -230,7 +227,7 @@ suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
 
   test "resolveSandbox with no override applies the new 1024 default":
     let spec = resolveSandbox(level = hlIsolated)
-    check spec.rlimitConfig.limitNofile == some(1024'i64)
+    check spec.limits.req[lkOpenFiles] == some(1024'i64)
 
   test "Config.rlimitNofile override is honored by the sandbox spec":
     ## Proves the Config -> RlimitOverrides -> SandboxSpec wiring end to end
@@ -238,12 +235,50 @@ suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
     ## uses at its resolveSandbox call site.
     let cfg  = Config(rlimitNofile: some(4096'i64))
     let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
-    check spec.rlimitConfig.limitNofile == some(4096'i64)
+    check spec.limits.req[lkOpenFiles] == some(4096'i64)
 
   test "Config.rlimitNofile unset (none) falls back to the built-in 1024 default":
     let cfg  = Config()   # rlimitNofile defaults to none(int64)
     let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
-    check spec.rlimitConfig.limitNofile == some(1024'i64)
+    check spec.limits.req[lkOpenFiles] == some(1024'i64)
+
+# ---------------------------------------------------------------------------
+# 12. isFullyAchieved (rfc-0007 A2a-iii): per-limit gate, netIso always false
+# ---------------------------------------------------------------------------
+
+suite "sandbox — isFullyAchieved":
+
+  proc allApplied(): LimitsAchieved =
+    for k in LimitKind: result[k] = lsApplied
+
+  test "every requested limit applied, netIso unrequested → true":
+    let spec = resolveSandbox(level = hlIsolated)  # requests fsize/nofile/core
+    check isFullyAchieved(spec, allApplied())
+
+  test "a requested limit that read back lsFailed → false":
+    let spec = resolveSandbox(level = hlIsolated)
+    var achieved = allApplied()
+    achieved[lkCore] = lsFailed
+    check not isFullyAchieved(spec, achieved)
+
+  test "an unrequested limit's status never matters":
+    let spec = resolveSandbox(level = hlIsolated)  # lkAddressSpace/lkCpu unrequested
+    var achieved = allApplied()
+    achieved[lkAddressSpace] = lsFailed  # never requested — must not fail the gate
+    achieved[lkCpu]          = lsNotRequested
+    check isFullyAchieved(spec, achieved)
+
+  test "netIso requested (hlNetwork) → always false, even with every limit applied":
+    ## netIso is NEVER wired (never-goal, §5) — hlNetwork stays uncacheable
+    ## until RFC-0008's observer exists (§6), matching the pre-A2a-iii
+    ## behavior where SandboxAchieved.netIso was likewise never set.
+    let spec = resolveSandbox(level = hlNetwork)
+    check not isFullyAchieved(spec, allApplied())
+
+  test "hlNone: nothing requested → true regardless of the achieved array":
+    let spec = resolveSandbox(level = hlNone)
+    check isFullyAchieved(spec, default(LimitsAchieved))
+    check isFullyAchieved(spec, allApplied())
 
 when isMainModule:
   echo "All sandbox tests passed."

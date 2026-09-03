@@ -53,7 +53,7 @@ proc expectCoreDumped(): bool =
   ## and sets WCOREDUMP REGARDLESS of the dumping process's RLIMIT_CORE;
   ## the rlimit only gates the plain-file-pattern path. Verified empirically
   ## in this dev container: RLIMIT_CORE=0 is confirmed applied
-  ## (SandboxAchieved.rlimitsApplied / getrlimit readback) and no core FILE
+  ## (LimitsAchieved[lkCore] == lsApplied / getrlimit readback) and no core FILE
   ## lands in the scratch dir, yet WCOREDUMP still reads true because
   ## core_pattern here is `|/lib/systemd/systemd-coredump ...`. Read the
   ## live pattern rather than hardcode either value.
@@ -235,7 +235,7 @@ suite "rfc-0007 A1f — authorship breadth via execute()":
 
     putEnv("HANG_PID_FILE", pidFile)
     let spec = resolveSandbox(level = hlNone)  # no rlimits requested at all
-    doAssert not spec.rlimits
+    doAssert spec.limits == ptypes.Limits()
 
     let watcherPid = fork()
     check watcherPid >= 0

@@ -126,7 +126,7 @@ suite "A4c timing/privilege-sensitive rlimits (RLIMIT_CPU, RLIMIT_AS)":
     ## forceKill drain the RLIMIT_CPU=1s case above never needed because
     ## SIGXCPU already ended that child.
     let spec = resolveSandbox(level = hlNone)  # no rlimits
-    doAssert not spec.rlimits
+    doAssert spec.limits == Limits()
     var sv = initSupervisor(installSignals = false)
     let outPath = getTempDir() / "crisol_timing_test_" & $getCurrentProcessId() & ".txt"
     var scratchDir = ""
@@ -177,7 +177,7 @@ suite "A4c timing/privilege-sensitive rlimits (RLIMIT_CPU, RLIMIT_AS)":
     ## space available.  On any modern 64-bit Linux this is trivially satisfied
     ## (process AS limit is typically 128 TiB).
     let spec = resolveSandbox(level = hlNone)  # no rlimits
-    doAssert not spec.rlimits
+    doAssert spec.limits == Limits()
     let r = runFixture(asBin, spec, timeoutMs = 15_000)
     cleanupScratch(r.scratchDir)
     check r.ok

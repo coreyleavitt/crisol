@@ -207,10 +207,10 @@ type
     slotBinDir:      string        # per-slot bin dir (separate from tmpDir for M15 cleanup)
     compiledThisRun: bool          # false for cdSkipFresh slots
     compileSkipped:  bool          # true for cdSkipFresh slots
-    achieved:        SandboxAchieved  # A4d/A6: hermeticity actually delivered by the
-                                      # run child (set at the spawnRun* call); copied
-                                      # onto the EntrypointResult and used by the
-                                      # cache-store gate (isFullyAchieved).
+    achieved:        ptypes.LimitsAchieved  # A4d/A6/A2a-iii: per-limit readback actually
+                                      # delivered by the run child (set at the spawnRun*
+                                      # call) — used directly by classifyCause's cbLimit
+                                      # branch and the cache-store gate (isFullyAchieved).
     spec:            SandboxSpec   # A6: resolved sandbox spec for the run phase; stored
                                    # at compile-spawn so the compile→run transition
                                    # (spawnRun) can route through forkExecEnvScratch.
@@ -294,10 +294,12 @@ proc buildProcResult(exit: ptypes.Exit; rusage: ptypes.Rusage; stop: Rfc7Stop;
   ## kill capture (stop.isSome always wins in classifyCause regardless of
   ## these two args, so passing zero values there costs nothing and stays
   ## honest). The one caller that DOES have a real rlimit request to report —
-  ## pollSlot's ordinary run-phase reap — passes `interimLimits(slot.spec,
-  ## slot.achieved)` (rfc-0007 A1f): the aggregate-approximation mapping
-  ## documented in the RFC's "interim evidence population" table, live until
-  ## A2a-iii's real per-limit getrlimit readback replaces it.
+  ## pollSlot's ordinary run-phase reap — passes `slot.spec.limits` (the
+  ## requested-limits home) and `slot.achieved` (the REAL per-limit
+  ## `LimitsAchieved` readback spawn.nim's status pipe delivers, rfc-0007
+  ## A2a-iii — the interim aggregate-bit approximation this comment used to
+  ## describe is gone; `interimLimits` had no legitimate callers left once
+  ## the runner path got real per-limit readback and was deleted with it).
   ptypes.ProcessResult(
     exit: exit,
     cause: ptypes.classifyCause(exit, stop, limits, achieved),
@@ -837,7 +839,8 @@ proc spawnRunDirect(
   ## B0: injects CRISOL_ATTEMPT=attempt (1-indexed) into the child environment.
   ## A6: routes through forkExecEnvScratch — the single spec-driven spawn entry
   ##     — so the LIVE run path actually applies hermeticity (env scrub, isolated
-  ##     TMPDIR, rlimits) and reports SandboxAchieved over the A4d status pipe.
+  ##     TMPDIR, rlimits) and reports per-limit LimitsAchieved over the
+  ##     A2a-iii status pipe.
   ## M8: uses mkdtemp for temp output files.
   ## S2b: run deadline set from effectiveRunTimeoutMs(ep, config).
 
@@ -910,7 +913,8 @@ proc spawnRun(
   ## B0: injects CRISOL_ATTEMPT=attempt (1-indexed) into the child environment.
   ## A6: routes through forkExecEnvScratch (spec stored on the slot) so the run
   ##     phase of a freshly-compiled entrypoint gets the same hermeticity as the
-  ##     skip-fresh path, and reports SandboxAchieved for the cache-store gate.
+  ##     skip-fresh path, and reports per-limit LimitsAchieved for the
+  ##     cache-store gate.
 
   let fd = openOutputFile(slot.runOut)
   if fd < 0:
@@ -1131,14 +1135,14 @@ proc pollSlot(
     # ekExited Exit dominates the derivation before records are consulted)
     # but must not be silently dropped just because the process was signaled.
     var res: EntrypointResult
-    # rfc-0007 A1f: the run phase is the ONLY sandboxed child (compile is
-    # unsandboxed, A6) — thread its real requested-limits/achieved-bit pair
-    # through so a SIGXCPU/SIGXFSZ the child received classifies cbLimit
-    # when that limit was actually requested (interim aggregate approximation
-    # until A2a-iii; see interimLimits' doc comment).
-    let (runLimits, runLimitsAchieved) = interimLimits(slot.spec, slot.achieved)
+    # rfc-0007 A1f/A2a-iii: the run phase is the ONLY sandboxed child (compile
+    # is unsandboxed, A6) — thread its real requested-limits (slot.spec.limits)
+    # and REAL per-limit readback (slot.achieved, A2a-iii's getrlimit
+    # confirmation, not the retired aggregate-bit approximation) through so a
+    # SIGXCPU/SIGXFSZ the child received classifies cbLimit when that limit
+    # was actually requested AND achieved.
     let runRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000,
-                                 runLimits, runLimitsAchieved)
+                                 slot.spec.limits, slot.achieved)
     if sigNum != 0:
       let sinkData = readSink(slot.sinkPath, maxOutputBytes)
       res = EntrypointResult(ep: pep.ep,

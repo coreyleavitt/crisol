@@ -30,8 +30,13 @@ proc freshPep(dec: EntrypointDecision = edRunFresh;
 let globalOn  = defaultCachePolicy()
 let globalOff = CachePolicy(enabled: false)
 let isoSpec   = resolveSandbox(hlIsolated)
-let fullAchieved = SandboxAchieved(envScrubbed: true, tmpdirIso: true,
-                                   rlimitsApplied: true, netIso: false)
+
+proc allApplied(): ptypes.LimitsAchieved =
+  for k in ptypes.LimitKind: result[k] = ptypes.lsApplied
+
+# A fully-achieved per-limit record for the isolated spec (rfc-0007 A2a-iii:
+# SandboxAchieved is deleted; env/tmpdir are achieved by construction).
+let fullAchieved = allApplied()
 
 type Calls = object
   loadCalls:  int
@@ -108,8 +113,8 @@ suite "M8 (a) — miss-stored vs miss-unstored via shouldStore":
     check v.decision == cdmKeyMiss
 
   test "hermeticity degraded → no store, decision=cdmHermeticityDeg (not cdmKeyMiss)":
-    let degraded = SandboxAchieved(envScrubbed: false, tmpdirIso: true,
-                                   rlimitsApplied: true, netIso: false)
+    var degraded = allApplied()
+    degraded[ptypes.lkCore] = ptypes.lsFailed
     let v = shouldStore(passRes(), isoSpec, degraded, 1, globalOn)
     check not v.store
     check v.decision == cdmHermeticityDeg
@@ -124,10 +129,9 @@ suite "M8 (a) — miss-stored vs miss-unstored via shouldStore":
     ## The only shouldStore path that returns cdmKeyMiss is the non-pass branch.
     let failV = shouldStore(failRes(), isoSpec, fullAchieved, 1, globalOn)
     check failV.decision == cdmKeyMiss
-    let hermV = shouldStore(passRes(), isoSpec,
-                            SandboxAchieved(envScrubbed: false, tmpdirIso: true,
-                                            rlimitsApplied: true, netIso: false),
-                            1, globalOn)
+    var degraded = allApplied()
+    degraded[ptypes.lkCore] = ptypes.lsFailed
+    let hermV = shouldStore(passRes(), isoSpec, degraded, 1, globalOn)
     check hermV.decision != cdmKeyMiss  # hermeticity degraded, not key-miss
 
 # ---------------------------------------------------------------------------

@@ -83,7 +83,7 @@ import crisol/process/resultjson  # the ONE ProcessResult<->JSON owner (§2)
 # Constants
 # ---------------------------------------------------------------------------
 
-const resultCacheFormatVersion* = 2
+const resultCacheFormatVersion* = 3
   ## Increment when the cache JSON schema changes incompatibly.  A loaded file
   ## with a different formatVersion is treated as a MISS (discard-on-mismatch).
   ## Note: the version is part of the on-disk *path* (`cache/v<fmt>/`) AND the
@@ -96,6 +96,14 @@ const resultCacheFormatVersion* = 2
   ## lives under a different directory (`cache/v1/`) and its header
   ## formatVersion (1) mismatches this binary's constant regardless — a v1
   ## entry is a MISS here, never a fabricated read of the old shape.
+  ##
+  ## rfc-0007 A2a-iii: bumped 2 -> 3.  The SoundnessKey's fold-input shape
+  ## changed (`keys.KeyInputs.rlimitConfig: RlimitConfig` -> `.limits:
+  ## Limits`, the §1 enum-indexed home) — deliberate and free (§5): a v2 key
+  ## folded the old five-field RlimitConfig serialization, so a stored v2
+  ## entry's key can never match a freshly-derived v3 key even for an
+  ## unchanged config, and must MISS rather than alias a differently-shaped
+  ## fold input to a coincidentally-equal-looking string.
 
 const DefaultMaxCacheEntries* = 10_000
   ## Interim soft cap on distinct cache entries (RFC-0004 F1, round 2).
