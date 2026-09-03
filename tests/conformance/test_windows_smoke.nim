@@ -64,13 +64,15 @@ when defined(windows):
       let report = sv.reap(ev.id)
       check report.stop.isSome
       # Two honest endings (§2/§3), both losslessly observed: the cooperative
-      # CTRL_BREAK landed and the child died with STATUS_CONTROL_C_EXIT
-      # (0xC000013A, an ekNtStatus observation — what actually happens on a
-      # hosted runner where the console probe passes), or the Job Object
+      # CTRL_BREAK landed and the child died on an NTSTATUS (typically
+      # STATUS_CONTROL_C_EXIT, but console teardown on hosted runners also
+      # produces e.g. STATUS_DLL_INIT_FAILED — the exact value is the OS's
+      # to choose; we record it, we don't fabricate it), or the Job Object
       # force-kill supplied our runner-chosen code (< 0xC0000000, ekExited).
+      # The pin is the §2 partition invariant, not one kernel-chosen status.
       case report.exit.kind
       of ekExited: discard
-      of ekNtStatus: check report.exit.status == 0xC000013A'u32
+      of ekNtStatus: check report.exit.status >= 0xC0000000'u32
       of ekSignaled: check false
       check report.killDomain == kdsJobObject
       removeFile(outPath)
