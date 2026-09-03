@@ -78,3 +78,42 @@ suite "summarize — counts array (rfc-0007 §2)":
     let s = summarize(@[])
     for o in Outcome:
       check s.counts[o] == 0
+
+# ---------------------------------------------------------------------------
+# rfc-0007 A6b — summarize(results, policy): a REPORTING trust boundary
+# ---------------------------------------------------------------------------
+
+proc passedWithEscapee(path: string): EntrypointResult =
+  ## A would-be pass whose run phase observed a same-pgroup escapee — the
+  ## exact shape spawn_grandchild produces (A6a).
+  result = EntrypointResult(ep: makeEp(path))
+  result.compile = skippedPhase
+  let escapee = ptypes.ProcSnapshot(pid: 999, ppid: 1, command: "leaked", rssBytes: 4096)
+  result.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
+    exit: ptypes.Exit(kind: ptypes.ekExited, code: 0),
+    cause: cbProcess,
+    evidence: ptypes.Evidence(escapees: @[escapee]),
+    rusage: none(ptypes.Rusage), durationUs: 0))
+
+suite "summarize — policy threading (rfc-0007 A6b, strictHygiene x escapees)":
+
+  test "DefaultPolicy (unstrict): an escapee-bearing pass still counts as passed":
+    let s = summarize(@[passedWithEscapee("a.nim")])
+    check s.passed == 1
+    check s.failed == 0
+    check s.counts[oPassed] == 1
+    check s.counts[oFailed] == 0
+
+  test "strictHygiene=true: an escapee-bearing pass counts as FAILED instead":
+    let policy = ptypes.OutcomePolicy(strictHygiene: true)
+    let s = summarize(@[passedWithEscapee("a.nim")], policy)
+    check s.passed == 0
+    check s.failed == 1
+    check s.counts[oPassed] == 0
+    check s.counts[oFailed] == 1
+
+  test "strictHygiene=true: a clean pass (no escapees) is unaffected":
+    let policy = ptypes.OutcomePolicy(strictHygiene: true)
+    let s = summarize(@[passedResult("a.nim")], policy)
+    check s.passed == 1
+    check s.failed == 0

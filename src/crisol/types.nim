@@ -274,6 +274,17 @@ type
                                 ## monolithic `nim c` path is byte-for-byte unchanged until an
                                 ## operator opts in (`--measure-compile-reuse` / `measure-compile-
                                 ## reuse #true` in crisol.kdl).
+    strictHygiene*: bool       ## rfc-0007 A6b: OutcomePolicy.strictHygiene, resolved. When true,
+                                ## a would-be pass with an OBSERVED escapee (evidence.escapees.len
+                                ## > 0) derives oFailed instead of oPassed at every REPORTING trust
+                                ## boundary (summarize -> exit code, render, JSON/junit wire,
+                                ## lastrun.json) — never at the cache's own outcome() call, which
+                                ## stays DefaultPolicy always (the cache stores/derives unstrict,
+                                ## RFC-0007 §2); nor at live scheduling decisions (retry
+                                ## eligibility, quarantine matching, ledger rows), which read the
+                                ## unstrict observation like the cache does. Default false:
+                                ## byte-for-byte unchanged until an operator opts in
+                                ## (`--strict-hygiene` / `strict-hygiene #true` in crisol.kdl).
     rlimitNofile*: Option[int64]
                                 ## Config-declared override for RLIMIT_NOFILE (max open fds) in the
                                 ## hermetic sandbox. none = use sandbox.DefaultRlimitNofile (1024).

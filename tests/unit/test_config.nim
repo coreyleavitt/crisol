@@ -844,6 +844,52 @@ group "unit" {
     check cfg.measureCompileReuse == false
 
 # ---------------------------------------------------------------------------
+# rfc-0007 A6b — strict-hygiene gate (config parity with the CLI flag)
+# ---------------------------------------------------------------------------
+
+suite "config — strict-hygiene gate (rfc-0007 A6b)":
+
+  test "absent strict-hygiene -> cfg.strictHygiene == false (default off)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.strictHygiene == false
+
+  test "strict-hygiene #true round-trips to cfg.strictHygiene == true":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+strict-hygiene #true
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.strictHygiene == true
+
+  test "strict-hygiene #false round-trips to cfg.strictHygiene == false":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+strict-hygiene #false
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.strictHygiene == false
+
+  test "no config file (convention fallback) -> cfg.strictHygiene == false":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check cfg.strictHygiene == false
+
+# ---------------------------------------------------------------------------
 # M-report PASS (b1) — reuse-check alerting policy block
 # ---------------------------------------------------------------------------
 

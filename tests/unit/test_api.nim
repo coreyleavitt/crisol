@@ -628,6 +628,36 @@ suite "R13 — measure-compile-reuse requested with no workerBinary surfaces a s
       check found
 
 # ---------------------------------------------------------------------------
+# rfc-0007 A6b — --strict-hygiene / strict-hygiene config parity + precedence
+# ---------------------------------------------------------------------------
+
+suite "rfc-0007 A6b — strict-hygiene resolution (RunOptions.strictHygiene x config)":
+
+  test "opts.strictHygiene=true (config absent) -> resolved settings.strictHygiene == true":
+    withTempProject:
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", strictHygiene: true)
+      let pr = planTests(opts)
+      check pr.settings.strictHygiene == true
+
+  test "config strict-hygiene #true, opts.strictHygiene=false -> STILL true (config wins; strengthen-only)":
+    withTempProject:
+      writeFile(projectRoot / "crisol.kdl", """
+strict-hygiene #true
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+""")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", strictHygiene: false)
+      let pr = planTests(opts)
+      check pr.settings.strictHygiene == true
+
+  test "neither opts nor config set -> resolved settings.strictHygiene == false (default off)":
+    withTempProject:
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let pr = planTests(opts)
+      check pr.settings.strictHygiene == false
+
+# ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.
 # api.nim gates the compile block on `measureCompileReuse` alone. A
 # regression that hardcoded this to `false` would silently drop the report

@@ -282,7 +282,8 @@ proc pathFlagsWarnings*(adHocPaths: seq[string];
       result.add "path \"" & p & "\" matched no configured group; using global flags"
 
 proc render*(results: seq[EntrypointResult]; summary: Summary;
-             opts: RenderOpts): string =
+             opts: RenderOpts;
+             policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): string =
   ## Pure: produce the full human-readable report string.
   ## All I/O decisions (color, progress) are made by the caller and passed
   ## via opts; this function performs no I/O of its own.
@@ -293,6 +294,12 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
   ## are NEVER altered by the filter (they are derived from `summary` which is
   ## computed from the full unfiltered run).  Slowest-N is also computed on ALL
   ## records (unfiltered) so the "slowest" ranking is not distorted.
+  ##
+  ## rfc-0007 A6b: `policy` is a REPORTING trust boundary (RFC-0007 §2) — the
+  ## caller (crisol.nim) threads the SAME resolved OutcomePolicy used to
+  ## build `summary`, so a per-entrypoint [OK]/[FAIL] label here never
+  ## disagrees with the aggregate counts / exit code. Defaults to
+  ## DefaultPolicy so every existing caller is unchanged.
 
   let color  = opts.color
   let n      = if opts.slowestN > 0: opts.slowestN else: 5
@@ -305,7 +312,7 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
   # 1. Per-entrypoint lines
   # -------------------------------------------------------------------------
   for r in results:
-    let derived   = outcome(r)  # rfc-0007 §2: display driven by the pure derivation
+    let derived   = outcome(r, policy)  # rfc-0007 §2/A6b: display driven by the pure derivation
     let label     = outcomeLabel(derived)
     let labelCol  = col(label, outcomeColor(derived), color)
     # Issue #14: entrypoint paths (config/disk-origin) and protocol record

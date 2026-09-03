@@ -232,10 +232,12 @@ proc crashedMessage(r: EntrypointResult): string =
   if r.run.kind == ptypes.pkRan: "crashed: " & ptypes.symbol(r.run.res.exit)
   else: "crashed"
 
-proc outcomeChildXml(r: EntrypointResult): string =
+proc outcomeChildXml(r: EntrypointResult;
+                     policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): string =
   ## Returns the inner child element for the synthetic opaque testcase, or ""
   ## when the (derived) outcome is oPassed (clean testcase, no child needed).
-  case outcome(r)
+  ## policy: rfc-0007 A6b — threaded from toJunitXml (see there).
+  case outcome(r, policy)
   of oPassed:
     ""
   of oFailed:
@@ -268,9 +270,15 @@ proc recordChildXml(rec: TestRecord): string =
 # toJunitXml — pure emitter
 # ---------------------------------------------------------------------------
 
-proc toJunitXml*(results: seq[EntrypointResult]; summary: Summary): string =
+proc toJunitXml*(results: seq[EntrypointResult]; summary: Summary;
+                 policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): string =
   ## Pure: serialize results and summary to a JUnit XML string.
   ## No I/O; returns the complete XML document as a string.
+  ##
+  ## policy: rfc-0007 A6b — a REPORTING trust boundary (§2). The caller
+  ## threads the SAME resolved OutcomePolicy `summary` was folded under, so
+  ## a testcase's pass/failure never disagrees with the aggregate counts.
+  ## Defaults to DefaultPolicy so every existing caller is unchanged.
   ##
   ## Structure: <testsuites> → one <testsuite> per entrypoint → <testcase>s.
   ## Opaque entrypoints (no records) → one synthetic testcase per entrypoint.
@@ -288,7 +296,7 @@ proc toJunitXml*(results: seq[EntrypointResult]; summary: Summary): string =
   for r in results:
     let epPath = escapeXml(r.ep.path)
     let timeSecs = fmtSecs(r.durationMs)
-    let derived = outcome(r)  # rfc-0007 §2
+    let derived = outcome(r, policy)  # rfc-0007 §2/A6b
 
     if r.records.len == 0:
       # Opaque entrypoint: one synthetic testcase
@@ -313,7 +321,7 @@ proc toJunitXml*(results: seq[EntrypointResult]; summary: Summary): string =
         buf.add " cached=\"true\""
       buf.add ">\n"
 
-      let child = outcomeChildXml(r)
+      let child = outcomeChildXml(r, policy)
       if child.len > 0:
         buf.add child
 

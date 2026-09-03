@@ -148,7 +148,7 @@ Usage:
               [--dry-run] [--json] [--force-compile]
               [--failed] [--changed [--base <ref>]]
               [--filter-tag <tag>]
-              [--retries <N>] [--fail-on-flaky]
+              [--retries <N>] [--fail-on-flaky] [--strict-hygiene]
               [--order <recent-fail|duration|none>]
               [--hermetic <none|isolated|network>]
               [--rlimit-nofile <N>]
@@ -203,6 +203,13 @@ Additional options for 'run':
                   failing tests first for minimum time-to-first-failure),
                   duration (longest-running first for best parallelism),
                   or none (default: no reorder).
+  --strict-hygiene
+                  A would-be pass with an OBSERVED escapee (a leaked same-
+                  process-group descendant still running at reap time) is
+                  reported as a failure (exit 1) instead of a pass.  Off by
+                  default: an escapee is still shown ([ESCAPEE] warning,
+                  evidence.escapees on the wire) but does not fail the run.
+                  Also settable via crisol.kdl's `strict-hygiene #true`.
   --hermetic <L>  Hermeticity level for child sandboxes: none (no env scrub /
                   no rlimits / inherit parent env), isolated (default: env
                   allowlist + isolated tmpdir + config-declared rlimits), or
@@ -621,6 +628,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     filterTag:    string = ""   # C3: reporting-level record filter
     retries:      int  = -1     # B1: --retries N; -1 = not specified (use config)
     failOnFlaky:  bool = false  # B1: --fail-on-flaky: flaky-passes → exit 1
+    strictHygiene: bool = false # rfc-0007 A6b: --strict-hygiene: escapee-bearing
+                                 # passes → exit 1
     junitPath:    string = ""   # C1: --junit <path> JUnit XML report output path
     shardK:       int  = 0      # C2: shard index (1-indexed); 0 = no sharding
     shardN:       int  = 1      # C2: total shard count; only used when shardK > 0
@@ -657,7 +666,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       # Flags valid only for `run`.
       if key in ["jobs", "timeout", "fail-fast", "dry-run", "failed", "changed",
                  "base", "force-compile", "no-cache", "filter-tag",
-                 "retries", "fail-on-flaky", "junit", "shard", "order",
+                 "retries", "fail-on-flaky", "strict-hygiene", "junit", "shard", "order",
                  "perf-check", "hermetic", "measure-compile-reuse",
                  "rlimit-nofile"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
@@ -734,6 +743,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
           return ExitEnvironment
       of "fail-on-flaky":
         failOnFlaky = true
+      of "strict-hygiene":
+        strictHygiene = true
       of "junit":
         let raw = nextVal("junit")
         if raw == "":
@@ -908,6 +919,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     persist:             true,
     retries:             retries,       # B1: -1 = use config; >= 0 = override
     failOnFlaky:         failOnFlaky,   # B1: flaky-pass → exit 1
+    strictHygiene:       strictHygiene, # rfc-0007 A6b: escapee-bearing pass → exit 1
     shardK:              shardK,        # C2: shard index (0 = no sharding)
     shardN:              shardN,        # C2: total shard count
     order:               orderMode,     # C4: history-based prioritization
@@ -1009,15 +1021,22 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
   if filterTag.len > 0 and hasZeroTagMatches(rr.results, filterTag):
     stderr.write("crisol: warning: no test records matched tag \"" & filterTag & "\"\n")
 
+  # rfc-0007 A6b: the resolved OutcomePolicy for this run (CLI flag OR
+  # config-file, already merged by planImpl into rr.plan.settings) —
+  # threaded into every REPORTING sink below so a per-entrypoint outcome
+  # label never disagrees with rr.exitCode.
+  let policy = OutcomePolicy(strictHygiene: rr.plan.settings.strictHygiene)
+
   if jsonMode:
     stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
-                              rr.memThrottledSlots, interrupted = rr.interrupted))
+                              rr.memThrottledSlots, interrupted = rr.interrupted,
+                              policy = policy))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,
                            filterTag: if filterTag.len > 0: some(filterTag)
                                       else: none(string))
-    stdout.write(render(rr.results, rr.summary, ropts))
+    stdout.write(render(rr.results, rr.summary, ropts, policy))
     # Gate-skip messages after results.
     if rr.plan.gatedOut.len > 0:
       for line in gateSkipMessages(rr.plan.gatedOut):
@@ -1026,7 +1045,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
   # C1: --junit <path> — write JUnit XML report as an additional output sink.
   # Composes with normal stdout reporting (--json or human render still runs).
   if junitPath.len > 0:
-    let xmlStr = toJunitXml(rr.results, rr.summary)
+    let xmlStr = toJunitXml(rr.results, rr.summary, policy)
     try:
       writeFile(junitPath, xmlStr)
     except IOError as e:

@@ -208,6 +208,14 @@ type
                                  ## N >= 1 = retry up to N times (maxAttempts = N+1).
     failOnFlaky*:  bool = false  ## B1: when true, a flaky-pass (passed after attempt > 1)
                                  ## contributes to exit 1 instead of exit 0.
+    strictHygiene*: bool = false ## rfc-0007 A6b: OutcomePolicy.strictHygiene. When true, a
+                                 ## would-be pass with an observed escapee (leaked same-pgroup
+                                 ## descendant, A6a) derives oFailed instead of oPassed at every
+                                 ## reporting boundary (exit code, render, JSON/junit wire,
+                                 ## lastrun.json) — never at the cache's own store/read gate,
+                                 ## which stays unstrict always. Can only strengthen a config-file
+                                 ## `strict-hygiene #true` (true wins), mirroring
+                                 ## measureCompileReuse/perfCheckForce below.
     ## Tier 2 — tuning
     jobs*:         int = 0        ## <= 0 → config/built-in default (no error,
                                   ## unlike CLI which rejects --jobs < 1)
@@ -272,6 +280,10 @@ type
                           ## Config.stateDir which is project-root-relative.
     jobs*:        int     ## resolved (never 0)
     timeoutSecs*: int     ## resolved
+    strictHygiene*: bool  ## rfc-0007 A6b: resolved OutcomePolicy.strictHygiene (CLI-flag OR
+                          ## config-file, opt-in-only-strengthen) — the CLI layer builds the
+                          ## real OutcomePolicy for render/JSON/junit from this, so it never
+                          ## has to re-run the merge itself.
 
   PlanReport* = object
     ## Output of planTests().  plan-phase result; no DepGraph or full Config.
@@ -331,11 +343,16 @@ proc runResult*(r: EntrypointResult): Option[ptypes.ProcessResult] =
   if r.run.kind in {ptypes.pkRan, ptypes.pkCached}: some(r.run.res)
   else: none(ptypes.ProcessResult)
 
-proc failureLine*(r: EntrypointResult): string =
+proc failureLine*(r: EntrypointResult;
+                  policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): string =
   ## Render-grade one-liner for a failing/non-passed result — the digest a
   ## caller building its own UI needs without re-deriving cause/exit detail.
-  ## "" for a passing result (outcome(r) == oPassed).
-  case outcome(r)
+  ## "" for a passing result (outcome(r, policy) == oPassed).
+  ## policy: rfc-0007 A6b — a library caller building custom UI under
+  ## --strict-hygiene passes the same resolved policy it used elsewhere
+  ## (e.g. RunOptions.strictHygiene) so this digest agrees with exitCode.
+  ## Defaults to DefaultPolicy so existing callers are unchanged.
+  case outcome(r, policy)
   of oPassed:
     ""
   of oFailed:
@@ -463,6 +480,9 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   # RFC-0006 M-artifact-identity PASS (b2): CLI/library --measure-compile-reuse
   # can only strengthen a config-file setting (true wins), mirroring perfCheckForce.
   if opts.measureCompileReuse: cfg.measureCompileReuse = true
+  # rfc-0007 A6b: CLI/library --strict-hygiene can only strengthen a
+  # config-file setting (true wins), mirroring measureCompileReuse above.
+  if opts.strictHygiene: cfg.strictHygiene = true
   if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
   # Fix 1: RunOptions.rlimitNofile, when set, overrides Config.rlimitNofile.
   if opts.rlimitNofile.isSome: cfg.rlimitNofile = opts.rlimitNofile
@@ -532,6 +552,7 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     stateDir:    resolvedStateDir,
     jobs:        pv.plan.jobs,
     timeoutSecs: cfg.timeoutSecs,
+    strictHygiene: cfg.strictHygiene,  # rfc-0007 A6b
   )
   let pr = PlanReport(
     entrypoints: pv.plan.entrypoints,
@@ -789,7 +810,17 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     releaseLock(lockHandle)
     return structuralResultWithPlan("unexpected error during execute: " & e.msg, 2, pr)
 
-  var s = summarize(results)
+  # rfc-0007 A6b: the ONE resolved OutcomePolicy for this run, built from
+  # cfg.strictHygiene (CLI flag OR config-file, already merged by planImpl
+  # above) — recomputed at every REPORTING trust boundary from here on
+  # (summarize -> exit code; render/JSON/junit/lastrun.json below via
+  # rr.plan.settings.strictHygiene). The cache's own outcome() calls
+  # (cachedispatch.shouldStore/lookupAtPlan) and live scheduling decisions
+  # (retry eligibility, quarantine matching, ledger rows) deliberately never
+  # see this value — they stay DefaultPolicy (unstrict), matching the
+  # cache's "stores/derives unstrict" rule (RFC-0007 §2).
+  let policy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene)
+  var s = summarize(results, policy)
   # rfc-0007 A1e-ii §2: notStarted is bookkeeping about entries OMITTED from
   # `results` (never a fold over `results` itself), so it is stamped on here
   # rather than inside summarize().
@@ -859,7 +890,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     let reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
     persistLastRun(results, s, cfg, warnings = pr.warnings,
                    memThrottledSlots = memThrottled, compileBlock = compileBlock,
-                   reuseAlerts = reuseAlerts)
+                   reuseAlerts = reuseAlerts, policy = policy)
 
   releaseLock(lockHandle)
 

@@ -454,6 +454,9 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # the compile slot. Default false (unlike mem-aware's Option[bool] tristate,
     # this is a plain bool — there is no "auto" mode, only explicit opt-in).
     measureCompileReuse: bool = false
+    # rfc-0007 A6b: OutcomePolicy.strictHygiene. Default false (same
+    # strengthen-only opt-in shape as measure-compile-reuse above).
+    strictHygiene: bool = false
     # Fix 1 (RLIMIT_NOFILE plumbing): config-declared override for the
     # sandbox's max-open-fds ceiling. none = use sandbox.DefaultRlimitNofile.
     rlimitNofile: Option[int64] = none(int64)
@@ -523,6 +526,12 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v.isNone or v.get.kind != kvBool:
         cfgErr("config: 'measure-compile-reuse' requires a boolean argument (#true/#false)")
       measureCompileReuse = v.get.boolVal
+    of "strict-hygiene":
+      # bool node: strict-hygiene #true  or  strict-hygiene #false
+      let v = n.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: 'strict-hygiene' requires a boolean argument (#true/#false)")
+      strictHygiene = v.get.boolVal
     of "rlimit-nofile":
       let v = requireIntArg(n, "rlimit-nofile")
       if v < 1:
@@ -568,6 +577,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     cacheMaxAgeDays:    cacheMaxAgeDays,
     ledgerMaxAgeDays:   ledgerMaxAgeDays,
     measureCompileReuse: measureCompileReuse,
+    strictHygiene:      strictHygiene,
     rlimitNofile:       rlimitNofile,
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).

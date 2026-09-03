@@ -494,7 +494,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              memThrottledSlots: int = 0;
              compileBlock: JsonNode = nil;
              reuseAlerts: JsonNode = nil;
-             interrupted: bool = false): JsonNode =
+             interrupted: bool = false;
+             policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): JsonNode =
   ## Pure: serialize to the crisol/run/v2 JsonNode.
   ## No I/O.
   ## interrupted: rfc-0007 A1e-ii — true iff this run was cut short by
@@ -503,6 +504,12 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## `summary.notStarted` the omitted count — this proc does not derive
   ## either, it only serializes what the caller (runner.execute() +
   ## api.runTests()) already computed.
+  ## policy: rfc-0007 A6b — a REPORTING trust boundary (§2). The caller
+  ## threads the SAME resolved OutcomePolicy `summary` was folded under, so
+  ## each entrypoint's `outcome`/`flaky` wire fields never disagree with
+  ## `summary.counts`/`summary.flaky`. Defaults to DefaultPolicy (unstrict)
+  ## so every existing caller (tests, lastrun.json's own default) is
+  ## unchanged.
   ## C3: when filterTag is non-empty, each entrypoint's records array contains
   ## only records whose tags include filterTag.  The summary block always
   ## reflects the full unfiltered run (no re-counting from filtered records).
@@ -559,7 +566,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
       recNode["tags"] = tagsNode
       recordsNode.add recNode
 
-    let derived = outcome(r)
+    let derived = outcome(r, policy)  # rfc-0007 A6b
 
     # Build entrypoint object
     let epNode = newJObject()
@@ -583,7 +590,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     # DERIVED value (flaky(r): outcome(r)==oPassed and attempts>1), not a
     # stored field -- see the field-mapping table.  `attempts` stays stored:
     # 0 for cached results (no live run), 1 for a clean first-pass, >1 if retried.
-    epNode["flaky"]         = newJBool(flaky(r))
+    epNode["flaky"]         = newJBool(flaky(r, policy))  # rfc-0007 A6b
     epNode["attempts"]      = newJInt(r.attempts)
     # B3 (rev 3): quarantine overlay — true iff ep.path ∈ Config.quarantine.
     # Absence-default false; only quarantined entrypoints carry true.
@@ -640,11 +647,13 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    memThrottledSlots: int = 0;
                    compileBlock: JsonNode = nil;
                    reuseAlerts: JsonNode = nil;
-                   interrupted: bool = false): string =
+                   interrupted: bool = false;
+                   policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): string =
   ## Pure: compact JSON string of the crisol/run/v2 document.
   ## C3: filterTag threads through to toJson.
+  ## policy: rfc-0007 A6b — threads through to toJson unchanged (see there).
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
-         reuseAlerts, interrupted)
+         reuseAlerts, interrupted, policy)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
@@ -655,13 +664,19 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
                      warnings: seq[ConfigWarning] = @[];
                      memThrottledSlots: int = 0;
                      compileBlock: JsonNode = nil;
-                     reuseAlerts: JsonNode = nil) =
+                     reuseAlerts: JsonNode = nil;
+                     policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy) =
   ## Write lastrun.json atomically to <projectRoot>/<stateDir>/lastrun.json.
   ## Creates the state directory if it does not exist.
   ## On any failure: prints a warning to stderr and returns -- never raises.
   ##
   ## warnings and memThrottledSlots are threaded through to toJsonString so
-  ## the persisted file matches the stdout JSON path exactly (M3 fix).
+  ## the persisted file matches the stdout JSON path exactly (M3 fix) — rfc-
+  ## 0007 A6b's `policy` extends that same invariant: lastrun.json's per-
+  ## entrypoint `outcome` must agree with the stdout JSON this same run
+  ## already emitted, so a `--strict-hygiene` failure does not silently drop
+  ## off the `--failed` selection on the NEXT run. Defaults to DefaultPolicy
+  ## (unstrict) for callers that never opted in.
   ## compileBlock: M-report pass (a) segmented compile block, or nil (default)
   ## when there is no telemetry to report -- threads through unchanged.
   ## reuseAlerts: M-report pass (b1) alert array, or nil (default; persisted
@@ -685,7 +700,8 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   let jsonStr = toJsonString(results, summary, warnings = warnings,
                              memThrottledSlots = memThrottledSlots,
                              compileBlock = compileBlock,
-                             reuseAlerts = reuseAlerts)
+                             reuseAlerts = reuseAlerts,
+                             policy = policy)
   let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
     stderr.write("crisol: warning: could not write lastrun.json: " & err & "\n")

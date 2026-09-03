@@ -300,7 +300,8 @@ const GracePeriodMs* = 400
   ## callers left after this rewrite and is deleted (rfc-0007 A2b).
 
 proc toProcessResult(report: ReapReport; limits: ptypes.Limits;
-                     durationUs: int64): ptypes.ProcessResult =
+                     durationUs: int64;
+                     hermetic: ptypes.HermeticLevel = ptypes.hlNone): ptypes.ProcessResult =
   ## The ONE place a reaped child's ProcessResult is assembled — a straight
   ## map over `ReapReport` (§1's "one report" promise). `cause` consults
   ## `report.stop` FIRST regardless of `report.exit` (§2's authorship rule:
@@ -313,12 +314,17 @@ proc toProcessResult(report: ReapReport; limits: ptypes.Limits;
   ## backend already computed the honest values (posixcore's post-reap pgid
   ## scan + `treeObservationFor`); this is the one place they reach the
   ## wire-facing `Evidence` instead of being silently discarded.
-  ## `evidence.hermetic` stays the ord-0 default here — it is runner-
-  ## authored (not backend-observed) and has no producer yet; a compile-
-  ## phase result has no HermeticLevel concept to begin with (sandboxing is
-  ## a run-phase-only notion, §5), so threading it through this ONE shared
-  ## constructor cleanly is a separate, not-yet-scheduled slice, flagged
-  ## rather than silently wired half-right here.
+  ## `evidence.hermetic` (rfc-0007 A6b) is the ONE runner-authored field —
+  ## not backend-observed, so it does not ride ReapReport like the rest.
+  ## Callers pass it explicitly; the default `hlNone` (ord 0, the weakest
+  ## claim — house rule: a default-initialized Evidence must never encode a
+  ## vouch) is exactly right for the THREE compile-phase call sites below,
+  ## which never pass this parameter: a compile has no HermeticLevel concept
+  ## to begin with (sandboxing is a run-phase-only notion, §5). The run-phase
+  ## call site passes `slots[idx].spec.level` — the SandboxSpec resolved for
+  ## this entrypoint's run child at transitionToRun (a label, like
+  ## killDomain — "the level this ran under", not a proof hlNetwork's
+  ## net-isolation was actually achieved; see resolveSandbox/evidenceSatisfies).
   ptypes.ProcessResult(
     exit: report.exit,
     cause: ptypes.classifyCause(report.exit, report.stop, limits, report.limits),
@@ -327,6 +333,7 @@ proc toProcessResult(report: ReapReport; limits: ptypes.Limits;
       tree:                   report.tree,
       escapees:               report.escapees,
       limits:                 report.limits,
+      hermetic:               hermetic,
       killSnapshot:           report.killSnapshot,
       cooperativeUnavailable: report.cooperativeUnavailable,
     ),
@@ -564,7 +571,8 @@ proc finalizeSlot(
                                records: sinkData.records)
       else:
         res = classifyRunResult(pep.ep, output, elapsed, slots[idx].compileSkipped)
-    let runRes = toProcessResult(report, slots[idx].spec.limits, elapsed * 1000)
+    let runRes = toProcessResult(report, slots[idx].spec.limits, elapsed * 1000,
+                                 slots[idx].spec.level)  # rfc-0007 A6b
     cleanupSlotTmp(slots[idx])
     res.compile = compilePhase
     res.run     = ptypes.Phase(kind: ptypes.pkRan, res: runRes)
@@ -1952,8 +1960,16 @@ proc runEntrypoint*(
 # summarize — pure aggregate counts
 # ---------------------------------------------------------------------------
 
-proc summarize*(results: seq[EntrypointResult]): Summary =
+proc summarize*(results: seq[EntrypointResult];
+                policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): Summary =
   ## Pure: fold a result sequence into aggregate counts.
+  ##
+  ## rfc-0007 A6b: `policy` is the ONE place summarize()'s verdict can diverge
+  ## from the observation — a REPORTING trust boundary (RFC-0007 §2), threaded
+  ## in by the caller (api.runTests) from the resolved --strict-hygiene /
+  ## `strict-hygiene` config value. Defaults to DefaultPolicy (unstrict) so
+  ## every existing call site (tests, library callers not opting in) is
+  ## byte-for-byte unchanged.
   ##
   ## B3: a quarantined FAILURE is excluded from all exit-contributing buckets
   ## (failed/compileFailed/spawnErrors/counts[oKilled]/counts[oCrashed]) and
@@ -1962,7 +1978,7 @@ proc summarize*(results: seq[EntrypointResult]): Summary =
   ## harmless on pass.
   result.total = results.len
   for r in results:
-    let o = outcome(r)
+    let o = outcome(r, policy)
     if r.quarantined and o.isFailure:
       # B3: quarantined failure — report it but exclude from exit-1 buckets.
       inc result.quarantined
@@ -1976,5 +1992,5 @@ proc summarize*(results: seq[EntrypointResult]): Summary =
         discard  ## no scalar counterpart — `counts` (below) is the ONLY
                  ## accounting for the killed/crashed buckets (rfc-0007 §2).
       inc result.counts[o]
-    if flaky(r): inc result.flaky  # B1: count flaky-passes
+    if flaky(r, policy): inc result.flaky  # B1: count flaky-passes
   result.noTestsRan = result.passed == 0 and result.total > 0
