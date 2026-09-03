@@ -63,7 +63,15 @@ when defined(windows):
       check ev.kind == weChildExited   # never weDeadline — Job Object kill is unconditional
       let report = sv.reap(ev.id)
       check report.stop.isSome
-      check report.exit.kind == ekExited   # our own runner-chosen code, < 0xC0000000 (§2)
+      # Two honest endings (§2/§3), both losslessly observed: the cooperative
+      # CTRL_BREAK landed and the child died with STATUS_CONTROL_C_EXIT
+      # (0xC000013A, an ekNtStatus observation — what actually happens on a
+      # hosted runner where the console probe passes), or the Job Object
+      # force-kill supplied our runner-chosen code (< 0xC0000000, ekExited).
+      case report.exit.kind
+      of ekExited: discard
+      of ekNtStatus: check report.exit.status == 0xC000013A'u32
+      of ekSignaled: check false
       check report.killDomain == kdsJobObject
       removeFile(outPath)
 

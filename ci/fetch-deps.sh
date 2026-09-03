@@ -74,7 +74,7 @@ for name in $(dep_names); do
     raw_url="$(printf '%s\n' "${block}" | grep -oE 'url "ssh://git@[^"]+"' | tail -1 | sed -E 's/^url "//; s/"$//')"
     # ref appears in both `source` and `provenance`; provenance's (the last
     # occurrence in the block) is the one paired with commit_sha below.
-    ref="$(printf '%s\n' "${block}" | grep -oE '^\s*ref "[^"]+"' | tail -1 | sed -E 's/^\s*ref "//; s/"$//')"
+    ref="$(printf '%s\n' "${block}" | grep -oE '^[[:space:]]*ref "[^"]+"' | tail -1 | sed -E 's/^[[:space:]]*ref "//; s/"$//')"
     commit_sha="$(printf '%s\n' "${block}" | grep -oE 'commit_sha "[^"]+"' | tail -1 | sed -E 's/^commit_sha "//; s/"$//')"
 
     if [ -z "${raw_url}" ] || [ -z "${ref}" ] || [ -z "${commit_sha}" ]; then
