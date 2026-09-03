@@ -8,22 +8,20 @@
 ## contract surface as mostly one-line delegations onto the procs below.
 ##
 ## SAFETY: the child window (between fork() and exec) executes ONLY
-## async-signal-safe primitives — the same invariant spawn.nim documents.
-## The cstring argv/envp arrays, the sink fd, and the readback pipe are all
-## built/opened BEFORE fork; the executor is single-threaded before and
-## during the spawn loop (RFC-0007 §1 invariant carried from RFC-0001).
+## async-signal-safe primitives — the same invariant crisol/spawn.nim used
+## to document. The cstring argv/envp arrays, the sink fd, and the readback
+## pipe are all built/opened BEFORE fork; the executor is single-threaded
+## before and during the spawn loop (RFC-0007 §1 invariant carried from
+## RFC-0001).
 ##
-## This module does NOT delete or touch `crisol/spawn.nim` — `spawn.nim`'s
-## `forkExec`/`forkExecEnvScratch` stay live for `runner.nim` (A2b migrates
-## the runner onto the Supervisor and retires them; RUNNER UNTOUCHED this
-## slice). Only `spawn.supervise` — genuinely dead outside test callers, all
-## of which migrate onto the Supervisor in this slice — is deleted. The
-## RLIMIT_* constants below are therefore importc'd again here rather than
-## imported from spawn.nim: duplicate `importc` `var`s referencing the same
-## C symbol are safe and idiomatic in Nim (no C definition is emitted, only a
-## reference through the header), and it keeps this module dependency-free of
-## `crisol/spawn` — the eventual A2b cleanup deletes spawn.nim's copies
-## without touching this file.
+## A2a-i note (superseded): this module was written to NOT touch
+## `crisol/spawn.nim` — `runner.nim` still drove `forkExec`/
+## `forkExecEnvScratch` directly at that point. A2b migrated `runner.nim`
+## onto the Supervisor and deleted `spawn.nim` outright (it had no callers
+## left). The RLIMIT_* constants below stayed importc'd here independently
+## rather than merged with anything — duplicate `importc` `var`s referencing
+## the same C symbol are safe and idiomatic in Nim (no C definition is
+## emitted, only a reference through the header).
 
 import std/[options, os, posix, strutils, tables, monotimes, times]
 import crisol/process/types

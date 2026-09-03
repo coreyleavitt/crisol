@@ -22,22 +22,37 @@
 ##   noopResult*(r: EntrypointResult)
 ##     Exported default for execute's onResult parameter.
 ##
-## Scheduler design (A4):
+## Scheduler design (A4; rfc-0007 A2b — supervised through crisol/process):
 ##   • At most plan.jobs child processes alive at once.
-##   • Single-threaded poll loop: waitpid(WNOHANG) every ~25 ms.
-##   • Slot state machine: compiling → running → done  (or running → done for cdSkipFresh).
-##   • Fork failure for one slot never aborts the pool.
+##   • Single-threaded event loop: `sv.next(deadline)` — the ONE wait
+##     primitive — blocks until a child exits, a deadline (a slot's own
+##     timeout, an armed grace window, or the ~25ms RSS-sample tick) passes,
+##     or a shutdown signal arrives. Never a fixed sleep + per-slot poll.
+##   • Slot state machine: SlotState (ssIdle/ssLive) × SlotPhase
+##     (compiling → running → done, or running → done for cdSkipFresh).
+##   • The timeout path, the interrupt path, and exception teardown all
+##     route through the SAME requestStop/forceKill/next machinery — see
+##     `armExpiredTimeouts`/`escalateExpired`/`finalizeSlot`/`teardownDiscard`.
+##   • Spawn failure for one slot never aborts the pool.
 ##   • Output captured to per-entrypoint temp files; read atomically after
 ##     completion; bounded by maxOutputBytes.
 
-import std/[json, monotimes, options, os, sets, strutils, tables, times]
-import std/posix
-import crisol/[types, config, spawn, signals, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver]
-# rfc-0007 A1c: the §2 result-model types (Exit/Cause/Phase/…), dual-written
-# directly onto EntrypointResult.compile/.run (crisol/types.nim) — see
-# pollSlot and buildProcResult below. `import nil` (not a plain `import as`)
-# so nothing unqualified leaks in — `Rusage` in this file must stay
-# std/posix's Rusage (used at every real reap site), never ptypes.Rusage.
+import std/[envvars, json, monotimes, options, os, sequtils, sets, strutils, tables, times]
+import crisol/[types, config, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver]
+# rfc-0007 A2b: the runner is supervised entirely through `crisol/process`'s
+# Supervisor contract now — `std/posix` and `crisol/spawn` (forkExec/
+# forkExecEnvScratch/GracePeriodMs) are GONE from this file; every compile
+# and run child goes through ONE spawn path (`sv.spawn`), and every wait/
+# kill/reap goes through ONE wait path (`sv.next`/`requestStop`/`forceKill`/
+# `reap`). `import crisol/process` unqualified (house convention — see
+# tests/support/spawnhelpers.nim, tests/integration/test_rlimits_safe.nim,
+# etc.) brings in Supervisor/ChildId/ChildSpec/WaitEvent*/ReapReport/
+# combinedSink/initSupervisor/spawn/next/requestStop/forceKill/reap/
+# groupRssBytes.
+import crisol/process
+# `ptypes.X` stays the qualified spelling for the §2 result-model types
+# (Exit/Cause/Phase/…) — unchanged house convention from before A2b, kept so
+# this file's existing `ptypes.*` call sites need no renaming.
 from crisol/process/types as ptypes import nil
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
 # M4: re-export the CacheContext bundle + constructors so callers of execute()
@@ -55,6 +70,15 @@ export cachedispatch.isActive
 # Helpers
 # ---------------------------------------------------------------------------
 
+proc mkdtemp(tmpl: cstring): cstring
+  {.importc: "mkdtemp", header: "<stdlib.h>".}
+  ## POSIX mkdtemp(3): create a secure temp dir from a template ending in
+  ## XXXXXX. Modifies the template in-place and returns it on success, or
+  ## nil on error. rfc-0007 A2b: this used to come in via `import std/
+  ## posix`; declared directly now that `std/posix` has left this file
+  ## (raw libc import, not a posix-module dependency — see spawn.nim's
+  ## former identical declaration, now dead code removed with that file).
+
 proc makeTmpDir(prefix: string): string =
   ## Create a secure temporary directory using mkdtemp(3).
   ## The template must end with exactly 6 'X' characters (POSIX requirement).
@@ -68,13 +92,6 @@ proc makeTmpDir(prefix: string): string =
   if r == nil:
     raise newException(IOError, "mkdtemp failed for template: " & tmpl)
   result = $cast[cstring](r)
-
-proc openOutputFile(path: string): cint =
-  ## Open `path` for writing (create / truncate), returning a raw fd with
-  ## O_CLOEXEC so the fd is not inherited across unrelated exec calls.
-  ## Returns -1 on failure.
-  let flags = O_WRONLY or O_CREAT or O_TRUNC or O_CLOEXEC
-  posix.open(path.cstring, flags, Mode(0o600))
 
 proc readCapped(path: string; maxBytes: int): string =
   ## Read up to maxBytes from path; append a truncation notice if cut short.
@@ -182,12 +199,39 @@ type
     spCompiling
     spRunning
 
+  SlotState = enum
+    ## rfc-0007 A2b (#1): the `pepIdx == -1` idle sentinel dies. A slot is
+    ## either idle (no child, available for dispatch) or live (a ChildId is
+    ## outstanding with the Supervisor — spawned, not yet reaped). There is
+    ## no separate "exited, awaiting reap" state: `next`'s weChildExited is
+    ## handled synchronously (reap happens the moment it is observed), so no
+    ## slot is ever left holding a stale unreaped exit across iterations.
+    ssIdle
+    ssLive
+
   Slot = object
-    ## One concurrent execution slot.  Empty when pepIdx == -1.
-    pepIdx:          int           # index into plan.entrypoints; -1 = idle
+    state:           SlotState      # rfc-0007 A2b: replaces the pepIdx==-1 sentinel
+    id:              ChildId        # valid iff state == ssLive; the executor never
+                                    # sees a Pid (rfc-0007 A2b) — every wait/kill/reap
+                                    # goes through the Supervisor by this token.
+    pepIdx:          int           # index into plan.entrypoints; valid iff state == ssLive
     phase:           SlotPhase
-    pid:             Pid           # live child pid (== pgid)
-    deadline:        MonoTime      # R11: monotonic deadline for current phase
+    deadline:        MonoTime      # R11: this phase's own timeout deadline
+    stopDeadline:    Option[MonoTime]  # rfc-0007 A2b: set the moment a stop act
+                                    # (requestStop) is recorded for this slot's live
+                                    # child — timeout OR interrupt, same field, same
+                                    # machinery (§1 "ONE stop/escalate machinery").
+                                    # `none` until stopped; armed to now+GracePeriodMs
+                                    # on the FIRST stop act for this child (idempotent —
+                                    # a second stop act for the same child never
+                                    # re-arms it, mirroring the Supervisor's own
+                                    # "first act wins" rule).
+    forceKilled:     bool          # rfc-0007 A2b: true once forceKill has been issued
+                                    # for this slot's live child — guards against
+                                    # re-issuing forceKill every deadline sweep while
+                                    # still draining toward weChildExited (forceKill
+                                    # is idempotent at the Supervisor layer too; this
+                                    # is purely to avoid redundant calls).
     t0:              float         # epochTime() when slot was claimed (for durationMs)
     runTimeoutMs:    int           # per-entrypoint run deadline (ms); set at slot setup
                                    # from effectiveRunTimeoutMs(ep, config).  Consumed only
@@ -208,12 +252,14 @@ type
     compiledThisRun: bool          # false for cdSkipFresh slots
     compileSkipped:  bool          # true for cdSkipFresh slots
     achieved:        ptypes.LimitsAchieved  # A4d/A6/A2a-iii: per-limit readback actually
-                                      # delivered by the run child (set at the spawnRun*
-                                      # call) — used directly by classifyCause's cbLimit
-                                      # branch and the cache-store gate (isFullyAchieved).
+                                      # delivered by the run child (rfc-0007 A2b: set
+                                      # by finalizeSlot from ReapReport.limits at
+                                      # reap time, §1) — used directly by
+                                      # classifyCause's cbLimit branch and the
+                                      # cache-store gate (isFullyAchieved).
     spec:            SandboxSpec   # A6: resolved sandbox spec for the run phase; stored
                                    # at compile-spawn so the compile→run transition
-                                   # (spawnRun) can route through forkExecEnvScratch.
+                                   # (transitionToRun) can route through buildRunChildSpec.
     token:           SlotToken     # S3: admission token; released on finish or spawn failure
     attempt:         int          # B0/B1: current attempt number (1-indexed); set at dispatch
     peakRssBytes:    int64        # C5: running max of procGroupRssBytes across all polls
@@ -231,275 +277,311 @@ type
                                    # occupant's compile observation.
 
 # ---------------------------------------------------------------------------
-# rfc-0007 A1b: honest reap capture — waitpid replaced with wait4 at every
-# reap site so rusage is captured alongside the wstatus (never zero-filled;
-# std/posix already declares `wait4`/`Rusage` in this toolchain, so no
-# hand-rolled FFI struct was needed here — see decodeRusage below).
+# rfc-0007 A2b: ONE stop/escalate machinery. The timeout path, the interrupt
+# path, and exception teardown all route through requestStop/forceKill/next
+# — never their own wait/kill loop. `sv.reap`'s ReapReport IS the honest
+# observation (§2); there is no runner-side mirror of Exit/Rusage/stop left
+# to maintain, and `classifyCause` is called directly against the report.
 # ---------------------------------------------------------------------------
 
-type
-  Rfc7Stop = Option[tuple[reason: ptypes.KillReason, escalated: bool]]
+const GracePeriodMs* = 400
+  ## Time (ms) to wait after a stop act (requestStop) before escalating to
+  ## forceKill. Formerly crisol/spawn.nim's constant; spawn.nim has no
+  ## callers left after this rewrite and is deleted (rfc-0007 A2b).
 
-  KillCapture = object
-    ## What a reap actually observed — NEVER fabricated. `reaped == false`
-    ## means truly unreaped (ECHILD, or the RFC's "unkillable child" corner:
-    ## a wedged D-state process outliving even a blocking reap's retry
-    ## loop) — callers must not synthesize an Exit in that case (§2).
-    reaped*:    bool
-    exit*:      ptypes.Exit
-    rusage*:    ptypes.Rusage
-    escalated*: bool   ## true iff SIGKILL was sent BEFORE this exit was
-                       ## observed — the §2 definition of `escalated`.
-
-let NoRfc7Stop: Rfc7Stop = none(tuple[reason: ptypes.KillReason, escalated: bool])
-
-proc wcoredump(wstatus: cint): bool =
-  ## WCOREDUMP is a C macro, not always importc-able through the header.
-  ## Linux/glibc defines it as `status & __WCOREFLAG` (0200 octal = 0x80) —
-  ## see <bits/waitstatus.h> — a stable ABI bit, not a guess.
-  (wstatus and 0x80) != 0
-
-proc decodeExit(wstatus: cint): ptypes.Exit =
-  ## The one place a raw wstatus becomes a §2 Exit — lossless, and nothing
-  ## else (never derives Cause here; that is classifyCause's job alone).
-  if WIFEXITED(wstatus):
-    ptypes.Exit(kind: ptypes.ekExited, code: int(WEXITSTATUS(wstatus)))
-  elif WIFSIGNALED(wstatus):
-    ptypes.Exit(kind: ptypes.ekSignaled, sig: int(WTERMSIG(wstatus)),
-               coreDumped: wcoredump(wstatus))
-  else:
-    # wait4 is never called with WUNTRACED/WCONTINUED here, so a stopped/
-    # continued notification cannot reach this branch in practice; kept as
-    # a defined fallback rather than an unreachable-by-construction crash.
-    ptypes.Exit(kind: ptypes.ekExited, code: 0)
-
-proc decodeRusage(ru: Rusage): ptypes.Rusage =
-  ## ru_maxrss is reported in KiB on Linux — converted to bytes here so
-  ## every ptypes.Rusage.maxRssBytes consumer sees the same unit (§2).
-  ptypes.Rusage(
-    maxRssBytes: int64(ru.ru_maxrss) * 1024,
-    userCpuUs:   int64(ru.ru_utime.tv_sec) * 1_000_000 + int64(ru.ru_utime.tv_usec),
-    sysCpuUs:    int64(ru.ru_stime.tv_sec) * 1_000_000 + int64(ru.ru_stime.tv_usec),
-  )
-
-proc buildProcResult(exit: ptypes.Exit; rusage: ptypes.Rusage; stop: Rfc7Stop;
-                     durationUs: int64;
-                     limits: ptypes.Limits = ptypes.Limits();
-                     achieved: ptypes.LimitsAchieved = default(ptypes.LimitsAchieved)):
-                       ptypes.ProcessResult =
-  ## The one place a live reap's ProcessResult is assembled. `limits`/
-  ## `achieved` default to their zero value (no requests, lsNotRequested
-  ## throughout) for every caller that never had a sandboxed rlimit request
-  ## in play — the compile phase (unsandboxed, A6) and every runner-authored
-  ## kill capture (stop.isSome always wins in classifyCause regardless of
-  ## these two args, so passing zero values there costs nothing and stays
-  ## honest). The one caller that DOES have a real rlimit request to report —
-  ## pollSlot's ordinary run-phase reap — passes `slot.spec.limits` (the
-  ## requested-limits home) and `slot.achieved` (the REAL per-limit
-  ## `LimitsAchieved` readback spawn.nim's status pipe delivers, rfc-0007
-  ## A2a-iii — the interim aggregate-bit approximation this comment used to
-  ## describe is gone; `interimLimits` had no legitimate callers left once
-  ## the runner path got real per-limit readback and was deleted with it).
+proc toProcessResult(report: ReapReport; limits: ptypes.Limits;
+                     durationUs: int64): ptypes.ProcessResult =
+  ## The ONE place a reaped child's ProcessResult is assembled — a straight
+  ## map over `ReapReport` (§1's "one report" promise). `cause` consults
+  ## `report.stop` FIRST regardless of `report.exit` (§2's authorship rule:
+  ## "cbRunner iff ReapReport.stop.isSome") — a child reaped after a stop
+  ## act reads cbRunner even if it happened to exit 0 inside the grace
+  ## window. `evidence` stays the interim zero value — killDomain/tree/
+  ## escapees wiring is A6a's job, not this slice's (matches the pre-A2b
+  ## placeholder exactly).
   ptypes.ProcessResult(
-    exit: exit,
-    cause: ptypes.classifyCause(exit, stop, limits, achieved),
+    exit: report.exit,
+    cause: ptypes.classifyCause(report.exit, report.stop, limits, report.limits),
     evidence: default(ptypes.Evidence),
-    rusage: some(rusage),
+    rusage: report.rusage,
     durationUs: durationUs,
   )
 
-proc reapBlocking(pid: Pid): KillCapture =
-  ## Blocking wait4 that retries on EINTR — consistent with supervise's
-  ## post-SIGKILL reap.  Captures the real wstatus + rusage (rfc-0007 A1b:
-  ## this used to be a bare waitpid whose status was thrown away).
-  var wstatus: cint = 0
-  var ru: Rusage
-  while true:
-    let r = wait4(pid, addr wstatus, 0, addr ru)
-    if r >= Pid(0):
-      return KillCapture(reaped: true, exit: decodeExit(wstatus), rusage: decodeRusage(ru))
-    if errno != EINTR:
-      return KillCapture(reaped: false)
+proc anyLiveSlot(slots: seq[Slot]): bool =
+  ## A plain top-level proc (not a nested closure): a nested proc capturing
+  ## a `var seq[Slot]` parameter (as `teardownDiscard` needs) triggers Nim's
+  ## memory-safety capture check at codegen — an ordinary by-value `seq`
+  ## parameter sidesteps it entirely and is reused by every caller (the main
+  ## loop's own condition/progress-line/failFast checks, and the exception-
+  ## teardown drain).
+  for s in slots:
+    if s.state == ssLive: return true
+  false
 
-proc killAndReap(pid: Pid): KillCapture =
-  ## M11 / rfc-0007 A1b: Send SIGTERM to the process group, wait up to
-  ## GracePeriodMs, then escalate to SIGKILL and do a blocking reap —
-  ## capturing what actually happened instead of discarding it. `escalated`
-  ## is true iff SIGKILL was sent before an exit was observed (§2) — exactly
-  ## what the two return points below encode structurally: the WNOHANG poll
-  ## loop returns escalated:false on every path (an exit was seen before any
-  ## SIGKILL), and reaching the SIGKILL line below is only possible once the
-  ## grace window is exhausted with no exit observed.
-  ## Safe to call when the process may already be dead.
-  discard killpg(pid, SIGTERM)
-  let graceDeadline = getMonoTime() + initDuration(milliseconds = GracePeriodMs)
-  while getMonoTime() < graceDeadline:
-    var wstatus: cint = 0
-    var ru: Rusage
-    let r = wait4(pid, addr wstatus, WNOHANG, addr ru)
-    if r == pid:
-      return KillCapture(reaped: true, exit: decodeExit(wstatus),
-                         rusage: decodeRusage(ru), escalated: false)
-    os.sleep(20)
-  # Escalate to SIGKILL and reap.
-  discard killpg(pid, SIGKILL)
-  result = reapBlocking(pid)
-  result.escalated = true
+proc slotIndexOf(slots: seq[Slot]; id: ChildId): int =
+  ## Linear scan over the (small, == jobs) slot array for the live slot
+  ## holding `id`. `next` never reports a ChildId this executor did not
+  ## spawn, so a live match always exists.
+  for i in 0 ..< slots.len:
+    if slots[i].state == ssLive and slots[i].id == id:
+      return i
+  -1
+
+proc nextDeadline(slots: seq[Slot]; now: MonoTime; sampleTickMs: int): MonoTime =
+  ## §1: "the executor passes min(run deadlines, grace deadlines, sample
+  ## tick)". `sampleTickMs` keeps RFC-0002's RSS-sampling cadence unchanged
+  ## (§Contract impacts) — it is a CEILING, not a poll interval: `next`
+  ## still returns immediately on a real child-exit or shutdown event.
+  result = now + initDuration(milliseconds = sampleTickMs)
+  for s in slots:
+    if s.state == ssLive:
+      let d = if s.stopDeadline.isSome: s.stopDeadline.get else: s.deadline
+      if d < result: result = d
+
+proc armExpiredTimeouts(sv: var Supervisor; slots: var seq[Slot]; now: MonoTime) =
+  ## Main-loop-only half of the shared machinery: a live, not-yet-stopped
+  ## slot whose OWN phase deadline (compile or run timeout) has passed gets
+  ## its stop act recorded now. This is the ONLY place krTimeout is
+  ## authored — everything downstream (grace, escalation, the eventual
+  ## Cause) is identical to the interrupt path from here on, which is
+  ## exactly the "three paths become one" acceptance.
+  for i in 0 ..< slots.len:
+    if slots[i].state == ssLive and slots[i].stopDeadline.isNone and
+       now >= slots[i].deadline:
+      sv.requestStop(slots[i].id, ptypes.krTimeout)
+      slots[i].stopDeadline = some(now + initDuration(milliseconds = GracePeriodMs))
+
+proc escalateExpired(sv: var Supervisor; slots: var seq[Slot]; now: MonoTime) =
+  ## Shared by the main loop AND both teardown drains: a slot already in its
+  ## grace window (armed by EITHER a timeout or an interrupt stop act — the
+  ## two paths converge here) whose window has elapsed gets forceKill.
+  ## Non-blocking, idempotent (§1); `forceKilled` just avoids redundant
+  ## calls while still draining toward the eventual weChildExited.
+  for i in 0 ..< slots.len:
+    if slots[i].state == ssLive and slots[i].stopDeadline.isSome and
+       now >= slots[i].stopDeadline.get and not slots[i].forceKilled:
+      sv.forceKill(slots[i].id)
+      slots[i].forceKilled = true
+
+proc cleanupSlotOnTeardown(slot: Slot) =
+  ## Full cleanup for a slot whose child is being torn down and will NEVER
+  ## reach the downstream promotion/ledger/cache block (a killed COMPILE on
+  ## any path, or any slot torn down via the exception path) — unlike
+  ## `cleanupSlotTmp` (used by a normal/timeout-killed RUN-phase finalize,
+  ## which still needs slotBinDir/cacheDir intact for promotion), this
+  ## removes tmpDir/testScratchDir/slotBinDir unconditionally. cacheDir is
+  ## wiped only when the slot was mid-compile: nim's own process may have
+  ## left a partial/corrupt nimcache; a slot torn down while already
+  ## running has a complete, valid, persistent nimcache from its (already
+  ## successful) compile phase, and wiping it would defeat nimcache
+  ## persistence for the common "interrupt a long test run" case.
+  if slot.tmpDir.len > 0:
+    try: removeDir(slot.tmpDir) except: discard
+  if slot.testScratchDir.len > 0:
+    try: removeDir(slot.testScratchDir) except: discard
+  if slot.slotBinDir.len > 0:
+    try: removeDir(slot.slotBinDir) except: discard
+  if slot.phase == spCompiling and slot.cacheDir.len > 0:
+    try: removeDir(slot.cacheDir) except: discard
 
 type
-  SlotKillCapture = object
-    ## What Phase 2/3 below actually observed for one live slot — never
-    ## fabricated (mirrors KillCapture's "reaped == false ⇒ no Phase" rule).
-    pepIdx:    int
-    slotPhase: SlotPhase
-    exit:      ptypes.Exit
-    rusage:    ptypes.Rusage
-    escalated: bool   ## true iff SIGKILL was sent before this exit was
-                       ## observed — same §2 definition killAndReap uses.
+  FinalizeKind = enum
+    fkTransitioned  ## compile succeeded, no stop act — now running; the
+                    ## slot stays live (under a NEW ChildId).
+    fkOmitted       ## compile raced to success DURING interrupt teardown
+                     ## (no stop act was recorded — the Supervisor's atomic
+                     ## no-op rule, §1) but the run phase must not start
+                     ## mid-shutdown: §2 explicitly names "compile-done-
+                     ## run-unstarted" as a real, honestly-omitted state,
+                     ## never an auto-continue. The slot goes idle with no
+                     ## result and no onResult; the caller leaves its pepIdx
+                     ## unfinalized so the emission-set trim below counts it
+                     ## in notStarted.
+    fkDone          ## a result was produced; the slot goes idle.
 
-proc teardownLiveSlots(
-  slots:          var seq[Slot];
-  plan:           RunPlan;
-  results:        var seq[EntrypointResult];
-  onResult:       ResultCallback;
-  maxOutputBytes: int;
-  attribute:      bool = false;
-): seq[int] =
-  ## M6: Graceful shutdown of all live slots — shared by the SIGINT/SIGTERM
-  ## path and the exception finally path.  Mirrors the three-phase approach
-  ## used in the supervise helper (SIGTERM → grace drain → SIGKILL), so test
-  ## children can flush output/protocol records before being killed.
+  FinalizeOutcome = object
+    case kind: FinalizeKind
+    of fkDone: res: EntrypointResult
+    of fkTransitioned, fkOmitted: discard
+
+proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
+                     attempt: int): bool
+  ## Forward-declared: defined below, alongside spawnCompileStable/
+  ## spawnRunDirect (the other two ChildSpec-building spawn sites).
+
+proc cleanupSlotTmp(slot: Slot)
+  ## Forward-declared: defined below (unchanged from pre-A2b) — removes
+  ## per-slot temp output files + the A4a scratch tmpdir; deliberately
+  ## narrower than cleanupSlotOnTeardown (see that proc's doc comment).
+
+proc classifyRunResult(
+  ep: Entrypoint; output: string; elapsed: int64; compileSkipped: bool;
+): EntrypointResult
+  ## Forward-declared: defined below (unchanged from pre-A2b) — the plain
+  ## opaque-fallback EntrypointResult construction for a normal run end
+  ## with no protocol records.
+
+proc finalizeSlot(
+  sv:              var Supervisor;
+  slots:           var seq[Slot];
+  idx:             int;
+  plan:            RunPlan;
+  maxOutputBytes:  int;
+  allowTransition: bool;
+): FinalizeOutcome =
+  ## Called once `next` has reported weChildExited for `slots[idx].id`.
+  ## Reaps it (the only place a ChildId is consumed, §1) and either
+  ## transitions a successfully-compiled, un-stopped slot into its run
+  ## phase (fkTransitioned) or produces this pepIdx's EntrypointResult
+  ## (fkDone / fkOmitted). `allowTransition` is false only during interrupt
+  ## teardown.
   ##
-  ## rfc-0007 A1e-ii: `attribute` distinguishes the two callers.
-  ##   true  (the real interrupt path): every slot actually reaped here is
-  ##         attributed `cbRunner/krInterrupt` and stamped into an honest
-  ##         partial `EntrypointResult` — §2's emission rule (an entry is
-  ##         emitted iff its last-started phase is pkRan/pkCached/
-  ##         pkSpawnFailed; compiling→pkRan+run pkSkipped, running→run pkRan
-  ##         with compile carried from slot.compileProcRes) — fired through
-  ##         `onResult` exactly like a live completion, and its pepIdx is
-  ##         returned so the caller can mark it finalized (§2: "onResult
-  ##         fires for killed finals like any other completion").
-  ##   false (the shared finally-block safety net for the normal/exception
-  ##         paths): reaps still happen for correctness, but the observation
-  ##         is DISCARDED, same as before this slice — an exception mid-run
-  ##         (e.g. a raising onResult callback) has no KillReason to author
-  ##         honestly (that is the A2b runner rewrite's job: "exception
-  ##         teardown records NOTHING").
-  var captures = newSeq[Option[SlotKillCapture]](slots.len)
+  ## rfc-0007 §2: `report.stop` is the SINGLE source of authorship —
+  ## `toProcessResult`'s `classifyCause` call already consults it before the
+  ## exit itself, so this proc never branches on "was this a timeout or an
+  ## interrupt" anywhere: krTimeout and krInterrupt reach the exact same
+  ## code from here on.
+  let report  = sv.reap(slots[idx].id)
+  let pepIdx  = slots[idx].pepIdx
+  let pep     = plan.entrypoints[pepIdx]
+  let elapsed = int64((epochTime() - slots[idx].t0) * 1000)
 
-  ## Phase 1: SIGTERM all live process groups.
-  for s in slots:
-    if s.pepIdx != -1:
-      discard killpg(s.pid, SIGTERM)
+  case slots[idx].phase
+  of spCompiling:
+    if report.stop.isSome:
+      # Killed mid-compile — timeout or interrupt, identical shape either way.
+      let suffix = case report.stop.get.reason
+                   of ptypes.krTimeout:   "\n[compile timed out]"
+                   of ptypes.krInterrupt: "\n[interrupted]"
+      let output = readCapped(slots[idx].compOut, maxOutputBytes) & suffix
+      var res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed,
+                                 compileSkipped: slots[idx].compileSkipped,
+                                 attempts: slots[idx].attempt)
+      let killedRes = toProcessResult(report, ptypes.Limits(), elapsed * 1000)
+      res.compile = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
+      res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
+      cleanupSlotOnTeardown(slots[idx])
+      slots[idx].state = ssIdle
+      return FinalizeOutcome(kind: fkDone, res: res)
+    elif not report.exit.isSuccess:
+      # Compile failed on its own — not killed.
+      let output = readCapped(slots[idx].compOut, maxOutputBytes)
+      var res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed)
+      # M15: clean up per-slot cache and bin dirs on an actual compile
+      # failure — nim's own output may be partial/corrupt.
+      if slots[idx].cacheDir.len > 0:
+        try: removeDir(slots[idx].cacheDir) except: discard
+      if slots[idx].slotBinDir.len > 0:
+        try: removeDir(slots[idx].slotBinDir) except: discard
+      cleanupSlotTmp(slots[idx])
+      let failedRes = toProcessResult(report, ptypes.Limits(), elapsed * 1000)
+      res.compile = ptypes.Phase(kind: ptypes.pkRan, res: failedRes)
+      res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
+      slots[idx].state = ssIdle
+      return FinalizeOutcome(kind: fkDone, res: res)
+    else:
+      # Compile succeeded, no stop act — capture it onto the slot so the
+      # eventual run-phase result (below, or a later kill) carries BOTH
+      # phases.
+      slots[idx].compileProcRes = some(toProcessResult(report, ptypes.Limits(), elapsed * 1000))
+      if not allowTransition:
+        cleanupSlotOnTeardown(slots[idx])
+        slots[idx].state = ssIdle
+        return FinalizeOutcome(kind: fkOmitted)
+      let ok = transitionToRun(sv, slots[idx], slots[idx].runTimeoutMs, slots[idx].attempt)
+      if not ok:
+        var res = EntrypointResult(ep: pep.ep, output: "fork failed during run phase",
+                                   durationMs: elapsed)
+        # M15: cacheDir intentionally LEFT ALONE — the compile that produced
+        # it already succeeded; this is a run-phase spawn failure, unrelated
+        # to the nimcache's validity.
+        if slots[idx].slotBinDir.len > 0:
+          try: removeDir(slots[idx].slotBinDir) except: discard
+        cleanupSlotTmp(slots[idx])
+        res.compile = ptypes.Phase(kind: ptypes.pkRan, res: slots[idx].compileProcRes.get)
+        res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
+                                   spawnError: "fork failed during run phase")
+        slots[idx].state = ssIdle
+        return FinalizeOutcome(kind: fkDone, res: res)
+      return FinalizeOutcome(kind: fkTransitioned)
 
-  ## Phase 2: drain up to GracePeriodMs with WNOHANG polls.
-  ## Track per-slot reaped state so Phase 3 never re-signals an already-reaped pid
-  ## (in a container with pid/pgid reuse, a SIGKILL could hit an unrelated process).
-  var reapedInGrace = newSeq[bool](slots.len)
-  let drainDeadline = getMonoTime() + initDuration(milliseconds = GracePeriodMs)
-  while getMonoTime() < drainDeadline:
-    var allDead = true
-    for i in 0 ..< slots.len:
-      if slots[i].pepIdx == -1: continue  # idle or already reap-tracked
-      if reapedInGrace[i]: continue       # reaped this grace window — skip
-      var ws: cint = 0
-      var ru: Rusage
-      let r = wait4(slots[i].pid, addr ws, WNOHANG, addr ru)
-      if r == Pid(0):
-        allDead = false                   # still alive; keep draining
-      elif r > Pid(0):
-        reapedInGrace[i] = true           # exited cleanly during grace; do NOT SIGKILL
-        # rfc-0007 A1b/A1e-ii: captured (decoded) — a real Exit, not a
-        # fabricated one. No SIGKILL was sent to reach this exit, so
-        # escalated:false (same definition killAndReap uses).
-        captures[i] = some(SlotKillCapture(
-          pepIdx: slots[i].pepIdx, slotPhase: slots[i].phase,
-          exit: decodeExit(ws), rusage: decodeRusage(ru), escalated: false))
-    if allDead: break
-    os.sleep(20)
-
-  ## Phase 3: SIGKILL any that survived the grace window, then reap all.
-  ## Slots reaped in Phase 2 are SKIPPED — their pid is gone (possibly reused).
-  for i in 0 ..< slots.len:
-    if slots[i].pepIdx == -1: continue
-    if reapedInGrace[i]: continue  # R2-2: already reaped in Phase 2; do not SIGKILL
-    var ws: cint = 0
-    var ru: Rusage
-    let r = wait4(slots[i].pid, addr ws, WNOHANG, addr ru)
-    if r == Pid(0):
-      discard killpg(slots[i].pid, SIGKILL)
-      let cap = reapBlocking(slots[i].pid)  # rfc-0007 A1b: captures via wait4; see above
-      if cap.reaped:
-        captures[i] = some(SlotKillCapture(
-          pepIdx: slots[i].pepIdx, slotPhase: slots[i].phase,
-          exit: cap.exit, rusage: cap.rusage, escalated: true))
-      # else: truly unreaped (the RFC's "unkillable child" corner, e.g. a
-      # wedged D-state process) — no Phase is fabricated for it; it simply
-      # never appears in `captures`, so it is never attributed and never
-      # joins the emission set (§2: the honest "the run does not complete").
-    # else: exited between Phase 2 end and Phase 3 check — already reaped, no SIGKILL
-    elif r > Pid(0):
-      # rfc-0007 A1b/A1e-ii: captured — same as the Phase 2 branch above,
-      # no SIGKILL was sent to THIS process, so escalated:false.
-      captures[i] = some(SlotKillCapture(
-        pepIdx: slots[i].pepIdx, slotPhase: slots[i].phase,
-        exit: decodeExit(ws), rusage: decodeRusage(ru), escalated: false))
-
-  ## Phase 3.5 (rfc-0007 A1e-ii): attribute captured kills to honest partial
-  ## EntrypointResults and fire onResult — skipped entirely when `attribute`
-  ## is false (the captures above were still needed to reap correctly; only
-  ## their USE as a result is conditional).
-  if attribute:
-    for i in 0 ..< slots.len:
-      if captures[i].isNone: continue
-      let cap = captures[i].get
-      let pep = plan.entrypoints[cap.pepIdx]
-      let elapsed = int64((epochTime() - slots[i].t0) * 1000)
-      let output =
-        if cap.slotPhase == spCompiling:
-          readCapped(slots[i].compOut, maxOutputBytes) & "\n[interrupted]"
-        else:
-          readCapped(slots[i].runOut, maxOutputBytes)
-      var res = EntrypointResult(ep: pep.ep, output: output,
-                                 durationMs: elapsed,
-                                 compileSkipped: slots[i].compileSkipped,
-                                 attempts: slots[i].attempt)
-      let killedRes = buildProcResult(cap.exit, cap.rusage,
-        some((reason: ptypes.krInterrupt, escalated: cap.escalated)), elapsed * 1000)
-      if cap.slotPhase == spCompiling:
-        res.compile = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
-        res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
+  of spRunning:
+    let compilePhase =
+      if slots[idx].compileProcRes.isSome:
+        ptypes.Phase(kind: ptypes.pkRan, res: slots[idx].compileProcRes.get)
       else:
-        res.compile =
-          if slots[i].compileProcRes.isSome:
-            ptypes.Phase(kind: ptypes.pkRan, res: slots[i].compileProcRes.get)
-          else:
-            ptypes.Phase(kind: ptypes.pkSkipped)  # cdSkipFresh: no compile this run
-        res.run = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
-      results[cap.pepIdx] = res
-      onResult(res)
-      result.add cap.pepIdx
+        ptypes.Phase(kind: ptypes.pkSkipped)  # cdSkipFresh: no compile this run
+    slots[idx].achieved = report.limits  # §1: delivered in ReapReport, not SpawnResult
+    var res: EntrypointResult
+    if report.stop.isSome:
+      # Killed mid-run (timeout or interrupt) — output only; sink
+      # reconciliation for a runner-initiated kill is unchanged/out of
+      # scope for this slice (pre-existing behavior).
+      let output = readCapped(slots[idx].runOut, maxOutputBytes)
+      res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed,
+                             compileSkipped: slots[idx].compileSkipped,
+                             attempts: slots[idx].attempt)
+    elif report.exit.kind == ptypes.ekSignaled:
+      let output   = readCapped(slots[idx].runOut, maxOutputBytes)
+      let sinkData = readSink(slots[idx].sinkPath, maxOutputBytes)
+      res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed,
+                             compileSkipped: slots[idx].compileSkipped,
+                             records: sinkData.records)
+    else:
+      let output   = readCapped(slots[idx].runOut, maxOutputBytes)
+      let sinkData = readSink(slots[idx].sinkPath, maxOutputBytes)
+      if sinkData.hasProtocol:
+        res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed,
+                               compileSkipped: slots[idx].compileSkipped,
+                               records: sinkData.records)
+      else:
+        res = classifyRunResult(pep.ep, output, elapsed, slots[idx].compileSkipped)
+    let runRes = toProcessResult(report, slots[idx].spec.limits, elapsed * 1000)
+    cleanupSlotTmp(slots[idx])
+    res.compile = compilePhase
+    res.run     = ptypes.Phase(kind: ptypes.pkRan, res: runRes)
+    slots[idx].state = ssIdle
+    return FinalizeOutcome(kind: fkDone, res: res)
 
-  ## Phase 4: cleanup temp dirs and clear slot so loops are idempotent on
-  ## double-invocation (e.g. interrupt path marks slots idle before finally runs).
+proc teardownDiscard(sv: var Supervisor; slots: var seq[Slot]) =
+  ## rfc-0007 A2b: exception-path teardown — the `finally:` safety net for
+  ## the normal AND exception paths (a no-op when every slot is already
+  ## idle, which is always true on a normal/interrupted completion — the
+  ## interrupt path above already drained to zero live slots). Shares the
+  ## EXACT SAME requestStop/escalateExpired/next machinery as
+  ## `teardownAllLive`, but authors nothing: `reap`'s ReapReport is
+  ## discarded outright, never fed through `classifyCause`. There is no
+  ## honest KillReason for "our own code raised" (§2 forbids reasons
+  ## without producers) — `krTimeout` is used purely as the mechanical
+  ## value `requestStop`'s signature requires; it is never read back into
+  ## any Phase/Cause/output.
+  let now0 = getMonoTime()
   for i in 0 ..< slots.len:
-    if slots[i].pepIdx == -1: continue   # already idle (or never live)
-    if slots[i].tmpDir.len > 0:
-      try: removeDir(slots[i].tmpDir) except: discard
-    if slots[i].testScratchDir.len > 0:
-      try: removeDir(slots[i].testScratchDir) except: discard
-    if slots[i].slotBinDir.len > 0:
-      try: removeDir(slots[i].slotBinDir) except: discard
-    # nimcache-persistence: only wipe cacheDir when the slot was interrupted
-    # WHILE COMPILING — nim's own process was killed mid-write and may have
-    # left a partial/corrupt nimcache. A slot interrupted during spRunning
-    # already has a complete, valid, persistent nimcache from its (already
-    # successful) compile phase; wiping it on every Ctrl-C would silently
-    # defeat persistence for the common "interrupt a long test run" case.
-    if slots[i].phase == spCompiling and slots[i].cacheDir.len > 0:
-      try: removeDir(slots[i].cacheDir) except: discard
-    slots[i].pepIdx = -1  # mark idle so a second call is a no-op
+    if slots[i].state == ssLive:
+      sv.requestStop(slots[i].id, ptypes.krTimeout)
+      if slots[i].stopDeadline.isNone:
+        slots[i].stopDeadline = some(now0 + initDuration(milliseconds = GracePeriodMs))
+
+  while anyLiveSlot(slots):
+    let now = getMonoTime()
+    escalateExpired(sv, slots, now)
+    let deadline = nextDeadline(slots, now, GracePeriodMs)
+    let ev = sv.next(deadline)
+    case ev.kind
+    of weChildExited:
+      let idx = slotIndexOf(slots, ev.id)
+      discard sv.reap(slots[idx].id)   # DISCARDED — no Phase, no Cause, no onResult
+      cleanupSlotOnTeardown(slots[idx])
+      slots[idx].state = ssIdle
+    of weDeadline:
+      discard
+    of weShutdown:
+      for i in 0 ..< slots.len:
+        if slots[i].state == ssLive:
+          sv.forceKill(slots[i].id)
+          slots[i].forceKilled = true
+    of weOrphanReaped:
+      discard
 
 proc classifyRunResult(
   ep: Entrypoint; output: string; elapsed: int64; compileSkipped: bool;
@@ -611,6 +693,7 @@ proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
       removeFile(path)
 
 proc spawnCompileStable(
+  sv:               var Supervisor;
   slot:             var Slot;
   pepIdx:           int;
   pep:              PlannedEntrypoint;
@@ -782,29 +865,34 @@ proc spawnCompileStable(
       warnMeasureCompileReuseNoWorkerOnce()
     compArgs = monolithicCompArgs()
 
-  let fd = openOutputFile(compOut)
-  if fd < 0:
+  # rfc-0007 A2b: ONE spawn path. ChildSpec.env is ALWAYS explicit (§1) — the
+  # compile phase stays unsandboxed (A6), so this is the parent env copied
+  # verbatim (filterEnv's envScrub:false branch), never "whatever environ
+  # is" by implicit fork() inheritance. cwd stays "" (parent cwd, matching
+  # pre-A2b forkExec) — A2c (#17) is the slice that resolves this to
+  # projectRoot; not this one.
+  let childSpec = ChildSpec(
+    argv:   compArgs,
+    cwd:    "",
+    env:    filterEnv(toSeq(envPairs()), SandboxSpec(envScrub: false), @[]),
+    sinks:  combinedSink(compOut),
+    limits: ptypes.Limits(),  # compile is unsandboxed — no limits requested
+  )
+  let sr = sv.spawn(childSpec)
+  if not sr.ok:
     # M15: cacheDir intentionally NOT wiped — nim c never ran this attempt
-    # (compile-output fd open failed before forkExec); see the mkdtemp-
-    # failure comment above.
+    # (spawn itself failed); see the mkdtemp-failure comment above.
     try: removeDir(tmpDir)     except: discard
     try: removeDir(binDirSlot) except: discard
     return false
 
-  let pid = forkExec(compArgs, fd)
-  discard posix.close(fd)
-
-  if int(pid) < 0:
-    # M15: cacheDir intentionally NOT wiped — forkExec itself failed, so
-    # nim c never ran this attempt; see the mkdtemp-failure comment above.
-    try: removeDir(tmpDir)     except: discard
-    try: removeDir(binDirSlot) except: discard
-    return false
-
+  slot.state           = ssLive
+  slot.id              = sr.id
   slot.pepIdx          = pepIdx
   slot.phase           = spCompiling
-  slot.pid             = pid
   slot.deadline        = getMonoTime() + initDuration(milliseconds = compileTimeoutMs)
+  slot.stopDeadline    = none(MonoTime)
+  slot.forceKilled     = false
   slot.t0              = epochTime()
   slot.runTimeoutMs    = effectiveRunTimeoutMs(ep, config)  # S2b: per-entrypoint run budget
   slot.tmpDir          = tmpDir        # M8: temp dir holding output files
@@ -818,14 +906,46 @@ proc spawnCompileStable(
   slot.slotBinDir      = binDirSlot    # M15: for cleanup on all paths
   slot.compiledThisRun = true
   slot.compileSkipped  = false
-  slot.spec            = spec          # A6: stored for the compile→run transition (spawnRun)
+  slot.spec            = spec          # A6: stored for the compile→run transition (transitionToRun)
   slot.compileProcRes  = none(ptypes.ProcessResult)  # rfc-0007 A1b: reset on every claim
                                         # so a reused slot never leaks a prior occupant's
-                                        # compile observation; pollSlot sets this for real
-                                        # once THIS compile is reaped.
+                                        # compile observation; finalizeSlot sets this for
+                                        # real once THIS compile is reaped.
   result = true
 
+proc buildRunChildSpec(
+  binFull:       string;
+  runOut:        string;
+  sinkFile:      string;
+  spec:          SandboxSpec;
+  attempt:       int;
+  outScratchDir: var string;
+): ChildSpec =
+  ## rfc-0007 A2b: the SINGLE ChildSpec-building path for a run child —
+  ## shared by `spawnRunDirect` (cdSkipFresh) and `transitionToRun` (a
+  ## freshly-compiled entrypoint), replacing crisol/spawn.nim's
+  ## `forkExecEnvScratch`. The scratch tmpdir (when `spec.tmpdir`) is
+  ## created HERE, in the runner, before spawn — the Supervisor's
+  ## `spawnChild` no longer owns any scratch/env resolution (§1: `cwd`/
+  ## `env` are resolved by the RUNNER before spawn). May raise (mkdtemp
+  ## failure) — callers catch and treat it as a spawn failure, same as
+  ## before.
+  outScratchDir = ""
+  var injected = @[("CRISOL_SINK", sinkFile), ("CRISOL_ATTEMPT", $attempt)]
+  if spec.tmpdir:
+    let scratch = makeTmpDir("crisol_scratch_")
+    outScratchDir = scratch
+    injected.add(("TMPDIR", scratch))
+  # rfc-0007 A2b "explicit env for hlNone": ChildSpec.env is ALWAYS explicit
+  # now (§1) — filterEnv already implements exactly this contract (envScrub
+  # false = the parent env explicitly copied, never implicit inheritance).
+  let env = filterEnv(toSeq(envPairs()), spec, injected)
+  let cwd = if spec.chdirIntoScratch and outScratchDir.len > 0: outScratchDir else: ""
+  ChildSpec(argv: @[binFull], cwd: cwd, env: env, sinks: combinedSink(runOut),
+            limits: spec.limits)
+
 proc spawnRunDirect(
+  sv:           var Supervisor;
   slot:         var Slot;
   pepIdx:       int;
   pep:          PlannedEntrypoint;
@@ -837,10 +957,11 @@ proc spawnRunDirect(
   ## Returns false on resource allocation failure.
   ## R1: injects CRISOL_SINK into the child environment.
   ## B0: injects CRISOL_ATTEMPT=attempt (1-indexed) into the child environment.
-  ## A6: routes through forkExecEnvScratch — the single spec-driven spawn entry
-  ##     — so the LIVE run path actually applies hermeticity (env scrub, isolated
-  ##     TMPDIR, rlimits) and reports per-limit LimitsAchieved over the
-  ##     A2a-iii status pipe.
+  ## rfc-0007 A2b: routes through `sv.spawn` + `buildRunChildSpec` — the
+  ## single spec-driven spawn entry — so the LIVE run path actually applies
+  ## hermeticity (env scrub, isolated TMPDIR, rlimits) and reports per-limit
+  ## LimitsAchieved via the Supervisor's own status-pipe readback (§1),
+  ## delivered in ReapReport at reap time (finalizeSlot), not here.
   ## M8: uses mkdtemp for temp output files.
   ## S2b: run deadline set from effectiveRunTimeoutMs(ep, config).
 
@@ -858,31 +979,28 @@ proc spawnRunDirect(
   let runOut   = tmpDir / "run_out.txt"
   let sinkFile = tmpDir / "sink.ndjson"
 
-  let fd = openOutputFile(runOut)
-  if fd < 0:
+  var scratchDir: string
+  var childSpec: ChildSpec
+  try:
+    childSpec = buildRunChildSpec(binFull, runOut, sinkFile, spec, attempt, scratchDir)
+  except:
     try: removeDir(tmpDir) except: discard
     return false
 
-  # A6: spec-driven spawn.  CRISOL_SINK and CRISOL_ATTEMPT are injected
-  # (after the allowlist filter); the scratch tmpdir + TMPDIR injection +
-  # rlimits are handled by spec.
-  var scratchDir: string
-  let (pid, achieved) = forkExecEnvScratch(
-    @[binFull], fd,
-    [("CRISOL_SINK", sinkFile), ("CRISOL_ATTEMPT", $attempt)],
-    spec, scratchDir)
-  discard posix.close(fd)
-
-  if int(pid) < 0:
+  let sr = sv.spawn(childSpec)
+  if not sr.ok:
     try: removeDir(tmpDir) except: discard
     if scratchDir.len > 0:
       try: removeDir(scratchDir) except: discard
     return false
 
+  slot.state           = ssLive
+  slot.id              = sr.id
   slot.pepIdx          = pepIdx
   slot.phase           = spRunning
-  slot.pid             = pid
   slot.deadline        = getMonoTime() + initDuration(milliseconds = rtMs)
+  slot.stopDeadline    = none(MonoTime)
+  slot.forceKilled     = false
   slot.t0              = epochTime()
   slot.runTimeoutMs    = rtMs           # S2b: stored for reference (deadline already set)
   slot.tmpDir          = tmpDir        # M8: temp dir to clean up
@@ -894,51 +1012,46 @@ proc spawnRunDirect(
   slot.slotBinDir      = ""
   slot.compiledThisRun = false
   slot.compileSkipped  = true
-  slot.achieved        = achieved      # A4d/A6: hermeticity delivered by this run
+  slot.spec            = spec          # A2b: carried so groupRssBytes callers and a
+                                        # later kill have the same spec context
+  slot.achieved         = default(ptypes.LimitsAchieved)  # §1: delivered in ReapReport, not
+                                        # SpawnResult — finalizeSlot sets the real value
   slot.compileProcRes  = none(ptypes.ProcessResult)  # rfc-0007 A1b: cdSkipFresh —
                                         # no compile happened this run; reset so a
                                         # reused slot never leaks a prior occupant's
                                         # compile observation.
   result = true
 
-proc spawnRun(
-  slot:         var Slot;
-  runTimeoutMs: int;
-  attempt:      int;
-): bool =
-  ## Transition a compile-succeeded slot into the running phase.
-  ## Spawns the compiled binary as a new child.
-  ## Returns false on fork/file-open failure; caller records oSpawnError.
+proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
+                     attempt: int): bool =
+  ## rfc-0007 A2b: transition a compile-succeeded, un-stopped slot into its
+  ## running phase — spawns the compiled binary as a NEW child (a fresh
+  ## ChildId; the compile child's id was already consumed by `reap` before
+  ## this is called). Returns false on spawn failure; caller records
+  ## oSpawnError. Formerly `spawnRun`.
   ## R1: injects CRISOL_SINK into the child's environment.
   ## B0: injects CRISOL_ATTEMPT=attempt (1-indexed) into the child environment.
-  ## A6: routes through forkExecEnvScratch (spec stored on the slot) so the run
-  ##     phase of a freshly-compiled entrypoint gets the same hermeticity as the
-  ##     skip-fresh path, and reports per-limit LimitsAchieved for the
-  ##     cache-store gate.
 
-  let fd = openOutputFile(slot.runOut)
-  if fd < 0:
+  var scratchDir: string
+  var childSpec: ChildSpec
+  try:
+    childSpec = buildRunChildSpec(slot.binFull, slot.runOut, slot.sinkPath,
+                                  slot.spec, attempt, scratchDir)
+  except:
     return false
 
-  # R1: inject CRISOL_SINK — slot.sinkPath was set in spawnCompileStable.
-  # B0: inject CRISOL_ATTEMPT (1-indexed).
-  var scratchDir: string
-  let (pid, achieved) = forkExecEnvScratch(
-    @[slot.binFull], fd,
-    [("CRISOL_SINK", slot.sinkPath), ("CRISOL_ATTEMPT", $attempt)],
-    slot.spec, scratchDir)
-  discard posix.close(fd)
-
-  if int(pid) < 0:
+  let sr = sv.spawn(childSpec)
+  if not sr.ok:
     if scratchDir.len > 0:
       try: removeDir(scratchDir) except: discard
     return false
 
-  slot.phase          = spRunning
-  slot.pid            = pid
-  slot.deadline       = getMonoTime() + initDuration(milliseconds = runTimeoutMs)
-  slot.testScratchDir = scratchDir   # A4a/A6: cleaned on all exit paths
-  slot.achieved       = achieved     # A4d/A6: hermeticity delivered by this run
+  slot.id              = sr.id
+  slot.phase           = spRunning
+  slot.deadline        = getMonoTime() + initDuration(milliseconds = runTimeoutMs)
+  slot.stopDeadline    = none(MonoTime)
+  slot.forceKilled     = false
+  slot.testScratchDir  = scratchDir   # A4a/A6: cleaned on all exit paths
   result = true
 
 proc cleanupSlotTmp(slot: Slot) =
@@ -955,217 +1068,6 @@ proc cleanupSlotTmp(slot: Slot) =
   # A4a: remove the per-entrypoint scratch tmpdir on all exit paths.
   if slot.testScratchDir.len > 0:
     try: removeDir(slot.testScratchDir) except: discard
-
-proc pollSlot(
-  slot:           var Slot;
-  results:        var seq[EntrypointResult];
-  plan:           RunPlan;
-  maxOutputBytes: int;
-): bool =
-  ## Poll a live slot with wait4(WNOHANG) — rfc-0007 A1b: wait4 (not
-  ## waitpid), so every real reap captures rusage alongside the wstatus.
-  ## Returns true if the slot is now idle (completed or errored) — caller
-  ## should clear slot.pepIdx and may fill it with a new entrypoint.
-  ##
-  ## S2b: the global runTimeoutMs parameter has been removed.  The per-
-  ## entrypoint run deadline is read from slot.runTimeoutMs (set at slot
-  ## setup time by spawnCompileStable / spawnRunDirect via
-  ## effectiveRunTimeoutMs) when transitioning spCompiling → spRunning.
-  ##
-  ## B1: onResult is NOT called here.  The execute loop decides whether to
-  ## retry (failure + attempts remaining) or finalize (pass or exhausted).
-  ## onResult is called ONCE by the execute loop after that decision.
-  ##
-  ## Records the result in `results[slot.pepIdx]`; execute loop calls onResult.
-  ## rfc-0007 §2: `results[slot.pepIdx].compile`/`.run` are populated below on
-  ## every path EXCEPT two documented, never-fabricated corners: a genuinely
-  ## unreaped kill (the "unkillable child" case) and ECHILD (truly no child to
-  ## observe) — both leave `compile`/`run` at their pkSkipped zero-value
-  ## default, and `outcome(r)` derives loudly (oSpawnError) rather than lying.
-
-  var wstatus: cint = 0
-  var ru: Rusage
-  var r: Pid
-  # R10: retry wait4 on EINTR.
-  while true:
-    r = wait4(slot.pid, addr wstatus, WNOHANG, addr ru)
-    if r >= Pid(0) or errno != EINTR:
-      break
-
-  # R11: monotonic deadline comparison.
-  let timedOut = getMonoTime() >= slot.deadline
-
-  # Check for timeout first: kill and reap, then process as timed out.
-  if timedOut and r != slot.pid:
-    let cap = killAndReap(slot.pid)
-    let pep    = plan.entrypoints[slot.pepIdx]
-    let elapsed = int64((epochTime() - slot.t0) * 1000)
-    let output =
-      if slot.phase == spCompiling:
-        readCapped(slot.compOut, maxOutputBytes) & "\n[compile timed out]"
-      else:
-        readCapped(slot.runOut, maxOutputBytes)
-    var res = EntrypointResult(ep: pep.ep, output: output,
-                               durationMs: elapsed,
-                               compileSkipped: slot.compileSkipped)
-    # M15: clean up per-slot bin dir on timeout during compile.
-    if slot.phase == spCompiling and slot.slotBinDir.len > 0:
-      try: removeDir(slot.slotBinDir) except: discard
-    # nimcache-persistence: a compile killed mid-run (SIGKILL on timeout) can
-    # leave a partial/corrupt nimcache (interrupted .c/.json manifest write) —
-    # the same "corrupt partial cache must not persist" rule as an outright
-    # compile failure below, so wipe it here too. A run-phase timeout leaves
-    # cacheDir alone: the compile that produced it already succeeded.
-    if slot.phase == spCompiling and slot.cacheDir.len > 0:
-      try: removeDir(slot.cacheDir) except: discard
-    cleanupSlotTmp(slot)
-    # rfc-0007 §2: the honest observation. `cap.reaped == false` is the
-    # RFC's "unkillable child" corner — never fabricate a Phase for it;
-    # `res.compile`/`.run` are simply left at their pkSkipped zero-value
-    # default for this pepIdx.
-    if cap.reaped:
-      let killedRes = buildProcResult(cap.exit, cap.rusage,
-        some((reason: ptypes.krTimeout, escalated: cap.escalated)), elapsed * 1000)
-      if slot.phase == spCompiling:
-        res.compile = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
-        res.run      = ptypes.Phase(kind: ptypes.pkSkipped)
-      else:
-        res.compile =
-          if slot.compileProcRes.isSome:
-            ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
-          else:
-            ptypes.Phase(kind: ptypes.pkSkipped)
-        res.run = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
-    results[slot.pepIdx] = res
-    return true  # execute loop calls onResult after retry decision
-
-  if r == 0:
-    # Child still running, no timeout yet.
-    return false
-
-  if r < Pid(0):
-    # R10: EINTR is now retried above; this branch is only ECHILD (truly no child).
-    let pep    = plan.entrypoints[slot.pepIdx]
-    let elapsed = int64((epochTime() - slot.t0) * 1000)
-    var res = EntrypointResult(ep: pep.ep,
-                               output: "waitpid error (ECHILD)",
-                               durationMs: elapsed,
-                               compileSkipped: slot.compileSkipped)
-    cleanupSlotTmp(slot)
-    results[slot.pepIdx] = res
-    # rfc-0007 A1c: truly no observation is possible here (ECHILD) — the
-    # Phase fields are left at their pkSkipped zero-value default, same
-    # never-fabricate rule as the "unkillable child" corner above.
-    return true  # execute loop calls onResult after retry decision
-
-  # r == slot.pid: child has exited.
-  let exitedCode   = if WIFEXITED(wstatus):   int(WEXITSTATUS(wstatus)) else: 0
-  let sigNum       = if WIFSIGNALED(wstatus): int(WTERMSIG(wstatus))    else: 0
-  let pep          = plan.entrypoints[slot.pepIdx]
-  let reapedExit   = decodeExit(wstatus)
-  let reapedRusage = decodeRusage(ru)
-
-  case slot.phase
-  of spCompiling:
-    if exitedCode != 0 or sigNum != 0:
-      # Compile failed.
-      let output  = readCapped(slot.compOut, maxOutputBytes)
-      let elapsed = int64((epochTime() - slot.t0) * 1000)
-      var res = EntrypointResult(ep: pep.ep,
-                                 output: output, durationMs: elapsed)
-      # M15: clean up per-slot cache and bin dirs on compile failure.
-      if slot.cacheDir.len > 0:
-        try: removeDir(slot.cacheDir) except: discard
-      if slot.slotBinDir.len > 0:
-        try: removeDir(slot.slotBinDir) except: discard
-      cleanupSlotTmp(slot)
-      let failedRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000)
-      res.compile = ptypes.Phase(kind: ptypes.pkRan, res: failedRes)
-      res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
-      results[slot.pepIdx] = res
-      return true  # execute loop calls onResult after retry decision
-    else:
-      # Compile succeeded → transition to running phase. rfc-0007 §2:
-      # capture the compile's own observation onto the slot BEFORE spawning
-      # the run child, so the eventual run-phase result (below, or the
-      # timeout branch above) can carry BOTH phases.
-      let elapsedCompile = int64((epochTime() - slot.t0) * 1000)
-      slot.compileProcRes = some(buildProcResult(
-        reapedExit, reapedRusage, NoRfc7Stop, elapsedCompile * 1000))
-      # S2b: use the per-entrypoint run budget stored at slot setup time.
-      # B0: pass the attempt counter stored on the slot.
-      let ok = spawnRun(slot, slot.runTimeoutMs, slot.attempt)
-      if not ok:
-        # Run spawn failed.
-        let elapsed = int64((epochTime() - slot.t0) * 1000)
-        var res = EntrypointResult(ep: pep.ep,
-                                   output: "fork failed during run phase",
-                                   durationMs: elapsed)
-        # M15: clean up the scratch bin dir only. cacheDir is intentionally
-        # LEFT ALONE here — the compile that produced it already succeeded
-        # (we are past the exitedCode/sigNum check above); this is a run-
-        # phase fork failure, unrelated to the nimcache's validity. Wiping a
-        # good persistent nimcache over an unrelated run-spawn failure would
-        # defeat nimcache-persistence for no reason.
-        if slot.slotBinDir.len > 0:
-          try: removeDir(slot.slotBinDir) except: discard
-        cleanupSlotTmp(slot)
-        res.compile = ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
-        res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
-                                   spawnError: "fork failed during run phase")
-        results[slot.pepIdx] = res
-        return true  # execute loop calls onResult after retry decision
-      # Slot is now in spRunning; not yet done.
-      return false
-
-  of spRunning:
-    let output  = readCapped(slot.runOut, maxOutputBytes)
-    let elapsed = int64((epochTime() - slot.t0) * 1000)
-    let compilePhase =
-      if slot.compileProcRes.isSome:
-        ptypes.Phase(kind: ptypes.pkRan, res: slot.compileProcRes.get)
-      else:
-        ptypes.Phase(kind: ptypes.pkSkipped)  # cdSkipFresh: no compile this run
-
-    # rfc-0007 §2: the process exited or was signaled — outcome(res) derives
-    # the verdict below from res.compile/res.run + res.records; there is no
-    # executor-precedence legacy value to compute here. The sink is
-    # read/reconciled on EVERY run end, signaled included — records from a
-    # signaled process are diagnostic only (cause.by == cbRunner / a non-
-    # ekExited Exit dominates the derivation before records are consulted)
-    # but must not be silently dropped just because the process was signaled.
-    var res: EntrypointResult
-    # rfc-0007 A1f/A2a-iii: the run phase is the ONLY sandboxed child (compile
-    # is unsandboxed, A6) — thread its real requested-limits (slot.spec.limits)
-    # and REAL per-limit readback (slot.achieved, A2a-iii's getrlimit
-    # confirmation, not the retired aggregate-bit approximation) through so a
-    # SIGXCPU/SIGXFSZ the child received classifies cbLimit when that limit
-    # was actually requested AND achieved.
-    let runRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000,
-                                 slot.spec.limits, slot.achieved)
-    if sigNum != 0:
-      let sinkData = readSink(slot.sinkPath, maxOutputBytes)
-      res = EntrypointResult(ep: pep.ep,
-                             output: output, durationMs: elapsed,
-                             compileSkipped: slot.compileSkipped,
-                             records: sinkData.records)
-    else:
-      # Normal exit — read the sink.
-      let sinkData = readSink(slot.sinkPath, maxOutputBytes)
-      if sinkData.hasProtocol:
-        res = EntrypointResult(ep: pep.ep, output: output,
-                               durationMs: elapsed,
-                               compileSkipped: slot.compileSkipped,
-                               records: sinkData.records)
-      else:
-        # Opaque fallback: no protocol records to carry.
-        res = classifyRunResult(pep.ep, output, elapsed, slot.compileSkipped)
-
-    cleanupSlotTmp(slot)
-    res.compile = compilePhase
-    res.run     = ptypes.Phase(kind: ptypes.pkRan, res: runRes)
-    results[slot.pepIdx] = res
-    return true  # execute loop calls onResult after retry decision
 
 # ---------------------------------------------------------------------------
 # execute — bounded-parallel continue-on-failure runner
@@ -1190,13 +1092,28 @@ proc execute*(
                                     ## a SIGINT/SIGTERM cut this run short (§2) —
                                     ## CrisolInterrupted is retired; this is its
                                     ## replacement signal. The raw signal number is
-                                    ## still readable via signals.pendingSignal()
-                                    ## once this is true (nothing clears it in between).
+                                    ## written to `shutdownSignalOut` (below), not
+                                    ## readable via signals.pendingSignal() any more
+                                    ## (rfc-0007 A2b: the Supervisor owns shutdown-
+                                    ## signal capture for the duration of this call).
   notStartedOut:    ptr int = nil;  ## rfc-0007 A1e-ii: if non-nil, written with the
                                     ## count of entries OMITTED from the returned
                                     ## seq because their next phase never started
                                     ## (§2's emission-set rule) — 0 on a normal
                                     ## (non-interrupted) completion.
+  shutdownSignalOut: ptr int = nil;  ## rfc-0007 A2b: if non-nil, written with the
+                                    ## SIGINT/SIGTERM signum this call's own
+                                    ## Supervisor observed (0 when not interrupted)
+                                    ## — RFC-0003's 128+n needs `n`; §1's
+                                    ## ShutdownSignal carries exactly this value.
+  installSignals:   bool = false;  ## rfc-0007 A2b: this call's OWN Supervisor owns
+                                    ## SIGINT/SIGTERM installation for its duration
+                                    ## (`initSupervisor(installSignals)`, §1) — the
+                                    ## seam that used to be the CALLER's job (via
+                                    ## crisol/signals.installSignalHandlers before
+                                    ## calling execute). Library default stays OFF:
+                                    ## a caller that never asks for interrupt
+                                    ## handling gets none installed, same as before.
   cache:            CacheContext = cacheDisabled(resolveSandbox());  ## M4: cohesive cache bundle
 ): seq[EntrypointResult] =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
@@ -1279,10 +1196,17 @@ proc execute*(
   if ledgerActive:
     led = openLedger(resolvedLedgerStateDir)
 
-  # Slots array: nJobs concurrent slots; idle when pepIdx == -1.
+  # Slots array: nJobs concurrent slots; idle when state == ssIdle (rfc-0007
+  # A2b — replaces the pepIdx==-1 sentinel).
   var slots = newSeq[Slot](nJobs)
   for s in slots.mitems:
-    s.pepIdx = -1
+    s.state = ssIdle
+
+  # rfc-0007 A2b: ONE Supervisor for this call, owning the event loop and
+  # (opt-in) SIGINT/SIGTERM installation for its duration (§1). Every
+  # compile/run child spawned below, and every wait/stop/kill/reap, goes
+  # through this one instance.
+  var sv = initSupervisor(installSignals = installSignals)
 
   # S6b / M5b: build admission controller.
   # The mem-aware truth table (kill-switch, force-on, auto) is resolved inside
@@ -1383,17 +1307,267 @@ proc execute*(
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — an interrupt is no longer
   # an exception, it is a HONEST PARTIAL RESULT (§2).  `wasInterrupted` is
-  # reported to the caller via `interruptedOut`; the loop below `break`s
-  # instead of raising once teardownLiveSlots(attribute = true) has stamped
-  # and emitted every in-flight slot's killed final.
+  # reported to the caller via `interruptedOut`.
   var wasInterrupted = false
+  var shutdownSignum = 0  # rfc-0007 A2b: the real signum, for shutdownSignalOut
+
+  # rfc-0007 A2b: `shuttingDown` is the ONE flag that turns the SAME loop
+  # below from normal dispatch into interrupt drain — no separate teardown
+  # loop. Once true: no new work is dispatched (the fill pass is skipped
+  # entirely), every live slot has already had its stop act recorded, and
+  # the loop keeps calling `next` — draining weChildExited/weDeadline/
+  # weShutdown exactly as it always did — until no slot is live.
+  var shuttingDown = false
+
+  template handleChildExited(childId: ChildId) =
+        ## rfc-0007 A2b: extracted so the weShutdown handler (below) can drain
+        ## any child that ALREADY exited but that this executor simply hadn't
+        ## gotten around to noticing yet BEFORE committing remaining live slots
+        ## to interrupt teardown — see the drain loop in the weShutdown case.
+        ## A TEMPLATE, not a proc: a nested proc capturing the enclosing
+        ## proc's implicit `result` (or a `var seq` parameter, same issue
+        ## hit earlier with `slots`) trips Nim's memory-safety capture
+        ## check at codegen; a template inlines at each call site instead,
+        ## sidestepping capture entirely.
+        let idx              = slotIndexOf(slots, childId)
+        let completedIdx     = slots[idx].pepIdx
+        let compiledThisRun  = slots[idx].compiledThisRun
+        let slotCacheDir     = slots[idx].cacheDir       # capture before slot cleared
+        let slotBinCompiled  = slots[idx].binCompiled    # capture before slot cleared
+        let slotBinDir       = slots[idx].slotBinDir     # per-slot bin dir (M15)
+        let slotToken        = slots[idx].token          # S3: capture before slot cleared
+        let slotAttempt      = slots[idx].attempt        # B0/B1: current attempt number
+
+        # S6b/rfc-0007 A2b: sample finish-time RSS BEFORE `finalizeSlot`
+        # reaps — reap is the only place a ChildId is consumed (§1), and
+        # `groupRssBytes` on an already-reaped id is a Defect. A lingering
+        # pgroup member (e.g. an orphaned grandchild) can still be observed
+        # at this exact instant — same intent as the pre-A2b finish-time
+        # sample; only actually used below once the slot is confirmed to
+        # have gone idle (fkDone/fkOmitted), harmless to compute otherwise.
+        let finishRss = sv.groupRssBytes(slots[idx].id)
+
+        let fo = finalizeSlot(sv, slots, idx, p, maxOutputBytes,
+                              allowTransition = not shuttingDown)
+
+        case fo.kind
+        of fkTransitioned:
+          discard  # slot still live under a NEW ChildId — nothing else this tick
+        of fkOmitted:
+          # rfc-0007 §2: interrupt-teardown race — a compile raced to success
+          # with no stop act recorded (the Supervisor's atomic no-op rule,
+          # §1). The slot went idle inside finalizeSlot; release admission.
+          # `completedIdx` stays unfinalized, so the emission-set trim below
+          # counts it in notStarted rather than fabricating a "run never
+          # started" lie.
+          ac.onSlotFinish(slotToken, finishRss)
+        of fkDone:
+          ac.onSlotFinish(slotToken, finishRss)  # S6b: feed real RSS so estJobPeak adapts
+          result[completedIdx] = fo.res
+
+          if shuttingDown:
+            # rfc-0007 §2: interrupt-killed finals bypass retry/ledger/cache/
+            # promotion entirely — fired through onResult exactly like a
+            # live completion. A slot torn down here never reaches the
+            # promotion block below, so sweep what finalizeSlot's RUN-phase
+            # branch leaves behind (a compile-phase kill already fully
+            # cleaned itself via cleanupSlotOnTeardown).
+            if slotBinDir.len > 0:
+              try: removeDir(slotBinDir) except: discard
+            if slots[idx].tmpDir.len > 0:
+              try: removeDir(slots[idx].tmpDir) except: discard
+            finalized[completedIdx] = true
+            onResult(fo.res)
+          else:
+            let slotAchieved = slots[idx].achieved  # §1: delivered in ReapReport
+                                                     # at reap time — finalizeSlot
+                                                     # set this above, not spawn time.
+
+            # rfc-0007 §2: retry/flaky/quarantine decisions read the pure
+            # derivation — there is no stored legacy field to read instead.
+            let completedOutcome = outcome(result[completedIdx])
+            let maxAttempts = p.entrypoints[completedIdx].retries + 1  # B1
+
+            # B2: append one ledger row per live attempt — including intermediate
+            # failed attempts that will be retried.  inputHash for intermediate
+            # attempts uses the plan-time key (may be ""); the final attempt's
+            # inputHash will be stamped later by the cache-store gate if caching
+            # is active, but for observability we record the plan-time key here
+            # (consistent: the build identity is the same across all attempts).
+            if ledgerActive:
+              appendAttemptRow(led, p.entrypoints[completedIdx].ep, slotAttempt,
+                               result[completedIdx], inputHashes[completedIdx],
+                               slots[idx].peakRssBytes)
+
+            # B1: retry decision — re-dispatch if the result is a failure AND we
+            # have remaining attempts.  Compile failures and spawn errors are NOT
+            # retried (retrying a compile failure is useless; only run failures
+            # benefit from retry).  oKilled and oCrashed ARE retried (transient
+            # infrastructure noise).
+            #
+            # "Failure eligible for retry" = outcome is NOT oPassed AND NOT
+            # oCompileFailed AND NOT oSpawnError, AND attempts[completedIdx] < maxAttempts.
+            let retryEligible =
+              completedOutcome notin {oPassed, oCompileFailed, oSpawnError} and
+              slotAttempt < maxAttempts
+
+            if retryEligible:
+              # Re-dispatch: the slot is now idle; the fill scan will pick it up.
+              # Do NOT inc done; do NOT call onResult (not final yet).
+              discard  # slot cleared above; fill scan will re-dispatch
+
+            else:
+              # Finalize: pass or exhausted retries.
+              inc done
+              finalized[completedIdx] = true
+
+              # B1: stamp attempts onto the final result; flaky is derived
+              # from attempts (A1e-i: `flaky(r, policy)`, no field to stamp).
+              result[completedIdx].attempts = slotAttempt
+              # B3/B4: apply quarantine overlay — pure reporting, not cache or execution logic.
+              # At the live-finalize site, result[completedIdx] carries the final records
+              # (protocol or empty), so the B4 per-test rule has full information.
+              result[completedIdx].quarantined =
+                isQuarantined(p.entrypoints[completedIdx].ep,
+                              result[completedIdx],
+                              config.quarantine)
+
+              # Track whether any failure has been recorded (for failFast).
+              if failFast and completedOutcome.isFailure:
+                anyFailed = true
+
+              # After run completes for a compiled-this-run slot: copy the binary
+              # to the stable slug-keyed path, then record freshness in the depgraph.
+              # Binary is valid (compile succeeded) whenever outcome is not
+              # oCompileFailed or oSpawnError.
+              # R9: default true — only a compiled-this-run entry whose closure
+              # recording actually failed sets this false; every other path
+              # (cache hit, edSkipFresh, etc.) is unaffected by this gate.
+              var closureRecorded = true
+              if compiledThisRun and slotCacheDir.len > 0:
+                if completedOutcome notin {oCompileFailed, oSpawnError}:
+                  let ep = p.entrypoints[completedIdx].ep
+                  let bname = binName(ep)
+                  let stableBinDir = binPath(ep, config)
+                  let stableBin    = stableBinDir / bname
+                  # Invariant on exit from this block: either (the depgraph
+                  # entry on disk matches the stable binary at `stableBin`) or
+                  # (no stable binary exists at `stableBin`) — NEVER a binary
+                  # whose provenance the on-disk depgraph does not describe
+                  # (issue #13.3). A promotion or persist failure below always
+                  # resolves toward "no stable binary" rather than leaving a
+                  # binary paired with a stale or absent depgraph entry.
+                  #
+                  # Copy per-slot binary to the stable slug-keyed location.
+                  # The stable binary is what decideCompile checks on future runs.
+                  if slotBinCompiled.len > 0 and slotBinCompiled != stableBin:
+                    try:
+                      createDir(stableBinDir)
+                      copyFile(slotBinCompiled, stableBin)
+                      setFilePermissions(stableBin, {fpUserRead, fpUserWrite, fpUserExec,
+                                                     fpGroupRead, fpGroupExec,
+                                                     fpOthersRead, fpOthersExec})
+                    except CatchableError as e:
+                      # Promotion failed partway (e.g. copyFile succeeded but
+                      # setFilePermissions did not) — whatever landed at
+                      # stableBin has unknown/partial content and no depgraph
+                      # entry describes it either way; discard it so the next
+                      # run starts from cdNeverBuilt instead of trusting it.
+                      # Not exercisable under test as root (chmod-based faults
+                      # do not fail for root); this is untested hardening.
+                      stderr.write("crisol: warning: " & ep.path &
+                                   ": could not promote its compiled binary (" &
+                                   e.msg & "); the previous binary was discarded\n")
+                      try: stderr.flushFile() except CatchableError: discard
+                      try: removeFile(stableBin) except CatchableError: discard
+
+                  # Record the closure — recovery policy lives in recordClosure
+                  # (see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE, and
+                  # recordClosure's doc comment in depgraph.nim).
+                  ensureSourceIndex()
+                  let rec = recordClosure(graph, config, ep,
+                                          slotCacheDir, bname, CrisolProtocolMajor,
+                                          sourceIndex)
+                  closureRecorded = rec.ok
+                  if not rec.ok:
+                    # The depgraph entry for this compile is either invalidated
+                    # or (on a persist failure) not reliably reflected on disk
+                    # at all — either way, the stable binary just promoted
+                    # above must not survive to be served by a future run
+                    # whose decideCompile can no longer be trusted to agree
+                    # with it (issue #13.3).
+                    try: removeFile(stableBin) except CatchableError: discard
+                    stderr.write("crisol: warning: " & ep.path & ": could not record its " &
+                                 "source closure (" & rec.error & "); dependency record " &
+                                 "invalidated and its binary was discarded — it will be " &
+                                 "recompiled and force-selected next run\n")
+                    try: stderr.flushFile() except CatchableError: discard
+
+              # Clean up the per-slot bin dir after stable copy (M15).
+              # finalizeSlot already cleaned this on compile-fail; only clean here on success.
+              if compiledThisRun and slotBinDir.len > 0:
+                try: removeDir(slotBinDir) except: discard
+
+              # ---------------------------------------------------------------
+              # A6/A7: cache-store gate for a freshly-RUN (not cached) result.
+              # Store ONLY when (a) policy permits, (b) hermeticity was achieved,
+              # and (c) it passed on attempt 1 (not a flaky-pass — never cache
+              # flaky: it would freeze the result as PASS forever).
+              # ALWAYS stamp the live result's CacheDecision for reporting (A8).
+              # ---------------------------------------------------------------
+              if cacheActive:
+                let verdict = shouldStore(result[completedIdx], cache.spec, slotAchieved,
+                                          slotAttempt, cache.policy,
+                                          p.entrypoints[completedIdx].cacheable)
+                # R9: a store is permitted only when BOTH the policy verdict AND
+                # the closure recording (above) agree. A result whose closure
+                # failed to record must never be stored: keyOf would derive the
+                # SoundnessKey from an empty closureContentHash, and the entry
+                # could never be looked up again (lookup needs edRunFresh, which
+                # needs a depgraph entry) — a permanently dead cache write.
+                if verdict.store and closureRecorded:
+                  # Re-derive the key from the NOW-updated graph (closureHash fresh)
+                  # so a later run's lookup-key matches this store-key.
+                  let key = cache.seams.keyOf(p.entrypoints[completedIdx])
+                  let cr  = toCachedResult(result[completedIdx], epochTime().int64)
+                  let stored = cache.seams.store(key, cr)
+                  # A8: the store-key is the authoritative inputHash for this live run
+                  # (the plan-time lookup key was derived before this compile updated
+                  # the graph; for an edStale/edNeverBuilt entry there was no plan-time
+                  # key at all).  Stamp the freshly-derived key string.
+                  result[completedIdx].inputHash = $key
+                  # M8: cdmStored = fresh run on a miss where the result WAS written.
+                  # cdmKeyMiss = fresh run on a miss where the result was NOT stored.
+                  # A run/v1 consumer can tell from cacheDecision alone whether a store
+                  # happened, without inferring from inputHash presence.
+                  result[completedIdx].cacheDecision =
+                    if stored: cdmStored else: cdmKeyMiss
+                else:
+                  # Not stored: either the verdict carries the structural reason, or
+                  # (R9) the verdict said store but the closure wasn't recorded — in
+                  # which case stamp cdmClosureUnrecorded, a dedicated variant so a
+                  # `--json` reader can tell WHY the store didn't happen instead of
+                  # this collapsing into the generic cdmKeyMiss.
+                  # Stamp the plan-time key (set for an edRunFresh miss; "" otherwise)
+                  # so a consulted-but-not-stored result still reports its inputHash.
+                  result[completedIdx].inputHash = inputHashes[completedIdx]
+                  result[completedIdx].cacheDecision =
+                    if verdict.store: cdmClosureUnrecorded   # else-branch ⇒ not closureRecorded
+                    else: verdict.decision
+              else:
+                # Caching inactive: stamp the structural reason recorded at plan time.
+                result[completedIdx].cacheDecision = cacheDecisions[completedIdx]
+
+              # Fire onResult ONCE with the final result (B1 contract).
+              onResult(result[completedIdx])
+
 
   # ---------------------------------------------------------------------------
   # M12: wrap entire dispatch loop in try/finally so any exception (e.g. from
-  # an onResult callback) still group-kills + reaps + cleans all live slots.
+  # an onResult callback) still stops + drains + cleans all live slots.
   # ---------------------------------------------------------------------------
   try:
-    while done < n:
+    while (if shuttingDown: anyLiveSlot(slots) else: done < n):
       # -----------------------------------------------------------------------
       # Fill idle slots from the queue.
       # Stop pulling new work when failFast and any failure has been recorded.
@@ -1406,7 +1580,7 @@ proc execute*(
       var idleCountBefore = 0
       var liveCountBefore = 0
       for s in slots:
-        if s.pepIdx == -1: inc idleCountBefore
+        if s.state == ssIdle: inc idleCountBefore
         else:              inc liveCountBefore
       var dispatchedThisPass = false
 
@@ -1417,11 +1591,12 @@ proc execute*(
       # nJobs iterations.  All captured variables (slots) remain in scope here.
       proc isInFlight(j: int): bool {.closure.} =
         for s in slots:
-          if s.pepIdx == j: return true
+          if s.state == ssLive and s.pepIdx == j: return true
         false
 
       for i in 0 ..< nJobs:
-        if slots[i].pepIdx != -1: continue  # slot busy
+        if shuttingDown:            continue  # rfc-0007 A2b: no new work once torn down
+        if slots[i].state == ssLive: continue  # slot busy
         if lwm >= n:               continue  # all entries dispatched
         if failFast and anyFailed: continue  # fail-fast: drain only; no new work
 
@@ -1467,7 +1642,7 @@ proc execute*(
           if pep.edecision == edRunFresh:
             # Skip compile: spawn run directly with the existing stable binary.
             # S2b: runTimeoutMs is resolved inside spawnRunDirect from effectiveRunTimeoutMs.
-            let ok = spawnRunDirect(slots[i], pepIdx, pep, config, cache.spec, attemptNum)
+            let ok = spawnRunDirect(sv, slots[i], pepIdx, pep, config, cache.spec, attemptNum)
             if not ok:
               ac.release(tok.get)  # S3: rollback admission on spawn failure
               var res = EntrypointResult(ep: pep.ep,
@@ -1488,7 +1663,7 @@ proc execute*(
               slots[i].token = tok.get  # S3: store token for onSlotFinish
           else:
             # Normal compile + run using stable slug-keyed paths.
-            let ok = spawnCompileStable(slots[i], pepIdx, pep, config, graph,
+            let ok = spawnCompileStable(sv, slots[i], pepIdx, pep, config, graph,
                                         compileTimeoutMs, cache.spec, toolchainFp,
                                         dupSlugs)
             if not ok:
@@ -1507,7 +1682,7 @@ proc execute*(
               finalized[pepIdx] = true
               anyFailed = true
               inc done
-              # Slot remains idle (pepIdx == -1); loop continues.
+              # Slot remains idle (state == ssIdle); loop continues.
             else:
               slots[i].token = tok.get  # S3: store token for onSlotFinish
           break  # this slot has been filled; move to next slot
@@ -1530,265 +1705,117 @@ proc execute*(
         throttledSince = none(MonoTime)  # progress made or not memory-blocked; clear
 
       # -----------------------------------------------------------------------
-      # Poll all live slots.
+      # rfc-0007 A2b: THE ONE WAIT PRIMITIVE. `next` blocks until a child
+      # exits, a deadline (a slot's own timeout, an armed grace window, or
+      # the ~25ms sample tick) passes, or a shutdown signal arrives — never
+      # a fixed sleep plus a per-slot WNOHANG poll. `armExpiredTimeouts`
+      # authors the ONLY krTimeout stop acts (main-loop only — never while
+      # already shuttingDown, since every live slot was already stopped the
+      # moment shutdown began); `escalateExpired` (below, on weDeadline)
+      # handles escalation for BOTH timeout- and interrupt-armed grace
+      # windows identically — the "three paths become one" acceptance.
       # -----------------------------------------------------------------------
-      for i in 0 ..< nJobs:
-        if slots[i].pepIdx == -1: continue  # idle
+      let preNow = getMonoTime()
+      if not shuttingDown:
+        armExpiredTimeouts(sv, slots, preNow)
+      let deadline = nextDeadline(slots, preNow, pollIntervalMs)
+      let ev = sv.next(deadline)
+      let now = getMonoTime()  # fresh — `next` may have blocked
 
-        let compiledThisRun = slots[i].compiledThisRun
-        let slotPepIdx      = slots[i].pepIdx
-        let slotCacheDir    = slots[i].cacheDir       # capture before slot cleared
-        let slotBinCompiled = slots[i].binCompiled    # capture before slot cleared
-        let slotBinDir      = slots[i].slotBinDir     # per-slot bin dir (M15)
-        let slotToken       = slots[i].token          # S3: capture before slot cleared
-        let slotPid         = int(slots[i].pid)       # S6b: capture pid before slot cleared
-        let slotAttempt     = slots[i].attempt        # B0/B1: current attempt number
-        let slotAchieved    = slots[i].achieved       # A4d/A6: hermeticity achieved this run;
-                                                       # captured before slot cleared (A1e-i: no
-                                                       # longer copied onto EntrypointResult — the
-                                                       # cache-store gate reads it from here).
+      case ev.kind
+      of weChildExited:
+        handleChildExited(ev.id)
+      of weDeadline:
+        # rfc-0007 A2b: escalate any slot whose grace window has elapsed —
+        # shared by BOTH the timeout path (armed above by
+        # armExpiredTimeouts) and the interrupt path (armed by the
+        # weShutdown handler below): "three paths become one".
+        escalateExpired(sv, slots, now)
 
-        # C5: pre-poll RSS sampling for already-running slots.
-        # Sample BEFORE pollSlot so the child is definitely live (WNOHANG inside
-        # pollSlot may reap it; RSS is 0 after reap for a vanished pgroup).
-        # Compile-phase slots are excluded — the Nim compiler's VmRSS is not
-        # meaningful as test-binary telemetry.
-        if slots[i].phase == spRunning:
-          let rssNow = procGroupRssBytes(slotPid)
-          if rssNow.isSome:
-            slots[i].peakRssBytes = max(slots[i].peakRssBytes, rssNow.get)
+        if not shuttingDown:
+          # C5: RSS sample tick for every live, running slot — the SAME
+          # ~25ms cadence as before (RFC-0002 §Contract impacts: quantity
+          # and cadence unchanged; only the primitive changed, `sv.
+          # groupRssBytes(id)` instead of memprobe.procGroupRssBytes(pid) —
+          # the executor never sees a raw Pid any more, §1). Compile-phase
+          # slots are excluded — the Nim compiler's VmRSS is not meaningful
+          # as test-binary telemetry.
+          for i in 0 ..< slots.len:
+            if slots[i].state == ssLive and slots[i].phase == spRunning:
+              let rssNow = sv.groupRssBytes(slots[i].id)
+              if rssNow.isSome:
+                slots[i].peakRssBytes = max(slots[i].peakRssBytes, rssNow.get)
 
-        let finished = pollSlot(slots[i], result, p, maxOutputBytes)
+          # -------------------------------------------------------------
+          # Progress line: emit to stderr ~every progressIntervalMs when
+          # showProgress. Lists in-flight entrypoints and how long each has
+          # been running.
+          # -------------------------------------------------------------
+          if showProgress and anyLiveSlot(slots):
+            let nowProgress = epochTime()
+            let msSinceProgress = int64((nowProgress - lastProgressAt) * 1000)
+            if msSinceProgress >= int64(progressIntervalMs):
+              var inFlight: seq[(string, int64)]
+              for s in slots:
+                if s.state == ssLive:
+                  let elapsed = int64((nowProgress - s.t0) * 1000)
+                  inFlight.add (p.entrypoints[s.pepIdx].ep.path, elapsed)
+              # M4: compute whether the mem-throttle signal should appear.
+              let showThrottle = memThrottleActive(throttledSince, getMonoTime(),
+                                                   MemThrottleSignalMs)
+              let line = formatProgressLine(inFlight, memThrottled = showThrottle)
+              if line.len > 0:
+                stderr.write(line & "\n")
+                try: stderr.flushFile() except: discard
+              lastProgressAt = nowProgress
 
-        # C5: post-poll RSS sample for slots that JUST transitioned to spRunning
-        # (compile finished this tick → spawnRun ran inside pollSlot → slot is now
-        # spRunning but we did NOT sample before because it was spCompiling).
-        # Also catches any remaining RSS if the child ran fast but is still live.
-        if not finished and slots[i].phase == spRunning:
-          let pidNow = int(slots[i].pid)  # pid updated by spawnRun
-          let rssNow = procGroupRssBytes(pidNow)
-          if rssNow.isSome:
-            slots[i].peakRssBytes = max(slots[i].peakRssBytes, rssNow.get)
-
-        if finished:
-          # Capture the completed pepIdx and peak RSS before clearing the slot.
-          let completedIdx   = slotPepIdx
-          let slotPeakRss    = slots[i].peakRssBytes  # C5: captured before slot cleared
-          slots[i].pepIdx = -1
-          # S6b: feed real RSS into onSlotFinish so estJobPeak adapts.
-          # Admission uses a finish-time sample (not the tracked peak) so its
-          # behavior is unaffected by C5's sampling.
-          ac.onSlotFinish(slotToken, procGroupRssBytes(slotPid))
-
-          # rfc-0007 §2: retry/flaky/quarantine decisions read the pure
-          # derivation — there is no stored legacy field to read instead.
-          let completedOutcome = outcome(result[completedIdx])
-          let maxAttempts = p.entrypoints[completedIdx].retries + 1  # B1
-
-          # C5: peak RSS is no longer stamped onto the EntrypointResult (the
-          # field is gone, A1e-i — it was a scheduler-sampled quantity with no
-          # Phase/ProcessResult counterpart, distinct from `rusage.maxRssBytes`;
-          # §7 gives it a mechanism-tagged ledger column). `slotPeakRss` still
-          # feeds the ledger row below — the ledger's own quantity is unaffected.
-
-          # B2: append one ledger row per live attempt — including intermediate
-          # failed attempts that will be retried.  inputHash for intermediate
-          # attempts uses the plan-time key (may be ""); the final attempt's
-          # inputHash will be stamped later by the cache-store gate if caching
-          # is active, but for observability we record the plan-time key here
-          # (consistent: the build identity is the same across all attempts).
-          if ledgerActive:
-            appendAttemptRow(led, p.entrypoints[completedIdx].ep, slotAttempt,
-                             result[completedIdx], inputHashes[completedIdx],
-                             slotPeakRss)
-
-          # B1: retry decision — re-dispatch if the result is a failure AND we
-          # have remaining attempts.  Compile failures and spawn errors are NOT
-          # retried (retrying a compile failure is useless; only run failures
-          # benefit from retry).  oKilled and oCrashed ARE retried (transient
-          # infrastructure noise).
-          #
-          # "Failure eligible for retry" = outcome is NOT oPassed AND NOT
-          # oCompileFailed AND NOT oSpawnError, AND attempts[completedIdx] < maxAttempts.
-          let retryEligible =
-            completedOutcome notin {oPassed, oCompileFailed, oSpawnError} and
-            slotAttempt < maxAttempts
-
-          if retryEligible:
-            # Re-dispatch: the slot is now idle; the fill scan will pick it up.
-            # Do NOT inc done; do NOT call onResult (not final yet).
-            # attempts[completedIdx] was already incremented when the re-dispatch
-            # was initiated in the fill scan; no change needed here.
-            # (The slot.attempt field will be set correctly on the re-dispatch.)
-            discard  # slot cleared above; fill scan will re-dispatch
-
-          else:
-            # Finalize: pass or exhausted retries.
-            inc done
-            finalized[completedIdx] = true
-
-            # B1: stamp attempts onto the final result; flaky is derived
-            # from attempts (A1e-i: `flaky(r, policy)`, no field to stamp).
-            result[completedIdx].attempts = slotAttempt
-            # B3/B4: apply quarantine overlay — pure reporting, not cache or execution logic.
-            # At the live-finalize site, result[completedIdx] carries the final records
-            # (protocol or empty), so the B4 per-test rule has full information.
-            result[completedIdx].quarantined =
-              isQuarantined(p.entrypoints[completedIdx].ep,
-                            result[completedIdx],
-                            config.quarantine)
-
-            # Track whether any failure has been recorded (for failFast).
-            if failFast and completedOutcome.isFailure:
-              anyFailed = true
-
-            # After run completes for a compiled-this-run slot: copy the binary
-            # to the stable slug-keyed path, then record freshness in the depgraph.
-            # Binary is valid (compile succeeded) whenever outcome is not
-            # oCompileFailed or oSpawnError.
-            # R9: default true — only a compiled-this-run entry whose closure
-            # recording actually failed sets this false; every other path
-            # (cache hit, edSkipFresh, etc.) is unaffected by this gate.
-            var closureRecorded = true
-            if compiledThisRun and slotCacheDir.len > 0:
-              if completedOutcome notin {oCompileFailed, oSpawnError}:
-                let ep = p.entrypoints[completedIdx].ep
-                let bname = binName(ep)
-                let stableBinDir = binPath(ep, config)
-                let stableBin    = stableBinDir / bname
-                # Invariant on exit from this block: either (the depgraph
-                # entry on disk matches the stable binary at `stableBin`) or
-                # (no stable binary exists at `stableBin`) — NEVER a binary
-                # whose provenance the on-disk depgraph does not describe
-                # (issue #13.3). A promotion or persist failure below always
-                # resolves toward "no stable binary" rather than leaving a
-                # binary paired with a stale or absent depgraph entry.
-                #
-                # Copy per-slot binary to the stable slug-keyed location.
-                # The stable binary is what decideCompile checks on future runs.
-                if slotBinCompiled.len > 0 and slotBinCompiled != stableBin:
-                  try:
-                    createDir(stableBinDir)
-                    copyFile(slotBinCompiled, stableBin)
-                    setFilePermissions(stableBin, {fpUserRead, fpUserWrite, fpUserExec,
-                                                   fpGroupRead, fpGroupExec,
-                                                   fpOthersRead, fpOthersExec})
-                  except CatchableError as e:
-                    # Promotion failed partway (e.g. copyFile succeeded but
-                    # setFilePermissions did not) — whatever landed at
-                    # stableBin has unknown/partial content and no depgraph
-                    # entry describes it either way; discard it so the next
-                    # run starts from cdNeverBuilt instead of trusting it.
-                    # Not exercisable under test as root (chmod-based faults
-                    # do not fail for root); this is untested hardening.
-                    stderr.write("crisol: warning: " & ep.path &
-                                 ": could not promote its compiled binary (" &
-                                 e.msg & "); the previous binary was discarded\n")
-                    try: stderr.flushFile() except CatchableError: discard
-                    try: removeFile(stableBin) except CatchableError: discard
-
-                # Record the closure — recovery policy lives in recordClosure
-                # (see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE, and
-                # recordClosure's doc comment in depgraph.nim).
-                ensureSourceIndex()
-                let rec = recordClosure(graph, config, ep,
-                                        slotCacheDir, bname, CrisolProtocolMajor,
-                                        sourceIndex)
-                closureRecorded = rec.ok
-                if not rec.ok:
-                  # The depgraph entry for this compile is either invalidated
-                  # or (on a persist failure) not reliably reflected on disk
-                  # at all — either way, the stable binary just promoted
-                  # above must not survive to be served by a future run
-                  # whose decideCompile can no longer be trusted to agree
-                  # with it (issue #13.3).
-                  try: removeFile(stableBin) except CatchableError: discard
-                  stderr.write("crisol: warning: " & ep.path & ": could not record its " &
-                               "source closure (" & rec.error & "); dependency record " &
-                               "invalidated and its binary was discarded — it will be " &
-                               "recompiled and force-selected next run\n")
-                  try: stderr.flushFile() except CatchableError: discard
-
-            # Clean up the per-slot bin dir after stable copy (M15).
-            # pollSlot already cleaned this on compile-fail; only clean here on success.
-            if compiledThisRun and slotBinDir.len > 0:
-              try: removeDir(slotBinDir) except: discard
-
-            # ---------------------------------------------------------------
-            # A6/A7: cache-store gate for a freshly-RUN (not cached) result.
-            # Store ONLY when (a) policy permits, (b) hermeticity was achieved,
-            # and (c) it passed on attempt 1 (not a flaky-pass — never cache
-            # flaky: it would freeze the result as PASS forever).
-            # ALWAYS stamp the live result's CacheDecision for reporting (A8).
-            # ---------------------------------------------------------------
-            if cacheActive:
-              let verdict = shouldStore(result[completedIdx], cache.spec, slotAchieved,
-                                        slotAttempt, cache.policy,
-                                        p.entrypoints[completedIdx].cacheable)
-              # R9: a store is permitted only when BOTH the policy verdict AND
-              # the closure recording (above) agree. A result whose closure
-              # failed to record must never be stored: keyOf would derive the
-              # SoundnessKey from an empty closureContentHash, and the entry
-              # could never be looked up again (lookup needs edRunFresh, which
-              # needs a depgraph entry) — a permanently dead cache write.
-              if verdict.store and closureRecorded:
-                # Re-derive the key from the NOW-updated graph (closureHash fresh)
-                # so a later run's lookup-key matches this store-key.
-                let key = cache.seams.keyOf(p.entrypoints[completedIdx])
-                let cr  = toCachedResult(result[completedIdx], epochTime().int64)
-                let stored = cache.seams.store(key, cr)
-                # A8: the store-key is the authoritative inputHash for this live run
-                # (the plan-time lookup key was derived before this compile updated
-                # the graph; for an edStale/edNeverBuilt entry there was no plan-time
-                # key at all).  Stamp the freshly-derived key string.
-                result[completedIdx].inputHash = $key
-                # M8: cdmStored = fresh run on a miss where the result WAS written.
-                # cdmKeyMiss = fresh run on a miss where the result was NOT stored.
-                # A run/v1 consumer can tell from cacheDecision alone whether a store
-                # happened, without inferring from inputHash presence.
-                result[completedIdx].cacheDecision =
-                  if stored: cdmStored else: cdmKeyMiss
-              else:
-                # Not stored: either the verdict carries the structural reason, or
-                # (R9) the verdict said store but the closure wasn't recorded — in
-                # which case stamp cdmClosureUnrecorded, a dedicated variant so a
-                # `--json` reader can tell WHY the store didn't happen instead of
-                # this collapsing into the generic cdmKeyMiss.
-                # Stamp the plan-time key (set for an edRunFresh miss; "" otherwise)
-                # so a consulted-but-not-stored result still reports its inputHash.
-                result[completedIdx].inputHash = inputHashes[completedIdx]
-                result[completedIdx].cacheDecision =
-                  if verdict.store: cdmClosureUnrecorded   # else-branch ⇒ not closureRecorded
-                  else: verdict.decision
+      of weShutdown:
+        # rfc-0007 A2b/§1: EDGE-triggered, once per delivered signal. The
+        # FIRST interrupt requests a cooperative stop for every live slot
+        # (idempotent — a slot already mid-timeout-grace keeps its original
+        # krTimeout, §1 "first act wins") and switches the loop above into
+        # drain mode. A SECOND interrupt observed while still draining means
+        # skip-grace-forceKill-now for every slot still live.
+        if not shuttingDown:
+          # `next`'s internal priority checks pendingShutdown BEFORE
+          # sweeping for a fresh child exit (§1 only promises the drain-
+          # before-weDeadline ordering, not before weShutdown) — a child
+          # that already exited moments before the signal arrived, but that
+          # this executor simply had not yet gotten around to noticing,
+          # could otherwise be misattributed as killed by scheduling luck
+          # rather than the true kernel-level race §2 accepts. Give the
+          # Supervisor a bounded number of immediate (zero-wait) chances —
+          # at most one per live slot — to report anything ALREADY ready
+          # before any slot is committed to interrupt teardown; each
+          # drained exit is processed exactly like a normal completion
+          # (full retry/ledger/cache/promotion via handleChildExited),
+          # because that is honestly what it is.
+          var drainBudget = slots.len
+          while drainBudget > 0:
+            dec drainBudget
+            let evReady = sv.next(getMonoTime())
+            if evReady.kind == weChildExited:
+              handleChildExited(evReady.id)
             else:
-              # Caching inactive: stamp the structural reason recorded at plan time.
-              result[completedIdx].cacheDecision = cacheDecisions[completedIdx]
+              break  # nothing more immediately ready (weDeadline), or a
+                     # second real signal already — either way, proceed.
 
-            # Fire onResult ONCE with the final result (B1 contract).
-            onResult(result[completedIdx])
+          shuttingDown = true
+          wasInterrupted = true
+          shutdownSignum = ev.signal.signum
+          for i in 0 ..< slots.len:
+            if slots[i].state == ssLive:
+              sv.requestStop(slots[i].id, ptypes.krInterrupt)
+              if slots[i].stopDeadline.isNone:
+                slots[i].stopDeadline = some(getMonoTime() + initDuration(milliseconds = GracePeriodMs))
+        else:
+          for i in 0 ..< slots.len:
+            if slots[i].state == ssLive:
+              sv.forceKill(slots[i].id)
+              slots[i].forceKilled = true
 
-      # -----------------------------------------------------------------------
-      # A6/R2: check for pending signal AFTER polling live slots, not before.
-      # rfc-0007 A1e-ii: a process that already exited during the PREVIOUS
-      # iteration's sleep is reaped by the "Poll all live slots" pass just
-      # above — checking the signal before that pass would misattribute an
-      # already-finished-but-not-yet-reaped entrypoint as interrupt-killed
-      # (the RFC's documented race, narrowed here to the true kernel window
-      # by draining ready exits first — §2's "next drains ready exits before
-      # weDeadline" spec-level narrowing, applied to today's poll loop ahead
-      # of the A2b Supervisor rewrite). teardownLiveSlots(attribute = true)
-      # SIGTERMs/drains/SIGKILLs every REMAINING live slot, stamps + emits
-      # each as a killed final (cbRunner/krInterrupt), and returns their
-      # pepIdxs so this loop can mark them finalized before breaking — the
-      # §2 emission-set bookkeeping the post-loop trim reads.
-      # -----------------------------------------------------------------------
-      let sig = pendingSignal()
-      if sig != 0:
-        wasInterrupted = true
-        for idx in teardownLiveSlots(slots, p, result, onResult, maxOutputBytes,
-                                     attribute = true):
-          finalized[idx] = true
-        break
+      of weOrphanReaped:
+        discard  # subreaper tier only (B1) — not reachable from this backend yet
 
       # -----------------------------------------------------------------------
       # failFast early-exit: if no slots are live and we would not dispatch any
@@ -1796,73 +1823,28 @@ proc execute*(
       # Return only entries from finalized[] so summarize sees only ran
       # entrypoints (non-contiguous with skip-ahead).
       # -----------------------------------------------------------------------
-      if failFast and anyFailed:
-        let anyLiveNow = block:
-          var found = false
-          for s in slots:
-            if s.pepIdx != -1:
-              found = true
-              break
-          found
-        if not anyLiveNow:
-          # H1: with skip-ahead, finalized indices may be non-contiguous; emit only
-          # entries actually completed (never-dispatched entries are omitted).
-          var ran: seq[EntrypointResult]
-          for j in 0 ..< n:
-            if finalized[j]:
-              ran.add(result[j])
-          result = ran
-          return
-
-      # Avoid busy-spinning when all slots are live.
-      # Only sleep when there are live children (done < n and all slots busy or
-      # queue is drained).  If we just freed a slot and the queue has work, the
-      # next iteration will fill it immediately without sleeping.
-      let anyLive = block:
-        var found = false
-        for s in slots:
-          if s.pepIdx != -1:
-            found = true
-            break
-        found
-
-      # -----------------------------------------------------------------------
-      # Progress line: emit to stderr ~every progressIntervalMs when showProgress.
-      # Lists in-flight entrypoints and how long each has been running.
-      # -----------------------------------------------------------------------
-      if showProgress and anyLive:
-        let nowProgress = epochTime()
-        let msSinceProgress = int64((nowProgress - lastProgressAt) * 1000)
-        if msSinceProgress >= int64(progressIntervalMs):
-          var inFlight: seq[(string, int64)]
-          for s in slots:
-            if s.pepIdx != -1:
-              let elapsed = int64((nowProgress - s.t0) * 1000)
-              inFlight.add (p.entrypoints[s.pepIdx].ep.path, elapsed)
-          # M4: compute whether the mem-throttle signal should appear.
-          let showThrottle = memThrottleActive(throttledSince, getMonoTime(),
-                                               MemThrottleSignalMs)
-          let line = formatProgressLine(inFlight, memThrottled = showThrottle)
-          if line.len > 0:
-            stderr.write(line & "\n")
-            try: stderr.flushFile() except: discard
-          lastProgressAt = nowProgress
-
-      if anyLive:
-        os.sleep(pollIntervalMs)
+      if not shuttingDown and failFast and anyFailed and not anyLiveSlot(slots):
+        # H1: with skip-ahead, finalized indices may be non-contiguous; emit only
+        # entries actually completed (never-dispatched entries are omitted).
+        var ran: seq[EntrypointResult]
+        for j in 0 ..< n:
+          if finalized[j]:
+            ran.add(result[j])
+        result = ran
+        return
 
   finally:
-    # M12/M6: handles the exception path (e.g. an onResult callback raised) AND
-    # the normal/early-return path (no-ops when all slots are already idle).
-    # teardownLiveSlots gives children SIGTERM → GracePeriodMs drain → SIGKILL
-    # so they can flush output/protocol records before being killed (M6 fix).
-    # The interrupt path above already called teardownLiveSlots(attribute =
-    # true) and marked all slots idle, so this call (attribute defaults to
-    # false: discard, not attribute — see teardownLiveSlots' doc comment) is
-    # a no-op for it (MED-1).
+    # M12/M6/rfc-0007 A2b: handles the exception path (e.g. an onResult
+    # callback raised) AND the normal/early-return path (a no-op when every
+    # slot is already idle — always true on a normal or interrupted
+    # completion: the interrupt path above already drained to zero live
+    # slots inside the SAME loop, via the SAME requestStop/escalateExpired/
+    # next machinery, before the loop condition let it exit). `teardownDiscard`
+    # is the "exception teardown records NOTHING" half of the shared
+    # machinery (§2) — never attributes, never fires onResult.
     # S6b: always write memThrottledSlots (normal, early-return, and exception paths).
     # B2: close the ledger shard on all exit paths (normal, early-return, exception).
-    discard teardownLiveSlots(slots, p, result, onResult, maxOutputBytes)
+    teardownDiscard(sv, slots)
     if ledgerActive:
       closeLedger(led)
     if memThrottledOut != nil:
@@ -1888,6 +1870,8 @@ proc execute*(
     interruptedOut[] = wasInterrupted
   if notStartedOut != nil:
     notStartedOut[] = notStarted
+  if shutdownSignalOut != nil:
+    shutdownSignalOut[] = shutdownSignum
 
 # ---------------------------------------------------------------------------
 # runEntrypoint — compile + run ONE entrypoint (M6: thin wrapper)

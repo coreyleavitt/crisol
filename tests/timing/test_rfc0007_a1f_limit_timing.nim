@@ -29,7 +29,6 @@ import crisol/types
 import crisol/runner
 import crisol/depgraph
 import crisol/sandbox
-import crisol/signals
 import crisol/process/types as ptypes
 
 if getEnv("CRISOL_TIMING_TESTS") == "":
@@ -83,12 +82,11 @@ suite "rfc-0007 A1f — compile-interrupt attributes correctly (timing)":
     ## compile_interrupt.nim holds `nim c` open ~5-6 real wall-clock seconds
     ## (a compile-time `staticExec("sleep 5")`) — a watcher fork sends SIGINT
     ## to THIS test process 1.5s in, comfortably inside that window, well
-    ## before the compile could ever finish on its own. `installSignalHandlers`
-    ## + `interruptedOut` is the same in-process mechanism
+    ## before the compile could ever finish on its own. rfc-0007 A2b:
+    ## `installSignals = true` makes THIS execute() call's own Supervisor own
+    ## SIGINT installation for its duration — the same in-process mechanism
     ## tests/integration/test_signal.nim's suite 2 already uses for a normal
     ## (non-interrupted) run; here the signal is real and lands mid-compile.
-    installSignalHandlers()
-    clearSignal()
 
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "compile_interrupt.nim")]
@@ -108,7 +106,8 @@ suite "rfc-0007 A1f — compile-interrupt attributes correctly (timing)":
       exitnow(0)
 
     var interrupted = false
-    let results = execute(p, config = cfg, graph = g, interruptedOut = addr interrupted)
+    let results = execute(p, config = cfg, graph = g, interruptedOut = addr interrupted,
+                          installSignals = true)
 
     var ws: cint = 0
     discard waitpid(watcherPid, ws, 0)

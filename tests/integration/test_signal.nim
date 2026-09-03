@@ -19,7 +19,6 @@ import std/posix
 import crisol/types
 import crisol/runner
 import crisol/depgraph
-import crisol/signals
 import crisol/sandbox
 
 # A6: live run path is hermetic by default; allowlist HANG_PID_FILE so the
@@ -104,8 +103,6 @@ suite "signal handling — SIGINT kills pool and exits 130":
       # Tell hang_with_pid where to write its PID.
       putEnv("HANG_PID_FILE", pidFile)
 
-      installSignalHandlers()
-
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "hang_with_pid.nim")]
       let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60)
@@ -115,12 +112,20 @@ suite "signal handling — SIGINT kills pool and exits 130":
         var g = emptyDepGraph()
         # rfc-0007 A1e-ii: CrisolInterrupted is retired — execute() returns
         # NORMALLY on SIGINT/SIGTERM now; `interruptedOut` is the real signal.
+        # rfc-0007 A2b: `installSignals = true` makes THIS execute() call's
+        # own Supervisor own SIGINT/SIGTERM installation for its duration —
+        # replacing the old crisol/signals.installSignalHandlers() ceremony
+        # this test used to run itself; `shutdownSignalOut` carries the real
+        # signum, replacing signals.pendingSignal().
         var interrupted = false
+        var shutdownSignum = 0
         discard execute(p, config = cfg, graph = g, cache = cacheDisabled(hangSpec),
-                        interruptedOut = addr interrupted)
+                        interruptedOut = addr interrupted,
+                        shutdownSignalOut = addr shutdownSignum,
+                        installSignals = true)
         if interrupted:
           # Correct path: exit 128 + signum so parent can verify.
-          exitnow(cint(128 + int(pendingSignal())))
+          exitnow(cint(128 + shutdownSignum))
         else:
           # execute() returned normally WITHOUT being interrupted (shouldn't
           # happen with a hung fixture) — exit 0, parent sees this as a
@@ -185,11 +190,9 @@ suite "signal handling — SIGINT kills pool and exits 130":
 suite "signal handling — normal run with handlers installed":
 
   test "pass_always.nim succeeds even when signal handlers are installed":
-    ## Regression: installing signal handlers must not interfere with a
+    ## Regression: installing signal handlers (rfc-0007 A2b: execute()'s own
+    ## Supervisor, via installSignals = true) must not interfere with a
     ## normal run that completes without any signal.
-
-    installSignalHandlers()
-    clearSignal()  # ensure no stale flag
 
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "pass_always.nim")]
@@ -198,7 +201,7 @@ suite "signal handling — normal run with handlers installed":
 
     var g = emptyDepGraph()
     # rfc-0007 A1e-ii: no CrisolInterrupted to catch any more — a plain call.
-    let results = execute(p, config = cfg, graph = g)
+    let results = execute(p, config = cfg, graph = g, installSignals = true)
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -207,16 +210,13 @@ suite "signal handling — normal run with handlers installed":
     ## A failing entrypoint still reports oFailed; signal handlers don't
     ## suppress normal failures.
 
-    installSignalHandlers()
-    clearSignal()
-
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "fail_always.nim")]
     let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30)
     let p    = plan(cfg, eps, emptyDepGraph())
 
     var g = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g)
+    let results = execute(p, config = cfg, graph = g, installSignals = true)
 
     check results.len == 1
     check results[0].outcome == oFailed

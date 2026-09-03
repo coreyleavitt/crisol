@@ -19,7 +19,9 @@
 ## CRISOL_TIMING_TESTS=1 and include tests/conformance in CRISOL_TEST_DIRS.
 ##
 ## HONEST NOTE: as in test_conformance.nim, this proves the §1 CONTRACT —
-## until A2b the product runner does not execute the Supervisor at all.
+## the product runner has executed the Supervisor since A2b (this file's
+## item-4 shared-grace-window case is the primitive-level proof; the
+## runner-level acceptance lives in tests/timing/test_rfc0007_a2b_shared_grace.nim).
 ##
 ## Run with:
 ##   ./dev timing

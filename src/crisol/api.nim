@@ -46,9 +46,15 @@
 ##   decisionStringEd, decisionLabelEd, warningsToJsonArray)
 
 import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, times]
-import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock, signals,
+import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock,
                sandbox, cachedispatch, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
+# rfc-0007 A2b: `crisol/signals` (the process-global gotSignal flag) is no
+# longer this module's concern — `runner.execute`'s OWN Supervisor now owns
+# SIGINT/SIGTERM installation for the duration of the call (`installSignals`
+# param, threaded from `opts.installSignals` below) and reports the real
+# signum it observed via `shutdownSignalOut`, superseding
+# `installSignalHandlers`/`clearSignal`/`pendingSignal`.
 # rfc-0007 A1c: the §2 result-model facade (Phase/ProcessResult/Exit/Cause/
 # Evidence/Rusage/OutcomePolicy) plus the runResult/failureLine digest
 # helpers below. `import nil` so nothing unqualified leaks into this
@@ -608,11 +614,10 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   ## Structural problems are encoded in RunReport.status / .error / .exitCode.
   ##
   ## Flow on rsOk path:
-  ##   clearSignal() → [installSignalHandlers if opts.installSignals]
-  ##   → [acquireLock if opts.manageLock]
+  ##   [acquireLock if opts.manageLock]
   ##   → planTests(opts) (CATCHES CrisolError → rsStructural)
   ##   → zero-runnable mapping (per RFC-0003 error table)
-  ##   → execute → summarize
+  ##   → execute (installSignals = opts.installSignals) → summarize
   ##   → [persistLastRun if opts.persist]
   ##   → map exitCode (0 all-passed / 1 any-failure)
   ##
@@ -622,14 +627,11 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   ##   returns normally with §2's emission set: `results`/`summary` are
   ##   populated (not empty), `onResult` already fired for every killed
   ##   final, and lastrun.json is deliberately never persisted for this run.
-
-  # S2d: clear any stale signal from a prior call so sequential runTests calls
-  # are safe.
-  clearSignal()
-
-  # S2d: install signal handlers if requested (library default: off).
-  if opts.installSignals:
-    installSignalHandlers()
+  ## rfc-0007 A2b: signal installation and capture are now entirely owned by
+  ## `execute`'s OWN per-call Supervisor (`installSignals = opts.installSignals`
+  ## below) — there is no process-global flag left to clear/stale-check at
+  ## entry (each call's Supervisor starts with an empty pending-shutdown
+  ## queue), so the old `clearSignal()` ceremony has no counterpart here.
 
   # Helper: build a structural RunReport without raising (pre-plan, no pr available).
   template structuralResult(msg: string; code: int): RunReport =
@@ -759,6 +761,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   # an exception; a SIGINT/SIGTERM no longer unwinds this call at all.
   var interrupted     = false
   var notStartedCount = 0
+  var shutdownSignum  = 0  # rfc-0007 A2b: the real signum execute()'s own Supervisor observed
 
   try:
     results = execute(
@@ -774,6 +777,8 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       memThrottledOut    = addr memThrottled,
       interruptedOut     = addr interrupted,
       notStartedOut      = addr notStartedCount,
+      shutdownSignalOut  = addr shutdownSignum,
+      installSignals     = opts.installSignals,
       cache              = cacheCtx,
     )
   except CrisolError as e:
@@ -868,7 +873,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     results:           results,
     memThrottledSlots: memThrottled,
     status:            if interrupted: rsInterrupted else: rsOk,
-    exitCode:          if interrupted: 128 + int(pendingSignal())
+    exitCode:          if interrupted: 128 + shutdownSignum
                         else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
     compileBlock:      compileBlock,
     interrupted:       interrupted,

@@ -5,11 +5,13 @@
 ## `process.nim`'s `when defined(...)` selects on the host running this file
 ## is what gets proven; on Linux today that is `process/posix.nim`.
 ##
-## HONEST NOTE (rfc-0007 A2a-ii bullet): until A2b, the PRODUCT runner does
-## not execute the Supervisor at all — `runner.nim` still drives
-## `crisol/spawn.nim`'s `forkExec`/`forkExecEnvScratch` directly. This suite
-## proves the §1 CONTRACT holds; it says nothing about whether the runner is
-## using it yet (it isn't). Bounded, and stated, not implied green.
+## HONEST NOTE (rfc-0007 A2a-ii bullet, superseded by A2b): before A2b, the
+## PRODUCT runner did not execute the Supervisor at all — `runner.nim` drove
+## `crisol/spawn.nim`'s `forkExec`/`forkExecEnvScratch` directly, and this
+## suite proved only the §1 CONTRACT, saying nothing about whether the
+## runner used it. A2b migrated `runner.nim` onto the Supervisor and deleted
+## `spawn.nim`; this suite now proves the substrate the product runner
+## actually runs on.
 ##
 ## Items covered here (see docs/rfc/0007-execution-substrate.md, the A2a-ii
 ## bullet, for the canonical list of nine): 1 (spawn/exit), 2 (timeout kill —
