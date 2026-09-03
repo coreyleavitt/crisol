@@ -214,16 +214,17 @@ suite "shouldStore — cache-write gate":
   # SandboxAchieved is deleted; env/tmpdir are achieved by construction, so
   # only limits are threaded through shouldStore now).
   let fullAchieved = allApplied()
+  let fullEvidence = Evidence(limits: fullAchieved)
 
-  proc passResult(): EntrypointResult =
-    ## rfc-0007 A1e-i: outcome is derived, not stored — a passing Phase pair
-    ## makes outcome(r) == oPassed. `achieved` is no longer carried on the
-    ## result either; shouldStore takes it as its own explicit parameter.
+  proc passResult(evidence: Evidence = default(Evidence)): EntrypointResult =
+    ## rfc-0007 A6a: outcome is derived, not stored — a passing Phase pair
+    ## makes outcome(r) == oPassed. `evidence` is now carried ON the result
+    ## itself; shouldStore reads it via `runEvidence` (no separate parameter).
     result = EntrypointResult(ep: Entrypoint(path: "p"))
     result.compile = Phase(kind: pkSkipped)
     result.run = Phase(kind: pkRan, res: ProcessResult(
       exit: Exit(kind: ekExited, code: 0), cause: Cause(by: cbProcess),
-      evidence: default(Evidence), rusage: none(Rusage), durationUs: 0))
+      evidence: evidence, rusage: none(Rusage), durationUs: 0))
 
   proc failResult(): EntrypointResult =
     result = EntrypointResult(ep: Entrypoint(path: "p"))
@@ -233,17 +234,17 @@ suite "shouldStore — cache-write gate":
       evidence: default(Evidence), rusage: none(Rusage), durationUs: 0))
 
   test "pass + fully achieved + attempt 1 → store":
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, defaultCachePolicy())
+    let v = shouldStore(passResult(fullEvidence), isoSpec, 1, defaultCachePolicy())
     check v.store
 
   test "policy disabled → no store, cdmPolicyDisabled":
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, CachePolicy(enabled: false))
+    let v = shouldStore(passResult(fullEvidence), isoSpec, 1, CachePolicy(enabled: false))
     check not v.store
     check v.decision == cdmPolicyDisabled
 
   test "non-pass outcome → no store":
     let r = failResult()
-    let v = shouldStore(r, isoSpec, fullAchieved, 1, defaultCachePolicy())
+    let v = shouldStore(r, isoSpec, 1, defaultCachePolicy())
     check not v.store
 
   test "hermeticity degraded → no store, cdmHermeticityDeg":
@@ -251,14 +252,32 @@ suite "shouldStore — cache-write gate":
     # kernel readback did not confirm.
     var degraded = allApplied()
     degraded[lkCore] = lsFailed
-    let v = shouldStore(passResult(), isoSpec, degraded, 1, defaultCachePolicy())
+    let v = shouldStore(passResult(Evidence(limits: degraded)), isoSpec, 1, defaultCachePolicy())
     check not v.store
     check v.decision == cdmHermeticityDeg
 
   test "flaky-pass (attempt > 1) → no store, cdmFlaky":
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 2, defaultCachePolicy())
+    let v = shouldStore(passResult(fullEvidence), isoSpec, 2, defaultCachePolicy())
     check not v.store
     check v.decision == cdmFlaky
+
+  test "observed escapee (rfc-0007 A6a) → no store, cdmHermeticityDeg, even with limits fully achieved":
+    ## §6: `escapees.len > 0` is the escapee-specific cache-gate fact, folded
+    ## into evidenceSatisfies alongside the limit/netIso checks — a leaked
+    ## same-pgroup survivor refuses the store exactly like a degraded limit.
+    let leaked = @[ProcSnapshot(pid: 4242, ppid: 1, command: "leaked", rssBytes: 1024)]
+    let ev = Evidence(limits: fullAchieved, escapees: leaked)
+    let v = shouldStore(passResult(ev), isoSpec, 1, defaultCachePolicy())
+    check not v.store
+    check v.decision == cdmHermeticityDeg
+
+  test "empty escapees + toUnobservable tree → still stores (the honest-label path)":
+    ## The pgid-only tier's de-facto caching behavior is preserved: `tree`
+    ## is a separate observability axis and is never itself a store-blocker.
+    var ev = Evidence(limits: fullAchieved, escapees: @[])
+    ev.tree = toUnobservable
+    let v = shouldStore(passResult(ev), isoSpec, 1, defaultCachePolicy())
+    check v.store
 
 # ---------------------------------------------------------------------------
 # realSeams env-value soundness: RFC-0004 §Keys requires names+values in key.

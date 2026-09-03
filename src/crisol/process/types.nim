@@ -243,6 +243,20 @@ type
     cooperativeUnavailable*: bool     ## from ReapReport — without this bit
                                       ## `escalated` degrades into noise (§3)
 
+proc treeObservationFor*(domain: KillDomainStrength): TreeObservation =
+  ## rfc-0007 A6a (§2/§3): observability is a property of the MECHANISM, not
+  ## of what a post-reap scan happened to find this run. A pgid-only domain
+  ## can never vouch for the whole tree — a setsid escape is invisible to
+  ## it, so "every pid I saw is gone" would be vacuous, not a real
+  ## toComplete claim. Subreaper (B1) / cgroup (B3) / jobObject (D1) tiers
+  ## see every descendant by construction. Tying `tree` to `killDomain` by
+  ## construction (a total case, not a bare literal at the call site) means
+  ## a future domain upgrade flips this by itself — nothing to remember to
+  ## revisit at B1/B3/D1.
+  case domain
+  of kdsProcessGroup: toUnobservable
+  of kdsProcessGroupSubreaper, kdsCgroup, kdsJobObject: toComplete
+
 # ---------------------------------------------------------------------------
 # ProcessResult — ONE shape for the compile and run phases (§2).
 # ---------------------------------------------------------------------------

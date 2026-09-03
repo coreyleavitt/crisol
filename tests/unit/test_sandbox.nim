@@ -243,42 +243,72 @@ suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
     check spec.limits.req[lkOpenFiles] == some(1024'i64)
 
 # ---------------------------------------------------------------------------
-# 12. isFullyAchieved (rfc-0007 A2a-iii): per-limit gate, netIso always false
+# 12. evidenceSatisfies (rfc-0007 A6a, replacing isFullyAchieved): per-limit
+#     gate, netIso always false, observed escapees always false
 # ---------------------------------------------------------------------------
 
-suite "sandbox — isFullyAchieved":
+suite "sandbox — evidenceSatisfies":
 
   proc allApplied(): LimitsAchieved =
     for k in LimitKind: result[k] = lsApplied
 
-  test "every requested limit applied, netIso unrequested → true":
-    let spec = resolveSandbox(level = hlIsolated)  # requests fsize/nofile/core
-    check isFullyAchieved(spec, allApplied())
+  proc evOf(limits: LimitsAchieved; escapees: seq[ProcSnapshot] = @[]): Evidence =
+    Evidence(limits: limits, escapees: escapees)
 
-  test "a requested limit that read back lsFailed → false":
+  test "every requested limit applied, netIso unrequested, no escapees → true":
+    let spec = resolveSandbox(level = hlIsolated)  # requests fsize/nofile/core
+    check evidenceSatisfies(spec, evOf(allApplied()))
+
+  test "a limit that read back lsFailed → false":
     let spec = resolveSandbox(level = hlIsolated)
     var achieved = allApplied()
     achieved[lkCore] = lsFailed
-    check not isFullyAchieved(spec, achieved)
+    check not evidenceSatisfies(spec, evOf(achieved))
 
-  test "an unrequested limit's status never matters":
-    let spec = resolveSandbox(level = hlIsolated)  # lkAddressSpace/lkCpu unrequested
+  test "lsNotRequested never fails the gate (vacuous, §6)":
+    let spec = resolveSandbox(level = hlIsolated)
     var achieved = allApplied()
-    achieved[lkAddressSpace] = lsFailed  # never requested — must not fail the gate
+    achieved[lkAddressSpace] = lsNotRequested
     achieved[lkCpu]          = lsNotRequested
-    check isFullyAchieved(spec, achieved)
+    check evidenceSatisfies(spec, evOf(achieved))
+
+  test "lsUnsupported is cacheable-with-the-label, NOT a failure (round-2 amendment #2)":
+    ## Before A6a, a requested-but-unsupported limit (e.g. Windows
+    ## `openFiles`) failed the old isFullyAchieved gate exactly like
+    ## lsFailed — permanently killing caching on that tier. §6 puts
+    ## lsUnsupported in the SAME class as `toUnobservable`: honest, not a
+    ## failure.
+    let spec = resolveSandbox(level = hlIsolated)
+    var achieved = allApplied()
+    achieved[lkOpenFiles] = lsUnsupported
+    check evidenceSatisfies(spec, evOf(achieved))
 
   test "netIso requested (hlNetwork) → always false, even with every limit applied":
     ## netIso is NEVER wired (never-goal, §5) — hlNetwork stays uncacheable
     ## until RFC-0008's observer exists (§6), matching the pre-A2a-iii
     ## behavior where SandboxAchieved.netIso was likewise never set.
     let spec = resolveSandbox(level = hlNetwork)
-    check not isFullyAchieved(spec, allApplied())
+    check not evidenceSatisfies(spec, evOf(allApplied()))
 
   test "hlNone: nothing requested → true regardless of the achieved array":
     let spec = resolveSandbox(level = hlNone)
-    check isFullyAchieved(spec, default(LimitsAchieved))
-    check isFullyAchieved(spec, allApplied())
+    check evidenceSatisfies(spec, evOf(default(LimitsAchieved)))
+    check evidenceSatisfies(spec, evOf(allApplied()))
+
+  test "an observed escapee ⇒ false even with every limit applied and netIso false (A6a)":
+    let spec = resolveSandbox(level = hlIsolated)
+    let leaked = @[ProcSnapshot(pid: 4242, ppid: 1, command: "leaked", rssBytes: 1024)]
+    check not evidenceSatisfies(spec, evOf(allApplied(), escapees = leaked))
+
+  test "tree is NOT consulted — an unobservable-but-empty-escapees tier is cacheable":
+    ## §2/§6: observability and survivors are separate axes. `evidenceSatisfies`
+    ## never reads `Evidence.tree` — an honest `toUnobservable` label with
+    ## zero escapees is exactly "no further condition", the pgid-only tier's
+    ## de-facto caching behavior preserved.
+    let spec = resolveSandbox(level = hlIsolated)
+    var ev = evOf(allApplied())
+    ev.tree = toUnobservable
+    check evidenceSatisfies(spec, ev)
 
 when isMainModule:
   echo "All sandbox tests passed."

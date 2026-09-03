@@ -65,8 +65,8 @@ type
     ## the child exists (filtered env, mkdtemp'd scratch dir), nothing to
     ## probe or degrade — and only limits require kernel readback
     ## (``LimitsAchieved``, produced per-limit at spawn time and threaded
-    ## through ``isFullyAchieved`` below). ``netIso`` is NEVER wired
-    ## (never-goal, §5/§6) — see ``isFullyAchieved``'s note.
+    ## through ``evidenceSatisfies`` below). ``netIso`` is NEVER wired
+    ## (never-goal, §5/§6) — see ``evidenceSatisfies``'s note.
     level*:                HermeticLevel
     envScrub*:             bool          ## apply env allowlist filter
     tmpdir*:               bool          ## create isolated per-entrypoint scratch tmpdir
@@ -81,22 +81,36 @@ type
     envAllowlistPrefixes*: seq[string]   ## prefix patterns (e.g. "LC_") to pass through
     limits*:               ptypes.Limits ## the SINGLE home for resource limits (§1)
 
-proc isFullyAchieved*(spec: SandboxSpec; achieved: ptypes.LimitsAchieved): bool =
-  ## Cache gate: true iff every REQUESTED limit was delivered (kernel
-  ## readback confirmed it — ``lsApplied``).  env/tmpdir are achieved BY
-  ## CONSTRUCTION (rfc-0007 §5) — the runner resolves them deterministically
-  ## before the child exists, so there is nothing left to probe for either.
+proc evidenceSatisfies*(spec: SandboxSpec; ev: ptypes.Evidence): bool =
+  ## Cache gate (rfc-0007 A6a, §6): named guarantees, never enum ordinals.
+  ## Replaces the old ``isFullyAchieved`` outright — ``Evidence`` (not just
+  ## the per-limit readback) is now the gate's real input, because §6 folds
+  ## THREE axes into one verdict:
   ##
-  ## ``netIso`` is NEVER wired (never-goal, §5) — a ``netIso`` request can
-  ## never be vouched for, so it unconditionally fails the gate.  This
-  ## matches the pre-A2a-iii behavior exactly (the old ``SandboxAchieved.netIso``
-  ## bit was likewise never set) and RFC-0007 §6's explicit rule: "hlNetwork
-  ## runs remain uncacheable until RFC-0008's observer exists" — caching on a
-  ## bare assertion is the one thing the gate must not do.
+  ##   - ``netIso`` requested ⇒ never achieved (never wired, §5) — the same
+  ##     unconditional refusal ``isFullyAchieved`` always gave ``hlNetwork``.
+  ##     env/tmpdir are achieved BY CONSTRUCTION (the runner resolves them
+  ##     deterministically before the child exists), so there is nothing
+  ##     left to probe for either.
+  ##   - observed escapees (``ev.escapees.len > 0``) ⇒ uncacheable — leaked
+  ##     side effects already happened, even where a later tier (B1) goes
+  ##     on to reap them; ``tree`` is a SEPARATE observability axis (§2) and
+  ##     is deliberately not consulted here — an unobservable-but-empty-
+  ##     escapees tier is cacheable-with-the-label, which is exactly "no
+  ##     further condition on ``tree``".
+  ##   - per-limit: ``lsFailed`` ⇒ uncacheable (the mechanism existed here
+  ##     and broke); ``lsUnsupported``/``lsNotRequested``/``lsApplied`` all
+  ##     satisfy — an unsupported tier is the SAME class as
+  ##     ``toUnobservable``, not a failure (round-2 amendment #2, locked).
+  ##     The achieved status alone is authoritative (no cross-check against
+  ##     ``spec.limits.req``): a correct producer only ever stamps
+  ##     ``lsNotRequested`` for a kind that was, in fact, not requested.
   if spec.netIso:
     return false
+  if ev.escapees.len > 0:
+    return false
   for kind in ptypes.LimitKind:
-    if spec.limits.req[kind].isSome and achieved[kind] != ptypes.lsApplied:
+    if ev.limits[kind] == ptypes.lsFailed:
       return false
   true
 
@@ -701,6 +715,23 @@ proc outcome*(r: EntrypointResult;
       else: oPassed
     else:
       oFailed
+
+proc runEvidence*(r: EntrypointResult): ptypes.Evidence =
+  ## rfc-0007 A6a: the run phase's real, backend-observed `Evidence` when
+  ## there is one (pkRan/pkCached — a cache hit replays the STORED
+  ## observation verbatim, §2); the ord-0 default (weakest claim, never a
+  ## vouch) otherwise. The single derivation point `evidenceSatisfies`/
+  ## `hasEscapees`/the render warning all read through — no separate
+  ## "achieved" value is ever threaded alongside `res` again.
+  case r.run.kind
+  of ptypes.pkRan, ptypes.pkCached: r.run.res.evidence
+  of ptypes.pkSkipped, ptypes.pkSpawnFailed: default(ptypes.Evidence)
+
+proc hasEscapees*(r: EntrypointResult): bool =
+  ## rfc-0007 A6a (§6): true iff the run phase observed same-pgroup
+  ## survivors at reap time — the cache-gate fact and the render/CLI
+  ## warning both key off this, never a separate bit.
+  runEvidence(r).escapees.len > 0
 
 proc cached*(r: EntrypointResult): bool =
   ## Derived (A1e-i): RFC F3 — true iff this result replays a stored

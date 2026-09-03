@@ -231,47 +231,48 @@ suite "A9 shouldStore — csFalse blocks write":
 
   let isoSpec     = resolveSandbox(hlIsolated)
   let fullAchieved = allApplied()
+  let fullEvidence = ptypes.Evidence(limits: fullAchieved)
 
-  proc passResult(): EntrypointResult =
-    ## rfc-0007 A1e-i: outcome is derived, not stored — a passing Phase pair
-    ## (compile skipped, run exited 0) makes outcome(r) == oPassed. `achieved`
-    ## is no longer carried on the result either; shouldStore now takes it as
-    ## its own explicit parameter (see the call sites below).
+  proc passResult(evidence: ptypes.Evidence = default(ptypes.Evidence)): EntrypointResult =
+    ## rfc-0007 A6a: outcome is derived, not stored — a passing Phase pair
+    ## (compile skipped, run exited 0) makes outcome(r) == oPassed. `evidence`
+    ## is now carried ON the result itself; shouldStore reads it via
+    ## `runEvidence` (no separate parameter — see the call sites below).
     result = EntrypointResult(ep: Entrypoint(path: "p"))
     result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     result.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
       exit: ptypes.Exit(kind: ptypes.ekExited, code: 0),
       cause: ptypes.Cause(by: ptypes.cbProcess),
-      evidence: default(ptypes.Evidence), rusage: none(ptypes.Rusage),
+      evidence: evidence, rusage: none(ptypes.Rusage),
       durationUs: 0))
 
   test "csFalse + global-on + achieved + attempt1 → no store, cdmGroupOptOut":
     ## M8: csFalse blocks write with cdmGroupOptOut (config opt-out, not --no-cache).
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, globalOn, csFalse)
+    let v = shouldStore(passResult(), isoSpec, 1, globalOn, csFalse)
     check not v.store
     check v.decision == cdmGroupOptOut
 
   test "csFalse + global-off + achieved + attempt1 → no store, cdmGroupOptOut":
     ## M8: csFalse is absolute; even with global off it reports cdmGroupOptOut.
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, globalOff, csFalse)
+    let v = shouldStore(passResult(), isoSpec, 1, globalOff, csFalse)
     check not v.store
     check v.decision == cdmGroupOptOut
 
   test "csDefault + global-on + achieved + attempt1 → store":
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, globalOn, csDefault)
+    let v = shouldStore(passResult(fullEvidence), isoSpec, 1, globalOn, csDefault)
     check v.store
 
   test "csTrue + global-on + achieved + attempt1 → store":
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, globalOn, csTrue)
+    let v = shouldStore(passResult(fullEvidence), isoSpec, 1, globalOn, csTrue)
     check v.store
 
   test "csDefault + global-off + achieved + attempt1 → no store, cdmPolicyDisabled":
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, globalOff, csDefault)
+    let v = shouldStore(passResult(), isoSpec, 1, globalOff, csDefault)
     check not v.store
     check v.decision == cdmPolicyDisabled
 
   test "csTrue + global-off + achieved + attempt1 → no store, cdmPolicyDisabled (global wins)":
-    let v = shouldStore(passResult(), isoSpec, fullAchieved, 1, globalOff, csTrue)
+    let v = shouldStore(passResult(), isoSpec, 1, globalOff, csTrue)
     check not v.store
     check v.decision == cdmPolicyDisabled
 
@@ -450,10 +451,10 @@ suite "A9 --force-compile × --no-cache orthogonality":
     r.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
       exit: ptypes.Exit(kind: ptypes.ekExited, code: 0),
       cause: ptypes.Cause(by: ptypes.cbProcess),
-      evidence: default(ptypes.Evidence), rusage: none(ptypes.Rusage),
+      evidence: ptypes.Evidence(limits: fullAchieved), rusage: none(ptypes.Rusage),
       durationUs: 0))
     # csDefault + global-on + achieved + attempt1 → store, even for a forced run.
-    let v = shouldStore(r, isoSpec, fullAchieved, 1, globalOn, csDefault)
+    let v = shouldStore(r, isoSpec, 1, globalOn, csDefault)
     check v.store
 
   ## (b) noCache alone does NOT force compilation.
@@ -503,7 +504,6 @@ suite "A9 --force-compile × --no-cache orthogonality":
 
     # Store-time: noCache blocks write
     let isoSpec     = resolveSandbox(hlIsolated)
-    let fullAchieved = allApplied()
     var r = EntrypointResult(ep: Entrypoint(path: "t.nim"))
     r.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     r.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
@@ -511,7 +511,7 @@ suite "A9 --force-compile × --no-cache orthogonality":
       cause: ptypes.Cause(by: ptypes.cbProcess),
       evidence: default(ptypes.Evidence), rusage: none(ptypes.Rusage),
       durationUs: 0))
-    let v = shouldStore(r, isoSpec, fullAchieved, 1, globalOff, csDefault)
+    let v = shouldStore(r, isoSpec, 1, globalOff, csDefault)
     check not v.store
     check v.decision == cdmPolicyDisabled
 

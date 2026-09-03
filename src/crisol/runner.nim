@@ -267,12 +267,6 @@ type
     slotBinDir:      string        # per-slot bin dir (separate from tmpDir for M15 cleanup)
     compiledThisRun: bool          # false for cdSkipFresh slots
     compileSkipped:  bool          # true for cdSkipFresh slots
-    achieved:        ptypes.LimitsAchieved  # A4d/A6/A2a-iii: per-limit readback actually
-                                      # delivered by the run child (rfc-0007 A2b: set
-                                      # by finalizeSlot from ReapReport.limits at
-                                      # reap time, §1) — used directly by
-                                      # classifyCause's cbLimit branch and the
-                                      # cache-store gate (isFullyAchieved).
     spec:            SandboxSpec   # A6: resolved sandbox spec for the run phase; stored
                                    # at compile-spawn so the compile→run transition
                                    # (transitionToRun) can route through buildRunChildSpec.
@@ -313,14 +307,29 @@ proc toProcessResult(report: ReapReport; limits: ptypes.Limits;
   ## "cbRunner iff ReapReport.stop.isSome") — a child reaped after a stop
   ## act reads cbRunner even if it happened to exit 0 inside the grace
   ## window. `evidence.limits` is the REAL per-limit readback the Supervisor
-  ## delivered at reap time (rfc-0007 A5) — everything else on `evidence`
-  ## (killDomain/tree/escapees/hermetic/killSnapshot/cooperativeUnavailable)
-  ## stays the interim zero value; that wiring is still A6a's job, not this
-  ## slice's (matches the pre-A2b placeholder exactly for those fields).
+  ## delivered at reap time (rfc-0007 A5); `killDomain`/`tree`/`escapees`/
+  ## `killSnapshot`/`cooperativeUnavailable` are copied VERBATIM from the
+  ## ReapReport too (rfc-0007 A6a — reap's "one report" promise, §2) — the
+  ## backend already computed the honest values (posixcore's post-reap pgid
+  ## scan + `treeObservationFor`); this is the one place they reach the
+  ## wire-facing `Evidence` instead of being silently discarded.
+  ## `evidence.hermetic` stays the ord-0 default here — it is runner-
+  ## authored (not backend-observed) and has no producer yet; a compile-
+  ## phase result has no HermeticLevel concept to begin with (sandboxing is
+  ## a run-phase-only notion, §5), so threading it through this ONE shared
+  ## constructor cleanly is a separate, not-yet-scheduled slice, flagged
+  ## rather than silently wired half-right here.
   ptypes.ProcessResult(
     exit: report.exit,
     cause: ptypes.classifyCause(report.exit, report.stop, limits, report.limits),
-    evidence: ptypes.Evidence(limits: report.limits),
+    evidence: ptypes.Evidence(
+      killDomain:             report.killDomain,
+      tree:                   report.tree,
+      escapees:               report.escapees,
+      limits:                 report.limits,
+      killSnapshot:           report.killSnapshot,
+      cooperativeUnavailable: report.cooperativeUnavailable,
+    ),
     rusage: report.rusage,
     durationUs: durationUs,
   )
@@ -531,7 +540,6 @@ proc finalizeSlot(
         ptypes.Phase(kind: ptypes.pkRan, res: slots[idx].compileProcRes.get)
       else:
         ptypes.Phase(kind: ptypes.pkSkipped)  # cdSkipFresh: no compile this run
-    slots[idx].achieved = report.limits  # §1: delivered in ReapReport, not SpawnResult
     var res: EntrypointResult
     if report.stop.isSome:
       # Killed mid-run (timeout or interrupt) — output only; sink
@@ -1047,8 +1055,6 @@ proc spawnRunDirect(
   slot.compileSkipped  = true
   slot.spec            = spec          # A2b: carried so groupRssBytes callers and a
                                         # later kill have the same spec context
-  slot.achieved         = default(ptypes.LimitsAchieved)  # §1: delivered in ReapReport, not
-                                        # SpawnResult — finalizeSlot sets the real value
   slot.compileProcRes  = none(ptypes.ProcessResult)  # rfc-0007 A1b: cdSkipFresh —
                                         # no compile happened this run; reset so a
                                         # reused slot never leaks a prior occupant's
@@ -1413,10 +1419,6 @@ proc execute*(
             finalized[completedIdx] = true
             onResult(fo.res)
           else:
-            let slotAchieved = slots[idx].achieved  # §1: delivered in ReapReport
-                                                     # at reap time — finalizeSlot
-                                                     # set this above, not spawn time.
-
             # rfc-0007 §2: retry/flaky/quarantine decisions read the pure
             # derivation — there is no stored legacy field to read instead.
             let completedOutcome = outcome(result[completedIdx])
@@ -1550,7 +1552,7 @@ proc execute*(
               # ALWAYS stamp the live result's CacheDecision for reporting (A8).
               # ---------------------------------------------------------------
               if cacheActive:
-                let verdict = shouldStore(result[completedIdx], cache.spec, slotAchieved,
+                let verdict = shouldStore(result[completedIdx], cache.spec,
                                           slotAttempt, cache.policy,
                                           p.entrypoints[completedIdx].cacheable)
                 # R9: a store is permitted only when BOTH the policy verdict AND

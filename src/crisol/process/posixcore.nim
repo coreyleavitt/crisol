@@ -356,8 +356,10 @@ proc readVmRssBytes(pid: int): int64 =
 
 proc scanProcessGroup*(pgid: Pid): seq[ProcSnapshot] =
   ## Walk /proc, keep every pid whose pgrp == pgid. pgid-only tier — a
-  ## setsid escape is invisible (§3), which is exactly why callers still
-  ## report `tree = toUnobservable` (interim table, until A6a).
+  ## setsid escape is invisible (§3), which is exactly why `reapCore`
+  ## reports `tree = treeObservationFor(kdsProcessGroup)` (A6a: always
+  ## `toUnobservable` on this backend) regardless of what a given scan
+  ## finds — observability is a property of the mechanism, not the scan.
   result = @[]
   try:
     for kind, path in walkDir("/proc"):
@@ -520,6 +522,14 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
   let entry = core.children[idx]
   if entry.state != csExited:
     doAssert false, "reap: weChildExited was never reported for ChildId " & $id
+  # rfc-0007 A6a (§6): the post-reap pgid scan — ALWAYS performed, not
+  # gated on a stop act. `spawn_grandchild` leaks a same-pgroup grandchild
+  # while the entrypoint itself exits 0 on its own, no kill involved; the
+  # escapee fact must still be caught. `entry.pid` doubles as the pgid
+  # (spawnChild calls setpgid(childPid, childPid)) and is still valid here
+  # — the leader is gone from /proc (just reaped), so only real survivors
+  # remain in the scan.
+  let escapees = scanProcessGroup(entry.pid)
   result = ReapReport(
     exit: entry.exit,
     rusage: entry.rusage,
@@ -527,8 +537,8 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
     killDomain: kdsProcessGroup,     # interim table: kdsProcessGroup until A7
     limits: entry.achieved,
     killSnapshot: entry.killSnapshot,
-    tree: toUnobservable,            # interim table: toUnobservable until A6a
-    escapees: @[],                   # interim table: empty until A6a
+    tree: treeObservationFor(kdsProcessGroup),
+    escapees: escapees,
     cooperativeUnavailable: false,   # POSIX: SIGTERM is always deliverable (§3)
   )
   core.children[idx] = ChildEntry(state: csReaped)   # tombstone: pid dropped

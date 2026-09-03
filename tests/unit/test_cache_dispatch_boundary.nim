@@ -219,7 +219,7 @@ suite "execute — degraded hermeticity blocks the store":
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
     # hlNetwork requests netIso, but unshare(CLONE_NEWNET) is not wired in spawn,
-    # so isFullyAchieved is false → the cache-store gate blocks the write.
+    # so evidenceSatisfies is false → the cache-store gate blocks the write.
     let netSpec = resolveSandbox(hlNetwork)
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",

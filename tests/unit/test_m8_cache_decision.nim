@@ -37,6 +37,7 @@ proc allApplied(): ptypes.LimitsAchieved =
 # A fully-achieved per-limit record for the isolated spec (rfc-0007 A2a-iii:
 # SandboxAchieved is deleted; env/tmpdir are achieved by construction).
 let fullAchieved = allApplied()
+let fullEvidence = ptypes.Evidence(limits: fullAchieved)
 
 type Calls = object
   loadCalls:  int
@@ -80,15 +81,16 @@ proc seamsMiss(c: var Calls): CacheSeams =
 
 suite "M8 (a) — miss-stored vs miss-unstored via shouldStore":
 
-  proc passRes(): EntrypointResult =
-    ## rfc-0007 A1e-i: outcome is derived from the Phase pair; `achieved` is
-    ## a separate shouldStore parameter now (see the call sites below).
+  proc passRes(evidence: ptypes.Evidence = default(ptypes.Evidence)): EntrypointResult =
+    ## rfc-0007 A6a: outcome is derived from the Phase pair; `evidence` is
+    ## now carried ON the result itself (shouldStore reads it via
+    ## `runEvidence` — no separate parameter).
     result = EntrypointResult(ep: Entrypoint(path: "p"))
     result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     result.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
       exit: ptypes.Exit(kind: ptypes.ekExited, code: 0),
       cause: ptypes.Cause(by: ptypes.cbProcess),
-      evidence: default(ptypes.Evidence), rusage: none(ptypes.Rusage),
+      evidence: evidence, rusage: none(ptypes.Rusage),
       durationUs: 0))
 
   proc failRes(): EntrypointResult =
@@ -104,34 +106,34 @@ suite "M8 (a) — miss-stored vs miss-unstored via shouldStore":
     ## shouldStore returns store=true; runner stamps cdmStored on the result.
     ## This test verifies the gate decision; the runner.nim integration test
     ## (test_cache_dispatch_boundary) verifies the final stamp.
-    let v = shouldStore(passRes(), isoSpec, fullAchieved, 1, globalOn)
+    let v = shouldStore(passRes(fullEvidence), isoSpec, 1, globalOn)
     check v.store
 
   test "non-pass outcome → no store, decision=cdmKeyMiss (ran but not stored)":
-    let v = shouldStore(failRes(), isoSpec, fullAchieved, 1, globalOn)
+    let v = shouldStore(failRes(), isoSpec, 1, globalOn)
     check not v.store
     check v.decision == cdmKeyMiss
 
   test "hermeticity degraded → no store, decision=cdmHermeticityDeg (not cdmKeyMiss)":
     var degraded = allApplied()
     degraded[ptypes.lkCore] = ptypes.lsFailed
-    let v = shouldStore(passRes(), isoSpec, degraded, 1, globalOn)
+    let v = shouldStore(passRes(ptypes.Evidence(limits: degraded)), isoSpec, 1, globalOn)
     check not v.store
     check v.decision == cdmHermeticityDeg
 
   test "flaky-pass (attempt>1) → no store, decision=cdmFlaky (not cdmKeyMiss)":
-    let v = shouldStore(passRes(), isoSpec, fullAchieved, 2, globalOn)
+    let v = shouldStore(passRes(fullEvidence), isoSpec, 2, globalOn)
     check not v.store
     check v.decision == cdmFlaky
 
   test "cdmKeyMiss only when non-pass (not degraded, not flaky, not policy)":
     ## Verify cdmKeyMiss is not spuriously produced by other branches.
     ## The only shouldStore path that returns cdmKeyMiss is the non-pass branch.
-    let failV = shouldStore(failRes(), isoSpec, fullAchieved, 1, globalOn)
+    let failV = shouldStore(failRes(), isoSpec, 1, globalOn)
     check failV.decision == cdmKeyMiss
     var degraded = allApplied()
     degraded[ptypes.lkCore] = ptypes.lsFailed
-    let hermV = shouldStore(passRes(), isoSpec, degraded, 1, globalOn)
+    let hermV = shouldStore(passRes(ptypes.Evidence(limits: degraded)), isoSpec, 1, globalOn)
     check hermV.decision != cdmKeyMiss  # hermeticity degraded, not key-miss
 
 # ---------------------------------------------------------------------------
@@ -180,13 +182,13 @@ suite "M8 (b) — cdmPolicyDisabled vs cdmGroupOptOut distinction":
     ## ever consulted, so a default-constructed (pkSkipped/pkSkipped) result
     ## is fine here -- shouldStore returns before reaching either check.
     let r = EntrypointResult(ep: Entrypoint(path: "p"))
-    let v = shouldStore(r, isoSpec, fullAchieved, 1, globalOn, csFalse)
+    let v = shouldStore(r, isoSpec, 1, globalOn, csFalse)
     check not v.store
     check v.decision == cdmGroupOptOut
 
   test "--no-cache → cdmPolicyDisabled from shouldStore":
     let r = EntrypointResult(ep: Entrypoint(path: "p"))
-    let v = shouldStore(r, isoSpec, fullAchieved, 1, globalOff, csDefault)
+    let v = shouldStore(r, isoSpec, 1, globalOff, csDefault)
     check not v.store
     check v.decision == cdmPolicyDisabled
 

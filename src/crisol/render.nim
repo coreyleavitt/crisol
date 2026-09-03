@@ -370,7 +370,16 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
         "  " & col("[SLOW: " & $(r.durationMs * 1000) & "µs > " &
                    $r.perfThresholdUs & "µs]", Ansi_Yellow, color)
       else: ""
-    buf.add "  " & labelCol & "  " & epPath & countsSuffix & cachedTag & quarantinedTag & slowTag & "\n"
+    # rfc-0007 A6a (§6): a first-class warning when the run observed a
+    # same-pgroup survivor — leaked side effects already happened, and the
+    # result was refused by the cache gate for exactly this reason
+    # (evidenceSatisfies). Appears after [SLOW]; yellow matches the other
+    # "degraded but not fatal" tags — the verdict itself is never changed
+    # by hygiene (crisol does not judge test semantics, §6).
+    let escapeeTag =
+      if hasEscapees(r): "  " & col("[ESCAPEE]", Ansi_Yellow, color)
+      else: ""
+    buf.add "  " & labelCol & "  " & epPath & countsSuffix & cachedTag & quarantinedTag & slowTag & escapeeTag & "\n"
 
     # -----------------------------------------------------------------------
     # Failure / compile-fail / signal detail block

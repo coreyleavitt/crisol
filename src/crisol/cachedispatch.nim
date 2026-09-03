@@ -19,7 +19,7 @@
 ##   - `CacheSeams`     — the injectable (keyOf, load, store) bundle.
 ##   - `lookupAtPlan`   — promote edRunFresh → edCached on a hit; synthesize the
 ##                        EntrypointResult; ALWAYS populate CacheDecision.
-##   - `shouldStore`    — the store gate: isFullyAchieved AND attempt-1 pass.
+##   - `shouldStore`    — the store gate: evidenceSatisfies AND attempt-1 pass.
 ##   - `realSeams`      — production seam bundle (keys.nim + resultcache.nim).
 ##
 ## The execute loop (runner.nim) calls `lookupAtPlan` once per runnable
@@ -279,19 +279,24 @@ type
 proc shouldStore*(
   res:       EntrypointResult;
   spec:      SandboxSpec;
-  achieved:  ptypes.LimitsAchieved;
   attempt:   int;
   policy:    CachePolicy;
   cacheable: CacheableState = csDefault;
 ): StoreVerdict =
   ## Gate a freshly-run result for caching (RFC-0004 F3).  Store ONLY when:
   ##   (a) per-group cacheable is not csFalse AND global policy permits, and
-  ##   (b) hermeticity was *achieved* (isFullyAchieved spec vs achieved), and
+  ##   (b) hermeticity was *achieved* (evidenceSatisfies over `res`'s own
+  ##       `Evidence` — rfc-0007 A6a: named guarantees, incl. escapees and
+  ##       the per-limit rules, §6), and
   ##   (c) it PASSED on attempt 1 (never cache a flaky-pass from attempt > 1, or
   ##       it freezes as PASS forever).
   ##
-  ## `achieved` is threaded in explicitly (A1e-i: EntrypointResult no longer
-  ## carries it — the runner reads it off the Slot that produced `res`).
+  ## No separate `achieved`/`evidence` parameter (A6a): the run phase's own
+  ## `ProcessResult.evidence` — copied VERBATIM from the ReapReport at reap
+  ## time (§1's "one report" promise) — is the SOLE source of truth
+  ## (`runEvidence(res)`); threading a second, independently-settable value
+  ## alongside `res` would let the gate's input disagree with the very
+  ## observation it is gating.
   ##
   ## v1 caches passes only; a failing outcome is simply not eligible.  The
   ## returned CacheDecision is the MISS reason for the live result so the
@@ -306,7 +311,7 @@ proc shouldStore*(
     # fresh run is cdmKeyMiss; a fresh FAIL is simply not stored — we keep the
     # key-miss label (it was a fresh run that found no entry and produced none).
     return StoreVerdict(store: false, decision: cdmKeyMiss)
-  if not isFullyAchieved(spec, achieved):
+  if not evidenceSatisfies(spec, runEvidence(res)):
     return StoreVerdict(store: false, decision: cdmHermeticityDeg)
   if attempt != 1:
     return StoreVerdict(store: false, decision: cdmFlaky)

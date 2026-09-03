@@ -398,6 +398,17 @@ const RunSchemaRevision* = 17
   ##                     zero value (A6a's job). No new field, an existing
   ##                     field's CONTENT changes — same rationale as A1e-i's
   ##                     entry above.
+  ##   (rfc-0007 A6a, no rev bump) — `run.evidence.killDomain`/`tree`/
+  ##                     `escapees`/`killSnapshot`/`cooperativeUnavailable`
+  ##                     now reflect the REAL backend observation
+  ##                     (`ReapReport`, copied verbatim by `toProcessResult`)
+  ##                     instead of the interim zero value A5 left them at —
+  ##                     `escapees` in particular now genuinely reports a
+  ##                     leaked same-pgroup survivor. `evidence.hermetic`
+  ##                     stays the ord-0 default (runner-authored, no
+  ##                     producer yet — a separate, not-yet-scheduled gap).
+  ##                     No new field, an existing field's CONTENT changes —
+  ##                     same rationale as A5's entry above.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
