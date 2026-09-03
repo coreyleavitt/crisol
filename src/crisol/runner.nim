@@ -405,7 +405,7 @@ type
     of fkTransitioned, fkOmitted: discard
 
 proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
-                     attempt: int): bool
+                     attempt: int; projectRoot: string): bool
   ## Forward-declared: defined below, alongside spawnCompileStable/
   ## spawnRunDirect (the other two ChildSpec-building spawn sites).
 
@@ -428,6 +428,7 @@ proc finalizeSlot(
   plan:            RunPlan;
   maxOutputBytes:  int;
   allowTransition: bool;
+  projectRoot:     string;
 ): FinalizeOutcome =
   ## Called once `next` has reported weChildExited for `slots[idx].id`.
   ## Reaps it (the only place a ChildId is consumed, §1) and either
@@ -488,7 +489,8 @@ proc finalizeSlot(
         cleanupSlotOnTeardown(slots[idx])
         slots[idx].state = ssIdle
         return FinalizeOutcome(kind: fkOmitted)
-      let ok = transitionToRun(sv, slots[idx], slots[idx].runTimeoutMs, slots[idx].attempt)
+      let ok = transitionToRun(sv, slots[idx], slots[idx].runTimeoutMs, slots[idx].attempt,
+                               projectRoot)
       if not ok:
         var res = EntrypointResult(ep: pep.ep, output: "fork failed during run phase",
                                    durationMs: elapsed)
@@ -625,6 +627,7 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
     groupId:           ep.group,
     configHash:        flagHash(ep.flags),
     stateDir:          stateDirOf(config),
+    projectRoot:       config.projectRoot.absolutePath.normalizedPath,
   )
 
 proc dirHasEntries(dir: string): bool =
@@ -868,12 +871,17 @@ proc spawnCompileStable(
   # rfc-0007 A2b: ONE spawn path. ChildSpec.env is ALWAYS explicit (§1) — the
   # compile phase stays unsandboxed (A6), so this is the parent env copied
   # verbatim (filterEnv's envScrub:false branch), never "whatever environ
-  # is" by implicit fork() inheritance. cwd stays "" (parent cwd, matching
-  # pre-A2b forkExec) — A2c (#17) is the slice that resolves this to
-  # projectRoot; not this one.
+  # is" by implicit fork() inheritance.
+  # rfc-0007 A2c (#17): cwd is ALWAYS config.projectRoot — never "" (the
+  # invoking crisol process's own cwd, which may be a subdirectory reached
+  # via `--config ../crisol.kdl`, or entirely unrelated when driven through
+  # the library API). A root-relative compile flag (e.g. `--path:src`) is
+  # resolved by `nim` against ITS OWN cwd, so this is the ONE place that
+  # guarantees a `--path:src` group compiles identically no matter where
+  # crisol itself was invoked from.
   let childSpec = ChildSpec(
     argv:   compArgs,
-    cwd:    "",
+    cwd:    config.projectRoot.absolutePath.normalizedPath,
     env:    filterEnv(toSeq(envPairs()), SandboxSpec(envScrub: false), @[]),
     sinks:  combinedSink(compOut),
     limits: ptypes.Limits(),  # compile is unsandboxed — no limits requested
@@ -919,6 +927,7 @@ proc buildRunChildSpec(
   sinkFile:      string;
   spec:          SandboxSpec;
   attempt:       int;
+  projectRoot:   string;
   outScratchDir: var string;
 ): ChildSpec =
   ## rfc-0007 A2b: the SINGLE ChildSpec-building path for a run child —
@@ -940,7 +949,12 @@ proc buildRunChildSpec(
   # now (§1) — filterEnv already implements exactly this contract (envScrub
   # false = the parent env explicitly copied, never implicit inheritance).
   let env = filterEnv(toSeq(envPairs()), spec, injected)
-  let cwd = if spec.chdirIntoScratch and outScratchDir.len > 0: outScratchDir else: ""
+  # rfc-0007 A2c (#17): cwd is `projectRoot` by default — ONLY overridden by
+  # an explicit `chdirIntoScratch` opt-in (the test's own isolated scratch
+  # dir takes precedence over projectRoot, same rule as before this slice;
+  # the change is what the "otherwise" branch resolves to: it used to be ""
+  # (inherit the crisol process's own cwd), now it is always projectRoot).
+  let cwd = if spec.chdirIntoScratch and outScratchDir.len > 0: outScratchDir else: projectRoot
   ChildSpec(argv: @[binFull], cwd: cwd, env: env, sinks: combinedSink(runOut),
             limits: spec.limits)
 
@@ -982,7 +996,8 @@ proc spawnRunDirect(
   var scratchDir: string
   var childSpec: ChildSpec
   try:
-    childSpec = buildRunChildSpec(binFull, runOut, sinkFile, spec, attempt, scratchDir)
+    childSpec = buildRunChildSpec(binFull, runOut, sinkFile, spec, attempt,
+                                  config.projectRoot.absolutePath.normalizedPath, scratchDir)
   except:
     try: removeDir(tmpDir) except: discard
     return false
@@ -1023,7 +1038,7 @@ proc spawnRunDirect(
   result = true
 
 proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
-                     attempt: int): bool =
+                     attempt: int; projectRoot: string): bool =
   ## rfc-0007 A2b: transition a compile-succeeded, un-stopped slot into its
   ## running phase — spawns the compiled binary as a NEW child (a fresh
   ## ChildId; the compile child's id was already consumed by `reap` before
@@ -1036,7 +1051,7 @@ proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
   var childSpec: ChildSpec
   try:
     childSpec = buildRunChildSpec(slot.binFull, slot.runOut, slot.sinkPath,
-                                  slot.spec, attempt, scratchDir)
+                                  slot.spec, attempt, projectRoot, scratchDir)
   except:
     return false
 
@@ -1348,7 +1363,8 @@ proc execute*(
         let finishRss = sv.groupRssBytes(slots[idx].id)
 
         let fo = finalizeSlot(sv, slots, idx, p, maxOutputBytes,
-                              allowTransition = not shuttingDown)
+                              allowTransition = not shuttingDown,
+                              projectRoot = config.projectRoot.absolutePath.normalizedPath)
 
         case fo.kind
         of fkTransitioned:

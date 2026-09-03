@@ -60,6 +60,7 @@ proc buildPlan(workDir: string): MeasurePlan =
     groupId:           "unit",
     configHash:        "test-config-hash",
     stateDir:          workDir / "state",
+    projectRoot:       projectRoot,
   )
 
 proc writePlan(plan: MeasurePlan; workDir: string): string =

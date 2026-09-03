@@ -172,6 +172,37 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
     check inputs.externals.len == 1
     check inputs.externals[0].headers == @["native/add.h"]
 
+  test "rfc-0007 A2c (issue #17): a relative header resolves against config.projectRoot, NOT the calling process's own cwd":
+    ## Same relative-header shape as the dedup test above, but the process
+    ## cwd is set to an UNRELATED third directory (neither p.root nor its
+    ## parent) instead of p.root. Pre-A2c, extractCompileInputs resolved a
+    ## relative cc -M header against getCurrentDir() — this would look for
+    ## "native/add.h" under the unrelated dir, find nothing tracked, and
+    ## silently drop it (index.underAnyRoot is false there). Post-A2c, the
+    ## header must still resolve — against cfg.projectRoot — regardless of
+    ## where the calling process's cwd happens to be.
+    let p = setupExtProject("cwdpin")
+    let elsewhere = freshRoot("cwdpin_elsewhere")
+    defer: removeDir(elsewhere)
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
+                 link    = @[p.objAbs])
+
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      let output = p.objAbs & ": " & p.srcAbs & " native/add.h\n"
+      (output: output, ok: true)
+
+    let savedCwd = getCurrentDir()
+    setCurrentDir(elsewhere)   # deliberately NOT p.root — the bug's exact trigger
+    defer: setCurrentDir(savedCwd)
+
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+    check inputs.externals.len == 1
+    check inputs.externals[0].headers == @["native/add.h"]
+    check "native/add.h" in inputs.files
+
 suite "extractCompileInputs — cached external (carried-forward headers)":
 
   test "no matching compile entry, a carried record for the source: headers carried verbatim, ccRun NOT invoked":

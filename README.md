@@ -195,7 +195,7 @@ All global keys are optional.
 | `compile-timeout-secs` | int | `600` | Per-entrypoint compile timeout in seconds. |
 | `max-output-bytes` | int | `10485760` | stdout+stderr capture cap per entrypoint (10 MiB). |
 | `state-dir` | string | `".crisol"` | State directory, relative to the project root (the directory containing `crisol.kdl`). |
-| `flags` | strings | (none) | Extra Nim compile flags applied to every entrypoint. Repeatable (each `flags` node appends). |
+| `flags` | strings | (none) | Extra Nim compile flags applied to every entrypoint. Repeatable (each `flags` node appends). A relative path inside a flag (e.g. `--path:src`) resolves against the project root — see below. |
 | `dep-roots` | strings | (none) | Additional source roots tracked for impact analysis (`--changed`). Repeatable. |
 
 #### Memory-aware scheduling keys (optional)
@@ -236,6 +236,15 @@ group "unit-orc" {
 ```
 
 `crisol run` runs both legs; `crisol run --group unit-orc` runs one; `crisol run tests/unit/test_x.nim` runs that file under both (add `--group` to pick one). Per-group flags only append to the global set — a group that needs to escape a global flag argues for not making it global.
+
+**Flags are resolved relative to the project root, not the invoking shell's directory.** A relative path inside a `flags` value — `--path:src`, `--path:vendor/lib`, and so on — is resolved against the project root (the directory containing `crisol.kdl`, or the `--config` file's parent directory), never against the directory `crisol` happened to be invoked from. This holds no matter where you run `crisol` from:
+
+```console
+$ crisol run                                # from the project root
+$ (cd tests/unit && crisol run --config ../../crisol.kdl)   # from any subdirectory
+```
+
+Both invocations compile every `--path:src` group identically, because crisol spawns every compile (and every run) child with the project root as its own working directory. If you need a flag resolved relative to something else, spell it out as an absolute path.
 
 ### Group-selection model
 

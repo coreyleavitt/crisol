@@ -747,7 +747,7 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
 proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
                     nimcacheDir, binaryName: string;
                     protocolMajor: int; index: SourceIndex;
-                    ccRun: RunProc = realRun):
+                    ccRun: RunProc = realRunIn(config.projectRoot.absolutePath.normalizedPath)):
                     tuple[ok: bool, error: string] =
   ## Extract, hash, and persist one entrypoint's source closure after a
   ## successful compile — the single place issue #5's recovery policy lives.
@@ -759,9 +759,11 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## of any single compile).
   ##
   ## `ccRun` — the `cc -M` header-probe seam (issue #16), threaded through to
-  ## `closure.extractCompileInputs`; defaults to `ccprobe.realRun`. Tests
-  ## inject a synthetic runner; production (`runner.execute`) uses the
-  ## default.
+  ## `closure.extractCompileInputs`; defaults to `ccprobe.realRunIn(config.
+  ## projectRoot)` (rfc-0007 A2c, issue #17) — replays `cc -M` from
+  ## projectRoot, the SAME directory the real compile ran `cc` from,
+  ## regardless of the crisol process's own cwd. Tests inject a synthetic
+  ## runner; production (`runner.execute`) uses the default.
   ##
   ## Extraction (issue #16) now goes through `closure.extractCompileInputs`,
   ## not `closure.extractClosure` directly: it additionally derives, for

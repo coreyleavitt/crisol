@@ -7,7 +7,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_ccprobe.nim
 
-import std/[unittest, strutils]
+import std/[os, unittest, strutils]
 import crisol/ccprobe
 
 # ---------------------------------------------------------------------------
@@ -161,6 +161,34 @@ suite "realRun — execv-style, no shell splitting":
 
   test "realRun captures stdout output":
     let (output, ok) = realRun("/bin/echo", ["hello"])
+    check ok
+    check output.strip() == "hello"
+
+# ---------------------------------------------------------------------------
+# Suite 5: realRunIn — rfc-0007 A2c (issue #17): the returned RunProc always
+# spawns its subprocess with the GIVEN workingDir, regardless of the calling
+# process's own cwd.
+# ---------------------------------------------------------------------------
+
+suite "realRunIn — subprocess cwd is the given workingDir, not the caller's":
+
+  test "the subprocess sees workingDir as its cwd even when the caller's cwd differs":
+    let target = getTempDir() / "crisol_ccprobe_realrunin_target"
+    createDir(target)
+    defer: removeDir(target)
+
+    let savedCwd = getCurrentDir()
+    setCurrentDir(getTempDir())   # deliberately NOT `target`
+    defer: setCurrentDir(savedCwd)
+
+    let run = realRunIn(target)
+    let (output, ok) = run("/bin/pwd", [])
+    check ok
+    check output.strip() == target.absolutePath.normalizedPath
+
+  test "workingDir = \"\" behaves exactly like realRun (inherits the caller's cwd)":
+    let run = realRunIn("")
+    let (output, ok) = run("/bin/echo", ["hello"])
     check ok
     check output.strip() == "hello"
 

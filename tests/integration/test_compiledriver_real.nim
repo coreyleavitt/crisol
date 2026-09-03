@@ -63,5 +63,78 @@ suite "runMeasured — real live compile (pass_always fixture)":
 
     removeDir(workDir)
 
+# ---------------------------------------------------------------------------
+# rfc-0007 A2c (issue #17): newMeasureDriver's `workingDir` — the SECOND
+# compile substrate (raw osproc.startProcess, not a Supervisor ChildSpec)
+# that must independently resolve a root-relative compile flag against
+# projectRoot, regardless of the calling process's own cwd.
+# ---------------------------------------------------------------------------
+
+proc freshA2cRoot(tag: string): string =
+  result = getTempDir() / "crisol_test_compiledriver_real_a2c_" & tag & "_" & $getCurrentProcessId()
+  removeDir(result)
+  createDir(result)
+
+proc writeA2cFixture(root: string) =
+  ## src/helper.nim, importable ONLY via a root-relative `--path:src`.
+  createDir(root / "src")
+  createDir(root / "tests")
+  writeFile(root / "src" / "helper.nim", "proc helperValue*(): int = 42\n")
+  writeFile(root / "tests" / "t.nim", """
+import helper
+doAssert helperValue() == 42
+""")
+
+suite "newMeasureDriver — workingDir resolves a root-relative --path:src flag (rfc-0007 A2c, issue #17)":
+
+  test "[RED-pin] workingDir=\"\" (pre-A2c default) fails to compile from an unrelated cwd":
+    ## Sanity-pins the bug this slice fixes: absent an explicit workingDir,
+    ## `nim --compileOnly` inherits the CALLING process's cwd, so a
+    ## root-relative `--path:src` cannot find `src/helper.nim`.
+    let root = freshA2cRoot("red")
+    defer: removeDir(root)
+    let elsewhere = freshA2cRoot("red_elsewhere")
+    defer: removeDir(elsewhere)
+    writeA2cFixture(root)
+
+    let workDir      = getTempDir() / "crisol_test_compiledriver_real_a2c_red_out_" & $getCurrentProcessId()
+    let nimcacheDir   = workDir / "nimcache"
+    let outputBinPath = workDir / "t"
+    createDir(nimcacheDir)
+    defer: removeDir(workDir)
+
+    let savedCwd = getCurrentDir()
+    setCurrentDir(elsewhere)
+    defer: setCurrentDir(savedCwd)
+
+    let driver = newMeasureDriver()   # workingDir defaults to "" — inherits elsewhere
+    let spans = runMeasured(driver, root / "tests" / "t.nim", @["--path:src"],
+                            nimcacheDir, outputBinPath)
+    check not spans.ok
+
+  test "workingDir=projectRoot compiles successfully from an unrelated cwd":
+    let root = freshA2cRoot("green")
+    defer: removeDir(root)
+    let elsewhere = freshA2cRoot("green_elsewhere")
+    defer: removeDir(elsewhere)
+    writeA2cFixture(root)
+
+    let workDir      = getTempDir() / "crisol_test_compiledriver_real_a2c_green_out_" & $getCurrentProcessId()
+    let nimcacheDir   = workDir / "nimcache"
+    let outputBinPath = workDir / "t"
+    createDir(nimcacheDir)
+    defer: removeDir(workDir)
+
+    let savedCwd = getCurrentDir()
+    setCurrentDir(elsewhere)
+    defer: setCurrentDir(savedCwd)
+
+    let driver = newMeasureDriver(workingDir = root)
+    let spans = runMeasured(driver, root / "tests" / "t.nim", @["--path:src"],
+                            nimcacheDir, outputBinPath)
+    check spans.ok
+    check spans.errorMsg == ""
+    check fileExists(outputBinPath)
+
 when isMainModule:
   echo "All compiledriver real-compile tests passed."

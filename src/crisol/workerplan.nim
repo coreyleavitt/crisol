@@ -37,8 +37,15 @@
 ##     dir — runner.nim's `cacheDir`), `outputBinPath` (the `-o:` path —
 ##     runner.nim's `binCompiled`), `groupId` (`ep.group`), `configHash`
 ##     (`flagHash(ep.flags)` rendered — artifactledger.nim's own doc says
-##     this is exactly what `configHash` is), and `stateDir` (artifact-
-##     ledger root).
+##     this is exactly what `configHash` is), `stateDir` (artifact-
+##     ledger root), and `projectRoot` (rfc-0007 A2c, issue #17 —
+##     `config.projectRoot`, resolved absolute by the AUTHOR, `runner.nim`'s
+##     `buildCompileWorkerPlan`). Unlike `entrypointAbsPath`, `flags` is
+##     appended VERBATIM, so a root-relative flag such as `--path:src` is
+##     only resolved correctly if the worker's own `nim --compileOnly`
+##     invocation runs FROM `projectRoot` — `measureworker.
+##     runMeasureCompileWorker` passes this field straight through as
+##     `compiledriver.newMeasureDriver`'s `workingDir`.
 ##
 ##   `entryUnitBasename` — the entry unit's generated basename
 ##     ("@m<entrypointBasename>.nim.c"), the soundness-critical
@@ -94,6 +101,9 @@ type
     groupId*:            string      ## ep.group — segmentation
     configHash*:         string      ## flagHash(ep.flags) rendered — segmentation
     stateDir*:           string      ## artifact-ledger root
+    projectRoot*:        string      ## rfc-0007 A2c (#17): resolved absolute
+                                      ## config.projectRoot — the worker's own
+                                      ## `nim --compileOnly` cwd
 
 proc toJson*(plan: MeasurePlan): JsonNode =
   ## Serialize a MeasurePlan to plan.json's JSON shape. Exported so the
@@ -111,15 +121,16 @@ proc toJson*(plan: MeasurePlan): JsonNode =
   result["groupId"]       = newJString(plan.groupId)
   result["configHash"]    = newJString(plan.configHash)
   result["stateDir"]      = newJString(plan.stateDir)
+  result["projectRoot"]   = newJString(plan.projectRoot)
 
 proc parseMeasurePlan*(jsonPath: string): MeasurePlan =
   ## Parse `jsonPath` into a MeasurePlan. Mirrors `closure.
   ## parseCompileManifest`'s error idiom: raises `CrisolError(cekEnvironment)`
   ## on a missing file, unparseable JSON, or a missing/empty required field
   ## (`entrypointPath`, `entrypointAbsPath`, `nimcacheDir`, `outputBinPath`,
-  ## `stateDir`) — never a bare/uncatchable exception. `flags`/`groupId`/
-  ## `configHash` default to empty when absent (a legitimately empty flag set
-  ## or ungrouped entrypoint is not malformed).
+  ## `stateDir`, `projectRoot`) — never a bare/uncatchable exception.
+  ## `flags`/`groupId`/`configHash` default to empty when absent (a
+  ## legitimately empty flag set or ungrouped entrypoint is not malformed).
   if not fileExists(jsonPath):
     raise newCrisolError(cekEnvironment,
       "measure-compile plan not found: " & jsonPath)
@@ -147,6 +158,7 @@ proc parseMeasurePlan*(jsonPath: string): MeasurePlan =
   result.nimcacheDir       = reqStr("nimcacheDir")
   result.outputBinPath     = reqStr("outputBinPath")
   result.stateDir          = reqStr("stateDir")
+  result.projectRoot       = reqStr("projectRoot")
   result.groupId    = node{"groupId"}.getStr("")
   result.configHash = node{"configHash"}.getStr("")
 

@@ -44,9 +44,12 @@
 ##    `defaultRunCc`/`realLink`) inherits the parent env whenever no explicit
 ##    `env` table is passed, so one `putEnv` here reaches every `nim`/`cc`/
 ##    link child the driver spawns.
-## 3. Run `compiledriver.newMeasureDriver()` + `runMeasured` on the
-##    entrypoint. A compile/link failure here IS a real failure: exit
-##    non-zero, no measurement attempted (there is no manifest to read).
+## 3. Run `compiledriver.newMeasureDriver(workingDir = plan.projectRoot)` +
+##    `runMeasured` on the entrypoint — `workingDir` (rfc-0007 A2c, issue
+##    #17) makes the compile cwd-correct for a root-relative flag such as
+##    `--path:src` regardless of where this worker process started. A
+##    compile/link failure here IS a real failure: exit non-zero, no
+##    measurement attempted (there is no manifest to read).
 ## 4. On a successful compile, attempt to RECORD artifact rows
 ##    (`recordArtifactRows`): parse the manifest, compute the reusable set
 ##    (every unit except the entry unit — RFC-0006 §File scoping), and for
@@ -201,7 +204,10 @@ proc runMeasureCompileWorker*(planPath: string): int =
 
   forceMeasurementCcEnv()
 
-  let driver = newMeasureDriver()
+  # rfc-0007 A2c (#17): the worker's own `nim --compileOnly` must run from
+  # plan.projectRoot, not wherever this worker process happens to have
+  # started — see workerplan.MeasurePlan.projectRoot's doc.
+  let driver = newMeasureDriver(workingDir = plan.projectRoot)
   let spans = runMeasured(driver, plan.entrypointAbsPath, plan.flags,
                           plan.nimcacheDir, plan.outputBinPath)
   if not spans.ok:

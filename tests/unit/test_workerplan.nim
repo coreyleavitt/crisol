@@ -34,6 +34,7 @@ proc samplePlan(): MeasurePlan =
     groupId:           "unit",
     configHash:        "deadbeefcafef00d",
     stateDir:          "/workspace/.crisol",
+    projectRoot:       "/workspace",
   )
 
 # ===========================================================================
@@ -57,6 +58,7 @@ suite "MeasurePlan — toJson / parseMeasurePlan round-trip":
     check parsed.groupId           == plan.groupId
     check parsed.configHash        == plan.configHash
     check parsed.stateDir          == plan.stateDir
+    check parsed.projectRoot       == plan.projectRoot
 
   test "an empty flags array round-trips as an empty seq (not a parse failure)":
     var plan = samplePlan()
@@ -76,6 +78,7 @@ suite "MeasurePlan — toJson / parseMeasurePlan round-trip":
     n["nimcacheDir"]       = newJString("/workspace/.crisol/cache/x")
     n["outputBinPath"]     = newJString("/workspace/.crisol/bin/x/pass_always")
     n["stateDir"]          = newJString("/workspace/.crisol")
+    n["projectRoot"]       = newJString("/workspace")
     writeFile(path, $n)
     defer: removeFile(path)
 
@@ -130,6 +133,24 @@ suite "parseMeasurePlan — malformed plan -> clear CrisolError":
     except CrisolError as e:
       check e.kind == cekEnvironment
       check "entrypointAbsPath" in e.msg
+
+  test "missing required field 'projectRoot' raises a clear CrisolError naming the field (rfc-0007 A2c, issue #17)":
+    let path = tmpPlanPath()
+    var n = newJObject()
+    n["entrypointPath"]    = newJString("tests/fixtures/pass_always.nim")
+    n["entrypointAbsPath"] = newJString("/workspace/tests/fixtures/pass_always.nim")
+    n["nimcacheDir"]       = newJString("/workspace/.crisol/cache/x")
+    n["outputBinPath"]     = newJString("/workspace/.crisol/bin/x/pass_always")
+    n["stateDir"]          = newJString("/workspace/.crisol")
+    writeFile(path, $n)
+    defer: removeFile(path)
+
+    try:
+      discard parseMeasurePlan(path)
+      check false  # must not reach here
+    except CrisolError as e:
+      check e.kind == cekEnvironment
+      check "projectRoot" in e.msg
 
   test "empty-string required field is treated the same as missing":
     let path = tmpPlanPath()

@@ -195,6 +195,7 @@ import crisol/fnv       # for chainedContentHash — the same leaf `crisol/depgr
                         # ExternalSource.headersHash (issue #16).
 export ccprobe.RunProc
 export ccprobe.realRun
+export ccprobe.realRunIn
 
 # ---------------------------------------------------------------------------
 # SourceIndex — once-per-run basename -> absolute-paths index (issue #8)
@@ -1259,7 +1260,7 @@ proc extractCompileInputs*(nimcacheDir: string;
                            config: Config;
                            index: SourceIndex;
                            carried: openArray[ExternalSource];
-                           ccRun: RunProc = realRun): CompileInputs =
+                           ccRun: RunProc = realRunIn(config.projectRoot.absolutePath.normalizedPath)): CompileInputs =
   ## Extract the source-dependency closure AND, for every `{.compile.}`d
   ## single-path external (D3c) it names, the header set that external's
   ## `#include`s — folded into `result.files` so `--changed` selection and
@@ -1292,18 +1293,24 @@ proc extractCompileInputs*(nimcacheDir: string;
   ##   header set.
   ##
   ## Each header path `cc -M` reports is normalized before being kept: a
-  ## relative path is resolved against `getCurrentDir()` (the same directory
-  ## `ccRun` — and the real `nim c`/`cc` invocation before it — ran in; see
-  ## `ccprobe.realRun`'s doc comment), then kept iff it resolves under a
-  ## tracked root (`index.underAnyRoot`/`toProjectRelative` — the identical
-  ## soundness gate `analyzeManifest`'s closure paths pass through), else
-  ## dropped silently (a system header, e.g. `/usr/include/stdint.h`, is
-  ## never tracked). The kept set is sorted and deduplicated.
+  ## relative path is resolved against `config.projectRoot` (rfc-0007 A2c,
+  ## issue #17) — NEVER `getCurrentDir()`, the crisol process's own cwd,
+  ## which need not be projectRoot (a subdirectory reached via
+  ## `--config ../crisol.kdl`, or an unrelated cwd through the library
+  ## API). The default `ccRun` (`ccprobe.realRunIn(config.projectRoot)`)
+  ## actually RUNS `cc -M` from that same directory — the same directory
+  ## the real `nim c`/`cc` invocation before it ran in (runner.nim's
+  ## ChildSpec.cwd, also projectRoot) — so a relative header path means the
+  ## same thing on both sides of the replay. Once resolved, a header is
+  ## kept iff it resolves under a tracked root
+  ## (`index.underAnyRoot`/`toProjectRelative` — the identical soundness
+  ## gate `analyzeManifest`'s closure paths pass through), else dropped
+  ## silently (a system header, e.g. `/usr/include/stdint.h`, is never
+  ## tracked). The kept set is sorted and deduplicated.
   ##
   ## `result.files = analyzeManifest(...).files UNION every external's headers`.
   let analyzed = analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index)
   let prAbs = config.projectRoot.absolutePath.normalizedPath
-  let cwd = getCurrentDir()
 
   var carriedBySource = initTable[string, ExternalSource]()
   for c in carried:
@@ -1333,7 +1340,7 @@ proc extractCompileInputs*(nimcacheDir: string;
       for h in ccIncludeHeaders(output, inv.sourceFile):
         let habs =
           if h.isAbsolute: h.normalizedPath
-          else: (cwd / h).normalizedPath
+          else: (prAbs / h).normalizedPath
         if not index.underAnyRoot(habs): continue    # system header, etc. — excluded
         let rel = toProjectRelative(habs, prAbs)
         if rel notin seen:

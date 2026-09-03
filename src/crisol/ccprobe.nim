@@ -77,25 +77,46 @@ type
   RunProc* = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool]
 
 # ---------------------------------------------------------------------------
-# realRun — default seam (wraps osproc)
+# realRun / realRunIn — default seam (wraps osproc)
 # ---------------------------------------------------------------------------
 
-proc realRun*(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-  ## Execute `cmd` with `args` using an explicit argv array — no shell interpretation.
-  ## Uses startProcess with poUsePath so bare command names (e.g. "cc", "ldd") resolve
-  ## via PATH.  poEvalCommand is intentionally NOT used (that is the shell path).
-  ## Captures stdout; stderr is not captured (version strings from cc/ldd go to stdout).
-  ## Never raises; failure (command not found, non-zero exit, OSError) surfaces as ok=false.
+proc runViaOsproc(cmd: string; args: openArray[string]; workingDir: string):
+                  tuple[output: string, ok: bool] =
+  ## Shared body for `realRun`/`realRunIn` — an explicit argv array, no
+  ## shell interpretation. Uses startProcess with poUsePath so bare command
+  ## names (e.g. "cc", "ldd") resolve via PATH. poEvalCommand is
+  ## intentionally NOT used (that is the shell path). Captures stdout;
+  ## stderr is not captured. Never raises; failure (command not found,
+  ## non-zero exit, OSError) surfaces as ok=false. `workingDir = ""` means
+  ## "inherit the calling process's cwd" (osproc's own default).
   try:
     var argSeq = newSeq[string](args.len)
     for i, a in args: argSeq[i] = a
-    let p = startProcess(cmd, args = argSeq, options = {poUsePath})
+    let p = startProcess(cmd, workingDir = workingDir, args = argSeq,
+                         options = {poUsePath})
     defer: p.close()   # R2-b: close on every exit path (readAll/waitForExit may raise)
     let output = p.outputStream.readAll()
     let exitCode = p.waitForExit()
     result = (output: output, ok: exitCode == 0)
   except CatchableError:
     result = (output: "", ok: false)
+
+proc realRun*(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+  ## Execute `cmd` with `args`, inheriting the calling process's cwd. See
+  ## `runViaOsproc` for the shared contract.
+  runViaOsproc(cmd, args, "")
+
+proc realRunIn*(workingDir: string): RunProc =
+  ## Returns a `RunProc` that always executes its command with `workingDir`
+  ## as the SUBPROCESS's cwd — never the calling process's own, whatever
+  ## that happens to be. `closure.extractCompileInputs` uses this (bound to
+  ## `config.projectRoot`) to replay a `cc -M` probe from the SAME
+  ## directory the real compile (rfc-0007 A2c, issue #17) ran `cc` from, so
+  ## a relative header the manifest's `ccCmd` names resolves identically
+  ## regardless of the crisol process's own cwd.
+  proc run(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    runViaOsproc(cmd, args, workingDir)
+  run
 
 # ---------------------------------------------------------------------------
 # Internal helpers

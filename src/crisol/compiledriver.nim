@@ -172,21 +172,50 @@ proc nimCompileArgs*(entrypoint: string; flags: seq[string];
     result.add f
   result.add entrypoint
 
-proc realCompileOnly*(entrypoint: string; flags: seq[string];
-                      nimcacheDir, outputBinPath: string):
-                        tuple[ok: bool; output: string] =
-  ## Spawns `nim <nimCompileArgs(..., compileOnly = true)>` via an argv
-  ## array (no shell). Never raises; failure surfaces as `ok = false`.
+proc runCompileOnly(entrypoint: string; flags: seq[string];
+                    nimcacheDir, outputBinPath, workingDir: string):
+                      tuple[ok: bool; output: string] =
+  ## Shared body for `realCompileOnly`/`realCompileOnlyIn`. Spawns
+  ## `nim <nimCompileArgs(..., compileOnly = true)>` via an argv array (no
+  ## shell), with `workingDir` as the subprocess's cwd (`"" ` = inherit the
+  ## calling process's own cwd, osproc's own default). Never raises; failure
+  ## surfaces as `ok = false`.
   let args = nimCompileArgs(entrypoint, flags, nimcacheDir, outputBinPath,
                             compileOnly = true)
   try:
-    let p = startProcess("nim", args = args, options = {poUsePath, poStdErrToStdOut})
+    let p = startProcess("nim", workingDir = workingDir, args = args,
+                         options = {poUsePath, poStdErrToStdOut})
     defer: p.close()
     let output = p.outputStream.readAll()
     let exitCode = p.waitForExit()
     result = (ok: exitCode == 0, output: output)
   except CatchableError as e:
     result = (ok: false, output: "nim --compileOnly spawn failed: " & e.msg)
+
+proc realCompileOnly*(entrypoint: string; flags: seq[string];
+                      nimcacheDir, outputBinPath: string):
+                        tuple[ok: bool; output: string] =
+  ## Spawns `nim <nimCompileArgs(..., compileOnly = true)>`, inheriting the
+  ## calling process's own cwd. See `runCompileOnly` for the shared contract.
+  runCompileOnly(entrypoint, flags, nimcacheDir, outputBinPath, "")
+
+proc realCompileOnlyIn*(workingDir: string): CompileOnlyProc =
+  ## Returns a `CompileOnlyProc` that always spawns `nim --compileOnly` with
+  ## `workingDir` as the subprocess's cwd — never the calling process's own,
+  ## whatever that happens to be. rfc-0007 A2c (issue #17): a root-relative
+  ## compile flag (e.g. `--path:src`) is resolved by `nim` against ITS OWN
+  ## cwd, so this is `realCompileOnly`'s counterpart to `runner.nim`'s
+  ## ChildSpec.cwd fix — a SEPARATE substrate (raw `osproc.startProcess`,
+  ## not a `Supervisor`-spawned `ChildSpec`) that must independently pin
+  ## `workingDir = projectRoot`, since this driver can also run entirely
+  ## in-process (`runMeasured` called directly, as
+  ## `test_compiledriver_real.nim` does) with no chdir happening anywhere
+  ## in its call chain.
+  proc compileOnly(entrypoint: string; flags: seq[string];
+                   nimcacheDir, outputBinPath: string):
+                     tuple[ok: bool; output: string] =
+    runCompileOnly(entrypoint, flags, nimcacheDir, outputBinPath, workingDir)
+  compileOnly
 
 proc defaultRunCc*(units: seq[CompileUnit];
                    concurrency: int = countProcessors()): RunCcResult =
@@ -244,10 +273,19 @@ proc realLink*(linkCmd: string): tuple[ok: bool; output: string] =
   except CatchableError as e:
     result = (ok: false, output: "link spawn failed: " & e.msg)
 
-proc newMeasureDriver*(concurrency: int = countProcessors()): CompileDriver =
+proc newMeasureDriver*(concurrency: int = countProcessors();
+                       workingDir: string = ""): CompileDriver =
   ## The measure-mode `CompileDriver`: real compileOnly/cc/link, no caching.
+  ## `workingDir` (rfc-0007 A2c, issue #17) is the cwd `nim --compileOnly`
+  ## spawns with — "" inherits the calling process's own cwd (this driver's
+  ## pre-A2c behavior); production callers (`measureworker.
+  ## runMeasureCompileWorker`) pass `plan.projectRoot` so a root-relative
+  ## compile flag resolves identically regardless of where crisol itself
+  ## was invoked from. The cc/link phases need no equivalent: both replay
+  ## commands the manifest `compileOnly` just wrote, which already carry
+  ## whatever paths that (correctly cwd'd) compileOnly step resolved.
   CompileDriver(
-    compileOnly: realCompileOnly,
+    compileOnly: realCompileOnlyIn(workingDir),
     runCc: proc(units: seq[CompileUnit]): RunCcResult = defaultRunCc(units, concurrency),
     link: realLink,
   )
