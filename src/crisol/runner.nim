@@ -171,6 +171,19 @@ proc noopResult*(r: EntrypointResult) = discard
 # B2: ledger append helper
 # ---------------------------------------------------------------------------
 
+proc wait4MaxRss(res: EntrypointResult): tuple[bytes: int64; mechanism: string] =
+  ## rfc-0007 A5: pull the run phase's wait4-reaped maxRss, when present.
+  ## Distinct from `peakRssBytes`/`rssBytes` (the RFC-0002 sampled group-sum
+  ## admission quantity) — this is the per-process max wait4 folds over
+  ## reaped descendants at exit (§7 "a new quantity, not a replacement").
+  ## ("", 0) when the run phase never produced a live ProcessResult (a
+  ## spawn failure, or a skipped phase) or the platform/attempt genuinely
+  ## had no rusage to report — never a fabricated non-zero value.
+  if res.run.kind in {ptypes.pkRan, ptypes.pkCached} and res.run.res.rusage.isSome:
+    (res.run.res.rusage.get.maxRssBytes, "wait4")
+  else:
+    (0'i64, "")
+
 proc appendAttemptRow(led: var Ledger; ep: Entrypoint; attemptNum: int;
                       res: EntrypointResult; inputHash: string;
                       peakRssBytes: int64 = 0) =
@@ -178,6 +191,7 @@ proc appendAttemptRow(led: var Ledger; ep: Entrypoint; attemptNum: int;
   ## Converts durationMs→durationUs; peakRssBytes is the per-slot running max
   ## sampled across poll ticks while the run phase was live (C5).
   let iKey = identityKey(ep.path, flagHash(ep.flags))
+  let (maxRss, mechanism) = wait4MaxRss(res)  # rfc-0007 A5
   let row = LedgerRow(
     identity:   iKey,
     timestamp:  int64(epochTime() * 1_000_000),  # unix epoch microseconds
@@ -186,6 +200,8 @@ proc appendAttemptRow(led: var Ledger; ep: Entrypoint; attemptNum: int;
     attempt:    attemptNum,
     durationUs: res.durationMs * 1000,
     rssBytes:   peakRssBytes,  # C5: peak RSS bytes for this attempt
+    maxRssBytes:  maxRss,      # rfc-0007 A5: wait4's per-process max, mechanism-tagged
+    rssMechanism: mechanism,
     rowVersion: currentRowVersion,
   )
   append(led, row)
@@ -296,13 +312,15 @@ proc toProcessResult(report: ReapReport; limits: ptypes.Limits;
   ## `report.stop` FIRST regardless of `report.exit` (§2's authorship rule:
   ## "cbRunner iff ReapReport.stop.isSome") — a child reaped after a stop
   ## act reads cbRunner even if it happened to exit 0 inside the grace
-  ## window. `evidence` stays the interim zero value — killDomain/tree/
-  ## escapees wiring is A6a's job, not this slice's (matches the pre-A2b
-  ## placeholder exactly).
+  ## window. `evidence.limits` is the REAL per-limit readback the Supervisor
+  ## delivered at reap time (rfc-0007 A5) — everything else on `evidence`
+  ## (killDomain/tree/escapees/hermetic/killSnapshot/cooperativeUnavailable)
+  ## stays the interim zero value; that wiring is still A6a's job, not this
+  ## slice's (matches the pre-A2b placeholder exactly for those fields).
   ptypes.ProcessResult(
     exit: report.exit,
     cause: ptypes.classifyCause(report.exit, report.stop, limits, report.limits),
-    evidence: default(ptypes.Evidence),
+    evidence: ptypes.Evidence(limits: report.limits),
     rusage: report.rusage,
     durationUs: durationUs,
   )

@@ -384,6 +384,20 @@ const RunSchemaRevision* = 17
   ##                     both are the disappearance of an always-zero/no-op
   ##                     key, and unknown-tolerant readers never depended on
   ##                     their ABSENCE meaning anything.
+  ##   (rfc-0007 A5, no rev bump) — `run.evidence.limits` on the wire now
+  ##                     reflects the REAL per-limit achieved status
+  ##                     (`ReapReport.limits`, delivered by the Supervisor at
+  ##                     reap time) instead of always reading "notRequested"
+  ##                     for every LimitKind. `evidence.limits` was already
+  ##                     part of the rev-16 shape; runner.nim's
+  ##                     `toProcessResult` built the whole `evidence` node
+  ##                     from `default(ptypes.Evidence)` and silently
+  ##                     discarded the achieved readback — this fixes only
+  ##                     `limits`; killDomain/tree/escapees/hermetic/
+  ##                     killSnapshot/cooperativeUnavailable stay the interim
+  ##                     zero value (A6a's job). No new field, an existing
+  ##                     field's CONTENT changes — same rationale as A1e-i's
+  ##                     entry above.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see

@@ -26,7 +26,15 @@
 ##
 ## Row line (one JSON object per line):
 ##   {"rowVersion":1,"identity":"<str>","timestamp":<int64>,"inputHash":"<str>",
-##    "outcome":"<str>","attempt":<int>,"durationUs":<int64>,"rssBytes":<int64>}
+##    "outcome":"<str>","attempt":<int>,"durationUs":<int64>,"rssBytes":<int64>,
+##    "maxRssBytes":<int64>,"rssMechanism":"<str>"}
+##
+## `maxRssBytes`/`rssMechanism` (rfc-0007 A5): additive columns, absent on any
+## row written before A5. `rssBytes` stays RFC-0002's sampled group-sum (the
+## admission quantity — unchanged); `maxRssBytes` is the DIFFERENT per-process
+## wait4 quantity reaped at exit, tagged by `rssMechanism` ("wait4" today, ""
+## = absent/unrecorded) so a future producer (e.g. cgroup memory.peak) can
+## supersede it explicitly by mechanism string, never silently.
 ##
 ## ## Writes
 ##
@@ -70,7 +78,25 @@ type
     outcome*:    string        ## "passed", "failed", etc. — stored as-is
     attempt*:    int           ## 1-indexed retry attempt number
     durationUs*: int64         ## wall-clock microseconds
-    rssBytes*:   int64         ## peak RSS bytes at exit
+    rssBytes*:   int64         ## RFC-0002's SAMPLED GROUP-SUM (admission
+                               ## quantity) — poll-sampled peak across the
+                               ## whole process group. UNCHANGED by A5;
+                               ## admission/memprobe keep consuming exactly
+                               ## this column.
+    maxRssBytes*:   int64      ## rfc-0007 A5 (§7 "Rusage is a new quantity,
+                               ## not a replacement"): a DIFFERENT quantity —
+                               ## the per-process max RSS reaped at exit,
+                               ## folded over reaped descendants. 0 when
+                               ## `rssMechanism` is "" (no observation this
+                               ## row — a pre-A5 row, or the platform/attempt
+                               ## had none).
+    rssMechanism*:  string     ## which mechanism produced `maxRssBytes`:
+                               ## "wait4" today (A1b's reap-time rusage); ""
+                               ## means absent/unrecorded. A future cgroup
+                               ## memory.peak producer supersedes this field
+                               ## EXPLICITLY, by writing its own mechanism
+                               ## string here — never silently by redefining
+                               ## what an untagged value means.
     rowVersion*: int           ## must equal currentRowVersion to be accepted
 
   Ledger* = object
@@ -187,6 +213,8 @@ proc rowToJsonLine(row: LedgerRow): string =
   n["attempt"]     = newJInt(row.attempt)
   n["durationUs"]  = newJInt(row.durationUs)
   n["rssBytes"]    = newJInt(row.rssBytes)
+  n["maxRssBytes"] = newJInt(row.maxRssBytes)   # rfc-0007 A5
+  n["rssMechanism"] = newJString(row.rssMechanism)  # rfc-0007 A5
   result = $n & "\n"
 
 # ---------------------------------------------------------------------------
@@ -296,6 +324,12 @@ proc parseRow(line: string; shardPath: string): (bool, LedgerRow) =
     attempt:     node{"attempt"}.getInt(1),
     durationUs:  node{"durationUs"}.getBiggestInt(0),
     rssBytes:    node{"rssBytes"}.getBiggestInt(0),
+    # rfc-0007 A5: additive columns — absent on any pre-A5 row (or a row
+    # where no observation was made this attempt); getOrDefault-style read
+    # gives the honest "no mechanism recorded" sentinel, never a fabricated
+    # value (same compat rule every other ledger column already follows).
+    maxRssBytes:  node{"maxRssBytes"}.getBiggestInt(0),
+    rssMechanism: node{"rssMechanism"}.getStr(""),
   )
   return (true, row)
 
