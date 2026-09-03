@@ -77,6 +77,30 @@ proc signalResult(path: string; sig = 11): EntrypointResult =
   result.compile = skippedPhase
   result.run = ranPhase(cbProcess, ptypes.Exit(kind: ptypes.ekSignaled, sig: sig, coreDumped: false))
 
+proc escalatedKillResult(path: string): EntrypointResult =
+  ## rfc-0007 A1f: SIGTERM ignored -> escalated to SIGKILL (term_ignores'
+  ## shape) — the render line must show escalation, not just cause.
+  result = EntrypointResult(ep: makeEp(path), durationMs: 5_000)
+  result.compile = skippedPhase
+  result.run = ranPhase(
+    ptypes.Cause(by: ptypes.cbRunner, reason: ptypes.krTimeout, escalated: true),
+    ptypes.Exit(kind: ptypes.ekSignaled, sig: 9, coreDumped: false))
+
+proc limitCrashedResult(path: string): EntrypointResult =
+  ## rfc-0007 A1f: SIGXCPU with the limit requested+achieved — cbLimit.
+  result = EntrypointResult(ep: makeEp(path), durationMs: 1_000)
+  result.compile = skippedPhase
+  result.run = ranPhase(
+    ptypes.Cause(by: ptypes.cbLimit, limit: ptypes.lkCpu),
+    ptypes.Exit(kind: ptypes.ekSignaled, sig: 24, coreDumped: false))
+
+proc externalCrashedResult(path: string): EntrypointResult =
+  ## rfc-0007 A1f: SIGKILL the runner did not send — cbExternal.
+  result = EntrypointResult(ep: makeEp(path), durationMs: 1_000)
+  result.compile = skippedPhase
+  result.run = ranPhase(ptypes.Cause(by: ptypes.cbExternal),
+    ptypes.Exit(kind: ptypes.ekSignaled, sig: 9, coreDumped: false))
+
 proc spawnResult(path: string): EntrypointResult =
   result = EntrypointResult(ep: makeEp(path),
                    output: "fork failed", durationMs: 0)
@@ -173,6 +197,33 @@ suite "render – failure detail":
     let rendered = render(results, summarize(results), noColorOpts())
     check "[CRASH]" in rendered
     check "cause: process" in rendered
+
+  test "rfc-0007 A1f: an escalated kill's detail line shows the escalation, not just the cause":
+    let results = @[escalatedKillResult("tests/unit/test_g.nim")]
+    let rendered = render(results, summarize(results), noColorOpts())
+    check "[KILLED]" in rendered
+    check "cause: runner timeout (escalated)" in rendered
+
+  test "rfc-0007 A1f: a non-escalated kill's detail line shows no escalation marker":
+    let results = @[timeoutResult("tests/unit/test_d.nim")]
+    let rendered = render(results, summarize(results), noColorOpts())
+    check "cause: runner timeout" in rendered
+    check "(escalated)" notin rendered
+
+  test "rfc-0007 A1f: a limit-authored crash's detail line names the limit":
+    ## causeLabel renders the LimitKind via Nim's `$` (its own render-layer
+    ## convention, distinct from resultjson's wire string "cpu") — pinning
+    ## the actual observed text, "limit lkCpu".
+    let results = @[limitCrashedResult("tests/unit/test_h.nim")]
+    let rendered = render(results, summarize(results), noColorOpts())
+    check "[CRASH]" in rendered
+    check "cause: limit lkCpu" in rendered
+
+  test "rfc-0007 A1f: an externally-signaled crash's detail line reads external":
+    let results = @[externalCrashedResult("tests/unit/test_i.nim")]
+    let rendered = render(results, summarize(results), noColorOpts())
+    check "[CRASH]" in rendered
+    check "cause: external" in rendered
 
 # ---------------------------------------------------------------------------
 # Suite 3 — Skip reasons

@@ -283,15 +283,24 @@ proc decodeRusage(ru: Rusage): ptypes.Rusage =
   )
 
 proc buildProcResult(exit: ptypes.Exit; rusage: ptypes.Rusage; stop: Rfc7Stop;
-                     durationUs: int64): ptypes.ProcessResult =
-  ## The one place a live reap's ProcessResult is assembled. Limits/
-  ## LimitsAchieved stay at their zero value (lsNotRequested) because the
-  ## runner does not yet plumb requested-limit info into Cause (A2a-iii) —
-  ## classifyCause's cbLimit branch is therefore unreachable from here until
-  ## then, which is the honest default (never a false vouch), not a bug.
+                     durationUs: int64;
+                     limits: ptypes.Limits = ptypes.Limits();
+                     achieved: ptypes.LimitsAchieved = default(ptypes.LimitsAchieved)):
+                       ptypes.ProcessResult =
+  ## The one place a live reap's ProcessResult is assembled. `limits`/
+  ## `achieved` default to their zero value (no requests, lsNotRequested
+  ## throughout) for every caller that never had a sandboxed rlimit request
+  ## in play — the compile phase (unsandboxed, A6) and every runner-authored
+  ## kill capture (stop.isSome always wins in classifyCause regardless of
+  ## these two args, so passing zero values there costs nothing and stays
+  ## honest). The one caller that DOES have a real rlimit request to report —
+  ## pollSlot's ordinary run-phase reap — passes `interimLimits(slot.spec,
+  ## slot.achieved)` (rfc-0007 A1f): the aggregate-approximation mapping
+  ## documented in the RFC's "interim evidence population" table, live until
+  ## A2a-iii's real per-limit getrlimit readback replaces it.
   ptypes.ProcessResult(
     exit: exit,
-    cause: ptypes.classifyCause(exit, stop, ptypes.Limits(), default(ptypes.LimitsAchieved)),
+    cause: ptypes.classifyCause(exit, stop, limits, achieved),
     evidence: default(ptypes.Evidence),
     rusage: some(rusage),
     durationUs: durationUs,
@@ -1122,7 +1131,14 @@ proc pollSlot(
     # ekExited Exit dominates the derivation before records are consulted)
     # but must not be silently dropped just because the process was signaled.
     var res: EntrypointResult
-    let runRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000)
+    # rfc-0007 A1f: the run phase is the ONLY sandboxed child (compile is
+    # unsandboxed, A6) — thread its real requested-limits/achieved-bit pair
+    # through so a SIGXCPU/SIGXFSZ the child received classifies cbLimit
+    # when that limit was actually requested (interim aggregate approximation
+    # until A2a-iii; see interimLimits' doc comment).
+    let (runLimits, runLimitsAchieved) = interimLimits(slot.spec, slot.achieved)
+    let runRes = buildProcResult(reapedExit, reapedRusage, NoRfc7Stop, elapsed * 1000,
+                                 runLimits, runLimitsAchieved)
     if sigNum != 0:
       let sinkData = readSink(slot.sinkPath, maxOutputBytes)
       res = EntrypointResult(ep: pep.ep,

@@ -90,6 +90,35 @@ proc isFullyAchieved*(spec: SandboxSpec; got: SandboxAchieved): bool =
   (not spec.rlimits  or got.rlimitsApplied) and
   (not spec.netIso   or got.netIso)
 
+proc interimLimits*(spec: SandboxSpec; got: SandboxAchieved):
+    tuple[limits: ptypes.Limits; achieved: ptypes.LimitsAchieved] =
+  ## rfc-0007 A1f: the INTERIM (pre-A2a-iii) approximation classifyCause's
+  ## cbLimit branch runs on — the RFC's "interim evidence population" table
+  ## (§2). Today's sandbox reports only ONE aggregate `rlimitsApplied` bit
+  ## (all-or-nothing across every rlimit the spec requested), not a
+  ## per-limit getrlimit readback (that is A2a-iii's job — enum-indexed
+  ## `LimitsAchieved`, one status per kind, loop-driven off the existing
+  ## readback). Until then, the aggregate bit is fanned UNIFORMLY over every
+  ## kind the spec actually REQUESTED:
+  ##   requested  + bit true  -> lsApplied
+  ##   requested  + bit false -> lsFailed   (a real request that did not
+  ##                                         confirm — never silently
+  ##                                         promoted to lsApplied)
+  ##   never requested        -> lsNotRequested (the array's ord-0 zero
+  ##                                             value — never a fabricated
+  ##                                             vouch, §2's house rule)
+  result.limits.req[ptypes.lkAddressSpace] = spec.rlimitConfig.limitAs
+  result.limits.req[ptypes.lkCpu]          = spec.rlimitConfig.limitCpu
+  result.limits.req[ptypes.lkFileSize]     = spec.rlimitConfig.limitFsize
+  result.limits.req[ptypes.lkOpenFiles]    = spec.rlimitConfig.limitNofile
+  result.limits.req[ptypes.lkCore]         = spec.rlimitConfig.limitCore
+
+  result.achieved = default(ptypes.LimitsAchieved)  # every kind starts lsNotRequested
+  for kind in ptypes.LimitKind:
+    if result.limits.req[kind].isSome:
+      result.achieved[kind] =
+        if got.rlimitsApplied: ptypes.lsApplied else: ptypes.lsFailed
+
 type
   Gate* = object
     ## A gate passes iff the named environment variable is set AND non-empty
