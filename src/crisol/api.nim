@@ -359,6 +359,36 @@ type
                                   ## compile summary line without re-scanning the
                                   ## ledgers. nil when opts.persist is false, or when
                                   ## measureCompileReuse is not enabled (no telemetry).
+    verifyDivergences*: seq[VerifyDivergence]  ## RFC-0005 B3b: the --verify-cache
+                                  ## post-run pass's findings. ALWAYS empty when
+                                  ## opts.verifyCache.enabled is false. Deliberately
+                                  ## separate from `results` (guard 3, "execute()
+                                  ## re-entrancy... three guards") — a verify
+                                  ## re-execution is diagnostic, never a substitute
+                                  ## observation for the entrypoint's reported outcome.
+
+  VerifyDivergence* = object
+    ## RFC-0005 B3b: one --verify-cache mismatch between the observation the
+    ## main run SERVED from the cache (a `cdmHit`) and the observation a
+    ## fresh, forced-live re-execution of the SAME sampled entry actually
+    ## produced. Comparison is structural — `Exit` (`==` over the variant,
+    ## `process/types`) and parsed `records` (name/status/msg/tags; per-
+    ## record `durationUs` excluded) — and NEVER outcome strings: `outcome`
+    ## is a derived, policy-dependent projection, and two distinct
+    ## observations can legitimately derive the same verdict, which is
+    ## exactly the nondeterminism this pass exists to catch.
+    ##
+    ## `Cause`/`Evidence`/`rusage`/durations are excluded from the
+    ## COMPARISON (authorship, tier and accounting of the fresh attempt
+    ## legitimately differ from the stored one) but are carried here in full
+    ## — via the complete `Phase` on both sides — for diagnosis.
+    ep*:              Entrypoint
+    exitDiverged*:    bool
+    recordsDiverged*: bool
+    storedRun*:       ptypes.Phase       ## the Phase served by the main run (pkCached)
+    freshRun*:        ptypes.Phase       ## the Phase the verify pass observed (pkRan)
+    storedRecords*:   seq[TestRecord]
+    freshRecords*:    seq[TestRecord]
 
 # ---------------------------------------------------------------------------
 # rfc-0007 A1c: result-model digest helpers — so a library consumer doesn't
@@ -467,6 +497,123 @@ proc verifySample*(pct: int = 5; seed: Option[int64] = none(int64);
   ## sample. `strict` = a divergence set exits 1 — always paired with
   ## enabled == true here, so "strict without enabled" never arises.
   VerifyCache(enabled: true, pct: pct, seed: seed, strict: strict)
+
+# ---------------------------------------------------------------------------
+# --verify-cache post-run pass — RFC-0005 B3b
+# ---------------------------------------------------------------------------
+
+proc defaultVerifySeed(): int64 =
+  ## RFC-0005 §Stage B: "the seed defaults to a per-run value ... so
+  ## coverage broadens across runs in expectation." Reporting the resolved
+  ## seed in the summary line is B3c's CLI/config concern; this is only the
+  ## resolution `verifyCachePass` needs when the caller hasn't pinned one
+  ## via `verifySample(seed = some(n))`.
+  int64(epochTime() * 1_000_000.0)
+
+proc phaseExit(p: ptypes.Phase): Option[ptypes.Exit] =
+  if p.kind in {ptypes.pkRan, ptypes.pkCached}: some(p.res.exit)
+  else: none(ptypes.Exit)
+
+proc exitsDiverge(a, b: Option[ptypes.Exit]): bool =
+  ## `ptypes.Exit` is imported `import nil` (see the module-doc note on
+  ## `ptypes` above) so its custom structural `==` (process/types.nim,
+  ## "==(Exit) in process/types" — the RFC's own anchor) is never in scope
+  ## unqualified; a plain `a != b` on `Option[Exit]` would silently fall
+  ## back to the compiler's builtin case-object comparison (which cannot
+  ## even compile for a case object — the `fields` iterator rejects it), so
+  ## this calls the qualified `ptypes.`==`` explicitly.
+  if a.isSome != b.isSome: return true
+  if a.isNone: return false   # both none
+  not ptypes.`==`(a.get, b.get)
+
+proc recordsDiverge(a, b: seq[TestRecord]): bool =
+  ## RFC-0005 §Stage B: name/status/msg/tags compared; per-record
+  ## `durationUs` deliberately excluded (legitimately differs run to run).
+  if a.len != b.len: return true
+  for i in 0 ..< a.len:
+    if a[i].name != b[i].name or a[i].status != b[i].status or
+       a[i].msg != b[i].msg or a[i].tags != b[i].tags:
+      return true
+  false
+
+proc verifyCachePass(results: seq[EntrypointResult];
+                     entrypoints: seq[PlannedEntrypoint];
+                     vc: VerifyCache; config: Config; graph: var DepGraph;
+                     nimVersion, ccVersion: string;
+                     sandboxSpec: SandboxSpec): seq[VerifyDivergence] =
+  ## The --verify-cache determinism backstop (RFC-0005 §Stage B). Samples
+  ## this run's `cdmHit` entries (seeded sampler, B3a `sampleHitIndices`),
+  ## builds a SYNTHETIC plan from them (B3a `buildVerifyPlan` — never a
+  ## re-`plan()`), and re-executes that plan with the cache forced OFF (a
+  ## verify run must genuinely execute, never re-hit) to compare each fresh
+  ## observation against the one served during the main run.
+  ##
+  ## `execute()` re-entrancy — three guards:
+  ##   1. `onResult = noopResult` — no caller callback fires for verify attempts.
+  ##   2. `recordLedger = false` — verify re-runs never pollute
+  ##      --order/perf-check/--shard ledger history.
+  ##   3. Verify results are returned HERE, never merged into the caller's
+  ##      `results` / `RunReport.results`.
+  ##
+  ## Caller contract: must be invoked AFTER `persistLastRun` and BEFORE
+  ## `releaseLock` — the binary precondition (`cdmHit` this run implies
+  ## `edRunFresh` at plan time, i.e. the binary exists) holds only while the
+  ## stateDir lock is held, and lastrun.json must reflect the main run only.
+  if not vc.enabled: return @[]
+
+  let decisions = results.mapIt(it.cacheDecision)
+  let seed = vc.seed.get(defaultVerifySeed())
+  let indices = sampleHitIndices(decisions, vc.pct, seed)
+  if indices.len == 0: return @[]
+
+  let verifyPlan = buildVerifyPlan(entrypoints, indices)
+  var verifyResults: seq[EntrypointResult]
+  try:
+    verifyResults = execute(
+      verifyPlan,
+      config       = config,
+      graph        = graph,
+      nimVersion   = nimVersion,
+      ccVersion    = ccVersion,
+      onResult     = noopResult,
+      failFast     = false,
+      showProgress = false,
+      cache        = cacheDisabled(sandboxSpec),
+      recordLedger = false,
+    )
+  except Exception as e:
+    # Matches runTests' own defensive posture around the main execute() call
+    # (CrisolError is-a Exception — one branch covers both): an unrelated
+    # verify-pass failure must never take down an otherwise-successful main
+    # run's real results.
+    stderr.write("crisol: warning: --verify-cache pass failed: " & e.msg & "\n")
+    return @[]
+
+  for j, i in indices:
+    if j >= verifyResults.len: break   # defensive: an interrupted verify sub-run
+    let stored = results[i]
+    let fresh  = verifyResults[j]
+    let exitDiverged = exitsDiverge(phaseExit(stored.run), phaseExit(fresh.run))
+    let recDiverged  = recordsDiverge(stored.records, fresh.records)
+    if not (exitDiverged or recDiverged): continue
+
+    result.add VerifyDivergence(
+      ep:              stored.ep,
+      exitDiverged:    exitDiverged,
+      recordsDiverged: recDiverged,
+      storedRun:       stored.run,
+      freshRun:        fresh.run,
+      storedRecords:   stored.records,
+      freshRecords:    fresh.records,
+    )
+
+    var what: seq[string]
+    if exitDiverged: what.add "exit"
+    if recDiverged:  what.add "records"
+    stderr.write("crisol: warning: --verify-cache divergence for " &
+                 stored.ep.path & " (" & what.join(", ") &
+                 " diverged from the cached result)\n")
+    try: stderr.flushFile() except CatchableError: discard
 
 # ---------------------------------------------------------------------------
 # H2 — PlanReport-typed facade overloads for planview procs
@@ -945,6 +1092,21 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
                    memThrottledSlots = memThrottled, compileBlock = compileBlock,
                    reuseAlerts = reuseAlerts, policy = policy)
 
+  # RFC-0005 B3b: the --verify-cache post-run pass. Placement is load-
+  # bearing (RFC "Binary precondition... the pass runs before releaseLock,
+  # after persistLastRun") — strictly AFTER persistLastRun above (so
+  # lastrun.json reflects the main run only; --failed narrowing reads it)
+  # and strictly BEFORE releaseLock below (the stateDir lock is still held,
+  # so `clean` cannot remove the stable binary a sampled `cdmHit` entry's
+  # synthetic plan depends on). Never runs on an interrupted run: a partial
+  # `results`/`pr.entrypoints` pairing would break the index alignment
+  # `buildVerifyPlan`/sampling relies on.
+  let verifyDivergences =
+    if opts.verifyCache.enabled and not interrupted:
+      verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
+                      nimVer, ccVer, spec)
+    else: @[]
+
   releaseLock(lockHandle)
 
   # rfc-0007 A1e-ii: an interrupted run still returns through this ONE
@@ -961,4 +1123,5 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
                         else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
     compileBlock:      compileBlock,
     interrupted:       interrupted,
+    verifyDivergences: verifyDivergences,
   )
