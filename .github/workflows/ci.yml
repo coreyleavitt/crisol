@@ -83,3 +83,75 @@ jobs:
             -e CRISOL_TEST_DIRS=tests/timing:tests/conformance \
             -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
             ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh
+
+  # rfc-0007 A2d — the cross-platform contract spike (N=3 before A2b rebuilds
+  # the runner on the contract). No docker here: docker-for-tooling is a
+  # Linux pattern (the `test`/`timing` jobs above use a Linux container
+  # regardless of runner OS); windows-latest/macos-latest run Nim NATIVELY
+  # via jiro4989/setup-nim-action, per this RFC's §1 promise that each
+  # backend is "checkable per platform from any host" — the checkABLE part
+  # is the `./dev run nim check --os:...` step a contributor runs locally
+  # from Linux; these two legs are where it actually EXECUTES.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash   # ci/fetch-deps.sh needs it; keeps every step's
+                       # quoting/globbing uniform (Git Bash ships on
+                       # windows-latest runners) instead of mixing in pwsh.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.10'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch vendored deps (milpa.lock)
+        run: bash ci/fetch-deps.sh
+
+      # Fast semantic pass first: `nim check` here targets the HOST os
+      # (windows-latest IS windows — no --os override needed, unlike the
+      # `./dev run nim check --os:windows` cross-check a contributor runs
+      # from a Linux checkout). Fails fast with clearer diagnostics before
+      # the full compile+link below.
+      - name: nim check — process.nim on real Windows
+        run: nim check --hints:off --path:src src/crisol/process.nim
+
+      # A2d's acceptance for this leg: COMPILES and the smoke test PASSES —
+      # spawn, losslessly observed exit code, and a Job-Object-backed kill.
+      # Conformance-green is explicitly NOT required here (RFC-0009 gates
+      # that, Stage D) — test_conformance.nim itself imports std/posix
+      # unconditionally and would not even compile on this target.
+      - name: Compile and run the Windows smoke test
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_smoke.nim
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.10'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch vendored deps (milpa.lock)
+        run: bash ci/fetch-deps.sh
+
+      - name: nim check — process.nim on real macOS
+        run: nim check --hints:off --path:src src/crisol/process.nim
+
+      # The ladder's `macosx` arm maps to process/posix today (C1b is where
+      # process/darwin.nim is born) — so this IS the posix backend, proven
+      # live on Darwin's kqueue-less poll fallback. Import-purity first
+      # (cheap, catches a suite-wide mistake before the real cases run);
+      # then the non-timing conformance cases — the POLL-FALLBACK subset
+      # the A2d bullet asks for. test_conformance_timing.nim is
+      # deliberately NOT invoked here: it's CRISOL_TIMING_TESTS-gated and
+      # wall-clock-sensitive, out of scope for this leg's acceptance.
+      - name: Conformance suite — import purity
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_conformance_import_purity.nim
+
+      - name: Conformance suite — non-timing cases (poll fallback)
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_conformance.nim

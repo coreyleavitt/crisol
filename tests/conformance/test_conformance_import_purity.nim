@@ -21,6 +21,7 @@ const forbiddenImports = [
   "crisol/process/posix",
   "crisol/process/posixcore",
   "crisol/process/linux",
+  "crisol/process/windows",
 ]
 
 suite "rfc-0007 A2a-ii — conformance suite import purity":
