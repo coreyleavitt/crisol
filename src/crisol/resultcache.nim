@@ -159,13 +159,21 @@ proc isResultCacheRootName*(name: string): bool =
 #
 # rfc-0005 A2a: the "At" forms take a *result-cache root* directly (the
 # `<root>` in `<root>/v<N>/<key>.json`) — this is the layer `localFsBackend`
-# (cachelocalfs.nim, a DIFFERENT on-disk shape/version axis — see there) and
-# a future `file://` remote tier will build on. The legacy stateDir-taking
-# forms below are thin delegates (`root = stateDir / "cache"`) so every
-# existing caller (`clean.nim`, `test_resultcache*.nim`, `test_a1c_gc.nim`,
-# `test_c0_clean_stores.nim`) is behavior-identical — same paths on disk.
+# (cachelocalfs.nim) and a future `file://` remote tier build on. `N` is
+# ALWAYS `resultCacheFormatVersion` (this module's own payload-schema axis)
+# — `cachewire.storageFormatVersion` is a SEPARATE axis (the StoredEntry
+# WIRE ENVELOPE shape +, later, the remote URL path segment) and must never
+# name a LOCAL directory (rfc-0005 A2a-era bug, fixed rfc-0005 B1b-prereq:
+# `cachelocalfs.nim` briefly grew its own `v<storageFormatVersion>` dir,
+# diverging from `gcResultCacheAt`'s walk and from every other local-fs
+# reader/writer of the SAME root — GC silently never saw live entries). The
+# legacy stateDir-taking forms below are thin delegates (`root = stateDir /
+# "cache"`) so every existing caller (`clean.nim`, `test_resultcache*.nim`,
+# `test_a1c_gc.nim`, `test_c0_clean_stores.nim`) is behavior-identical —
+# same paths on disk. `cacheVersionDirAt` is exported so `cachelocalfs.nim`
+# shares this ONE proc rather than re-deriving the dir name itself.
 
-proc cacheVersionDirAt(root: string): string {.inline.} =
+proc cacheVersionDirAt*(root: string): string {.inline.} =
   root / resultCacheDirName()
 
 proc keyFilePathAt(root: string; key: SoundnessKey): string {.inline.} =

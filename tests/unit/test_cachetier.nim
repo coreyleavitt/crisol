@@ -33,6 +33,13 @@
 ##      autoCreate creates the root on demand and a fresh get on it is a
 ##      clean miss, never offline; the soft cap skips a new-key put once the
 ##      version dir is at capacity, rate-limited stderr warning included.
+##      6i (B1b-prereq regression): `localFsBackend` and the legacy
+##      resultcache helpers (`loadCachedAt`/`storeCachedAt`/
+##      `gcResultCacheAt`) agree on ONE version dir for a shared root — an
+##      entry `localFsBackend.put` writes is visible to `loadCachedAt` AND
+##      actually walked (and evictable) by `gcResultCacheAt`; a
+##      `storeCachedAt` entry is visible to `localFsBackend.get` — the
+##      A2a-era divergence this fixes.
 
 import std/[json, options, os]
 import crisol/types
@@ -232,7 +239,12 @@ proc localFsRootPathNoCreate(name: string): string =
   removeDir(result)
 
 proc versionedEntryPath(root: string; key: SoundnessKey): string =
-  root / ("v" & $storageFormatVersion) / ($key & ".json")
+  ## rfc-0005 B1b-prereq: local-fs entries live at `<root>/v<N>/<key>.json`
+  ## where N == resultCacheFormatVersion (resultcache.cacheVersionDirAt),
+  ## the SAME dir `gcResultCacheAt`/`loadCachedAt`/`storeCachedAt` use for
+  ## this root -- NOT `cachewire.storageFormatVersion` (a different axis:
+  ## the StoredEntry wire-envelope version, never a local dir name).
+  cacheVersionDirAt(root) / ($key & ".json")
 
 # 6a. checksum tamper on disk -> cvCorrupt. Unlike memory/memoryBytes (whose
 # `put` always self-heals the checksum — see the module doc comment), a
@@ -365,6 +377,42 @@ block test_localfs_soft_cap_skip:
   # re-storing an EXISTING key at cap still succeeds (replaces, not grows)
   assert backend.put(sampleEntry(kA, exitCode = 9)) == cvOk
   assert backend.get(kA).verdict == cvOk
+
+# 6i. rfc-0005 B1b-prereq regression: `localFsBackend` and the legacy
+# `resultcache` helpers must agree on ONE version dir for the SAME root —
+# an entry written through one is visible (and, for GC, evictable) through
+# the other. This is the exact bug: `cachelocalfs.nim` briefly derived its
+# own `v<storageFormatVersion>` dir (a wire-envelope axis, not a local
+# path), diverging from `gcResultCacheAt`'s `v<resultCacheFormatVersion>`
+# walk, so `crisol clean` silently never saw live production entries.
+block test_localfs_and_resultcache_agree_on_one_root:
+  let root = freshLocalFsRoot("agreement")
+  let backend = localFsBackend(root, autoCreate = true, maxEntries = 0)
+
+  # localFsBackend.put -> visible to loadCachedAt (same root, same version dir).
+  let kA = SoundnessKey("a1a1a1a1a1a1a1a1")
+  assert backend.put(sampleEntry(kA, exitCode = 3)) == cvOk
+  let viaLoad = loadCachedAt(root, kA)
+  assert viaLoad.isSome,
+    "an entry written by localFsBackend.put must be visible to loadCachedAt"
+  assert viaLoad.get.run.exit.code == 3
+
+  # ... AND actually walked/evictable by gcResultCacheAt (GC must see live
+  # production entries, not just the legacy resultcache-only directory).
+  let evictReport = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 1,
+                                     nowSecs = 9_999_999_999'i64)
+  assert evictReport.evicted == 1,
+    "gcResultCacheAt must walk the SAME dir localFsBackend.put wrote to"
+  assert backend.get(kA).verdict == cvMiss,
+    "the entry gcResultCacheAt evicted must be gone from localFsBackend's view too"
+
+  # storeCachedAt -> visible to localFsBackend.get (the reverse direction).
+  let kB = SoundnessKey("b2b2b2b2b2b2b2b2")
+  assert storeCachedAt(root, kB, sampleCachedResult(exitCode = 7))
+  let viaBackend = backend.get(kB)
+  assert viaBackend.verdict == cvOk,
+    "an entry written by storeCachedAt must be visible to localFsBackend.get"
+  assert viaBackend.value.result.run.exit.code == 7
 
 # ---------------------------------------------------------------------------
 # 7. zero-tier lookup/put is a clean no-op (never raises, never crashes)

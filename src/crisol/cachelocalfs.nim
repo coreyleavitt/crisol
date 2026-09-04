@@ -5,8 +5,18 @@
 ## one JSON file per key, at:
 ##
 ## ```
-##   <root>/v<cachewire.storageFormatVersion>/<soundnessKey>.json
+##   <root>/v<resultcache.resultCacheFormatVersion>/<soundnessKey>.json
 ## ```
+##
+## The version segment is `resultcache.cacheVersionDirAt(root)` — the SAME
+## helper `loadCachedAt`/`storeCachedAt`/`gcResultCacheAt` use for the
+## identical `<root>`, so every local-fs reader/writer of a given root
+## (this backend, the legacy resultcache helpers, and `clean.nim`'s GC)
+## agrees on where entries live. (rfc-0005 B1b-prereq fix: this module
+## briefly derived its OWN version dir from `cachewire.storageFormatVersion`
+## — a different axis, the StoredEntry WIRE ENVELOPE version, never a local
+## directory name — which silently diverged from `gcResultCacheAt`'s walk;
+## see `resultcache.cacheVersionDirAt`'s doc comment.)
 ##
 ## `<root>` is whatever the caller hands in — the future `localOnlyCache`
 ## (Stage A2b) passes `stateDir / "cache"` for the pinned `"l1"` tier; a
@@ -62,11 +72,8 @@ import crisol/cachewire
 import crisol/resultcache
 import crisol/ioutils
 
-proc versionDir(root: string): string {.inline.} =
-  root / ("v" & $storageFormatVersion)
-
 proc entryPath(root: string; key: SoundnessKey): string {.inline.} =
-  versionDir(root) / ($key & ".json")
+  cacheVersionDirAt(root) / ($key & ".json")
 
 proc countEntries(dir: string): int =
   ## Mirrors `resultcache`'s `countCacheEntries` exactly — count `*.json`
@@ -130,7 +137,7 @@ proc localFsBackend*(root: string; autoCreate: bool; maxEntries: int): CacheBack
                        root & "': " & e.msg & "\n")
           return cvUnauthorized
 
-      let verDir = versionDir(root)
+      let verDir = cacheVersionDirAt(root)
       let finalPath = entryPath(root, entry.key)
 
       if not fileExists(finalPath):
