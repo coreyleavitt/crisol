@@ -451,6 +451,70 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     let parsed = parseJson(s)  # must not raise -- stdout stays parseable JSON
     check parsed["entrypoints"][0]["keyDiff"][0]["component"].getStr == "kcClosure"
 
+  test "RFC-0005 A3b: cacheTier is ALWAYS present, \"\" when not consulted (syntheticResults default)":
+    let node = toJson(syntheticResults(), syntheticSummary())
+    for ep in node["entrypoints"].elems:
+      check ep.hasKey("cacheTier")
+      check ep["cacheTier"].getStr == ""
+
+  test "RFC-0005 A3b: cacheTier carries the serving tier's name on a hit":
+    var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                             compile: okPhase(), run: okPhase(), durationMs: 1,
+                             cacheDecision: cdmHit, cacheTier: "l1", cacheLookup: cvOk)
+    let node = toJson(@[r], summarize(@[r]))
+    check node["entrypoints"][0]["cacheTier"].getStr == "l1"
+
+  test "RFC-0005 A3b: cacheLookup is ABSENT when not consulted (notEligible/groupOptOut/policyDisabled)":
+    for dec in [cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled]:
+      var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                               compile: okPhase(), run: okPhase(), durationMs: 1,
+                               cacheDecision: dec)
+      let node = toJson(@[r], summarize(@[r]))
+      check not node["entrypoints"][0].hasKey("cacheLookup")
+
+  test "RFC-0005 A3b: cacheLookup is PRESENT with the stable verdict string when consulted":
+    let cases = [
+      (cdmHit, cvOk, "ok"),
+      (cdmKeyMiss, cvMiss, "miss"),
+      (cdmStored, cvMiss, "miss"),
+      (cdmHermeticityDeg, cvMiss, "miss"),
+      (cdmFlaky, cvMiss, "miss"),
+      (cdmClosureUnrecorded, cvMiss, "miss"),
+      (cdmRecomputeMiss, cvOk, "ok"),
+      (cdmStored, cvTrustBadSignature, "trustBadSignature"),  # E2E-A-trust's own case
+    ]
+    for (dec, verdict, expected) in cases:
+      var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                               compile: okPhase(), run: okPhase(), durationMs: 1,
+                               cacheDecision: dec, cacheLookup: verdict)
+      let node = toJson(@[r], summarize(@[r]))
+      let ep = node["entrypoints"][0]
+      check ep.hasKey("cacheLookup")
+      check ep["cacheLookup"].getStr == expected
+
+  test "RFC-0005 A3b: toJsonString threads cacheTier/cacheLookup through unchanged, stdout stays parseable":
+    var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                             compile: okPhase(), run: okPhase(), durationMs: 1,
+                             cacheDecision: cdmHit, cacheTier: "l1", cacheLookup: cvOk)
+    let s = toJsonString(@[r], summarize(@[r]))
+    let parsed = parseJson(s)
+    check parsed["entrypoints"][0]["cacheTier"].getStr == "l1"
+    check parsed["entrypoints"][0]["cacheLookup"].getStr == "ok"
+
+  test "RFC-0005 A3b: cacheVerdictString covers every CacheVerdict with a stable name":
+    check cacheVerdictString(cvOk) == "ok"
+    check cacheVerdictString(cvMiss) == "miss"
+    check cacheVerdictString(cvOffline) == "offline"
+    check cacheVerdictString(cvTimeout) == "timeout"
+    check cacheVerdictString(cvVersionSkew) == "versionSkew"
+    check cacheVerdictString(cvCorrupt) == "corrupt"
+    check cacheVerdictString(cvUnauthorized) == "unauthorized"
+    check cacheVerdictString(cvTrustNoAttestation) == "trustNoAttestation"
+    check cacheVerdictString(cvTrustUnknownAlg) == "trustUnknownAlg"
+    check cacheVerdictString(cvTrustUnpinnedSigner) == "trustUnpinnedSigner"
+    check cacheVerdictString(cvTrustSignerMismatch) == "trustSignerMismatch"
+    check cacheVerdictString(cvTrustBadSignature) == "trustBadSignature"
+
   test "a run-phase interrupt-killed entry: outcome killed, run.cause {by: runner, reason: interrupt}":
     let r    = killedByInterruptDuringRun()
     let node = toJson(@[r], summarize(@[r]), interrupted = true)

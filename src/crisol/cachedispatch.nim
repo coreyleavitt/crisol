@@ -247,6 +247,29 @@ type
                           ## eligible / policy disabled / group opt-out) -- the seam
                           ## is never consulted on those paths. The runner threads
                           ## this onto the live EntrypointResult's `keyDiff` field.
+    tier*:        string  ## RFC-0005 A3b: the serving tier's name on a genuine
+                          ## cache-level hit (`l.hit.get.tier`); "" otherwise --
+                          ## whether the eventual EntrypointResult is served from
+                          ## this lookup (a promoted edCached) or not (a recompute-
+                          ## invalidated hit, or a miss) is the runner's business,
+                          ## not this proc's; see `synthesize`'s caller and the
+                          ## hit/live stamp sites in runner.nim. Threaded onto the
+                          ## live/synthesized EntrypointResult's `cacheTier` field.
+    lookup*:      CacheVerdict  ## RFC-0005 A3b: the TieredCache-level lookup
+                          ## verdict -- `cvOk` on a genuine hit (`l.hit.isSome`,
+                          ## regardless of a later recompute-invalidation: the
+                          ## CACHE lookup itself succeeded); `worst(l)` over every
+                          ## tier CONSULTED on a miss (`l.hit.isNone` -- surfaces
+                          ## the specific trust/transport code even when an
+                          ## earlier tier's rejection isn't why the OVERALL lookup
+                          ## missed, exactly `worst`'s own documented purpose). The
+                          ## zero value `cvOk` (ord 0) on every early return (not
+                          ## eligible / policy disabled / group opt-out) -- the
+                          ## seam is never consulted on those paths, so there is no
+                          ## verdict to report; `EntrypointResult.cacheLookup`'s own
+                          ## doc comment covers why the wire presence-gates this
+                          ## rather than trusting the bare value. Threaded onto the
+                          ## live/synthesized EntrypointResult's `cacheLookup` field.
 
 proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
                 inputHash: string): EntrypointResult =
@@ -363,8 +386,14 @@ proc lookupAtPlan*(
   else:
     sink.emit(TelemetryEvent(kind: tekMiss, verdicts: l.verdicts))
   if l.hit.isNone:
+    # RFC-0005 A3b: `lookup` = worst(l) -- the strongest verdict across every
+    # tier CONSULTED (cvMiss on an empty/cold cache; a trust code, e.g.
+    # cvTrustBadSignature, when a verifyTrust tier rejected an entry and the
+    # waterfall found nothing servable -- E2E-A-trust). `tier` stays "" (no
+    # tier served this lookup).
     return PlanLookup(decision: edRunFresh, cacheDecision: cdmKeyMiss, inputHash: kStr,
-                      synthesized: none(EntrypointResult), explain: l.explain)
+                      synthesized: none(EntrypointResult), explain: l.explain,
+                      tier: "", lookup: worst(l))
 
   # rfc-0007 A1d-ii / §2: recompute the outcome at THIS trust boundary, never
   # read it from storage.  A hit whose recomputed outcome is not oPassed is
@@ -372,11 +401,20 @@ proc lookupAtPlan*(
   # serve a stale/invalidated pass from cache forever with no rerun path.
   let synth = synthesize(pep, l.hit.get.result, kStr)
   if outcome(synth) != oPassed:
+    # RFC-0005 A3b (judgment call): the CACHE lookup itself genuinely hit
+    # (l.hit.isSome) -- `lookup` stays cvOk, honestly describing that fact;
+    # `tier` names which tier had the now-invalidated entry. Neither reaches
+    # the wire as "served" (EntrypointResult.cacheTier stays "" here) --
+    # only the runner's HIT stamp site copies `tier` onto a result, and this
+    # branch returns `synthesized: none`, so it never takes that path; the
+    # live rerun's own stamp threads `lookup` (cvOk) alongside cacheDecision
+    # "recomputeMiss" -- an honest, if unusual, combination: the lookup
+    # succeeded, a later check invalidated it.
     return PlanLookup(decision: edRunFresh, cacheDecision: cdmRecomputeMiss,
                       inputHash: kStr, synthesized: none(EntrypointResult),
-                      explain: l.explain)
+                      explain: l.explain, tier: l.hit.get.tier, lookup: cvOk)
   PlanLookup(decision: edCached, cacheDecision: cdmHit, inputHash: kStr,
-             synthesized: some(synth))
+             synthesized: some(synth), tier: l.hit.get.tier, lookup: cvOk)
 
 # ---------------------------------------------------------------------------
 # Store gate — decide whether a freshly-run result should be cached
@@ -611,6 +649,15 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
     keyOf: keyOfProc(ctx, graph),
     load:  proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
              result = rt.cache.lookup(d.key)
+             # RFC-0005 A3b: the tekBackfillErr LIVE emission site -- A3a
+             # landed the pure producer (cachetelemetry.backfillErrEvents,
+             # over CacheLookup.backfillVerdicts) with no caller; this is
+             # that caller. Mirrors realSeams.store's own tekPublish/
+             # tekRemoteErr emission a few lines down -- the store side of
+             # the SAME "translate a cache-layer outcome into telemetry"
+             # concern this adapter already owns for puts.
+             for ev in backfillErrEvents(result):
+               rt.sink.emit(ev)
              if result.hit.isNone and rt.localRoot.len > 0:
                let prior = mostRecentRecord(readSidecar(rt.localRoot, pep.ep.path))
                if prior.isSome:

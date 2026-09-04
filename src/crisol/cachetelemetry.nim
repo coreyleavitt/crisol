@@ -149,10 +149,15 @@ type
     published*:    int
     verifyFails*:  int
 
-const notConsultedDecisions = {cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled}
+const notConsultedDecisions* = {cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled}
   ## RFC-0005 "Hit-rate telemetry" / `cachedispatch.inactiveDecision`'s own
   ## domain — the three `CacheDecision`s that mean "never consulted", not
-  ## "consulted and did not hit".
+  ## "consulted and did not hit". Exported since RFC-0005 A3b: `jsonout`
+  ## reuses this SAME set as the presence gate for the per-result
+  ## `cacheLookup` wire field (`EntrypointResult.cacheLookup`'s zero value,
+  ## `cvOk`, is ambiguous between "hit" and "never consulted" — presence on
+  ## the wire is keyed off `cacheDecision` instead, one source of truth for
+  ## "was this entrypoint's cache actually consulted").
 
 proc aggregateCacheStats*(events: seq[TelemetryEvent];
                           decisions: seq[CacheDecision]): CacheStats =

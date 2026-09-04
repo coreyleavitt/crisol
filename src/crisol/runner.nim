@@ -1369,6 +1369,11 @@ proc execute*(
                                                   # per index (empty when not consulted, a
                                                   # hit, or no prior sidecar record); stamped
                                                   # onto the live EntrypointResult below.
+  var lookups         = newSeq[CacheVerdict](n)  # RFC-0005 A3b: PlanLookup.lookup per index
+                                                  # (cvOk zero value if not consulted), next to
+                                                  # inputHashes -- stamped onto the live
+                                                  # EntrypointResult's cacheLookup wherever
+                                                  # inputHashes[completedIdx] lands below.
   for i in 0 ..< n:
     if not cacheActive:
       # No cache: record the structural reason on every entry.  edRunFresh
@@ -1385,11 +1390,17 @@ proc execute*(
     cacheDecisions[i] = look.cacheDecision
     inputHashes[i]    = look.inputHash  # A8: stamped onto live miss results below
     explains[i]       = look.explain    # RFC-0005 B1c: stamped onto live miss results below
+    lookups[i]        = look.lookup     # RFC-0005 A3b: stamped onto live miss results below
     if look.decision == edCached and look.synthesized.isSome:
       # Served from cache: synthesize, fire callback now, retire the slot.
       # edCached entries are NEVER retried — they are terminal at plan time.
       var synth = look.synthesized.get
       synth.cacheDecision = look.cacheDecision   # cdmHit
+      # RFC-0005 A3b: the HIT stamp -- which tier served it + the (cvOk)
+      # lookup verdict, straight from PlanLookup (see that type's doc
+      # comment for why `tier`/`lookup` are populated the way they are).
+      synth.cacheTier   = look.tier
+      synth.cacheLookup = look.lookup
       # B3/B4: apply quarantine overlay post-lookup — quarantine is a reporting
       # concern, not part of the soundness/cache key.  Cached results are
       # always passes (only passing results are stored), so the B4 per-test
@@ -1631,6 +1642,14 @@ proc execute*(
                 # is unconditional — the sidecar diff belongs to the fact that this
                 # index was a plan-time miss, not to the store outcome below).
                 result[completedIdx].keyDiff = explains[completedIdx]
+                # RFC-0005 A3b: the LIVE stamp -- same unconditional-of-store-
+                # outcome reasoning as keyDiff just above: this index's
+                # plan-time lookup verdict (cvMiss / a trust code / cvOk on a
+                # recompute-invalidated hit) belongs to the fact that it was
+                # consulted, not to whether the fresh result ends up stored.
+                # cacheTier stays "" (its zero value) -- a live-run result was
+                # never served from a tier, whatever the reason.
+                result[completedIdx].cacheLookup = lookups[completedIdx]
                 let verdict = shouldStore(result[completedIdx], cache.spec,
                                           slotAttempt, cache.policy,
                                           p.entrypoints[completedIdx].cacheable)

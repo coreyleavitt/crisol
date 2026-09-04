@@ -54,31 +54,12 @@ export resultcache
 # CacheVerdict — get / put / verify share ONE vocabulary.
 # ---------------------------------------------------------------------------
 
-type
-  CacheVerdict* = enum
-    ## Ordered weakest → strongest (declaration order) so an aggregate over
-    ## several tiers/checks can report "the strongest thing anyone said" via
-    ## a simple `ord` comparison (see `cachetier.worst`).
-    cvOk
-    cvMiss
-    cvOffline
-    cvTimeout
-    cvVersionSkew
-    cvCorrupt
-    cvUnauthorized
-    cvTrustNoAttestation
-    cvTrustUnknownAlg
-    cvTrustUnpinnedSigner
-    cvTrustSignerMismatch
-    cvTrustBadSignature
-
-const transportVerdicts* = {cvOffline, cvTimeout, cvUnauthorized}
-  ## A backend/network problem, not a statement about the data itself.
-const integrityVerdicts* = {cvVersionSkew, cvCorrupt}
-  ## The bytes/object are unusable as stored — a version mismatch or a torn
-  ## / tampered payload.
-const trustVerdicts* = {cvTrustNoAttestation .. cvTrustBadSignature}
-  ## A `TrustPolicy.verify` rejection — always fail-closed, never silent.
+## CacheVerdict/transportVerdicts/integrityVerdicts/trustVerdicts moved to
+## crisol/types (RFC-0005 A3b) -- EntrypointResult.cacheLookup rides on
+## CacheVerdict and types.nim cannot import this module (cacheport imports
+## types) -- same relocation rationale as KeyComponent/KeyDiff (B1c). Still
+## in scope here, unqualified, via `import crisol/types` + `export types`
+## above.
 
 # ---------------------------------------------------------------------------
 # Fetched[T] — "a value exists iff cvOk" (hit-with-an-error unrepresentable).

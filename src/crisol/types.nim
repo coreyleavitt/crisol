@@ -497,6 +497,32 @@ type
     kcClosure, kcFlags, kcNimVersion, kcCcVersion, kcFixtures, kcArgv,
     kcLimits, kcHermeticEnv, kcProtocol
 
+  CacheVerdict* = enum
+    ## RFC-0005 A1: get/put/verify all speak this ONE vocabulary
+    ## (`cacheport.nim` DEFINES its usage contract). Homed here (not
+    ## `cacheport.nim`) for the SAME reason as `KeyComponent`/`KeyDiff`
+    ## above: `EntrypointResult.cacheLookup` (below, RFC-0005 A3b) rides on
+    ## it, and `cacheport.nim` imports `types.nim` -- the reverse import
+    ## would cycle. `cacheport.nim` (and every cache module downstream of
+    ## it) sees this unqualified via its existing `import crisol/types` +
+    ## `export types`.
+    ##
+    ## Ordered weakest → strongest (declaration order) so an aggregate over
+    ## several tiers/checks can report "the strongest thing anyone said" via
+    ## a simple `ord` comparison (see `cachetier.worst`).
+    cvOk
+    cvMiss
+    cvOffline
+    cvTimeout
+    cvVersionSkew
+    cvCorrupt
+    cvUnauthorized
+    cvTrustNoAttestation
+    cvTrustUnknownAlg
+    cvTrustUnpinnedSigner
+    cvTrustSignerMismatch
+    cvTrustBadSignature
+
   KeyDiff* = object
     ## RFC-0005 B1a: one differing `KeyInputs` component, pure diff output of
     ## `keys.explainMiss`.  `prev`/`curr` are the two component values as
@@ -528,6 +554,14 @@ type
                                   ## global on + hermeticity gate; csFalse = never cache.
     retries*:      int            ## precomputed effective retry count (B1); set by plan().
                                   ## maxAttempts = retries + 1.  0 = no retry.
+
+const transportVerdicts* = {cvOffline, cvTimeout, cvUnauthorized}
+  ## A backend/network problem, not a statement about the data itself.
+const integrityVerdicts* = {cvVersionSkew, cvCorrupt}
+  ## The bytes/object are unusable as stored — a version mismatch or a torn
+  ## / tampered payload.
+const trustVerdicts* = {cvTrustNoAttestation .. cvTrustBadSignature}
+  ## A `TrustPolicy.verify` rejection — always fail-closed, never silent.
 
 proc compileView*(pep: PlannedEntrypoint): CompileDecision =
   ## M3: Pure accessor that derives the compile-only view FROM edecision.
@@ -603,6 +637,23 @@ type
                                    ## Default field value is cdmNotEligible (enum ord 0, the
                                    ## safe "cache not consulted" default); the runner sets it
                                    ## explicitly on every result it produces.
+    cacheTier*:      string        ## RFC-0005 A3b: which tier SERVED this result ("l1" |
+                                   ## the KDL remote-cache name); "" unless served (a live
+                                   ## run, whatever the reason, always leaves this "").
+                                   ## Always present on the wire (same "always-present, ""-
+                                   ## is-honest" convention as inputHash) -- no presence gate
+                                   ## needed, unlike cacheLookup below.
+    cacheLookup*:    CacheVerdict  ## RFC-0005 A3b: the TieredCache-level lookup verdict for
+                                   ## THIS entrypoint -- cvOk on a genuine hit (the serving
+                                   ## tier's own verdict, populated even if a later recompute
+                                   ## check invalidates the hit and reruns it live); worst(l)
+                                   ## over every tier CONSULTED on a miss (cvMiss / cvOffline /
+                                   ## a trust code, e.g. cvTrustBadSignature -- E2E-A-trust);
+                                   ## the zero value cvOk (ord 0) when the cache was never
+                                   ## consulted at all -- indistinguishable from "hit" by VALUE
+                                   ## alone, so the wire (jsonout) presence-gates this field on
+                                   ## whether cacheDecision means "consulted", never emitting it
+                                   ## bare on a not-consulted result.
     attempts*:       int              ## B1: how many attempts were made (1 on a clean pass;
                                       ## > 1 means at least one prior attempt failed).
                                       ## Populated by execute(); 0 for cached results (no run).

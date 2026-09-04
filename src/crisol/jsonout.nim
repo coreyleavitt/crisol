@@ -446,6 +446,40 @@ const RunSchemaRevision* = 21
   ##                     A3b had not landed when B1c shipped, so this
   ##                     forward-reference to rev 20 never resolved as
   ##                     written -- rev 20 went to B1c instead; see there.)
+  ##   rev 19 (RFC-0005 A3b, same rev as `verifyFails` above — NO bump) —
+  ##                     per-result `cacheTier` (string) and `cacheLookup`
+  ##                     (string). `cacheTier` is which tier SERVED this
+  ##                     result ("l1" | a KDL remote-cache name); ALWAYS
+  ##                     present, "" unless served — same "always-present,
+  ##                     ""-is-honest" convention as `inputHash`.
+  ##                     `cacheLookup` is the `CacheVerdict` the plan-time
+  ##                     `TieredCache` lookup returned for this entrypoint
+  ##                     (`cacheDecisionString`'s sibling, `cacheVerdictString`
+  ##                     — e.g. `"ok"`, `"miss"`, `"trustBadSignature"`);
+  ##                     PRESENT ONLY when `cacheDecision` is NOT one of
+  ##                     `cachetelemetry.notConsultedDecisions` ("notEligible"
+  ##                     / "groupOptOut" / "policyDisabled") — ABSENT
+  ##                     otherwise, never a bare `"ok"`, because the
+  ##                     underlying enum's zero value (`cvOk`) cannot
+  ##                     otherwise be told apart from "never consulted" (same
+  ##                     posture as rev 20/21's flag-gated presence below,
+  ##                     but keyed off `cacheDecision` rather than a CLI
+  ##                     flag — this is unconditional per-result data, not
+  ##                     something an operator opts into). `"ok"` on a
+  ##                     genuine hit (the serving tier's own verdict) *and*
+  ##                     on a cache-level hit later invalidated by the
+  ##                     rfc-0007 A1d-ii recompute check (`cacheDecision`
+  ##                     `"recomputeMiss"`) — the lookup itself succeeded;
+  ##                     a later check, not the lookup, is why it reran.
+  ##                     Otherwise the strongest verdict across every tier
+  ##                     CONSULTED on a miss (`worst`, `cachetier.nim`) —
+  ##                     `"miss"` on a cold cache, a trust code (e.g.
+  ##                     `"trustBadSignature"`) when a `verifyTrust` tier
+  ##                     rejected a stored entry and the waterfall found
+  ##                     nothing else servable (E2E-A-trust: the entry is
+  ##                     never served, `cacheDecision` becomes `"stored"`
+  ##                     as the live rerun re-publishes a fresh, honest
+  ##                     result over the rejected one).
   ##   rev 20 (RFC-0005 B1c) — per-result `keyDiff` (array), present ONLY
   ##                     when the run was invoked with `--explain-miss` (or
   ##                     `--explain-miss-verbose`, which implies it) --
@@ -542,6 +576,26 @@ proc cacheDecisionString*(d: CacheDecision): string =
   of cdmFlaky:             "flaky"
   of cdmClosureUnrecorded: "closureUnrecorded"
   of cdmRecomputeMiss:     "recomputeMiss"
+
+proc cacheVerdictString*(v: CacheVerdict): string =
+  ## Returns the stable JSON string for a CacheVerdict enum value (RFC-0005
+  ## A3b) — the per-result `cacheLookup` field's rendering. Same "explicit
+  ## case, stable name, never `$enumVal`" convention as
+  ## `cacheDecisionString`/`recordStatusString` above (an enum's Nim
+  ## identifier is an implementation detail; the wire name is a promise).
+  case v
+  of cvOk:                   "ok"
+  of cvMiss:                 "miss"
+  of cvOffline:               "offline"
+  of cvTimeout:               "timeout"
+  of cvVersionSkew:           "versionSkew"
+  of cvCorrupt:               "corrupt"
+  of cvUnauthorized:          "unauthorized"
+  of cvTrustNoAttestation:    "trustNoAttestation"
+  of cvTrustUnknownAlg:       "trustUnknownAlg"
+  of cvTrustUnpinnedSigner:   "trustUnpinnedSigner"
+  of cvTrustSignerMismatch:   "trustSignerMismatch"
+  of cvTrustBadSignature:     "trustBadSignature"
 
 # ---------------------------------------------------------------------------
 # phaseToJson -- the ONE place a Phase (compile OR run) becomes a wire node
@@ -693,6 +747,20 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     epNode["cached"]        = newJBool(cached(r))
     epNode["inputHash"]     = newJString(r.inputHash)
     epNode["cacheDecision"] = newJString(cacheDecisionString(r.cacheDecision))
+    # rev 19 (RFC-0005 A3b): cacheTier -- always present, "" unless served
+    # (same "always-present, ""-is-honest" convention as inputHash; see
+    # EntrypointResult.cacheTier's doc comment).
+    epNode["cacheTier"]     = newJString(r.cacheTier)
+    # rev 19 (RFC-0005 A3b): cacheLookup -- PRESENT only when the cache was
+    # actually consulted (cacheDecision not in notConsultedDecisions); the
+    # zero value cvOk is ambiguous between "hit" and "never consulted", so
+    # presence (not content) carries that distinction -- same posture as
+    # rev 20's keyDiff/rev 21's cacheStats field-presence gating, but keyed
+    # off cacheDecision rather than a CLI flag (there is no flag here: this
+    # is unconditional per-result data, gated only by whether it MEANS
+    # anything for this result).
+    if r.cacheDecision notin notConsultedDecisions:
+      epNode["cacheLookup"] = newJString(cacheVerdictString(r.cacheLookup))
     # B1 (rev 3, rev 16): per-entrypoint retry observability.  `flaky` is the
     # DERIVED value (flaky(r): outcome(r)==oPassed and attempts>1), not a
     # stored field -- see the field-mapping table.  `attempts` stays stored:

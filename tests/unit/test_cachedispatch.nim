@@ -20,7 +20,9 @@ import crisol/process/types  # pkCached/pkSkipped (rfc-0007 A1c coherence test)
 import crisol/keys           # KeyDiff, KeyComponent (kcFlags/kcHermeticEnv)
 import crisol/cacheregistry  # localOnlyCache -- a real CacheRuntime + local root
 import crisol/cachelocalfs   # sidecarPath -- raw sidecar file inspection
+import crisol/cachewire      # storageFormatVersion -- RFC-0005 A3b tekBackfillErr fixture
 import crisol/cachetier      # CacheLookup, TierHit -- RFC-0005 B1c PlanLookup.explain tests
+import crisol/cachememory    # RFC-0005 A3b: memory() -- tekBackfillErr live-emission fixture
 import crisol/cachetelemetry # RFC-0005 B2a: TelemetryEvent/InMemorySink
 import crisol/runner          # execute() -- drives a real run directly (no planner)
 import crisol/api             # verifyCachePass/VerifyCache/verifySample/VerifyDivergence
@@ -103,6 +105,22 @@ proc seamsMissWithExplain(c: var Calls; explain: seq[KeyDiff]): CacheSeams =
     load: proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
              inc cp[].loadCalls
              CacheLookup(hit: none(TierHit), verdicts: @[], explain: explain),
+    store: proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool =
+             inc cp[].storeCalls; true,
+  )
+
+proc seamsMissWithVerdicts(c: var Calls; verdicts: seq[TierVerdict]): CacheSeams =
+  ## RFC-0005 A3b: a seam whose `load` always misses but returns a caller-
+  ## supplied `.verdicts` -- lets tests assert `PlanLookup.lookup ==
+  ## worst(l)` threading independent of any real backend/tier.
+  let cp = addr c
+  CacheSeams(
+    keyOf: proc(pep: PlannedEntrypoint): KeyInputs =
+             inc cp[].keyCalls
+             KeyInputs(argv: @[pep.ep.path]),
+    load: proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
+             inc cp[].loadCalls
+             CacheLookup(hit: none(TierHit), verdicts: verdicts),
     store: proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )
@@ -233,6 +251,56 @@ suite "lookupAtPlan — promotion + decision":
     check c.loadCalls == 1                     # the entry was found; its
                                                 # recomputed outcome (not oPassed)
                                                 # disqualified it as a hit.
+
+# ---------------------------------------------------------------------------
+# RFC-0005 A3b: PlanLookup.tier / PlanLookup.lookup threading
+# ---------------------------------------------------------------------------
+
+suite "lookupAtPlan — PlanLookup.tier/lookup (RFC-0005 A3b)":
+
+  test "hit -> tier is the serving tier's name, lookup is cvOk":
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c, sampleCached()))
+    check look.cacheDecision == cdmHit
+    check look.tier == "legacy"     # legacySeams' synthesized TierHit.tier
+    check look.lookup == cvOk
+
+  test "genuine miss -> tier is empty, lookup is worst(l) over the seam's verdicts":
+    var c: Calls
+    let verdicts = @[(tier: "l1", verdict: cvTrustBadSignature), (tier: "l2", verdict: cvMiss)]
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsMissWithVerdicts(c, verdicts))
+    check look.cacheDecision == cdmKeyMiss
+    check look.tier == ""
+    check look.lookup == cvTrustBadSignature   # strongest verdict, per cachetier.worst
+
+  test "genuine miss with no verdicts at all -> lookup is cvMiss (worst's empty-list sentinel)":
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsMissWithVerdicts(c, @[]))
+    check look.cacheDecision == cdmKeyMiss
+    check look.lookup == cvMiss
+
+  test "not-eligible (edNeverBuilt) -> tier empty, lookup is the cvOk zero value":
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edNeverBuilt), onPolicy, seamsHit(c, sampleCached()))
+    check look.cacheDecision == cdmNotEligible
+    check look.tier == ""
+    check look.lookup == cvOk
+
+  test "policy disabled -> tier empty, lookup is the cvOk zero value":
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edRunFresh), offPolicy, seamsHit(c, sampleCached()))
+    check look.cacheDecision == cdmPolicyDisabled
+    check look.tier == ""
+    check look.lookup == cvOk
+
+  test "recompute-invalidated hit -> tier names the tier that HAD it, lookup stays cvOk (the cache lookup itself succeeded)":
+    var c: Calls
+    var badCr = sampleCached()
+    badCr.run.exit = Exit(kind: ekExited, code: 1)   # derives oFailed, not oPassed
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c, badCr))
+    check look.cacheDecision == cdmRecomputeMiss
+    check look.tier == "legacy"
+    check look.lookup == cvOk
 
 # ---------------------------------------------------------------------------
 # RFC-0005 B1c: PlanLookup.explain threading (l.explain -> PlanLookup.explain)
@@ -844,6 +912,90 @@ suite "RFC-0005 B2a — telemetry: realSeams.store (real seam)":
     check mem.events[0].kind == tekRemoteErr
     check mem.events[0].putTier == "l1"
     check mem.events[0].putVerdict == cvOffline
+
+# ---------------------------------------------------------------------------
+# RFC-0005 A3b — telemetry: realSeams.load's tekBackfillErr LIVE emission.
+#
+# A3a landed the pure producer (cachetelemetry.backfillErrEvents, over
+# CacheLookup.backfillVerdicts) with no live caller -- an event arm with no
+# emission path is a violation this slice must close. `realSeams.load` is
+# the call site (see cachedispatch.nim's module doc + the RFC's own
+# tekBackfillErr note: "the actual sink.emit call site for a LIVE run is
+# realSeams.load (Stage A3b)").
+#
+# Setup: a two-tier TieredCache where tier "l0" (upstream, backfillOnHit)
+# always MISSES on get but always FAILS (cvOffline) on put, and tier "l1"
+# (downstream) is pre-seeded so the waterfall serves the hit from "l1" and
+# attempts to backfill "l0" -- which fails, landing exactly one
+# CacheLookup.backfillVerdicts entry in transportVerdicts.
+# ---------------------------------------------------------------------------
+
+proc offlinePutBackend(): CacheBackend =
+  ## A minimal double: every `get` is a clean miss, every `put` fails
+  ## transport-class (cvOffline) -- lets a test force a backfill WRITE
+  ## failure independent of any real filesystem/network fault.
+  CacheBackend(
+    scheme: "test-offline-put",
+    get:  proc(key: SoundnessKey): Fetched[StoredEntry] = Fetched[StoredEntry](verdict: cvMiss),
+    put:  proc(entry: StoredEntry): CacheVerdict = cvOffline,
+    probe: nil,
+  )
+
+suite "RFC-0005 A3b — telemetry: realSeams.load (tekBackfillErr goes live)":
+
+  test "a backfill write failure on load -> exactly one tekBackfillErr through the sink":
+    let l1 = memory()
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let mem = newInMemorySink()
+    let rt = CacheRuntime(
+      cache: TieredCache(
+        tiers: @[
+          Tier(name: "l0", backend: offlinePutBackend(), backfillOnHit: true, verifyTrust: false),
+          Tier(name: "l1", backend: l1, backfillOnHit: false, verifyTrust: false),
+        ],
+        trust: nonePolicy(),
+      ),
+      sink: mem.sink(),
+    )
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_tekbackfillerr.nim")
+    let d = derive(seams, pep)
+    # Seed l1 directly (bypass seams.store, which would ALSO put to l0 via
+    # the put rule, not the backfill path this test targets).
+    discard l1.put(StoredEntry(key: d.key, keyInputs: some(d.inputs),
+                               result: samplePassResult(),
+                               storageVersion: storageFormatVersion))
+
+    let look = seams.load(pep, d)
+    check look.hit.isSome
+    check look.hit.get.tier == "l1"
+    check look.backfillVerdicts == @[(tier: "l0", verdict: cvOffline)]
+    check mem.events.len == 1
+    check mem.events[0].kind == tekBackfillErr
+    check mem.events[0].putTier == "l0"
+    check mem.events[0].putVerdict == cvOffline
+
+  test "a successful backfill (or no backfill at all) -> zero tekBackfillErr events":
+    let sd = freshStateDir("tekbackfillok")
+    var rt = localOnlyCache(sd, maxEntries = 0)   # single tier: no backfill target at all
+    let mem = newInMemorySink()
+    rt.sink = mem.sink()
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_tekbackfillok.nim")
+    let d = derive(seams, pep)
+    check seams.store(pep, d, samplePassResult())
+
+    let look = seams.load(pep, d)
+    check look.hit.isSome
+    for ev in mem.events:
+      check ev.kind != tekBackfillErr
 
 # ---------------------------------------------------------------------------
 # RFC-0005 B2a — telemetry: tekVerifyFail (through the landed B3 machinery)

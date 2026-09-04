@@ -913,10 +913,57 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
   )
 
 # ---------------------------------------------------------------------------
-# runTests — full run facade; catches-and-encodes structural failures
+# CacheDeps — the test-injection seam for runTestsWith (RFC-0005 A3b)
 # ---------------------------------------------------------------------------
 
-proc runTests*(opts: RunOptions = RunOptions()): RunReport =
+type
+  CacheDeps* = object
+    ## RFC-0005 "Test injection without a facade leak": `RunOptions.
+    ## cacheRuntime: Option[CacheRuntime]` was rejected (round 3) because it
+    ## would leak `cacheport`'s whole type graph into the CONTRACTED
+    ## `crisol/api` facade. Instead `runTestsWith*(opts, deps: CacheDeps)`
+    ## is an internal, documented-uncontracted entry point; `runTests*`
+    ## (below) is the public facade and always builds `productionCacheDeps()`.
+    ##
+    ## **A3b interim shape (judgment call, recorded):** the RFC's inline
+    ## sketch gives `CacheDeps`'s END-STATE shape as `{registry:
+    ## BackendRegistry, secrets: CacheSecrets, sink: TelemetrySink}`, fed
+    ## into `configuredCache(cfg, stateDir, reg, secrets, sink)`. Neither
+    ## `configuredCache` nor `CacheSecrets` exist yet — both are A3c/C-dep
+    ## (the KDL remote-tier parse + trust-secret env resolution), and A3b's
+    ## own bullet scope names only types.nim/cachedispatch.nim/runner.nim/
+    ## jsonout.nim/api.nim — `cacheregistry.nim` (where `configuredCache`
+    ## would live) is out of scope this slice. A3b's actual need — E2E-A-
+    ## trust's "two `memory` tiers + a mock `TrustPolicy` through
+    ## `runTestsWith`" — only requires a seam that can hand back an
+    ## arbitrary, fully-built `CacheRuntime` once `stateDir`/`maxEntries`
+    ## are known (post-plan; `runTests` cannot resolve them any earlier
+    ## today either — see the `localOnlyCache` call site this replaces).
+    ## `buildRuntime` is that narrowest seam: production wraps today's
+    ## `localOnlyCache` call unchanged (`productionCacheDeps`, below); a
+    ## test closes over pre-built `memory://` backends + a mock policy and
+    ## returns the SAME `CacheRuntime` value on every call, so a warm
+    ## second `runTestsWith` call sees what the first one stored (the
+    ## backends' own `Table` state — not `rt` identity — is what persists;
+    ## see `cachememory.nim`). A3c reshapes this into the registry+secrets
+    ## form once `configuredCache` exists to consume it — narrowing the
+    ## seam, not the design.
+    buildRuntime*: proc(stateDir: string; maxEntries: int): CacheRuntime {.closure.}
+
+proc productionCacheDeps*(): CacheDeps =
+  ## The real dependency: exactly what `runTests` built inline before this
+  ## slice — `cacheregistry.localOnlyCache`, unchanged.
+  CacheDeps(buildRuntime: proc(stateDir: string; maxEntries: int): CacheRuntime =
+    localOnlyCache(stateDir, maxEntries))
+
+# ---------------------------------------------------------------------------
+# runTestsWith — full run facade; catches-and-encodes structural failures.
+# INTERNAL / documented-uncontracted (RFC-0005 A3b) — `deps` reaches into
+# cache-module internals a `crisol/api` consumer should never need to import;
+# `runTests` (below) is the public, opts-only facade.
+# ---------------------------------------------------------------------------
+
+proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   ## Full run facade.  Returns outcomes; never raises for expected conditions.
   ## Structural problems are encoded in RunReport.status / .error / .exitCode.
   ##
@@ -1063,13 +1110,15 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       ctx
     else:
       # RFC-0005 A2b: keyContext built once (the key-derivation closure's
-      # captured state); localOnlyCache built once (the single-tier "l1"
-      # TieredCache over the local-fs backend — behaviorally identical to
-      # RFC-0004's direct loadCached/storeCached).  maxCacheEntries mirrors
-      # clean.nim's own resolution of the SAME config field (0 = use
-      # DefaultMaxCacheEntries) so the live store path's soft cap and
-      # `clean`'s GC target agree — one knob, one resolution rule, both
-      # readers of it.
+      # captured state); the run's CacheRuntime built once via `deps.
+      # buildRuntime` (RFC-0005 A3b — production: `localOnlyCache`, the
+      # single-tier "l1" TieredCache over the local-fs backend, behaviorally
+      # identical to RFC-0004's direct loadCached/storeCached; tests: an
+      # injected multi-tier double, see CacheDeps's doc comment).
+      # maxCacheEntries mirrors clean.nim's own resolution of the SAME
+      # config field (0 = use DefaultMaxCacheEntries) so the live store
+      # path's soft cap and `clean`'s GC target agree — one knob, one
+      # resolution rule, both readers of it.
       let keyCtx = keyContext(
         nimVersion    = nimVer,
         ccVersion     = ccVer,
@@ -1080,7 +1129,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       let maxCacheEntries =
         if cfg.maxCacheEntries > 0: cfg.maxCacheEntries
         else: DefaultMaxCacheEntries
-      var rt = localOnlyCache(pr.settings.stateDir, maxCacheEntries)
+      var rt = deps.buildRuntime(pr.settings.stateDir, maxCacheEntries)
       # RFC-0005 B2b: override BEFORE realSeams closes over `rt` — realSeams'
       # own store closure reads `rt.sink` (its embedded copy), so the swap
       # must happen here, not on the CacheContext built below (that sink
@@ -1262,3 +1311,15 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     verifyDivergences: verifyDivergences,
     cacheStats:        cacheStats,  # RFC-0005 B2b
   )
+
+# ---------------------------------------------------------------------------
+# runTests — the public, opts-only facade (RFC-0005 A3b)
+# ---------------------------------------------------------------------------
+
+proc runTests*(opts: RunOptions = RunOptions()): RunReport =
+  ## Full run facade.  Returns outcomes; never raises for expected conditions.
+  ## Thin wrapper over `runTestsWith` with `productionCacheDeps()` — the
+  ## real dependency (`cacheregistry.localOnlyCache`, unchanged behavior).
+  ## See `runTestsWith`'s doc comment for the full flow; see `CacheDeps`'s
+  ## for why the split exists.
+  runTestsWith(opts, productionCacheDeps())

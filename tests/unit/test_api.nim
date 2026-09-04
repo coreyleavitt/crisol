@@ -42,6 +42,17 @@ import std/[json, options, os, osproc, strutils, times, unittest]
 import crisol/api
 import crisol/types
 import crisol/process/types as ptypes
+# RFC-0005 A3b — E2E-A-trust: runTestsWith/CacheDeps injects a real
+# CacheRuntime built directly from the cache-internal modules (memory
+# tiers + a controllable mock TrustPolicy) -- these are NOT part of the
+# contracted `crisol/api` facade (runTestsWith/CacheDeps are themselves
+# documented-uncontracted), so the test reaches past api.nim on purpose,
+# exactly as this slice's own design intends.
+import crisol/cacheport      # TrustPolicy, StoredEntry, Attestation, SigAlg, CacheVerdict
+import crisol/cachetier      # Tier, TieredCache
+import crisol/cachememory    # memory()
+import crisol/cacheregistry  # CacheRuntime
+import crisol/cachetelemetry # NilSink
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -759,6 +770,108 @@ suite "RunReport.cacheStats — RFC-0005 B2b end-to-end (real runTests, no CLI)"
       check rr.status == rsOk
       check rr.cacheStats.l1Hits > 0
       check rr.cacheStats.hitPct > 0.0
+
+# ---------------------------------------------------------------------------
+# RFC-0005 A3b — runTestsWith / CacheDeps: the internal injection seam.
+# ---------------------------------------------------------------------------
+
+suite "runTestsWith / CacheDeps — production parity":
+
+  test "runTests(opts) == runTestsWith(opts, productionCacheDeps()) in observable outcome":
+    ## runTests is now a thin wrapper -- prove the delegation is real, not
+    ## a second, silently-diverging code path.
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let rr = runTestsWith(opts, productionCacheDeps())
+      check rr.status == rsOk
+      check rr.results.len == 1
+      check rr.results[0].cacheDecision == cdmStored
+
+# ---------------------------------------------------------------------------
+# RFC-0005 A3b — E2E-A-trust (RFC §Definition of done, verbatim): two
+# `memory` tiers via `runTestsWith`, a mock `TrustPolicy` returning
+# `cvTrustBadSignature` ⇒ live execution, `cacheLookup == "trustBadSignature"`,
+# `cacheDecision == cdmStored`, the rejected entry never served.
+#
+# End-to-end through the REAL entry path (runTestsWith -> planImpl -> execute
+# -> the hit/live stamps -> jsonout render), not a unit test of TieredCache
+# or the mock policy in isolation (those are test_cachetier.nim's job).
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock TrustPolicy":
+
+  proc mockRejectPolicy(): TrustPolicy =
+    ## `sign` always attaches an Attestation (so a fresh store's put rule
+    ## accepts on BOTH verifyTrust tiers -- warming the cache); `verify`
+    ## ALWAYS rejects (cvTrustBadSignature), so nothing stored under this
+    ## policy can ever be served back -- the security-meaningful case
+    ## `nonePolicy` cannot exercise (A3a's own rationale for the mock).
+    TrustPolicy(
+      name: "mock-reject",
+      verify: proc(entry: StoredEntry): CacheVerdict = cvTrustBadSignature,
+      sign: proc(entry: var StoredEntry) =
+        entry.attestation = some(Attestation(sigAlg: saHmacSha256, signer: "mock-signer",
+                                              signature: "sig", signedAt: 0)),
+    )
+
+  test "trust-rejected entry on both tiers -> live execution, cacheLookup trustBadSignature, cacheDecision stored, never served":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      let l1 = memory()
+      let l2 = memory()
+      let deps = CacheDeps(buildRuntime: proc(stateDir: string; maxEntries: int): CacheRuntime =
+        CacheRuntime(
+          cache: TieredCache(
+            tiers: @[
+              Tier(name: "l1", backend: l1, backfillOnHit: false, verifyTrust: true),
+              Tier(name: "l2", backend: l2, backfillOnHit: false, verifyTrust: true),
+            ],
+            trust: mockRejectPolicy(),
+          ),
+          sink: NilSink[TelemetryEvent](),
+        ))
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+
+      # First call: both memory tiers start empty -> genuine miss -> live
+      # run -> shouldStore publishes (sign attaches an attestation, so the
+      # put rule accepts on both verifyTrust tiers) -- warms both tiers'
+      # backing Tables (which persist across calls: `deps` closes over the
+      # SAME `l1`/`l2` backend values on every call).
+      let rr1 = runTestsWith(opts, deps)
+      check rr1.status == rsOk
+      check rr1.results.len == 1
+      check rr1.results[0].cacheDecision == cdmStored
+      # First-ever compile: the entrypoint is edNeverBuilt at plan time, not
+      # edRunFresh -- lookupAtPlan's cache-eligibility gate never runs a
+      # real consult for it (no binary exists yet to serve from cache), so
+      # PlanLookup.lookup stays at its cvOk zero value (same "not literally
+      # consulted, degenerate default" case cacheStats.misses already
+      # counts this index under -- see aggregateCacheStats's own doc: the
+      # fold is decision-sourced, not event-sourced, for exactly this
+      # reason). The wire still renders cacheLookup here (cacheDecision
+      # ends up "stored", not one of notConsultedDecisions) -- cvOk is the
+      # honest least-wrong value available.
+      check rr1.results[0].cacheLookup == cvOk
+
+      # Second call: SAME backends, SAME mock policy -- `verify` now
+      # rejects the entry on EVERY consulted tier, so the waterfall finds
+      # nothing servable and the entrypoint reruns live.
+      let rr2 = runTestsWith(opts, deps)
+      check rr2.status == rsOk
+      check rr2.results.len == 1
+      let r2 = rr2.results[0]
+      check r2.cacheDecision == cdmStored          # the live rerun re-publishes (self-healing)
+      check r2.cacheLookup == cvTrustBadSignature
+      check r2.cacheTier == ""                     # never served from any tier
+      check r2.run.kind == ptypes.pkRan            # a genuine LIVE run, not a cache replay
+
+      # Wire-level assertion (RFC's own DoD wording, verbatim): the run/v2
+      # render, not just the in-process EntrypointResult.
+      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let epNode = node["entrypoints"][0]
+      check epNode["cacheLookup"].getStr == "trustBadSignature"
+      check epNode["cacheDecision"].getStr == "stored"
 
 # ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.
