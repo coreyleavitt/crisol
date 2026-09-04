@@ -3,7 +3,7 @@
 ## All types shared by discover, plan, and execute. Only what A1–A3 needs is
 ## defined here; later slices append without touching the existing definitions.
 
-import std/[algorithm, options, random, sets]
+import std/[algorithm, hashes, options, random, sets]
 # rfc-0007 A1c: dependency inversion. Outcome/HermeticLevel now live in
 # process/types.nim (moved out of this module) because EntrypointResult below
 # carries `compile`/`run: Phase` fields directly — process/types cannot import
@@ -35,6 +35,10 @@ proc `==`*(a, b: IdentityKey): bool {.borrow.}
 proc `==`*(a, b: SoundnessKey): bool {.borrow.}
 proc `$`*(k: IdentityKey): string {.borrow.}
 proc `$`*(k: SoundnessKey): string {.borrow.}
+proc hash*(k: SoundnessKey): Hash {.borrow.}
+  ## rfc-0005 A1: `cachememory.nim`'s `memory`/`memoryBytes` doubles key a
+  ## `Table` by `SoundnessKey` — the standard `distinct string` borrow, same
+  ## as `==`/`$` above.
 
 type
   RlimitOverrides* = object

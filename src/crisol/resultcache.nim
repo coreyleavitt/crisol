@@ -167,9 +167,14 @@ proc keyFilePath(stateDir: string; key: SoundnessKey): string {.inline.} =
 # Payload (de)serialization — the canonical form the checksum is taken over
 # ---------------------------------------------------------------------------
 
-proc payloadToJson(res: CachedResult): JsonNode =
+proc payloadToJson*(res: CachedResult): JsonNode =
   ## Serialize ONLY the payload (no header, no checksum).  The checksum is an
   ## FNV-1a fold over `$payloadToJson(res)`, so this must be deterministic.
+  ##
+  ## rfc-0005 A1: exported so `cachewire`'s `CacheSerializer` and this
+  ## module's own `loadCached`/`storeCached` share the identical proc --
+  ## "one canonical payload" (see `canonicalPayload` below), not two
+  ## codecs that merely happen to agree by construction.
   let recsArr = newJArray()
   for r in res.records:
     let recNode = newJObject()
@@ -198,9 +203,11 @@ proc parseStatus(s: string): Option[RecordStatus] =
   of "rsSkip": some(rsSkip)
   else:        none(RecordStatus)
 
-proc payloadFromJson(node: JsonNode): Option[CachedResult] =
+proc payloadFromJson*(node: JsonNode): Option[CachedResult] =
   ## Parse a payload node into a CachedResult.  Returns none on any structural
   ## problem (treated as a MISS by the caller) — never raises on bad data.
+  ##
+  ## rfc-0005 A1: exported alongside `payloadToJson` (see there).
   ##
   ## rfc-0007 A1d-ii: `run` is parsed through `resultjson.fromJson` — crisol's
   ## OWN reader (§2).  A structural problem in the stored observation (a
@@ -241,6 +248,18 @@ proc payloadFromJson(node: JsonNode): Option[CachedResult] =
       res.records.add rec
 
   result = some(res)
+
+proc canonicalPayload*(res: CachedResult): string =
+  ## THE canonical byte form the payload checksum is computed over -- one
+  ## proc, shared by writer (`storeCached`), reader (`loadCached`), and, from
+  ## rfc-0005 A1, the `cachewire` serializer's integrity and trust layers
+  ## (RFC-0005 "Integrity vs. trust — two layers, two hashes, one canonical
+  ## payload"; ed25519/HMAC sign over `SHA256(canonicalPayload(res))` in
+  ## Stage C, but that layer is crypto-free through A1).  Deliberately just
+  ## `$payloadToJson(res)` -- no separate encoding, so "one proc, shared by
+  ## every consumer" is literally true rather than two codecs that happen to
+  ## agree by construction.
+  $payloadToJson(res)
 
 # ---------------------------------------------------------------------------
 # Public: load
@@ -292,7 +311,7 @@ proc loadCached*(stateDir: string; key: SoundnessKey): Option[CachedResult] =
   let parsed = payloadFromJson(payloadNode)
   if parsed.isNone: return
 
-  let recomputed = toHex16(fnv1a64($payloadToJson(parsed.get)))
+  let recomputed = toHex16(fnv1a64(canonicalPayload(parsed.get)))
   if recomputed != storedChecksum: return  # checksum mismatch ⇒ MISS
 
   var res = parsed.get
@@ -363,7 +382,7 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
   # Compute checksum over the canonical payload serialization, then assemble the
   # full file node (header + checksum + payload).
   let payloadNode = payloadToJson(res)
-  let checksum    = toHex16(fnv1a64($payloadNode))
+  let checksum    = toHex16(fnv1a64(canonicalPayload(res)))
 
   let headerNode = newJObject()
   headerNode["formatVersion"] = newJInt(resultCacheFormatVersion)

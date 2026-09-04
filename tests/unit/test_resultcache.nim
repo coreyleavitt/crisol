@@ -278,4 +278,44 @@ block test_structurally_bad_run_node_is_a_miss:
   let loaded = loadCached(sd, key)
   assert loaded.isNone, "a structurally-bad `run` node must be a MISS"
 
+# ---------------------------------------------------------------------------
+# 9. rfc-0005 A1 tracer: the shared codec (`payloadToJson`/`payloadFromJson`/
+#    `canonicalPayload`), exported for the new `cachewire` serializer, is the
+#    SAME codec the real production `loadCached` reads with -- not a private
+#    duplicate that merely happens to share a shape.  Proven by building a
+#    cache file using ONLY the exported functions (never `storeCached`) and
+#    handing it to the real `loadCached`.
+# ---------------------------------------------------------------------------
+
+block test_exported_codec_is_loadCacheds_real_format:
+  let sd = freshStateDir("exportedcodec")
+  defer: removeDir(sd)
+  let key = SoundnessKey("c0dec0dec0dec0de")
+  let res = sampleResult(exitCode = 7)
+
+  let payloadNode = payloadToJson(res)
+  let checksum    = toHex16(fnv1a64(canonicalPayload(res)))
+  assert canonicalPayload(res) == $payloadNode,
+    "canonicalPayload must be exactly $payloadToJson(res) (RFC-0005 'one canonical payload')"
+
+  let headerNode = newJObject()
+  headerNode["formatVersion"] = newJInt(resultCacheFormatVersion)
+  let fileNode = newJObject()
+  fileNode["header"]          = headerNode
+  fileNode["payloadChecksum"] = newJString(checksum)
+  fileNode["payload"]         = payloadNode
+
+  createDir(cacheDir(sd))
+  writeFile(keyFile(sd, key), $fileNode)
+
+  let loaded = loadCached(sd, key)
+  assert loaded.isSome, "loadCached must accept a file built purely from the exported shared codec"
+  assert loaded.get.run.exit.code == 7
+  assert loaded.get.payloadChecksum == checksum
+
+  let reparsed = payloadFromJson(payloadNode)
+  assert reparsed.isSome
+  assert reparsed.get.run.exit.code == res.run.exit.code
+  assert reparsed.get.cachedAt == res.cachedAt
+
 echo "test_resultcache: all blocks passed"
