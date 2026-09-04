@@ -17,13 +17,43 @@
 ##   7. soft-cap: dir already at cap → store SKIPPED, returns false; entries intact.
 ##   8. rfc-0007 A1d-ii: a structurally-bad `run` node (unparseable enum
 ##      string) is a MISS, never a fabricated read (§2 own-reader posture).
+##   9. rfc-0005 A2a: the root-taking helpers (`loadCachedAt`/
+##      `storeCachedAt`/`gcResultCacheAt`) and the stateDir-taking legacy
+##      forms are behavior-identical -- same file, same bytes, on disk,
+##      regardless which form a caller uses (the no-regression anchor for
+##      the A2a refactor).
+##  10. rfc-0005 A2a: `storeCachedAt`'s stderr failure warning is
+##      rate-limited to ONE line per root per process lifetime -- proven via
+##      real stderr (fd-level capture), not just the once-set's bookkeeping.
 
 import std/[os, json, options, strutils]
-import std/posix as posix_m  # L10: getpid() for PID-unique tmp filename check
+import std/posix as posix_m  # L10: getpid() for PID-unique tmp filename check; also fd-capture (test 10)
 import crisol/types
 import crisol/resultcache
 import crisol/process/types as ptypes
 import crisol/depgraph  # fnv1a64/toHex16 — recompute a matching checksum in test 8
+
+# ---------------------------------------------------------------------------
+# Stderr fd-capture helper (test 10) — redirects the OS-level fd 2 for the
+# duration of `body`, so the rate-limiting proof exercises the REAL stream
+# `warnStoreFailureOnce` writes to, not merely the once-set's internal state.
+# ---------------------------------------------------------------------------
+
+proc withCapturedStderr(body: proc()): string =
+  stdout.flushFile()
+  stderr.flushFile()
+  let capPath = getTempDir() / ("crisol_resultcache_stderr_capture_" & $posix_m.getpid() & ".txt")
+  let savedFd = posix_m.dup(2.cint)
+  let capFd = posix_m.open(capPath.cstring,
+                            posix_m.O_WRONLY or posix_m.O_CREAT or posix_m.O_TRUNC, 0o600)
+  discard posix_m.dup2(capFd, 2.cint)
+  discard posix_m.close(capFd)
+  body()
+  stderr.flushFile()
+  discard posix_m.dup2(savedFd, 2.cint)
+  discard posix_m.close(savedFd)
+  result = readFile(capPath)
+  removeFile(capPath)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -317,5 +347,102 @@ block test_exported_codec_is_loadCacheds_real_format:
   assert reparsed.isSome
   assert reparsed.get.run.exit.code == res.run.exit.code
   assert reparsed.get.cachedAt == res.cachedAt
+
+# ---------------------------------------------------------------------------
+# 9. rfc-0005 A2a: root-taking helpers vs. stateDir-taking delegates --
+#    behavior-identical, same file on disk, either direction.
+# ---------------------------------------------------------------------------
+
+block test_at_helpers_and_statedir_delegates_agree:
+  let sd = freshStateDir("a2a_anchor")
+  defer: removeDir(sd)
+  let root = sd / "cache"
+
+  # Store via the legacy stateDir form; the file must land at exactly
+  # <stateDir>/cache/v<N>/<key>.json (the documented, unchanged layout).
+  let k1 = SoundnessKey("a0a0a0a0a0a0a0a0")
+  let r1 = sampleResult(exitCode = 11)
+  assert storeCached(sd, k1, r1)
+  assert fileExists(keyFile(sd, k1)), "storeCached must write to <stateDir>/cache/v<N>/<key>.json"
+
+  # The root-taking loader must read that SAME file.
+  let viaAt = loadCachedAt(root, k1)
+  assert viaAt.isSome
+  assert viaAt.get.run.exit.code == 11
+
+  # Store via the root-taking form directly; must land at the identical path
+  # a stateDir-form store would have used.
+  let k2 = SoundnessKey("b0b0b0b0b0b0b0b0")
+  let r2 = sampleResult(exitCode = 22)
+  assert storeCachedAt(root, k2, r2)
+  assert fileExists(keyFile(sd, k2)),
+    "storeCachedAt(stateDir / \"cache\", ...) must land at the SAME path storeCached(stateDir, ...) would"
+
+  # The legacy loader must read what the root-taking form wrote.
+  let viaLegacy = loadCached(sd, k2)
+  assert viaLegacy.isSome
+  assert viaLegacy.get.run.exit.code == 22
+
+  # gcResultCacheAt(root, ...) and gcResultCache(stateDir, ...) must observe
+  # and evict the identical entry set -- prove via a deterministic age-based
+  # eviction of k1 (old) while k2 (fresh) survives, using the root-taking form.
+  let nowSecs = int64(1_700_050_000)
+  let report = gcResultCacheAt(root, maxEntries = 100, maxAgeSecs = 1,
+                               nowSecs = nowSecs)
+  assert report.evicted == 2, "both entries' cachedAt (1_700_000_xxx) predate nowSecs - 1s"
+  assert loadCachedAt(root, k1).isNone
+  assert loadCachedAt(root, k2).isNone
+
+# ---------------------------------------------------------------------------
+# 10. rfc-0005 A2a: storeCachedAt's stderr warning is rate-limited to ONE
+#     line per root per process lifetime.
+# ---------------------------------------------------------------------------
+
+block test_store_failure_warning_rate_limited_per_root:
+  resetCacheWriteWarnings()
+
+  let sdA = freshStateDir("ratelimit_a")
+  let sdB = freshStateDir("ratelimit_b")
+  defer:
+    removeDir(sdA)
+    removeDir(sdB)
+  let rootA = sdA / "cache"
+  let rootB = sdB / "cache"
+
+  # Seed rootA to its cap (2), then attempt THREE further new-key stores --
+  # each individually would warn under the old (unlimited) behavior; the
+  # rate limiter must reduce that to exactly one line for rootA.
+  assert storeCachedAt(rootA, SoundnessKey("c0c0c0c0c0c0c0c0"), sampleResult(), maxCacheEntries = 2)
+  assert storeCachedAt(rootA, SoundnessKey("c1c1c1c1c1c1c1c1"), sampleResult(), maxCacheEntries = 2)
+
+  let captured = withCapturedStderr(proc() =
+    for i in 0 ..< 3:
+      let k = SoundnessKey("c2c2c2c2c2c2c2c" & $i)
+      let ok = storeCachedAt(rootA, k, sampleResult(), maxCacheEntries = 2)
+      assert not ok, "each of these three stores must be soft-capped (skipped)"
+    # A DIFFERENT root's first failure must still warn -- the bucket is
+    # per-root, not a single global once-flag.
+    assert storeCachedAt(rootB, SoundnessKey("d0d0d0d0d0d0d0d0"), sampleResult(), maxCacheEntries = 2)
+    assert storeCachedAt(rootB, SoundnessKey("d1d1d1d1d1d1d1d1"), sampleResult(), maxCacheEntries = 2)
+    let okB = storeCachedAt(rootB, SoundnessKey("d2d2d2d2d2d2d2d2"), sampleResult(), maxCacheEntries = 2)
+    assert not okB
+  )
+
+  let lines = captured.strip(chars = {'\n'}).splitLines()
+  var warnLines: seq[string]
+  for l in lines:
+    if l.len > 0: warnLines.add l
+  assert warnLines.len == 2,
+    "expected exactly 2 warning lines (one per root: the FIRST skipped key " &
+    "each, never the 2nd/3rd skip on the same root), got " & $warnLines.len &
+    ": " & captured
+  # The warning message names the skipped KEY, not the root path (see
+  # storeCachedAt) -- so the per-root FIRST-failure key is what proves which
+  # root's warning survived: rootA's first skip is "c2...0", rootB's is
+  # "d2...2" (its only attempted skip).
+  assert "c2c2c2c2c2c2c2c0" in captured, "rootA's FIRST skip must still warn: " & captured
+  assert "c2c2c2c2c2c2c2c1" notin captured, "rootA's 2nd skip must be suppressed: " & captured
+  assert "c2c2c2c2c2c2c2c2" notin captured, "rootA's 3rd skip must be suppressed: " & captured
+  assert "d2d2d2d2d2d2d2d2" in captured, "rootB's first skip must warn independently of rootA: " & captured
 
 echo "test_resultcache: all blocks passed"

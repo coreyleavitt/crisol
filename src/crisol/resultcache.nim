@@ -72,7 +72,7 @@
 ## bounds inode/directory growth (`ext4` `readdir`/`unlink` degrade past ~100 K
 ## entries) until the real LRU GC lands in A1c.
 
-import std/[algorithm, json, options, os, strutils]
+import std/[algorithm, json, options, os, sets, strutils]
 import crisol/types
 import crisol/depgraph   # re-uses fnv1a64, toHex16; never reimplement the hash
 import crisol/ioutils    # atomicPublish: shared O_EXCL-tmp + writeAllFd + rename(2)
@@ -156,12 +156,20 @@ proc isResultCacheRootName*(name: string): bool =
 # ---------------------------------------------------------------------------
 # Path helpers (internal)
 # ---------------------------------------------------------------------------
+#
+# rfc-0005 A2a: the "At" forms take a *result-cache root* directly (the
+# `<root>` in `<root>/v<N>/<key>.json`) — this is the layer `localFsBackend`
+# (cachelocalfs.nim, a DIFFERENT on-disk shape/version axis — see there) and
+# a future `file://` remote tier will build on. The legacy stateDir-taking
+# forms below are thin delegates (`root = stateDir / "cache"`) so every
+# existing caller (`clean.nim`, `test_resultcache*.nim`, `test_a1c_gc.nim`,
+# `test_c0_clean_stores.nim`) is behavior-identical — same paths on disk.
 
-proc cacheVersionDir(stateDir: string): string {.inline.} =
-  stateDir / "cache" / resultCacheDirName()
+proc cacheVersionDirAt(root: string): string {.inline.} =
+  root / resultCacheDirName()
 
-proc keyFilePath(stateDir: string; key: SoundnessKey): string {.inline.} =
-  cacheVersionDir(stateDir) / ($key & ".json")
+proc keyFilePathAt(root: string; key: SoundnessKey): string {.inline.} =
+  cacheVersionDirAt(root) / ($key & ".json")
 
 # ---------------------------------------------------------------------------
 # Payload (de)serialization — the canonical form the checksum is taken over
@@ -265,8 +273,9 @@ proc canonicalPayload*(res: CachedResult): string =
 # Public: load
 # ---------------------------------------------------------------------------
 
-proc loadCached*(stateDir: string; key: SoundnessKey): Option[CachedResult] =
-  ## Look up `key` in the cache.
+proc loadCachedAt*(root: string; key: SoundnessKey): Option[CachedResult] =
+  ## Look up `key` in the result cache rooted at `root` (entries live at
+  ## `<root>/v<resultCacheFormatVersion>/<key>.json`).
   ##
   ## Returns `none` (a MISS — never an exception) when:
   ##   - the file is absent;
@@ -278,7 +287,7 @@ proc loadCached*(stateDir: string; key: SoundnessKey): Option[CachedResult] =
   ##     A1d-ii's own-reader posture, §2).
   ##
   ## On a hit, returns `some(CachedResult)` with `payloadChecksum` populated.
-  let path = keyFilePath(stateDir, key)
+  let path = keyFilePathAt(root, key)
   if not fileExists(path): return
 
   var raw: string
@@ -318,6 +327,11 @@ proc loadCached*(stateDir: string; key: SoundnessKey): Option[CachedResult] =
   res.payloadChecksum = storedChecksum
   result = some(res)
 
+proc loadCached*(stateDir: string; key: SoundnessKey): Option[CachedResult] =
+  ## Thin delegate: `loadCachedAt(stateDir / "cache", key)` — see there for
+  ## the full contract. Keeps every existing caller behavior-identical.
+  loadCachedAt(stateDir / "cache", key)
+
 # ---------------------------------------------------------------------------
 # Soft-cap helper
 # ---------------------------------------------------------------------------
@@ -338,26 +352,58 @@ proc countCacheEntries(dir: string): int =
       inc result
 
 # ---------------------------------------------------------------------------
+# Rate-limited store-failure warnings (rfc-0005 A2a)
+# ---------------------------------------------------------------------------
+#
+# storeCachedAt's stderr warnings (soft-cap skip, cache-dir create failure,
+# atomic-write failure) are best-effort diagnostics, not control flow — but
+# a full disk (or a persistently-full L1) hit during N backfills in a single
+# run must not flood stderr with N near-identical lines. Rate-limited to ONE
+# line per (root) per process lifetime: the FIRST failure for a given root is
+# diagnostic enough, and every subsequent one for the SAME root is silently
+# swallowed (a DIFFERENT root still gets its own first warning — the bucket
+# is per-root, not global). `resetCacheWriteWarnings` exists solely so a test
+# suite's later cases are not silently gagged by an earlier case's warning.
+
+var warnedStoreRoots: HashSet[string]
+
+proc resetCacheWriteWarnings*() =
+  ## Test-only: clear the once-per-run per-root store-failure warning state.
+  warnedStoreRoots = initHashSet[string]()
+
+proc warnStoreFailureOnce*(root: string; msg: string) =
+  ## Exported (rfc-0005 A2a) so `cachelocalfs.nim`'s `localFsBackend` shares
+  ## the SAME once-per-root suppressor `storeCachedAt` uses below — one
+  ## warning bucket per root, not two independent ones that could each emit
+  ## their own first line for the same physical directory.
+  if root in warnedStoreRoots: return
+  warnedStoreRoots.incl root
+  stderr.write(msg)
+
+# ---------------------------------------------------------------------------
 # Public: store
 # ---------------------------------------------------------------------------
 
-proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
-                  maxCacheEntries = DefaultMaxCacheEntries): bool =
-  ## Store `res` under `key`, atomically.  Returns:
+proc storeCachedAt*(root: string; key: SoundnessKey; res: CachedResult;
+                    maxCacheEntries = DefaultMaxCacheEntries): bool =
+  ## Store `res` under `key` in the result cache rooted at `root` (entries
+  ## land at `<root>/v<resultCacheFormatVersion>/<key>.json`), atomically.
+  ## Returns:
   ##   - `true`  — the entry was written (or replaced in place);
-  ##   - `false` — the write was SKIPPED by the interim soft cap.
+  ##   - `false` — the write was SKIPPED by the interim soft cap, or failed.
   ##
   ## The soft cap skips only when adding a *new* key would exceed
   ## `maxCacheEntries`; re-storing an existing key always proceeds (it replaces,
-  ## not grows).  A skipped store never raises and never evicts.
+  ## not grows).  A skipped/failed store never raises and never evicts.
   ##
   ## Atomicity: payload+header+checksum are serialized, written to
   ## `<key>.json.tmp` with O_CREAT|O_EXCL (a planted symlink/file makes the open
   ## fail), then `rename(2)`d into place.  A stale `.tmp` is removed first.
-  ## On any I/O failure this warns to stderr and returns `false` — a cache write
-  ## is best-effort and never aborts a run.
-  let verDir    = cacheVersionDir(stateDir)
-  let finalPath = keyFilePath(stateDir, key)
+  ## On any I/O failure this warns to stderr (rate-limited, once per `root`
+  ## per process lifetime — see above) and returns `false` — a cache write is
+  ## best-effort and never aborts a run.
+  let verDir    = cacheVersionDirAt(root)
+  let finalPath = keyFilePathAt(root, key)
   # L10: atomicPublish (ioutils) writes to `<finalPath>.<pid>.tmp` — the
   # writer's PID in the tmp filename means concurrent writers for the same
   # key each operate on their own tmp file, no collision on the stale-tmp
@@ -367,7 +413,7 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
   # Soft cap: only blocks growth (a NEW key past the cap), never a replacement.
   if not fileExists(finalPath):
     if countCacheEntries(verDir) >= maxCacheEntries:
-      stderr.write("crisol: warning: result cache at soft cap (" &
+      warnStoreFailureOnce(root, "crisol: warning: result cache at soft cap (" &
                    $maxCacheEntries & " entries); skipping write for key " &
                    $key & " (run `crisol clean` to prune)\n")
       return false
@@ -375,7 +421,7 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
   try:
     createDir(verDir)
   except OSError as e:
-    stderr.write("crisol: warning: could not create cache dir '" & verDir &
+    warnStoreFailureOnce(root, "crisol: warning: could not create cache dir '" & verDir &
                  "': " & e.msg & "\n")
     return false
 
@@ -402,10 +448,17 @@ proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
   # factor-out.
   let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
-    stderr.write("crisol: warning: could not write cache entry '" & finalPath &
+    warnStoreFailureOnce(root, "crisol: warning: could not write cache entry '" & finalPath &
                  "': " & err & "\n")
     return false
   return true
+
+proc storeCached*(stateDir: string; key: SoundnessKey; res: CachedResult;
+                  maxCacheEntries = DefaultMaxCacheEntries): bool =
+  ## Thin delegate: `storeCachedAt(stateDir / "cache", key, res,
+  ## maxCacheEntries)` — see there for the full contract. Keeps every
+  ## existing caller behavior-identical.
+  storeCachedAt(stateDir / "cache", key, res, maxCacheEntries)
 
 # ---------------------------------------------------------------------------
 # A1c: Result-cache GC (size-bounded LRU + age eviction)
@@ -447,12 +500,13 @@ proc readCachedAt(path: string): int64 =
   if payload == nil or payload.kind != JObject: return 0
   payload{"cachedAt"}.getBiggestInt(0)
 
-proc gcResultCache*(stateDir: string; maxEntries: int; maxAgeSecs: int64;
-                    nowSecs: int64): GcResultCacheReport =
-  ## Evict result-cache entries that violate the size or age bound.
+proc gcResultCacheAt*(root: string; maxEntries: int; maxAgeSecs: int64;
+                      nowSecs: int64): GcResultCacheReport =
+  ## Evict result-cache entries (rooted at `root`, i.e.
+  ## `<root>/v<resultCacheFormatVersion>/`) that violate the size or age bound.
   ##
   ## Parameters:
-  ##   stateDir    — the `.crisol` state directory.
+  ##   root        — the result-cache root (e.g. `<stateDir>/cache`).
   ##   maxEntries  — keep at most this many entries (LRU by cachedAt); 0 = no size bound.
   ##   maxAgeSecs  — evict entries older than this many seconds; 0 = no age bound.
   ##   nowSecs     — current unix epoch seconds (injected for testability).
@@ -462,8 +516,8 @@ proc gcResultCache*(stateDir: string; maxEntries: int; maxAgeSecs: int64;
   ## Safety:
   ##   - Never raises on malformed files; parse failures → treated as `cachedAt = 0`.
   ##   - Only deletes `*.json` files (not `.tmp` or other artifacts).
-  ##   - Callers (cleanOrphans) must hold the stateDir lock before calling.
-  let verDir = cacheVersionDir(stateDir)
+  ##   - Callers (cleanOrphans) must hold the root's exclusive lock before calling.
+  let verDir = cacheVersionDirAt(root)
   if not dirExists(verDir):
     return (evicted: 0)
 
@@ -512,3 +566,10 @@ proc gcResultCache*(stateDir: string; maxEntries: int; maxAgeSecs: int64;
       inc evicted
 
   result = (evicted: evicted)
+
+proc gcResultCache*(stateDir: string; maxEntries: int; maxAgeSecs: int64;
+                    nowSecs: int64): GcResultCacheReport =
+  ## Thin delegate: `gcResultCacheAt(stateDir / "cache", maxEntries,
+  ## maxAgeSecs, nowSecs)` — see there for the full contract. Keeps every
+  ## existing caller (`clean.nim`) behavior-identical.
+  gcResultCacheAt(stateDir / "cache", maxEntries, maxAgeSecs, nowSecs)
