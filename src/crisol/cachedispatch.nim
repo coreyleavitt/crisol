@@ -41,6 +41,7 @@ import crisol/cachetier
 import crisol/cachewire
 import crisol/cachelocalfs  # RFC-0005 B1b: readSidecar/writeSidecar (sidecar I/O)
 import crisol/cacheregistry
+import crisol/cachetelemetry  # RFC-0005 B2a: TelemetryEvent/TelemetrySink/NilSink
 # rfc-0007 §2: synthesize() replays the REAL stored `run` ProcessResult as
 # a `Phase(kind: pkCached, ...)` node -- `outcome(r)` (there is no stored
 # field) is recomputed over it at THIS boundary (lookupAtPlan) -- see
@@ -177,6 +178,12 @@ type
     policy*: CachePolicy   ## always present: governs store-gate decisions
     seams*:  CacheSeams    ## keyOf==nil iff !active (invariant maintained by constructors)
     active*: bool          ## true iff caching is fully enabled (keyOf!=nil AND policy.enabled)
+    sink*:   TelemetrySink[TelemetryEvent]
+      ## RFC-0005 B2a: threaded to `lookupAtPlan`'s hit/miss emission (the
+      ## store side gets its sink from the `CacheRuntime` `realSeams`
+      ## closed over — see that proc). Defaults to `NilSink` so a caller
+      ## that never installs telemetry (e.g. every existing `cacheEnabled`
+      ## call site predating B2a) pays nothing for it.
 
 proc cacheDisabled*(spec: SandboxSpec): CacheContext =
   ## Construct a CacheContext with caching fully disabled.
@@ -187,13 +194,19 @@ proc cacheDisabled*(spec: SandboxSpec): CacheContext =
     policy: CachePolicy(enabled: false),
     seams:  CacheSeams(),   # keyOf==nil sentinel
     active: false,
+    sink:   NilSink[TelemetryEvent](),
   )
 
 proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
-                   seams: CacheSeams): CacheContext =
+                   seams: CacheSeams;
+                   sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()
+                   ): CacheContext =
   ## Construct a CacheContext with caching enabled.
   ## `seams.keyOf` MUST be non-nil; asserted at construction time so an
   ## inconsistent (enabled-but-no-keyOf) state is caught at the boundary.
+  ## `sink` defaults to `NilSink` — pass a real sink (e.g. an
+  ## `InMemorySink`'s, or, production, the `CacheRuntime`'s) to observe
+  ## `lookupAtPlan`'s hit/miss events.
   doAssert seams.keyOf != nil,
     "cacheEnabled: seams.keyOf must be non-nil (use cacheDisabled if not caching)"
   doAssert policy.enabled,
@@ -203,6 +216,7 @@ proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
     policy: policy,
     seams:  seams,
     active: true,
+    sink:   sink,
   )
 
 proc isActive*(ctx: CacheContext): bool {.inline.} =
@@ -266,8 +280,15 @@ proc lookupAtPlan*(
   policy: CachePolicy;
   seams:  CacheSeams;
   explainDiag: bool = false;
+  sink:   TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
 ): PlanLookup =
   ## Decide whether `pep` can be served from cache.
+  ##
+  ## RFC-0005 B2a: on the REAL (non-diagnostic) consult below, emits exactly
+  ## one `tekHit`/`tekMiss` through `sink` — see `cachetelemetry.nim`'s
+  ## module doc for why this proc, not `realSeams.load`, owns the emission
+  ## (the diagnostic consult a few lines down calls that SAME `load` closure
+  ## and must emit nothing).
   ##
   ## Only `edRunFresh` entrypoints are eligible (a fresh binary is required for
   ## edCached).  edNeverBuilt / edStale are `cdmNotEligible` (cache not consulted).
@@ -331,6 +352,16 @@ proc lookupAtPlan*(
   let d    = derive(seams, pep)
   let kStr = $d.key
   let l    = seams.load(pep, d)
+  # RFC-0005 B2a: the real (non-diagnostic) consult -- exactly one event.
+  # A later recompute-invalidated hit (cdmRecomputeMiss, below) still emits
+  # tekHit here: the cache-level lookup genuinely hit; see
+  # cachetelemetry.aggregateCacheStats's doc for why l1Hits is nonetheless
+  # decision-sourced rather than a raw tekHit count.
+  if l.hit.isSome:
+    sink.emit(TelemetryEvent(kind: tekHit, tier: l.hit.get.tier,
+                             durationMs: l.hit.get.result.run.durationUs div 1000))
+  else:
+    sink.emit(TelemetryEvent(kind: tekMiss, verdicts: l.verdicts))
   if l.hit.isNone:
     return PlanLookup(decision: edRunFresh, cacheDecision: cdmKeyMiss, inputHash: kStr,
                       synthesized: none(EntrypointResult), explain: l.explain)
@@ -595,7 +626,13 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
              ))
              result = false
              for v in verdicts:
-               if v.verdict == cvOk: result = true
+               # RFC-0005 B2a: publish/remote-err on put outcomes.
+               if v.verdict == cvOk:
+                 result = true
+                 rt.sink.emit(TelemetryEvent(kind: tekPublish, publishedTo: v.tier))
+               elif v.verdict in transportVerdicts:
+                 rt.sink.emit(TelemetryEvent(kind: tekRemoteErr, putTier: v.tier,
+                                             putVerdict: v.verdict))
              if result and rt.localRoot.len > 0:
                writeSidecar(rt.localRoot, pep.ep.path,
                             SidecarEntry(key: d.key, inputs: d.inputs, envDigest: ctx.envDigest))

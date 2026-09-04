@@ -1380,7 +1380,8 @@ proc execute*(
       # there with rationale; this call site is the single consumer.
       cacheDecisions[i] = inactiveDecision(pep.edecision)
       continue
-    let look = lookupAtPlan(p.entrypoints[i], cache.policy, cache.seams, explainMiss)
+    let look = lookupAtPlan(p.entrypoints[i], cache.policy, cache.seams, explainMiss,
+                            cache.sink)
     cacheDecisions[i] = look.cacheDecision
     inputHashes[i]    = look.inputHash  # A8: stamped onto live miss results below
     explains[i]       = look.explain    # RFC-0005 B1c: stamped onto live miss results below

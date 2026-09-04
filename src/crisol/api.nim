@@ -564,11 +564,13 @@ proc recordsDiverge(a, b: seq[TestRecord]): bool =
       return true
   false
 
-proc verifyCachePass(results: seq[EntrypointResult];
+proc verifyCachePass*(results: seq[EntrypointResult];
                      entrypoints: seq[PlannedEntrypoint];
                      vc: VerifyCache; config: Config; graph: var DepGraph;
                      nimVersion, ccVersion: string;
-                     sandboxSpec: SandboxSpec): seq[VerifyDivergence] =
+                     sandboxSpec: SandboxSpec;
+                     sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()
+                     ): seq[VerifyDivergence] =
   ## The --verify-cache determinism backstop (RFC-0005 §Stage B). Samples
   ## this run's `cdmHit` entries (seeded sampler, B3a `sampleHitIndices`),
   ## builds a SYNTHETIC plan from them (B3a `buildVerifyPlan` — never a
@@ -587,6 +589,13 @@ proc verifyCachePass(results: seq[EntrypointResult];
   ## `releaseLock` — the binary precondition (`cdmHit` this run implies
   ## `edRunFresh` at plan time, i.e. the binary exists) holds only while the
   ## stateDir lock is held, and lastrun.json must reflect the main run only.
+  ##
+  ## Exported* (RFC-0005 B2a) so a test can drive this pass directly — with
+  ## its own `results`/`entrypoints` built via `runner.execute` + a real
+  ## `CacheRuntime`/`InMemorySink` — without needing the `--cache-stats`
+  ## surface `runTests*` doesn't install until Stage B2b. `runTests*` remains
+  ## the only production call site (that binary/lock precondition is its
+  ## contract to keep, not this proc's).
   if not vc.enabled: return @[]
 
   let decisions = results.mapIt(it.cacheDecision)
@@ -634,6 +643,8 @@ proc verifyCachePass(results: seq[EntrypointResult];
       storedRecords:   stored.records,
       freshRecords:    fresh.records,
     )
+    # RFC-0005 B2a: the landed B3c divergence path's telemetry event.
+    sink.emit(TelemetryEvent(kind: tekVerifyFail, path: stored.ep.path))
 
     var what: seq[string]
     if exitDiverged: what.add "exit"
@@ -1033,7 +1044,8 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       let rt = localOnlyCache(pr.settings.stateDir, maxCacheEntries)
       cacheEnabled(spec,
         CachePolicy(enabled: true),
-        realSeams(keyCtx, addr graph, rt))
+        realSeams(keyCtx, addr graph, rt),
+        rt.sink)  # RFC-0005 B2a: NilSink today; B2b installs a real sink on `rt`
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
   # are written by execute() itself (via ptr out-params) rather than caught as
@@ -1164,7 +1176,7 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   let verifyDivergences =
     if opts.verifyCache.enabled and not interrupted:
       verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
-                      nimVer, ccVer, spec)
+                      nimVer, ccVer, spec, cacheCtx.sink)
     else: @[]
 
   releaseLock(lockHandle)

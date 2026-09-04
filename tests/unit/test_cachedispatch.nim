@@ -7,6 +7,9 @@
 ##   - lookupAtPlan: policy disabled → cdmPolicyDisabled, no load called
 ##   - shouldStore gate: pass+achieved+attempt1 → store; every negative branch
 ##   - synthesized result carries historical duration + cached flag + records
+##   - RFC-0005 B2a: lookupAtPlan hit/miss telemetry through the real seam
+##     (localOnlyCache -> realSeams), the not-eligible/diagnostic-consult
+##     exclusions, and realSeams.store's publish/remote-err telemetry
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_cachedispatch.nim
@@ -18,6 +21,9 @@ import crisol/keys           # KeyDiff, KeyComponent (kcFlags/kcHermeticEnv)
 import crisol/cacheregistry  # localOnlyCache -- a real CacheRuntime + local root
 import crisol/cachelocalfs   # sidecarPath -- raw sidecar file inspection
 import crisol/cachetier      # CacheLookup, TierHit -- RFC-0005 B1c PlanLookup.explain tests
+import crisol/cachetelemetry # RFC-0005 B2a: TelemetryEvent/InMemorySink
+import crisol/runner          # execute() -- drives a real run directly (no planner)
+import crisol/api             # verifyCachePass/VerifyCache/verifySample/VerifyDivergence
 import "../support/helpers"  # legacySeams
 
 # ---------------------------------------------------------------------------
@@ -718,5 +724,205 @@ suite "inactiveDecision — inactive-cache decision matrix":
     ## edCached requires a plan-time hit which requires isActive; this branch is
     ## documented as unreachable but must not crash or produce a wrong decision.
     check inactiveDecision(edCached) == cdmNotEligible
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B2a — telemetry: lookupAtPlan hit/miss through the real seam
+# ---------------------------------------------------------------------------
+##
+## The tier below "realSeams — explain-miss sidecar" already establishes the
+## freshStateDir/samplePassResult/pepAt fixture trio; reused verbatim here so
+## these tests drive the SAME real local-fs seam, not a hand-rolled double.
+
+suite "RFC-0005 B2a — telemetry: lookupAtPlan hit/miss (real seam)":
+
+  test "hit through the real seam -> exactly one tekHit{tier: l1, durationMs from cached result}":
+    let sd = freshStateDir("tekhit")
+    let rt = localOnlyCache(sd, maxEntries = 0)
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_tekhit.nim")
+    let d = derive(seams, pep)
+    check seams.store(pep, d, samplePassResult())  # durationUs = 1000
+
+    let mem = newInMemorySink()
+    let look = lookupAtPlan(pep, defaultCachePolicy(), seams, sink = mem.sink)
+    check look.cacheDecision == cdmHit
+    check mem.events.len == 1
+    check mem.events[0].kind == tekHit
+    check mem.events[0].tier == "l1"
+    check mem.events[0].durationMs == 1  # 1000us -> 1ms
+
+  test "consulted miss -> tekMiss":
+    let sd = freshStateDir("tekmiss")
+    let rt = localOnlyCache(sd, maxEntries = 0)
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_tekmiss.nim")  # never stored -> genuine miss
+
+    let mem = newInMemorySink()
+    let look = lookupAtPlan(pep, defaultCachePolicy(), seams, sink = mem.sink)
+    check look.cacheDecision == cdmKeyMiss
+    check mem.events.len == 1
+    check mem.events[0].kind == tekMiss
+
+  test "not-eligible entry (edNeverBuilt) -> no event":
+    var c: Calls
+    let mem = newInMemorySink()
+    let look = lookupAtPlan(freshPep(edNeverBuilt), onPolicy, seamsHit(c, sampleCached()),
+                            sink = mem.sink)
+    check look.cacheDecision == cdmNotEligible
+    check mem.events.len == 0
+
+  test "policy-disabled entry -> no event":
+    var c: Calls
+    let mem = newInMemorySink()
+    let look = lookupAtPlan(freshPep(edRunFresh), offPolicy, seamsHit(c, sampleCached()),
+                            sink = mem.sink)
+    check look.cacheDecision == cdmPolicyDisabled
+    check mem.events.len == 0
+
+  test "diagnostic consult (non-edRunFresh + explainDiag) -> zero events":
+    ## RFC-0005 B1c's flag-gated diagnostic consult (--explain-miss on a
+    ## recompiling, non-edRunFresh entrypoint) calls seams.load PURELY to
+    ## recover .explain -- it must never be counted as a real lookup.
+    var c: Calls
+    let mem = newInMemorySink()
+    let look = lookupAtPlan(freshPep(edStale), onPolicy, seamsMissWithExplain(c, @[]),
+                            explainDiag = true, sink = mem.sink)
+    check look.cacheDecision == cdmNotEligible
+    check c.loadCalls == 1        # the diagnostic load DID happen...
+    check mem.events.len == 0     # ...but emitted nothing
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B2a — telemetry: realSeams.store publish/remote-err
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 B2a — telemetry: realSeams.store (real seam)":
+
+  test "successful store -> tekPublish":
+    let sd = freshStateDir("tekpublish")
+    var rt = localOnlyCache(sd, maxEntries = 0)
+    let mem = newInMemorySink()
+    rt.sink = mem.sink
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_tekpublish.nim")
+    let d = derive(seams, pep)
+    check seams.store(pep, d, samplePassResult())
+    check mem.events.len == 1
+    check mem.events[0].kind == tekPublish
+    check mem.events[0].publishedTo == "l1"
+
+  test "failed store (unwritable root) -> tekRemoteErr with the verdict":
+    let sd = freshStateDir("tekremoteerr")
+    # A plain FILE where the cache root directory should be: ENOTDIR blocks
+    # `createDir`, which `localFsBackend.put` reports as cvOffline
+    # (transportVerdicts) regardless of autoCreate -- cachelocalfs.nim's own
+    # documented rule ("a file blocks the dir, autoCreate can't fix it").
+    writeFile(sd / "cache", "blocker")
+    var rt = localOnlyCache(sd, maxEntries = 0)
+    let mem = newInMemorySink()
+    rt.sink = mem.sink
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_tekremoteerr.nim")
+    let d = derive(seams, pep)
+    check not seams.store(pep, d, samplePassResult())
+    check mem.events.len == 1
+    check mem.events[0].kind == tekRemoteErr
+    check mem.events[0].putTier == "l1"
+    check mem.events[0].putVerdict == cvOffline
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B2a — telemetry: tekVerifyFail (through the landed B3 machinery)
+# ---------------------------------------------------------------------------
+##
+## Drives `runner.execute` directly (no planner, mirroring
+## test_cache_dispatch_boundary.nim's pattern) against a REAL localOnlyCache
+## + realSeams, so `verifyCachePass` (exported for exactly this) can be
+## called with our own InMemorySink -- runTests* has no public knob to
+## install one before Stage B2b's --cache-stats. The nondeterministic
+## fixture (flips exit code on every real execution, via a counter file in
+## the project root -- rfc-0007 issue #17's "children spawn in projectRoot")
+## is test_b3b_verify_cache.nim's own proven technique for a genuine
+## divergence.
+
+const B2aFlipFixture = """
+import std/[os, strutils]
+const counterFile = "verify_counter.txt"
+var n = 0
+if fileExists(counterFile):
+  n = parseInt(readFile(counterFile).strip())
+inc n
+writeFile(counterFile, $n)
+if n mod 2 == 1: quit(0) else: quit(1)
+"""
+
+suite "RFC-0005 B2a — telemetry: tekVerifyFail":
+
+  test "a genuine --verify-cache divergence emits exactly one tekVerifyFail carrying the path":
+    let dir = getTempDir() / "crisol_b2a_verifyfail"
+    removeDir(dir); createDir(dir)
+    defer: removeDir(dir)
+    let epPath = dir / "test_flip.nim"
+    writeFile(epPath, B2aFlipFixture)
+
+    let cfg = Config(projectRoot: dir, stateDir: ".crisol",
+                     compileTimeoutSecs: 120, timeoutSecs: 60)
+    let spec = resolveSandbox(hlIsolated)
+    var g = emptyDepGraph()
+    let rt = localOnlyCache(dir / ".crisol", maxEntries = 0)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+
+    # Run 1: edNeverBuilt -- compiles + runs live (n=1 -> exit 0) + stores
+    # via the real cache; also records epPath's closureHash into `g`.
+    let pep1 = PlannedEntrypoint(ep: Entrypoint(path: epPath, group: "unit", flags: @[]),
+                                 edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    let results1 = execute(
+      RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
+    check results1.len == 1
+    check results1[0].cacheDecision == cdmStored
+    check readFile(dir / "verify_counter.txt").strip() == "1"
+
+    # Run 2: edRunFresh -- `g` now has epPath's closureHash, so lookupAtPlan
+    # derives the SAME key -> cdmHit (no fresh execution for this run).
+    let pep2 = PlannedEntrypoint(ep: Entrypoint(path: epPath, group: "unit", flags: @[]),
+                                 edecision: edRunFresh, runTimeoutMs: 60_000)
+    let results2 = execute(
+      RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
+    check results2.len == 1
+    check results2[0].cacheDecision == cdmHit
+    check readFile(dir / "verify_counter.txt").strip() == "1"   # unchanged: served from cache
+
+    # The verify pass: forces a genuine third execution (n=2 -> exit 1),
+    # diverging from the stored exit-0 observation.
+    let mem = newInMemorySink()
+    let divergences = verifyCachePass(
+      results2, @[pep2], verifySample(pct = 100), cfg, g,
+      "2.2.10", "gcc 13.2.0", spec, mem.sink)
+
+    check readFile(dir / "verify_counter.txt").strip() == "2"   # proves a real re-execution
+    check divergences.len == 1
+    check divergences[0].ep.path == epPath
+    check divergences[0].exitDiverged
+
+    check mem.events.len == 1
+    check mem.events[0].kind == tekVerifyFail
+    check mem.events[0].path == epPath
 
 echo "test_cachedispatch: done"

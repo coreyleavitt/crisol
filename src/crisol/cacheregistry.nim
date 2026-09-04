@@ -10,36 +10,28 @@
 ## `localOnlyCache(stateDir, maxEntries)` builds the single-tier "l1"
 ## local-fs cache that makes a purely-local run behaviorally identical to
 ## RFC-0004: `TieredCache{@[l1Tier], nonePolicy()}` + a silent sink.
+##
+## RFC-0005 B2a: `CacheRuntime.sink` is `TelemetrySink[TelemetryEvent]` —
+## the real event type (`cachetelemetry.nim`), replacing A2b's placeholder
+## `CacheEvent`.  `localOnlyCache` still defaults to `NilSink` (a purely-
+## local run with no `--cache-stats`/InMemorySink override pays nothing for
+## observability it never asked for); a caller that wants telemetry
+## overrides `.sink` on the returned `CacheRuntime`.
 
 import std/os
 import crisol/cacheport
 import crisol/cachetier
 import crisol/cachelocalfs
+import crisol/cachetelemetry
+
+export cachetelemetry
 
 type
-  CacheEvent* = object
-    ## A2b placeholder event type. `cacheport.TelemetrySink[E]` is generic
-    ## (see that module's doc comment on why); the real event type
-    ## (`TelemetryEvent`, a variant covering tekHit/tekMiss/tekPublish/…)
-    ## is owned by `cachetelemetry.nim`, which does not exist until Stage
-    ## B2a. Rather than leak `TelemetrySink`'s generic parameter into
-    ## `CacheRuntime` (and therefore into every caller of `realSeams`/
-    ## `localOnlyCache`, none of which has any business naming an event
-    ## type it will never construct in A2b), `CacheRuntime.sink` is pinned
-    ## to `TelemetrySink[CacheEvent]` — a zero-field, uninstantiable-except-
-    ## as-a-unit placeholder. Nothing in A2b constructs a `CacheEvent`
-    ## value or calls `sink.emit`: `NilSink[CacheEvent]()` (its `emit` is
-    ## `discard`) is the only value ever assigned, matching the RFC's "a
-    ## purely-local run pays nothing for observability it never asked for."
-    ## Stage B2a swaps this alias for the real `TelemetryEvent` and wires
-    ## the `tekHit`/`tekMiss`/`tekPublish`/`tekRemoteErr` emit calls into
-    ## `realSeams`' load/store adapters.
-
   CacheRuntime* = object
     ## The cache-side bundle `realSeams`/`api.nim` receive (one place for
     ## growth; no dispose — RFC-0005 "Wiring").
     cache*: TieredCache
-    sink*:  TelemetrySink[CacheEvent]
+    sink*:  TelemetrySink[TelemetryEvent]
     localRoot*: string
       ## RFC-0005 B1b: the LOCAL-FS root the explain-miss sidecar lives
       ## under (tier 0 / "l1" only — never a shared remote tier, which
@@ -62,6 +54,6 @@ proc localOnlyCache*(stateDir: string; maxEntries: int): CacheRuntime =
   )
   CacheRuntime(
     cache:     TieredCache(tiers: @[l1], trust: nonePolicy()),
-    sink:      NilSink[CacheEvent](),
+    sink:      NilSink[TelemetryEvent](),
     localRoot: root,
   )
