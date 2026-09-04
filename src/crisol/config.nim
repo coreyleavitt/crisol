@@ -19,6 +19,7 @@
 ## verify-cache-pct 5                   // RFC-0005 B3c: --verify-cache sample-percent default
 ## explain-miss #true                   // RFC-0005 B1c: ↔ --explain-miss (config < CLI;
 ##                                       // --explain-miss-verbose is CLI-only, no KDL key)
+## cache-stats #true                     // RFC-0005 B2b: ↔ --cache-stats (config < CLI)
 ## env-pin "USER" "ci-runner"            // RFC-0005 A0: pin NAME=VALUE into every child env
 ##                                       // (repeatable node = more pins); the pinned value,
 ##                                       // not the host's own, enters the soundness key.
@@ -478,6 +479,9 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # strict-hygiene above -- api.planImpl OR's the CLI flag in, never
     # overrides a config `true` back to `false`.
     explainMiss: bool = false
+    # RFC-0005 B2b: --cache-stats's config-file default (`cache-stats
+    # #true`). Same strengthen-only opt-in shape as explainMiss above.
+    cacheStats: bool = false
     # RFC-0005 A0: repeatable `env-pin "NAME" "VALUE"` nodes -> NAME=VALUE
     # pairs pinned into every child env (see sandbox.filterEnv's tail).
     envPins: seq[(string, string)]
@@ -573,6 +577,12 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v.isNone or v.get.kind != kvBool:
         cfgErr("config: 'explain-miss' requires a boolean argument (#true/#false)")
       explainMiss = v.get.boolVal
+    of "cache-stats":
+      # bool node: cache-stats #true  or  cache-stats #false
+      let v = n.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: 'cache-stats' requires a boolean argument (#true/#false)")
+      cacheStats = v.get.boolVal
     of "env-pin":
       # RFC-0005 A0: `env-pin "NAME" "VALUE"` -- exactly 2 string args.
       # Repeatable: each node contributes ONE pin (unlike `flags`/`dep-roots`,
@@ -628,6 +638,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     rlimitNofile:       rlimitNofile,
     verifyCachePct:     verifyCachePct,
     explainMiss:        explainMiss,
+    cacheStats:         cacheStats,
     envPins:            envPins,
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).

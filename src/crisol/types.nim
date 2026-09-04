@@ -336,6 +336,17 @@ type
                                 ## `--explain-miss-verbose` is CLI-only (no KDL key; the RFC's
                                 ## config-additions list omits it) and implies this field true.
                                 ## Default false: byte-for-byte unchanged until an operator opts in.
+    cacheStats*: bool          ## RFC-0005 B2b: resolved --cache-stats / `cache-stats #true`
+                                ## KDL node (config < CLI: api.planImpl strengthens a config
+                                ## `false` to `true` when the CLI flag is passed -- same
+                                ## strengthen-only shape as explainMiss above; never the reverse).
+                                ## Gates installing a REAL telemetry sink (an InMemorySink) in
+                                ## place of the default NilSink for the run -- api.runTests reads
+                                ## THIS field, not a raw RunOptions flag, so a config-file-only
+                                ## opt-in is honored identically to the CLI flag. Also gates the
+                                ## human summary-line render and the run/v2 `cacheStats` field's
+                                ## PRESENCE. Default false: a run that never asks for --cache-stats
+                                ## pays nothing for the telemetry it never asked to see.
     workerBinary*: string       ## INTERNAL plumbing (not user-facing; no KDL node). Absolute path
                                 ## to a binary whose `main()` dispatches the
                                 ## `--internal-measure-compile` token (see measureworker.nim /

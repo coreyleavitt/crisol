@@ -40,6 +40,7 @@
 ## stay in `realSeams.store`, exactly where the RFC sketch places them.
 
 import std/sequtils
+import std/tables
 import crisol/cacheport
 import crisol/cachetier
 
@@ -188,3 +189,82 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
     published:    published,
     verifyFails:  verifyFails,
   )
+
+# ---------------------------------------------------------------------------
+# Per-tier 100%-error diagnostic — RFC-0005 B2b ("Hit-rate telemetry":
+# "crisol additionally writes a stderr warning when a configured remote tier
+# errored on every call in a run ... attributed per tier via
+# CacheLookup.verdicts even when a later tier served").
+# ---------------------------------------------------------------------------
+
+const tierErrorVerdicts* = transportVerdicts + trustVerdicts + {cvCorrupt}
+  ## The RFC's own list for this diagnostic: "'errored' includes the trust
+  ## codes and cvCorrupt" in addition to the transport-class verdicts
+  ## (`cvOffline`/`cvTimeout`/`cvUnauthorized`) `remoteErrors` already
+  ## counts. Deliberately EXCLUDES `cvMiss` (a normal cold-cache miss is not
+  ## an error) and `cvVersionSkew` (a storage-format mismatch, not a
+  ## backend/trust failure) — the RFC's own enumerated set, not "every
+  ## non-cvOk verdict".
+
+type
+  TierErrorReport* = object
+    ## One tier that errored on every read this run consulted it for.
+    tier*:  string
+    calls*: int  ## the (nonzero) number of consulted reads — always equals
+                 ## the error count by construction (see `erroredTiers`).
+
+proc erroredTiers*(events: seq[TelemetryEvent]): seq[TierErrorReport] =
+  ## Pure fold, mirroring `aggregateCacheStats`'s shape: tallies, per tier
+  ## name, how many reads it was consulted for and how many of those came
+  ## back with a verdict in `tierErrorVerdicts`.
+  ##
+  ## **Scope note (this slice ships a single "l1" tier only — Stage A3a
+  ## lands the multi-tier waterfall):** the RFC's prose frames this as "a
+  ## configured REMOTE tier errored on every call", but no remote tier can
+  ## exist before A3a lands `cacheregistry.configuredCache` (A3c) — there is
+  ## nothing "remote" to attribute yet. Rather than gate this on a tier
+  ## label that cannot occur, the fold is written generically against
+  ## whatever tiers `events` actually names: today that is only ever "l1",
+  ## so a broken/misconfigured local-fs root (e.g. a state dir the process
+  ## cannot read) already gets the SAME honest diagnosis the RFC wants for a
+  ## dead remote — and once A3a/A3c add real remote tiers, this proc needs
+  ## no changes to start covering them (each tier already carries its own
+  ## name on every `TierVerdict`/`tekHit.tier`).
+  ##
+  ## A read is attributed via:
+  ##   - `tekHit.tier`         — the serving tier's verdict was `cvOk` (never
+  ##                             an error) — contributes to that tier's call
+  ##                             count only.
+  ##   - `tekMiss.verdicts`    — one `TierVerdict` per tier CONSULTED on the
+  ##                             miss (`cachetier.CacheLookup.verdicts`,
+  ##                             threaded verbatim into the event) —
+  ##                             contributes to both the call count and,
+  ##                             when the verdict is in `tierErrorVerdicts`,
+  ##                             the error count.
+  ## Store-side events (`tekPublish`/`tekRemoteErr`) are deliberately NOT
+  ## folded in here: the RFC's "attributed per tier via CacheLookup.verdicts"
+  ## names the READ path specifically; `remoteErrors` already reports the
+  ## write-side failure count in aggregate.
+  var totals, errors: OrderedTable[string, int]
+  for ev in events:
+    case ev.kind
+    of tekHit:
+      totals.mgetOrPut(ev.tier, 0).inc
+    of tekMiss:
+      for tv in ev.verdicts:
+        totals.mgetOrPut(tv.tier, 0).inc
+        if tv.verdict in tierErrorVerdicts:
+          errors.mgetOrPut(tv.tier, 0).inc
+    of tekRemoteErr, tekPublish, tekVerifyFail:
+      discard
+  for tier, calls in totals:
+    if calls > 0 and errors.getOrDefault(tier, 0) == calls:
+      result.add TierErrorReport(tier: tier, calls: calls)
+
+proc tierErrorWarning*(t: TierErrorReport): string =
+  ## Pure formatter for the stderr warning `erroredTiers` results drive
+  ## ("a tier that rejects 100% of reads is as dead as one that times out" —
+  ## RFC-0005 "Hit-rate telemetry"). Callers write this unconditionally to
+  ## stderr (no `--quiet` exists in crisol; RFC "Output channels").
+  "cache tier '" & t.tier & "' errored on every consulted read this run (" &
+  $t.calls & "/" & $t.calls & ") — treat it as misconfigured or unreachable"

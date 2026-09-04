@@ -944,6 +944,60 @@ group "unit" {
     check cfg.explainMiss == false
 
 # ---------------------------------------------------------------------------
+# RFC-0005 B2b — cache-stats gate (config parity with --cache-stats)
+# ---------------------------------------------------------------------------
+
+suite "config — cache-stats gate (RFC-0005 B2b)":
+
+  test "absent cache-stats -> cfg.cacheStats == false (default off)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cacheStats == false
+
+  test "cache-stats #true round-trips to cfg.cacheStats == true":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-stats #true
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cacheStats == true
+
+  test "cache-stats #false round-trips to cfg.cacheStats == false":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-stats #false
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cacheStats == false
+
+  test "cache-stats with a non-boolean argument raises cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "cache-stats \"yes\"\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    expect CrisolError:
+      discard loadConfig(configPath = cfgPath)
+
+  test "no config file (convention fallback) -> cfg.cacheStats == false":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check cfg.cacheStats == false
+
+# ---------------------------------------------------------------------------
 # M-report PASS (b1) — reuse-check alerting policy block
 # ---------------------------------------------------------------------------
 

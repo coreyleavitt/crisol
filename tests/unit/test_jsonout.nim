@@ -1549,8 +1549,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 20 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss)":
-    check RunSchemaRevision == 20
+  test "RunSchemaRevision is 21 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats)":
+    check RunSchemaRevision == 21
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default

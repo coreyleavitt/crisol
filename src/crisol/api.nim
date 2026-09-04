@@ -52,8 +52,8 @@
 
 import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, times]
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock,
-               sandbox, cachedispatch, cacheregistry, resultcache, ccprobe, nimprobe, planner,
-               order, ledger, keys, depgraph, stats, compilereport]
+               sandbox, cachedispatch, cacheregistry, cachetelemetry, resultcache, ccprobe,
+               nimprobe, planner, order, ledger, keys, depgraph, stats, compilereport]
 # rfc-0007 A2b: `crisol/signals` (the process-global gotSignal flag) is no
 # longer this module's concern — `runner.execute`'s OWN Supervisor now owns
 # SIGINT/SIGTERM installation for the duration of the call (`installSignals`
@@ -131,6 +131,7 @@ export render.renderClosure
 # From jsonout — schema constant + toJsonString only (NOT persistLastRun, loadLastRun)
 export jsonout.toJsonString
 export jsonout.RunSchema
+export cachetelemetry.CacheStats  # RFC-0005 B2b: RunReport.cacheStats's type
 export jsonout.closureToJsonString
 export jsonout.ClosureV1Schema
 
@@ -323,6 +324,16 @@ type
     ## detail to an already-shown block).
     explainMiss*:         bool = false
     explainMissVerbose*:  bool = false
+    ## RFC-0005 B2b: --cache-stats (KDL `cache-stats`; config < CLI). false
+    ## by default (identical behavior to before this slice: NilSink,
+    ## RunReport.cacheStats a zero value). Gates installing a real
+    ## InMemorySink for the run's `CacheContext.sink`/`CacheRuntime.sink`
+    ## (see `runTests`) -- a run that never opts in collects no telemetry
+    ## events and pays for none of the bookkeeping. api.planImpl merges this
+    ## into `cfg.cacheStats` (opt-in-only-strengthen, same shape as
+    ## explainMiss); `runTests` reads `cfg.cacheStats`, never this raw field
+    ## directly, so a config-file-only opt-in is honored identically.
+    cacheStats*:          bool = false
 
   ResolvedSettings* = object
     ## Slim projection of the resolved Config (NOT the full Config).
@@ -343,6 +354,11 @@ type
                           ## var, when deciding whether to render the miss-explanation block
                           ## or set the run/v2 `keyDiff` field's presence, so a config-file-only
                           ## `--explain-miss` (no CLI flag passed) is honored identically.
+    cacheStats*: bool     ## RFC-0005 B2b: resolved --cache-stats (CLI flag OR config-file
+                          ## `cache-stats #true`, opt-in-only-strengthen — same shape as
+                          ## explainMiss above). The CLI reads THIS when deciding whether to
+                          ## render the cache-stats summary line or set the run/v2
+                          ## `cacheStats` field's presence.
 
   PlanReport* = object
     ## Output of planTests().  plan-phase result; no DepGraph or full Config.
@@ -394,6 +410,15 @@ type
                                   ## re-entrancy... three guards") — a verify
                                   ## re-execution is diagnostic, never a substitute
                                   ## observation for the entrypoint's reported outcome.
+    cacheStats*: CacheStats       ## RFC-0005 B2b: `aggregateCacheStats(events, decisions)`
+                                  ## over the run's real telemetry (hit/miss/publish/
+                                  ## remote-error/verifyFail) and per-result cacheDecisions.
+                                  ## A ZERO-VALUE `CacheStats()` (same "always-present,
+                                  ## zero-value-is-honest" convention as `verifyFails`) when
+                                  ## `cfg.cacheStats` is false — no InMemorySink was ever
+                                  ## installed, so there is nothing real to report; the CLI
+                                  ## reads `rr.plan.settings.cacheStats` (not this field's
+                                  ## "is it all zero?") to decide whether to show it at all.
 
   VerifyDivergence* = object
     ## RFC-0005 B3b: one --verify-cache mismatch between the observation the
@@ -736,6 +761,9 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   # config-file `explain-miss #true` setting (true wins), mirroring
   # strictHygiene/measureCompileReuse above.
   if opts.explainMiss: cfg.explainMiss = true
+  # RFC-0005 B2b: CLI/library --cache-stats can only strengthen a
+  # config-file `cache-stats #true` setting, same shape as explainMiss above.
+  if opts.cacheStats: cfg.cacheStats = true
   if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
   # Fix 1: RunOptions.rlimitNofile, when set, overrides Config.rlimitNofile.
   if opts.rlimitNofile.isSome: cfg.rlimitNofile = opts.rlimitNofile
@@ -810,6 +838,7 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     timeoutSecs: cfg.timeoutSecs,
     strictHygiene: cfg.strictHygiene,  # rfc-0007 A6b
     explainMiss:   cfg.explainMiss,    # RFC-0005 B1c
+    cacheStats:    cfg.cacheStats,     # RFC-0005 B2b
   )
   let pr = PlanReport(
     entrypoints: pv.plan.entrypoints,
@@ -1019,9 +1048,19 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   # STRING is soundly distinguished; see the module-doc note above.
   let ccVer  = cachedCcVersion()
   let nimVer = cachedNimFingerprint()
+  # RFC-0005 B2b: --cache-stats installs a REAL InMemorySink in place of the
+  # default NilSink so the run's hit/miss/publish/remote-error/verifyFail
+  # events are actually collected. `cfg.cacheStats` is the RESOLVED value
+  # (CLI flag OR config-file `cache-stats #true`, already merged above) —
+  # reading it here, not opts.cacheStats directly, matches explainMiss's own
+  # precedent. `nil` (not installed) when the run never asked for telemetry:
+  # NilSink stays free, exactly as before this slice.
+  let statsSink = if cfg.cacheStats: newInMemorySink() else: nil
   let cacheCtx =
     if opts.noCache:
-      cacheDisabled(spec)   # fully off; spec still governs sandbox hermeticity
+      var ctx = cacheDisabled(spec)   # fully off; spec still governs sandbox hermeticity
+      if statsSink != nil: ctx.sink = statsSink.sink()
+      ctx
     else:
       # RFC-0005 A2b: keyContext built once (the key-derivation closure's
       # captured state); localOnlyCache built once (the single-tier "l1"
@@ -1041,11 +1080,16 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       let maxCacheEntries =
         if cfg.maxCacheEntries > 0: cfg.maxCacheEntries
         else: DefaultMaxCacheEntries
-      let rt = localOnlyCache(pr.settings.stateDir, maxCacheEntries)
+      var rt = localOnlyCache(pr.settings.stateDir, maxCacheEntries)
+      # RFC-0005 B2b: override BEFORE realSeams closes over `rt` — realSeams'
+      # own store closure reads `rt.sink` (its embedded copy), so the swap
+      # must happen here, not on the CacheContext built below (that sink
+      # only reaches lookupAtPlan's hit/miss emission, the READ side).
+      if statsSink != nil: rt.sink = statsSink.sink()
       cacheEnabled(spec,
         CachePolicy(enabled: true),
         realSeams(keyCtx, addr graph, rt),
-        rt.sink)  # RFC-0005 B2a: NilSink today; B2b installs a real sink on `rt`
+        rt.sink)  # RFC-0005 B2a: NilSink by default; B2b's statsSink above when installed
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
   # are written by execute() itself (via ptr out-params) rather than caught as
@@ -1179,6 +1223,26 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
                       nimVer, ccVer, spec, cacheCtx.sink)
     else: @[]
 
+  # RFC-0005 B2b: aggregate the run's real telemetry (hit/miss/publish/
+  # remote-error events, PLUS verifyCachePass's tekVerifyFail above, since
+  # both were emitted through the SAME statsSink) against this run's actual
+  # per-result cacheDecisions. A zero-value CacheStats() when statsSink was
+  # never installed (`cfg.cacheStats == false`) -- nothing was collected.
+  let cacheStats =
+    if statsSink != nil:
+      aggregateCacheStats(statsSink.events, results.mapIt(it.cacheDecision))
+    else: CacheStats()
+
+  # RFC-0005 B2b: "crisol additionally writes a stderr warning when a
+  # configured remote tier errored on every call in a run" (RFC "Hit-rate
+  # telemetry"). Only meaningful when telemetry was actually collected;
+  # unconditional stderr like every other warning in this codebase (no
+  # --quiet exists). See cachetelemetry.erroredTiers's doc for the scope
+  # note on "remote" vs. today's single "l1" tier.
+  if statsSink != nil:
+    for terr in erroredTiers(statsSink.events):
+      stderr.write("crisol: warning: " & tierErrorWarning(terr) & "\n")
+
   releaseLock(lockHandle)
 
   # rfc-0007 A1e-ii: an interrupted run still returns through this ONE
@@ -1196,4 +1260,5 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     compileBlock:      compileBlock,
     interrupted:       interrupted,
     verifyDivergences: verifyDivergences,
+    cacheStats:        cacheStats,  # RFC-0005 B2b
   )

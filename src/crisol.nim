@@ -155,6 +155,7 @@ Usage:
               [--rlimit-nofile <N>]
               [--env-pin NAME=VALUE]...
               [--explain-miss | --explain-miss-verbose]
+              [--cache-stats]
               [--verify-cache [--verify-cache-pct <N>]
                               [--verify-cache-seed <N>] [--verify-cache-strict]]
   crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
@@ -251,6 +252,15 @@ Additional options for 'run':
                   Like --explain-miss, but shows full untruncated component
                   values instead of the terse truncated form. Implies
                   --explain-miss.
+  --cache-stats   Print a one-line cache-hit/miss/publish/wall-time-saved
+                  summary after the run (also settable via crisol.kdl's
+                  `cache-stats #true`) and add a `cacheStats` object to the
+                  run/v2 JSON document. In --json mode the summary line
+                  renders to stderr (stdout stays parseable JSON). Also
+                  enables a stderr warning when a cache tier errored on
+                  every read consulted this run (a misconfigured/dead
+                  tier, indistinguishable otherwise from a cold cache).
+                  Off by default (no telemetry sink installed).
   --verify-cache  The determinism backstop: after the run completes, re-
                   executes a sample of this run's cache hits and compares
                   the fresh observation against the stored one. Divergence
@@ -689,6 +699,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     envPins: seq[(string, string)]   # RFC-0005 A0: collected from --env-pin NAME=VALUE (repeatable)
     explainMissFlag:        bool = false  # RFC-0005 B1c: --explain-miss
     explainMissVerboseFlag: bool = false  # RFC-0005 B1c: --explain-miss-verbose (implies explain)
+    cacheStatsFlag:         bool = false  # RFC-0005 B2b: --cache-stats
 
   let runArgs = args[1..^1]
   var i = 0
@@ -720,7 +731,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                  "perf-check", "hermetic", "measure-compile-reuse",
                  "rlimit-nofile", "verify-cache", "verify-cache-pct",
                  "verify-cache-seed", "verify-cache-strict", "env-pin",
-                 "explain-miss", "explain-miss-verbose"] and isList:
+                 "explain-miss", "explain-miss-verbose", "cache-stats"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
         stderr.write(usage())
         return ExitEnvironment
@@ -892,6 +903,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         # alone is enough to get output).
         explainMissFlag = true
         explainMissVerboseFlag = true
+      of "cache-stats":
+        cacheStatsFlag = true
       of "env-pin":
         # RFC-0005 A0: --env-pin NAME=VALUE (repeatable). Malformed input
         # (no '=', or an empty NAME) is a usage error, same shape as --base
@@ -1083,6 +1096,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     envPins:             envPins,       # RFC-0005 A0: --env-pin NAME=VALUE (repeatable)
     explainMiss:         explainMissFlag,         # RFC-0005 B1c: verbose already folded in above
     explainMissVerbose:  explainMissVerboseFlag,  # RFC-0005 B1c
+    cacheStats:          cacheStatsFlag,          # RFC-0005 B2b
     workerBinary:        selfWorkerBinary,  # "" unless the real CLI entrypoint (below) passed
                                              # its own getAppFilename() — see runMain's doc above
                                              # for why this must never be resolved in here.
@@ -1188,6 +1202,11 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
   # opt-in (no CLI flag passed) is honored identically to the CLI flag.
   let explainMissResolved = rr.plan.settings.explainMiss
 
+  # RFC-0005 B2b: resolved --cache-stats (CLI flag OR config-file
+  # `cache-stats #true`, already merged by planImpl into rr.plan.settings)
+  # -- same shape as explainMissResolved above.
+  let cacheStatsResolved = rr.plan.settings.cacheStats
+
   if jsonMode:
     # In --json mode ALL human lines go to stderr (stdout stays parseable
     # JSON) -- the miss-explanation block is exactly such a human line; the
@@ -1198,18 +1217,27 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
           for blk in explainMissLines(r.keyDiff, explainMissVerboseFlag):
             for physLine in blk.splitLines():
               stderr.write("crisol: " & r.ep.path & ": explain: " & physLine & "\n")
+    # RFC-0005 B2b: same routing rule -- the cache-stats summary line is
+    # exactly such a human line; the structured data lives in the
+    # `cacheStats` field below instead.
+    if cacheStatsResolved:
+      stderr.write("crisol: " & renderCacheStats(rr.cacheStats) & "\n")
     stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
                               rr.memThrottledSlots, interrupted = rr.interrupted,
                               policy = policy, substrate = process.capabilities(),
                               verifyFails = rr.verifyDivergences.len,
-                              explainMiss = explainMissResolved))
+                              explainMiss = explainMissResolved,
+                              cacheStats = rr.cacheStats,
+                              showCacheStats = cacheStatsResolved))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,
                            filterTag: if filterTag.len > 0: some(filterTag)
                                       else: none(string),
                            explainMiss: explainMissResolved,
-                           explainMissVerbose: explainMissVerboseFlag)
+                           explainMissVerbose: explainMissVerboseFlag,
+                           showCacheStats: cacheStatsResolved,
+                           cacheStats: rr.cacheStats)
     stdout.write(render(rr.results, rr.summary, ropts, policy))
     # Gate-skip messages after results.
     if rr.plan.gatedOut.len > 0:

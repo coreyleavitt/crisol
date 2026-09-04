@@ -35,6 +35,11 @@
 ##     When memThrottled=true, appends " [mem-throttled]" to the line.
 ##     Empty inFlight → returns "".
 ##
+##   renderCacheStats*(s: CacheStats): string
+##     Pure: RFC-0005 B2b's one-line --cache-stats summary. Used both inside
+##     render() (opts.showCacheStats gates its footer appearance) and
+##     directly by the CLI's --json branch (stderr, "crisol: " prefixed).
+##
 ## Color gating (RFC B4):
 ##   Color is emitted ONLY when opts.color == true.  The CLI sets opts.color from
 ##   terminal.shouldEnableColor(isatty(stdout.getFileHandle())).  Render itself is
@@ -58,6 +63,7 @@
 import std/[algorithm, monotimes, os, options, sequtils, strutils, times]
 import crisol/types
 import crisol/ioutils  # sanitizeControlBytes — issue #14: report-body field sanitization
+import crisol/cachetelemetry  # RFC-0005 B2b: CacheStats — the --cache-stats summary line
 # rfc-0007 A1c: cause-aware detail for killed/crashed lines. `import nil` so
 # nothing unqualified leaks in.
 from crisol/process/types as ptypes import nil
@@ -110,10 +116,15 @@ type
                                 ## values instead of the terse truncated form. The CLI ensures
                                 ## this implies explainMiss=true; render() itself only ever
                                 ## consults explainMiss to decide WHETHER to render.
+    showCacheStats*: bool      ## RFC-0005 B2b: --cache-stats -- append the cache-stats
+                                ## summary line to the footer (section 4, after PASSED/FAILED).
+    cacheStats*: CacheStats    ## The aggregated stats to render when showCacheStats is true;
+                                ## ignored otherwise (defaults to the zero value).
 
 proc defaultOpts*(): RenderOpts =
   RenderOpts(color: false, slowestN: 5, filterTag: none(string),
-             explainMiss: false, explainMissVerbose: false)
+             explainMiss: false, explainMissVerbose: false,
+             showCacheStats: false, cacheStats: CacheStats())
 
 # ---------------------------------------------------------------------------
 # Color helpers (kept thin; render logic uses these)
@@ -406,6 +417,20 @@ proc isCacheMissDecision*(cd: CacheDecision): bool =
   ## when the cache was never asked.
   cd in {cdmStored, cdmKeyMiss, cdmHermeticityDeg, cdmFlaky,
          cdmClosureUnrecorded, cdmRecomputeMiss}
+
+proc renderCacheStats*(s: CacheStats): string =
+  ## PURE: the one-line --cache-stats summary (RFC-0005 "Hit-rate
+  ## telemetry": "L1 hits / remote hits / misses / remote-errors / total /
+  ## hit-% / wall-time-saved / published / verifyFails"). No trailing
+  ## newline, no "crisol: " prefix — callers add both (render()'s footer
+  ## just appends "\n"; the CLI's --json branch prefixes "crisol: " to match
+  ## its other stderr diagnostics, same as explainMissLines' callers).
+  "cache: " & $s.l1Hits & " l1 hits, " & $s.remoteHits & " remote hits, " &
+  $s.misses & " misses, " & $s.remoteErrors & " remote-errors, " &
+  $s.total & " consulted (" & $s.notConsulted & " not consulted), " &
+  formatFloat(s.hitPct, ffDecimal, 1) & "% hit rate, " &
+  $s.wallSavedMs & "ms saved, " & $s.published & " published, " &
+  $s.verifyFails & " verify-fails"
 
 # ---------------------------------------------------------------------------
 # render — PURE
@@ -741,6 +766,10 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     if summary.spawnErrors        > 0: parts.add $summary.spawnErrors        & " spawn-error"
     let msg = "FAILED: " & parts.join(", ") & " — see above"
     buf.add col(msg, Ansi_Red & Ansi_Bold, color) & "\n"
+
+  # RFC-0005 B2b: --cache-stats summary line, after PASSED/FAILED.
+  if opts.showCacheStats:
+    buf.add col(renderCacheStats(opts.cacheStats), Ansi_Dim, color) & "\n"
 
   result = buf
 

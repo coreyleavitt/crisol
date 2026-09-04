@@ -7,11 +7,14 @@
 ##   4. tekRemoteErr/tekPublish/tekVerifyFail -> remoteErrors/published/verifyFails counts.
 ##   5. remoteHits is always 0, regardless of input.
 ##   6. a full mixed event+decision set together (the "run-shaped" vector).
+##   7. RFC-0005 B2b: erroredTiers/tierErrorWarning -- the per-tier
+##      100%-error diagnostic ("a tier that rejects 100% of reads is as
+##      dead as one that times out").
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_cachetelemetry.nim
 
-import std/unittest
+import std/[strutils, unittest]
 import crisol/cachetelemetry
 
 suite "aggregateCacheStats — empty input":
@@ -146,5 +149,71 @@ suite "aggregateCacheStats — a full run-shaped mixed vector":
     check s.published == 1
     check s.remoteErrors == 1
     check s.verifyFails == 1
+
+suite "erroredTiers — the per-tier 100%-error diagnostic":
+
+  test "empty input -> no errored tiers":
+    check erroredTiers(@[]).len == 0
+
+  test "a tier with only hits is never errored":
+    let events = @[
+      TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 5),
+      TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 7),
+    ]
+    check erroredTiers(events).len == 0
+
+  test "a tier with only cvMiss (a normal cold cache) is never errored":
+    let events = @[
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvMiss)]),
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvMiss)]),
+    ]
+    check erroredTiers(events).len == 0
+
+  test "a tier with 100% cvOffline reads is errored":
+    let events = @[
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvOffline)]),
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvOffline)]),
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvOffline)]),
+    ]
+    let errored = erroredTiers(events)
+    check errored.len == 1
+    check errored[0].tier == "l1"
+    check errored[0].calls == 3
+
+  test "a single non-error read among errors keeps the tier out of the report":
+    let events = @[
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvOffline)]),
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvOffline)]),
+      TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 1),  # one real success
+    ]
+    check erroredTiers(events).len == 0
+
+  test "every RFC-listed error class counts: transport + trust codes + cvCorrupt":
+    for v in [cvOffline, cvTimeout, cvUnauthorized, cvCorrupt,
+              cvTrustNoAttestation, cvTrustUnknownAlg, cvTrustUnpinnedSigner,
+              cvTrustSignerMismatch, cvTrustBadSignature]:
+      let events = @[TelemetryEvent(kind: tekMiss, verdicts: @[("l1", v)])]
+      let errored = erroredTiers(events)
+      check errored.len == 1
+      check errored[0].tier == "l1"
+
+  test "cvVersionSkew is NOT in the RFC's error list -- does not trip the warning":
+    let events = @[
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvVersionSkew)]),
+    ]
+    check erroredTiers(events).len == 0
+
+  test "store-side events (tekPublish/tekRemoteErr/tekVerifyFail) never contribute":
+    let events = @[
+      TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvOffline),
+      TelemetryEvent(kind: tekPublish, publishedTo: "l1"),
+      TelemetryEvent(kind: tekVerifyFail, path: "x.nim"),
+    ]
+    check erroredTiers(events).len == 0
+
+  test "tierErrorWarning names the tier and the call count":
+    let msg = tierErrorWarning(TierErrorReport(tier: "l1", calls: 4))
+    check "l1" in msg
+    check "4/4" in msg
 
 echo "test_cachetelemetry: done"

@@ -6,7 +6,7 @@
 ##   1. Run 1 populates the cache (live pass, stored + sidecar written).
 ##   2. Changing a compile flag (crisol.kdl group `flags`) and re-running
 ##      with `--explain-miss --json` produces a per-entrypoint `keyDiff`
-##      array naming `kcFlags` with non-empty prev/curr, schemaRevision 20,
+##      array naming `kcFlags` with non-empty prev/curr, schemaRevision 21,
 ##      and stdout stays parseable JSON (the human explain line goes to
 ##      stderr instead).
 ##   3. Changing an allowlisted env var (via `--env-pin TERM=...`, which
@@ -101,7 +101,7 @@ suite "B1c CLI — --explain-miss over --json: kcFlags on a flag change":
 
     # stdout stays parseable JSON even with the flag on.
     let doc = parseJson(r.stdout)
-    check doc["schemaRevision"].getInt == 20
+    check doc["schemaRevision"].getInt == 21
     let eps = doc["entrypoints"]
     check eps.len == 1
     check eps[0].hasKey("keyDiff")

@@ -25,6 +25,7 @@ import crisol/render
 import crisol/terminal  # for shouldEnableColor
 import crisol/runner  # for summarize
 import crisol/process/types as ptypes  # rfc-0007 A1c: coherent Phase fixtures
+import crisol/cachetelemetry  # RFC-0005 B2b: CacheStats — renderCacheStats
 
 # ---------------------------------------------------------------------------
 # Helpers — build synthetic results
@@ -758,3 +759,44 @@ suite "render — miss-explanation integration into render()":
     let s = summarize(@[r])
     let rendered = render(@[r], s, RenderOpts(explainMiss: true, explainMissVerbose: true))
     check "explain: kcFlags: changed (aaaa1111 → bbbb2222)" in rendered
+
+suite "render — renderCacheStats (RFC-0005 B2b)":
+
+  test "renders every field, in the RFC's own order":
+    let s = CacheStats(l1Hits: 3, remoteHits: 0, misses: 1, remoteErrors: 2,
+                       total: 4, notConsulted: 5, hitPct: 75.0,
+                       wallSavedMs: 120, published: 3, verifyFails: 1)
+    let line = renderCacheStats(s)
+    check "3 l1 hits" in line
+    check "0 remote hits" in line
+    check "1 misses" in line
+    check "2 remote-errors" in line
+    check "4 consulted" in line
+    check "5 not consulted" in line
+    check "75.0% hit rate" in line
+    check "120ms saved" in line
+    check "3 published" in line
+    check "1 verify-fails" in line
+
+  test "zero value renders 0.0% hit rate, never NaN":
+    check "0.0% hit rate" in renderCacheStats(CacheStats())
+
+suite "render — cache-stats integration into render()":
+
+  test "opts.showCacheStats=false: no 'cache:' line even when cacheStats is set":
+    let r = passedResult("tests/unit/test_a.nim")
+    let s = summarize(@[r])
+    let rendered = render(@[r], s, RenderOpts(showCacheStats: false,
+                          cacheStats: CacheStats(l1Hits: 1)))
+    check "cache:" notin rendered
+
+  test "opts.showCacheStats=true: the summary line appears after PASSED/FAILED":
+    let r = passedResult("tests/unit/test_a.nim")
+    let s = summarize(@[r])
+    let rendered = render(@[r], s, RenderOpts(showCacheStats: true,
+                          cacheStats: CacheStats(l1Hits: 1, total: 1, hitPct: 100.0)))
+    check "cache: 1 l1 hits" in rendered
+    let passedIdx = rendered.find("PASSED:")
+    let cacheIdx  = rendered.find("cache: 1 l1 hits")
+    check passedIdx >= 0
+    check cacheIdx > passedIdx

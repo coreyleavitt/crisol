@@ -72,6 +72,10 @@
 ##     ]
 ##     // NO "substrate" key: absent until A7 lands the substrate-identity
 ##     // block.  Absence IS the honest placeholder — no null, no stub object.
+##     "cacheStats": {   // rev 21 (RFC-0005 B2b); PRESENT ONLY under --cache-stats
+##       l1Hits, remoteHits, misses, remoteErrors, total, notConsulted,
+##       hitPct, wallSavedMs, published, verifyFails
+##     }
 ##   }
 ##
 ##   <PhaseNode> (rfc-0007 §2's Phase, one shape shared by "compile" and "run"):
@@ -232,6 +236,7 @@ import crisol/ioutils  # atomicPublish: shared O_EXCL-tmp + writeAllFd + rename(
 # unqualified leaks into this module's own Outcome/etc namespace.
 from crisol/process/types as ptypes import nil
 import crisol/process/resultjson  # resultjson.toJson(ProcessResult): the ONE wire format owner
+import crisol/cachetelemetry      # RFC-0005 B2b: CacheStats — the run/v2 `cacheStats` object
 
 # ---------------------------------------------------------------------------
 # Schema-version constant (single source of truth)
@@ -250,7 +255,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 20
+const RunSchemaRevision* = 21
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -470,6 +475,22 @@ const RunSchemaRevision* = 20
   ##                     prose order) so B2b now takes rev 21 for
   ##                     `cacheStats` instead. See the RFC's §Contract
   ##                     impacts for the corrected assignment.
+  ##   rev 21 (RFC-0005 B2b) — top-level `cacheStats` object: `{l1Hits,
+  ##                     remoteHits, misses, remoteErrors, total,
+  ##                     notConsulted, hitPct, wallSavedMs, published,
+  ##                     verifyFails}` (`cachetelemetry.CacheStats`,
+  ##                     `aggregateCacheStats`'s fold over the run's real
+  ##                     telemetry events + per-result cacheDecisions).
+  ##                     PRESENT ONLY when the run was invoked with
+  ##                     `--cache-stats` (or config-file `cache-stats
+  ##                     #true`) -- ABSENT otherwise, not an all-zero
+  ##                     object: without the flag no InMemorySink was ever
+  ##                     installed (the default NilSink drops every event),
+  ##                     so an all-zero object would misrepresent "nothing
+  ##                     happened" when the truth is "nobody was watching"
+  ##                     -- same posture as rev 20's `keyDiff` field-
+  ##                     presence gating. `remoteHits` is always 0 (no
+  ##                     remote tier exists before Stage A3a).
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -559,9 +580,16 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
              substrate: ptypes.Capabilities = ptypes.Capabilities();
              verifyFails: int = 0;
-             explainMiss: bool = false): JsonNode =
+             explainMiss: bool = false;
+             cacheStats: CacheStats = CacheStats();
+             showCacheStats: bool = false): JsonNode =
   ## Pure: serialize to the crisol/run/v2 JsonNode.
   ## No I/O.
+  ## cacheStats/showCacheStats: RFC-0005 B2b (rev 21) — when showCacheStats
+  ## is true, the top-level `cacheStats` object is emitted from the
+  ## (caller-aggregated) `cacheStats` value; OMITTED entirely when false
+  ## (see the rev-21 schema-history entry above for why an all-zero object
+  ## would be dishonest here — same posture as explainMiss/keyDiff below).
   ## explainMiss: RFC-0005 B1c (rev 20) — when true, each entrypoint gains a
   ## `keyDiff` array (serialized from `EntrypointResult.keyDiff`, which the
   ## PRODUCER populates unconditionally on a miss -- see the rev-20 schema-
@@ -740,6 +768,22 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   result["substrate"] = resultjson.capabilitiesToJson(substrate)
   # rev 19 (RFC-0005 B3c): --verify-cache's divergence count, always present.
   result["verifyFails"] = newJInt(verifyFails)
+  # rev 21 (RFC-0005 B2b): cacheStats, PRESENT ONLY under --cache-stats --
+  # OMITTED (not an all-zero object) otherwise; see the rev-21 schema-
+  # history entry above.
+  if showCacheStats:
+    let cs = newJObject()
+    cs["l1Hits"]       = newJInt(cacheStats.l1Hits)
+    cs["remoteHits"]   = newJInt(cacheStats.remoteHits)
+    cs["misses"]       = newJInt(cacheStats.misses)
+    cs["remoteErrors"] = newJInt(cacheStats.remoteErrors)
+    cs["total"]        = newJInt(cacheStats.total)
+    cs["notConsulted"] = newJInt(cacheStats.notConsulted)
+    cs["hitPct"]       = newJFloat(cacheStats.hitPct)
+    cs["wallSavedMs"]  = newJInt(cacheStats.wallSavedMs)
+    cs["published"]    = newJInt(cacheStats.published)
+    cs["verifyFails"]  = newJInt(cacheStats.verifyFails)
+    result["cacheStats"] = cs
 
 proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    filterTag: string = "";
@@ -751,15 +795,20 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
                    substrate: ptypes.Capabilities = ptypes.Capabilities();
                    verifyFails: int = 0;
-                   explainMiss: bool = false): string =
+                   explainMiss: bool = false;
+                   cacheStats: CacheStats = CacheStats();
+                   showCacheStats: bool = false): string =
   ## Pure: compact JSON string of the crisol/run/v2 document.
   ## C3: filterTag threads through to toJson.
   ## policy: rfc-0007 A6b — threads through to toJson unchanged (see there).
   ## substrate: rfc-0007 A7 — threads through to toJson unchanged (see there).
   ## verifyFails: RFC-0005 B3c — threads through to toJson unchanged (see there).
   ## explainMiss: RFC-0005 B1c (rev 20) — threads through to toJson unchanged.
+  ## cacheStats/showCacheStats: RFC-0005 B2b (rev 21) — threads through to
+  ## toJson unchanged.
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
-         reuseAlerts, interrupted, policy, substrate, verifyFails, explainMiss)
+         reuseAlerts, interrupted, policy, substrate, verifyFails, explainMiss,
+         cacheStats, showCacheStats)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful

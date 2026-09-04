@@ -702,6 +702,65 @@ group "unit" {
       check pr.settings.explainMiss == false
 
 # ---------------------------------------------------------------------------
+# RFC-0005 B2b — --cache-stats / cache-stats config parity + precedence
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 B2b — cache-stats resolution (RunOptions.cacheStats x config)":
+
+  test "opts.cacheStats=true (config absent) -> resolved settings.cacheStats == true":
+    withTempProject:
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
+      let pr = planTests(opts)
+      check pr.settings.cacheStats == true
+
+  test "config cache-stats #true, opts.cacheStats=false -> STILL true (config wins; strengthen-only)":
+    withTempProject:
+      writeFile(projectRoot / "crisol.kdl", """
+cache-stats #true
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+""")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: false)
+      let pr = planTests(opts)
+      check pr.settings.cacheStats == true
+
+  test "neither opts nor config set -> resolved settings.cacheStats == false (default off)":
+    withTempProject:
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let pr = planTests(opts)
+      check pr.settings.cacheStats == false
+
+suite "RunReport.cacheStats — RFC-0005 B2b end-to-end (real runTests, no CLI)":
+
+  test "cacheStats not requested -> RunReport.cacheStats is the zero value (no sink installed)":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl"))
+      check rr.status == rsOk
+      check rr.cacheStats.total == 0
+      check rr.cacheStats.l1Hits == 0
+      check rr.cacheStats.hitPct == 0.0
+
+  test "cacheStats requested, cold run -> a genuine miss (misses > 0, hitPct 0.0)":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true))
+      check rr.status == rsOk
+      check rr.cacheStats.misses > 0
+      check rr.cacheStats.l1Hits == 0
+      check rr.cacheStats.hitPct == 0.0
+
+  test "cacheStats requested, warm rerun -> a genuine hit (hits > 0, hitPct > 0)":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      discard runTests(RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true))
+      let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true))
+      check rr.status == rsOk
+      check rr.cacheStats.l1Hits > 0
+      check rr.cacheStats.hitPct > 0.0
+
+# ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.
 # api.nim gates the compile block on `measureCompileReuse` alone. A
 # regression that hardcoded this to `false` would silently drop the report
