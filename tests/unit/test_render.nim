@@ -549,3 +549,212 @@ suite "render — renderClosure":
     check lines[1] == "  lib/dep.nim"
     check lines[2] == "  tests/unit/test_a.nim"
     check lines[3] == "tests/unit/test_b.nim  [unit]  1111111111111111  unrecorded  (0 files)"
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B1c: miss-explanation rendering — pure component vectors
+# ---------------------------------------------------------------------------
+
+suite "render — isCacheMissDecision":
+
+  test "the six miss variants are true":
+    for cd in [cdmStored, cdmKeyMiss, cdmHermeticityDeg, cdmFlaky,
+               cdmClosureUnrecorded, cdmRecomputeMiss]:
+      check isCacheMissDecision(cd)
+
+  test "cdmHit and every not-consulted variant are false":
+    for cd in [cdmHit, cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled]:
+      check not isCacheMissDecision(cd)
+
+suite "render — explainMissLines (degraded case)":
+
+  test "empty diffs -> 'no prior inputs recorded', gated by nothing (caller decides whether to call)":
+    check explainMissLines(@[], verbose = false) == @["no prior inputs recorded"]
+    check explainMissLines(@[], verbose = true) == @["no prior inputs recorded"]
+
+suite "render — renderKeyDiffLines: opaque-hash components":
+
+  test "kcClosure terse: truncated to 8 chars on each side":
+    let d = KeyDiff(component: kcClosure,
+                     prev: "a1b2c3d4e5f6a7b8", curr: "9988776655443322")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcClosure: changed (a1b2c3d4… → 99887766…)"]
+
+  test "kcFlags verbose: full untruncated values":
+    let d = KeyDiff(component: kcFlags,
+                     prev: "a1b2c3d4e5f6a7b8", curr: "9988776655443322")
+    check renderKeyDiffLines(d, verbose = true) ==
+          @["kcFlags: changed (a1b2c3d4e5f6a7b8 → 9988776655443322)"]
+
+  test "kcFixtures and kcProtocol use the same generic renderer":
+    let fx = KeyDiff(component: kcFixtures, prev: "aaaaaaaaaaaaaaaa", curr: "bbbbbbbbbbbbbbbb")
+    check renderKeyDiffLines(fx, verbose = false) ==
+          @["kcFixtures: changed (aaaaaaaa… → bbbbbbbb…)"]
+    let pr = KeyDiff(component: kcProtocol, prev: "1", curr: "2")
+    check renderKeyDiffLines(pr, verbose = false) == @["kcProtocol: changed (1… → 2…)"]
+
+  test "short hash (< 8 chars) is shown in full, not padded, terse mode":
+    let d = KeyDiff(component: kcClosure, prev: "ab", curr: "cd")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcClosure: changed (ab… → cd…)"]
+
+suite "render — renderKeyDiffLines: kcNimVersion":
+
+  test "version TEXT differs: first line of each side + 8-hex hash, terse":
+    let d = KeyDiff(component: kcNimVersion,
+      prev: "Nim Compiler Version 2.2.10 [Linux: amd64]\nCompiled at ...|a1b2c3d4e5f6a7b8",
+      curr: "Nim Compiler Version 2.4.0 [Linux: amd64]\nCompiled at ...|9988776655443322")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcNimVersion: Nim Compiler Version 2.2.10 [Linux: amd64] (a1b2c3d4…) → " &
+            "Nim Compiler Version 2.4.0 [Linux: amd64] (99887766…)"]
+
+  test "only the binary hash differs (text identical): 'compiler binary differs', terse":
+    let d = KeyDiff(component: kcNimVersion,
+      prev: "Nim Compiler Version 2.2.10 [Linux: amd64]|a1b2c3d4e5f6a7b8",
+      curr: "Nim Compiler Version 2.2.10 [Linux: amd64]|9988776655443322")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcNimVersion: compiler binary differs (a1b2c3d4… → 99887766…)"]
+
+  test "verbose: full multi-line text and full hash on both sides":
+    let d = KeyDiff(component: kcNimVersion,
+      prev: "line1\nline2|a1b2c3d4e5f6a7b8",
+      curr: "line1\nline3|9988776655443322")
+    let lines = renderKeyDiffLines(d, verbose = true)
+    check lines.len == 1
+    let physLines = lines[0].splitLines()
+    check physLines == @["kcNimVersion prev:", "line1", "line2",
+                          "  hash: a1b2c3d4e5f6a7b8", "kcNimVersion curr:",
+                          "line1", "line3", "  hash: 9988776655443322"]
+
+  test "malformed (no pipe) falls back to the generic opaque render, never crashes":
+    let d = KeyDiff(component: kcNimVersion, prev: "no-pipe-here", curr: "also-no-pipe")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcNimVersion: changed (no-pipe-… → also-no-…)"]
+
+suite "render — renderKeyDiffLines: kcCcVersion (accurate two-segment shape, NOT a binary hash)":
+
+  test "only cc differs: names cc, full values, no truncation":
+    let d = KeyDiff(component: kcCcVersion,
+      prev: "cc (GCC) 12.2.0|ldd (GNU libc) 2.36",
+      curr: "cc (GCC) 13.1.0|ldd (GNU libc) 2.36")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcCcVersion: cc: cc (GCC) 12.2.0 → cc (GCC) 13.1.0"]
+
+  test "only ldd differs: MUST name ldd, MUST NOT say 'compiler binary differs'":
+    let d = KeyDiff(component: kcCcVersion,
+      prev: "cc (GCC) 12.2.0|ldd (GNU libc) 2.36",
+      curr: "cc (GCC) 12.2.0|ldd (GNU libc) 2.38")
+    let lines = renderKeyDiffLines(d, verbose = false)
+    check lines == @["kcCcVersion: ldd: ldd (GNU libc) 2.36 → ldd (GNU libc) 2.38"]
+    for l in lines:
+      check "compiler binary differs" notin l
+      check "ldd" in l
+
+  test "both cc and ldd differ: two lines, both named":
+    let d = KeyDiff(component: kcCcVersion,
+      prev: "cc (GCC) 12.2.0|ldd (GNU libc) 2.36",
+      curr: "cc (GCC) 13.1.0|ldd (GNU libc) 2.38")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcCcVersion: cc: cc (GCC) 12.2.0 → cc (GCC) 13.1.0",
+            "kcCcVersion: ldd: ldd (GNU libc) 2.36 → ldd (GNU libc) 2.38"]
+
+  test "verbose makes no difference (already single lines, per coordinator ruling)":
+    let d = KeyDiff(component: kcCcVersion,
+      prev: "cc (GCC) 12.2.0|ldd (GNU libc) 2.36",
+      curr: "cc (GCC) 12.2.0|ldd (GNU libc) 2.38")
+    check renderKeyDiffLines(d, verbose = true) == renderKeyDiffLines(d, verbose = false)
+
+  test "malformed (no pipe) falls back to the generic opaque render":
+    let d = KeyDiff(component: kcCcVersion, prev: "no-pipe", curr: "still-no-pipe")
+    let lines = renderKeyDiffLines(d, verbose = false)
+    check lines.len == 1
+    check "kcCcVersion: changed (" in lines[0]
+
+suite "render — renderKeyDiffLines: kcHermeticEnv":
+
+  test "terse: lists envNames only, never the digest values":
+    let d = KeyDiff(component: kcHermeticEnv, prev: "aaaa1111", curr: "bbbb2222",
+                     envNames: @["LANG", "TERM"])
+    check renderKeyDiffLines(d, verbose = false) == @["kcHermeticEnv: LANG, TERM"]
+
+  test "verbose: names plus the full digest values":
+    let d = KeyDiff(component: kcHermeticEnv, prev: "aaaa1111", curr: "bbbb2222",
+                     envNames: @["TERM"])
+    check renderKeyDiffLines(d, verbose = true) ==
+          @["kcHermeticEnv: TERM (hash aaaa1111 → bbbb2222)"]
+
+  test "no envNames identified: honest fallback, not a crash or empty string":
+    let d = KeyDiff(component: kcHermeticEnv, prev: "aaaa1111", curr: "bbbb2222", envNames: @[])
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcHermeticEnv: (unable to identify which variable)"]
+
+suite "render — renderKeyDiffLines: kcLimits (per-LimitKind diff)":
+
+  test "one kind changed: only that kind is named":
+    let d = KeyDiff(component: kcLimits,
+      prev: "lkAddressSpace=-|lkCpu=300|lkFileSize=-|lkOpenFiles=1024|lkCore=-",
+      curr: "lkAddressSpace=-|lkCpu=600|lkFileSize=-|lkOpenFiles=1024|lkCore=-")
+    check renderKeyDiffLines(d, verbose = false) == @["kcLimits: lkCpu: 300 → 600"]
+
+  test "two kinds changed: one line per kind":
+    let d = KeyDiff(component: kcLimits,
+      prev: "lkAddressSpace=-|lkCpu=300|lkFileSize=-|lkOpenFiles=1024|lkCore=-",
+      curr: "lkAddressSpace=-|lkCpu=300|lkFileSize=-|lkOpenFiles=4096|lkCore=0")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcLimits: lkOpenFiles: 1024 → 4096", "kcLimits: lkCore: - → 0"]
+
+suite "render — renderKeyDiffLines: kcArgv":
+
+  test "full joined argv shown on both sides, never truncated":
+    let d = KeyDiff(component: kcArgv, prev: "unit/x/testx --seed 1", curr: "unit/x/testx --seed 2")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcArgv: unit/x/testx --seed 1 → unit/x/testx --seed 2"]
+
+suite "render — explainMissLines: multi-component ordering":
+
+  test "one line per diff, in the order given":
+    let diffs = @[
+      KeyDiff(component: kcFlags, prev: "a1b2c3d4e5f6a7b8", curr: "9988776655443322"),
+      KeyDiff(component: kcHermeticEnv, prev: "aaaa1111", curr: "bbbb2222", envNames: @["TERM"]),
+    ]
+    check explainMissLines(diffs, verbose = false) ==
+          @["kcFlags: changed (a1b2c3d4… → 99887766…)", "kcHermeticEnv: TERM"]
+
+suite "render — miss-explanation integration into render()":
+
+  proc missResult(path: string; cd: CacheDecision; keyDiff: seq[KeyDiff] = @[]): EntrypointResult =
+    result = passedResult(path)
+    result.cacheDecision = cd
+    result.keyDiff = keyDiff
+
+  test "opts.explainMiss=false: no explain lines even for a miss decision with a diff":
+    let r = missResult("tests/unit/test_a.nim", cdmKeyMiss,
+                        @[KeyDiff(component: kcFlags, prev: "aaaa1111", curr: "bbbb2222")])
+    let s = summarize(@[r])
+    let rendered = render(@[r], s, RenderOpts(explainMiss: false))
+    check "explain:" notin rendered
+
+  test "opts.explainMiss=true, terse: shows the component-aware line for a miss":
+    let r = missResult("tests/unit/test_a.nim", cdmStored,
+                        @[KeyDiff(component: kcFlags, prev: "aaaa1111", curr: "bbbb2222")])
+    let s = summarize(@[r])
+    let rendered = render(@[r], s, RenderOpts(explainMiss: true))
+    check "explain: kcFlags: changed (aaaa1111… → bbbb2222…)" in rendered
+
+  test "opts.explainMiss=true: a HIT gets no explain block (nothing to explain)":
+    let r = missResult("tests/unit/test_a.nim", cdmHit)
+    let s = summarize(@[r])
+    let rendered = render(@[r], s, RenderOpts(explainMiss: true))
+    check "explain:" notin rendered
+
+  test "opts.explainMiss=true: a miss with an empty diff shows the degraded message":
+    let r = missResult("tests/unit/test_a.nim", cdmKeyMiss)
+    let s = summarize(@[r])
+    let rendered = render(@[r], s, RenderOpts(explainMiss: true))
+    check "explain: no prior inputs recorded" in rendered
+
+  test "opts.explainMissVerbose=true implies full values in the report":
+    let r = missResult("tests/unit/test_a.nim", cdmKeyMiss,
+                        @[KeyDiff(component: kcFlags, prev: "aaaa1111", curr: "bbbb2222")])
+    let s = summarize(@[r])
+    let rendered = render(@[r], s, RenderOpts(explainMiss: true, explainMissVerbose: true))
+    check "explain: kcFlags: changed (aaaa1111 → bbbb2222)" in rendered

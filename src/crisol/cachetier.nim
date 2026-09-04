@@ -26,7 +26,9 @@
 
 import std/options
 import crisol/cacheport
-import crisol/keys   # KeyDiff -- RFC-0005 B1b's explain-miss attachment
+# KeyDiff (RFC-0005 B1b's explain-miss attachment) lives in `crisol/types`
+# (B1c re-home) and reaches here via `cacheport`'s `export types` -- no
+# direct `crisol/keys` import needed.
 
 type
   Tier* = object

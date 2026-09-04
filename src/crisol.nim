@@ -154,6 +154,7 @@ Usage:
               [--hermetic <none|isolated|network>]
               [--rlimit-nofile <N>]
               [--env-pin NAME=VALUE]...
+              [--explain-miss | --explain-miss-verbose]
               [--verify-cache [--verify-cache-pct <N>]
                               [--verify-cache-seed <N>] [--verify-cache-strict]]
   crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
@@ -236,6 +237,20 @@ Additional options for 'run':
                   Diagnostic: run compile slots through the measurement
                   worker and emit the `compile` block's segmented cc%/
                   r_time/r_size stats to the run report (no caching).
+  --explain-miss  On a cache miss, name which of the 9 soundness-key
+                  components changed since the last recorded attempt for
+                  that entrypoint (and, for the env component, which
+                  variable). Requires local history from a prior run on
+                  this stateDir -- an entrypoint with no prior record
+                  reports "no prior inputs recorded" instead. Also settable
+                  via crisol.kdl's `explain-miss #true`. In --json mode
+                  this renders to stderr (stdout stays parseable JSON) and
+                  the run/v2 document gains a per-entrypoint `keyDiff`
+                  field. Off by default.
+  --explain-miss-verbose
+                  Like --explain-miss, but shows full untruncated component
+                  values instead of the terse truncated form. Implies
+                  --explain-miss.
   --verify-cache  The determinism backstop: after the run completes, re-
                   executes a sample of this run's cache hits and compares
                   the fresh observation against the stored one. Divergence
@@ -672,6 +687,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     verifyCacheSeed:   Option[int64] = none(int64)  # --verify-cache-seed N
     verifyCacheStrict: bool = false  # --verify-cache-strict: a divergence flips the exit code
     envPins: seq[(string, string)]   # RFC-0005 A0: collected from --env-pin NAME=VALUE (repeatable)
+    explainMissFlag:        bool = false  # RFC-0005 B1c: --explain-miss
+    explainMissVerboseFlag: bool = false  # RFC-0005 B1c: --explain-miss-verbose (implies explain)
 
   let runArgs = args[1..^1]
   var i = 0
@@ -702,7 +719,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                  "retries", "fail-on-flaky", "strict-hygiene", "junit", "shard", "order",
                  "perf-check", "hermetic", "measure-compile-reuse",
                  "rlimit-nofile", "verify-cache", "verify-cache-pct",
-                 "verify-cache-seed", "verify-cache-strict", "env-pin"] and isList:
+                 "verify-cache-seed", "verify-cache-strict", "env-pin",
+                 "explain-miss", "explain-miss-verbose"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
         stderr.write(usage())
         return ExitEnvironment
@@ -867,6 +885,13 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
           return ExitEnvironment
       of "verify-cache-strict":
         verifyCacheStrict = true
+      of "explain-miss":
+        explainMissFlag = true
+      of "explain-miss-verbose":
+        # verbose implies explain (single-flag-answer: --explain-miss-verbose
+        # alone is enough to get output).
+        explainMissFlag = true
+        explainMissVerboseFlag = true
       of "env-pin":
         # RFC-0005 A0: --env-pin NAME=VALUE (repeatable). Malformed input
         # (no '=', or an empty NAME) is a usage error, same shape as --base
@@ -1056,6 +1081,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     measureCompileReuse: measureCompileReuse,  # RFC-0006: gate measurement worker into compile slot
     verifyCache:         verifyCacheOpts,  # RFC-0005 B3c: --verify-cache facade
     envPins:             envPins,       # RFC-0005 A0: --env-pin NAME=VALUE (repeatable)
+    explainMiss:         explainMissFlag,         # RFC-0005 B1c: verbose already folded in above
+    explainMissVerbose:  explainMissVerboseFlag,  # RFC-0005 B1c
     workerBinary:        selfWorkerBinary,  # "" unless the real CLI entrypoint (below) passed
                                              # its own getAppFilename() — see runMain's doc above
                                              # for why this must never be resolved in here.
@@ -1155,16 +1182,34 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
   # label never disagrees with rr.exitCode.
   let policy = OutcomePolicy(strictHygiene: rr.plan.settings.strictHygiene)
 
+  # RFC-0005 B1c: resolved --explain-miss (CLI flag OR config-file
+  # `explain-miss #true`, already merged by planImpl into rr.plan.settings)
+  # -- threaded into both reporting sinks below so a config-file-only
+  # opt-in (no CLI flag passed) is honored identically to the CLI flag.
+  let explainMissResolved = rr.plan.settings.explainMiss
+
   if jsonMode:
+    # In --json mode ALL human lines go to stderr (stdout stays parseable
+    # JSON) -- the miss-explanation block is exactly such a human line; the
+    # structured data lives in the `keyDiff` field below instead.
+    if explainMissResolved:
+      for r in rr.results:
+        if isCacheMissDecision(r.cacheDecision):
+          for blk in explainMissLines(r.keyDiff, explainMissVerboseFlag):
+            for physLine in blk.splitLines():
+              stderr.write("crisol: " & r.ep.path & ": explain: " & physLine & "\n")
     stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
                               rr.memThrottledSlots, interrupted = rr.interrupted,
                               policy = policy, substrate = process.capabilities(),
-                              verifyFails = rr.verifyDivergences.len))
+                              verifyFails = rr.verifyDivergences.len,
+                              explainMiss = explainMissResolved))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,
                            filterTag: if filterTag.len > 0: some(filterTag)
-                                      else: none(string))
+                                      else: none(string),
+                           explainMiss: explainMissResolved,
+                           explainMissVerbose: explainMissVerboseFlag)
     stdout.write(render(rr.results, rr.summary, ropts, policy))
     # Gate-skip messages after results.
     if rr.plan.gatedOut.len > 0:

@@ -189,23 +189,13 @@ proc soundnessKey*(inp: KeyInputs): SoundnessKey =
 # in fixed KeyComponent (== KeyInputs field) order.  No I/O, no sidecar: the
 # path-keyed persistence that supplies `prev`/`prevEnv` from a prior run is
 # B1b's concern; the CLI/render surface (`--explain-miss`) is B1c's.
+#
+# KeyComponent/KeyDiff themselves live in `crisol/types` (B1c re-home): the
+# wire/render field `EntrypointResult.keyDiff` needs the type, and
+# `types.nim` cannot import `keys.nim` (this module already imports
+# `crisol/types` — the reverse would cycle).  Used here unqualified via that
+# existing import; no behavior change.
 # ---------------------------------------------------------------------------
-
-type KeyComponent* = enum   ## names WHICH of the 9 key inputs differs; one
-                             ## arm per KeyInputs field, in field order.
-  kcClosure, kcFlags, kcNimVersion, kcCcVersion, kcFixtures, kcArgv,
-  kcLimits, kcHermeticEnv, kcProtocol
-
-type KeyDiff* = object
-  component*: KeyComponent
-  prev*, curr*: string
-    ## The two component values, opaque-hash components left opaque and
-    ## multi-line version text left as-is — rendering is B1c's job.
-  envNames*: seq[string]
-    ## kcHermeticEnv ONLY: the variable NAMES whose digest differs or which
-    ## are present on only one side, sorted.  NEVER values — `prevEnv`/
-    ## `currEnv` are themselves digests already (see `envDigest`), so no
-    ## value ever reaches this type.  Empty for every other component.
 
 proc envDigest*(env: seq[(string, string)]): seq[(string, string)] =
   ## Map each `(name, value)` pair to `(name, hash16(value))`.  The value

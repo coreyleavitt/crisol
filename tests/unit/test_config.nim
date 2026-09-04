@@ -890,6 +890,60 @@ group "unit" {
     check cfg.strictHygiene == false
 
 # ---------------------------------------------------------------------------
+# RFC-0005 B1c — explain-miss gate (config parity with --explain-miss)
+# ---------------------------------------------------------------------------
+
+suite "config — explain-miss gate (RFC-0005 B1c)":
+
+  test "absent explain-miss -> cfg.explainMiss == false (default off)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.explainMiss == false
+
+  test "explain-miss #true round-trips to cfg.explainMiss == true":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+explain-miss #true
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.explainMiss == true
+
+  test "explain-miss #false round-trips to cfg.explainMiss == false":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+explain-miss #false
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.explainMiss == false
+
+  test "explain-miss with a non-boolean argument raises cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "explain-miss \"yes\"\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    expect CrisolError:
+      discard loadConfig(configPath = cfgPath)
+
+  test "no config file (convention fallback) -> cfg.explainMiss == false":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let (cfg, _) = loadConfig(startDir = tmp)
+    check cfg.explainMiss == false
+
+# ---------------------------------------------------------------------------
 # M-report PASS (b1) — reuse-check alerting policy block
 # ---------------------------------------------------------------------------
 

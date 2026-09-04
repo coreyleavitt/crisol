@@ -1209,6 +1209,19 @@ proc execute*(
                                   ## per-process shard, per the RFC's
                                   ## `ledger.nim` shardSeq note); only the
                                   ## per-attempt row write is gated.
+  explainMiss:      bool = false;  ## RFC-0005 B1c: resolved --explain-miss
+                                  ## (CLI OR config, already merged by
+                                  ## api.planImpl into cfg.explainMiss before
+                                  ## this call). Threaded to lookupAtPlan's
+                                  ## `explainDiag` param -- gates ONLY the
+                                  ## diagnostic seam consult for a
+                                  ## recompiling (non-edRunFresh) entrypoint;
+                                  ## the plan-time explain stamping onto
+                                  ## `explains[i]` below (and the live-result
+                                  ## `keyDiff` stamping further down) stays
+                                  ## unconditional, same as B1b's sidecar
+                                  ## write -- there is simply nothing to
+                                  ## stamp when the seam was never consulted.
 ): seq[EntrypointResult] =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
   ## scheduler honouring p.jobs (A4).  At most p.jobs child processes alive at
@@ -1352,6 +1365,10 @@ proc execute*(
   let cacheActive = cache.isActive()
   var cacheDecisions = newSeq[CacheDecision](n)
   var inputHashes    = newSeq[string](n)  # A8: soundnessKey per index ("" if not consulted)
+  var explains        = newSeq[seq[KeyDiff]](n)  # RFC-0005 B1c: plan-time miss explanation
+                                                  # per index (empty when not consulted, a
+                                                  # hit, or no prior sidecar record); stamped
+                                                  # onto the live EntrypointResult below.
   for i in 0 ..< n:
     if not cacheActive:
       # No cache: record the structural reason on every entry.  edRunFresh
@@ -1363,9 +1380,10 @@ proc execute*(
       # there with rationale; this call site is the single consumer.
       cacheDecisions[i] = inactiveDecision(pep.edecision)
       continue
-    let look = lookupAtPlan(p.entrypoints[i], cache.policy, cache.seams)
+    let look = lookupAtPlan(p.entrypoints[i], cache.policy, cache.seams, explainMiss)
     cacheDecisions[i] = look.cacheDecision
     inputHashes[i]    = look.inputHash  # A8: stamped onto live miss results below
+    explains[i]       = look.explain    # RFC-0005 B1c: stamped onto live miss results below
     if look.decision == edCached and look.synthesized.isSome:
       # Served from cache: synthesize, fire callback now, retire the slot.
       # edCached entries are NEVER retried — they are terminal at plan time.
@@ -1607,6 +1625,11 @@ proc execute*(
               # ALWAYS stamp the live result's CacheDecision for reporting (A8).
               # ---------------------------------------------------------------
               if cacheActive:
+                # RFC-0005 B1c: stamp the plan-time miss explanation regardless of
+                # whether THIS run's result ends up stored (`explains[completedIdx]`
+                # is unconditional — the sidecar diff belongs to the fact that this
+                # index was a plan-time miss, not to the store outcome below).
+                result[completedIdx].keyDiff = explains[completedIdx]
                 let verdict = shouldStore(result[completedIdx], cache.spec,
                                           slotAttempt, cache.policy,
                                           p.entrypoints[completedIdx].cacheable)

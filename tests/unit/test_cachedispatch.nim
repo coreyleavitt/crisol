@@ -17,6 +17,7 @@ import crisol/process/types  # pkCached/pkSkipped (rfc-0007 A1c coherence test)
 import crisol/keys           # KeyDiff, KeyComponent (kcFlags/kcHermeticEnv)
 import crisol/cacheregistry  # localOnlyCache -- a real CacheRuntime + local root
 import crisol/cachelocalfs   # sidecarPath -- raw sidecar file inspection
+import crisol/cachetier      # CacheLookup, TierHit -- RFC-0005 B1c PlanLookup.explain tests
 import "../support/helpers"  # legacySeams
 
 # ---------------------------------------------------------------------------
@@ -80,6 +81,23 @@ proc seamsMiss(c: var Calls): CacheSeams =
     load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls; none(CachedResult),
     store = proc(key: SoundnessKey; res: CachedResult): bool =
+             inc cp[].storeCalls; true,
+  )
+
+proc seamsMissWithExplain(c: var Calls; explain: seq[KeyDiff]): CacheSeams =
+  ## RFC-0005 B1c: a seam whose `load` always misses but returns a caller-
+  ## supplied `.explain` -- lets tests assert PlanLookup.explain threading
+  ## and the diagnostic-consult call-counting independent of any real
+  ## sidecar/backend.
+  let cp = addr c
+  CacheSeams(
+    keyOf: proc(pep: PlannedEntrypoint): KeyInputs =
+             inc cp[].keyCalls
+             KeyInputs(argv: @[pep.ep.path]),
+    load: proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
+             inc cp[].loadCalls
+             CacheLookup(hit: none(TierHit), verdicts: @[], explain: explain),
+    store: proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )
 
@@ -209,6 +227,134 @@ suite "lookupAtPlan — promotion + decision":
     check c.loadCalls == 1                     # the entry was found; its
                                                 # recomputed outcome (not oPassed)
                                                 # disqualified it as a hit.
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B1c: PlanLookup.explain threading (l.explain -> PlanLookup.explain)
+#
+# B1b already covers the SEAM (realSeams' load adapter populating
+# CacheLookup.explain -- see "realSeams — explain-miss sidecar" below); this
+# covers the layer B1c actually adds: lookupAtPlan copying that CacheLookup.
+# explain onto the PlanLookup it returns, so the runner can thread it onto
+# the live EntrypointResult's keyDiff field.
+# ---------------------------------------------------------------------------
+
+suite "lookupAtPlan — PlanLookup.explain threading (RFC-0005 B1c)":
+
+  test "genuine key miss: PlanLookup.explain carries the seam's CacheLookup.explain verbatim":
+    var c: Calls
+    let diffs = @[
+      KeyDiff(component: kcFlags, prev: "aaaa1111", curr: "bbbb2222"),
+      KeyDiff(component: kcHermeticEnv, prev: "cccc3333", curr: "dddd4444",
+              envNames: @["TERM"]),
+    ]
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsMissWithExplain(c, diffs))
+    check look.cacheDecision == cdmKeyMiss
+    check look.explain == diffs
+
+  test "genuine key miss with no prior sidecar record: explain is empty (degraded case, not an error)":
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsMissWithExplain(c, @[]))
+    check look.cacheDecision == cdmKeyMiss
+    check look.explain.len == 0
+
+  test "a served hit carries empty explain (nothing to explain)":
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c, sampleCached()))
+    check look.cacheDecision == cdmHit
+    check look.explain.len == 0
+
+  test "not-eligible / policy-disabled early returns carry empty explain (seam never consulted)":
+    var c1, c2: Calls
+    check lookupAtPlan(freshPep(edNeverBuilt), onPolicy,
+                       seamsHit(c1, sampleCached())).explain.len == 0
+    check lookupAtPlan(freshPep(edRunFresh), offPolicy,
+                       seamsHit(c2, sampleCached())).explain.len == 0
+
+  test "cdmRecomputeMiss carries empty explain (an entry WAS found; nothing to diff)":
+    var c: Calls
+    var badCr = sampleCached()
+    badCr.run.exit = Exit(kind: ekExited, code: 1)   # now derives oFailed, not oPassed
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c, badCr))
+    check look.cacheDecision == cdmRecomputeMiss
+    check look.explain.len == 0
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B1c (coordinator ruling): the diagnostic consult for a
+# recompiling (non-edRunFresh) entrypoint, gated on `explainDiag`.
+#
+# A flag change is the LOAD-BEARING explain-miss scenario (RFC line 375's
+# "your flags changed") but a flag change NEVER produces edRunFresh
+# (planner.slug hashes ALL flags into the bin dir), so without this
+# diagnostic consult explainMiss could never explain the single most
+# common real-world miss. The consult is READ-ONLY: it must never change
+# `decision`/`cacheDecision`/`synthesized` — only `explain`.
+# ---------------------------------------------------------------------------
+
+suite "lookupAtPlan — diagnostic consult for non-edRunFresh entrypoints (RFC-0005 B1c ruling)":
+
+  test "edNeverBuilt + explainDiag=true: consults the seam, carries explain, cacheDecision UNCHANGED":
+    var c: Calls
+    let diffs = @[KeyDiff(component: kcFlags, prev: "aaaa1111", curr: "bbbb2222")]
+    let look = lookupAtPlan(freshPep(edNeverBuilt), onPolicy,
+                            seamsMissWithExplain(c, diffs), explainDiag = true)
+    check look.decision == edNeverBuilt        # UNCHANGED: no promotion
+    check look.cacheDecision == cdmNotEligible  # UNCHANGED: A2c's job, not this diagnostic
+    check look.synthesized.isNone               # UNCHANGED: never served from cache
+    check look.explain == diffs                 # the diagnostic DID run
+    check c.loadCalls == 1
+    check c.keyCalls == 1
+
+  test "edStale + explainDiag=true: same diagnostic consult, same non-promotion guarantee":
+    var c: Calls
+    let diffs = @[KeyDiff(component: kcHermeticEnv, prev: "x", curr: "y", envNames: @["TERM"])]
+    let look = lookupAtPlan(freshPep(edStale), onPolicy,
+                            seamsMissWithExplain(c, diffs), explainDiag = true)
+    check look.decision == edStale
+    check look.cacheDecision == cdmNotEligible
+    check look.explain == diffs
+    check c.loadCalls == 1
+
+  test "edNeverBuilt + explainDiag=true, no prior sidecar record: explain empty, still no promotion":
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edNeverBuilt), onPolicy,
+                            seamsMissWithExplain(c, @[]), explainDiag = true)
+    check look.cacheDecision == cdmNotEligible
+    check look.explain.len == 0
+    check c.loadCalls == 1   # the seam WAS asked; it just had nothing to diff against
+
+  test "edNeverBuilt + explainDiag=false (default): the seam is NEVER consulted -- zero I/O waste":
+    ## The exact regression this test exists to catch: without --explain-miss
+    ## the diagnostic consult must not run at all (not merely produce no
+    ## OUTPUT) -- one spurious backend `get` per recompiling entrypoint per
+    ## run would be pure I/O waste, and on a future remote tier a pointless
+    ## network round-trip at plan time. Call-counting seams make "did we
+    ## even ask" observable, not just "was the answer empty".
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edNeverBuilt), onPolicy,
+                            seamsMissWithExplain(c, @[KeyDiff(component: kcFlags,
+                                                              prev: "a", curr: "b")]))
+    check look.explain.len == 0   # discarded -- never even fetched
+    check c.loadCalls == 0        # THE regression guard: zero backend calls
+    check c.keyCalls == 0
+
+  test "edStale + explainDiag=false (default): same zero-I/O guarantee":
+    var c: Calls
+    discard lookupAtPlan(freshPep(edStale), onPolicy, seamsMissWithExplain(c, @[]))
+    check c.loadCalls == 0
+    check c.keyCalls == 0
+
+  test "edRunFresh is unaffected by explainDiag (the normal path already consults unconditionally)":
+    ## explainDiag only gates the NON-edRunFresh branch; the edRunFresh path
+    ## already calls seams.load unconditionally (B1b) regardless of this flag.
+    var c1, c2: Calls
+    let diffs = @[KeyDiff(component: kcFlags, prev: "a", curr: "b")]
+    let lookOff = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsMissWithExplain(c1, diffs))
+    let lookOn  = lookupAtPlan(freshPep(edRunFresh), onPolicy,
+                               seamsMissWithExplain(c2, diffs), explainDiag = true)
+    check lookOff.explain == diffs
+    check lookOn.explain == diffs
+    check c1.loadCalls == 1
+    check c2.loadCalls == 1
 
 # ---------------------------------------------------------------------------
 # shouldStore gate

@@ -658,6 +658,50 @@ group "unit" {
       check pr.settings.strictHygiene == false
 
 # ---------------------------------------------------------------------------
+# RFC-0005 B1c — --explain-miss / explain-miss config parity + precedence
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 B1c — explain-miss resolution (RunOptions.explainMiss x config)":
+
+  test "opts.explainMiss=true (config absent) -> resolved settings.explainMiss == true":
+    withTempProject:
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", explainMiss: true)
+      let pr = planTests(opts)
+      check pr.settings.explainMiss == true
+
+  test "config explain-miss #true, opts.explainMiss=false -> STILL true (config wins; strengthen-only)":
+    withTempProject:
+      writeFile(projectRoot / "crisol.kdl", """
+explain-miss #true
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+""")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", explainMiss: false)
+      let pr = planTests(opts)
+      check pr.settings.explainMiss == true
+
+  test "neither opts nor config set -> resolved settings.explainMiss == false (default off)":
+    withTempProject:
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let pr = planTests(opts)
+      check pr.settings.explainMiss == false
+
+  test "--explain-miss-verbose (CLI-only, no KDL key) resolves via opts.explainMiss OR'd in by the caller":
+    ## explainMissVerbose has no KDL key of its own (RFC's config-additions
+    ## list omits it); the CLI resolves "verbose implies explain" BEFORE
+    ## building RunOptions (opts.explainMiss = flag OR verboseFlag), so a
+    ## library caller reproduces the same behavior by setting explainMiss
+    ## itself when it wants verbose. This test pins that explainMissVerbose
+    ## alone (with explainMiss left false) does NOT retroactively resolve
+    ## settings.explainMiss -- planImpl only ever reads opts.explainMiss.
+    withTempProject:
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
+                            explainMiss: false, explainMissVerbose: true)
+      let pr = planTests(opts)
+      check pr.settings.explainMiss == false
+
+# ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.
 # api.nim gates the compile block on `measureCompileReuse` alone. A
 # regression that hardcoded this to `false` would silently drop the report

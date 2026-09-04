@@ -250,7 +250,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 19
+const RunSchemaRevision* = 20
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -437,8 +437,39 @@ const RunSchemaRevision* = 19
   ##                     fields -- it adds `cacheTier`/`cacheLookup` under
   ##                     this SAME rev 19 and appends its own bullet here
   ##                     documenting them, exactly as this bullet documents
-  ##                     `verifyFails`. rev 20 is reserved for B2b's
-  ##                     `cacheStats` object (see the RFC's §Schemas list).
+  ##                     `verifyFails`. (Superseded by the rev-20 note below:
+  ##                     A3b had not landed when B1c shipped, so this
+  ##                     forward-reference to rev 20 never resolved as
+  ##                     written -- rev 20 went to B1c instead; see there.)
+  ##   rev 20 (RFC-0005 B1c) — per-result `keyDiff` (array), present ONLY
+  ##                     when the run was invoked with `--explain-miss` (or
+  ##                     `--explain-miss-verbose`, which implies it) --
+  ##                     ABSENT otherwise, not an empty array (a consumer
+  ##                     that didn't ask for the flag sees no field at all,
+  ##                     same posture as every other flag-gated addition).
+  ##                     Each element serializes one `KeyDiff`
+  ##                     (`EntrypointResult.keyDiff`, threaded from
+  ##                     `cachedispatch.PlanLookup.explain`): `{"component":
+  ##                     <KeyComponent enum name string, e.g. "kcFlags">,
+  ##                     "prev": <string>, "curr": <string>, "envNames":
+  ##                     [<string>, ...]}`. Empty array on a result whose
+  ##                     cacheDecision represents a miss but which had no
+  ##                     prior sidecar record to diff against (the
+  ##                     degraded case the human render spells out as "no
+  ##                     prior inputs recorded"); absent on a hit or a
+  ##                     not-consulted result even under the flag, since
+  ##                     `EntrypointResult.keyDiff` is unconditionally empty
+  ##                     there too -- `--explain-miss` gates the FIELD's
+  ##                     presence, never its content (the producer, B1b, is
+  ##                     unconditional). CONTROL-LOOP STAGING NOTE (rfc-0005
+  ##                     build order: B1 lands before B2b): the RFC's
+  ##                     §Schemas bullet originally assigned rev 20 to
+  ##                     B2b's `cacheStats` object and rev 21 to this field
+  ##                     -- renumbered (B1c ships first in landing order;
+  ##                     revisions are monotonic in LANDING order, not RFC
+  ##                     prose order) so B2b now takes rev 21 for
+  ##                     `cacheStats` instead. See the RFC's §Contract
+  ##                     impacts for the corrected assignment.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -527,9 +558,16 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              interrupted: bool = false;
              policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
              substrate: ptypes.Capabilities = ptypes.Capabilities();
-             verifyFails: int = 0): JsonNode =
+             verifyFails: int = 0;
+             explainMiss: bool = false): JsonNode =
   ## Pure: serialize to the crisol/run/v2 JsonNode.
   ## No I/O.
+  ## explainMiss: RFC-0005 B1c (rev 20) — when true, each entrypoint gains a
+  ## `keyDiff` array (serialized from `EntrypointResult.keyDiff`, which the
+  ## PRODUCER populates unconditionally on a miss -- see the rev-20 schema-
+  ## history entry above). When false (default), the field is OMITTED
+  ## entirely, not emitted empty -- a consumer that never asked for
+  ## `--explain-miss` sees no new field on the wire at all.
   ## verifyFails: RFC-0005 B3c (rev 19) — RunReport.verifyDivergences.len.
   ## Always emitted, 0 by default (see the rev-19 schema-history entry above
   ## for why 0 is ambiguous-by-design between "ran clean" and "never ran").
@@ -647,6 +685,23 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     # advisory exit/cause (run-phase-only).  See the field-mapping table.
     epNode["compile"]       = phaseToJson(r.compile)
     epNode["run"]           = phaseToJson(r.run)
+    # rev 20 (RFC-0005 B1c): keyDiff array, ONLY under --explain-miss (field
+    # OMITTED, not empty-array, when the flag is off). Content is whatever
+    # the unconditional producer (B1b/B1c threading) already populated --
+    # `explainMiss` gates presence, never content.
+    if explainMiss:
+      let keyDiffNode = newJArray()
+      for d in r.keyDiff:
+        let dn = newJObject()
+        dn["component"] = newJString($d.component)
+        dn["prev"]       = newJString(d.prev)
+        dn["curr"]       = newJString(d.curr)
+        let envNamesNode = newJArray()
+        for name in d.envNames:
+          envNamesNode.add newJString(name)
+        dn["envNames"] = envNamesNode
+        keyDiffNode.add dn
+      epNode["keyDiff"] = keyDiffNode
     entrypointsNode.add epNode
 
   # C6 (rev 5): build the regressions array from regressed results.
@@ -695,14 +750,16 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    interrupted: bool = false;
                    policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
                    substrate: ptypes.Capabilities = ptypes.Capabilities();
-                   verifyFails: int = 0): string =
+                   verifyFails: int = 0;
+                   explainMiss: bool = false): string =
   ## Pure: compact JSON string of the crisol/run/v2 document.
   ## C3: filterTag threads through to toJson.
   ## policy: rfc-0007 A6b — threads through to toJson unchanged (see there).
   ## substrate: rfc-0007 A7 — threads through to toJson unchanged (see there).
   ## verifyFails: RFC-0005 B3c — threads through to toJson unchanged (see there).
+  ## explainMiss: RFC-0005 B1c (rev 20) — threads through to toJson unchanged.
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
-         reuseAlerts, interrupted, policy, substrate, verifyFails)
+         reuseAlerts, interrupted, policy, substrate, verifyFails, explainMiss)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful

@@ -326,6 +326,16 @@ type
                                 ## same-named config pin; see api.envPinsFrom) before reaching
                                 ## `resolveSandbox`. Empty by default -- nothing pinned unless an
                                 ## operator opts in (§Non-Goals: no default pins in RFC-0005).
+    explainMiss*: bool          ## RFC-0005 B1c: resolved --explain-miss / `explain-miss #true`
+                                ## KDL node (config < CLI: api.planImpl strengthens a config
+                                ## `false` to `true` when the CLI flag is passed, mirroring
+                                ## strictHygiene/measureCompileReuse above; never the reverse).
+                                ## Gates ONLY the CLI's miss-explanation RENDERING and the run/v2
+                                ## `keyDiff` field's PRESENCE (see EntrypointResult.keyDiff's doc
+                                ## comment) -- the producer that populates keyDiff is unconditional.
+                                ## `--explain-miss-verbose` is CLI-only (no KDL key; the RFC's
+                                ## config-additions list omits it) and implies this field true.
+                                ## Default false: byte-for-byte unchanged until an operator opts in.
     workerBinary*: string       ## INTERNAL plumbing (not user-facing; no KDL node). Absolute path
                                 ## to a binary whose `main()` dispatches the
                                 ## `--internal-measure-compile` token (see measureworker.nim /
@@ -443,6 +453,31 @@ type
                            ## entry was stored.  Treated as a MISS and rerun; distinct
                            ## from cdmKeyMiss (no entry was found at all).
 
+  KeyComponent* = enum
+    ## RFC-0005 B1a/B1c: names WHICH of the 9 `KeyInputs` soundness
+    ## components differs between a prior recorded attempt and the current
+    ## one, one arm per `KeyInputs` field, in field order.  Homed here
+    ## (not in keys.nim, which DEFINES the diff) because `KeyDiff` rides on
+    ## `EntrypointResult.keyDiff` (below) and `keys.nim` imports `types.nim`
+    ## -- the reverse import would cycle. `keys.nim`'s `explainMiss` uses
+    ## these unqualified via its existing `import crisol/types`.
+    kcClosure, kcFlags, kcNimVersion, kcCcVersion, kcFixtures, kcArgv,
+    kcLimits, kcHermeticEnv, kcProtocol
+
+  KeyDiff* = object
+    ## RFC-0005 B1a: one differing `KeyInputs` component, pure diff output of
+    ## `keys.explainMiss`.  `prev`/`curr` are the two component values as
+    ## recorded -- opaque-hash components left opaque, multi-line version
+    ## text left as-is; rendering is `render.nim`'s job (B1c).
+    component*: KeyComponent
+    prev*, curr*: string
+    envNames*: seq[string]
+      ## kcHermeticEnv ONLY: the variable NAMES whose digest differs or
+      ## which are present on only one side, sorted. NEVER values -- the
+      ## digests `explainMiss` diffs are themselves already per-name value
+      ## hashes (see keys.envDigest), so no raw value ever reaches this
+      ## type. Empty for every other component.
+
   PlannedEntrypoint* = object
     ## A single entrypoint annotated with its compile decision and reason.
     ep*:          Entrypoint
@@ -519,6 +554,18 @@ type
                                    ## (cache hit, fresh-run store gate, and plan-time lookup); "" when
                                    ## caching was not consulted (edNeverBuilt/edStale, --no-cache, or
                                    ## no seams wired).
+    keyDiff*:        seq[KeyDiff]  ## RFC-0005 B1c: populated ONLY on a genuine cache-miss
+                                   ## decision (cacheDecision in the "ran live due to a miss"
+                                   ## set -- cdmStored/cdmKeyMiss/cdmHermeticityDeg/cdmFlaky/
+                                   ## cdmClosureUnrecorded/cdmRecomputeMiss) when the path-keyed
+                                   ## local-fs sidecar (B1b) had a prior record to diff against.
+                                   ## Threaded verbatim from PlanLookup.explain (cachedispatch.
+                                   ## lookupAtPlan) through the runner; empty for a hit, for a
+                                   ## not-consulted result, or when no prior sidecar record
+                                   ## exists (degraded -- "no prior inputs recorded" is a
+                                   ## render-time distinction, not a data one). The PRODUCER
+                                   ## (this field) is unconditional; `--explain-miss` gates only
+                                   ## RENDERING and the run/v2 JSON field (§Contract impacts).
     cacheDecision*:  CacheDecision ## RFC F3: ALWAYS populated; why this did/didn't cache.
                                    ## Default field value is cdmNotEligible (enum ord 0, the
                                    ## safe "cache not consulted" default); the runner sets it

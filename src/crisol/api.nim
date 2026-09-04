@@ -307,6 +307,22 @@ type
     ## same "zero value IS the disabled state" convention as narrowing*
     ## above). Nothing consumes this yet; B3b wires the post-run pass.
     verifyCache*:         VerifyCache
+    ## RFC-0005 B1c: --explain-miss / --explain-miss-verbose (KDL
+    ## `explain-miss`; config < CLI). false by default (identical behavior
+    ## to RFC-0004). NEITHER field gates the PRODUCER: `EntrypointResult.
+    ## keyDiff` is always populated on a genuine cache-miss decision when a
+    ## prior sidecar record exists to diff against (B1b's seam, threaded
+    ## through runner.nim unconditionally) -- these two fields gate only
+    ## the CLI's RENDERING (render.RenderOpts.explainMiss/-Verbose) and the
+    ## run/v2 JSON `keyDiff` field's PRESENCE (jsonout.toJson's
+    ## `explainMiss` param), both downstream of RunReport, never the
+    ## runner/cachedispatch seam itself. explainMissVerbose implies
+    ## explainMiss=true (enforced by the CLI when resolving flags into
+    ## this struct; a library caller that sets verbose=true without
+    ## explain=true gets no output either way — verbose only ever adds
+    ## detail to an already-shown block).
+    explainMiss*:         bool = false
+    explainMissVerbose*:  bool = false
 
   ResolvedSettings* = object
     ## Slim projection of the resolved Config (NOT the full Config).
@@ -321,6 +337,12 @@ type
                           ## config-file, opt-in-only-strengthen) — the CLI layer builds the
                           ## real OutcomePolicy for render/JSON/junit from this, so it never
                           ## has to re-run the merge itself.
+    explainMiss*: bool    ## RFC-0005 B1c: resolved --explain-miss (CLI flag OR config-file
+                          ## `explain-miss #true`, opt-in-only-strengthen — same shape as
+                          ## strictHygiene above). The CLI reads THIS, not its own raw flag
+                          ## var, when deciding whether to render the miss-explanation block
+                          ## or set the run/v2 `keyDiff` field's presence, so a config-file-only
+                          ## `--explain-miss` (no CLI flag passed) is honored identically.
 
   PlanReport* = object
     ## Output of planTests().  plan-phase result; no DepGraph or full Config.
@@ -698,6 +720,11 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   # rfc-0007 A6b: CLI/library --strict-hygiene can only strengthen a
   # config-file setting (true wins), mirroring measureCompileReuse above.
   if opts.strictHygiene: cfg.strictHygiene = true
+  # RFC-0005 B1c: CLI/library --explain-miss (or --explain-miss-verbose,
+  # which the CLI resolves into opts.explainMiss too) can only strengthen a
+  # config-file `explain-miss #true` setting (true wins), mirroring
+  # strictHygiene/measureCompileReuse above.
+  if opts.explainMiss: cfg.explainMiss = true
   if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
   # Fix 1: RunOptions.rlimitNofile, when set, overrides Config.rlimitNofile.
   if opts.rlimitNofile.isSome: cfg.rlimitNofile = opts.rlimitNofile
@@ -771,6 +798,7 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     jobs:        pv.plan.jobs,
     timeoutSecs: cfg.timeoutSecs,
     strictHygiene: cfg.strictHygiene,  # rfc-0007 A6b
+    explainMiss:   cfg.explainMiss,    # RFC-0005 B1c
   )
   let pr = PlanReport(
     entrypoints: pv.plan.entrypoints,
@@ -1031,6 +1059,8 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
       shutdownSignalOut  = addr shutdownSignum,
       installSignals     = opts.installSignals,
       cache              = cacheCtx,
+      explainMiss        = cfg.explainMiss,  # RFC-0005 B1c: resolved (CLI OR config,
+                                              # already merged by planImpl above)
     )
   except CrisolError as e:
     releaseLock(lockHandle)

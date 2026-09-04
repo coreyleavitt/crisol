@@ -396,16 +396,60 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     let s = toJsonString(syntheticResults(), syntheticSummary(), interrupted = true)
     check parseJson(s)["interrupted"].getBool == true
 
-  test "RFC-0005 B3c: verifyFails defaults to 0 and is always present (schemaRevision 19)":
+  test "RFC-0005 B3c: verifyFails defaults to 0 and is always present":
     let node = toJson(syntheticResults(), syntheticSummary())
     check node["verifyFails"].getInt == 0
-    check node["schemaRevision"].getInt == 19
+    check node["schemaRevision"].getInt == RunSchemaRevision
 
   test "RFC-0005 B3c: verifyFails threads through explicitly, toJson and toJsonString both":
     let node = toJson(syntheticResults(), syntheticSummary(), verifyFails = 3)
     check node["verifyFails"].getInt == 3
     let s = toJsonString(syntheticResults(), syntheticSummary(), verifyFails = 3)
     check parseJson(s)["verifyFails"].getInt == 3
+
+  test "RFC-0005 B1c: keyDiff is ABSENT on every entrypoint when explainMiss is false (default)":
+    let node = toJson(syntheticResults(), syntheticSummary())
+    for ep in node["entrypoints"].elems:
+      check not ep.hasKey("keyDiff")
+
+  test "RFC-0005 B1c: keyDiff is PRESENT (even if empty) on every entrypoint under explainMiss":
+    let node = toJson(syntheticResults(), syntheticSummary(), explainMiss = true)
+    for ep in node["entrypoints"].elems:
+      check ep.hasKey("keyDiff")
+      check ep["keyDiff"].kind == JArray
+
+  test "RFC-0005 B1c: keyDiff serializes component/prev/curr/envNames, component as the enum name string":
+    var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                             compile: okPhase(), run: okPhase(), durationMs: 1,
+                             cacheDecision: cdmKeyMiss)
+    r.keyDiff = @[
+      KeyDiff(component: kcFlags, prev: "a1b2c3d4", curr: "e5f6a7b8"),
+      KeyDiff(component: kcHermeticEnv, prev: "aaaa", curr: "bbbb", envNames: @["TERM", "LANG"]),
+    ]
+    let node = toJson(@[r], summarize(@[r]), explainMiss = true)
+    let kd = node["entrypoints"][0]["keyDiff"]
+    check kd.len == 2
+    check kd[0]["component"].getStr == "kcFlags"
+    check kd[0]["prev"].getStr == "a1b2c3d4"
+    check kd[0]["curr"].getStr == "e5f6a7b8"
+    check kd[0]["envNames"].elems.len == 0
+    check kd[1]["component"].getStr == "kcHermeticEnv"
+    check kd[1]["envNames"].elems.mapIt(it.getStr) == @["TERM", "LANG"]
+
+  test "RFC-0005 B1c: a result with no keyDiff (hit / not-consulted) serializes an empty array under the flag":
+    let node = toJson(syntheticResults(), syntheticSummary(), explainMiss = true)
+    # syntheticResults() never sets keyDiff -- every entry must be present-but-empty.
+    for ep in node["entrypoints"].elems:
+      check ep["keyDiff"].elems.len == 0
+
+  test "RFC-0005 B1c: toJsonString threads explainMiss through unchanged, stdout stays parseable":
+    var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                             compile: okPhase(), run: okPhase(), durationMs: 1,
+                             cacheDecision: cdmStored)
+    r.keyDiff = @[KeyDiff(component: kcClosure, prev: "1111", curr: "2222")]
+    let s = toJsonString(@[r], summarize(@[r]), explainMiss = true)
+    let parsed = parseJson(s)  # must not raise -- stdout stays parseable JSON
+    check parsed["entrypoints"][0]["keyDiff"][0]["component"].getStr == "kcClosure"
 
   test "a run-phase interrupt-killed entry: outcome killed, run.cause {by: runner, reason: interrupt}":
     let r    = killedByInterruptDuringRun()
@@ -1505,8 +1549,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 19 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails)":
-    check RunSchemaRevision == 19
+  test "RunSchemaRevision is 20 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss)":
+    check RunSchemaRevision == 20
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default

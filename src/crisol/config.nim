@@ -17,6 +17,8 @@
 ## quarantine "tests/integration/test_x.nim"  // B3: failure excluded from exit-1
 ## rlimit-nofile 2048                   // Fix 1: override sandbox RLIMIT_NOFILE (default 1024)
 ## verify-cache-pct 5                   // RFC-0005 B3c: --verify-cache sample-percent default
+## explain-miss #true                   // RFC-0005 B1c: ↔ --explain-miss (config < CLI;
+##                                       // --explain-miss-verbose is CLI-only, no KDL key)
 ## env-pin "USER" "ci-runner"            // RFC-0005 A0: pin NAME=VALUE into every child env
 ##                                       // (repeatable node = more pins); the pinned value,
 ##                                       // not the host's own, enters the soundness key.
@@ -471,6 +473,11 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # concrete value (never a sentinel) -- DefaultVerifyCachePct until the
     # KDL node overrides it, mirroring timeoutSecs above.
     verifyCachePct: int = DefaultVerifyCachePct
+    # RFC-0005 B1c: --explain-miss's config-file default (`explain-miss
+    # #true`). Same strengthen-only opt-in shape as measure-compile-reuse/
+    # strict-hygiene above -- api.planImpl OR's the CLI flag in, never
+    # overrides a config `true` back to `false`.
+    explainMiss: bool = false
     # RFC-0005 A0: repeatable `env-pin "NAME" "VALUE"` nodes -> NAME=VALUE
     # pairs pinned into every child env (see sandbox.filterEnv's tail).
     envPins: seq[(string, string)]
@@ -560,6 +567,12 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v < 0:
         cfgErr("config: 'verify-cache-pct' must be >= 0, got " & $v)
       verifyCachePct = v
+    of "explain-miss":
+      # bool node: explain-miss #true  or  explain-miss #false
+      let v = n.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: 'explain-miss' requires a boolean argument (#true/#false)")
+      explainMiss = v.get.boolVal
     of "env-pin":
       # RFC-0005 A0: `env-pin "NAME" "VALUE"` -- exactly 2 string args.
       # Repeatable: each node contributes ONE pin (unlike `flags`/`dep-roots`,
@@ -614,6 +627,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     strictHygiene:      strictHygiene,
     rlimitNofile:       rlimitNofile,
     verifyCachePct:     verifyCachePct,
+    explainMiss:        explainMiss,
     envPins:            envPins,
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).

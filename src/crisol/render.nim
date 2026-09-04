@@ -104,9 +104,16 @@ type
     color*:     bool           ## emit ANSI color codes
     slowestN*:  int            ## how many slowest items to show (0 → use default of 5)
     filterTag*: Option[string] ## C3: when set, only records with this tag are displayed
+    explainMiss*:        bool  ## RFC-0005 B1c: --explain-miss -- render the per-entrypoint
+                                ## miss-explanation block for a genuine cache-miss decision.
+    explainMissVerbose*: bool  ## RFC-0005 B1c: --explain-miss-verbose -- full raw component
+                                ## values instead of the terse truncated form. The CLI ensures
+                                ## this implies explainMiss=true; render() itself only ever
+                                ## consults explainMiss to decide WHETHER to render.
 
 proc defaultOpts*(): RenderOpts =
-  RenderOpts(color: false, slowestN: 5, filterTag: none(string))
+  RenderOpts(color: false, slowestN: 5, filterTag: none(string),
+             explainMiss: false, explainMissVerbose: false)
 
 # ---------------------------------------------------------------------------
 # Color helpers (kept thin; render logic uses these)
@@ -235,6 +242,170 @@ proc countRecords(records: seq[TestRecord]): RecordCounts =
     of rsPass: inc result.passed
     of rsFail: inc result.failed
     of rsSkip: inc result.skipped
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B1c: miss-explanation rendering (--explain-miss[-verbose])
+#
+# Component-aware, per RFC-0005 §Miss-explanation (line 377, corrected):
+#   kcNimVersion — value is "<multi-line `nim --version` text>|<16-hex binary
+#     content hash>" (nimprobe.nimFingerprint). Terse: first line of the
+#     text + first-8-hex of the hash on each side; when only the hash
+#     differs (text identical), "compiler binary differs" instead.
+#   kcCcVersion — value is "<cc --version first line>|<ldd --version first
+#     line>" (ccprobe.ccVersion) — NOT a multi-line+hash shape like
+#     kcNimVersion, despite RFC-0005's now-corrected line 377. Split on the
+#     pipe; name cc/ldd independently, no truncation (already single lines).
+#   kcHermeticEnv — lists envNames (never values).
+#   kcLimits — per-LimitKind diff over the "<kind>=<v>|..." fold string.
+#   kcArgv — already a plain joined argv string; shown in full.
+#   kcClosure/kcFlags/kcFixtures/kcProtocol — opaque: "changed (<a> → <b>)",
+#     truncated to 8 chars terse, full under --explain-miss-verbose.
+#
+# All pure — no I/O — so vector-testable without running anything. A
+# returned line MAY itself contain embedded '\n' (verbose nimVersion raw
+# text); callers split on lines again before applying their own indent.
+# ---------------------------------------------------------------------------
+
+proc hash8*(h: string): string =
+  ## First 8 characters of an opaque hash string, or the whole string when
+  ## shorter — the terse-mode truncation shared by every opaque component.
+  if h.len > 8: h[0 ..< 8] else: h
+
+proc firstLine*(s: string): string =
+  ## First non-empty line of a (possibly multi-line) string; "" if none.
+  for line in s.splitLines():
+    if line.len > 0: return line
+  ""
+
+proc splitLastPipe(s: string): tuple[left, right: string, ok: bool] =
+  ## Split on the LAST '|'. kcNimVersion's left segment is multi-line
+  ## `nim --version` text that could in principle itself contain a '|'; the
+  ## trailing binary-hash segment never does. `ok=false` (no '|' at all —
+  ## a malformed/foreign value) lets the caller fall back to the generic
+  ## opaque render instead of misparsing.
+  let idx = s.rfind('|')
+  if idx < 0: return ("", "", false)
+  (s[0 ..< idx], s[idx+1 .. ^1], true)
+
+proc splitFirstPipe(s: string): tuple[left, right: string, ok: bool] =
+  ## Split on the FIRST '|'. kcCcVersion is exactly two already-single-line
+  ## segments (`ccprobe.ccVersion`: "<cc first line>|<ldd first line>").
+  let idx = s.find('|')
+  if idx < 0: return ("", "", false)
+  (s[0 ..< idx], s[idx+1 .. ^1], true)
+
+proc renderOpaqueChanged(label: string; prev, curr: string; verbose: bool): string =
+  ## Generic opaque-hash render, shared by every component with no
+  ## dedicated renderer AND as the malformed-value fallback for
+  ## kcNimVersion/kcCcVersion.
+  if verbose:
+    label & ": changed (" & prev & " → " & curr & ")"
+  else:
+    label & ": changed (" & hash8(prev) & "… → " & hash8(curr) & "…)"
+
+proc renderNimVersionLine(d: KeyDiff; verbose: bool): string =
+  let (prevText, prevHash, prevOk) = splitLastPipe(d.prev)
+  let (currText, currHash, currOk) = splitLastPipe(d.curr)
+  if not prevOk or not currOk:
+    return renderOpaqueChanged("kcNimVersion", d.prev, d.curr, verbose)
+  if verbose:
+    return "kcNimVersion prev:\n" & prevText & "\n  hash: " & prevHash &
+           "\nkcNimVersion curr:\n" & currText & "\n  hash: " & currHash
+  let prevLine = firstLine(prevText)
+  let currLine = firstLine(currText)
+  if prevLine == currLine:
+    "kcNimVersion: compiler binary differs (" & hash8(prevHash) & "… → " & hash8(currHash) & "…)"
+  else:
+    "kcNimVersion: " & prevLine & " (" & hash8(prevHash) & "…) → " &
+                        currLine & " (" & hash8(currHash) & "…)"
+
+proc renderCcVersionLines(d: KeyDiff; verbose: bool): seq[string] =
+  ## No verbose/terse distinction on the NORMAL path: cc/ldd segments are
+  ## already single lines (coordinator ruling) — always shown in full,
+  ## never truncated. `verbose` is only consulted on the malformed-value
+  ## fallback, mirroring kcNimVersion's fallback.
+  let (prevCc, prevLdd, prevOk) = splitFirstPipe(d.prev)
+  let (currCc, currLdd, currOk) = splitFirstPipe(d.curr)
+  if not prevOk or not currOk:
+    return @[renderOpaqueChanged("kcCcVersion", d.prev, d.curr, verbose)]
+  result = @[]
+  if prevCc != currCc:
+    result.add "kcCcVersion: cc: " & prevCc & " → " & currCc
+  if prevLdd != currLdd:
+    result.add "kcCcVersion: ldd: " & prevLdd & " → " & currLdd
+  if result.len == 0:
+    # Defensive: the component is only ever emitted (keys.explainMiss) when
+    # the combined value differs, so a diff with both segments equal should
+    # not occur — fall back rather than render nothing.
+    result.add renderOpaqueChanged("kcCcVersion", d.prev, d.curr, verbose)
+
+proc renderHermeticEnvLine(d: KeyDiff; verbose: bool): string =
+  let names = if d.envNames.len > 0: d.envNames.join(", ")
+              else: "(unable to identify which variable)"
+  if verbose:
+    "kcHermeticEnv: " & names & " (hash " & d.prev & " → " & d.curr & ")"
+  else:
+    "kcHermeticEnv: " & names
+
+proc parseLimitsFold(s: string): seq[(string, string)] =
+  ## Parse keys.limitsFoldString's "<kind>=<v>|..." shape back into
+  ## (kind, value) pairs, in fold order.
+  for part in s.split('|'):
+    let eq = part.find('=')
+    if eq >= 0:
+      result.add (part[0 ..< eq], part[eq+1 .. ^1])
+
+proc findLimitVal(parts: seq[(string, string)]; kind: string): string =
+  for (k, v) in parts:
+    if k == kind: return v
+  "-"
+
+proc renderLimitsLines(d: KeyDiff; verbose: bool): seq[string] =
+  ## Per-LimitKind diff: only the kinds whose value actually changed, one
+  ## line each — not the whole fold string (RFC-0005 line 377).
+  let prevParts = parseLimitsFold(d.prev)
+  let currParts = parseLimitsFold(d.curr)
+  result = @[]
+  for (k, pv) in prevParts:
+    let cv = findLimitVal(currParts, k)
+    if pv != cv:
+      result.add "kcLimits: " & k & ": " & pv & " → " & cv
+  if result.len == 0:
+    result.add renderOpaqueChanged("kcLimits", d.prev, d.curr, verbose)
+
+proc renderKeyDiffLines*(d: KeyDiff; verbose: bool): seq[string] =
+  ## PURE, component-aware. One or more logical lines per KeyDiff; a line
+  ## MAY itself contain embedded '\n' (verbose kcNimVersion raw text) —
+  ## callers split on lines again before indenting.
+  case d.component
+  of kcNimVersion: @[renderNimVersionLine(d, verbose)]
+  of kcCcVersion:  renderCcVersionLines(d, verbose)
+  of kcHermeticEnv: @[renderHermeticEnvLine(d, verbose)]
+  of kcLimits:     renderLimitsLines(d, verbose)
+  of kcArgv:       @["kcArgv: " & d.prev & " → " & d.curr]
+  of kcClosure, kcFlags, kcFixtures, kcProtocol:
+    @[renderOpaqueChanged($d.component, d.prev, d.curr, verbose)]
+
+proc explainMissLines*(diffs: seq[KeyDiff]; verbose: bool): seq[string] =
+  ## PURE: format the whole miss-explanation block for one entrypoint.
+  ## Degrades to a single "no prior inputs recorded" line when `diffs` is
+  ## empty — B1b's documented degradation (no sidecar / no matching
+  ## flagHash record), NOT a claim that nothing differs.
+  if diffs.len == 0:
+    return @["no prior inputs recorded"]
+  result = @[]
+  for d in diffs:
+    result.add renderKeyDiffLines(d, verbose)
+
+proc isCacheMissDecision*(cd: CacheDecision): bool =
+  ## PURE: true iff `cd` is a genuine "ran live because the cache was
+  ## consulted and did not serve a hit" decision — the set explain-miss
+  ## rendering applies to. Excludes cdmHit (nothing to explain) and every
+  ## "cache not even consulted" variant (cdmNotEligible/cdmGroupOptOut/
+  ## cdmPolicyDisabled) — explaining "why did this miss" is meaningless
+  ## when the cache was never asked.
+  cd in {cdmStored, cdmKeyMiss, cdmHermeticityDeg, cdmFlaky,
+         cdmClosureUnrecorded, cdmRecomputeMiss}
 
 # ---------------------------------------------------------------------------
 # render — PURE
@@ -469,6 +640,14 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
       let cause = causeDetail(r)
       if cause.len > 0:
         buf.add "           " & col("cause: " & cause, Ansi_Dim, color) & "\n"
+
+    # -----------------------------------------------------------------------
+    # RFC-0005 B1c: miss-explanation detail (--explain-miss[-verbose])
+    # -----------------------------------------------------------------------
+    if opts.explainMiss and isCacheMissDecision(r.cacheDecision):
+      for blk in explainMissLines(r.keyDiff, opts.explainMissVerbose):
+        for physLine in blk.splitLines():
+          buf.add "           " & col("explain: ", Ansi_Dim, color) & physLine & "\n"
 
   # -------------------------------------------------------------------------
   # 2. Slowest-N section

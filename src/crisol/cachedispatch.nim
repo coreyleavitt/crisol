@@ -225,6 +225,14 @@ type
                           ## EntrypointResult so run/v1 reports inputHash on
                           ## misses too, not only on hits.
     synthesized*: Option[EntrypointResult]  ## some() iff a hit was served
+    explain*:     seq[KeyDiff]  ## RFC-0005 B1c: threaded verbatim from the seam's
+                          ## `CacheLookup.explain` (B1b) on a genuine miss (`l.hit.
+                          ## isNone`) or a recompute-invalidated hit (empty in that
+                          ## case -- the entry WAS found, so there is nothing to
+                          ## diff against). Empty for every other early return (not
+                          ## eligible / policy disabled / group opt-out) -- the seam
+                          ## is never consulted on those paths. The runner threads
+                          ## this onto the live EntrypointResult's `keyDiff` field.
 
 proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
                 inputHash: string): EntrypointResult =
@@ -257,6 +265,7 @@ proc lookupAtPlan*(
   pep:    PlannedEntrypoint;
   policy: CachePolicy;
   seams:  CacheSeams;
+  explainDiag: bool = false;
 ): PlanLookup =
   ## Decide whether `pep` can be served from cache.
   ##
@@ -273,9 +282,42 @@ proc lookupAtPlan*(
   ## `--changed` is unaffected: a changed closure ⇒ different closureHash ⇒
   ## different soundness key ⇒ guaranteed miss (cache + impact read the same
   ## content, so they cannot disagree).
+  ##
+  ## `explainDiag` (RFC-0005 B1c, coordinator ruling): a recompiling
+  ## entrypoint (flag change, source change, first-ever build) is the
+  ## LOAD-BEARING explain-miss scenario (RFC line 375's "your flags
+  ## changed") -- but it is NEVER edRunFresh (`planner.slug` hashes ALL
+  ## flags into the bin directory, so any flag change points at a bin dir
+  ## that does not exist yet), so the normal cache lookup below never runs
+  ## for it. When `explainDiag` is true, the `pep.edecision != edRunFresh`
+  ## branch does a READ-ONLY diagnostic consult (derive this run's
+  ## KeyInputs, call the seam's `load` PURELY to recover `.explain`) --
+  ## discarding `.hit`/`.verdicts` entirely: no promotion, no cacheDecision
+  ## change (stays `cdmNotEligible`; actually promoting/serving a
+  ## recompiled entry from a matching cache elsewhere is A2c's job, not
+  ## this diagnostic). GATED on the flag (unlike the sidecar WRITE, which
+  ## stays unconditional as B1b built it): with no `--explain-miss` the
+  ## extra load has zero observable output (`keyDiff` is only rendered/
+  ## serialized under the flag), so an unconditional consult here would be
+  ## pure I/O waste -- one backend `get` per recompiling entrypoint per
+  ## run, and on a future remote tier a pointless network GET at plan time.
+  ## A stale/absent depgraph entry for the (path, NEW flagHash) pair (the
+  ## graph is keyed by (path, flagHash); a flag change means no entry
+  ## exists yet even though the source is unchanged) can make `keyOf`
+  ## derive a degenerate `closureContentHash` ("" — DepGraphEntry()'s
+  ## zero value) for this consult, which may surface as an HONEST but
+  ## incidental `kcClosure` diff alongside the genuine `kcFlags` one --
+  ## not suppressed; degrading gracefully means reporting what the diff
+  ## actually is, not hiding a component `keys.explainMiss` legitimately
+  ## found different.
   if pep.edecision != edRunFresh:
+    var diagExplain: seq[KeyDiff] = @[]
+    if explainDiag:
+      let d = derive(seams, pep)
+      diagExplain = seams.load(pep, d).explain
     return PlanLookup(decision: pep.edecision, cacheDecision: cdmNotEligible,
-                      inputHash: "", synthesized: none(EntrypointResult))
+                      inputHash: "", synthesized: none(EntrypointResult),
+                      explain: diagExplain)
 
   let res = resolveCacheable(policy, pep.cacheable)
   if not res.readOk:
@@ -291,7 +333,7 @@ proc lookupAtPlan*(
   let l    = seams.load(pep, d)
   if l.hit.isNone:
     return PlanLookup(decision: edRunFresh, cacheDecision: cdmKeyMiss, inputHash: kStr,
-                      synthesized: none(EntrypointResult))
+                      synthesized: none(EntrypointResult), explain: l.explain)
 
   # rfc-0007 A1d-ii / §2: recompute the outcome at THIS trust boundary, never
   # read it from storage.  A hit whose recomputed outcome is not oPassed is
@@ -300,7 +342,8 @@ proc lookupAtPlan*(
   let synth = synthesize(pep, l.hit.get.result, kStr)
   if outcome(synth) != oPassed:
     return PlanLookup(decision: edRunFresh, cacheDecision: cdmRecomputeMiss,
-                      inputHash: kStr, synthesized: none(EntrypointResult))
+                      inputHash: kStr, synthesized: none(EntrypointResult),
+                      explain: l.explain)
   PlanLookup(decision: edCached, cacheDecision: cdmHit, inputHash: kStr,
              synthesized: some(synth))
 
