@@ -53,7 +53,7 @@
 ## byte-serialization; a backend that never touches bytes (the in-memory
 ## object double) must honor it exactly the same as one that does.
 
-import std/[json, options]
+import std/[json, options, tables]
 import crisol/cacheport
 import crisol/resultcache
 import crisol/fnv
@@ -171,6 +171,147 @@ proc keyInputsFromJson*(node: JsonNode): Option[KeyInputs] =
     hermeticEnvHash:    envN.getStr,
     protocolMajor:      protoN.getInt,
   ))
+
+# ---------------------------------------------------------------------------
+# Sidecar <-> JSON (RFC-0005 B1b: the path-keyed explain-miss sidecar) —
+# hand-written, following `keyInputsToJson`/`keyInputsFromJson`'s pattern
+# (never `std/jsonutils`). This is a LOCAL-FS implementation detail, not
+# part of the `CacheBackend` port contract (`cachelocalfs.nim` owns the
+# path/read/write I/O; this module owns only the type + wire shape, exactly
+# as it owns `StoredEntry`'s own codec).
+#
+# `Sidecar` stores a small map `flagHash -> {inputs, envDigest}`,
+# most-recent-per-flagHash (`upsertSidecarRecord` below), pruned on write.
+# `order` records write-recency (oldest first) so pruning and "most recent
+# prior record" (`mostRecentRecord`) are O(1) — the JSON `records` object is
+# unordered (JSON object key order is not a place to hang a soundness-load-
+# bearing invariant on), so recency is carried explicitly in `order`.
+#
+# Values are NEVER stored: `envDigest` entries are `(name, hash16(value))`
+# pairs — see `keys.envDigest`, whose own doc comment is the one authority
+# on this guarantee; this module never receives a raw value to begin with.
+# ---------------------------------------------------------------------------
+
+type
+  SidecarEntry* = object
+    key*:       SoundnessKey
+      ## The soundness key this record was stored under — carried
+      ## redundantly (the dispatch seam already has it as `KeyDerivation.key`
+      ## when writing) so a reader can check entry-liveness (`<key>.json`
+      ## exists?) WITHOUT decoding `inputs` and recomputing `soundnessKey`.
+      ## `resultcache.gcResultCacheAt`'s sidecar-prune pass is the reader
+      ## that matters: it sits BELOW `cachewire`/`cacheport` in the import
+      ## graph (this module already imports `resultcache` — the reverse
+      ## edge would cycle) and reads this one scalar field with a minimal,
+      ## cachewire-independent JSON walk rather than importing this codec.
+    inputs*:    KeyInputs
+    envDigest*: seq[(string, string)]
+      ## `(name, hash16(value))` pairs — see `keys.envDigest`. NEVER a raw
+      ## value.
+
+  Sidecar* = object
+    order*:   seq[string]              ## flagHash write order, oldest first
+    records*: Table[string, SidecarEntry]  ## flagHash -> most-recent record
+
+const DefaultMaxSidecarRecords* = 8
+  ## Bound on distinct flagHash records retained per sidecar (RFC-0005
+  ## "Miss-explanation": "most-recent-per-flagHash, pruned on write").
+
+proc envDigestToJson(d: seq[(string, string)]): JsonNode =
+  result = newJArray()
+  for (name, digest) in d:
+    let o = newJObject()
+    o["name"]   = newJString(name)
+    o["digest"] = newJString(digest)
+    result.add o
+
+proc envDigestFromJson(node: JsonNode): Option[seq[(string, string)]] =
+  if node == nil or node.kind != JArray: return
+  var res: seq[(string, string)] = @[]
+  for item in node:
+    if item.kind != JObject: return
+    let n = item{"name"}
+    let d = item{"digest"}
+    if n == nil or n.kind != JString: return
+    if d == nil or d.kind != JString: return
+    res.add (n.getStr, d.getStr)
+  some(res)
+
+proc sidecarEntryToJson(e: SidecarEntry): JsonNode =
+  result = newJObject()
+  result["key"]       = newJString($e.key)
+  result["inputs"]    = keyInputsToJson(e.inputs)
+  result["envDigest"] = envDigestToJson(e.envDigest)
+
+proc sidecarEntryFromJson(node: JsonNode): Option[SidecarEntry] =
+  if node == nil or node.kind != JObject: return
+  let keyN = node{"key"}
+  if keyN == nil or keyN.kind != JString: return
+  let inputs = keyInputsFromJson(node{"inputs"})
+  if inputs.isNone: return
+  let env = envDigestFromJson(node{"envDigest"})
+  if env.isNone: return
+  some(SidecarEntry(key: SoundnessKey(keyN.getStr), inputs: inputs.get, envDigest: env.get))
+
+proc sidecarToJson*(s: Sidecar): JsonNode =
+  result = newJObject()
+  let orderArr = newJArray()
+  for f in s.order: orderArr.add newJString(f)
+  result["order"] = orderArr
+  let recsObj = newJObject()
+  for f in s.order:
+    if f in s.records:
+      recsObj[f] = sidecarEntryToJson(s.records[f])
+  result["records"] = recsObj
+
+proc sidecarFromJson*(node: JsonNode): Option[Sidecar] =
+  if node == nil or node.kind != JObject: return
+  let orderN = node{"order"}
+  let recsN  = node{"records"}
+  if orderN == nil or orderN.kind != JArray: return
+  if recsN == nil or recsN.kind != JObject: return
+  var order: seq[string] = @[]
+  for o in orderN:
+    if o.kind != JString: return
+    order.add o.getStr
+  var records = initTable[string, SidecarEntry]()
+  for f in order:
+    let e = sidecarEntryFromJson(recsN{f})
+    if e.isNone: return
+    records[f] = e.get
+  some(Sidecar(order: order, records: records))
+
+proc upsertSidecarRecord*(s: Sidecar; flagHash: string; entry: SidecarEntry;
+                          maxRecords = DefaultMaxSidecarRecords): Sidecar =
+  ## Insert/replace `flagHash`'s record as the MOST RECENT, then prune to
+  ## `maxRecords` distinct flagHashes (oldest-touched dropped first).  PURE.
+  ## `maxRecords <= 0` means no bound.
+  var order = s.order
+  var records = s.records
+  var idx = -1
+  for i, f in order:
+    if f == flagHash: idx = i; break
+  if idx >= 0: order.delete(idx)
+  order.add flagHash
+  records[flagHash] = entry
+  if maxRecords > 0:
+    while order.len > maxRecords:
+      let victim = order[0]
+      order.delete(0)
+      records.del(victim)
+  Sidecar(order: order, records: records)
+
+proc mostRecentRecord*(s: Sidecar): Option[tuple[flagHash: string, entry: SidecarEntry]] =
+  ## The globally most-recently-touched record, regardless of its flagHash
+  ## — RFC-0005's "picks the most-recent prior record" (deliberately NOT
+  ## keyed by the CURRENT flagHash: a flag change is the common case this
+  ## mechanism exists to explain, so diffing against a record whose
+  ## flagHash differs is exactly the point — it surfaces as `kcFlags`).
+  ## PURE.  `none` iff the sidecar is empty (no prior record at all).
+  if s.order.len == 0: return
+  let f = s.order[^1]
+  if f notin s.records: return
+  some((flagHash: f, entry: s.records[f]))
 
 # ---------------------------------------------------------------------------
 # Attestation <-> JSON (private — SigAlg's wire mapping stays local to the

@@ -322,6 +322,33 @@ const hermeticSkipVars = ["CRISOL_SINK", "CRISOL_ATTEMPT"]
 const hermeticNameOnlyVars = ["TMPDIR"]
   ## Vars whose value carries a per-run random suffix (mkdtemp): hash name only.
 
+proc hermeticEnvDigestInput*(filteredEnv: seq[(string, string)]): seq[(string, string)] =
+  ## RFC-0005 B1b: normalize `filteredEnv` for the explain-miss sidecar's
+  ## per-name digest (`keys.envDigest`) using the SAME two rules
+  ## `hermeticEnvHash` folds into the soundness key, so the sidecar's
+  ## `envNames` diagnostic never disagrees with what actually participates
+  ## in `KeyInputs.hermeticEnvHash`:
+  ##   - CRISOL_SINK/CRISOL_ATTEMPT (per-run injections) are dropped
+  ##     entirely — they never reach the digest, exactly as they never
+  ##     reach the hash.
+  ##   - TMPDIR's VALUE (a per-run mkdtemp suffix) is blanked to "" — its
+  ##     digest is therefore CONSTANT across runs/hosts, matching
+  ##     `hermeticEnvHash`'s name-only treatment; only its NAME
+  ##     participates, so a TMPDIR-value-only difference never shows up as
+  ##     spurious envNames noise.
+  ##
+  ## Does NOT touch `hermeticEnvHash` itself (unchanged below — this is a
+  ## SEPARATE, purely-additive normalization for the diagnostic digest
+  ## only, so the existing SoundnessKey / cache behavior is byte-for-byte
+  ## untouched).
+  var sorted = filteredEnv
+  sorted.sort(proc(a, b: (string, string)): int = cmp(a[0], b[0]))
+  result = @[]
+  for (name, value) in sorted:
+    if name in hermeticSkipVars: continue
+    elif name in hermeticNameOnlyVars: result.add (name, "")
+    else: result.add (name, value)
+
 proc hermeticEnvHash*(filteredEnv: seq[(string, string)]): string =
   ## Compute a stable FNV-1a hash of a filtered env for the soundness key.
   ##

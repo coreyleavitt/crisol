@@ -26,6 +26,7 @@
 
 import std/options
 import crisol/cacheport
+import crisol/keys   # KeyDiff -- RFC-0005 B1b's explain-miss attachment
 
 type
   Tier* = object
@@ -65,6 +66,15 @@ type
     verdicts*: seq[TierVerdict]
       ## One per tier CONSULTED, in search order (`cvOk` for the serving
       ## tier).
+    explain*: seq[KeyDiff]
+      ## RFC-0005 B1b: populated ONLY by the `cachedispatch.realSeams`
+      ## `load` adapter, on a MISS, when the path-keyed local-fs sidecar
+      ## (tier 0 / local root only) has a prior record to diff against via
+      ## `keys.explainMiss` — empty otherwise (a hit, no sidecar, or a
+      ## runtime with no local root). NOT set by `TieredCache.lookup`
+      ## itself: this is a pure lookup engine with no path/sidecar
+      ## knowledge — see `cachelocalfs.nim`'s module doc ("sidecar I/O is a
+      ## local-fs implementation detail, not a CacheBackend contract").
 
 proc worst*(l: CacheLookup): CacheVerdict =
   ## The strongest verdict across `l.verdicts`, by `CacheVerdict`'s own

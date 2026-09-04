@@ -39,6 +39,7 @@ import crisol/[types, keys, resultcache, sandbox, depgraph, planner]
 import crisol/cacheport
 import crisol/cachetier
 import crisol/cachewire
+import crisol/cachelocalfs  # RFC-0005 B1b: readSidecar/writeSidecar (sidecar I/O)
 import crisol/cacheregistry
 # rfc-0007 §2: synthesize() replays the REAL stored `run` ProcessResult as
 # a `Phase(kind: pkCached, ...)` node -- `outcome(r)` (there is no stored
@@ -415,6 +416,14 @@ type
       ## = hermeticEnvHash(filterEnv(parentEnv, spec, @[])) — computed ONCE
       ## by `keyContext` (env-pins are already applied via `spec.envPins`,
       ## which `filterEnv` reads; see `sandbox.filterEnv`).
+    envDigest*: seq[(string, string)]
+      ## RFC-0005 B1b: `keys.envDigest` over `sandbox.hermeticEnvDigestInput`'s
+      ## normalized pairs — the SAME two exclusion rules `hermeticEnvHash`
+      ## folds into the key (CRISOL_SINK/ATTEMPT dropped; TMPDIR value
+      ## blanked), so this never disagrees with `hermeticEnvHash` about what
+      ## is actually IN the key. Computed ONCE alongside `hermeticEnvHash`.
+      ## Feeds the explain-miss sidecar's stored record and `explainMiss`'s
+      ## `currEnv` — NEVER a raw value (`keys.envDigest` never retains one).
     protocolMajor*:   int
 
 proc keyContext*(nimVersion, ccVersion: string; spec: SandboxSpec;
@@ -428,11 +437,13 @@ proc keyContext*(nimVersion, ccVersion: string; spec: SandboxSpec;
   ## synthetic snapshot to exercise the key-derivation logic without live env
   ## reads.  Filtering (allowlist + `spec.envPins`' tail) happens exactly once
   ## here — every `keyOfProc`-built closure reuses the resulting hash.
+  let filtered = filterEnv(parentEnv, spec, @[])
   KeyContext(
     nimVersion:      nimVersion,
     ccVersion:       ccVersion,
     spec:            spec,
-    hermeticEnvHash: hermeticEnvHash(filterEnv(parentEnv, spec, @[])),
+    hermeticEnvHash: hermeticEnvHash(filtered),
+    envDigest:       envDigest(hermeticEnvDigestInput(filtered)),
     protocolMajor:   protocolMajor,
   )
 
@@ -513,11 +524,25 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
   ## `rt` is captured as a mutable local shadow so the closures below can
   ## call `TieredCache.lookup`/`put` (which take `var TieredCache`); `rt`'s
   ## `cache` field is otherwise identical to what the caller passed in.
+  ##
+  ## RFC-0005 B1b: `load`/`store` ALSO drive the path-keyed explain-miss
+  ## sidecar directly via `cachelocalfs.readSidecar`/`writeSidecar` — NOT
+  ## through `CacheBackend`/`TieredCache` (sidecar I/O is a local-fs
+  ## implementation detail, not a port concern) — gated on
+  ## `rt.localRoot.len > 0` (tier 0 / local root only; a runtime with no
+  ## local root, e.g. a bare test double, simply has nothing to diff
+  ## against or write to).
   var rt = rt
   CacheSeams(
     keyOf: keyOfProc(ctx, graph),
     load:  proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
-             rt.cache.lookup(d.key),
+             result = rt.cache.lookup(d.key)
+             if result.hit.isNone and rt.localRoot.len > 0:
+               let prior = mostRecentRecord(readSidecar(rt.localRoot, pep.ep.path))
+               if prior.isSome:
+                 result.explain = explainMiss(prior.get.entry.inputs, d.inputs,
+                                               prior.get.entry.envDigest, ctx.envDigest)
+    ,
     store: proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool =
              let verdicts = rt.cache.put(StoredEntry(
                key:            d.key,
@@ -527,5 +552,9 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
              ))
              result = false
              for v in verdicts:
-               if v.verdict == cvOk: result = true,
+               if v.verdict == cvOk: result = true
+             if result and rt.localRoot.len > 0:
+               writeSidecar(rt.localRoot, pep.ep.path,
+                            SidecarEntry(key: d.key, inputs: d.inputs, envDigest: ctx.envDigest))
+    ,
   )

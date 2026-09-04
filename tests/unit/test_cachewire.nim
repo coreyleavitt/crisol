@@ -12,8 +12,15 @@
 ##   8. envelopeBytes is a pure NUL-delimited joiner.
 ##   9. decode of garbage bytes -> cvCorrupt (never raises).
 ##   10. verifyEntryIntegrity directly: ok / corrupt / version-skew.
+##   11. Sidecar (RFC-0005 B1b) — sidecarToJson/sidecarFromJson roundtrip
+##       (order + records + envDigest + key, values never in the wire shape
+##       beyond their digest); upsertSidecarRecord: new flagHash appended,
+##       re-store of an EXISTING flagHash replaces in place and becomes
+##       most-recent; pruning bound drops the oldest-touched flagHash;
+##       mostRecentRecord returns the globally most-recent record regardless
+##       of its own flagHash; malformed sidecar JSON shapes -> none.
 
-import std/[json, options]
+import std/[json, options, strutils, tables]
 import crisol/types
 import crisol/keys
 import crisol/cacheport
@@ -265,5 +272,115 @@ block test_verify_entry_integrity_version_skew:
   e.result.payloadChecksum = toHex16(fnv1a64(canonicalPayload(e.result)))
   e.storageVersion = storageFormatVersion + 1
   assert verifyEntryIntegrity(e) == cvVersionSkew
+
+
+# ---------------------------------------------------------------------------
+# 11. Sidecar (RFC-0005 B1b: the path-keyed explain-miss sidecar)
+# ---------------------------------------------------------------------------
+
+proc sampleEnvDigest(): seq[(string, string)] =
+  @[("HOME", "aa11bb22cc33dd44"), ("PATH", "1122334455667788")]
+
+proc sampleSidecarEntry(flagHash: string): SidecarEntry =
+  var inp = sampleKeyInputs()
+  inp.flagHash = flagHash
+  SidecarEntry(
+    key:       SoundnessKey("side" & flagHash),
+    inputs:    inp,
+    envDigest: sampleEnvDigest(),
+  )
+
+block test_sidecar_roundtrip:
+  var s = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
+  s = upsertSidecarRecord(s, "flagA", sampleSidecarEntry("flagA"))
+  let node = sidecarToJson(s)
+  let back = sidecarFromJson(node)
+  assert back.isSome
+  assert back.get.order == @["flagA"]
+  assert "flagA" in back.get.records
+  let rec = back.get.records["flagA"]
+  assert rec.key == SoundnessKey("sideflagA")
+  assert rec.inputs == sampleSidecarEntry("flagA").inputs
+  assert rec.envDigest == sampleEnvDigest()
+
+block test_sidecar_wire_never_carries_a_raw_value:
+  ## envDigest entries are (name, hash16(value)) pairs -- the wire form must
+  ## never contain a raw value string, only names + hex digests.
+  var s = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
+  s = upsertSidecarRecord(s, "flagA", sampleSidecarEntry("flagA"))
+  let raw = $sidecarToJson(s)
+  assert "aa11bb22cc33dd44" in raw   # the digest IS present
+  assert "1122334455667788" in raw
+  # (nothing to grep for a "raw value" here -- sampleEnvDigest already only
+  # ever carries digests; the end-to-end "sentinel value absent" property
+  # is proven through the real key-derivation path in test_cachedispatch.nim.)
+
+block test_upsert_new_flaghash_appends:
+  var s = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
+  s = upsertSidecarRecord(s, "flagA", sampleSidecarEntry("flagA"))
+  s = upsertSidecarRecord(s, "flagB", sampleSidecarEntry("flagB"))
+  assert s.order == @["flagA", "flagB"]
+  assert s.records.len == 2
+  assert "flagA" in s.records
+  assert "flagB" in s.records
+
+block test_upsert_same_flaghash_replaces_and_becomes_most_recent:
+  var s = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
+  s = upsertSidecarRecord(s, "flagA", sampleSidecarEntry("flagA"))
+  s = upsertSidecarRecord(s, "flagB", sampleSidecarEntry("flagB"))
+  # Re-store flagA with a DIFFERENT entry (distinguishable via envDigest) --
+  # must replace flagA's record in place AND move flagA to most-recent.
+  var newer = sampleSidecarEntry("flagA")
+  newer.envDigest = @[("HOME", "ffffffffffffffff")]
+  s = upsertSidecarRecord(s, "flagA", newer)
+  assert s.order == @["flagB", "flagA"], "re-stored flagHash must become most-recent"
+  assert s.records.len == 2, "re-storing an EXISTING flagHash must not grow the record count"
+  assert s.records["flagA"].envDigest == @[("HOME", "ffffffffffffffff")]
+
+block test_upsert_prunes_oldest_touched_past_the_bound:
+  var s = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
+  for i in 0 ..< 5:
+    s = upsertSidecarRecord(s, "flag" & $i, sampleSidecarEntry("flag" & $i), maxRecords = 3)
+  assert s.order.len == 3, "must be pruned to the bound"
+  assert s.records.len == 3
+  assert s.order == @["flag2", "flag3", "flag4"], "oldest-touched (flag0, flag1) must be dropped first"
+  assert "flag0" notin s.records
+  assert "flag1" notin s.records
+
+block test_most_recent_record_empty_sidecar:
+  let s = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
+  assert mostRecentRecord(s).isNone
+
+block test_most_recent_record_is_globally_most_recent_not_current_flaghash:
+  ## `mostRecentRecord` must return the LAST-touched record overall,
+  ## regardless of what flagHash the caller is currently deriving under --
+  ## this is precisely what makes a flag-change miss explainable (RFC-0005
+  ## "Miss-explanation": diffing against a record whose flagHash differs is
+  ## the point -- it surfaces as kcFlags).
+  var s = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
+  s = upsertSidecarRecord(s, "flagA", sampleSidecarEntry("flagA"))
+  s = upsertSidecarRecord(s, "flagB", sampleSidecarEntry("flagB"))
+  let prior = mostRecentRecord(s)
+  assert prior.isSome
+  assert prior.get.flagHash == "flagB"
+  assert prior.get.entry.key == SoundnessKey("sideflagB")
+
+block test_sidecar_from_json_malformed_shapes:
+  assert sidecarFromJson(nil).isNone
+  assert sidecarFromJson(newJString("not an object")).isNone
+  assert sidecarFromJson(newJObject()).isNone, "missing order/records -> none"
+
+  let missingRecords = newJObject()
+  missingRecords["order"] = newJArray()
+  assert sidecarFromJson(missingRecords).isNone, "order without records -> none"
+
+  # order names a flagHash with no matching entry under records -> none
+  # (an internally-inconsistent sidecar is corrupt, not partially valid).
+  let dangling = newJObject()
+  let orderArr = newJArray()
+  orderArr.add newJString("flagA")
+  dangling["order"] = orderArr
+  dangling["records"] = newJObject()
+  assert sidecarFromJson(dangling).isNone
 
 echo "test_cachewire: all blocks passed"

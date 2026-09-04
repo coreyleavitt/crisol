@@ -66,11 +66,12 @@
 ## there) — so a full disk hit across many `put`s to the same root emits one
 ## line, not N.
 
-import std/[os, strutils]
+import std/[json, options, os, strutils, tables]
 import crisol/cacheport
 import crisol/cachewire
 import crisol/resultcache
 import crisol/ioutils
+import crisol/fnv
 
 proc entryPath(root: string; key: SoundnessKey): string {.inline.} =
   cacheVersionDirAt(root) / ($key & ".json")
@@ -96,6 +97,59 @@ proc classifyRootForRead(root: string; autoCreate: bool): RootState =
   if fileExists(root): return rsOffline  # ENOTDIR — a file blocks the dir
   if autoCreate: return rsEmptyOk
   return rsOffline
+
+# ---------------------------------------------------------------------------
+# Explain-miss sidecar I/O (RFC-0005 B1b) — a LOCAL-FS implementation
+# detail, NOT part of the `CacheBackend` port contract (the `memory`/
+# `memoryBytes` doubles never see this; `cachedispatch.realSeams` calls
+# these procs directly, bypassing `CacheBackend.get`/`put` entirely, since
+# a sidecar is keyed by PATH, not by `SoundnessKey`). Type + wire codec
+# live in `cachewire.nim` (`Sidecar`/`SidecarEntry`/`sidecarToJson`/
+# `sidecarFromJson`/`upsertSidecarRecord`); this module owns only path
+# construction and the actual reads/writes.
+# ---------------------------------------------------------------------------
+
+proc inputsDirAt(root: string): string {.inline.} =
+  cacheVersionDirAt(root) / "inputs"
+
+proc sidecarPath*(root: string; path: string): string =
+  ## `<root>/v<N>/inputs/<fnv(path)>.json` — keyed by the entrypoint PATH
+  ## (never `identityKey`/`SoundnessKey`), so a flag change still finds the
+  ## sidecar and explains as `kcFlags` rather than "no prior inputs"
+  ## (RFC-0005 "Miss-explanation").
+  inputsDirAt(root) / (toHex16(fnv1a64(path)) & ".json")
+
+proc readSidecar*(root: string; path: string): Sidecar =
+  ## Read the path-keyed explain sidecar. Absent, unreadable, or
+  ## structurally corrupt (including truncated JSON) degrades gracefully to
+  ## an EMPTY sidecar — never an error, never a crash (RFC-0005's "older
+  ## writer, first-ever run" case, generalized to any read failure).
+  result = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
+  let p = sidecarPath(root, path)
+  if not fileExists(p): return
+  var raw: string
+  try: raw = readFile(p)
+  except CatchableError: return
+  var node: JsonNode
+  try: node = parseJson(raw)
+  except CatchableError: return
+  let parsed = sidecarFromJson(node)
+  if parsed.isSome: result = parsed.get
+
+proc writeSidecar*(root: string; path: string; entry: SidecarEntry;
+                   maxRecords = DefaultMaxSidecarRecords) =
+  ## Update the path-keyed sidecar's most-recent record for
+  ## `entry.inputs.flagHash`, pruning to `maxRecords` distinct flagHashes
+  ## (`cachewire.upsertSidecarRecord`). Best-effort: a sidecar is
+  ## diagnostic, never load-bearing, so any I/O failure here is silently
+  ## swallowed rather than surfaced as a run warning (unlike a genuine
+  ## cache-entry write failure).
+  let cur = readSidecar(root, path)
+  let next = upsertSidecarRecord(cur, entry.inputs.flagHash, entry, maxRecords)
+  let dir = inputsDirAt(root)
+  try: createDir(dir)
+  except OSError: return
+  discard atomicPublish(sidecarPath(root, path), $sidecarToJson(next))
 
 proc localFsBackend*(root: string; autoCreate: bool; maxEntries: int): CacheBackend =
   let ser = jsonCacheSerializer()

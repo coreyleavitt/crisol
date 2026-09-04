@@ -40,19 +40,28 @@ type
     ## growth; no dispose — RFC-0005 "Wiring").
     cache*: TieredCache
     sink*:  TelemetrySink[CacheEvent]
+    localRoot*: string
+      ## RFC-0005 B1b: the LOCAL-FS root the explain-miss sidecar lives
+      ## under (tier 0 / "l1" only — never a shared remote tier, which
+      ## must not host per-host history). "" means no local root to write
+      ## a sidecar against (e.g. a bare test runtime with no local-fs tier
+      ## at all). NOT a general per-tier concept — the RFC pins the
+      ## sidecar mechanism to tier 0 specifically.
 
 proc localOnlyCache*(stateDir: string; maxEntries: int): CacheRuntime =
   ## Single-tier local-fs ("l1"), `nonePolicy`, `NilSink` — the default for
   ## every run with no remote tier configured (RFC-0005 "Local-fs root":
   ## L1 is never a URL; the tier name is pinned "l1").
+  let root = stateDir / "cache"
   let l1 = Tier(
     name:          "l1",
-    backend:       localFsBackend(root = stateDir / "cache", autoCreate = true,
+    backend:       localFsBackend(root = root, autoCreate = true,
                                    maxEntries = maxEntries),
     backfillOnHit: false,  # A1 single-tier scope: no downstream tier to backfill from
     verifyTrust:   false,  # nonePolicy already verifies unconditionally cvOk
   )
   CacheRuntime(
-    cache: TieredCache(tiers: @[l1], trust: nonePolicy()),
-    sink:  NilSink[CacheEvent](),
+    cache:     TieredCache(tiers: @[l1], trust: nonePolicy()),
+    sink:      NilSink[CacheEvent](),
+    localRoot: root,
   )

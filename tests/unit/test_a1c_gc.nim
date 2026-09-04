@@ -23,10 +23,26 @@
 ##  cleanOrphans integration:
 ##  12. cleanOrphans evicts over-cap result-cache entries + returns count.
 ##  13. cleanOrphans compacts ledger shards + returns counts.
+##
+##  RFC-0005 B1b — orphan sidecar pruning (inside gcResultCacheAt's walk):
+##  14. entry evicted (age bound) -> its path's sidecar is pruned.
+##  15. entry NOT evicted -> its path's sidecar survives.
+##  16. a sidecar with multiple records survives if ANY record's key is
+##      still live, even when others are not.
+##  17. a sidecar all of whose records are dead (evicted or never-live) is
+##      pruned entirely.
+##  18. a corrupt/malformed sidecar file is pruned too (never crashes GC).
+##  19. sidecars are outside countCacheEntries's cap glob / the LRU walk:
+##      exactly-at-cap real entries + extra sidecars in the same verDir ->
+##      0 evictions (sidecars never inflate the apparent entry count).
 
 import std/[os, json, options, sequtils, strutils, tables, times]
 import std/posix as posix_mod
 import crisol/[types, resultcache, ledger, clean, depgraph]
+import crisol/keys
+import crisol/cachewire
+import crisol/cachelocalfs
+import crisol/process/types as ptypes  # default(Limits) for the sidecar fixtures below
 
 # ---------------------------------------------------------------------------
 # Helpers — state-dir factories
@@ -513,5 +529,130 @@ block test_gc_removes_tmp_even_when_no_json:
   assert r.evicted == 0
   assert not fileExists(verDir / "aaaa0000aaaa0000.json.99.tmp"), "pid-style tmp removed"
   assert not fileExists(verDir / "bbbb0000bbbb0000.json.tmp"),    "plain tmp removed"
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B1b: orphan sidecar pruning inside gcResultCacheAt's walk
+# ---------------------------------------------------------------------------
+
+proc sampleKeyInputsFor(flagHash: string): KeyInputs =
+  KeyInputs(
+    closureContentHash: "closure-abc",
+    flagHash:            flagHash,
+    nimVersion:          "2.2.10",
+    ccVersion:           "gcc-13",
+    fixtureHash:         "",
+    argv:                @["mybin"],
+    limits:              default(ptypes.Limits),
+    hermeticEnvHash:     "envhash-xyz",
+    protocolMajor:       1,
+  )
+
+proc seedSidecarRecord(root: string; path: string; key: string; flagHash: string) =
+  ## `root` is the cache ROOT (`stateDir / "cache"`), matching
+  ## `cachelocalfs.writeSidecar`'s own parameter — the same value
+  ## `gcResultCacheAt` is called with below.
+  writeSidecar(root, path, SidecarEntry(
+    key:       SoundnessKey(key),
+    inputs:    sampleKeyInputsFor(flagHash),
+    envDigest: @[("HOME", "aa11bb22cc33dd44")],
+  ))
+
+block test_sidecar_pruned_when_its_only_entry_is_evicted:
+  let sd = freshSD("sidecar_prune_evicted")
+  defer: removeDir(sd)
+  let root = sd / "cache"
+  let path = "tests/unit/test_gone.nim"
+
+  seedCacheEntry(sd, "keyA0000keyA0000", cachedAt = 1_000)  # old
+  seedSidecarRecord(root, path, "keyA0000keyA0000", "flagA")
+  let sc = sidecarPath(root, path)
+  assert fileExists(sc), "sidecar must exist before GC"
+
+  # Age-evict everything older than (nowSecs - maxAgeSecs).
+  let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 100, nowSecs = 1_000_000)
+  assert r.evicted == 1
+  assert not fileExists(sc), "the path's sidecar must be pruned once its only entry is gone"
+
+block test_sidecar_survives_when_its_entry_stays_live:
+  let sd = freshSD("sidecar_survive_live")
+  defer: removeDir(sd)
+  let root = sd / "cache"
+  let path = "tests/unit/test_stays.nim"
+
+  seedCacheEntry(sd, "keyB0000keyB0000", cachedAt = 999_999)  # recent
+  seedSidecarRecord(root, path, "keyB0000keyB0000", "flagB")
+  let sc = sidecarPath(root, path)
+
+  let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 100, nowSecs = 1_000_000)
+  assert r.evicted == 0
+  assert fileExists(sc), "a sidecar whose entry is still live must survive GC"
+
+block test_sidecar_survives_if_any_record_still_live:
+  let sd = freshSD("sidecar_multi_any_live")
+  defer: removeDir(sd)
+  let root = sd / "cache"
+  let path = "tests/unit/test_multi.nim"
+
+  # keyLive has a real, recent entry; keyGoneForever never had one at all
+  # (already evicted in some earlier GC pass, in the real-world story).
+  seedCacheEntry(sd, "keyLive0keyLive0", cachedAt = 999_999)
+  seedSidecarRecord(root, path, "keyGoneForevr000", "flagOld")
+  seedSidecarRecord(root, path, "keyLive0keyLive0", "flagNew")
+  let sc = sidecarPath(root, path)
+
+  let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 100, nowSecs = 1_000_000)
+  assert r.evicted == 0
+  assert fileExists(sc), "a sidecar survives as long as ANY record's key is still live"
+
+block test_sidecar_pruned_when_all_records_are_dead:
+  let sd = freshSD("sidecar_all_dead")
+  defer: removeDir(sd)
+  let root = sd / "cache"
+  let path = "tests/unit/test_all_dead.nim"
+
+  # Both referenced keys are dead: keyOld1 gets age-evicted, keyOld2 never
+  # had a real entry file at all.
+  seedCacheEntry(sd, "keyOld1keyOld100", cachedAt = 1_000)
+  seedSidecarRecord(root, path, "keyOld1keyOld100", "flagA")
+  seedSidecarRecord(root, path, "keyOld2keyOld200", "flagB")
+  let sc = sidecarPath(root, path)
+
+  let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 100, nowSecs = 1_000_000)
+  assert r.evicted == 1
+  assert not fileExists(sc), "a sidecar with NO surviving live record must be pruned entirely"
+
+block test_corrupt_sidecar_is_pruned_not_crashed:
+  let sd = freshSD("sidecar_corrupt")
+  defer: removeDir(sd)
+  let root = sd / "cache"
+  let path = "tests/unit/test_corrupt.nim"
+
+  seedSidecarRecord(root, path, "keyC0000keyC0000", "flagC")
+  let sc = sidecarPath(root, path)
+  writeFile(sc, "{ not json at all ]]]")
+
+  let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 0, nowSecs = 1_000_000)
+  assert r.evicted == 0, "a malformed sidecar is not a result-cache ENTRY -- must not count toward `evicted`"
+  assert not fileExists(sc), "a structurally-broken sidecar is treated as orphaned and pruned"
+
+block test_sidecars_do_not_count_against_the_entry_cap_or_lru:
+  let sd = freshSD("sidecar_not_counted")
+  defer: removeDir(sd)
+  let root = sd / "cache"
+
+  # Exactly AT the cap: 3 real entries.
+  seedCacheEntry(sd, "capA0000capA0000", cachedAt = 999_997)
+  seedCacheEntry(sd, "capB0000capB0000", cachedAt = 999_998)
+  seedCacheEntry(sd, "capC0000capC0000", cachedAt = 999_999)
+  # Extra sidecars in the SAME verDir referencing all three (live) keys --
+  # if the entry-collection walk (or countCacheEntries) mistakenly counted
+  # inputs/*.json as entries, this would push the apparent count over the
+  # cap and trigger a spurious eviction.
+  seedSidecarRecord(root, "tests/unit/test_p1.nim", "capA0000capA0000", "f1")
+  seedSidecarRecord(root, "tests/unit/test_p2.nim", "capB0000capB0000", "f2")
+  seedSidecarRecord(root, "tests/unit/test_p3.nim", "capC0000capC0000", "f3")
+
+  let r = gcResultCacheAt(root, maxEntries = 3, maxAgeSecs = 0, nowSecs = 1_000_000)
+  assert r.evicted == 0, "sidecars must never be mistaken for cache entries by the size bound"
 
 echo "test_a1c_gc: all blocks passed"

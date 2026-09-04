@@ -508,6 +508,57 @@ proc readCachedAt(path: string): int64 =
   if payload == nil or payload.kind != JObject: return 0
   payload{"cachedAt"}.getBiggestInt(0)
 
+# ---------------------------------------------------------------------------
+# RFC-0005 B1b: orphan sidecar pruning, inside gcResultCacheAt's existing
+# walk. `inputs/*.json` sidecars (cachelocalfs.nim's `sidecarPath`, keyed
+# by fnv(entrypoint path)) are a SIBLING of the `*.json` entry files under
+# the SAME verDir -- non-recursive `walkDir(verDir)` (both `countEntries`
+# and the entry-collection loop above) never descends into `inputs/`, so
+# sidecars are already outside the entry-count cap and the LRU walk by
+# construction; this section only ADDS pruning of `inputs/` itself.
+#
+# resultcache.nim sits BELOW cachewire.nim in the import graph (cachewire
+# already imports resultcache -- the reverse edge would cycle), so this
+# does NOT use cachewire's Sidecar/SidecarEntry codec. It does the MINIMAL
+# possible read instead: pull each record's own `"key"` string (a
+# SoundnessKey, written redundantly into each sidecar record for exactly
+# this purpose -- see cachewire.SidecarEntry's doc comment) via a plain
+# std/json walk, with no KeyInputs decoding at all. A structurally-broken
+# sidecar (corrupt/truncated/wrong shape) yields no keys, so it is treated
+# as orphaned -- eligible for pruning, matching the "malformed cache files
+# are evicted first" posture already used above for readCachedAt.
+# ---------------------------------------------------------------------------
+
+proc sidecarLiveKeys(path: string): seq[string] =
+  var raw: string
+  try: raw = readFile(path)
+  except CatchableError: return @[]
+  var node: JsonNode
+  try: node = parseJson(raw)
+  except CatchableError: return @[]
+  if node == nil or node.kind != JObject: return @[]
+  let recs = node{"records"}
+  if recs == nil or recs.kind != JObject: return @[]
+  for _, v in recs:
+    if v.kind == JObject:
+      let k = v{"key"}
+      if k != nil and k.kind == JString and k.getStr.len > 0:
+        result.add k.getStr
+
+proc pruneOrphanSidecars(verDir: string; liveKeys: HashSet[string]) =
+  ## Delete any `<verDir>/inputs/<fnv(path)>.json` sidecar whose every
+  ## recorded SoundnessKey has no surviving `<key>.json` entry -- i.e. the
+  ## path it was keyed on has no live cache entry left.
+  let inputsDir = verDir / "inputs"
+  if not dirExists(inputsDir): return
+  for kind, path in walkDir(inputsDir):
+    if kind != pcFile or not path.endsWith(".json"): continue
+    var stillLive = false
+    for k in sidecarLiveKeys(path):
+      if k in liveKeys: stillLive = true; break
+    if not stillLive:
+      try: removeFile(path) except CatchableError: discard
+
 proc gcResultCacheAt*(root: string; maxEntries: int; maxAgeSecs: int64;
                       nowSecs: int64): GcResultCacheReport =
   ## Evict result-cache entries (rooted at `root`, i.e.
@@ -546,9 +597,6 @@ proc gcResultCacheAt*(root: string; maxEntries: int; maxAgeSecs: int64;
       let ca = readCachedAt(path)
       entries.add (path: path, cachedAt: ca)
 
-  if entries.len == 0:
-    return (evicted: 0)
-
   # Sort by cachedAt ascending (oldest first).
   entries.sort(proc(a, b: Entry): int = cmp(a.cachedAt, b.cachedAt))
 
@@ -572,6 +620,15 @@ proc gcResultCacheAt*(root: string; maxEntries: int; maxAgeSecs: int64;
     for i in 0 ..< toEvict:
       try: removeFile(entries[i].path) except CatchableError: discard
       inc evicted
+
+  # RFC-0005 B1b: prune `inputs/` sidecar files (§Local-fs root) whose path
+  # no longer has ANY surviving live entry -- computed from the FINAL
+  # (post-eviction) `entries` set, so a sidecar is kept iff at least one of
+  # ITS records' SoundnessKey still names a `<key>.json` on disk.
+  var liveKeys = initHashSet[string]()
+  for e in entries:
+    liveKeys.incl splitFile(e.path).name
+  pruneOrphanSidecars(verDir, liveKeys)
 
   result = (evicted: evicted)
 

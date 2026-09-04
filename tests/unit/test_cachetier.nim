@@ -41,7 +41,7 @@
 ##      `storeCachedAt` entry is visible to `localFsBackend.get` — the
 ##      A2a-era divergence this fixes.
 
-import std/[json, options, os]
+import std/[json, options, os, strutils, tables]
 import crisol/types
 import crisol/keys
 import crisol/cacheport
@@ -425,5 +425,101 @@ block test_zero_tier_is_clean_noop:
   assert l.verdicts.len == 0
   assert worst(l) == cvMiss
   assert tc.put(sampleEntry(SoundnessKey("0000000000000000"))).len == 0
+
+# ---------------------------------------------------------------------------
+# 8. Explain-miss sidecar I/O (RFC-0005 B1b) — cachelocalfs.sidecarPath/
+#    readSidecar/writeSidecar directly. A LOCAL-FS implementation detail:
+#    the memory/memoryBytes doubles never see this (cachelocalfs.nim's own
+#    module doc).
+# ---------------------------------------------------------------------------
+
+proc sampleKeyInputsFor(flagHash: string): KeyInputs =
+  KeyInputs(
+    closureContentHash: "closure-abc",
+    flagHash:            flagHash,
+    nimVersion:          "2.2.10",
+    ccVersion:           "gcc-13",
+    fixtureHash:         "",
+    argv:                @["mybin"],
+    limits:              default(ptypes.Limits),
+    hermeticEnvHash:     "envhash-xyz",
+    protocolMajor:       1,
+  )
+
+proc sampleSidecarEntry(flagHash: string): SidecarEntry =
+  SidecarEntry(
+    key:       SoundnessKey("sc-" & flagHash),
+    inputs:    sampleKeyInputsFor(flagHash),
+    envDigest: @[("HOME", "aa11bb22cc33dd44")],
+  )
+
+block test_sidecar_path_deterministic_and_path_discriminating:
+  let root = freshLocalFsRoot("sidecar_path")
+  let p1 = sidecarPath(root, "tests/unit/test_a.nim")
+  let p2 = sidecarPath(root, "tests/unit/test_a.nim")
+  let p3 = sidecarPath(root, "tests/unit/test_b.nim")
+  assert p1 == p2, "sidecarPath must be deterministic for the same (root, path)"
+  assert p1 != p3, "different entrypoint paths must map to different sidecar files"
+  assert p1.startsWith(root), "sidecar files must live under the given root"
+
+block test_read_sidecar_absent_is_empty_not_error:
+  let root = freshLocalFsRoot("sidecar_absent")
+  let sc = readSidecar(root, "tests/unit/test_never_written.nim")
+  assert sc.order.len == 0
+  assert sc.records.len == 0
+
+block test_write_then_read_sidecar_roundtrips:
+  let root = freshLocalFsRoot("sidecar_rw")
+  let path = "tests/unit/test_rw.nim"
+  writeSidecar(root, path, sampleSidecarEntry("flagA"))
+  let sc = readSidecar(root, path)
+  assert sc.order == @["flagA"]
+  assert "flagA" in sc.records
+  assert sc.records["flagA"].key == SoundnessKey("sc-flagA")
+  assert sc.records["flagA"].envDigest == @[("HOME", "aa11bb22cc33dd44")]
+
+block test_write_sidecar_twice_different_flaghash_keeps_both:
+  let root = freshLocalFsRoot("sidecar_two_flags")
+  let path = "tests/unit/test_two.nim"
+  writeSidecar(root, path, sampleSidecarEntry("flagA"))
+  writeSidecar(root, path, sampleSidecarEntry("flagB"))
+  let sc = readSidecar(root, path)
+  assert sc.order == @["flagA", "flagB"]
+  assert sc.records.len == 2
+
+block test_write_sidecar_same_flaghash_replaces:
+  let root = freshLocalFsRoot("sidecar_replace")
+  let path = "tests/unit/test_replace.nim"
+  writeSidecar(root, path, sampleSidecarEntry("flagA"))
+  var newer = sampleSidecarEntry("flagA")
+  newer.envDigest = @[("HOME", "ffffffffffffffff")]
+  writeSidecar(root, path, newer)
+  let sc = readSidecar(root, path)
+  assert sc.order == @["flagA"], "re-storing the SAME flagHash must not duplicate the record"
+  assert sc.records.len == 1
+  assert sc.records["flagA"].envDigest == @[("HOME", "ffffffffffffffff")]
+
+block test_write_sidecar_prunes_past_bound:
+  let root = freshLocalFsRoot("sidecar_prune")
+  let path = "tests/unit/test_prune.nim"
+  for i in 0 ..< (DefaultMaxSidecarRecords + 3):
+    writeSidecar(root, path, sampleSidecarEntry("flag" & $i))
+  let sc = readSidecar(root, path)
+  assert sc.order.len == DefaultMaxSidecarRecords, "must stay bounded"
+  assert sc.records.len == DefaultMaxSidecarRecords
+  assert "flag0" notin sc.records, "the oldest-touched record must have been pruned"
+
+block test_read_sidecar_corrupt_json_is_treated_as_absent:
+  let root = freshLocalFsRoot("sidecar_corrupt")
+  let path = "tests/unit/test_corrupt.nim"
+  # Write a real record first, THEN corrupt the file on disk directly --
+  # proves readSidecar degrades gracefully rather than propagating a parse
+  # error, exactly like the RFC's "older writer / first-ever run" case.
+  writeSidecar(root, path, sampleSidecarEntry("flagA"))
+  let p = sidecarPath(root, path)
+  writeFile(p, "{ this is not valid json ]]]")
+  let sc = readSidecar(root, path)
+  assert sc.order.len == 0, "a corrupt sidecar must degrade to empty, never raise"
+  assert sc.records.len == 0
 
 echo "test_cachetier: all blocks passed"

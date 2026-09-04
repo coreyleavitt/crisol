@@ -11,9 +11,12 @@
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_cachedispatch.nim
 
-import std/[options, unittest]
+import std/[options, os, sequtils, strutils, unittest]
 import crisol/[types, sandbox, cachedispatch, resultcache, planner, depgraph]
 import crisol/process/types  # pkCached/pkSkipped (rfc-0007 A1c coherence test)
+import crisol/keys           # KeyDiff, KeyComponent (kcFlags/kcHermeticEnv)
+import crisol/cacheregistry  # localOnlyCache -- a real CacheRuntime + local root
+import crisol/cachelocalfs   # sidecarPath -- raw sidecar file inspection
 import "../support/helpers"  # legacySeams
 
 # ---------------------------------------------------------------------------
@@ -356,6 +359,147 @@ suite "realSeams — env values enter soundness key (RFC-0004 §Keys)":
     let k1 = keyOf1(pep)
     let k2 = keyOf2(pep)
     check k1 == k2   # TMPDIR value must NOT enter the key (per-run noise)
+
+# ---------------------------------------------------------------------------
+# realSeams — explain-miss sidecar (RFC-0005 B1b)
+# ---------------------------------------------------------------------------
+##
+## Drives the REAL local-fs seams end to end (localOnlyCache -> realSeams ->
+## cachelocalfs), via `derive`/`seams.store`/`seams.load` directly -- the
+## tracer property: through the real dispatch + local-fs path, not
+## hand-built sidecar fixtures.
+
+proc freshStateDir(tag: string): string =
+  result = getTempDir() / ("crisol_b1b_dispatch_" & tag)
+  removeDir(result)
+  createDir(result)
+
+proc samplePassResult(exitCode = 0): CachedResult =
+  CachedResult(
+    run: ProcessResult(
+      exit:     Exit(kind: ekExited, code: exitCode),
+      cause:    Cause(by: cbProcess),
+      evidence: default(Evidence),
+      rusage:   none(Rusage),
+      durationUs: 1000,
+    ),
+    records: @[], cachedAt: 1_700_000_000'i64)
+
+proc pepAt(path: string; flags: seq[string] = @[]): PlannedEntrypoint =
+  PlannedEntrypoint(ep: Entrypoint(path: path, group: "unit", flags: flags),
+                    edecision: edRunFresh)
+
+suite "realSeams — explain-miss sidecar (RFC-0005 B1b)":
+
+  test "store then flag-changed lookup -> miss with explain naming kcFlags":
+    let sd = freshStateDir("flags")
+    let rt = localOnlyCache(sd, maxEntries = 0)
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                         spec = spec, parentEnv = @[("HOME", "/root"), ("PATH", "/usr/bin")],
+                         protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+
+    let pep1 = pepAt("tests/unit/test_flagchange.nim", @["--flagA"])
+    let d1 = derive(seams, pep1)
+    check seams.store(pep1, d1, samplePassResult())
+
+    let pep2 = pepAt("tests/unit/test_flagchange.nim", @["--flagB"])
+    let d2 = derive(seams, pep2)
+    let lookup2 = seams.load(pep2, d2)
+    check lookup2.hit.isNone
+    check lookup2.explain.anyIt(it.component == kcFlags)
+
+  test "env-value-changed lookup -> miss with explain naming kcHermeticEnv + the var name":
+    let sd = freshStateDir("envval")
+    let rt = localOnlyCache(sd, maxEntries = 0)
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+
+    let ctx1 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                          parentEnv = @[("HOME", "/root"), ("PATH", "/usr/bin")], protocolMajor = 1)
+    let ctx2 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                          parentEnv = @[("HOME", "/root"), ("PATH", "/usr/local/bin")], protocolMajor = 1)
+    let seams1 = realSeams(ctx1, addr g, rt)
+    let seams2 = realSeams(ctx2, addr g, rt)
+
+    let pep = pepAt("tests/unit/test_envchange.nim")
+    let d1 = derive(seams1, pep)
+    check seams1.store(pep, d1, samplePassResult())
+
+    let d2 = derive(seams2, pep)
+    let lookup2 = seams2.load(pep, d2)
+    check lookup2.hit.isNone
+    let envDiffs = lookup2.explain.filterIt(it.component == kcHermeticEnv)
+    check envDiffs.len == 1
+    check "PATH" in envDiffs[0].envNames
+
+  test "first-ever miss (no sidecar) -> empty explain, no error":
+    let sd = freshStateDir("firstmiss")
+    let rt = localOnlyCache(sd, maxEntries = 0)
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_neverseen.nim")
+    let d = derive(seams, pep)
+    let lookup = seams.load(pep, d)
+    check lookup.hit.isNone
+    check lookup.explain.len == 0
+
+  test "corrupt sidecar JSON -> treated as absent, no crash":
+    let sd = freshStateDir("corruptsc")
+    let rt = localOnlyCache(sd, maxEntries = 0)
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_corruptsc.nim")
+
+    let scPath = sidecarPath(rt.localRoot, pep.ep.path)
+    createDir(parentDir(scPath))
+    writeFile(scPath, "{ broken")
+
+    let d = derive(seams, pep)
+    let lookup = seams.load(pep, d)
+    check lookup.hit.isNone
+    check lookup.explain.len == 0
+
+  test "hit -> no explain attached":
+    let sd = freshStateDir("hitnoexplain")
+    let rt = localOnlyCache(sd, maxEntries = 0)
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_hit.nim")
+    let d = derive(seams, pep)
+    check seams.store(pep, d, samplePassResult())
+    let lookup = seams.load(pep, d)
+    check lookup.hit.isSome
+    check lookup.explain.len == 0
+
+  test "values never persisted: sidecar file never contains a raw env VALUE":
+    let sd = freshStateDir("novalues")
+    let rt = localOnlyCache(sd, maxEntries = 0)
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let sentinel = "sentinel-super-secret-9f8e7d"
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", sentinel), ("PATH", "/usr/bin")], protocolMajor = 1)
+    let seams = realSeams(ctx, addr g, rt)
+    let pep = pepAt("tests/unit/test_novalues.nim")
+    let d = derive(seams, pep)
+    check seams.store(pep, d, samplePassResult())
+
+    let scPath = sidecarPath(rt.localRoot, pep.ep.path)
+    check fileExists(scPath)
+    let raw = readFile(scPath)
+    check sentinel notin raw
 
 # ---------------------------------------------------------------------------
 # M4: CacheContext invariant — inconsistent state is unconstructable
