@@ -204,9 +204,12 @@ proc localFsBackend*(root: string; autoCreate: bool; maxEntries: int): CacheBack
 
       try:
         createDir(verDir)
-      except OSError as e:
+      except OSError, IOError:
+        # `createDir` raises `IOError` (not `OSError`) on this toolchain when
+        # a plain FILE already occupies the target path -- see
+        # `resultcache.storeCachedAt`'s identical guard for the same reason.
         warnStoreFailureOnce(root, "crisol: warning: could not create cache dir '" &
-                     verDir & "': " & e.msg & "\n")
+                     verDir & "': " & getCurrentExceptionMsg() & "\n")
         return cvUnauthorized
 
       let bytes = ser.encode(entry)

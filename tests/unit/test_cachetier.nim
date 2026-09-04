@@ -414,6 +414,22 @@ block test_localfs_and_resultcache_agree_on_one_root:
     "an entry written by storeCachedAt must be visible to localFsBackend.get"
   assert viaBackend.value.result.run.exit.code == 7
 
+# 6j. on this toolchain `os.createDir` raises `IOError`, not `OSError`, when
+# a plain FILE already occupies the exact directory path being created (the
+# root itself is a real, writable directory -- only the version-dir segment
+# is blocked). `localFsBackend.put` must degrade exactly like any other
+# createDir failure (cvUnauthorized, rate-limited warning), never crash.
+block test_localfs_ioerror_file_blocks_version_dir_put:
+  let root = freshLocalFsRoot("blocked_verdir")
+  let verDir = cacheVersionDirAt(root)
+  writeFile(verDir, "i am a file, not a directory")
+  defer: removeFile(verDir)
+
+  let backend = localFsBackend(root, autoCreate = true, maxEntries = 0)
+  let verdict = backend.put(sampleEntry(SoundnessKey("7070707070707070")))
+  assert verdict == cvUnauthorized,
+    "createDir raising IOError (file blocks the version dir) must degrade like OSError, not crash"
+
 # ---------------------------------------------------------------------------
 # 7. zero-tier lookup/put is a clean no-op (never raises, never crashes)
 # ---------------------------------------------------------------------------

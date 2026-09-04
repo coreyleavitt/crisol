@@ -445,4 +445,30 @@ block test_store_failure_warning_rate_limited_per_root:
   assert "c2c2c2c2c2c2c2c2" notin captured, "rootA's 3rd skip must be suppressed: " & captured
   assert "d2d2d2d2d2d2d2d2" in captured, "rootB's first skip must warn independently of rootA: " & captured
 
+# ---------------------------------------------------------------------------
+# 11. on this toolchain `os.createDir` raises `IOError`, not `OSError`, when
+#     a plain FILE already occupies the exact directory path being created
+#     (the root itself is a real, writable directory -- only the version-dir
+#     segment is blocked). `storeCachedAt` must degrade exactly like any
+#     other createDir failure: rate-limited stderr warning, return false,
+#     never crash.
+# ---------------------------------------------------------------------------
+
+block test_store_ioerror_when_file_blocks_version_dir:
+  resetCacheWriteWarnings()
+
+  let sd = freshStateDir("ioerror_verdir")
+  let root = sd / "cache"
+  createDir(root)
+  let verDir = cacheDir(sd)
+  writeFile(verDir, "i am a file, not a directory")
+  defer: removeFile(verDir)
+
+  var ok = true
+  let captured = withCapturedStderr(proc() =
+    ok = storeCachedAt(root, SoundnessKey("8080808080808080"), sampleResult())
+  )
+  assert not ok, "a version dir blocked by a file (IOError) must degrade to false, not crash"
+  assert "could not create cache dir" in captured
+
 echo "test_resultcache: all blocks passed"

@@ -428,9 +428,12 @@ proc storeCachedAt*(root: string; key: SoundnessKey; res: CachedResult;
 
   try:
     createDir(verDir)
-  except OSError as e:
+  except OSError, IOError:
+    # `createDir` raises `IOError` (not `OSError`) on this toolchain when a
+    # plain FILE already occupies the target path -- see
+    # `cachelocalfs.localFsBackend`'s identical guard for the same reason.
     warnStoreFailureOnce(root, "crisol: warning: could not create cache dir '" & verDir &
-                 "': " & e.msg & "\n")
+                 "': " & getCurrentExceptionMsg() & "\n")
     return false
 
   # Compute checksum over the canonical payload serialization, then assemble the
