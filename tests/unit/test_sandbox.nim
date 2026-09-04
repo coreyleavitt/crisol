@@ -243,6 +243,38 @@ suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
     check spec.limits.req[lkOpenFiles] == some(1024'i64)
 
 # ---------------------------------------------------------------------------
+# 11b. envPinsFrom (RFC-0005 A0): Config.envPins merged with RunOptions.envPins
+# ---------------------------------------------------------------------------
+
+suite "sandbox — envPinsFrom (RFC-0005 A0: Config + RunOptions pin merge)":
+
+  test "config-only pins pass through unchanged":
+    let cfg  = Config(envPins: @[("USER", "ci-runner")])
+    let opts = RunOptions()
+    check envPinsFrom(cfg, opts) == @[("USER", "ci-runner")]
+
+  test "CLI-only pins (RunOptions) pass through unchanged":
+    let cfg  = Config()
+    let opts = RunOptions(envPins: @[("USER", "cli-runner")])
+    check envPinsFrom(cfg, opts) == @[("USER", "cli-runner")]
+
+  test "a CLI pin overrides a same-named config pin":
+    let cfg  = Config(envPins: @[("USER", "ci-runner"), ("HOME", "/home/ci")])
+    let opts = RunOptions(envPins: @[("USER", "cli-override")])
+    check envPinsFrom(cfg, opts) == @[("USER", "cli-override"), ("HOME", "/home/ci")]
+
+  test "disjoint config and CLI pins are unioned":
+    let cfg  = Config(envPins: @[("HOME", "/home/ci")])
+    let opts = RunOptions(envPins: @[("USER", "cli-runner")])
+    check envPinsFrom(cfg, opts) == @[("HOME", "/home/ci"), ("USER", "cli-runner")]
+
+  test "the merged pins reach resolveSandbox's SandboxSpec":
+    let cfg  = Config(envPins: @[("USER", "ci-runner")])
+    let opts = RunOptions(envPins: @[("HOME", "/home/cli")])
+    let spec = resolveSandbox(level = hlIsolated, envPins = envPinsFrom(cfg, opts))
+    check spec.envPins == @[("USER", "ci-runner"), ("HOME", "/home/cli")]
+
+# ---------------------------------------------------------------------------
 # 12. evidenceSatisfies (rfc-0007 A6a, replacing isFullyAchieved): per-limit
 #     gate, netIso always false, observed escapees always false
 # ---------------------------------------------------------------------------

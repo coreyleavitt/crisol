@@ -80,6 +80,19 @@ type
     envAllowlist*:         seq[string]   ## exact env-var names to pass through (sorted)
     envAllowlistPrefixes*: seq[string]   ## prefix patterns (e.g. "LC_") to pass through
     limits*:               ptypes.Limits ## the SINGLE home for resource limits (§1)
+    envPins*:              seq[(string, string)]
+                                         ## RFC-0005 A0: NAME=VALUE pairs pinned into the
+                                         ## child env by ``filterEnv``'s tail — always applied
+                                         ## (independent of ``envScrub``/``level``), and hashed
+                                         ## as the PINNED value by ``hermeticEnvHash`` (never
+                                         ## the host's own value), so a pinned variable is
+                                         ## soundness-key-stable across hosts. Populated from
+                                         ## ``Config.envPins`` (KDL ``env-pin "NAME" "VALUE"``)
+                                         ## merged with ``RunOptions.envPins`` (CLI
+                                         ## ``--env-pin NAME=VALUE``, repeatable; overrides a
+                                         ## same-named config pin) — see ``api.envPinsFrom``.
+                                         ## Empty by default: NOTHING is pinned unless an
+                                         ## operator opts in (RFC-0005 defers default pins).
 
 proc evidenceSatisfies*(spec: SandboxSpec; ev: ptypes.Evidence): bool =
   ## Cache gate (rfc-0007 A6a, §6): named guarantees, never enum ordinals.
@@ -302,6 +315,13 @@ type
                                 ## Always resolved to a concrete value by config.loadConfig
                                 ## (defaults to config.DefaultVerifyCachePct when the KDL node is
                                 ## absent) -- never a sentinel, mirroring timeoutSecs.
+    envPins*: seq[(string, string)]
+                                ## RFC-0005 A0: NAME=VALUE pairs from repeatable top-level
+                                ## `env-pin "NAME" "VALUE"` KDL nodes. Merged with
+                                ## `RunOptions.envPins` in api.planImpl (CLI pin overrides a
+                                ## same-named config pin; see api.envPinsFrom) before reaching
+                                ## `resolveSandbox`. Empty by default -- nothing pinned unless an
+                                ## operator opts in (§Non-Goals: no default pins in RFC-0005).
     workerBinary*: string       ## INTERNAL plumbing (not user-facing; no KDL node). Absolute path
                                 ## to a binary whose `main()` dispatches the
                                 ## `--internal-measure-compile` token (see measureworker.nim /

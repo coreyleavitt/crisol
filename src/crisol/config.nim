@@ -17,6 +17,9 @@
 ## quarantine "tests/integration/test_x.nim"  // B3: failure excluded from exit-1
 ## rlimit-nofile 2048                   // Fix 1: override sandbox RLIMIT_NOFILE (default 1024)
 ## verify-cache-pct 5                   // RFC-0005 B3c: --verify-cache sample-percent default
+## env-pin "USER" "ci-runner"            // RFC-0005 A0: pin NAME=VALUE into every child env
+##                                       // (repeatable node = more pins); the pinned value,
+##                                       // not the host's own, enters the soundness key.
 ##
 ## group "unit" {
 ##     globs "tests/unit/test_*.nim"
@@ -468,6 +471,9 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # concrete value (never a sentinel) -- DefaultVerifyCachePct until the
     # KDL node overrides it, mirroring timeoutSecs above.
     verifyCachePct: int = DefaultVerifyCachePct
+    # RFC-0005 A0: repeatable `env-pin "NAME" "VALUE"` nodes -> NAME=VALUE
+    # pairs pinned into every child env (see sandbox.filterEnv's tail).
+    envPins: seq[(string, string)]
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -554,6 +560,17 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v < 0:
         cfgErr("config: 'verify-cache-pct' must be >= 0, got " & $v)
       verifyCachePct = v
+    of "env-pin":
+      # RFC-0005 A0: `env-pin "NAME" "VALUE"` -- exactly 2 string args.
+      # Repeatable: each node contributes ONE pin (unlike `flags`/`dep-roots`,
+      # which flatten every arg of every occurrence into one list).
+      let args = collectStrArgs(n, "env-pin")
+      if args.len != 2:
+        cfgErr("config: 'env-pin' requires exactly 2 string arguments " &
+               "(NAME VALUE), got " & $args.len)
+      if args[0].len == 0:
+        cfgErr("config: 'env-pin' NAME must not be empty")
+      envPins.add (args[0], args[1])
     of "group":        discard
     of "perf-check":   discard  # C6: parsed in second pass (has children)
     of "reuse-check":  discard  # M-report (b1): parsed in second pass (has children)
@@ -597,6 +614,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     strictHygiene:      strictHygiene,
     rlimitNofile:       rlimitNofile,
     verifyCachePct:     verifyCachePct,
+    envPins:            envPins,
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).
   )

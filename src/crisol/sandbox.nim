@@ -117,6 +117,7 @@ proc resolveSandbox*(
   passthroughs:     seq[string]     = @[];
   chdirIntoScratch: bool            = false;
   rlimits:          RlimitOverrides = RlimitOverrides();
+  envPins:          seq[(string, string)] = @[];
 ): SandboxSpec =
   ## Resolve a ``SandboxSpec`` from a hermeticity level and optional overrides.
   ##
@@ -137,9 +138,16 @@ proc resolveSandbox*(
   ## default (applied only when rlimits are active, i.e. level != hlNone).  The
   ## named-field bundle (vs. five positional ``Option[int64]`` args) makes a
   ## transposition a compile-visible misnomer rather than a silent bug.
+  ##
+  ## ``envPins`` (RFC-0005 A0) is a set of NAME=VALUE overrides carried
+  ## through to ``filterEnv``'s tail regardless of ``level`` — pinning is
+  ## orthogonal to hermeticity (even an ``hlNone`` child gets pinned values
+  ## injected). See ``filterEnv`` and ``hermeticEnvHash`` below for the two
+  ## consequences: the pinned value reaches the child, and it — not the
+  ## host's actual value — is what enters the soundness key.
 
   if level == hlNone:
-    return SandboxSpec(level: hlNone)
+    return SandboxSpec(level: hlNone, envPins: envPins)
 
   # hlIsolated and hlNetwork share the same isolation body; netIso differs.
   let netIso = (level == hlNetwork)
@@ -171,74 +179,110 @@ proc resolveSandbox*(
     envAllowlist:         allowlist,
     envAllowlistPrefixes: DefaultEnvAllowlistPrefixes,
     limits:               lim,
+    envPins:              envPins,
   )
 
 # ---------------------------------------------------------------------------
 # filterEnv — pure env-var filtering per SandboxSpec (A5)
 # ---------------------------------------------------------------------------
 
+const CrisolCachePrefix = "CRISOL_CACHE_"
+  ## RFC-0005 A0 / Hard constraints: secrets resolved for the cache-trust
+  ## layer (C4) are read once in api.nim and MUST never reach a test child.
+  ## Stripped unconditionally in filterEnv's tail below — regardless of
+  ## envScrub, regardless of whether the name is (or is ever added to) the
+  ## allowlist, and regardless of whether it arrived via the host env, an
+  ## injected pair, or an operator's own ``--env-pin``.
+
+proc overrideByName*(
+  base: openArray[(string, string)];
+  overrides: openArray[(string, string)];
+): seq[(string, string)] =
+  ## Merge two NAME=VALUE lists: each ``overrides`` pair replaces a
+  ## same-named ``base`` pair in place (preserving ``base``'s position), or
+  ## is appended if its name is new.  Later ``overrides`` entries win over
+  ## earlier ones for a repeated name.  Small-N linear scan — both lists are
+  ## always a handful of entries (env pins / runner injections), never worth
+  ## a table.
+  result = @[]
+  for pair in base:
+    result.add pair
+  for (k, v) in overrides:
+    var replaced = false
+    for i in 0 ..< result.len:
+      if result[i][0] == k:
+        result[i] = (k, v)
+        replaced = true
+        break
+    if not replaced:
+      result.add (k, v)
+
 proc filterEnv*(
   parentEnv: openArray[(string, string)];
   spec: SandboxSpec;
   injected: openArray[(string, string)];
 ): seq[(string, string)] =
-  ## Filter the parent environment according to ``spec``, then append injected
-  ## key=value pairs (always last, in the order given; override any duplicate).
+  ## Filter the parent environment according to ``spec``, then append the
+  ## TAIL: ``spec.envPins`` (RFC-0005 A0) overridden by ``injected`` (the
+  ## caller's runner-internal pairs — CRISOL_SINK/CRISOL_ATTEMPT/TMPDIR —
+  ## always win over a same-named pin, so a misconfigured ``--env-pin``
+  ## cannot clobber the runner's own control variables), in that combined
+  ## order; any var whose name appears in the tail is excluded from the
+  ## parent pass-through below (it is supplied by the tail instead).
   ##
-  ## When ``spec.envScrub == false`` (hlNone): parent env passes through as-is.
+  ## When ``spec.envScrub == false`` (hlNone): parent env passes through as-is
+  ## (minus any name the tail supplies).
   ## When ``spec.envScrub == true``: keep only vars whose name appears in
   ## ``spec.envAllowlist`` OR whose name starts with any prefix in
-  ## ``spec.envAllowlistPrefixes``.  The kept (non-injected) portion is sorted
-  ## by name for determinism before the injected pairs are appended.
+  ## ``spec.envAllowlistPrefixes``.  The kept (non-tail) portion is sorted
+  ## by name for determinism before the tail is appended.
   ##
-  ## Injected vars always appear at the end in the order given.  If an injected
-  ## name duplicates a kept parent var, the injected value wins (the kept copy
-  ## is removed and replaced at the tail).
+  ## A pinned or injected name need NOT be on the allowlist — the tail always
+  ## reaches the child, exactly like the pre-A0 ``injected`` contract already
+  ## did for CRISOL_SINK/CRISOL_ATTEMPT/TMPDIR.
+  ##
+  ## Finally, any ``CRISOL_CACHE_*``-named var is stripped from the ENTIRE
+  ## result, unconditionally — parent, pin, or injected alike (RFC-0005 Hard
+  ## constraints: "CRISOL_CACHE_* stripped from every child env at every
+  ## hermeticity level").
+
+  let tail = overrideByName(spec.envPins, injected)
+  var tailNames: seq[string] = @[]
+  for (k, _) in tail:
+    tailNames.add(k)
+
+  var assembled: seq[(string, string)] = @[]
 
   if not spec.envScrub:
-    # No scrub: pass parent through, then override/append injected.
-    # Build result as a table to handle overrides, but preserve parent order
-    # for non-overridden vars.
-    var injectedNames: seq[string] = @[]
-    for (k, _) in injected:
-      injectedNames.add(k)
-
-    result = @[]
+    # No scrub: pass parent through (minus tail-supplied names), then the tail.
     for pair in parentEnv:
-      if pair[0] notin injectedNames:
-        result.add(pair)
-    for pair in injected:
+      if pair[0] notin tailNames:
+        assembled.add(pair)
+  else:
+    # envScrub == true: filter parent to allowlist + prefixes, sort, then the tail.
+    var kept: seq[(string, string)] = @[]
+    for pair in parentEnv:
+      let name = pair[0]
+      if name in tailNames:
+        continue
+      var pass = name in spec.envAllowlist
+      if not pass:
+        for pfx in spec.envAllowlistPrefixes:
+          if name.startsWith(pfx):
+            pass = true
+            break
+      if pass:
+        kept.add(pair)
+    kept.sort(proc(a, b: (string, string)): int = cmp(a[0], b[0]))
+    assembled = kept
+
+  for pair in tail:
+    assembled.add(pair)
+
+  result = @[]
+  for pair in assembled:
+    if not pair[0].startsWith(CrisolCachePrefix):
       result.add(pair)
-    return
-
-  # envScrub == true: filter parent to allowlist + prefixes, sort, append injected.
-  var injectedNames: seq[string] = @[]
-  for (k, _) in injected:
-    injectedNames.add(k)
-
-  var kept: seq[(string, string)] = @[]
-  for pair in parentEnv:
-    let name = pair[0]
-    # Skip vars that will be overridden by injected (they'll appear at the tail)
-    if name in injectedNames:
-      continue
-    # Check exact allowlist
-    var pass = name in spec.envAllowlist
-    # Check prefix allowlist
-    if not pass:
-      for pfx in spec.envAllowlistPrefixes:
-        if name.startsWith(pfx):
-          pass = true
-          break
-    if pass:
-      kept.add(pair)
-
-  # Sort kept portion by name for determinism.
-  kept.sort(proc(a, b: (string, string)): int = cmp(a[0], b[0]))
-
-  result = kept
-  for pair in injected:
-    result.add(pair)
 
 # ---------------------------------------------------------------------------
 # hermeticEnvHash — stable hash of the filtered env for the soundness key (A5)

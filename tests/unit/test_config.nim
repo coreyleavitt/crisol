@@ -1349,5 +1349,109 @@ group "unit" {
     check caught
     check kind == cekConfig
 
+suite "config — env-pin (RFC-0005 A0: repeatable NAME=VALUE pin)":
+
+  test "absent env-pin -> cfg.envPins is empty":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.envPins.len == 0
+
+  test "one env-pin node round-trips to cfg.envPins":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+env-pin "USER" "ci-runner"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.envPins == @[("USER", "ci-runner")]
+
+  test "repeated env-pin nodes each contribute one pair, in order":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+env-pin "USER" "ci-runner"
+env-pin "HOME" "/home/ci"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.envPins == @[("USER", "ci-runner"), ("HOME", "/home/ci")]
+
+  test "env-pin with only 1 argument is rejected":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+env-pin "USER"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "env-pin with 3 arguments is rejected":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+env-pin "USER" "ci-runner" "extra"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+    check caught
+
+  test "env-pin with an empty NAME is rejected":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+env-pin "" "value"
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+    check caught
+
+  test "env-pin with an empty VALUE is accepted (pins to the empty string)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+env-pin "LC_ALL" ""
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.envPins == @[("LC_ALL", "")]
+
 when isMainModule:
   echo "All config tests passed."

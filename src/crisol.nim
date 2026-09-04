@@ -153,6 +153,7 @@ Usage:
               [--order <recent-fail|duration|none>]
               [--hermetic <none|isolated|network>]
               [--rlimit-nofile <N>]
+              [--env-pin NAME=VALUE]...
               [--verify-cache [--verify-cache-pct <N>]
                               [--verify-cache-seed <N>] [--verify-cache-strict]]
   crisol list [<path>...] [--group <name>]... [--all-groups] [--json]
@@ -224,6 +225,13 @@ Additional options for 'run':
                   if set).  Raise this for fd-heavy consumer workloads (e.g.
                   one eventfd per in-flight async call) without patching
                   crisol.
+  --env-pin NAME=VALUE
+                  Pin an env var into every child's environment, regardless
+                  of the host's own value for NAME (repeatable). The pinned
+                  value -- not the host's -- enters the soundness key, so a
+                  pinned variable is cache-key-stable across hosts. Also
+                  settable via crisol.kdl's `env-pin "NAME" "VALUE"` (CLI
+                  wins on a name collision). Nothing is pinned by default.
   --measure-compile-reuse
                   Diagnostic: run compile slots through the measurement
                   worker and emit the `compile` block's segmented cc%/
@@ -663,6 +671,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     verifyCachePctFlag: int  = 0     # --verify-cache-pct N; 0 = not specified (use config/built-in)
     verifyCacheSeed:   Option[int64] = none(int64)  # --verify-cache-seed N
     verifyCacheStrict: bool = false  # --verify-cache-strict: a divergence flips the exit code
+    envPins: seq[(string, string)]   # RFC-0005 A0: collected from --env-pin NAME=VALUE (repeatable)
 
   let runArgs = args[1..^1]
   var i = 0
@@ -693,7 +702,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                  "retries", "fail-on-flaky", "strict-hygiene", "junit", "shard", "order",
                  "perf-check", "hermetic", "measure-compile-reuse",
                  "rlimit-nofile", "verify-cache", "verify-cache-pct",
-                 "verify-cache-seed", "verify-cache-strict"] and isList:
+                 "verify-cache-seed", "verify-cache-strict", "env-pin"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
         stderr.write(usage())
         return ExitEnvironment
@@ -858,6 +867,26 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
           return ExitEnvironment
       of "verify-cache-strict":
         verifyCacheStrict = true
+      of "env-pin":
+        # RFC-0005 A0: --env-pin NAME=VALUE (repeatable). Malformed input
+        # (no '=', or an empty NAME) is a usage error, same shape as --base
+        # requiring --changed.
+        let raw = nextVal("env-pin")
+        if raw == "":
+          stderr.write("crisol: --env-pin requires a NAME=VALUE argument\n")
+          return ExitEnvironment
+        let eqIdx = raw.find('=')
+        if eqIdx < 0:
+          stderr.write("crisol: --env-pin: expected NAME=VALUE, got '" &
+                       raw & "' (missing '=')\n")
+          return ExitEnvironment
+        let pinName = raw[0 ..< eqIdx]
+        let pinValue = raw[eqIdx + 1 .. ^1]
+        if pinName.len == 0:
+          stderr.write("crisol: --env-pin: NAME must not be empty (got '" &
+                       raw & "')\n")
+          return ExitEnvironment
+        envPins.add (pinName, pinValue)
       else:
         stderr.write("crisol: unknown flag '--" & key & "'\n\n")
         stderr.write(usage())
@@ -1026,6 +1055,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                                          # Fix 1: --rlimit-nofile override
     measureCompileReuse: measureCompileReuse,  # RFC-0006: gate measurement worker into compile slot
     verifyCache:         verifyCacheOpts,  # RFC-0005 B3c: --verify-cache facade
+    envPins:             envPins,       # RFC-0005 A0: --env-pin NAME=VALUE (repeatable)
     workerBinary:        selfWorkerBinary,  # "" unless the real CLI entrypoint (below) passed
                                              # its own getAppFilename() — see runMain's doc above
                                              # for why this must never be resolved in here.

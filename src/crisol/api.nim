@@ -279,6 +279,12 @@ type
     ## precedence below in planImpl — lets a library caller raise the ceiling
     ## for one run without editing crisol.kdl.
     rlimitNofile*:       Option[int64] = none(int64)
+    ## RFC-0005 A0: per-run NAME=VALUE pins (CLI `--env-pin`, repeatable).
+    ## Merged with `Config.envPins` (KDL `env-pin "NAME" "VALUE"`) in
+    ## planImpl via `envPinsFrom` -- a pin here overrides a same-named
+    ## config pin (CLI wins), mirroring rlimitNofile's override precedence.
+    ## Empty by default: nothing pinned unless an operator opts in.
+    envPins*:            seq[(string, string)] = @[]
     ## RFC-0006 M-artifact-identity PASS (b2): --measure-compile-reuse.
     ## false (default) → compile slots run plain `nim c`, byte-for-byte
     ## unchanged from before this pass. true → compile slots run the
@@ -665,6 +671,15 @@ proc rlimitOverridesFrom*(cfg: Config): RlimitOverrides =
   ## none here (resolveSandbox applies its own safe built-in defaults).
   RlimitOverrides(limitNofile: cfg.rlimitNofile)
 
+proc envPinsFrom*(cfg: Config; opts: RunOptions): seq[(string, string)] =
+  ## RFC-0005 A0: pure projection merging `Config.envPins` (KDL) with
+  ## `RunOptions.envPins` (CLI/library `--env-pin`) into the final pin set
+  ## `resolveSandbox` receives.  A CLI pin overrides a same-named config pin
+  ## (`sandbox.overrideByName`'s override side); a config-only pin passes
+  ## through unchanged. Extracted (like `rlimitOverridesFrom` above) so the
+  ## merge is independently unit-testable without a real run.
+  overrideByName(cfg.envPins, opts.envPins)
+
 proc planImpl(opts: RunOptions): PlanImplResult =
   ## Internal plan phase shared by planTests and runTests.
   ## Raises CrisolError on any structural problem.
@@ -686,6 +701,9 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
   # Fix 1: RunOptions.rlimitNofile, when set, overrides Config.rlimitNofile.
   if opts.rlimitNofile.isSome: cfg.rlimitNofile = opts.rlimitNofile
+  # RFC-0005 A0: merge CLI/library --env-pin into the config-declared pins
+  # (CLI wins on a name collision); resolveSandbox reads cfg.envPins below.
+  cfg.envPins = envPinsFrom(cfg, opts)
 
   # 3. Assemble narrowing inputs.
   let useFailed  = opts.narrowing.kind in {nkFailed, nkFailedOrChanged}
@@ -951,7 +969,8 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   # M4: bundle spec+policy+seams into a CacheContext so the invariant
   # (active iff keyOf!=nil AND policy.enabled) is enforced structurally.
   let spec  = resolveSandbox(level = opts.hermeticLevel,
-                              rlimits = rlimitOverridesFrom(cfg))
+                              rlimits = rlimitOverridesFrom(cfg),
+                              envPins = cfg.envPins)
   # nimcache-persistence (RFC-0006): the SAME ccVersion/nimVersion probes
   # already used by RFC-0004's SoundnessKey (via realSeams below) are reused
   # here — folded into execute()'s toolchain fingerprint, which keys the
