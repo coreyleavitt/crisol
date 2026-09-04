@@ -20,11 +20,18 @@
 ##                        successful put.
 ##   - `tekVerifyFail`  — `api.verifyCachePass`, the landed `--verify-cache`
 ##                        (B3c) divergence path.
-## `tekBackfillErr` from the RFC's inline sketch is deliberately NOT defined
-## here: backfill does not exist until Stage A3a, which lands the arm
-## alongside its producer (multi-tier `lookup`'s backfill-on-hit).  Shipping
-## the arm now would be a consumer-less arm — exactly the dormant substrate
-## the standing rules forbid.
+##   - `tekBackfillErr` — RFC-0005 A3a: `backfillErrEvents`, a pure
+##                        translation of `cachetier.CacheLookup.backfillVerdicts`
+##                        (the multi-tier `lookup`'s backfill-on-hit writes)
+##                        into events, mirroring `realSeams.store`'s own
+##                        `v in transportVerdicts` filter for `tekRemoteErr`.
+##                        `TieredCache` itself stays a pure engine with no
+##                        sink (see `cachetier.nim`'s module doc) — the
+##                        actual `sink.emit` call site for a LIVE run is
+##                        `realSeams.load` (Stage A3b, the very next slice),
+##                        exactly the split B1a's `explainMiss` already used
+##                        (a pure, exhaustively-tested function ships with
+##                        its data producer; the live call site follows).
 ##
 ## **`lookupAtPlan` emits, not `realSeams.load`.** The RFC's inline sketch
 ## shows hit/miss emission inside `realSeams`'s `load` closure. That closure
@@ -59,6 +66,7 @@ type
     tekRemoteErr
     tekPublish
     tekVerifyFail
+    tekBackfillErr
 
   TelemetryEvent* = object
     case kind*: TelemetryEventKind
@@ -67,7 +75,7 @@ type
       durationMs*:  int64
     of tekMiss:
       verdicts*:    seq[TierVerdict]
-    of tekRemoteErr:
+    of tekRemoteErr, tekBackfillErr:
       putTier*:     string
       putVerdict*:  CacheVerdict
     of tekPublish:
@@ -93,6 +101,25 @@ proc sink*(m: InMemorySink): TelemetrySink[TelemetryEvent] =
   ## Adapts the collector to the `cacheport.TelemetrySink[TelemetryEvent]`
   ## contract expected by `CacheRuntime.sink` / `CacheContext.sink`.
   TelemetrySink[TelemetryEvent](emit: proc(ev: TelemetryEvent) = m.events.add ev)
+
+# ---------------------------------------------------------------------------
+# backfillErrEvents — the tekBackfillErr producer (RFC-0005 A3a).
+# ---------------------------------------------------------------------------
+
+proc backfillErrEvents*(l: CacheLookup): seq[TelemetryEvent] =
+  ## Pure translation of a lookup's backfill writes into events: one
+  ## `tekBackfillErr` per `backfillVerdicts` entry whose verdict is
+  ## transport-class (`cvOffline`/`cvTimeout`/`cvUnauthorized`) — mirroring
+  ## `realSeams.store`'s existing `v in transportVerdicts` filter for the
+  ## primary-put `tekRemoteErr` (RFC "the backfill-failure path in the
+  ## multi-tier lookup" — `cachetier.lookup`'s backfill loop is the DATA
+  ## producer via `CacheLookup.backfillVerdicts`; this is the EVENT
+  ## producer). A successful backfill (`cvOk`) or one skipped by the
+  ## verified-bit rule (never recorded in `backfillVerdicts` at all) is
+  ## never an event — only a genuine write failure is.
+  for tv in l.backfillVerdicts:
+    if tv.verdict in transportVerdicts:
+      result.add TelemetryEvent(kind: tekBackfillErr, putTier: tv.tier, putVerdict: tv.verdict)
 
 # ---------------------------------------------------------------------------
 # CacheStats — the aggregate (RFC-0005 "Hit-rate telemetry").
@@ -163,7 +190,7 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
       wallSavedMs += ev.durationMs
     of tekMiss:
       discard  # miss count is decision-sourced (see `misses` below)
-    of tekRemoteErr:
+    of tekRemoteErr, tekBackfillErr:
       inc remoteErrors
     of tekPublish:
       inc published
@@ -241,10 +268,11 @@ proc erroredTiers*(events: seq[TelemetryEvent]): seq[TierErrorReport] =
   ##                             contributes to both the call count and,
   ##                             when the verdict is in `tierErrorVerdicts`,
   ##                             the error count.
-  ## Store-side events (`tekPublish`/`tekRemoteErr`) are deliberately NOT
-  ## folded in here: the RFC's "attributed per tier via CacheLookup.verdicts"
-  ## names the READ path specifically; `remoteErrors` already reports the
-  ## write-side failure count in aggregate.
+  ## Store-side events (`tekPublish`/`tekRemoteErr`/`tekBackfillErr`) are
+  ## deliberately NOT folded in here: the RFC's "attributed per tier via
+  ## CacheLookup.verdicts" names the READ path specifically; `remoteErrors`
+  ## already reports the write-side (primary put + backfill) failure count
+  ## in aggregate.
   var totals, errors: OrderedTable[string, int]
   for ev in events:
     case ev.kind
@@ -255,7 +283,7 @@ proc erroredTiers*(events: seq[TelemetryEvent]): seq[TierErrorReport] =
         totals.mgetOrPut(tv.tier, 0).inc
         if tv.verdict in tierErrorVerdicts:
           errors.mgetOrPut(tv.tier, 0).inc
-    of tekRemoteErr, tekPublish, tekVerifyFail:
+    of tekRemoteErr, tekBackfillErr, tekPublish, tekVerifyFail:
       discard
   for tier, calls in totals:
     if calls > 0 and errors.getOrDefault(tier, 0) == calls:

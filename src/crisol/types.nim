@@ -216,6 +216,28 @@ type
                         ## value produce a reuseAlerts entry. Default 0.5
                         ## when the block is present without 'alert-below'.
 
+  RemoteTier* = object
+    ## RFC-0005 A3a/A3c: a configured non-"l1" cache tier, one KDL
+    ## `remote-cache "<name>" { ... }` block. Lives here (not `cacheport`/
+    ## `cacheregistry`) because `config.nim` must not import the cache
+    ## modules (`depgraph → config` would cycle) — `types.nim` is the one
+    ## module both `config.nim` and `cacheregistry.nim` can see.
+    ##
+    ## The KDL *parser* that produces these from a `remote-cache` block is
+    ## A3c-i's job; A3a's `cacheregistry.buildBackend` is this type's first
+    ## consumer, resolving `url`'s scheme to a `CacheBackend` factory —
+    ## exercised in A3a with hand-built values (the same bottom-up pattern
+    ## `Tier`/`TieredCache` used in A1, ahead of A3c's KDL wiring).
+    name*:          string
+    url*:           string          ## SCHEME selects the adapter: file/http/https/s3
+    endpoint*:      Option[string]  ## s3 only; absent -> AWS default host
+    pathStyle*:     Option[bool]    ## s3 only; default #true iff endpoint is set
+    verifyTrust*:   Option[bool]    ## absent -> policy != "none" (config-layer default, A3c-ii)
+    backfillOnHit*: bool            ## KDL default #true (A3c-i's parser; the zero-value here is
+                                    ## deliberately `false` for a hand-built test value -- callers
+                                    ## that want the KDL default set it explicitly, matching the
+                                    ## codebase's constructor-proc convention over field defaults)
+
   Config* = object
     ## Top-level runtime configuration parsed from the project config file or
     ## built by the consuming library / CLI.

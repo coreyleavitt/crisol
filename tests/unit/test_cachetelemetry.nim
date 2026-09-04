@@ -14,7 +14,7 @@
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_cachetelemetry.nim
 
-import std/[strutils, unittest]
+import std/[options, strutils, unittest]
 import crisol/cachetelemetry
 
 suite "aggregateCacheStats — empty input":
@@ -122,6 +122,22 @@ suite "aggregateCacheStats — event-sourced counts":
     check s.verifyFails == 1
     check events[0].path == "tests/unit/test_a.nim"
 
+  test "tekBackfillErr events -> remoteErrors, carrying putTier/putVerdict (RFC-0005 A3a)":
+    let events = @[
+      TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvOffline),
+      TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvTimeout),
+    ]
+    let s = aggregateCacheStats(events, @[cdmHit, cdmHit])
+    check s.remoteErrors == 2
+
+  test "tekRemoteErr and tekBackfillErr pool into the SAME remoteErrors count":
+    let events = @[
+      TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvOffline),
+      TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvOffline),
+    ]
+    let s = aggregateCacheStats(events, @[cdmHit])
+    check s.remoteErrors == 2
+
 suite "aggregateCacheStats — a full run-shaped mixed vector":
 
   test "a plausible run: hits, a miss-then-store, a not-eligible entry, one remote-err, one verifyFail":
@@ -203,13 +219,42 @@ suite "erroredTiers — the per-tier 100%-error diagnostic":
     ]
     check erroredTiers(events).len == 0
 
-  test "store-side events (tekPublish/tekRemoteErr/tekVerifyFail) never contribute":
+  test "store-side events (tekPublish/tekRemoteErr/tekBackfillErr/tekVerifyFail) never contribute":
     let events = @[
       TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvOffline),
+      TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvOffline),
       TelemetryEvent(kind: tekPublish, publishedTo: "l1"),
       TelemetryEvent(kind: tekVerifyFail, path: "x.nim"),
     ]
     check erroredTiers(events).len == 0
+
+suite "backfillErrEvents — the tekBackfillErr producer (RFC-0005 A3a)":
+
+  test "empty backfillVerdicts -> no events":
+    let l = CacheLookup(hit: none(TierHit), verdicts: @[], backfillVerdicts: @[])
+    check backfillErrEvents(l).len == 0
+
+  test "a successful backfill (cvOk) produces no event":
+    let l = CacheLookup(hit: none(TierHit), verdicts: @[],
+                         backfillVerdicts: @[("l1", cvOk)])
+    check backfillErrEvents(l).len == 0
+
+  test "a transport-class backfill verdict produces one tekBackfillErr, carrying tier + verdict":
+    let l = CacheLookup(hit: none(TierHit), verdicts: @[],
+                         backfillVerdicts: @[("l1", cvOffline)])
+    let events = backfillErrEvents(l)
+    check events.len == 1
+    check events[0].kind == tekBackfillErr
+    check events[0].putTier == "l1"
+    check events[0].putVerdict == cvOffline
+
+  test "multiple failing backfill tiers each produce their own event":
+    let l = CacheLookup(hit: none(TierHit), verdicts: @[],
+                         backfillVerdicts: @[("l1", cvOffline), ("l2", cvTimeout), ("l3", cvOk)])
+    let events = backfillErrEvents(l)
+    check events.len == 2
+    check events[0].putTier == "l1"
+    check events[1].putTier == "l2"
 
   test "tierErrorWarning names the tier and the call count":
     let msg = tierErrorWarning(TierErrorReport(tier: "l1", calls: 4))

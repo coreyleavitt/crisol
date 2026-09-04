@@ -1,30 +1,28 @@
-## cachetier.nim — RFC-0005 A1: `TieredCache`, the pure lookup engine.
+## cachetier.nim — RFC-0005 A3a: the multi-tier `TieredCache` engine.
 ##
 ## `lookup` must NOT discard which tier hit, whether trust passed, or what
 ## each tier said — telemetry, `run/v2` provenance, the 100%-error
-## diagnostic, and the backfill rule (Stage A3a) all need it. Hence
-## `CacheLookup.verdicts`: one per tier CONSULTED, in search order.
+## diagnostic, and the backfill rule all need it. Hence `CacheLookup.verdicts`:
+## one per tier CONSULTED, in search order.
 ##
-## **A1 scope is deliberately SINGLE-TIER** (`tc.tiers[0]` only) —
-## RFC-0005's Stage list assigns the general N-tier waterfall +
-## backfill-on-hit + the verified-bit backfill rule + the put rule + the
-## per-tier circuit breaker to **A3a**, which re-touches this exact file
-## with its own tests (the exhaustive 2×2×2 backfill matrix + 2×2 put
-## matrix, via a controllable mock `TrustPolicy` — `nonePolicy.verify`
-## always returns `cvOk`, so the security-meaningful multi-tier cases
-## cannot be exercised until A3a's mock exists). Writing the general loop
-## now, un-exercised by any multi-tier test, would be exactly the dormant
-## substrate the standing rules forbid — so `lookup`/`put` fail loudly
-## (`doAssert`) rather than silently mis-serving a second tier if one is
-## ever configured before A3a lands (nothing in A1 can configure one: KDL
-## remote-tier parsing is A3c).
+## **A3a lifts A1's single-tier restriction** (the `doAssert tiers.len <= 1`
+## that made `lookup`/`put` refuse a second tier) and builds the general
+## N-tier waterfall: backfill-on-hit gated by the **verified-bit backfill
+## rule**, the **put rule** (separate gate, `put`'s own fan-out), a per-tier
+## **circuit breaker**, and a budget-bounded drain for **deferred puts**
+## (RFC-0005 "TieredCache — the composition, with provenance" + "B0").
 ##
-## `TieredCache` is a PURE lookup engine — no `TelemetrySink` field (that
+## `TieredCache` stays a PURE lookup engine — no `TelemetrySink` field (that
 ## lives on `CacheRuntime`, Stage A2b): telemetry emission is a translation
 ## concern belonging to the `realSeams` adapter, exactly where an
-## observation of the call belongs, not to the engine itself.
+## observation of the call belongs, not to the engine itself. Likewise no
+## stderr I/O here: the circuit breaker's "one stderr line" (RFC "Per-tier
+## circuit breaker") is a rendering decision for whichever layer has I/O
+## access (mirrors `cachetelemetry.tierErrorWarning`: a pure formatter, the
+## caller writes it) — a tripped tier is fully legible from `CacheLookup`'s
+## `cvOffline`/`cvTimeout` verdicts without this module ever touching stderr.
 
-import std/options
+import std/[options, sets]
 import crisol/cacheport
 # KeyDiff (RFC-0005 B1b's explain-miss attachment) lives in `crisol/types`
 # (B1c re-home) and reaches here via `cacheport`'s `export types` -- no
@@ -37,20 +35,33 @@ type
       ## name (Stage A3c). NOT `CacheBackend.scheme` (the adapter kind).
     backend*: CacheBackend
     backfillOnHit*: bool
-      ## Write to THIS tier when a DOWNSTREAM tier serves the hit. Consumed
-      ## starting A3a; A1's single-tier `lookup`/`put` never backfills
-      ## (there is no downstream tier to backfill FROM).
+      ## Write to THIS tier when a DOWNSTREAM tier serves the hit.
     verifyTrust*: bool
       ## Reject entries READ from this tier that fail `TrustPolicy`; also:
       ## PUT here only attested entries (the A3a put rule).
 
   TieredCache* = object
     tiers*: seq[Tier]
-      ## L1 → L2 → L3, searched in order. A1: `len <= 1`.
+      ## L1 → L2 → L3 …, searched in order.
     trust*: TrustPolicy
       ## ONE policy per cache — shared by every `verifyTrust` tier (a
       ## backfilled entry is re-stored WITH the attestation it arrived
       ## with, valid at the destination only under the SAME policy).
+    breaker: HashSet[string]
+      ## Per-tier circuit breaker state (RFC-0005 "Per-tier circuit
+      ## breaker"), keyed by `Tier.name`. Once a tier's `get`/`put` returns
+      ## `cvOffline`/`cvTimeout`, it is added here and every subsequent
+      ## `get`/`put` against that tier for the rest of THIS `TieredCache`'s
+      ## life (== the run, since one `TieredCache` is built per run) short-
+      ## circuits to `cvOffline` without touching the backend — "total dead
+      ## wall-clock per run per tier ≤ one deadline" holds by construction.
+      ## A private, non-exported field: callers observe the effect (through
+      ## verdicts), never the state directly. No injected clock: the RFC's
+      ## own design text (unlike the stage-list's terse parenthetical)
+      ## describes a permanent-for-the-run latch, not a timed half-open —
+      ## building an unrequested recovery window would be speculative code
+      ## the standing rules forbid. See the module test suite's breaker
+      ## block for the "still dead after N further calls" proof.
 
   TierHit* = object
     result*: CachedResult
@@ -68,6 +79,16 @@ type
     verdicts*: seq[TierVerdict]
       ## One per tier CONSULTED, in search order (`cvOk` for the serving
       ## tier).
+    backfillVerdicts*: seq[TierVerdict]
+      ## RFC-0005 A3a: one per UPSTREAM `backfillOnHit` tier this lookup
+      ## actually attempted to backfill (empty on a miss, or when no
+      ## upstream tier qualifies). A backfill write is attempted only for
+      ## tiers passing the verified-bit backfill rule (below) — a skipped
+      ## tier (rule failed) contributes NO entry here, same as an
+      ## unconsulted tier contributes none to `verdicts`. `cachetelemetry`
+      ## folds the transport-class entries here into `tekBackfillErr`
+      ## (`backfillErrEvents`) — kept as data on the pure engine's result,
+      ## never emitted from here (see the module doc comment above).
     explain*: seq[KeyDiff]
       ## RFC-0005 B1b: populated ONLY by the `cachedispatch.realSeams`
       ## `load` adapter, on a MISS, when the path-keyed local-fs sidecar
@@ -94,41 +115,123 @@ proc worst*(l: CacheLookup): CacheVerdict =
     if ord(tv.verdict) > ord(result):
       result = tv.verdict
 
+# ---------------------------------------------------------------------------
+# Circuit breaker — ~10 lines, private to this module (RFC-0005 "Per-tier
+# circuit breaker").
+# ---------------------------------------------------------------------------
+
+proc breakerTripped(tc: TieredCache; name: string): bool {.inline.} =
+  name in tc.breaker
+
+proc tripBreaker(tc: var TieredCache; name: string; verdict: CacheVerdict) {.inline.} =
+  if verdict in {cvOffline, cvTimeout}:
+    tc.breaker.incl name
+
+# ---------------------------------------------------------------------------
+# lookup — the waterfall + backfill-on-hit + the verified-bit rule.
+# ---------------------------------------------------------------------------
+
 proc lookup*(tc: var TieredCache; key: SoundnessKey): CacheLookup =
-  ## See the module doc comment for the A1 single-tier scope note.
-  doAssert tc.tiers.len <= 1,
-    "cachetier.lookup: multi-tier waterfall is RFC-0005 Stage A3a, not yet built"
-  if tc.tiers.len == 0:
-    return CacheLookup(hit: none(TierHit), verdicts: @[])
+  var verdicts: seq[TierVerdict] = @[]
+  for idx, tier in tc.tiers:
+    var fetched: Fetched[StoredEntry]
+    if tc.breakerTripped(tier.name):
+      fetched = Fetched[StoredEntry](verdict: cvOffline)
+    else:
+      fetched = tier.backend.get(key)
+      tc.tripBreaker(tier.name, fetched.verdict)
 
-  let tier = tc.tiers[0]
-  let fetched = tier.backend.get(key)
-  if fetched.verdict != cvOk:
-    return CacheLookup(hit: none(TierHit), verdicts: @[(tier.name, fetched.verdict)])
+    if fetched.verdict != cvOk:
+      verdicts.add (tier.name, fetched.verdict)
+      continue
 
-  # Trust verify runs for the `verified` bit even on a non-`verifyTrust`
-  # tier (one pure local computation over bytes already in hand, no I/O) —
-  # it is meaningful only under a real policy (nonePolicy is trivially ok).
-  let verifyVerdict = tc.trust.verify(fetched.value)
-  let verified = verifyVerdict == cvOk
+    # Trust verify runs for the `verified` bit even on a non-`verifyTrust`
+    # tier (one pure local computation over bytes already in hand, no I/O) —
+    # it is meaningful only under a real policy (nonePolicy is trivially ok).
+    let verifyVerdict = tc.trust.verify(fetched.value)
+    let verified = verifyVerdict == cvOk
 
-  if tier.verifyTrust and verifyVerdict in trustVerdicts:
-    # Never serve a failed entry: this tier's specific trust code is the
-    # recorded verdict, not a generic miss (RFC-0005 "lookup (waterfall)").
-    return CacheLookup(hit: none(TierHit), verdicts: @[(tier.name, verifyVerdict)])
+    if tier.verifyTrust and verifyVerdict in trustVerdicts:
+      # Never serve a failed entry: this tier's specific trust code is the
+      # recorded verdict, not a generic miss (RFC-0005 "lookup (waterfall)").
+      # Continue the waterfall — a rejected entry here does not abort the
+      # search.
+      verdicts.add (tier.name, verifyVerdict)
+      continue
 
-  let hit = TierHit(result: fetched.value.result, tier: tier.name, verified: verified)
-  CacheLookup(hit: some(hit), verdicts: @[(tier.name, cvOk)])
+    verdicts.add (tier.name, cvOk)
+    let hit = TierHit(result: fetched.value.result, tier: tier.name, verified: verified)
+
+    # Backfill: earlier (upstream) `backfillOnHit` tiers, subject ONLY to
+    # the verified-bit backfill rule -- "backfill tier t only if
+    # hit.verified OR not t.verifyTrust". The entry is re-stored EXACTLY as
+    # fetched (its own attestation, if any) -- backfill never re-signs
+    # (RFC: "a backfilled entry is re-stored with the attestation it
+    # arrived with").
+    var backfillVerdicts: seq[TierVerdict] = @[]
+    for j in 0 ..< idx:
+      let btier = tc.tiers[j]
+      if not btier.backfillOnHit: continue
+      if not (verified or not btier.verifyTrust): continue
+      var v: CacheVerdict
+      if tc.breakerTripped(btier.name):
+        v = cvOffline
+      else:
+        v = btier.backend.put(fetched.value)
+        tc.tripBreaker(btier.name, v)
+      backfillVerdicts.add (btier.name, v)
+
+    return CacheLookup(hit: some(hit), verdicts: verdicts, backfillVerdicts: backfillVerdicts)
+
+  CacheLookup(hit: none(TierHit), verdicts: verdicts, backfillVerdicts: @[])
+
+# ---------------------------------------------------------------------------
+# put — the fan-out + the put rule.
+# ---------------------------------------------------------------------------
 
 proc put*(tc: var TieredCache; entry: StoredEntry): seq[TierVerdict] =
-  ## See the module doc comment for the A1 single-tier scope note — the put
-  ## rule (`entry.attestation.isSome or not t.verifyTrust`) is A3a's.
-  doAssert tc.tiers.len <= 1,
-    "cachetier.put: the multi-tier put rule is RFC-0005 Stage A3a, not yet built"
-  if tc.tiers.len == 0:
-    return @[]
-
+  ## The entry has ALREADY cleared `shouldStore`'s gate (unchanged, upstream
+  ## of this call). Signs once via `tc.trust.sign` (no-op under `nonePolicy`
+  ## or a no-secret policy), then fans out to every tier subject to the
+  ## **put rule**: "write to tier t only if entry.attestation.isSome OR NOT
+  ## t.verifyTrust" -- a pinned-keys-only consumer (no signing secret) must
+  ## never overwrite a validly-attested entry with an unverifiable one. A
+  ## skipped tier returns `cvUnauthorized` ("no write credential") so
+  ## `cacheStats.published` stays honest.
   var e = entry
-  tc.trust.sign(e)  # no-op under nonePolicy; sets e.attestation under a real policy
-  let tier = tc.tiers[0]
-  @[(tier.name, tier.backend.put(e))]
+  tc.trust.sign(e)
+  result = @[]
+  for tier in tc.tiers:
+    if not (e.attestation.isSome or not tier.verifyTrust):
+      result.add (tier.name, cvUnauthorized)
+      continue
+    if tc.breakerTripped(tier.name):
+      result.add (tier.name, cvOffline)
+      continue
+    let v = tier.backend.put(e)
+    tc.tripBreaker(tier.name, v)
+    result.add (tier.name, v)
+
+proc drainPending*(tc: var TieredCache; pending: openArray[StoredEntry];
+                    budget: int = high(int)): seq[TierVerdict] =
+  ## RFC-0005 B0 "Deferred remote puts": a caller (the runner's end-of-run
+  ## join point, after the poll loop drains and before `persistLastRun` --
+  ## wiring that lands with the first slice that has a real non-"l1" tier
+  ## worth deferring for) does not call `put` inline at every live finalize
+  ## for remote-destined entries; it QUEUES them (a plain `seq[StoredEntry]`
+  ## the caller owns -- no new container type needed here) and drains the
+  ## queue through this proc once, under the breaker (already `put`'s own
+  ## behavior, unchanged) and a TOTAL BUDGET on the number of entries
+  ## attempted this drain (bounding worst-case wall-clock on a slow-but-
+  ## alive remote even when the breaker never trips -- N entries would
+  ## otherwise cost up to N deadlines). Entries beyond the budget are
+  ## simply never attempted this run: consistent with "a crash mid-run
+  ## loses queued remote puts -- acceptable" (the loss is warmth, never
+  ## correctness, since a future run re-publishes from its own live
+  ## results).
+  result = @[]
+  var attempted = 0
+  for entry in pending:
+    if attempted >= budget: break
+    result.add tc.put(entry)
+    inc attempted

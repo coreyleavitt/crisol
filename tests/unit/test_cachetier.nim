@@ -1,10 +1,13 @@
-## test_cachetier.nim — RFC-0005 A1: `TieredCache` single-tier `lookup`/`put`,
+## test_cachetier.nim — RFC-0005 A1/A3a: `TieredCache` `lookup`/`put`,
 ## boundary-tested over the `memory`/`memoryBytes` doubles (`cachememory.nim`)
 ## AND, from A2a, the real `local-fs` backend (`cachelocalfs.nim`) — the
 ## RFC's "the localFs backend must pass the SAME boundary suite as
-## memory/memoryBytes" requirement. Grows in place through A3a (the
-## multi-tier waterfall + backfill + put-rule + circuit-breaker tests), per
-## RFC-0005's fixture/test-file inventory.
+## memory/memoryBytes" requirement. Grows in place — A1 shipped the
+## single-tier engine; A3a lifts that restriction and adds the general
+## N-tier waterfall, backfill-on-hit + the verified-bit rule, the put rule,
+## the per-tier circuit breaker, the deferred-put drain, and
+## `cacheregistry`'s `BackendRegistry`, per RFC-0005's fixture/test-file
+## inventory ("one `test_cachetier.nim` across A1/A3a").
 ##
 ## Coverage:
 ##   1. roundtrip: put then lookup returns a hit, `verified == true`
@@ -24,16 +27,39 @@
 ##      `test_resultcache.nim` already uses.
 ##   4. `probe` is nil on all three backends (`canProbe == false`) — no
 ##      producer yet (Stage C3c).
-##   5. multi-tier configuration is refused loudly (`doAssert`) — A1's
-##      documented scope boundary (the general waterfall is Stage A3a).
-##   6. localFs-specific (A2a): checksum tamper on disk -> cvCorrupt; a
+##   5. RFC-0005 A3a: the multi-tier waterfall — miss falls through, first
+##      hit wins with no fall-through, all-miss, and `put`'s fan-out to
+##      every tier (A1's `doAssert`-refused-second-tier tests are GONE:
+##      multi-tier is now the real, tested behavior).
+##   6. the controllable mock `TrustPolicy` + trust rejection on an
+##      intermediate tier continues the waterfall (never aborts), recording
+##      the SPECIFIC trust code, not a generic miss.
+##   7. the verified-bit backfill rule, exhaustive 2x2x2 (source verified x
+##      destination verifyTrust x single-/multi-upstream-tier ordering).
+##   8. the put rule, exhaustive 2x2 (attested x destination verifyTrust),
+##      via `tc.put` directly (a fresh publish, not a backfill).
+##   9. the per-tier circuit breaker: trips on first offline/timeout, stays
+##      dead the rest of the run (proven by call-counting, not a clock —
+##      see `cachetier.nim`'s module doc), never trips on a plain miss, is
+##      per-tier independent, and short-circuits a backfill target tripped
+##      earlier in the SAME lookup call.
+##   10. the deferred-put drain (`drainPending`): flushes a caller-owned
+##       queue, and respects a total attempt budget.
+##   11. `tekBackfillErr`'s producer (`cachetelemetry.backfillErrEvents`
+##       over `CacheLookup.backfillVerdicts`) + its fold into
+##       `aggregateCacheStats.remoteErrors`.
+##   12. `cacheregistry`: `BackendRegistry`/`buildBackend` resolves by URL
+##       scheme; `productionRegistry` has no `memory://`; `testRegistry`
+##       adds `memory://`/`memorybytes://` and keeps `file://`; an unknown
+##       scheme resolves to `none`.
+##   13. localFs-specific (A2a): checksum tamper on disk -> cvCorrupt; a
 ##      pre-0005 file (RFC-0004 shape, no envelope keys) decodes; offline
 ##      semantics (missing root, non-autoCreate; a FILE blocking the root —
 ##      ENOTDIR, regardless of autoCreate) -> cvOffline on get AND put;
 ##      autoCreate creates the root on demand and a fresh get on it is a
 ##      clean miss, never offline; the soft cap skips a new-key put once the
 ##      version dir is at capacity, rate-limited stderr warning included.
-##      6i (B1b-prereq regression): `localFsBackend` and the legacy
+##      13i (B1b-prereq regression): `localFsBackend` and the legacy
 ##      resultcache helpers (`loadCachedAt`/`storeCachedAt`/
 ##      `gcResultCacheAt`) agree on ONE version dir for a shared root — an
 ##      entry `localFsBackend.put` writes is visible to `loadCachedAt` AND
@@ -49,6 +75,8 @@ import crisol/cachewire
 import crisol/cachetier
 import crisol/cachememory
 import crisol/cachelocalfs
+import crisol/cachetelemetry  # RFC-0005 A3a: backfillErrEvents/aggregateCacheStats wiring
+import crisol/cacheregistry   # RFC-0005 A3a: BackendRegistry/buildBackend
 import crisol/resultcache
 import crisol/depgraph  # fnv1a64/toHex16 -- recompute a matching checksum by hand (6b)
 import crisol/process/types as ptypes
@@ -197,38 +225,395 @@ block test_probe_is_nil_on_all_backends:
   assert not canProbe(localFsBackend(freshLocalFsRoot("probe"), autoCreate = true, maxEntries = 0))
 
 # ---------------------------------------------------------------------------
-# 5. multi-tier configuration is refused loudly (A1's documented scope
-#    boundary — the general waterfall lands in A3a)
+# 5. RFC-0005 A3a: the multi-tier waterfall (A1's single-tier restriction
+#    lifted -- replaced by the real N-tier engine).
 # ---------------------------------------------------------------------------
 
-block test_multi_tier_lookup_refused:
-  var tc = TieredCache(
-    tiers: @[Tier(name: "l1", backend: memory(), backfillOnHit: false, verifyTrust: false),
-             Tier(name: "l2", backend: memory(), backfillOnHit: false, verifyTrust: false)],
-    trust: nonePolicy(),
+proc twoTier(b0, b1: CacheBackend; backfill0 = false; verifyTrust0 = false;
+             verifyTrust1 = false; trust = nonePolicy()): TieredCache =
+  TieredCache(
+    tiers: @[
+      Tier(name: "l1", backend: b0, backfillOnHit: backfill0, verifyTrust: verifyTrust0),
+      Tier(name: "l2", backend: b1, backfillOnHit: false, verifyTrust: verifyTrust1),
+    ],
+    trust: trust,
   )
-  var caught = false
-  try:
-    discard tc.lookup(SoundnessKey("0000000000000000"))
-  except AssertionDefect:
-    caught = true
-  assert caught, "cachetier A1: a 2-tier TieredCache must refuse lookup, not silently ignore tier[1]"
 
-block test_multi_tier_put_refused:
-  var tc = TieredCache(
-    tiers: @[Tier(name: "l1", backend: memory(), backfillOnHit: false, verifyTrust: false),
-             Tier(name: "l2", backend: memory(), backfillOnHit: false, verifyTrust: false)],
-    trust: nonePolicy(),
-  )
-  var caught = false
-  try:
-    discard tc.put(sampleEntry(SoundnessKey("0000000000000000")))
-  except AssertionDefect:
-    caught = true
-  assert caught, "cachetier A1: a 2-tier TieredCache must refuse put, not silently write only tier[0]"
+block test_multi_tier_lookup_falls_through_on_miss:
+  var tc = twoTier(memory(), memory())
+  let key = SoundnessKey("2020202020202020")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 4))  # only l2 has it
+
+  let l = tc.lookup(key)
+  assert l.hit.isSome, "a miss on l1 must fall through to l2"
+  assert l.hit.get.tier == "l2"
+  assert l.hit.get.result.run.exit.code == 4
+  assert l.verdicts == @[(tier: "l1", verdict: cvMiss), (tier: "l2", verdict: cvOk)]
+  assert worst(l) == cvMiss, "a real miss upstream stays attributable even though l2 served"
+
+block test_multi_tier_first_hit_wins_no_fallthrough:
+  var tc = twoTier(memory(), memory())
+  let key = SoundnessKey("3030303030303030")
+  discard tc.tiers[0].backend.put(sampleEntry(key, exitCode = 1))
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 9))  # must never be consulted
+
+  let l = tc.lookup(key)
+  assert l.hit.get.tier == "l1"
+  assert l.hit.get.result.run.exit.code == 1
+  assert l.verdicts == @[(tier: "l1", verdict: cvOk)], "l2 must not even be consulted once l1 hits"
+
+block test_multi_tier_miss_on_all_tiers:
+  var tc = twoTier(memory(), memory())
+  let l = tc.lookup(SoundnessKey("4040404040404040"))
+  assert l.hit.isNone
+  assert l.verdicts == @[(tier: "l1", verdict: cvMiss), (tier: "l2", verdict: cvMiss)]
+  assert worst(l) == cvMiss
+
+block test_multi_tier_put_fans_out_to_all_tiers:
+  var tc = twoTier(memory(), memory())
+  let key = SoundnessKey("5050505050505050")
+  let vs = tc.put(sampleEntry(key, exitCode = 7))
+  assert vs == @[(tier: "l1", verdict: cvOk), (tier: "l2", verdict: cvOk)]
+  assert tc.tiers[0].backend.get(key).verdict == cvOk
+  assert tc.tiers[1].backend.get(key).verdict == cvOk
 
 # ---------------------------------------------------------------------------
-# 6. localFs-specific (rfc-0005 A2a)
+# 6. RFC-0005 A3a: the controllable mock TrustPolicy + trust rejection
+#    continues the waterfall (never aborts the search).
+# ---------------------------------------------------------------------------
+
+proc mockPolicy(verifyResult: CacheVerdict; attest: bool): TrustPolicy =
+  ## `nonePolicy.verify` is UNCONDITIONALLY `cvOk`, so the security-
+  ## meaningful reject cases (RFC "the security-meaningful cases cannot be
+  ## exercised until a policy that can reject exists") need a controllable
+  ## double: `verify` returns whatever the test wants; `sign` attaches an
+  ## `Attestation` iff `attest` (a no-op otherwise, exactly like
+  ## `nonePolicy.sign`).
+  TrustPolicy(
+    name: "mock",
+    verify: proc(entry: StoredEntry): CacheVerdict = verifyResult,
+    sign: proc(entry: var StoredEntry) =
+      if attest:
+        entry.attestation = some(Attestation(sigAlg: saHmacSha256, signer: "mock-signer",
+                                              signature: "sig", signedAt: 0)),
+  )
+
+block test_trust_reject_on_intermediate_tier_continues_waterfall:
+  var tc = twoTier(memory(), memory(), verifyTrust0 = true,
+                    trust = mockPolicy(cvTrustBadSignature, attest = false))
+  let key = SoundnessKey("6060606060606060")
+  discard tc.tiers[0].backend.put(sampleEntry(key, exitCode = 2))
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 3))
+
+  let l = tc.lookup(key)
+  assert l.hit.isSome, "l2 does not verifyTrust, so it still serves despite the mock's reject verdict"
+  assert l.hit.get.tier == "l2"
+  assert l.hit.get.result.run.exit.code == 3
+  assert l.hit.get.verified == false, "verify ran (and rejected) even on l2's non-verifyTrust read"
+  assert l.verdicts == @[(tier: "l1", verdict: cvTrustBadSignature), (tier: "l2", verdict: cvOk)],
+    "l1's specific trust code is recorded, not a generic miss -- and the search continues"
+
+# ---------------------------------------------------------------------------
+# 7. RFC-0005 A3a: the verified-bit backfill rule -- exhaustive 2x2x2
+#    (source verified in {T,F} x destination verifyTrust in {T,F} x
+#    single-upstream-tier vs multiple-upstream-tier ordering).
+# ---------------------------------------------------------------------------
+
+proc backfillSetup(destVerifyTrust: bool; policy: TrustPolicy): TieredCache =
+  TieredCache(
+    tiers: @[
+      Tier(name: "l1", backend: memory(), backfillOnHit: true, verifyTrust: destVerifyTrust),
+      Tier(name: "l2", backend: memory(), backfillOnHit: false, verifyTrust: false),
+    ],
+    trust: policy,
+  )
+
+block test_backfill_verified_true_dest_verifytrust_true_backfills:
+  var tc = backfillSetup(destVerifyTrust = true, policy = mockPolicy(cvOk, attest = true))
+  let key = SoundnessKey("7070707070707070")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))
+
+  let l = tc.lookup(key)
+  assert l.hit.get.verified == true
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOk)]
+  assert tc.tiers[0].backend.get(key).verdict == cvOk, "a verified hit may backfill a verifyTrust tier"
+
+block test_backfill_verified_true_dest_verifytrust_false_backfills:
+  var tc = backfillSetup(destVerifyTrust = false, policy = mockPolicy(cvOk, attest = true))
+  let key = SoundnessKey("8080808080808080")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))
+
+  let l = tc.lookup(key)
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOk)]
+  assert tc.tiers[0].backend.get(key).verdict == cvOk
+
+block test_backfill_verified_false_dest_verifytrust_true_is_skipped:
+  var tc = backfillSetup(destVerifyTrust = true, policy = mockPolicy(cvTrustBadSignature, attest = false))
+  let key = SoundnessKey("9090909090909090")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))
+
+  let l = tc.lookup(key)
+  assert l.hit.isSome, "l2 itself has verifyTrust=false, so the hit still serves"
+  assert l.hit.get.verified == false
+  assert l.backfillVerdicts.len == 0,
+    "an unverified entry must NOT populate a verifyTrust destination tier"
+  assert tc.tiers[0].backend.get(key).verdict == cvMiss, "l1 must remain empty"
+
+block test_backfill_verified_false_dest_verifytrust_false_still_backfills:
+  var tc = backfillSetup(destVerifyTrust = false, policy = mockPolicy(cvTrustBadSignature, attest = false))
+  let key = SoundnessKey("a0a0a0a0a0a0a0a0")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))
+
+  let l = tc.lookup(key)
+  assert l.hit.get.verified == false
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOk)],
+    "an unverified entry MAY populate a tier that does not verify trust"
+  assert tc.tiers[0].backend.get(key).verdict == cvOk
+
+block test_backfill_multiple_upstream_tiers_all_qualify_in_order:
+  var tc = TieredCache(
+    tiers: @[
+      Tier(name: "l1", backend: memory(), backfillOnHit: true, verifyTrust: false),
+      Tier(name: "l2", backend: memory(), backfillOnHit: true, verifyTrust: true),
+      Tier(name: "l3", backend: memory(), backfillOnHit: false, verifyTrust: false),
+    ],
+    trust: mockPolicy(cvOk, attest = true),
+  )
+  let key = SoundnessKey("b0b0b0b0b0b0b0b0")
+  discard tc.tiers[2].backend.put(sampleEntry(key, exitCode = 5))  # only l3 (the served tier) has it
+
+  let l = tc.lookup(key)
+  assert l.hit.get.tier == "l3"
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOk), (tier: "l2", verdict: cvOk)],
+    "every qualifying upstream tier backfills, in tier order -- not just the immediate neighbor"
+  assert tc.tiers[0].backend.get(key).verdict == cvOk
+  assert tc.tiers[1].backend.get(key).verdict == cvOk
+
+# ---------------------------------------------------------------------------
+# 8. RFC-0005 A3a: the put rule -- exhaustive 2x2 (attested x destination
+#    verifyTrust), via tc.put directly (a fresh publish, not a backfill).
+# ---------------------------------------------------------------------------
+
+proc oneVerifyingTier(verifyTrust: bool; policy: TrustPolicy): TieredCache =
+  TieredCache(tiers: @[Tier(name: "l1", backend: memory(), backfillOnHit: false,
+                            verifyTrust: verifyTrust)],
+              trust: policy)
+
+block test_put_rule_attested_true_dest_verifytrust_true_writes:
+  var tc = oneVerifyingTier(verifyTrust = true, policy = mockPolicy(cvOk, attest = true))
+  let vs = tc.put(sampleEntry(SoundnessKey("c0c0c0c0c0c0c0c0")))
+  assert vs == @[(tier: "l1", verdict: cvOk)]
+
+block test_put_rule_attested_true_dest_verifytrust_false_writes:
+  var tc = oneVerifyingTier(verifyTrust = false, policy = mockPolicy(cvOk, attest = true))
+  let vs = tc.put(sampleEntry(SoundnessKey("d0d0d0d0d0d0d0d0")))
+  assert vs == @[(tier: "l1", verdict: cvOk)]
+
+block test_put_rule_attested_false_dest_verifytrust_true_refuses:
+  var tc = oneVerifyingTier(verifyTrust = true, policy = mockPolicy(cvOk, attest = false))
+  let key = SoundnessKey("e0e0e0e0e0e0e0e0")
+  let vs = tc.put(sampleEntry(key))
+  assert vs == @[(tier: "l1", verdict: cvUnauthorized)],
+    "no write credential (no attestation) must refuse a verifyTrust tier"
+  assert tc.tiers[0].backend.get(key).verdict == cvMiss, "a refused write must never land"
+
+block test_put_rule_attested_false_dest_verifytrust_false_writes:
+  var tc = oneVerifyingTier(verifyTrust = false, policy = mockPolicy(cvOk, attest = false))
+  let vs = tc.put(sampleEntry(SoundnessKey("f0f0f0f0f0f0f0f0")))
+  assert vs == @[(tier: "l1", verdict: cvOk)],
+    "a non-verifyTrust tier accepts an unattested write (matches nonePolicy's own roundtrip test)"
+
+# ---------------------------------------------------------------------------
+# 9. RFC-0005 A3a: the per-tier circuit breaker (a permanent-for-the-run
+#    latch -- no clock: see cachetier.nim's module doc for why).
+# ---------------------------------------------------------------------------
+
+proc countingBackend(getResults: seq[CacheVerdict] = @[];
+                      putResults: seq[CacheVerdict] = @[]): tuple[backend: CacheBackend, getCalls, putCalls: ref int] =
+  ## A scripted double: call N returns `Results[N]` (clamped to the last
+  ## entry once exhausted), counting calls so a test can prove a tripped
+  ## tier's backend is NEVER invoked again -- the "fake clock" property
+  ## from the RFC's stage-list bullet, proven by call-counting rather than
+  ## by an injected timestamp (no elapsed-time decision exists to fake).
+  var getIdx = 0
+  var putIdx = 0
+  let getCalls = new(int)
+  let putCalls = new(int)
+  let backend = CacheBackend(
+    scheme: "counting",
+    get: proc(key: SoundnessKey): Fetched[StoredEntry] =
+      inc getCalls[]
+      let v = getResults[min(getIdx, getResults.len - 1)]
+      inc getIdx
+      Fetched[StoredEntry](verdict: v)
+    ,
+    put: proc(entry: StoredEntry): CacheVerdict =
+      inc putCalls[]
+      let v = putResults[min(putIdx, putResults.len - 1)]
+      inc putIdx
+      v
+    ,
+    probe: nil,
+  )
+  (backend, getCalls, putCalls)
+
+block test_circuit_breaker_trips_on_first_offline_and_stays_dead:
+  let (backend, getCalls, _) = countingBackend(getResults = @[cvOffline, cvOk, cvOk, cvOk])
+  var tc = oneTier(backend)
+  let key = SoundnessKey("1111111111111111")
+
+  discard tc.lookup(key)
+  assert getCalls[] == 1
+
+  for _ in 0 ..< 3:
+    let l = tc.lookup(key)
+    assert l.verdicts == @[(tier: "l1", verdict: cvOffline)]
+  assert getCalls[] == 1,
+    "a tripped tier must never be consulted again, even though the double would now return cvOk"
+
+block test_circuit_breaker_trips_on_timeout:
+  let (backend, getCalls, _) = countingBackend(getResults = @[cvTimeout, cvOk])
+  var tc = oneTier(backend)
+  let key = SoundnessKey("2222222222222222")
+  discard tc.lookup(key)
+  discard tc.lookup(key)
+  assert getCalls[] == 1
+
+block test_circuit_breaker_does_not_trip_on_a_plain_miss:
+  let (backend, getCalls, _) = countingBackend(getResults = @[cvMiss, cvMiss])
+  var tc = oneTier(backend)
+  let key = SoundnessKey("3333333333333333")
+  discard tc.lookup(key)
+  discard tc.lookup(key)
+  assert getCalls[] == 2, "a cold miss must not trip the breaker -- only offline/timeout does"
+
+block test_circuit_breaker_is_per_tier_independent:
+  let (b0, get0, _) = countingBackend(getResults = @[cvOffline])
+  let (b1, get1, _) = countingBackend(getResults = @[cvOk])
+  var tc = twoTier(b0, b1)
+  let key = SoundnessKey("4444444444444444")
+
+  let l = tc.lookup(key)
+  assert l.hit.isSome
+  assert l.hit.get.tier == "l2"
+  assert get0[] == 1
+  assert get1[] == 1
+
+  discard tc.lookup(key)
+  assert get0[] == 1, "l1 stays tripped"
+  assert get1[] == 2, "l2 (never tripped) keeps being consulted normally"
+
+block test_circuit_breaker_trips_on_put_and_stays_dead:
+  let (backend, _, putCalls) = countingBackend(putResults = @[cvOffline, cvOk])
+  var tc = oneTier(backend)
+  let entry = sampleEntry(SoundnessKey("5555555555555555"))
+  discard tc.put(entry)
+  assert putCalls[] == 1
+  discard tc.put(entry)
+  assert putCalls[] == 1, "a tripped tier's put must never be attempted again"
+
+block test_circuit_breaker_short_circuits_a_backfill_target:
+  let (b0, _, put0) = countingBackend(getResults = @[cvOffline], putResults = @[cvOk])
+  var tc = twoTier(b0, memory(), backfill0 = true)
+  let key = SoundnessKey("6666666666666666")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 2))
+
+  let l = tc.lookup(key)  # l1.get trips the breaker THIS call; l2 serves; backfill to l1 follows
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOffline)],
+    "a tier tripped earlier in the SAME lookup call must short-circuit its own backfill write too"
+  assert put0[] == 0, "a tripped tier's backend.put must never be reached by backfill either"
+
+# ---------------------------------------------------------------------------
+# 10. RFC-0005 A3a/B0: deferred-put drain -- a budget-bounded fold over a
+#     caller-owned queue of previously-unpublished entries.
+# ---------------------------------------------------------------------------
+
+block test_drain_pending_flushes_every_entry_with_no_budget:
+  var tc = oneTier(memory())
+  let entries = @[sampleEntry(SoundnessKey("7777000000000001"), exitCode = 1),
+                  sampleEntry(SoundnessKey("7777000000000002"), exitCode = 2)]
+  let vs = tc.drainPending(entries)
+  assert vs == @[(tier: "l1", verdict: cvOk), (tier: "l1", verdict: cvOk)]
+  assert tc.tiers[0].backend.get(entries[0].key).verdict == cvOk
+  assert tc.tiers[0].backend.get(entries[1].key).verdict == cvOk
+
+block test_drain_pending_respects_a_total_budget:
+  let (backend, _, putCalls) = countingBackend(putResults = @[cvOk, cvOk, cvOk])
+  var tc = oneTier(backend)
+  let entries = @[sampleEntry(SoundnessKey("8888000000000001")),
+                  sampleEntry(SoundnessKey("8888000000000002")),
+                  sampleEntry(SoundnessKey("8888000000000003"))]
+  let vs = tc.drainPending(entries, budget = 2)
+  assert vs.len == 2
+  assert putCalls[] == 2, "the third queued entry must never be attempted once the budget is spent"
+
+# ---------------------------------------------------------------------------
+# 11. RFC-0005 A3a coordinator ruling: tekBackfillErr's producer
+#     (`cachetelemetry.backfillErrEvents`, over `CacheLookup.backfillVerdicts`)
+#     + its fold into `aggregateCacheStats.remoteErrors`.
+# ---------------------------------------------------------------------------
+
+block test_backfill_err_events_and_stats:
+  let (b0, _, put0) = countingBackend(getResults = @[cvMiss], putResults = @[cvOffline])
+  var tc = twoTier(b0, memory(), backfill0 = true)
+  let key = SoundnessKey("9999000000000001")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 4))
+
+  let l = tc.lookup(key)
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOffline)]
+  assert put0[] == 1
+
+  let events = backfillErrEvents(l)
+  assert events.len == 1
+  assert events[0].kind == tekBackfillErr
+  assert events[0].putTier == "l1"
+  assert events[0].putVerdict == cvOffline
+
+  let stats = aggregateCacheStats(events, @[cdmHit])
+  assert stats.remoteErrors == 1
+
+block test_backfill_err_events_is_empty_on_a_successful_backfill:
+  var tc = twoTier(memory(), memory(), backfill0 = true)
+  let key = SoundnessKey("9999000000000002")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 4))
+  let l = tc.lookup(key)
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOk)]
+  assert backfillErrEvents(l).len == 0
+
+# ---------------------------------------------------------------------------
+# 12. RFC-0005 A3a: cacheregistry — BackendRegistry + buildBackend +
+#     productionRegistry/testRegistry (scheme-resolved factories).
+# ---------------------------------------------------------------------------
+
+block test_registry_resolves_file_scheme:
+  let root = freshLocalFsRoot("registry_file")
+  let reg = productionRegistry()
+  let tier = RemoteTier(name: "team", url: "file://" & root)
+  let backend = reg.buildBackend(tier, token = "")
+  assert backend.isSome
+  let key = SoundnessKey("aaaa111122223333")
+  assert backend.get.put(sampleEntry(key, exitCode = 6)) == cvOk
+  assert backend.get.get(key).verdict == cvOk
+
+block test_production_registry_has_no_memory_scheme:
+  let reg = productionRegistry()
+  let tier = RemoteTier(name: "oops", url: "memory://whatever")
+  assert reg.buildBackend(tier, token = "").isNone,
+    "a typo'd memory:// URL in production must be a config error, not a silent tier"
+
+block test_test_registry_adds_memory_and_memorybytes_and_keeps_file:
+  let reg = testRegistry()
+  assert reg.buildBackend(RemoteTier(name: "m", url: "memory://x"), token = "").isSome
+  assert reg.buildBackend(RemoteTier(name: "mb", url: "memorybytes://x"), token = "").isSome
+  let root = freshLocalFsRoot("registry_test_file")
+  assert reg.buildBackend(RemoteTier(name: "f", url: "file://" & root), token = "").isSome
+
+block test_registry_unknown_scheme_is_none:
+  let reg = testRegistry()
+  assert reg.buildBackend(RemoteTier(name: "x", url: "s3://bucket/key"), token = "").isNone
+
+# ---------------------------------------------------------------------------
+# 13. localFs-specific (rfc-0005 A2a)
 # ---------------------------------------------------------------------------
 
 proc localFsRootPathNoCreate(name: string): string =
@@ -431,7 +816,7 @@ block test_localfs_ioerror_file_blocks_version_dir_put:
     "createDir raising IOError (file blocks the version dir) must degrade like OSError, not crash"
 
 # ---------------------------------------------------------------------------
-# 7. zero-tier lookup/put is a clean no-op (never raises, never crashes)
+# 14. zero-tier lookup/put is a clean no-op (never raises, never crashes)
 # ---------------------------------------------------------------------------
 
 block test_zero_tier_is_clean_noop:
@@ -443,7 +828,7 @@ block test_zero_tier_is_clean_noop:
   assert tc.put(sampleEntry(SoundnessKey("0000000000000000"))).len == 0
 
 # ---------------------------------------------------------------------------
-# 8. Explain-miss sidecar I/O (RFC-0005 B1b) — cachelocalfs.sidecarPath/
+# 15. Explain-miss sidecar I/O (RFC-0005 B1b) — cachelocalfs.sidecarPath/
 #    readSidecar/writeSidecar directly. A LOCAL-FS implementation detail:
 #    the memory/memoryBytes doubles never see this (cachelocalfs.nim's own
 #    module doc).
