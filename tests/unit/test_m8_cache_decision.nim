@@ -14,6 +14,7 @@
 import std/[options, unittest]
 import crisol/[types, sandbox, cachedispatch, resultcache, planner, depgraph]
 import crisol/process/types as ptypes
+import "../support/helpers"  # legacySeams
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,10 +47,10 @@ type Calls = object
 
 proc seamsHit(c: var Calls): CacheSeams =
   let cp = addr c
-  CacheSeams(
-    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
              inc cp[].keyCalls; SoundnessKey("mk-" & pep.ep.path),
-    load:  proc(key: SoundnessKey): Option[CachedResult] =
+    load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls
              some(CachedResult(
                run: ptypes.ProcessResult(
@@ -60,18 +61,18 @@ proc seamsHit(c: var Calls): CacheSeams =
                  durationUs: 100 * 1000,
                ),
                records: @[], cachedAt: 1_700_000_000'i64)),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )
 
 proc seamsMiss(c: var Calls): CacheSeams =
   let cp = addr c
-  CacheSeams(
-    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
              inc cp[].keyCalls; SoundnessKey("mk-" & pep.ep.path),
-    load:  proc(key: SoundnessKey): Option[CachedResult] =
+    load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls; none(CachedResult),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )
 

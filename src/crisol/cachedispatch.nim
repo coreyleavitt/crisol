@@ -20,13 +20,26 @@
 ##   - `lookupAtPlan`   — promote edRunFresh → edCached on a hit; synthesize the
 ##                        EntrypointResult; ALWAYS populate CacheDecision.
 ##   - `shouldStore`    — the store gate: evidenceSatisfies AND attempt-1 pass.
-##   - `realSeams`      — production seam bundle (keys.nim + resultcache.nim).
+##   - `KeyContext`/`keyContext`/`keyOfProc` — key-derivation state + closure
+##                        builder (RFC-0005 A2b), independent of any backend.
+##   - `realSeams`      — production seam bundle: `keyOf` from `keyOfProc`;
+##                        `load`/`store` close over a `CacheRuntime`'s
+##                        `TieredCache` (cachetier.nim over cacheport.nim/
+##                        cacheregistry.nim) instead of `loadCached`/
+##                        `storeCached` directly.
 ##
 ## The execute loop (runner.nim) calls `lookupAtPlan` once per runnable
 ## entrypoint before dispatch, and `shouldStore` after each live result.
 
 import std/[options, os, tables]
 import crisol/[types, keys, resultcache, sandbox, depgraph, planner]
+# RFC-0005 A2b: the seam now derives INPUTS and looks them up through a
+# TieredCache (cachetier) over a CacheBackend (cacheport/cachewire) — see
+# KeyContext/KeyDerivation/realSeams below.
+import crisol/cacheport
+import crisol/cachetier
+import crisol/cachewire
+import crisol/cacheregistry
 # rfc-0007 §2: synthesize() replays the REAL stored `run` ProcessResult as
 # a `Phase(kind: pkCached, ...)` node -- `outcome(r)` (there is no stored
 # field) is recomputed over it at THIS boundary (lookupAtPlan) -- see
@@ -93,22 +106,46 @@ proc resolveCacheable*(policy: CachePolicy;
 # ---------------------------------------------------------------------------
 
 type
-  KeyOfProc* = proc(pep: PlannedEntrypoint): SoundnessKey {.closure.}
-    ## Derive the soundness key for an entrypoint.  All effectful inputs
-    ## (closureHash, ccVersion, hermeticEnvHash, …) are captured in the closure
-    ## when the seam is built, so the dispatch logic stays pure w.r.t. them.
+  KeyOfProc* = proc(pep: PlannedEntrypoint): KeyInputs {.closure.}
+    ## Derive the soundness-key INPUTS for an entrypoint (RFC-0005 A2b: was
+    ## `pep -> SoundnessKey` directly).  All effectful inputs (closureHash,
+    ## ccVersion, hermeticEnvHash, …) are captured in the closure when the
+    ## seam is built, so the dispatch logic stays pure w.r.t. them.  Dispatch
+    ## (`derive`, below) hashes the returned `KeyInputs` — the seam itself
+    ## never hashes, so a caller that needs the inputs (the explain-miss
+    ## sidecar, the wire's `keyInputs` field) can always get them back; a
+    ## `SoundnessKey` is a one-way FNV fold and cannot be reversed.
 
-  LoadProc* = proc(key: SoundnessKey): Option[CachedResult] {.closure.}
-    ## Look up a cached result.  none = miss.
+  LoadProc* = proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup {.closure.}
+    ## Look up a cached result.  `d` is `derive(seams, pep)` — the caller
+    ## derives once and passes both the entrypoint (for adapters that key
+    ## provenance/sidecars by path) and the derivation (inputs + hashed key).
+    ## RFC-0005 A2b: was `key -> Option[CachedResult]`.
 
-  StoreProc* = proc(key: SoundnessKey; res: CachedResult): bool {.closure.}
-    ## Persist a result.  Returns false when skipped (soft cap) or on I/O error.
+  StoreProc* = proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool {.closure.}
+    ## Persist a result.  Returns false when skipped (soft cap, offline tier,
+    ## or any I/O error).  RFC-0005 A2b: was `(key, res) -> bool`.
 
   CacheSeams* = object
     ## Injectable bundle: production builds it via `realSeams`; tests mock it.
+    ## Still exactly three closures (RFC-0005: "re-typed, not re-shaped").
     keyOf*: KeyOfProc
     load*:  LoadProc
     store*: StoreProc
+
+  KeyDerivation* = object
+    ## RFC-0005 A2b: the seam derives INPUTS; dispatch hashes them (pure,
+    ## keys.nim) — the clean split that lets `load`/`store` recover the
+    ## inputs a `SoundnessKey` alone cannot yield back up.
+    inputs*: KeyInputs
+    key*:    SoundnessKey  ## = soundnessKey(inputs)
+
+proc derive*(seams: CacheSeams; pep: PlannedEntrypoint): KeyDerivation =
+  ## Derive an entrypoint's `KeyDerivation` exactly once: `inputs =
+  ## seams.keyOf(pep)`, `key = soundnessKey(inputs)`.  `lookupAtPlan` and
+  ## the runner's store-gate call site each call this once per entrypoint.
+  let inputs = seams.keyOf(pep)
+  KeyDerivation(inputs: inputs, key: soundnessKey(inputs))
 
 # ---------------------------------------------------------------------------
 # CacheContext — cohesive bundle enforcing the cache invariant (M4)
@@ -244,13 +281,14 @@ proc lookupAtPlan*(
     return PlanLookup(decision: edRunFresh, cacheDecision: res.decision,
                       inputHash: "", synthesized: none(EntrypointResult))
 
-  # Eligible + caching on: derive the soundness key once.  Surface it on the
-  # lookup so the runner can stamp it onto BOTH a hit (synthesized) and a live
-  # miss — run/v1 reports inputHash whenever the cache was actually consulted.
-  let key  = seams.keyOf(pep)
-  let kStr = $key
-  let hit  = seams.load(key)
-  if hit.isNone:
+  # Eligible + caching on: derive the soundness key once (RFC-0005 A2b).
+  # Surface it on the lookup so the runner can stamp it onto BOTH a hit
+  # (synthesized) and a live miss — run/v1 reports inputHash whenever the
+  # cache was actually consulted.
+  let d    = derive(seams, pep)
+  let kStr = $d.key
+  let l    = seams.load(pep, d)
+  if l.hit.isNone:
     return PlanLookup(decision: edRunFresh, cacheDecision: cdmKeyMiss, inputHash: kStr,
                       synthesized: none(EntrypointResult))
 
@@ -258,7 +296,7 @@ proc lookupAtPlan*(
   # read it from storage.  A hit whose recomputed outcome is not oPassed is
   # treated as a MISS and rerun — a derivation or policy change must never
   # serve a stale/invalidated pass from cache forever with no rerun path.
-  let synth = synthesize(pep, hit.get, kStr)
+  let synth = synthesize(pep, l.hit.get.result, kStr)
   if outcome(synth) != oPassed:
     return PlanLookup(decision: edRunFresh, cacheDecision: cdmRecomputeMiss,
                       inputHash: kStr, synthesized: none(EntrypointResult))
@@ -363,63 +401,79 @@ proc inactiveDecision*(d: EntrypointDecision): CacheDecision =
   of edCached:     cdmNotEligible   # unreachable: plan-time hit requires isActive
 
 # ---------------------------------------------------------------------------
-# Real production seams (keys.nim + resultcache.nim)
+# KeyContext — everything keyOf closes over except the live graph
+# (RFC-0005 A2b "Wiring": realSeams' key-derivation params, minus stateDir
+# and graph, which load/store and keyOfProc need directly instead).
 # ---------------------------------------------------------------------------
 
-proc realSeams*(
-  stateDir:   string;
-  graph:      ptr DepGraph;
-  nimVersion: string;
-  ccVersion:  string;
-  spec:       SandboxSpec;
-  parentEnv:  seq[(string, string)];
-  protocolMajor: int;
-): CacheSeams =
-  ## Build the production seam bundle.
+type
+  KeyContext* = object
+    ## Everything `keyOf` closes over except the live graph.
+    nimVersion*, ccVersion*: string
+    spec*:            SandboxSpec
+    hermeticEnvHash*: string
+      ## = hermeticEnvHash(filterEnv(parentEnv, spec, @[])) — computed ONCE
+      ## by `keyContext` (env-pins are already applied via `spec.envPins`,
+      ## which `filterEnv` reads; see `sandbox.filterEnv`).
+    protocolMajor*:   int
+
+proc keyContext*(nimVersion, ccVersion: string; spec: SandboxSpec;
+                 parentEnv: openArray[(string, string)];
+                 protocolMajor: int): KeyContext =
+  ## Build the key-derivation context once per run.
   ##
-  ## The soundness key is derived from:
+  ## `parentEnv` is the host environment snapshot to filter against `spec`.
+  ## Pass `toSeq(envPairs())` at the production call site so the hash reflects
+  ## the actual env values the child process will see.  Tests inject a
+  ## synthetic snapshot to exercise the key-derivation logic without live env
+  ## reads.  Filtering (allowlist + `spec.envPins`' tail) happens exactly once
+  ## here — every `keyOfProc`-built closure reuses the resulting hash.
+  KeyContext(
+    nimVersion:      nimVersion,
+    ccVersion:       ccVersion,
+    spec:            spec,
+    hermeticEnvHash: hermeticEnvHash(filterEnv(parentEnv, spec, @[])),
+    protocolMajor:   protocolMajor,
+  )
+
+proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
+  ## Build the `KeyOfProc` closure — what the key-derivation tests call
+  ## directly (no cache backend/CacheRuntime needed to exercise key logic).
+  ##
+  ## The soundness-key INPUTS are derived from:
   ##   closureContentHash ← DepGraphEntry.closureHash for (path, flagHash)
   ##   flagHash           ← flagHash(ep.flags)
-  ##   nimVersion, ccVersion, protocolMajor ← passed in
+  ##   nimVersion, ccVersion, protocolMajor ← ctx
   ##   fixtureHash        ← "" (EmptyFixtureSentinel; per-group fixtures are A9)
   ##   argv               ← [<slug>/<binName>] — stable machine-independent
   ##                        surrogate for the actual binary path used at run time
   ##                        (`<stateDir>/bin/<slug>/<binName>`).  Two entrypoints
   ##                        with the same basename but different paths get different
   ##                        slugs and therefore different argv components.
-  ##   limits             ← spec.limits (rfc-0007 §1 enum-indexed Limits home)
-  ##   hermeticEnvHash    ← hash of names+values of every env var that actually
-  ##                        reaches the hermetic child (post-allowlist-filter),
-  ##                        EXCLUDING TMPDIR value (per-run random suffix) and
-  ##                        CRISOL_SINK / CRISOL_ATTEMPT (per-run injections).
-  ##                        WHY values: an allowlisted var is one tests are
-  ##                        *allowed to depend on*, so its value is a real input;
-  ##                        soundness (equal key ⇒ equal result) requires it in
-  ##                        the key.  Cross-host cache reuse is achieved by pinning
-  ##                        the env, not by omitting values (cf. Bazel --action_env,
-  ##                        Nix derivations).
+  ##   limits             ← ctx.spec.limits (rfc-0007 §1 enum-indexed Limits home)
+  ##   hermeticEnvHash    ← ctx.hermeticEnvHash: names+values of every env var
+  ##                        that actually reaches the hermetic child
+  ##                        (post-allowlist-filter), EXCLUDING TMPDIR value
+  ##                        (per-run random suffix) and CRISOL_SINK /
+  ##                        CRISOL_ATTEMPT (per-run injections).  WHY values:
+  ##                        an allowlisted var is one tests are *allowed to
+  ##                        depend on*, so its value is a real input;
+  ##                        soundness (equal key ⇒ equal result) requires it
+  ##                        in the key.  Cross-host cache reuse is achieved by
+  ##                        pinning the env, not by omitting values (cf.
+  ##                        Bazel --action_env, Nix derivations).
   ##
-  ## `parentEnv` is the host environment snapshot to filter against `spec`.
-  ## Pass `toSeq(envPairs())` at the production call site so the hash reflects
-  ## the actual env values the child process will see.  Tests inject a synthetic
-  ## snapshot to exercise the key-derivation logic without live env reads.
+  ## When an entrypoint has no graph entry (closureHash empty) the inputs
+  ## still derive deterministically — but such entrypoints are never
+  ## `edRunFresh` (decideCompile returns cdStale without a record), so they
+  ## never reach the cache lookup; this is belt-and-suspenders.
   ##
-  ## When an entrypoint has no graph entry (closureHash empty) the key still
-  ## derives deterministically — but such entrypoints are never `edRunFresh`
-  ## (decideCompile returns cdStale without a record), so they never reach the
-  ## cache lookup; this is belt-and-suspenders.
-  ##
-  ## `graph` is a `ptr DepGraph` so the key proc reads the LIVE graph: the
-  ## runner updates the graph (fresh closureHash) right after a compile, and the
-  ## store-key derived afterwards must reflect that updated hash so a later run's
-  ## lookup-key (built from the persisted graph) matches.
-
-  # Filter the parent env through the allowlist (no per-run injections yet —
-  # those are noise, already excluded inside hermeticEnvHash), then hash
-  # names+values.  TMPDIR value and CRISOL_* vars are excluded by hermeticEnvHash.
-  let hEnvHash = hermeticEnvHash(filterEnv(parentEnv, spec, @[]))
-
-  let keyOf: KeyOfProc = proc(pep: PlannedEntrypoint): SoundnessKey =
+  ## `graph` is a `ptr DepGraph` so the returned closure reads the LIVE
+  ## graph: the runner updates the graph (fresh closureHash) right after a
+  ## compile, and the store-key derived afterwards must reflect that updated
+  ## hash so a later run's lookup-key (built from the persisted graph)
+  ## matches.
+  proc(pep: PlannedEntrypoint): KeyInputs =
     let ep    = pep.ep
     let fHash = flagHash(ep.flags)
     let entry =
@@ -434,22 +488,44 @@ proc realSeams*(
     # different paths produce distinct argv components.
     let epSlug = slug(ep.path, ep.flags)
     let epArgv = epSlug / binName(ep)
-    soundnessKey(KeyInputs(
+    KeyInputs(
       closureContentHash: entry.closureHash,
       flagHash:           fHash,
-      nimVersion:         nimVersion,
-      ccVersion:          ccVersion,
+      nimVersion:         ctx.nimVersion,
+      ccVersion:          ctx.ccVersion,
       fixtureHash:        "",
       argv:               @[epArgv],
-      limits:             spec.limits,
-      hermeticEnvHash:    hEnvHash,
-      protocolMajor:      protocolMajor,
-    ))
+      limits:             ctx.spec.limits,
+      hermeticEnvHash:    ctx.hermeticEnvHash,
+      protocolMajor:      ctx.protocolMajor,
+    )
 
-  let load: LoadProc = proc(key: SoundnessKey): Option[CachedResult] =
-    loadCached(stateDir, key)
+# ---------------------------------------------------------------------------
+# Real production seams (cacheport.nim + cachetier.nim + cacheregistry.nim)
+# ---------------------------------------------------------------------------
 
-  let store: StoreProc = proc(key: SoundnessKey; res: CachedResult): bool =
-    storeCached(stateDir, key, res)
-
-  CacheSeams(keyOf: keyOf, load: load, store: store)
+proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSeams =
+  ## Build the production seam bundle.  `load`/`store` close over `rt.cache`
+  ## (a single-tier `TieredCache` over the local-fs backend by default, via
+  ## `cacheregistry.localOnlyCache`) instead of `loadCached`/`storeCached`
+  ## directly (RFC-0005 A2b — "the load-bearing refactor").
+  ##
+  ## `rt` is captured as a mutable local shadow so the closures below can
+  ## call `TieredCache.lookup`/`put` (which take `var TieredCache`); `rt`'s
+  ## `cache` field is otherwise identical to what the caller passed in.
+  var rt = rt
+  CacheSeams(
+    keyOf: keyOfProc(ctx, graph),
+    load:  proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
+             rt.cache.lookup(d.key),
+    store: proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool =
+             let verdicts = rt.cache.put(StoredEntry(
+               key:            d.key,
+               keyInputs:      some(d.inputs),
+               result:         res,
+               storageVersion: storageFormatVersion,
+             ))
+             result = false
+             for v in verdicts:
+               if v.verdict == cvOk: result = true,
+  )

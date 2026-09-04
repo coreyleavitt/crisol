@@ -52,8 +52,8 @@
 
 import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, times]
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock,
-               sandbox, cachedispatch, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
-               compilereport]
+               sandbox, cachedispatch, cacheregistry, resultcache, ccprobe, nimprobe, planner,
+               order, ledger, keys, depgraph, stats, compilereport]
 # rfc-0007 A2b: `crisol/signals` (the process-global gotSignal flag) is no
 # longer this module's concern — `runner.execute`'s OWN Supervisor now owns
 # SIGINT/SIGTERM installation for the duration of the call (`installSignals`
@@ -984,17 +984,28 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
     if opts.noCache:
       cacheDisabled(spec)   # fully off; spec still governs sandbox hermeticity
     else:
+      # RFC-0005 A2b: keyContext built once (the key-derivation closure's
+      # captured state); localOnlyCache built once (the single-tier "l1"
+      # TieredCache over the local-fs backend — behaviorally identical to
+      # RFC-0004's direct loadCached/storeCached).  maxCacheEntries mirrors
+      # clean.nim's own resolution of the SAME config field (0 = use
+      # DefaultMaxCacheEntries) so the live store path's soft cap and
+      # `clean`'s GC target agree — one knob, one resolution rule, both
+      # readers of it.
+      let keyCtx = keyContext(
+        nimVersion    = nimVer,
+        ccVersion     = ccVer,
+        spec          = spec,
+        parentEnv     = toSeq(envPairs()),
+        protocolMajor = CrisolProtocolMajor,
+      )
+      let maxCacheEntries =
+        if cfg.maxCacheEntries > 0: cfg.maxCacheEntries
+        else: DefaultMaxCacheEntries
+      let rt = localOnlyCache(pr.settings.stateDir, maxCacheEntries)
       cacheEnabled(spec,
         CachePolicy(enabled: true),
-        realSeams(
-          stateDir      = pr.settings.stateDir,
-          graph         = addr graph,
-          nimVersion    = nimVer,
-          ccVersion     = ccVer,
-          spec          = spec,
-          parentEnv     = toSeq(envPairs()),
-          protocolMajor = CrisolProtocolMajor,
-        ))
+        realSeams(keyCtx, addr graph, rt))
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
   # are written by execute() itself (via ptr out-params) rather than caught as

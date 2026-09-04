@@ -30,6 +30,7 @@
 import std/[options, os, sets, tables, times, unittest]
 import std/posix as posix_mod
 import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache]
+import "../support/helpers"  # legacySeams
 
 proc fixtureDir(): string =
   currentSourcePath().parentDir.parentDir / "fixtures"
@@ -100,11 +101,11 @@ type MockCacheState = ref object
 proc mockStoreOnlySeams(ms: MockCacheState): CacheSeams =
   ## keyOf/load are never expected to be hit by this scenario (edNeverBuilt
   ## is not plan-time cache-eligible); store is the seam under test.
-  CacheSeams(
-    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
              SoundnessKey("mk-" & pep.ep.path),
-    load:  proc(key: SoundnessKey): Option[CachedResult] = none(CachedResult),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
+    load = proc(key: SoundnessKey): Option[CachedResult] = none(CachedResult),
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc ms.storeCalls; true,
   )
 

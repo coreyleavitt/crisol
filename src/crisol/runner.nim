@@ -1619,14 +1619,14 @@ proc execute*(
                 if verdict.store and closureRecorded:
                   # Re-derive the key from the NOW-updated graph (closureHash fresh)
                   # so a later run's lookup-key matches this store-key.
-                  let key = cache.seams.keyOf(p.entrypoints[completedIdx])
+                  let d   = derive(cache.seams, p.entrypoints[completedIdx])
                   let cr  = toCachedResult(result[completedIdx], epochTime().int64)
-                  let stored = cache.seams.store(key, cr)
+                  let stored = cache.seams.store(p.entrypoints[completedIdx], d, cr)
                   # A8: the store-key is the authoritative inputHash for this live run
                   # (the plan-time lookup key was derived before this compile updated
                   # the graph; for an edStale/edNeverBuilt entry there was no plan-time
                   # key at all).  Stamp the freshly-derived key string.
-                  result[completedIdx].inputHash = $key
+                  result[completedIdx].inputHash = $d.key
                   # M8: cdmStored = fresh run on a miss where the result WAS written.
                   # cdmKeyMiss = fresh run on a miss where the result was NOT stored.
                   # A run/v1 consumer can tell from cacheDecision alone whether a store

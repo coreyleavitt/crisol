@@ -17,8 +17,8 @@
 ##     narrowing tests have valid prior-run state without hand-written JSON
 ##     (schema drift would make loadLastRun raise).
 
-import std/[os, osproc, tempfiles]
-import crisol/[types, config, jsonout]
+import std/[options, os, osproc, tempfiles]
+import crisol/[types, config, jsonout, cachedispatch, cachetier, cacheport]
 
 # ---------------------------------------------------------------------------
 # Minimal crisol.kdl content for fixture projects
@@ -100,6 +100,47 @@ template withTempGitProject*(body: untyped): untyped =
 # ---------------------------------------------------------------------------
 # seedLastRun — write lastrun.json via persistLastRun (never hand-written JSON)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# legacySeams — adapt a pre-RFC-0005-A2b (keyOf, load, store) triple into the
+# current CacheSeams shape.
+# ---------------------------------------------------------------------------
+#
+# RFC-0005 A2b re-typed CacheSeams' three closures (KeyOfProc: pep -> KeyInputs,
+# was pep -> SoundnessKey directly; LoadProc/StoreProc: (pep, KeyDerivation[, res]),
+# was (key[, res])) while lookupAtPlan's/shouldStore's DECISION LOGIC stayed
+# unchanged. Every mock CacheSeams(...) literal in the suite was written
+# against the pre-A2b shape -- exactly the mental model ("a key maps to a
+# result") lookupAtPlan/shouldStore still test. This ONE helper adapts an
+# old-shape (keyOf, load, store) triple into the new shape mechanically, so
+# none of the suite's literals needs to hand-construct a KeyDerivation/
+# CacheLookup itself: the legacy SoundnessKey is carried inside KeyInputs'
+# otherwise-unused `argv` slot (the real `derive` hashes whatever KeyInputs
+# keyOf returns, so a distinguishable KeyInputs is all soundness requires),
+# and a CacheLookup/TierHit is synthesized around the legacy
+# Option[CachedResult].
+
+type
+  LegacyKeyOfProc* = proc(pep: PlannedEntrypoint): SoundnessKey {.closure.}
+  LegacyLoadProc*  = proc(key: SoundnessKey): Option[CachedResult] {.closure.}
+  LegacyStoreProc* = proc(key: SoundnessKey; res: CachedResult): bool {.closure.}
+
+proc legacySeams*(keyOf: LegacyKeyOfProc; load: LegacyLoadProc;
+                  store: LegacyStoreProc): CacheSeams =
+  CacheSeams(
+    keyOf: proc(pep: PlannedEntrypoint): KeyInputs =
+             KeyInputs(argv: @[$keyOf(pep)]),
+    load: proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
+             let hit = load(SoundnessKey(d.inputs.argv[0]))
+             if hit.isSome:
+               CacheLookup(
+                 hit: some(TierHit(result: hit.get, tier: "legacy", verified: true)),
+                 verdicts: @[("legacy", cvOk)])
+             else:
+               CacheLookup(hit: none(TierHit), verdicts: @[("legacy", cvMiss)]),
+    store: proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool =
+             store(SoundnessKey(d.inputs.argv[0]), res),
+  )
 
 proc seedLastRun*(projectRoot: string; results: seq[EntrypointResult];
                   summary: Summary = Summary()) =

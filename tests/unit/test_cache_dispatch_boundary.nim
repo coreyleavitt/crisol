@@ -21,6 +21,7 @@
 import std/[options, os, tables, unittest]
 import crisol/[types, runner, planner, depgraph, sandbox, cachedispatch, resultcache]
 import crisol/process/types as ptypes
+import "../support/helpers"  # legacySeams
 
 # ---------------------------------------------------------------------------
 # Mock seam construction
@@ -32,14 +33,14 @@ type MockState = ref object
   loadCalls:  int
 
 proc mockSeams(ms: MockState): CacheSeams =
-  CacheSeams(
-    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
              SoundnessKey("mk-" & pep.ep.path),
-    load:  proc(key: SoundnessKey): Option[CachedResult] =
+    load = proc(key: SoundnessKey): Option[CachedResult] =
              inc ms.loadCalls
              if ($key) in ms.store: some(ms.store[$key])
              else: none(CachedResult),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc ms.storeCalls
              ms.store[$key] = res
              true,

@@ -14,6 +14,7 @@
 import std/[options, unittest]
 import crisol/[types, sandbox, cachedispatch, resultcache, planner, depgraph]
 import crisol/process/types  # pkCached/pkSkipped (rfc-0007 A1c coherence test)
+import "../support/helpers"  # legacySeams
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,25 +56,27 @@ type Calls = object
   keyCalls:   int
   storeCalls: int
 
+proc legacyKey(pep: PlannedEntrypoint): SoundnessKey = SoundnessKey("k-" & pep.ep.path)
+
 proc seamsHit(c: var Calls; cr: CachedResult): CacheSeams =
   let cp = addr c
-  CacheSeams(
-    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
-             inc cp[].keyCalls; SoundnessKey("k-" & pep.ep.path),
-    load:  proc(key: SoundnessKey): Option[CachedResult] =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
+             inc cp[].keyCalls; legacyKey(pep),
+    load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls; some(cr),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )
 
 proc seamsMiss(c: var Calls): CacheSeams =
   let cp = addr c
-  CacheSeams(
-    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
-             inc cp[].keyCalls; SoundnessKey("k-" & pep.ep.path),
-    load:  proc(key: SoundnessKey): Option[CachedResult] =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
+             inc cp[].keyCalls; legacyKey(pep),
+    load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls; none(CachedResult),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )
 
@@ -136,18 +139,23 @@ suite "lookupAtPlan — promotion + decision":
     check c.loadCalls == 1
 
   test "A8: lookup surfaces inputHash on a hit (key string the hit was served on)":
-    var c: Calls
+    # RFC-0005 A2b: keyOf now returns KeyInputs; dispatch hashes it
+    # (soundnessKey) — inputHash is that hash, not keyOf's legacy literal
+    # verbatim. `derive` over the SAME legacy-key mapping is the ground
+    # truth for what a given pep's hash must be.
+    var c1, c2: Calls
     let pep  = freshPep(edRunFresh)
-    let look = lookupAtPlan(pep, onPolicy, seamsHit(c, sampleCached()))
-    check look.inputHash == "k-" & pep.ep.path
+    let look = lookupAtPlan(pep, onPolicy, seamsHit(c1, sampleCached()))
+    let expected = $derive(seamsMiss(c2), pep).key
+    check look.inputHash == expected
     # The synthesized result also carries the same inputHash.
-    check look.synthesized.get.inputHash == "k-" & pep.ep.path
+    check look.synthesized.get.inputHash == expected
 
   test "A8: lookup surfaces inputHash on a miss (run/v1 reports it on misses too)":
-    var c: Calls
+    var c1, c2: Calls
     let pep  = freshPep(edRunFresh)
-    let look = lookupAtPlan(pep, onPolicy, seamsMiss(c))
-    check look.inputHash == "k-" & pep.ep.path
+    let look = lookupAtPlan(pep, onPolicy, seamsMiss(c1))
+    check look.inputHash == $derive(seamsMiss(c2), pep).key
 
   test "A8: not-eligible / policy-disabled lookups carry empty inputHash":
     var c1, c2: Calls
@@ -309,27 +317,17 @@ suite "realSeams — env values enter soundness key (RFC-0004 §Keys)":
       ep: Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[]),
       edecision: edRunFresh)
 
-    let seams1 = realSeams(
-      stateDir = "/tmp/crisol_state",
-      graph = addr g,
-      nimVersion = "2.2.10",
-      ccVersion = "gcc 13.2.0",
-      spec = spec,
-      parentEnv = env1,
-      protocolMajor = 1,
-    )
-    let seams2 = realSeams(
-      stateDir = "/tmp/crisol_state",
-      graph = addr g,
-      nimVersion = "2.2.10",
-      ccVersion = "gcc 13.2.0",
-      spec = spec,
-      parentEnv = env2,
-      protocolMajor = 1,
-    )
+    # RFC-0005 A2b: keyOfProc(ctx, graph) is what the key-derivation tests
+    # call directly — no CacheRuntime/backend needed to exercise key logic.
+    let ctx1 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                          spec = spec, parentEnv = env1, protocolMajor = 1)
+    let ctx2 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                          spec = spec, parentEnv = env2, protocolMajor = 1)
+    let keyOf1 = keyOfProc(ctx1, addr g)
+    let keyOf2 = keyOfProc(ctx2, addr g)
 
-    let k1 = seams1.keyOf(pep)
-    let k2 = seams2.keyOf(pep)
+    let k1 = keyOf1(pep)
+    let k2 = keyOf2(pep)
     check k1 != k2   # soundness: different PATH value must produce different key
 
   test "same spec, same allowlisted values, different TMPDIR → SAME soundness key":
@@ -348,27 +346,15 @@ suite "realSeams — env values enter soundness key (RFC-0004 §Keys)":
       ep: Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[]),
       edecision: edRunFresh)
 
-    let seams1 = realSeams(
-      stateDir = "/tmp/crisol_state",
-      graph = addr g,
-      nimVersion = "2.2.10",
-      ccVersion = "gcc 13.2.0",
-      spec = spec,
-      parentEnv = env1,
-      protocolMajor = 1,
-    )
-    let seams2 = realSeams(
-      stateDir = "/tmp/crisol_state",
-      graph = addr g,
-      nimVersion = "2.2.10",
-      ccVersion = "gcc 13.2.0",
-      spec = spec,
-      parentEnv = env2,
-      protocolMajor = 1,
-    )
+    let ctx1 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                          spec = spec, parentEnv = env1, protocolMajor = 1)
+    let ctx2 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                          spec = spec, parentEnv = env2, protocolMajor = 1)
+    let keyOf1 = keyOfProc(ctx1, addr g)
+    let keyOf2 = keyOfProc(ctx2, addr g)
 
-    let k1 = seams1.keyOf(pep)
-    let k2 = seams2.keyOf(pep)
+    let k1 = keyOf1(pep)
+    let k2 = keyOf2(pep)
     check k1 == k2   # TMPDIR value must NOT enter the key (per-run noise)
 
 # ---------------------------------------------------------------------------

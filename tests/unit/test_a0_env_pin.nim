@@ -4,16 +4,17 @@
 ##      host's own value for that name, and CRISOL_CACHE_* is stripped
 ##      unconditionally (envScrub true OR false, even if allowlisted).
 ##   2. Key-portability invariance (the RFC's named load-bearing property):
-##      realSeams' keyOf is invariant under {stateDir, projectRoot/cwd
-##      context, TMPDIR value, a pinned variable's host value} and VARIES
-##      when an unpinned allowlisted env variable's value changes.
+##      keyOf (built via keyContext/keyOfProc, RFC-0005 A2b) is invariant
+##      under {stateDir, projectRoot/cwd context, TMPDIR value, a pinned
+##      variable's host value} and VARIES when an unpinned allowlisted env
+##      variable's value changes.
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##     tests/unit/test_a0_env_pin.nim
 
 import std/[os, strutils, unittest]
-import crisol/[types, sandbox, cachedispatch, depgraph]
+import crisol/[types, sandbox, cachedispatch, depgraph, keys]
 
 # ---------------------------------------------------------------------------
 # 1a — filterEnv injects a pin, overriding the host's own value.
@@ -96,22 +97,25 @@ suite "A0 — filterEnv: CRISOL_CACHE_* stripped unconditionally":
 # 2 — key-portability invariance (RFC-0005 A0, load-bearing).
 # ---------------------------------------------------------------------------
 #
-# keyOf (realSeams' returned KeyOfProc) must be INVARIANT under:
-#   - stateDir            (realSeams param; keyOf's closure never reads it —
-#                          only load/store do)
-#   - projectRoot / cwd    (realSeams takes neither as a parameter at all;
-#                          slug()/binName() — planner.nim — are pure functions
-#                          of ep.path/ep.flags with no getCurrentDir() call,
-#                          so the process's cwd cannot reach the key. Proven
-#                          below by actually calling keyOf from two different
-#                          working directories.)
+# keyOf (built via keyContext + keyOfProc, RFC-0005 A2b) must be INVARIANT
+# under:
+#   - stateDir            (RFC-0005 A2b: KeyContext/keyContext do not even
+#                          take a stateDir parameter any more — only
+#                          load/store, via CacheRuntime, read it — so this
+#                          invariant is now structural, not merely observed)
+#   - projectRoot / cwd    (keyContext/keyOfProc take neither as a parameter
+#                          at all; slug()/binName() — planner.nim — are pure
+#                          functions of ep.path/ep.flags with no
+#                          getCurrentDir() call, so the process's cwd cannot
+#                          reach the key. Proven below by actually calling
+#                          keyOf from two different working directories.)
 #   - TMPDIR's value       (hermeticEnvHash hashes TMPDIR's NAME only)
 #   - a pinned variable's  (its PINNED value is hashed, never the host's —
 #     host value            this is the property env-pin exists to add)
 #
 # and must VARY when an unpinned allowlisted variable's value changes.
 
-suite "A0 — key-portability invariance (keyOf, through realSeams)":
+suite "A0 — key-portability invariance (keyOf, through keyContext/keyOfProc)":
 
   test "keyOf is invariant under stateDir + cwd + TMPDIR value + pinned host value; varies on an unpinned value":
     var g = initDepGraph("2.2.10")
@@ -124,29 +128,29 @@ suite "A0 — key-portability invariance (keyOf, through realSeams)":
       ("HOME", "/root"), ("PATH", "/usr/bin"), ("USER", "alice"),
       ("TMPDIR", "/tmp/run-aaa"),
     ]
-    let seamsA = realSeams(
-      stateDir = "/tmp/crisol_state_A", graph = addr g,
+    let ctxA = keyContext(
       nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
       spec = pinnedSpec, parentEnv = envA, protocolMajor = 1)
-    let keyA = seamsA.keyOf(pep)
+    let keyA = keyOfProc(ctxA, addr g)(pep)
 
-    # Different stateDir, different host TMPDIR value, different host USER
-    # value (the pinned name) -- everything the RFC calls out as host-
-    # variable -- PLUS a different process cwd at call time.
+    # Different host TMPDIR value, different host USER value (the pinned
+    # name) -- everything the RFC calls out as host-variable -- PLUS a
+    # different process cwd at call time.  (stateDir no longer applies —
+    # KeyContext has no stateDir parameter to vary.)
     let envB: seq[(string, string)] = @[
       ("HOME", "/root"), ("PATH", "/usr/bin"), ("USER", "bob"),
       ("TMPDIR", "/tmp/run-bbb-totally-different-suffix"),
     ]
-    let seamsB = realSeams(
-      stateDir = "/tmp/crisol_state_B_a_completely_different_path", graph = addr g,
+    let ctxB = keyContext(
       nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
       spec = pinnedSpec, parentEnv = envB, protocolMajor = 1)
+    let keyOfB = keyOfProc(ctxB, addr g)
 
     let originalCwd = getCurrentDir()
-    var keyB: SoundnessKey
+    var keyB: KeyInputs
     setCurrentDir(getTempDir())
     try:
-      keyB = seamsB.keyOf(pep)
+      keyB = keyOfB(pep)
     finally:
       setCurrentDir(originalCwd)
 
@@ -157,11 +161,10 @@ suite "A0 — key-portability invariance (keyOf, through realSeams)":
       ("HOME", "/root"), ("PATH", "/usr/local/bin"), ("USER", "alice"),
       ("TMPDIR", "/tmp/run-aaa"),
     ]
-    let seamsC = realSeams(
-      stateDir = "/tmp/crisol_state_A", graph = addr g,
+    let ctxC = keyContext(
       nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
       spec = pinnedSpec, parentEnv = envC, protocolMajor = 1)
-    let keyC = seamsC.keyOf(pep)
+    let keyC = keyOfProc(ctxC, addr g)(pep)
 
     check keyC != keyA   # variance: an unpinned allowlisted value must move the key
 

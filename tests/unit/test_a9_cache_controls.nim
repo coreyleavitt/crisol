@@ -27,6 +27,7 @@
 import std/[options, os, tempfiles, unittest]
 import crisol/[types, config, cachedispatch, resultcache, sandbox, planner, depgraph]
 import crisol/process/types as ptypes
+import "../support/helpers"  # legacySeams
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,23 +68,23 @@ type Calls = object
 
 proc seamsHit(c: var Calls; cr: CachedResult): CacheSeams =
   let cp = addr c
-  CacheSeams(
-    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
              inc cp[].keyCalls; SoundnessKey("k-" & pep.ep.path),
-    load:  proc(key: SoundnessKey): Option[CachedResult] =
+    load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls; some(cr),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )
 
 proc seamsMiss(c: var Calls): CacheSeams =
   let cp = addr c
-  CacheSeams(
-    keyOf: proc(pep: PlannedEntrypoint): SoundnessKey =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
              inc cp[].keyCalls; SoundnessKey("k-" & pep.ep.path),
-    load:  proc(key: SoundnessKey): Option[CachedResult] =
+    load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls; none(CachedResult),
-    store: proc(key: SoundnessKey; res: CachedResult): bool =
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc cp[].storeCalls; true,
   )
 
@@ -538,25 +539,25 @@ suite "A9 --changed × warm-cache interaction":
     let pep = freshPep(edRunFresh, csDefault, "tests/unit/test_changed.nim")
 
     # Seam whose key is stable ("k-A")
-    let seamsStableKey = CacheSeams(
-      keyOf: proc(p: PlannedEntrypoint): SoundnessKey =
+    let seamsStableKey = legacySeams(
+      keyOf = proc(p: PlannedEntrypoint): SoundnessKey =
                inc calls1.keyCalls; SoundnessKey("k-A"),
-      load:  proc(key: SoundnessKey): Option[CachedResult] =
+      load = proc(key: SoundnessKey): Option[CachedResult] =
                inc calls1.loadCalls; some(sampleCached()),
-      store: proc(key: SoundnessKey; res: CachedResult): bool = true,
+      store = proc(key: SoundnessKey; res: CachedResult): bool = true,
     )
     let look1 = lookupAtPlan(pep, globalOn, seamsStableKey)
     check look1.decision == edCached     # warm cache hit
     check look1.cacheDecision == cdmHit
 
     # Seam whose key is new ("k-B") — simulates a changed closure → new hash
-    let seamsNewKey = CacheSeams(
-      keyOf: proc(p: PlannedEntrypoint): SoundnessKey =
+    let seamsNewKey = legacySeams(
+      keyOf = proc(p: PlannedEntrypoint): SoundnessKey =
                inc calls2.keyCalls; SoundnessKey("k-B"),
-      load:  proc(key: SoundnessKey): Option[CachedResult] =
+      load = proc(key: SoundnessKey): Option[CachedResult] =
                # k-B is not in the cache (new closure → no prior result)
                inc calls2.loadCalls; none(CachedResult),
-      store: proc(key: SoundnessKey; res: CachedResult): bool = true,
+      store = proc(key: SoundnessKey; res: CachedResult): bool = true,
     )
     let look2 = lookupAtPlan(pep, globalOn, seamsNewKey)
     check look2.decision == edRunFresh   # changed closure → miss → live re-run
