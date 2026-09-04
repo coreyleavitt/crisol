@@ -16,6 +16,8 @@
 
 import std/options
 import std/strutils
+import std/tables
+import std/algorithm
 import crisol/types
 import crisol/depgraph   # re-uses fnv1a64, toHex16, fnvOffset64; never reimplement
 from crisol/process/types as ptypes import nil  ## qualified access to the
@@ -98,6 +100,26 @@ proc chainComponent(running: uint64; component: string): uint64 {.inline.} =
   fnv1a64(toHex16(running) & "\x00" & compDigest)
 
 # ---------------------------------------------------------------------------
+# limitsFoldString — stable string serialisation of `Limits`, shared by
+# `soundnessKey` (folded into the chain) and `explainMiss` (carried verbatim
+# as a KeyDiff.prev/curr value for the kcLimits component).
+#
+# rfc-0007 A2a-iii: LOOP-DRIVEN over LimitKind (no five copied stanzas) —
+# format "<kindName>=<v>|..." in enum order, each value rendered as a decimal
+# or the literal "-" when none.  Adding a LimitKind (B3's lkMemory) is
+# therefore a compiler-forced, automatic addition to this fold, never a
+# silently-missed sixth stanza.
+# ---------------------------------------------------------------------------
+
+proc limitsFoldString(limits: ptypes.Limits): string =
+  proc optStr(o: Option[int64]): string =
+    if o.isSome: $o.get else: "-"
+  result = ""
+  for kind in ptypes.LimitKind:
+    if result.len > 0: result.add("|")
+    result.add($kind & "=" & optStr(limits.req[kind]))
+
+# ---------------------------------------------------------------------------
 # IdentityKey derivation
 # ---------------------------------------------------------------------------
 
@@ -130,17 +152,7 @@ proc soundnessKey*(inp: KeyInputs): SoundnessKey =
              else:                     inp.fixtureHash
 
   # Derive a stable serialisation of `Limits` so it participates cleanly.
-  # rfc-0007 A2a-iii: LOOP-DRIVEN over LimitKind (no five copied stanzas) —
-  # format "<kindName>=<v>|..." in enum order, each value rendered as a
-  # decimal or the literal "-" when none.  Adding a LimitKind (B3's lkMemory)
-  # is therefore a compiler-forced, automatic addition to this fold, never a
-  # silently-missed sixth stanza.
-  proc optStr(o: Option[int64]): string =
-    if o.isSome: $o.get else: "-"
-  var rlStr = ""
-  for kind in ptypes.LimitKind:
-    if rlStr.len > 0: rlStr.add("|")
-    rlStr.add($kind & "=" & optStr(inp.limits.req[kind]))
+  let rlStr = limitsFoldString(inp.limits)
 
   # Argv is serialised as NUL-joined elements so per-element boundaries are
   # captured within the component value before the per-component wrapping.
@@ -169,3 +181,90 @@ proc soundnessKey*(inp: KeyInputs): SoundnessKey =
   running = chainComponent(running, $inp.protocolMajor)
 
   result = SoundnessKey(toHex16(running))
+
+# ---------------------------------------------------------------------------
+# explainMiss — RFC-0005 Stage B (§Miss-explanation), slice B1a.
+#
+# Pure diffing of two KeyInputs records, one KeyDiff per differing component,
+# in fixed KeyComponent (== KeyInputs field) order.  No I/O, no sidecar: the
+# path-keyed persistence that supplies `prev`/`prevEnv` from a prior run is
+# B1b's concern; the CLI/render surface (`--explain-miss`) is B1c's.
+# ---------------------------------------------------------------------------
+
+type KeyComponent* = enum   ## names WHICH of the 9 key inputs differs; one
+                             ## arm per KeyInputs field, in field order.
+  kcClosure, kcFlags, kcNimVersion, kcCcVersion, kcFixtures, kcArgv,
+  kcLimits, kcHermeticEnv, kcProtocol
+
+type KeyDiff* = object
+  component*: KeyComponent
+  prev*, curr*: string
+    ## The two component values, opaque-hash components left opaque and
+    ## multi-line version text left as-is — rendering is B1c's job.
+  envNames*: seq[string]
+    ## kcHermeticEnv ONLY: the variable NAMES whose digest differs or which
+    ## are present on only one side, sorted.  NEVER values — `prevEnv`/
+    ## `currEnv` are themselves digests already (see `envDigest`), so no
+    ## value ever reaches this type.  Empty for every other component.
+
+proc envDigest*(env: seq[(string, string)]): seq[(string, string)] =
+  ## Map each `(name, value)` pair to `(name, hash16(value))`.  The value
+  ## itself is never retained — this is the exact shape B1b's sidecar
+  ## persists (`envDigest → {inputs, envDigest}` per flagHash record), so
+  ## a leaked sidecar file can never disclose a hermetic env VALUE, only
+  ## which variable NAMES were present and a value fingerprint.
+  result = newSeq[(string, string)](env.len)
+  for i, pair in env:
+    result[i] = (pair[0], toHex16(fnv1a64(pair[1])))
+
+proc diffEnvNames(prevEnv, currEnv: seq[(string, string)]): seq[string] =
+  ## Names whose digest differs between `prevEnv` and `currEnv`, or which
+  ## are present on only one side.  `prevEnv`/`currEnv` are already digests
+  ## (per-name `hash16(value)`, e.g. the output of `envDigest`) — this proc
+  ## never sees a raw value.  Sorted; no duplicates.
+  var prevMap = initTable[string, string]()
+  for (name, digest) in prevEnv: prevMap[name] = digest
+  var currMap = initTable[string, string]()
+  for (name, digest) in currEnv: currMap[name] = digest
+
+  result = @[]
+  for name, digest in prevMap:
+    if name notin currMap or currMap[name] != digest:
+      result.add name
+  for name in currMap.keys:
+    if name notin prevMap:
+      result.add name
+  result.sort()
+
+proc explainMiss*(prev, curr: KeyInputs;
+                   prevEnv, currEnv: seq[(string, string)]): seq[KeyDiff] =
+  ## PURE.  Diff `prev` against `curr`, one KeyDiff per differing component,
+  ## in enum (== KeyInputs field) order.  No difference ⇒ empty seq.
+  ##
+  ## `prevEnv`/`currEnv` are per-name env DIGESTS (`seq[(name, hash16(value))]`,
+  ## see `envDigest`) — never raw values.  They drive `KeyDiff.envNames` for
+  ## the `kcHermeticEnv` component only; whether that component itself
+  ## differs is still decided from `hermeticEnvHash` like every other
+  ## component, so `explainMiss` stays consistent even if a caller passes
+  ## envs that disagree with the recorded hash.
+  result = @[]
+
+  template addSimple(comp: KeyComponent; p, c: string) =
+    if p != c:
+      result.add KeyDiff(component: comp, prev: p, curr: c, envNames: @[])
+
+  addSimple(kcClosure,    prev.closureContentHash, curr.closureContentHash)
+  addSimple(kcFlags,      prev.flagHash,           curr.flagHash)
+  addSimple(kcNimVersion, prev.nimVersion,         curr.nimVersion)
+  addSimple(kcCcVersion,  prev.ccVersion,          curr.ccVersion)
+  addSimple(kcFixtures,   prev.fixtureHash,        curr.fixtureHash)
+  addSimple(kcArgv,       prev.argv.join(" "),     curr.argv.join(" "))
+  addSimple(kcLimits,     limitsFoldString(prev.limits),
+                          limitsFoldString(curr.limits))
+
+  if prev.hermeticEnvHash != curr.hermeticEnvHash:
+    result.add KeyDiff(component: kcHermeticEnv,
+                        prev: prev.hermeticEnvHash, curr: curr.hermeticEnvHash,
+                        envNames: diffEnvNames(prevEnv, currEnv))
+
+  addSimple(kcProtocol, $prev.protocolMajor, $curr.protocolMajor)

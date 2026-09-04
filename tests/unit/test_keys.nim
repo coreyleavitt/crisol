@@ -13,6 +13,15 @@
 ##   - NUL-in-fixture aliasing negative: embedded NUL bytes in a component cannot
 ##     alias the NUL separator between components.
 ##   - Empty-fixture sentinel produces a stable key distinct from a non-empty hash.
+##
+## RFC-0005 B1a — explainMiss + envDigest (§Miss-explanation, pure half):
+##   - One vector per KeyComponent (9): changed alone ⇒ exactly that KeyDiff.
+##   - Flag-change vector (the common deliberate miss).
+##   - Env-name vector: changed value, added name, removed name — named in
+##     envNames, values never appear in the output.
+##   - Multi-component vector ⇒ all changed components, in enum order.
+##   - No-diff vector ⇒ empty seq.
+##   - envDigest: stable, hides the value, renders 16 hex chars.
 
 import std/[options, strutils]
 import crisol/keys
@@ -251,5 +260,221 @@ block test_key_inputs_has_no_cache_shaped_field:
         "KeyInputs field '" & name & "' looks compile-cache-shaped " &
         "(matched substring '" & bad & "') -- object/compile reuse must " &
         "stay OUTSIDE the result-soundness key"
+
+# ---------------------------------------------------------------------------
+# RFC-0005 B1a — explainMiss + envDigest
+# ---------------------------------------------------------------------------
+
+const NoEnv: seq[(string, string)] = @[]
+  ## Used for every vector that does not exercise kcHermeticEnv: prevEnv/
+  ## currEnv are irrelevant when hermeticEnvHash itself is unchanged.
+
+proc limitsStr(limits: Limits): string =
+  ## Test-local mirror of keys.nim's private `limitsFoldString`, built from
+  ## the documented format ("<kindName>=<v>|..." in LimitKind enum order)
+  ## rather than importing the private proc — keeps the test honest about
+  ## the format as observable behavior, not implementation reach-in.
+  proc optStr(o: Option[int64]): string =
+    if o.isSome: $o.get else: "-"
+  result = ""
+  for kind in LimitKind:
+    if result.len > 0: result.add("|")
+    result.add($kind & "=" & optStr(limits.req[kind]))
+
+block test_explain_miss_no_diff:
+  let base = baseInputs()
+  assert explainMiss(base, base, NoEnv, NoEnv) == @[],
+    "identical KeyInputs must explain to an empty seq"
+
+block test_explain_miss_component_closure:
+  let base = baseInputs()
+  var curr = base
+  curr.closureContentHash = "0000000000000000"
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcClosure
+  assert diffs[0].prev == base.closureContentHash
+  assert diffs[0].curr == curr.closureContentHash
+  assert diffs[0].envNames == @[]
+
+block test_explain_miss_component_flags:
+  let base = baseInputs()
+  var curr = base
+  curr.flagHash = "ffffffffffffffff"
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcFlags
+  assert diffs[0].prev == base.flagHash
+  assert diffs[0].curr == curr.flagHash
+  assert diffs[0].envNames == @[]
+
+block test_explain_miss_component_nim_version:
+  let base = baseInputs()
+  var curr = base
+  curr.nimVersion = "2.3.0"
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcNimVersion
+  assert diffs[0].prev == base.nimVersion
+  assert diffs[0].curr == curr.nimVersion
+
+block test_explain_miss_component_cc_version:
+  let base = baseInputs()
+  var curr = base
+  curr.ccVersion = "clang 18.0.0|ldd 2.40"
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcCcVersion
+  assert diffs[0].prev == base.ccVersion
+  assert diffs[0].curr == curr.ccVersion
+
+block test_explain_miss_component_fixtures:
+  let base = baseInputs()
+  var curr = base
+  curr.fixtureHash = "0000000000000000"
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcFixtures
+  assert diffs[0].prev == base.fixtureHash
+  assert diffs[0].curr == curr.fixtureHash
+
+block test_explain_miss_component_argv:
+  let base = baseInputs()
+  var curr = base
+  curr.argv = @["./test_foo", "--seed=99"]
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcArgv
+  assert diffs[0].prev == "./test_foo --seed=42"
+  assert diffs[0].curr == "./test_foo --seed=99"
+
+block test_explain_miss_component_limits:
+  let base = baseInputs()
+  var curr = base
+  curr.limits = Limits()
+  curr.limits.req[lkAddressSpace] = some(512 * 1024 * 1024'i64)
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcLimits
+  assert diffs[0].prev == limitsStr(base.limits)
+  assert diffs[0].curr == limitsStr(curr.limits)
+  assert diffs[0].curr != diffs[0].prev
+
+block test_explain_miss_component_hermetic_env:
+  let base = baseInputs()
+  var curr = base
+  curr.hermeticEnvHash = "ffffffffffffffff"
+  let prevEnv = @[("PATH", "aaaa1111bbbb2222")]
+  let currEnv = @[("PATH", "aaaa1111bbbb2222")]  # unchanged names/digests
+  let diffs = explainMiss(base, curr, prevEnv, currEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcHermeticEnv
+  assert diffs[0].prev == base.hermeticEnvHash
+  assert diffs[0].curr == curr.hermeticEnvHash
+
+block test_explain_miss_component_protocol:
+  let base = baseInputs()
+  var curr = base
+  curr.protocolMajor = 2
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcProtocol
+  assert diffs[0].prev == "1"
+  assert diffs[0].curr == "2"
+
+# ---------------------------------------------------------------------------
+# Flag-change vector — the common deliberate miss (RFC-0005 B1a bullet,
+# stated separately from the generic per-component sweep above because it
+# is the dominant real-world explainMiss case: a developer edits compile
+# flags and expects the miss to say so, not "no prior inputs").
+# ---------------------------------------------------------------------------
+
+block test_explain_miss_flag_change_is_the_common_case:
+  let prev = baseInputs()
+  var curr = baseInputs()
+  curr.flagHash = "9988776655443322"   # a different --define set, e.g.
+  let diffs = explainMiss(prev, curr, NoEnv, NoEnv)
+  assert diffs.len == 1, "a flag-only change must explain to exactly one KeyDiff"
+  assert diffs[0].component == kcFlags
+  assert diffs[0].prev == prev.flagHash
+  assert diffs[0].curr == curr.flagHash
+
+# ---------------------------------------------------------------------------
+# Env-name vector: changed value, added name, removed name.
+#
+# prevEnv/currEnv are DIGESTS (per envDigest's contract) — this test builds
+# them directly as opaque hex strings to prove explainMiss never needs (or
+# leaks) the underlying values.
+# ---------------------------------------------------------------------------
+
+block test_explain_miss_env_names_changed_added_removed:
+  let base = baseInputs()
+  var curr = base
+  curr.hermeticEnvHash = "abcdefabcdefabcd"   # must differ to report the component
+
+  let prevEnv = @[
+    ("CHANGED_VAR", "1111111111111111"),
+    ("REMOVED_VAR", "2222222222222222"),
+    ("STABLE_VAR",  "3333333333333333"),
+  ]
+  let currEnv = @[
+    ("CHANGED_VAR", "9999999999999999"),  # value (digest) changed
+    ("STABLE_VAR",  "3333333333333333"),  # unchanged
+    ("ADDED_VAR",   "4444444444444444"),  # present only in curr
+  ]
+
+  let diffs = explainMiss(base, curr, prevEnv, currEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcHermeticEnv
+  assert diffs[0].envNames == @["ADDED_VAR", "CHANGED_VAR", "REMOVED_VAR"],
+    "envNames must list changed/added/removed names, sorted, excluding STABLE_VAR"
+  # No digest or value ever appears in prev/curr/envNames for this component.
+  for n in diffs[0].envNames:
+    assert "1111111111111111" notin n
+    assert "9999999999999999" notin n
+
+# ---------------------------------------------------------------------------
+# Multi-component vector ⇒ all changed components, in enum (== field) order.
+# ---------------------------------------------------------------------------
+
+block test_explain_miss_multi_component_enum_order:
+  let base = baseInputs()
+  var curr = base
+  # Change kcProtocol, kcClosure, kcFixtures out of enum order to prove the
+  # OUTPUT order is enum order, not mutation order.
+  curr.protocolMajor = 2
+  curr.closureContentHash = "0000000000000000"
+  curr.fixtureHash = "0000000000000000"
+
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 3
+  assert diffs[0].component == kcClosure
+  assert diffs[1].component == kcFixtures
+  assert diffs[2].component == kcProtocol
+
+# ---------------------------------------------------------------------------
+# envDigest: stable, hides the value, 16 hex chars.
+# ---------------------------------------------------------------------------
+
+block test_env_digest_stable:
+  let env = @[("PATH", "/usr/bin:/bin")]
+  assert envDigest(env) == envDigest(env),
+    "envDigest must be deterministic for identical input"
+
+block test_env_digest_hides_value:
+  let value = "super-secret-value-1234"
+  let digested = envDigest(@[("SECRET", value)])
+  assert digested.len == 1
+  assert digested[0][0] == "SECRET"
+  assert digested[0][1] != value
+  assert value notin digested[0][1]
+
+block test_env_digest_is_16_hex_chars:
+  let digested = envDigest(@[("A", "x"), ("B", "")])
+  const hexChars = "0123456789abcdef"
+  for (_, digest) in digested:
+    assert digest.len == 16, "envDigest must render 16 hex chars"
+    for c in digest:
+      assert c in hexChars, "envDigest must be lower-case hex"
 
 echo "test_keys: all assertions passed"
