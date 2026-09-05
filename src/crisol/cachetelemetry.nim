@@ -129,7 +129,11 @@ type
   CacheStats* = object
     l1Hits*:       int
     remoteHits*:   int
-      ## Always 0 until a remote tier exists (Stage A3a) — no producer today.
+      ## RFC-0005 C-dep rider: tier-granular, derived from each hit's
+      ## authoritative `EntrypointResult.cacheTier` — "l1" (the pinned
+      ## local tier) counts toward `l1Hits`; any other (configured
+      ## `remote-cache` name) counts here. Zero when no remote tier ever
+      ## served a hit this run (identical to the pre-A3a behavior).
     misses*:       int
     remoteErrors*: int
     total*:        int
@@ -159,8 +163,16 @@ const notConsultedDecisions* = {cdmNotEligible, cdmGroupOptOut, cdmPolicyDisable
   ## the wire is keyed off `cacheDecision` instead, one source of truth for
   ## "was this entrypoint's cache actually consulted").
 
+type
+  DecisionTier* = tuple[decision: CacheDecision, tier: string]
+    ## RFC-0005 C-dep rider: `aggregateCacheStats`'s per-entrypoint input,
+    ## pairing the authoritative `EntrypointResult.cacheDecision` with the
+    ## authoritative `EntrypointResult.cacheTier` that served it (""  when
+    ## the result was never served — a miss, a not-consulted entry, or a
+    ## live rerun; `tier` is only inspected when `decision == cdmHit`).
+
 proc aggregateCacheStats*(events: seq[TelemetryEvent];
-                          decisions: seq[CacheDecision]): CacheStats =
+                          decisions: seq[DecisionTier]): CacheStats =
   ## Pure fold. Two independent inputs, matching what a run naturally
   ## produces:
   ##   - `events`    — everything collected by an `InMemorySink` (or the
@@ -170,24 +182,32 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
   ##                   `realSeams.store`, `tekVerifyFail` from the
   ##                   `--verify-cache` pass.
   ##   - `decisions` — every `EntrypointResult.cacheDecision` this run
-  ##                   produced (one per entrypoint, `runner.execute`'s own
-  ##                   bookkeeping — NOT re-derived from `events`).
+  ##                   produced, paired with its `cacheTier` (one per
+  ##                   entrypoint, `runner.execute`'s own bookkeeping — NOT
+  ##                   re-derived from `events`).
   ##
-  ## `l1Hits`/`total`/`notConsulted` are decision-sourced: a `CacheDecision`
-  ## is the run's own authoritative record of what actually happened to an
-  ## entrypoint (served vs. reran), immune to a subtlety `events` alone
-  ## cannot resolve — a `tekHit` fires on every cache-level hit, including
-  ## the rare rfc-0007 A1d-ii case where the recomputed outcome invalidates
-  ## it (`cdmRecomputeMiss`): that entrypoint reran live and is correctly
-  ## NOT one of the `l1Hits` a reader can trust the binary came straight
-  ## from cache. `wallSavedMs` stays event-sourced (only a `tekHit` carries
-  ## the historical duration) — in that same rare case it may over-count by
-  ## one entry's duration; undetected by this slice's test vectors and
-  ## follow-on if it ever matters in practice.
+  ## `l1Hits`/`remoteHits`/`total`/`notConsulted` are decision-sourced: a
+  ## `CacheDecision` (+ its `cacheTier`) is the run's own authoritative
+  ## record of what actually happened to an entrypoint (served vs. reran,
+  ## and from which tier), immune to a subtlety `events` alone cannot
+  ## resolve — a `tekHit` fires on every cache-level hit, including the
+  ## rare rfc-0007 A1d-ii case where the recomputed outcome invalidates it
+  ## (`cdmRecomputeMiss`): that entrypoint reran live and is correctly NOT
+  ## one of the `l1Hits`/`remoteHits` a reader can trust the binary came
+  ## straight from cache. `wallSavedMs` stays event-sourced (only a
+  ## `tekHit` carries the historical duration) — in that same rare case it
+  ## may over-count by one entry's duration; undetected by this slice's
+  ## test vectors and follow-on if it ever matters in practice.
   ##
-  ## `remoteHits` is hardcoded 0: no producer exists before a remote tier
-  ## (Stage A3a).
-  var l1Hits, remoteErrors, published, verifyFails: int
+  ## **RFC-0005 C-dep rider (tier-granular split):** every `cdmHit` decision
+  ## counts toward `l1Hits` when its `tier == "l1"` (the pinned local
+  ## tier — `cacheregistry.nim`), else toward `remoteHits` (any configured
+  ## `remote-cache` name — a mirror, an L2, etc.). Previously every
+  ## `cdmHit` was folded into `l1Hits` and `remoteHits` was hardcoded 0;
+  ## that was accurate only before a remote tier could ever serve a hit
+  ## (pre-A3c-ii). `hitPct`/`misses` are unaffected (both already summed
+  ## `l1Hits + remoteHits`).
+  var remoteErrors, published, verifyFails: int
   var wallSavedMs: int64
   for ev in events:
     case ev.kind
@@ -202,9 +222,12 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
     of tekVerifyFail:
       inc verifyFails
 
-  l1Hits = decisions.filterIt(it == cdmHit).len
-  let remoteHits = 0
-  let notConsulted = decisions.filterIt(it in notConsultedDecisions).len
+  var l1Hits, remoteHits: int
+  for d in decisions:
+    if d.decision == cdmHit:
+      if d.tier == "l1": inc l1Hits
+      else: inc remoteHits
+  let notConsulted = decisions.filterIt(it.decision in notConsultedDecisions).len
   let total = decisions.len - notConsulted
   let misses = max(0, total - l1Hits - remoteHits)
   let hitPct = if total == 0: 0.0 else: (l1Hits + remoteHits).float / total.float * 100.0

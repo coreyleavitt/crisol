@@ -523,8 +523,11 @@ const RunSchemaRevision* = 21
   ##                     so an all-zero object would misrepresent "nothing
   ##                     happened" when the truth is "nobody was watching"
   ##                     -- same posture as rev 20's `keyDiff` field-
-  ##                     presence gating. `remoteHits` is always 0 (no
-  ##                     remote tier exists before Stage A3a).
+  ##                     presence gating. `remoteHits` is tier-granular
+  ##                     (RFC-0005 C-dep rider): a served hit counts toward
+  ##                     `l1Hits` iff its `cacheTier == "l1"`, else toward
+  ##                     `remoteHits` -- zero only when no configured
+  ##                     remote-cache tier has ever served a hit this run.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see

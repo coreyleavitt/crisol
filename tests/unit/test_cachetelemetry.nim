@@ -5,7 +5,10 @@
 ##   2. mixed decisions -> l1Hits/total/notConsulted/misses/hitPct.
 ##   3. tekHit events -> wallSavedMs sums durationMs.
 ##   4. tekRemoteErr/tekPublish/tekVerifyFail -> remoteErrors/published/verifyFails counts.
-##   5. remoteHits is always 0, regardless of input.
+##   5. RFC-0005 C-dep rider: l1Hits/remoteHits are tier-granular, keyed off
+##      each hit's authoritative `cacheTier` (DecisionTier.tier) -- an
+##      "l1"-tier hit counts toward l1Hits, any OTHER (remote-cache) tier
+##      counts toward remoteHits, and a mixed run splits correctly.
 ##   6. a full mixed event+decision set together (the "run-shaped" vector).
 ##   7. RFC-0005 B2b: erroredTiers/tierErrorWarning -- the per-tier
 ##      100%-error diagnostic ("a tier that rejects 100% of reads is as
@@ -35,10 +38,10 @@ suite "aggregateCacheStats — empty input":
 suite "aggregateCacheStats — decision-sourced counts":
 
   test "mixed decisions -> l1Hits/total/notConsulted/misses/hitPct":
-    let decisions = @[
-      cdmHit, cdmHit, cdmHit,             # 3 hits
-      cdmKeyMiss, cdmStored,              # 2 misses (consulted, not served)
-      cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled,  # 3 not-consulted
+    let decisions: seq[DecisionTier] = @[
+      (cdmHit, "l1"), (cdmHit, "l1"), (cdmHit, "l1"),   # 3 hits
+      (cdmKeyMiss, ""), (cdmStored, ""),                # 2 misses (consulted, not served)
+      (cdmNotEligible, ""), (cdmGroupOptOut, ""), (cdmPolicyDisabled, ""),  # 3 not-consulted
     ]
     let s = aggregateCacheStats(@[], decisions)
     check s.l1Hits == 3
@@ -49,9 +52,9 @@ suite "aggregateCacheStats — decision-sourced counts":
     check s.hitPct == 60.0       # 3 / 5 * 100
 
   test "every RFC-0005 'consulted' decision variant counts toward total, never notConsulted":
-    let decisions = @[
-      cdmHit, cdmStored, cdmKeyMiss, cdmHermeticityDeg, cdmFlaky,
-      cdmClosureUnrecorded, cdmRecomputeMiss,
+    let decisions: seq[DecisionTier] = @[
+      (cdmHit, "l1"), (cdmStored, ""), (cdmKeyMiss, ""), (cdmHermeticityDeg, ""),
+      (cdmFlaky, ""), (cdmClosureUnrecorded, ""), (cdmRecomputeMiss, ""),
     ]
     let s = aggregateCacheStats(@[], decisions)
     check s.total == decisions.len
@@ -59,20 +62,51 @@ suite "aggregateCacheStats — decision-sourced counts":
     check s.l1Hits == 1   # only cdmHit
 
   test "every notConsulted decision variant is excluded from total":
-    let decisions = @[cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled]
+    let decisions: seq[DecisionTier] =
+      @[(cdmNotEligible, ""), (cdmGroupOptOut, ""), (cdmPolicyDisabled, "")]
     let s = aggregateCacheStats(@[], decisions)
     check s.total == 0
     check s.notConsulted == 3
     check s.hitPct == 0.0   # zero consulted -> 0, not NaN
 
-  test "remoteHits stays 0 regardless of input":
-    let decisions = @[cdmHit, cdmHit, cdmKeyMiss]
-    let events = @[
-      TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 5),
-      TelemetryEvent(kind: tekPublish, publishedTo: "l1"),
-    ]
-    let s = aggregateCacheStats(events, decisions)
+suite "aggregateCacheStats — RFC-0005 C-dep rider: tier-granular l1Hits/remoteHits":
+
+  test "an l1-tier hit counts as l1Hits, not remoteHits":
+    let decisions: seq[DecisionTier] = @[(cdmHit, "l1")]
+    let s = aggregateCacheStats(@[], decisions)
+    check s.l1Hits == 1
     check s.remoteHits == 0
+
+  test "a mirror-tier hit counts as remoteHits, not l1Hits":
+    let decisions: seq[DecisionTier] = @[(cdmHit, "mirror")]
+    let s = aggregateCacheStats(@[], decisions)
+    check s.l1Hits == 0
+    check s.remoteHits == 1
+
+  test "any non-l1 tier name counts as remoteHits (not a hardcoded remote-cache name)":
+    let decisions: seq[DecisionTier] = @[(cdmHit, "l2"), (cdmHit, "some-other-remote")]
+    let s = aggregateCacheStats(@[], decisions)
+    check s.l1Hits == 0
+    check s.remoteHits == 2
+
+  test "a mixed run splits correctly and hitPct/misses still sum both":
+    let decisions: seq[DecisionTier] = @[
+      (cdmHit, "l1"), (cdmHit, "l1"), (cdmHit, "mirror"),  # 2 l1 + 1 remote hit
+      (cdmKeyMiss, ""),                                     # 1 miss
+    ]
+    let s = aggregateCacheStats(@[], decisions)
+    check s.l1Hits == 2
+    check s.remoteHits == 1
+    check s.total == 4
+    check s.misses == 1              # total - l1Hits - remoteHits
+    check s.hitPct == 75.0           # (2 + 1) / 4 * 100
+
+  test "a non-hit decision's tier is never inspected (miss/stored carry an empty tier honestly)":
+    let decisions: seq[DecisionTier] = @[(cdmKeyMiss, "mirror"), (cdmStored, "l1")]
+    let s = aggregateCacheStats(@[], decisions)
+    check s.l1Hits == 0
+    check s.remoteHits == 0
+    check s.misses == 2
 
 suite "aggregateCacheStats — event-sourced counts":
 
@@ -82,7 +116,7 @@ suite "aggregateCacheStats — event-sourced counts":
       TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 250),
       TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 7),
     ]
-    let decisions = @[cdmHit, cdmHit, cdmHit]
+    let decisions: seq[DecisionTier] = @[(cdmHit, "l1"), (cdmHit, "l1"), (cdmHit, "l1")]
     let s = aggregateCacheStats(events, decisions)
     check s.wallSavedMs == 357
 
@@ -91,7 +125,7 @@ suite "aggregateCacheStats — event-sourced counts":
       TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvMiss)]),
       TelemetryEvent(kind: tekMiss, verdicts: @[]),
     ]
-    let decisions = @[cdmKeyMiss, cdmKeyMiss]
+    let decisions: seq[DecisionTier] = @[(cdmKeyMiss, ""), (cdmKeyMiss, "")]
     let s = aggregateCacheStats(events, decisions)
     check s.misses == 2
     check s.total == 2
@@ -102,7 +136,7 @@ suite "aggregateCacheStats — event-sourced counts":
       TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvOffline),
       TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvUnauthorized),
     ]
-    let s = aggregateCacheStats(events, @[cdmKeyMiss, cdmKeyMiss])
+    let s = aggregateCacheStats(events, @[(cdmKeyMiss, ""), (cdmKeyMiss, "")])
     check s.remoteErrors == 2
 
   test "tekPublish events -> published":
@@ -111,14 +145,14 @@ suite "aggregateCacheStats — event-sourced counts":
       TelemetryEvent(kind: tekPublish, publishedTo: "l1"),
       TelemetryEvent(kind: tekPublish, publishedTo: "l1"),
     ]
-    let s = aggregateCacheStats(events, @[cdmStored, cdmStored, cdmStored])
+    let s = aggregateCacheStats(events, @[(cdmStored, ""), (cdmStored, ""), (cdmStored, "")])
     check s.published == 3
 
   test "tekVerifyFail events -> verifyFails, carrying path":
     let events = @[
       TelemetryEvent(kind: tekVerifyFail, path: "tests/unit/test_a.nim"),
     ]
-    let s = aggregateCacheStats(events, @[cdmHit])
+    let s = aggregateCacheStats(events, @[(cdmHit, "l1")])
     check s.verifyFails == 1
     check events[0].path == "tests/unit/test_a.nim"
 
@@ -127,7 +161,7 @@ suite "aggregateCacheStats — event-sourced counts":
       TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvOffline),
       TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvTimeout),
     ]
-    let s = aggregateCacheStats(events, @[cdmHit, cdmHit])
+    let s = aggregateCacheStats(events, @[(cdmHit, "l1"), (cdmHit, "l1")])
     check s.remoteErrors == 2
 
   test "tekRemoteErr and tekBackfillErr pool into the SAME remoteErrors count":
@@ -135,7 +169,7 @@ suite "aggregateCacheStats — event-sourced counts":
       TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvOffline),
       TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvOffline),
     ]
-    let s = aggregateCacheStats(events, @[cdmHit])
+    let s = aggregateCacheStats(events, @[(cdmHit, "l1")])
     check s.remoteErrors == 2
 
 suite "aggregateCacheStats — a full run-shaped mixed vector":
@@ -144,7 +178,8 @@ suite "aggregateCacheStats — a full run-shaped mixed vector":
     # 5 entrypoints: 2 served from cache, 1 ran live and stored, 1 not
     # eligible (edNeverBuilt), 1 ran live but its store attempt hit an
     # unwritable root (remote-err).
-    let decisions = @[cdmHit, cdmHit, cdmStored, cdmNotEligible, cdmKeyMiss]
+    let decisions: seq[DecisionTier] =
+      @[(cdmHit, "l1"), (cdmHit, "l1"), (cdmStored, ""), (cdmNotEligible, ""), (cdmKeyMiss, "")]
     let events = @[
       TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 40),
       TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 60),
@@ -165,6 +200,23 @@ suite "aggregateCacheStats — a full run-shaped mixed vector":
     check s.published == 1
     check s.remoteErrors == 1
     check s.verifyFails == 1
+
+  test "a plausible run WITH a remote tier: l1 hits + a mirror hit -> both counted, hitPct sums both":
+    let decisions: seq[DecisionTier] =
+      @[(cdmHit, "l1"), (cdmHit, "l1"), (cdmHit, "mirror"), (cdmKeyMiss, "")]
+    let events = @[
+      TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 40),
+      TelemetryEvent(kind: tekHit, tier: "l1", durationMs: 20),
+      TelemetryEvent(kind: tekHit, tier: "mirror", durationMs: 60),
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvMiss), ("mirror", cvMiss)]),
+    ]
+    let s = aggregateCacheStats(events, decisions)
+    check s.l1Hits == 2
+    check s.remoteHits == 1
+    check s.total == 4
+    check s.misses == 1
+    check s.hitPct == 75.0        # (2 + 1) / 4 * 100
+    check s.wallSavedMs == 120
 
 suite "erroredTiers — the per-tier 100%-error diagnostic":
 

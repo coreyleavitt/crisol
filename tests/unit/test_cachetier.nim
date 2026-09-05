@@ -626,7 +626,7 @@ block test_backfill_err_events_and_stats:
   assert events[0].putTier == "l1"
   assert events[0].putVerdict == cvOffline
 
-  let stats = aggregateCacheStats(events, @[cdmHit])
+  let stats = aggregateCacheStats(events, @[(cdmHit, "l1")])
   assert stats.remoteErrors == 1
 
 block test_backfill_err_events_is_empty_on_a_successful_backfill:

@@ -1164,13 +1164,23 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     # backfill-on-hit (KDL default #true) re-seeded P2's OWN L1.
     check anyFileUnder(p2 / ".crisol" / "cache")
     check rr2.cacheStats.hitPct == 100.0
+    # RFC-0005 C-dep rider: this hit was SERVED FROM "mirror" (a remote
+    # tier), not "l1" -- aggregateCacheStats must attribute it to
+    # remoteHits, not fold it into l1Hits (the pre-rider mislabel).
+    check rr2.cacheStats.remoteHits == 1
+    check rr2.cacheStats.l1Hits == 0
 
     # Wire-level assertion: the run/v2 render, not just the in-process
-    # EntrypointResult.
-    let node2 = parseJson(toJsonString(rr2.results, rr2.summary))
+    # EntrypointResult. Threading cacheStats through the SAME render path
+    # `crisol run --json` uses proves the rider's fix is visible on the
+    # wire, not just in the in-process CacheStats struct.
+    let node2 = parseJson(toJsonString(rr2.results, rr2.summary,
+                                       cacheStats = rr2.cacheStats, showCacheStats = true))
     let epNode2 = node2["entrypoints"][0]
     check epNode2["cacheTier"].getStr == "mirror"
     check epNode2["cacheDecision"].getStr == "hit"
+    check node2["cacheStats"]["remoteHits"].getInt == 1
+    check node2["cacheStats"]["l1Hits"].getInt == 0
 
     # --- Run 3: P2/S2 again -- binary + depgraph + P2's L1 all warm now. --
     let rr3 = runTests(RunOptions(configPath: p2 / "crisol.kdl", cacheStats: true))
@@ -1181,11 +1191,18 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     check r3.cacheDecision == cdmHit
     check r3.cacheTier == "l1"
     check rr3.cacheStats.hitPct == 100.0
+    # This hit was served from "l1" -- the mirror image of the rr2 check
+    # above (an l1 hit must land in l1Hits, not remoteHits).
+    check rr3.cacheStats.l1Hits == 1
+    check rr3.cacheStats.remoteHits == 0
 
-    let node3 = parseJson(toJsonString(rr3.results, rr3.summary))
+    let node3 = parseJson(toJsonString(rr3.results, rr3.summary,
+                                       cacheStats = rr3.cacheStats, showCacheStats = true))
     let epNode3 = node3["entrypoints"][0]
     check epNode3["cacheTier"].getStr == "l1"
     check epNode3["cacheDecision"].getStr == "hit"
+    check node3["cacheStats"]["l1Hits"].getInt == 1
+    check node3["cacheStats"]["remoteHits"].getInt == 0
 
     # --- Secondary: evict P2's L1 only -- binary + depgraph stay warm. ----
     removeDir(p2 / ".crisol" / "cache")
@@ -1197,6 +1214,9 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     check r4.cacheDecision == cdmHit
     check r4.cacheTier == "mirror"            # L2 refallback (L1 was empty)
     check rr4.cacheStats.hitPct == 100.0
+    # L2 refallback is a remote-served hit again -- remoteHits, not l1Hits.
+    check rr4.cacheStats.remoteHits == 1
+    check rr4.cacheStats.l1Hits == 0
     check anyFileUnder(p2 / ".crisol" / "cache")  # re-backfilled
 
 suite "RFC-0005 A3c-ii — RunOptions.noRemoteCache (--no-remote-cache)":

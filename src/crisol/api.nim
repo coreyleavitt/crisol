@@ -1351,9 +1351,13 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # both were emitted through the SAME statsSink) against this run's actual
   # per-result cacheDecisions. A zero-value CacheStats() when statsSink was
   # never installed (`cfg.cacheStats == false`) -- nothing was collected.
+  # RFC-0005 C-dep rider: paired with cacheTier so the fold can be
+  # tier-granular (l1Hits vs remoteHits) instead of folding every hit into
+  # l1Hits -- see cachetelemetry.DecisionTier / aggregateCacheStats.
   let cacheStats =
     if statsSink != nil:
-      aggregateCacheStats(statsSink.events, results.mapIt(it.cacheDecision))
+      aggregateCacheStats(statsSink.events,
+                          results.mapIt((decision: it.cacheDecision, tier: it.cacheTier)))
     else: CacheStats()
 
   # RFC-0005 B2b: "crisol additionally writes a stderr warning when a
