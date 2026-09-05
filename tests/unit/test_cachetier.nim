@@ -35,9 +35,13 @@
 ##      intermediate tier continues the waterfall (never aborts), recording
 ##      the SPECIFIC trust code, not a generic miss.
 ##   7. the verified-bit backfill rule, exhaustive 2x2x2 (source verified x
-##      destination verifyTrust x single-/multi-upstream-tier ordering).
+##      destination verifyTrust x single-/multi-upstream-tier ordering) —
+##      RFC-0005 C5c: proven against the REAL `ed25519Policy`, not the A3a
+##      mock (a backfilled entry also carries its original attestation and
+##      re-verifies when later served directly from l1).
 ##   8. the put rule, exhaustive 2x2 (attested x destination verifyTrust),
-##      via `tc.put` directly (a fresh publish, not a backfill).
+##      via `tc.put` directly (a fresh publish, not a backfill) — RFC-0005
+##      C5c: also proven against the real `ed25519Policy`.
 ##   9. the per-tier circuit breaker: trips on first offline/timeout, stays
 ##      dead the rest of the run (proven by call-counting, not a clock —
 ##      see `cachetier.nim`'s module doc), never trips on a plain miss, is
@@ -343,29 +347,77 @@ proc backfillSetup(destVerifyTrust: bool; policy: TrustPolicy): TieredCache =
     trust: policy,
   )
 
+# ---------------------------------------------------------------------------
+# RFC-0005 C5c: the REAL ed25519Policy in place of A3a's controllable mock
+# for the backfill/put RULES specifically (section 6's waterfall-continues
+# test above stays on the mock -- see that block's own comment). Two real
+# policies cover every mock configuration these rules were exercised
+# through: `realSigningPolicy` (holds the seed -- `sign` genuinely signs,
+# `verify` genuinely returns `cvOk` against its own signature) stands in
+# for `mockPolicy(cvOk, attest = true)`; `realVerifyOnlyPolicy` (no seed --
+# RFC-0005 "no-op if no secret held") stands in for
+# `mockPolicy(_, attest = false)`. Neither test below asserted the MOCK's
+# specific forced verdict (only the `verified` bit / backfill-rule
+# OUTCOME), so swapping in the real, ACTUALLY-COMPUTED verdict
+# (`cvTrustNoAttestation` where the mock said `cvTrustBadSignature`) only
+# strengthens the proof.
+# ---------------------------------------------------------------------------
+
+const RealTrustSeedBytes: array[32, byte] = [
+  byte 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
+  67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82]
+
+proc realTrustPubKey(): PublicKey =
+  keypair(toSeed(RealTrustSeedBytes)).public
+
+proc realSigningPolicy(): TrustPolicy =
+  ed25519Policy(some(toSeed(RealTrustSeedBytes)), @[realTrustPubKey()])
+
+proc realVerifyOnlyPolicy(): TrustPolicy =
+  ed25519Policy(none(Seed), @[realTrustPubKey()])
+
 block test_backfill_verified_true_dest_verifytrust_true_backfills:
-  var tc = backfillSetup(destVerifyTrust = true, policy = mockPolicy(cvOk, attest = true))
+  let policy = realSigningPolicy()
+  var tc = backfillSetup(destVerifyTrust = true, policy = policy)
   let key = SoundnessKey("7070707070707070")
-  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))
+  var e = sampleEntry(key, exitCode = 1)
+  policy.sign(e)
+  discard tc.tiers[1].backend.put(e)
 
   let l = tc.lookup(key)
   assert l.hit.get.verified == true
   assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOk)]
   assert tc.tiers[0].backend.get(key).verdict == cvOk, "a verified hit may backfill a verifyTrust tier"
 
+  # RFC-0005 C5c: "a backfilled entry is re-stored WITH the attestation it
+  # arrived with" -- the l1 copy carries the SAME real attestation, and a
+  # later lookup served DIRECTLY from l1 (now warm, searched first) still
+  # verifies it, genuinely, under the same policy -- not merely by
+  # construction.
+  let backfilled = tc.tiers[0].backend.get(key)
+  assert backfilled.verdict == cvOk
+  assert backfilled.value.attestation.isSome
+  assert backfilled.value.attestation.get.sigAlg == saEd25519
+  let l2 = tc.lookup(key)
+  assert l2.hit.get.tier == "l1", "l1 is warm now and is searched first"
+  assert l2.hit.get.verified == true, "the backfilled attestation verifies again, served from l1"
+
 block test_backfill_verified_true_dest_verifytrust_false_backfills:
-  var tc = backfillSetup(destVerifyTrust = false, policy = mockPolicy(cvOk, attest = true))
+  let policy = realSigningPolicy()
+  var tc = backfillSetup(destVerifyTrust = false, policy = policy)
   let key = SoundnessKey("8080808080808080")
-  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))
+  var e = sampleEntry(key, exitCode = 1)
+  policy.sign(e)
+  discard tc.tiers[1].backend.put(e)
 
   let l = tc.lookup(key)
   assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOk)]
   assert tc.tiers[0].backend.get(key).verdict == cvOk
 
 block test_backfill_verified_false_dest_verifytrust_true_is_skipped:
-  var tc = backfillSetup(destVerifyTrust = true, policy = mockPolicy(cvTrustBadSignature, attest = false))
+  var tc = backfillSetup(destVerifyTrust = true, policy = realVerifyOnlyPolicy())
   let key = SoundnessKey("9090909090909090")
-  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))  # never signed -- genuinely unattested
 
   let l = tc.lookup(key)
   assert l.hit.isSome, "l2 itself has verifyTrust=false, so the hit still serves"
@@ -375,9 +427,9 @@ block test_backfill_verified_false_dest_verifytrust_true_is_skipped:
   assert tc.tiers[0].backend.get(key).verdict == cvMiss, "l1 must remain empty"
 
 block test_backfill_verified_false_dest_verifytrust_false_still_backfills:
-  var tc = backfillSetup(destVerifyTrust = false, policy = mockPolicy(cvTrustBadSignature, attest = false))
+  var tc = backfillSetup(destVerifyTrust = false, policy = realVerifyOnlyPolicy())
   let key = SoundnessKey("a0a0a0a0a0a0a0a0")
-  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 1))  # never signed -- genuinely unattested
 
   let l = tc.lookup(key)
   assert l.hit.get.verified == false
@@ -386,16 +438,19 @@ block test_backfill_verified_false_dest_verifytrust_false_still_backfills:
   assert tc.tiers[0].backend.get(key).verdict == cvOk
 
 block test_backfill_multiple_upstream_tiers_all_qualify_in_order:
+  let policy = realSigningPolicy()
   var tc = TieredCache(
     tiers: @[
       Tier(name: "l1", backend: memory(), backfillOnHit: true, verifyTrust: false),
       Tier(name: "l2", backend: memory(), backfillOnHit: true, verifyTrust: true),
       Tier(name: "l3", backend: memory(), backfillOnHit: false, verifyTrust: false),
     ],
-    trust: mockPolicy(cvOk, attest = true),
+    trust: policy,
   )
   let key = SoundnessKey("b0b0b0b0b0b0b0b0")
-  discard tc.tiers[2].backend.put(sampleEntry(key, exitCode = 5))  # only l3 (the served tier) has it
+  var e = sampleEntry(key, exitCode = 5)
+  policy.sign(e)
+  discard tc.tiers[2].backend.put(e)  # only l3 (the served tier) has it
 
   let l = tc.lookup(key)
   assert l.hit.get.tier == "l3"
@@ -407,6 +462,10 @@ block test_backfill_multiple_upstream_tiers_all_qualify_in_order:
 # ---------------------------------------------------------------------------
 # 8. RFC-0005 A3a: the put rule -- exhaustive 2x2 (attested x destination
 #    verifyTrust), via tc.put directly (a fresh publish, not a backfill).
+#    RFC-0005 C5c: the real ed25519Policy replaces the mock here too --
+#    `tc.put` itself calls `tc.trust.sign`, so `realSigningPolicy`/
+#    `realVerifyOnlyPolicy` (above) produce a genuinely attested or
+#    genuinely unattested entry, never a hand-set `attest` flag.
 # ---------------------------------------------------------------------------
 
 proc oneVerifyingTier(verifyTrust: bool; policy: TrustPolicy): TieredCache =
@@ -415,17 +474,17 @@ proc oneVerifyingTier(verifyTrust: bool; policy: TrustPolicy): TieredCache =
               trust: policy)
 
 block test_put_rule_attested_true_dest_verifytrust_true_writes:
-  var tc = oneVerifyingTier(verifyTrust = true, policy = mockPolicy(cvOk, attest = true))
+  var tc = oneVerifyingTier(verifyTrust = true, policy = realSigningPolicy())
   let vs = tc.put(sampleEntry(SoundnessKey("c0c0c0c0c0c0c0c0")))
   assert vs == @[(tier: "l1", verdict: cvOk)]
 
 block test_put_rule_attested_true_dest_verifytrust_false_writes:
-  var tc = oneVerifyingTier(verifyTrust = false, policy = mockPolicy(cvOk, attest = true))
+  var tc = oneVerifyingTier(verifyTrust = false, policy = realSigningPolicy())
   let vs = tc.put(sampleEntry(SoundnessKey("d0d0d0d0d0d0d0d0")))
   assert vs == @[(tier: "l1", verdict: cvOk)]
 
 block test_put_rule_attested_false_dest_verifytrust_true_refuses:
-  var tc = oneVerifyingTier(verifyTrust = true, policy = mockPolicy(cvOk, attest = false))
+  var tc = oneVerifyingTier(verifyTrust = true, policy = realVerifyOnlyPolicy())
   let key = SoundnessKey("e0e0e0e0e0e0e0e0")
   let vs = tc.put(sampleEntry(key))
   assert vs == @[(tier: "l1", verdict: cvUnauthorized)],
@@ -433,7 +492,7 @@ block test_put_rule_attested_false_dest_verifytrust_true_refuses:
   assert tc.tiers[0].backend.get(key).verdict == cvMiss, "a refused write must never land"
 
 block test_put_rule_attested_false_dest_verifytrust_false_writes:
-  var tc = oneVerifyingTier(verifyTrust = false, policy = mockPolicy(cvOk, attest = false))
+  var tc = oneVerifyingTier(verifyTrust = false, policy = realVerifyOnlyPolicy())
   let vs = tc.put(sampleEntry(SoundnessKey("f0f0f0f0f0f0f0f0")))
   assert vs == @[(tier: "l1", verdict: cvOk)],
     "a non-verifyTrust tier accepts an unattested write (matches nonePolicy's own roundtrip test)"
@@ -590,9 +649,13 @@ block test_put_local_then_drain_pending_reaches_remote_too:
 
 block test_put_local_respects_the_put_rule:
   ## An unattested entry must never land on a verifyTrust tier -- same put
-  ## rule `put` enforces, just scoped to tier 0 here.
+  ## rule `put` enforces, just scoped to tier 0 here. RFC-0005 C5c: the
+  ## real "no-seed verify-only" ed25519Policy replaces A3a's
+  ## mockPolicy(cvOk, attest = false) -- putLocal's own sign() call is a
+  ## genuine no-op (no secret held), so the entry really does arrive
+  ## unattested.
   var tc = twoTier(memory(), memory(), verifyTrust0 = true,
-                    trust = mockPolicy(cvOk, attest = false))
+                    trust = realVerifyOnlyPolicy())
   let entry = sampleEntry(SoundnessKey("a1a1000000000003"))
   let v = tc.putLocal(entry)
   assert v == (tier: "l1", verdict: cvUnauthorized)

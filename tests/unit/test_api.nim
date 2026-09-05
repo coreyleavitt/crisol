@@ -1033,10 +1033,17 @@ remote-cache "mirror" {
 proc findStoredEntryJson(root: string): string =
   ## The one `.json` entry a single-entrypoint fixture publishes under a
   ## configured remote root (RFC-0005 "Local-fs root": entries live at
-  ## `<root>/v<N>/<key>.json`; no sidecar dir exists here -- sidecars are
-  ## tier-0/local-fs-adapter only, never written to a configured remote).
+  ## `<root>/v<N>/<key>.json`). A CONFIGURED REMOTE never has a sidecar dir
+  ## (sidecars are tier-0/local-fs-adapter only -- `cachedispatch.realSeams`
+  ## gates `writeSidecar` on `rt.localRoot`, which is always l1), but an
+  ## l1 root (RFC-0005 C5c's backfill assertions pass one here too) CAN
+  ## carry a `v<N>/inputs/<fnv(path)>.json` explain-miss sidecar alongside
+  ## the real entry -- skip that subdirectory explicitly so a caller always
+  ## gets the STORED ENTRY, never the sidecar, regardless of which root or
+  ## which `walkDirRec` traversal order the filesystem happens to produce.
+  let sidecarMarker = DirSep & "inputs" & DirSep
   for f in walkDirRec(root):
-    if f.endsWith(".json"): return f
+    if f.endsWith(".json") and sidecarMarker notin f: return f
   doAssert false, "expected exactly one stored entry under " & root
 
 suite "RFC-0005 C4 -- E2E-2: a forged entry is never served (hmacPolicy over two file:// tiers)":
@@ -1256,6 +1263,30 @@ cache-trust {
       check epNode["cacheTier"].getStr == "mirror"
       check epNode["cacheDecision"].getStr == "hit"
 
+      # RFC-0005 C5c: backfill-only-after-verify, through the real entry
+      # point. Run 2's hit came from "mirror" (a verifying tier) -- the
+      # verified-bit backfill rule (`cachetier.nim`) says a VERIFIED hit
+      # may re-seed l1, and "a backfilled entry is re-stored WITH the
+      # attestation it arrived with" (RFC-0005 "One TrustPolicy per
+      # TieredCache"). Prove BOTH halves against the real, on-disk l1
+      # entry -- not just the in-process CacheLookup.
+      check remoteHasAnyEntry(projectRoot / ".crisol" / "cache")
+      let backfilledPath = findStoredEntryJson(projectRoot / ".crisol" / "cache")
+      let backfilled = parseJson(readFile(backfilledPath))
+      check backfilled.hasKey("attestation")
+      check backfilled["attestation"]["sigAlg"].getStr == "ed25519"
+      check backfilled["attestation"]["signer"].getStr == pubKeyB64
+
+      # Run 3: l1 is warm now (nothing wiped) -- the waterfall serves the
+      # backfilled entry DIRECTLY from l1, and it verifies again under the
+      # same pinned key, genuinely, from disk.
+      let rr3 = runTests(opts)
+      check rr3.status == rsOk
+      check rr3.results.len == 1
+      check rr3.results[0].cacheDecision == cdmHit
+      check rr3.results[0].cacheTier == "l1"
+      check rr3.results[0].cacheLookup == cvOk
+
 # ---------------------------------------------------------------------------
 # RFC-0005 C5b -- E2E-2 repeated under ed25519 with an unpinned second
 # signer (RFC's own wording, verbatim): "a forged entry is never served" --
@@ -1359,6 +1390,21 @@ cache-trust {
       let epNode = node["entrypoints"][0]
       check epNode["cacheLookup"].getStr == "trustUnpinnedSigner"
       check epNode["cacheDecision"].getStr == "stored"
+
+      # RFC-0005 C5c: the contrast to C5a's backfill proof above -- an
+      # UNTRUSTED remote entry must never backfill l1, even though a NEW
+      # l1 entry now exists (the self-heal live rerun's own store, just
+      # asserted via cacheDecision == cdmStored). Prove the l1 file on
+      # disk is that fresh, genuinely UNATTESTED live result (this
+      # consumer holds no signing secret) -- not a copy of key B's
+      # rejected, validly-signed-but-untrusted attestation; a real
+      # backfill would have carried key B's attestation onto l1 instead.
+      check remoteHasAnyEntry(projectRoot / ".crisol" / "cache")
+      let l1Path = findStoredEntryJson(projectRoot / ".crisol" / "cache")
+      let l1Entry = parseJson(readFile(l1Path))
+      # no L1 backfill of the unpinned remote entry may occur -- the l1
+      # file must be the consumer's own unattested live store, never key B's
+      check not l1Entry.hasKey("attestation")
 
 # ---------------------------------------------------------------------------
 # RFC-0005 A2c-ii — the post-compile consult, through the REAL entry point
