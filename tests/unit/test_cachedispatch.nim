@@ -872,6 +872,43 @@ suite "CacheContext — M4 invariant enforcement":
     check enabled.active         # raw field agrees
 
 # ---------------------------------------------------------------------------
+# RFC-0005 C3c: CacheContext.prefetch — defaults to a no-op; a custom
+# PrefetchProc threads through cacheEnabled unchanged. NOT a fourth
+# CacheSeams closure (see PrefetchProc's own doc comment) -- lives here,
+# alongside sink.
+# ---------------------------------------------------------------------------
+
+suite "CacheContext — prefetch (RFC-0005 C3c)":
+
+  test "cacheDisabled: prefetch defaults to a safe no-op (never called, but callable)":
+    let ctx = cacheDisabled(resolveSandbox())
+    check ctx.prefetch != nil
+    ctx.prefetch(@[SoundnessKey("0000000000000001")], proc(): bool = false)  # must not raise
+
+  test "cacheEnabled: prefetch defaults to a safe no-op when not passed":
+    var calls: Calls
+    let ctx = cacheEnabled(resolveSandbox(), defaultCachePolicy(), seamsMiss(calls))
+    check ctx.prefetch != nil
+    ctx.prefetch(@[SoundnessKey("0000000000000002")], proc(): bool = false)  # must not raise
+
+  test "cacheEnabled: a custom prefetch closure threads through and is invocable":
+    var calls: Calls
+    var prefetchCalls = 0
+    var seenKeys: seq[SoundnessKey] = @[]
+    var seenAbandoned = false
+    let spy = proc(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) =
+      inc prefetchCalls
+      for k in keys: seenKeys.add k
+      seenAbandoned = abandoned()
+    let ctx = cacheEnabled(resolveSandbox(), defaultCachePolicy(), seamsMiss(calls),
+                           NilSink[TelemetryEvent](), spy)
+    ctx.prefetch(@[SoundnessKey("0000000000000003"), SoundnessKey("0000000000000004")],
+                 proc(): bool = true)
+    check prefetchCalls == 1
+    check seenKeys.len == 2
+    check seenAbandoned == true
+
+# ---------------------------------------------------------------------------
 # L15: inactiveDecision — (isActive=false, edecision) → CacheDecision matrix
 # ---------------------------------------------------------------------------
 

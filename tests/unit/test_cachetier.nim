@@ -25,8 +25,9 @@
 ##      time) — `localFs` uniquely CAN exercise it by tampering the file
 ##      directly on disk (below), the same on-disk-tamper pattern
 ##      `test_resultcache.nim` already uses.
-##   4. `probe` is nil on all three backends (`canProbe == false`) — no
-##      producer yet (Stage C3c).
+##   4. `probe` is nil on all three real backends (`canProbe == false` for
+##      memory/memoryBytes/localFs — none of the three ships a bulk-
+##      existence op; `resolveProbes` is a pure no-op over them, see 15).
 ##   5. RFC-0005 A3a: the multi-tier waterfall — miss falls through, first
 ##      hit wins with no fall-through, all-miss, and `put`'s fan-out to
 ##      every tier (A1's `doAssert`-refused-second-tier tests are GONE:
@@ -81,8 +82,19 @@
 ##      `verify-trust`'s default to `false` (no `cache-trust` parser before
 ##      C4) while honoring an explicit override; the built tier is exercised
 ##      live through the real file backend.
+##   15. RFC-0005 C3c (prefetch): `resolveProbes` — a canProbe tier's
+##      existence-set is resolved ONCE regardless of how many keys are
+##      looked up afterward, and `lookup` skips the `get` for a key the
+##      probe did not report present; a non-canProbe tier is unaffected
+##      (untouched by `resolveProbes`, its own existing per-key/breaker
+##      path unchanged); an abandoned (mid-scan-interrupted) tier degrades
+##      every subsequent lookup on it to a `get`-free `cvMiss`; a key
+##      outside the originally-probed candidate set (the post-compile
+##      case, A2c) still gets a real `get` — absence from a probe response
+##      is only evidence of absence for a key the probe was actually asked
+##      about.
 
-import std/[base64, json, options, os, strutils, tables]
+import std/[base64, json, options, os, sets, strutils, tables]
 import crisol/types
 import crisol/keys
 import crisol/cacheport
@@ -1439,5 +1451,157 @@ block test_configured_cache_wires_hmac_policy_end_to_end:
   assert l.hit.isSome
   assert l.hit.get.verified == true
   assert l.hit.get.tier == "l1"
+
+# ---------------------------------------------------------------------------
+# 15. RFC-0005 C3c (prefetch): resolveProbes + lookup's probe-set consult.
+# ---------------------------------------------------------------------------
+
+proc probingBackend(found: HashSet[SoundnessKey];
+                     probeVerdict = cvOk;
+                     getResults: seq[CacheVerdict] = @[cvOk]):
+    tuple[backend: CacheBackend, probeCalls, getCalls: ref int, probeArgs: ref seq[SoundnessKey]] =
+  ## A canProbe call-counting double: `probe` returns `found` (intersected
+  ## with the caller's own requested keys, mirroring the real s3 adapter's
+  ## contract — see caches3.nim's module doc) and counts its calls/args;
+  ## `get` cycles through `getResults` (clamped once exhausted, exactly
+  ## like `countingBackend`) and counts its own calls independently.
+  var getIdx = 0
+  let probeCalls = new(int)
+  let getCalls = new(int)
+  let probeArgs = new(seq[SoundnessKey])
+  let backend = CacheBackend(
+    scheme: "probing",
+    get: proc(key: SoundnessKey): Fetched[StoredEntry] =
+      inc getCalls[]
+      let v = getResults[min(getIdx, getResults.len - 1)]
+      inc getIdx
+      if v == cvOk: Fetched[StoredEntry](verdict: cvOk, value: sampleEntry(key))
+      else: Fetched[StoredEntry](verdict: v)
+    ,
+    put: proc(entry: StoredEntry): CacheVerdict = cvOk,
+    probe: proc(keys: openArray[SoundnessKey]): Fetched[HashSet[SoundnessKey]] =
+      inc probeCalls[]
+      for k in keys: probeArgs[].add k
+      if probeVerdict != cvOk: return Fetched[HashSet[SoundnessKey]](verdict: probeVerdict)
+      var present = initHashSet[SoundnessKey]()
+      for k in keys:
+        if k in found: present.incl k
+      Fetched[HashSet[SoundnessKey]](verdict: cvOk, value: present)
+    ,
+  )
+  (backend, probeCalls, getCalls, probeArgs)
+
+block test_resolve_probes_called_once_and_get_skipped_for_unprobed_keys:
+  ## The RFC's own acceptance text, verbatim: "call-counting memory/fake
+  ## backend over N synthetic entrypoints ⇒ probe 1x and get ≤ |keys ∩
+  ## probed|". 5 synthetic keys stand in for 5 entrypoints' plan-time
+  ## lookups; the fake probe reports exactly 3 of them present.
+  let keys = @[SoundnessKey("c3c0000000000001"), SoundnessKey("c3c0000000000002"),
+               SoundnessKey("c3c0000000000003"), SoundnessKey("c3c0000000000004"),
+               SoundnessKey("c3c0000000000005")]
+  var found = initHashSet[SoundnessKey]()
+  found.incl keys[0]; found.incl keys[2]; found.incl keys[4]   # 3 of 5
+  let (backend, probeCalls, getCalls, probeArgs) = probingBackend(found)
+  var tc = oneTier(backend)
+  assert canProbe(backend)
+
+  tc.resolveProbes(keys)
+  assert probeCalls[] == 1, "the probe must be resolved exactly once regardless of N lookups"
+  assert probeArgs[].len == 5, "the probe must see the FULL candidate key set, not a subset"
+
+  var hits = 0
+  var misses = 0
+  for k in keys:
+    let l = tc.lookup(k)
+    if l.hit.isSome: inc hits else: inc misses
+  assert probeCalls[] == 1, "no lookup may trigger a second probe call"
+  assert getCalls[] == 3, "get must fire ONLY for keys the probe reported present (|keys ∩ probed| == 3)"
+  assert hits == 3
+  assert misses == 2
+
+block test_resolve_probes_is_a_noop_for_a_nonprobing_tier:
+  ## A non-canProbe backend (`probe == nil`, the shape every shipped
+  ## real backend has as of C2) is untouched by resolveProbes — its
+  ## existing per-key path is exactly as before this slice.
+  let (backend, getCalls, _) = countingBackend(getResults = @[cvOk])
+  var tc = oneTier(backend)
+  assert not canProbe(backend)
+  tc.resolveProbes(@[SoundnessKey("c3c1000000000001")])   # must not raise/loop-forever/etc.
+  discard tc.lookup(SoundnessKey("c3c1000000000001"))
+  assert getCalls[] == 1, "an untouched (non-probing) tier still does its normal per-key get"
+
+block test_resolve_probes_offline_branch_breaker_bounds_n_lookups_to_one_get:
+  ## The RFC's own acceptance text, verbatim: "N bounded gets, breaker
+  ## trips after the first cvOffline ⇒ total wall ≤ one deadline + eps".
+  ## No `probe` here (breaker-only path); N synthetic entrypoints share
+  ## ONE tier gone offline on the very first call — call-count, not a
+  ## timer, is the honest proxy for "bounded wall-clock" (this module's own
+  ## documented testing discipline, see the breaker's doc comment above).
+  let (backend, getCalls, _) = countingBackend(getResults = @[cvOffline, cvOk, cvOk, cvOk, cvOk])
+  var tc = oneTier(backend)
+  let keys = @[SoundnessKey("c3c2000000000001"), SoundnessKey("c3c2000000000002"),
+               SoundnessKey("c3c2000000000003"), SoundnessKey("c3c2000000000004"),
+               SoundnessKey("c3c2000000000005")]
+  for k in keys:
+    let l = tc.lookup(k)
+    assert l.hit.isNone
+    assert l.verdicts == @[(tier: "l1", verdict: cvOffline)]
+  assert getCalls[] == 1,
+    "the breaker must trip on the FIRST cvOffline; the remaining 4 synthetic entrypoints' " &
+    "lookups must never reach the backend at all -- total dead wall-clock stays one deadline"
+
+block test_resolve_probes_abandoned_tier_degrades_to_getfree_misses:
+  ## RFC-0005 B0(c): a pending shutdown abandons the remaining un-probed
+  ## tiers rather than falling back to their (potentially slow) per-key
+  ## `get` path -- an abandoned tier's lookups must all be `cvMiss` WITHOUT
+  ## ever calling `get`. The predicate is injected (no real
+  ## `crisol/signals` dependency here -- see `resolveProbes`'s own doc
+  ## comment); production wires it to `shutdownRequested().isSome`.
+  let (backend, probeCalls, getCalls, _) = probingBackend(initHashSet[SoundnessKey]())
+  var tc = oneTier(backend)
+  let keys = @[SoundnessKey("c3c3000000000001"), SoundnessKey("c3c3000000000002")]
+  tc.resolveProbes(keys, abandoned = proc(): bool = true)
+  assert probeCalls[] == 0, "an abandoned tier's probe must never actually be called"
+  for k in keys:
+    let l = tc.lookup(k)
+    assert l.hit.isNone
+    assert l.verdicts == @[(tier: "l1", verdict: cvMiss)]
+  assert getCalls[] == 0, "an abandoned tier's lookups must never fall through to a real get"
+
+block test_resolve_probes_idempotent_within_a_run:
+  ## A tier already resolved (or already breaker-tripped) is left alone by
+  ## a second resolveProbes call -- "resolved once per tier per run", not
+  ## once per call.
+  let keys = @[SoundnessKey("c3c4000000000001")]
+  var found = initHashSet[SoundnessKey]()
+  found.incl keys[0]
+  let (backend, probeCalls, _, _) = probingBackend(found)
+  var tc = oneTier(backend)
+  tc.resolveProbes(keys)
+  tc.resolveProbes(keys)
+  assert probeCalls[] == 1, "a tier already resolved this run must not be probed again"
+
+block test_post_compile_key_outside_probed_set_still_does_a_real_get:
+  ## RFC-0005 A2c/C3c interaction (judgment call, recorded in cachetier.nim
+  ## and the RFC handoff): the plan-time prefetch resolves the probe over
+  ## the PLAN-TIME candidate set only. A post-compile key (derived AFTER a
+  ## fresh compile, consultPostCompile's own case — it could not have been
+  ## part of the plan-time candidate set, since no binary existed yet to
+  ## make it edRunFresh) is NOT covered by that probe response: its absence
+  ## from the found-set is not evidence of absence, so `lookup` must still
+  ## issue a real `get` for it, never a probe-derived miss.
+  let planKey = SoundnessKey("c3c5000000000001")
+  let postCompileKey = SoundnessKey("c3c5000000000002")   # never passed to resolveProbes
+  var found = initHashSet[SoundnessKey]()
+  found.incl planKey   # the only key the probe ever reported on
+  let (backend, probeCalls, getCalls, _) = probingBackend(found)
+  var tc = oneTier(backend)
+
+  tc.resolveProbes(@[planKey])
+  assert probeCalls[] == 1
+
+  let l = tc.lookup(postCompileKey)
+  assert getCalls[] == 1, "a key outside the probed candidate set must always fall through to a real get"
+  assert l.hit.isSome, "the real get (probingBackend's default cvOk) must be allowed to serve it"
 
 echo "test_cachetier: all blocks passed"

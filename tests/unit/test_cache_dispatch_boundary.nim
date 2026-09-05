@@ -323,4 +323,85 @@ suite "R2-1 — no-cache cacheDecision discrimination":
     # R2-1: this was cdmNotEligible before the fix; must be cdmPolicyDisabled after.
     check results[0].cacheDecision == cdmPolicyDisabled
 
+# ---------------------------------------------------------------------------
+# 6. RFC-0005 C3c (prefetch): cache.prefetch called ONCE at plan time, before
+#    any per-entry load, with the edRunFresh + read-permitted candidate key
+#    set. TieredCache.resolveProbes' own probe/get-skip mechanics are
+#    test_cachetier.nim's job (15); this is execute()'s WIRING of the
+#    pre-loop key gather + the cache.prefetch call.
+# ---------------------------------------------------------------------------
+
+suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set":
+
+  test "N edRunFresh hits -> prefetch called exactly once, before load, with all N keys":
+    let ms = MockState(store: initTable[string, CachedResult]())
+    ms.store["mk-tests/unit/c3c_bogus_0.nim"] = cachedPass(1)
+    ms.store["mk-tests/unit/c3c_bogus_1.nim"] = cachedPass(2)
+    ms.store["mk-tests/unit/c3c_bogus_2.nim"] = cachedPass(3)
+
+    var prefetchCalls = 0
+    var prefetchedKeyCount = 0
+    let spy = proc(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) =
+      inc prefetchCalls
+      prefetchedKeyCount = keys.len
+
+    let peps = @[
+      plannedFresh("tests/unit/c3c_bogus_0.nim"),
+      plannedFresh("tests/unit/c3c_bogus_1.nim"),
+      plannedFresh("tests/unit/c3c_bogus_2.nim"),
+    ]
+    let p = RunPlan(entrypoints: peps, jobs: 1)
+    var g = emptyDepGraph()
+    let results = execute(
+      p, config = Config(projectRoot: getTempDir()), graph = g, showProgress = false,
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms), prefetch = spy))
+
+    check results.len == 3
+    for r in results: check r.cached   # every entry served from cache -- no live spawn attempted
+    check prefetchCalls == 1
+    check prefetchedKeyCount == 3
+    check ms.loadCalls == 3   # each entry still gets its own per-entry consult after the prefetch
+
+  test "a group-opted-out entry (cacheable #false) is excluded from the candidate key set":
+    let ms = MockState(store: initTable[string, CachedResult]())
+    ms.store["mk-tests/unit/c3c_bogus_a.nim"] = cachedPass(1)
+    var prefetchedKeyCount = -1
+    let spy = proc(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) =
+      prefetchedKeyCount = keys.len
+
+    let peps = @[
+      plannedFresh("tests/unit/c3c_bogus_a.nim"),
+      PlannedEntrypoint(ep: Entrypoint(path: "tests/unit/c3c_bogus_b.nim", group: "unit", flags: @[]),
+                        edecision: edRunFresh, runTimeoutMs: 30_000, cacheable: csFalse),
+    ]
+    let p = RunPlan(entrypoints: peps, jobs: 1)
+    var g = emptyDepGraph()
+    discard execute(
+      p, config = Config(projectRoot: getTempDir()), graph = g, showProgress = false,
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms), prefetch = spy))
+
+    check prefetchedKeyCount == 1   # only the non-opted-out entry made it into the candidate set
+
+  test "cacheDisabled: prefetch is never invoked (cacheActive gates the pre-loop gather)":
+    var prefetchCalls = 0
+    let spy = proc(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) =
+      inc prefetchCalls
+
+    let dir = getTempDir() / "crisol_c3c_nocache"
+    removeDir(dir); createDir(dir)
+    defer: removeDir(dir)
+    let fixt = dir / "test_pass.nim"
+    writeFile(fixt, "quit(0)\n")
+    let pep = PlannedEntrypoint(
+      ep: Entrypoint(path: fixt, group: "unit", flags: @[]),
+      edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    let p = RunPlan(entrypoints: @[pep], jobs: 1)
+    var g = emptyDepGraph()
+    var ctx = cacheDisabled(isoSpec)
+    ctx.prefetch = spy
+    discard execute(p, config = Config(projectRoot: dir, stateDir: ".crisol",
+                                       compileTimeoutSecs: 120, timeoutSecs: 60),
+                    graph = g, showProgress = false, cache = ctx)
+    check prefetchCalls == 0
+
 echo "test_cache_dispatch_boundary: done"

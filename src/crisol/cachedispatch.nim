@@ -128,6 +128,20 @@ type
     ## Persist a result.  Returns false when skipped (soft cap, offline tier,
     ## or any I/O error).  RFC-0005 A2b: was `(key, res) -> bool`.
 
+  PrefetchProc* = proc(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) {.closure.}
+    ## RFC-0005 C3c (prefetch): resolve every canProbe tier's key-existence
+    ## set ONCE, over the runner's full plan-time candidate key set, before
+    ## any per-entry `load`. NOT a fourth `CacheSeams` closure (the RFC
+    ## repeatedly pins "CacheSeams' three-closure shape ... unchanged"
+    ## across every stage) — it lives on `CacheContext` instead, alongside
+    ## `sink`: a per-RUN, plan-wide step layered on top of the existing
+    ## per-entry seam, not a per-entry consult itself. `abandoned` mirrors
+    ## `cachetier.resolveProbes`'s own injected predicate (RFC-0005 B0(c):
+    ## a pending shutdown abandons the remaining tiers) — production wires
+    ## it to `crisol/signals.shutdownRequested().isSome`, called from the
+    ## runner's plan-time loop (the sanctioned owner of shutdown/signal
+    ## concerns, not this module — see `realPrefetch`, below).
+
   CacheSeams* = object
     ## Injectable bundle: production builds it via `realSeams`; tests mock it.
     ## Still exactly three closures (RFC-0005: "re-typed, not re-shaped").
@@ -184,6 +198,16 @@ type
       ## closed over — see that proc). Defaults to `NilSink` so a caller
       ## that never installs telemetry (e.g. every existing `cacheEnabled`
       ## call site predating B2a) pays nothing for it.
+    prefetch*: PrefetchProc
+      ## RFC-0005 C3c: called ONCE by the runner's plan-time loop, before
+      ## any per-entry `load`, with every eligible entrypoint's candidate
+      ## key. Defaults to a no-op (below) so every existing `cacheEnabled`
+      ## call site predating C3c pays nothing for it; production installs
+      ## `realPrefetch(rt)` (see that proc) at the same call site `sink`
+      ## already threads `rt` through.
+
+proc noopPrefetch(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) =
+  discard
 
 proc cacheDisabled*(spec: SandboxSpec): CacheContext =
   ## Construct a CacheContext with caching fully disabled.
@@ -195,18 +219,21 @@ proc cacheDisabled*(spec: SandboxSpec): CacheContext =
     seams:  CacheSeams(),   # keyOf==nil sentinel
     active: false,
     sink:   NilSink[TelemetryEvent](),
+    prefetch: noopPrefetch,
   )
 
 proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
                    seams: CacheSeams;
-                   sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()
+                   sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
+                   prefetch: PrefetchProc = noopPrefetch,
                    ): CacheContext =
   ## Construct a CacheContext with caching enabled.
   ## `seams.keyOf` MUST be non-nil; asserted at construction time so an
   ## inconsistent (enabled-but-no-keyOf) state is caught at the boundary.
   ## `sink` defaults to `NilSink` — pass a real sink (e.g. an
   ## `InMemorySink`'s, or, production, the `CacheRuntime`'s) to observe
-  ## `lookupAtPlan`'s hit/miss events.
+  ## `lookupAtPlan`'s hit/miss events. `prefetch` defaults to a no-op — RFC-
+  ## 0005 C3c; pass `realPrefetch(rt)` in production, or a spy in a test.
   doAssert seams.keyOf != nil,
     "cacheEnabled: seams.keyOf must be non-nil (use cacheDisabled if not caching)"
   doAssert policy.enabled,
@@ -217,6 +244,7 @@ proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
     seams:  seams,
     active: true,
     sink:   sink,
+    prefetch: prefetch,
   )
 
 proc isActive*(ctx: CacheContext): bool {.inline.} =
@@ -761,3 +789,16 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
                             SidecarEntry(key: d.key, inputs: d.inputs, envDigest: ctx.envDigest))
     ,
   )
+
+proc realPrefetch*(rt: CacheRuntime): PrefetchProc =
+  ## RFC-0005 C3c: the production `PrefetchProc` — forwards straight onto
+  ## `rt.cache.resolveProbes` (the same `rt` `realSeams`'s `load`/`store`
+  ## close over, so a tier's resolved probe set is visible to every
+  ## per-entry `load` this run). Deliberately signal-agnostic: `abandoned`
+  ## is forwarded verbatim, never read here — the runner's plan-time loop
+  ## (the sanctioned owner of shutdown/signal concerns since rfc-0007 A2b;
+  ## see runner.nim) supplies it, wired to `crisol/signals.
+  ## shutdownRequested().isSome`.
+  var rt = rt
+  proc(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) =
+    rt.cache.resolveProbes(keys, abandoned)

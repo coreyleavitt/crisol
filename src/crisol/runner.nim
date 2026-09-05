@@ -58,6 +58,12 @@ import crisol/[types, config, render, depgraph, protocol, planner, scheduler, ad
 # combinedSink/initSupervisor/spawn/next/requestStop/forceKill/reap/
 # groupRssBytes.
 import crisol/process
+# RFC-0005 C3c: `shutdownRequested()` -- the process-global, level-triggered
+# query the plan-time consult loop below checks per-iteration (B0(c)); the
+# SAME state `process`'s own Supervisor/`weShutdown` reads, just a query-only
+# view a caller with no Supervisor handle in scope (this loop runs before any
+# child is ever spawned) can still consult.
+import crisol/signals
 # `ptypes.X` stays the qualified spelling for the §2 result-model types
 # (Exit/Cause/Phase/…) — unchanged house convention from before A2b, kept so
 # this file's existing `ptypes.*` call sites need no renaming.
@@ -1556,6 +1562,24 @@ proc execute*(
                                                   # inputHashes -- stamped onto the live
                                                   # EntrypointResult's cacheLookup wherever
                                                   # inputHashes[completedIdx] lands below.
+  # RFC-0005 C3c (prefetch): resolve every canProbe tier's key-existence set
+  # ONCE, over every edRunFresh + read-permitted entrypoint's candidate key,
+  # BEFORE the per-entry consult loop below -- cache.prefetch (a no-op
+  # unless the cache runtime installed `realPrefetch`, see cachedispatch.nim)
+  # forwards straight onto `TieredCache.resolveProbes`. Gathering the keys
+  # here (not inside `lookupAtPlan`) is the whole point: a probe needs the
+  # FULL candidate set up front to be useful, and this loop is the only
+  # place that knows it. `derive` is pure (no I/O), so recomputing it here
+  # and again inside `lookupAtPlan`'s own consult a few lines down costs one
+  # extra hash per eligible entrypoint, not a second lookup.
+  if cacheActive:
+    var candidateKeys: seq[SoundnessKey] = @[]
+    for i in 0 ..< n:
+      let pep = p.entrypoints[i]
+      if pep.edecision == edRunFresh and resolveCacheable(cache.policy, pep.cacheable).readOk:
+        candidateKeys.add derive(cache.seams, pep).key
+    cache.prefetch(candidateKeys, proc(): bool = shutdownRequested().isSome)
+
   for i in 0 ..< n:
     if not cacheActive:
       # No cache: record the structural reason on every entry.  edRunFresh
@@ -1567,6 +1591,15 @@ proc execute*(
       # there with rationale; this call site is the single consumer.
       cacheDecisions[i] = inactiveDecision(pep.edecision)
       continue
+    if shutdownRequested().isSome:
+      # RFC-0005 B0(c)/C3c: abandon the remaining plan-time consults on a
+      # pending interrupt rather than embarking on more (potentially
+      # network-bound) cache lookups. Unconsulted entries simply keep their
+      # zero-value cacheDecision/inputHash/explain/lookup (cdmNotEligible /
+      # "" / empty / cvOk -- "not consulted", see CacheDecision's own doc
+      # comment) and proceed to dispatch normally below, where the run's
+      # own interrupt handling (the poll loop's weShutdown case) takes over.
+      break
     let look = lookupAtPlan(p.entrypoints[i], cache.policy, cache.seams, explainMiss,
                             cache.sink)
     cacheDecisions[i] = look.cacheDecision

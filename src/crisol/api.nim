@@ -1265,7 +1265,8 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       cacheEnabled(spec,
         CachePolicy(enabled: true),
         realSeams(keyCtx, addr graph, rt),
-        rt.sink)  # RFC-0005 B2a: NilSink by default; B2b's statsSink above when installed
+        rt.sink,          # RFC-0005 B2a: NilSink by default; B2b's statsSink above when installed
+        realPrefetch(rt)) # RFC-0005 C3c: resolves each canProbe tier's key-existence set once
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
   # are written by execute() itself (via ptr out-params) rather than caught as

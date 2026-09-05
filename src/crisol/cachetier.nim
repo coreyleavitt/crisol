@@ -28,7 +28,7 @@
 ## caller writes it) — a tripped tier is fully legible from `CacheLookup`'s
 ## `cvOffline`/`cvTimeout` verdicts without this module ever touching stderr.
 
-import std/[options, sets]
+import std/[options, sets, tables]
 import crisol/cacheport
 # KeyDiff (RFC-0005 B1b's explain-miss attachment) lives in `crisol/types`
 # (B1c re-home) and reaches here via `cacheport`'s `export types` -- no
@@ -68,6 +68,22 @@ type
       ## building an unrequested recovery window would be speculative code
       ## the standing rules forbid. See the module test suite's breaker
       ## block for the "still dead after N further calls" proof.
+    probed: Table[string, HashSet[SoundnessKey]]
+      ## RFC-0005 C3c (prefetch): per-tier bulk-existence result, keyed by
+      ## `Tier.name`, populated ONLY by `resolveProbes` (below) for a tier
+      ## whose backend `canProbe` — absent for every other tier (nil-probe,
+      ## not-yet-resolved, or breaker-tripped) for the life of this
+      ## `TieredCache`, exactly like `breaker`. A private, non-exported
+      ## field: `lookup` is the sole reader.
+    probedKeys: HashSet[SoundnessKey]
+      ## RFC-0005 C3c: the union of every key `resolveProbes` was ever
+      ## asked about THIS run — shared across tiers (one candidate set,
+      ## probed once per tier). `lookup` only trusts a tier's `probed` set
+      ## to mean "absent" for a key that is IN `probedKeys`; a key outside
+      ## it (e.g. a post-compile key derived after the plan-time prefetch,
+      ## RFC-0005 A2c) was never asked about, so its absence from a probe
+      ## response is not evidence of absence — `lookup` falls back to a
+      ## real `get` for it (see `lookup`'s own comment).
 
   TierHit* = object
     result*: CachedResult
@@ -134,6 +150,59 @@ proc tripBreaker(tc: var TieredCache; name: string; verdict: CacheVerdict) {.inl
     tc.breaker.incl name
 
 # ---------------------------------------------------------------------------
+# resolveProbes — RFC-0005 C3c (prefetch): resolve every canProbe tier's
+# key-existence set ONCE, over the caller's full plan-time candidate key
+# set, so `lookup` (below) can consult it before any per-key `get`.
+# ---------------------------------------------------------------------------
+
+proc resolveProbes*(tc: var TieredCache; keys: openArray[SoundnessKey];
+                     abandoned: proc(): bool {.closure.} = proc(): bool = false) =
+  ## Called ONCE per run by the caller (the runner's plan-time consult loop,
+  ## `runner.nim`) with the full set of candidate keys it is about to look
+  ## up. For every tier whose backend `canProbe` (and is not already
+  ## resolved or breaker-tripped), calls `backend.probe(keys)` exactly once
+  ## and remembers the result; `lookup` then skips the `get` entirely for a
+  ## key this tier's probe did not report present.
+  ##
+  ## `abandoned` is an injected predicate (default: never abandon) rather
+  ## than a direct `crisol/signals` import — the SAME "no real clock/signal
+  ## dependency, call-counting/injected-predicate only" discipline the
+  ## circuit breaker already follows (module doc, above), keeping this a
+  ## pure, memory-testable engine. The production caller wires
+  ## `proc(): bool = signals.shutdownRequested().isSome`.
+  ##
+  ## RFC-0005 B0(c): "the prefetch loop checks `shutdownRequested()` per
+  ## iteration and abandons the prefetch on a pending shutdown ... an
+  ## abandoned prefetch degrades to per-key misses" — checked once PER TIER
+  ## here (a probe is one network round trip; N tiers is N round trips), so
+  ## a pending interrupt stops embarking on any further tier's probe. The
+  ## remaining, un-probed tier(s) are marked probed-EMPTY (not left
+  ## unresolved): every key ends up a `cvMiss` for that tier with no `get`
+  ## at all, rather than falling through to the (potentially much slower,
+  ## N-round-trip) per-key `get` path an unresolved tier would otherwise
+  ## take — the whole point of abandoning is to stop doing more I/O, not to
+  ## trade one kind of I/O for another.
+  if keys.len == 0: return
+  for k in keys: tc.probedKeys.incl k
+  for tier in tc.tiers:
+    if not canProbe(tier.backend): continue
+    if tier.name in tc.probed: continue          # already resolved this run
+    if tc.breakerTripped(tier.name): continue    # already known dead
+    if abandoned():
+      tc.probed[tier.name] = initHashSet[SoundnessKey]()
+      continue
+    let fetched = tier.backend.probe(keys)
+    if fetched.verdict == cvOk:
+      tc.probed[tier.name] = fetched.value
+    else:
+      # A probe failure is a transport failure by BackendProbeProc's own
+      # contract (cacheport.nim) — trip the breaker exactly as a failed
+      # `get`/`put` would; `lookup`'s breaker check (below) already short-
+      # circuits every subsequent call against this tier, so leaving
+      # `tc.probed` unset for it here is fine (unreachable via the breaker).
+      tc.tripBreaker(tier.name, fetched.verdict)
+
+# ---------------------------------------------------------------------------
 # lookup — the waterfall + backfill-on-hit + the verified-bit rule.
 # ---------------------------------------------------------------------------
 
@@ -143,6 +212,16 @@ proc lookup*(tc: var TieredCache; key: SoundnessKey): CacheLookup =
     var fetched: Fetched[StoredEntry]
     if tc.breakerTripped(tier.name):
       fetched = Fetched[StoredEntry](verdict: cvOffline)
+    elif tier.name in tc.probed and key in tc.probedKeys and key notin tc.probed[tier.name]:
+      # RFC-0005 C3c: this tier's probe was resolved over a candidate set
+      # that INCLUDED this key and did not report it present — skip the
+      # `get` entirely, exactly the prefetch optimization's point. A key
+      # outside `probedKeys` (e.g. a post-compile key derived AFTER this
+      # run's plan-time prefetch, RFC-0005 A2c) is deliberately NOT covered
+      # by this branch: it was never asked about, so its absence here is
+      # not evidence of absence — it falls to the `else` branch's real
+      # `get`, below, same as an unprobed tier.
+      fetched = Fetched[StoredEntry](verdict: cvMiss)
     else:
       fetched = tier.backend.get(key)
       tc.tripBreaker(tier.name, fetched.verdict)
