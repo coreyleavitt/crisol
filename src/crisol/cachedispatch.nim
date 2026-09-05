@@ -636,6 +636,21 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
   ## `rt` is captured as a mutable local shadow so the closures below can
   ## call `TieredCache.lookup`/`put` (which take `var TieredCache`); `rt`'s
   ## `cache` field is otherwise identical to what the caller passed in.
+  ## (`CacheRuntime` is a `ref` since A3c-ii, so this shadow and the caller's
+  ## own handle already point at the SAME heap object — the caller observes
+  ## everything these closures accumulate, including the breaker and the
+  ## deferred-put queue below, without any extra plumbing.)
+  ##
+  ## RFC-0005 B0/A3c-ii "Deferred remote puts": `store` writes tier 0 ("l1")
+  ## SYNCHRONOUSLY via `TieredCache.putLocal` and, only when a remote tier is
+  ## actually configured (`rt.cache.tiers.len > 1`), queues the SAME entry on
+  ## `rt.pending` for `api.runTestsWith`'s end-of-run flush
+  ## (`TieredCache.drainPending`) instead of fanning out to remote tiers
+  ## inline — remote I/O must never run inside the poll loop at every live
+  ## finalize. The seam's boolean return (published-or-not, folded by the
+  ## caller into `cdmStored`/live-stamp bookkeeping) reflects tier 0's
+  ## verdict ONLY — the remote verdict is not yet known at this point in the
+  ## run.
   ##
   ## RFC-0005 B1b: `load`/`store` ALSO drive the path-keyed explain-miss
   ## sidecar directly via `cachelocalfs.readSidecar`/`writeSidecar` — NOT
@@ -665,21 +680,25 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
                                                prior.get.entry.envDigest, ctx.envDigest)
     ,
     store: proc(pep: PlannedEntrypoint; d: KeyDerivation; res: CachedResult): bool =
-             let verdicts = rt.cache.put(StoredEntry(
+             let entry = StoredEntry(
                key:            d.key,
                keyInputs:      some(d.inputs),
                result:         res,
                storageVersion: storageFormatVersion,
-             ))
-             result = false
-             for v in verdicts:
-               # RFC-0005 B2a: publish/remote-err on put outcomes.
-               if v.verdict == cvOk:
-                 result = true
-                 rt.sink.emit(TelemetryEvent(kind: tekPublish, publishedTo: v.tier))
-               elif v.verdict in transportVerdicts:
-                 rt.sink.emit(TelemetryEvent(kind: tekRemoteErr, putTier: v.tier,
-                                             putVerdict: v.verdict))
+             )
+             let v = rt.cache.putLocal(entry)
+             result = v.verdict == cvOk
+             # RFC-0005 B2a: publish/remote-err on tier 0's put outcome. The
+             # remote tiers' own publish/remote-err events fire later, at
+             # drain time (api.runTestsWith), when their verdicts actually
+             # exist.
+             if result:
+               rt.sink.emit(TelemetryEvent(kind: tekPublish, publishedTo: v.tier))
+             elif v.verdict in transportVerdicts:
+               rt.sink.emit(TelemetryEvent(kind: tekRemoteErr, putTier: v.tier,
+                                           putVerdict: v.verdict))
+             if rt.cache.tiers.len > 1:
+               rt.pending.add entry
              if result and rt.localRoot.len > 0:
                writeSidecar(rt.localRoot, pep.ep.path,
                             SidecarEntry(key: d.key, inputs: d.inputs, envDigest: ctx.envDigest))

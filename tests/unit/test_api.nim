@@ -820,7 +820,8 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let l1 = memory()
       let l2 = memory()
-      let deps = CacheDeps(buildRuntime: proc(stateDir: string; maxEntries: int): CacheRuntime =
+      let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+        discard cfg; discard stateDir; discard maxEntries
         CacheRuntime(
           cache: TieredCache(
             tiers: @[
@@ -872,6 +873,178 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
       let epNode = node["entrypoints"][0]
       check epNode["cacheLookup"].getStr == "trustBadSignature"
       check epNode["cacheDecision"].getStr == "stored"
+
+# ---------------------------------------------------------------------------
+# RFC-0005 A3c-ii — E2E-1: `configuredCache` wired live through the REAL
+# entry path (runTests -> planImpl -> configuredCache -> execute), driven by
+# a REAL crisol.kdl `remote-cache "<name>" { url "file://..." }` block —
+# not a hand-built CacheDeps override (E2E-A-trust's job, above).
+#
+# Scoping (RFC's own FORK-2 note, "E2E-1 (two-tier file://; lands in A3c —
+# form depends on FORK-2)"): FORK-2 resolved (a) — the FULL cold-host
+# three-run sequence needs A2c's post-compile consult, which is NOT this
+# slice (A2c lands after A3c-ii; see the RFC's own stage list). What DOES
+# land here, for real, through this exact entry path:
+#   1. the offline variant (verbatim from the RFC, FORK-independent):
+#      url -> a plain FILE at the path -> ENOTDIR -> run proceeds live,
+#      cacheLookup == "offline", the per-tier 100%-error stat is nonzero.
+#   2. a genuine two-tier file:// flow that already works TODAY (warm
+#      binary + depgraph, only l1 wiped): a remote hit backfills l1 and
+#      serves — proving configuredCache's wiring is live end to end.
+#   3. the deferred-put flush: run 1's remote tier receives its entry only
+#      by END of run (the join point), never inline during dispatch.
+# ---------------------------------------------------------------------------
+
+proc remoteHasAnyEntry(root: string): bool =
+  if not dirExists(root): return false
+  for f in walkDirRec(root):
+    if f.endsWith(".json"): return true
+  false
+
+const RemoteCacheProjectFixture = "quit(0)\n"
+
+suite "RFC-0005 A3c-ii — E2E-1: offline file:// remote (ENOTDIR)":
+
+  test "url blocked by a plain file -> ENOTDIR -> run proceeds live, cacheLookup offline, remoteErrors > 0":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      let blockedPath = projectRoot / "blocked_remote"
+      writeFile(blockedPath, "not a directory")
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "broken" {
+    url "file://""" & blockedPath & """"
+}
+""")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
+
+      # Run 1: first-ever compile (edNeverBuilt at plan time) never reaches
+      # a real cache consult at all (same "First-ever compile" fact
+      # E2E-A-trust's own test above already documents) -- cacheLookup stays
+      # the not-consulted cvOk zero value regardless of the remote's health.
+      # Live run stores into l1 fine; the broken remote is merely QUEUED and
+      # fails at the end-of-run flush (harmless -- proves nothing about the
+      # offline LOOKUP path this test targets).
+      let rr1 = runTests(opts)
+      check rr1.status == rsOk
+      check rr1.results[0].cacheDecision == cdmStored
+
+      # Wipe l1 only -- binary + depgraph stay warm, so run 2 IS a real
+      # edRunFresh consult: l1 misses (wiped), the broken remote is
+      # ENOTDIR-offline -> no hit anywhere -> live run, cacheLookup ==
+      # offline (the aggregate worst() over {cvMiss, cvOffline}).
+      removeDir(projectRoot / ".crisol" / "cache")
+
+      let rr2 = runTests(opts)
+      check rr2.status == rsOk
+      check rr2.results.len == 1
+      check rr2.results[0].cacheLookup == cvOffline
+      check rr2.cacheStats.remoteErrors > 0
+      # Zero network, zero crypto: still just the local-fs adapter, offline.
+
+suite "RFC-0005 A3c-ii — E2E-1: genuine two-tier file:// flow (warm host) + deferred-put flush":
+
+  test "run 1 publishes to the remote by end of run (flush); run 2 (l1 wiped) hits the remote and backfills l1":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      let remoteRoot = getTempDir() / ("crisol_a3cii_e2e1_remote_" & $getCurrentProcessId())
+      removeDir(remoteRoot)
+      createDir(remoteRoot)  # a configured remote is never auto-created (RFC "Local-fs root")
+      defer: removeDir(remoteRoot)
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "mirror" {
+    url "file://""" & remoteRoot & """"
+}
+""")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+
+      # Run 1: cold everywhere -> live run. L1 is written SYNCHRONOUSLY at
+      # finalize; the remote tier is queued and flushed at the end-of-run
+      # join point (RFC-0005 "Deferred remote puts") -- asserting on the
+      # POST-run filesystem state is exactly what proves the flush ran.
+      let rr1 = runTests(opts)
+      check rr1.status == rsOk
+      check rr1.results.len == 1
+      check rr1.results[0].cacheDecision == cdmStored
+      # the deferred-put flush must have published to the remote tier by end of run
+      check remoteHasAnyEntry(remoteRoot)
+
+      # Wipe ONLY the local l1 cache. The stable binary + depgraph stay
+      # warm, so lookupAtPlan's real consult still runs this run (the
+      # "warm bin+graph" case the RFC's own Summary already supports —
+      # A2c's post-compile consult is for the COLD-host case only).
+      removeDir(projectRoot / ".crisol" / "cache")
+
+      let rr2 = runTests(opts)
+      check rr2.status == rsOk
+      check rr2.results.len == 1
+      check rr2.results[0].cacheDecision == cdmHit
+      check rr2.results[0].cacheTier == "mirror"
+
+      # Wire-level assertion: the run/v2 render, not just the in-process
+      # EntrypointResult -- proves configuredCache's wiring reaches the
+      # actual JSON provenance, not merely an in-memory field.
+      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let epNode = node["entrypoints"][0]
+      check epNode["cacheTier"].getStr == "mirror"
+      check epNode["cacheDecision"].getStr == "hit"
+
+      # backfill-on-hit (KDL default #true) must have re-seeded l1.
+      check remoteHasAnyEntry(projectRoot / ".crisol" / "cache")
+
+suite "RFC-0005 A3c-ii — RunOptions.noRemoteCache (--no-remote-cache)":
+
+  test "noRemoteCache=true drops the configured remote tier; local (l1) caching stays active":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      let remoteRoot = getTempDir() / ("crisol_a3cii_noremote_" & $getCurrentProcessId())
+      removeDir(remoteRoot)
+      createDir(remoteRoot)  # exists and writable -- proves the miss is --no-remote-cache, not ENOTDIR
+      defer: removeDir(remoteRoot)
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "mirror" {
+    url "file://""" & remoteRoot & """"
+}
+""")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", noRemoteCache: true)
+
+      let rr1 = runTests(opts)
+      check rr1.status == rsOk
+      check rr1.results[0].cacheDecision == cdmStored
+      # --no-remote-cache must drop the remote tier entirely -- nothing ever queued or flushed to it
+      check not remoteHasAnyEntry(remoteRoot)
+
+      # l1 stays warm across the SAME opts (still noRemoteCache) -> a real hit.
+      let rr2 = runTests(opts)
+      check rr2.status == rsOk
+      check rr2.results[0].cacheDecision == cdmHit
+      check rr2.results[0].cacheTier == "l1"
+
+  test "an otherwise-rejected remote-cache config (l1-named) is never even validated when noRemoteCache is set":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "l1" {
+    url "file:///nonexistent/wherever"
+}
+""")
+      # Without --no-remote-cache this would be a structural cekConfig
+      # failure (configuredCache rejects the reserved "l1" name); dropping
+      # the remote before configuredCache ever sees it makes the run
+      # succeed regardless of the (moot) remote's own misconfiguration.
+      let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", noRemoteCache: true))
+      check rr.status == rsOk
 
 # ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.

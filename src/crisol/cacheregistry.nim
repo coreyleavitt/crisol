@@ -1,11 +1,20 @@
 ## cacheregistry.nim — RFC-0005 A2b: `CacheRuntime` + `localOnlyCache`;
-## RFC-0005 A3a: `BackendRegistry` + scheme-resolved `buildBackend`.
+## RFC-0005 A3a: `BackendRegistry` + scheme-resolved `buildBackend`;
+## RFC-0005 A3c-ii: `configuredCache`.
 ##
 ## The cache-side bundle `realSeams`/`api.nim` receive (RFC-0005 "Wiring").
-## A2b shipped ONLY the local-only factory; `CacheSecrets` and
-## `configuredCache` belong to their OWN later slices (C-dep/A3c) per the
-## RFC's stage list — building them now, with no `cache-trust`/`remote-cache`
-## KDL parser yet (A3c-i/C4), would be dormant substrate.
+## A2b shipped ONLY the local-only factory; A3a added the scheme-resolved
+## registry with no consumer wiring it to a real KDL block yet. A3c-ii
+## closes that loop: `configuredCache` builds a real multi-tier
+## `TieredCache` from `CacheConfig.remotes` (A3c-i's parser) via `reg`,
+## rejecting an `"l1"`-named remote and a `file://` root inside `stateDir`,
+## resolving `verify-trust`'s default honestly (no `cache-trust` block
+## parser exists before C4, so the policy is unconditionally "none" and the
+## default is `false`). `CacheSecrets`/per-tier credentials remain a later
+## slice (C-dep/C4) — the `file` scheme has no credential axis
+## (`fileBackendFactory` already discards `token`), so nothing here is dead
+## substrate: `configuredCache` passes `token = ""` to `buildBackend` today
+## and grows a `secrets` parameter only when `http`/`s3` need one.
 ##
 ## `localOnlyCache(stateDir, maxEntries)` builds the single-tier "l1"
 ## local-fs cache that makes a purely-local run behaviorally identical to
@@ -102,9 +111,26 @@ proc testRegistry*(): BackendRegistry =
     memoryBytes(jsonCacheSerializer()))
 
 type
-  CacheRuntime* = object
+  CacheRuntime* = ref object
     ## The cache-side bundle `realSeams`/`api.nim` receive (one place for
     ## growth; no dispose — RFC-0005 "Wiring").
+    ##
+    ## **`ref` since A3c-ii (was `object`).** `realSeams` receives `rt` by
+    ## value and keeps its OWN captured copy alive for the closures it
+    ## returns (`cachedispatch.nim`'s `var rt = rt`) — that copy is where the
+    ## per-run circuit breaker actually accumulates state across a run's
+    ## `load`/`store` calls, entirely inside `realSeams`'s own closure
+    ## environment. `api.runTestsWith`'s end-of-run deferred-put FLUSH
+    ## (RFC-0005 "Deferred remote puts") needs to observe THAT SAME
+    ## accumulated state (the breaker, and the queue of remote-destined
+    ## entries below) from ITS OWN copy of `rt`, built before `realSeams` is
+    ## ever called — a value type cannot do this (copying a `TieredCache`
+    ## struct only shares backend closures' own captured environments, never
+    ## the `breaker`/`pending` fields living directly on the struct). Making
+    ## the WHOLE bundle a `ref` costs nothing at every existing call site
+    ## (`CacheRuntime(...)` object-construction syntax already allocates on
+    ## the heap for a `ref object`; field access/mutation through a `let`- or
+    ## `var`-bound handle is unchanged) and requires editing no test.
     cache*: TieredCache
     sink*:  TelemetrySink[TelemetryEvent]
     localRoot*: string
@@ -114,6 +140,28 @@ type
       ## a sidecar against (e.g. a bare test runtime with no local-fs tier
       ## at all). NOT a general per-tier concept — the RFC pins the
       ## sidecar mechanism to tier 0 specifically.
+    pending*: seq[StoredEntry]
+      ## RFC-0005 B0/A3c-ii "Deferred remote puts": entries a live finalize
+      ## wrote to tier 0 ("l1") synchronously via `TieredCache.putLocal` AND
+      ## destined for at least one remote tier (`cache.tiers.len > 1`) —
+      ## queued here instead of fanning out inline. `api.runTestsWith`
+      ## drains this ONCE, at the end-of-run join point (after the poll loop
+      ## drains, before `persistLastRun`), via `cache.drainPending`, under
+      ## the SAME circuit breaker the run's own lookups/puts already
+      ## accumulated and a total attempt budget (`DefaultDeferredPutBudget`).
+      ## Empty for the common single-tier (no remote configured) run — never
+      ## populated, so `drainPending` is never even called (RFC "A purely-
+      ## local run... behaviorally identical to RFC-0004").
+
+const DefaultDeferredPutBudget* = 1000
+  ## RFC-0005 "Deferred remote puts" requires the end-of-run flush be bounded
+  ## by "a total budget" but pins no concrete number (no CLI/config knob is
+  ## specified for tuning it either — a follow-on once real deployments need
+  ## one). 1000 is a deliberately generous, arbitrary bound: it makes the
+  ## "never blocks unboundedly" property concrete (worst case, 1000 ×
+  ## the per-call deadline of a slow-but-alive remote) without constraining
+  ## any real run — a single invocation storing 1000 fresh (non-cached)
+  ## entries is already an extreme outlier for one `crisol run`.
 
 proc localOnlyCache*(stateDir: string; maxEntries: int): CacheRuntime =
   ## Single-tier local-fs ("l1"), `nonePolicy`, `NilSink` — the default for
@@ -130,5 +178,106 @@ proc localOnlyCache*(stateDir: string; maxEntries: int): CacheRuntime =
   CacheRuntime(
     cache:     TieredCache(tiers: @[l1], trust: nonePolicy()),
     sink:      NilSink[TelemetryEvent](),
+    localRoot: root,
+  )
+
+proc rootInsideStateDir(root, stateDir: string): bool =
+  ## `root` (a configured `file://` remote's directory) resolves equal to,
+  ## or nested under, `stateDir` — RFC-0005 "Local-fs root": such a tier
+  ## would recurse the L1 cache (`clean.nim`'s `pruneDir` walks the whole
+  ## `stateDir`, not just `stateDir/cache`, so ANY location inside it is
+  ## fair game for pruning). Absolute + normalized on both sides so a
+  ## relative config value and trailing separators cannot dodge the check.
+  let a = normalizedPath(absolutePath(root))
+  let b = normalizedPath(absolutePath(stateDir))
+  a == b or a.startsWith(b & DirSep)
+
+proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                      reg: BackendRegistry; sink: TelemetrySink[TelemetryEvent]): CacheRuntime =
+  ## RFC-0005 A3c-ii: build the run's `TieredCache` from parsed KDL
+  ## (`CacheConfig.remotes` — `types.RemoteTier`), via `reg` (scheme ->
+  ## adapter). Returns `localOnlyCache(stateDir, maxEntries)` unchanged when
+  ## `cfg.remotes` is empty — a purely-local run stays behaviorally
+  ## identical to RFC-0004 (RFC "What does not change").
+  ##
+  ## **Invoked inside the plan `try`, BEFORE `acquireLock`** (`api.nim`'s
+  ## `runTestsWith`): every rejection below raises `CrisolError(cekConfig)`,
+  ## caught by the SAME structural-failure path a bad group/glob already
+  ## uses, so a misconfigured remote-cache block is a plan-time exit 3, never
+  ## a lock-then-fail.
+  ##
+  ## Rejects (RFC "Misconfiguration is a config error, not a silent dead
+  ## tier"):
+  ##   - a remote named `"l1"` — reserved for the pinned local tier.
+  ##   - a `file://` root that resolves inside `stateDir` (`clean` would
+  ##     prune it out from under a live remote — see `rootInsideStateDir`).
+  ##   - a url whose scheme `reg` cannot resolve (`buildBackend` -> `none`):
+  ##     an unregistered/typo'd/not-yet-shipped scheme (http/s3 arrive in
+  ##     Stage C; `memory://` is registered ONLY by `testRegistry`) is a
+  ##     config error here, per `cacheregistry`'s own module doc ("the
+  ##     config layer... decides whether it's fatal") — never a silently
+  ##     inert tier.
+  ##
+  ## **`verify-trust` default (RFC, round 3): `cache-trust.policy !=
+  ## "none"`.** No `cache-trust` block parser exists before C4 —
+  ## `CacheConfig` carries no `trust` field yet — so the policy is
+  ## UNCONDITIONALLY "none" today; the honest default is therefore `false`.
+  ## C4 replaces the literal below with `cfg.trust.policy != "none"` when the
+  ## trust block lands. An explicit `verify-trust #true` is honored as-is
+  ## (harmless today: `nonePolicy.verify` is unconditionally `cvOk`
+  ## regardless of a tier's `verifyTrust` flag) — REJECTING that explicit
+  ## combination is a C4 concern (it needs `TrustConfig.policy` to exist to
+  ## even state "under policy none"), not this slice's.
+  if cfg.remotes.len == 0:
+    return localOnlyCache(stateDir, maxEntries)
+
+  let root = stateDir / "cache"
+  var tiers = @[Tier(
+    name:          "l1",
+    backend:       localFsBackend(root = root, autoCreate = true,
+                                   maxEntries = maxEntries),
+    # `backfillOnHit: true` here (unlike `localOnlyCache`'s single-tier
+    # `false`) -- with at least one remote tier below, a remote HIT must
+    # backfill l1 (RFC-0005 "TieredCache — the composition, with
+    # provenance": backfill targets are UPSTREAM tiers of the one that
+    # served; l1, at index 0, is upstream of every remote here). In the
+    # single-tier case there is no downstream tier that could ever serve a
+    # hit for l1 to backfill FROM, so `localOnlyCache` leaves it `false`
+    # (a dead flag there either way) -- this proc reaches this branch only
+    # once `cfg.remotes` is non-empty, so the flag is live here.
+    backfillOnHit: true,
+    verifyTrust:   false,
+  )]
+
+  for remote in cfg.remotes:
+    if remote.name == "l1":
+      raise newCrisolError(cekConfig,
+        "config: remote-cache '" & remote.name & "': the name 'l1' is " &
+        "reserved for the local cache tier")
+
+    if remote.url.startsWith("file://"):
+      let fsRoot = remote.url["file://".len .. ^1]
+      if rootInsideStateDir(fsRoot, stateDir):
+        raise newCrisolError(cekConfig,
+          "config: remote-cache '" & remote.name & "': url '" & remote.url &
+          "' resolves inside the state dir '" & stateDir & "' -- this would " &
+          "recurse the local (l1) cache; point it somewhere else")
+
+    let backendOpt = reg.buildBackend(remote, token = "")
+    if backendOpt.isNone:
+      raise newCrisolError(cekConfig,
+        "config: remote-cache '" & remote.name & "': unsupported or " &
+        "unrecognized scheme in url '" & remote.url & "'")
+
+    tiers.add Tier(
+      name:          remote.name,
+      backend:       backendOpt.get,
+      backfillOnHit: remote.backfillOnHit,
+      verifyTrust:   remote.verifyTrust.get(false),  # see doc comment above
+    )
+
+  CacheRuntime(
+    cache:     TieredCache(tiers: tiers, trust: nonePolicy()),
+    sink:      sink,
     localRoot: root,
   )

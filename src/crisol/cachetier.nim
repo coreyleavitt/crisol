@@ -12,6 +12,12 @@
 ## **circuit breaker**, and a budget-bounded drain for **deferred puts**
 ## (RFC-0005 "TieredCache — the composition, with provenance" + "B0").
 ##
+## **A3c-ii wires the deferred-put split live:** `putLocal` is the
+## SYNCHRONOUS half a live finalize calls (tier 0 / "l1" only — the caller
+## queues the same entry for tiers 1..N and flushes that queue once, at the
+## end-of-run join point, via the unchanged `drainPending` — see
+## `cachedispatch.realSeams.store`/`api.runTestsWith`).
+##
 ## `TieredCache` stays a PURE lookup engine — no `TelemetrySink` field (that
 ## lives on `CacheRuntime`, Stage A2b): telemetry emission is a translation
 ## concern belonging to the `realSeams` adapter, exactly where an
@@ -211,6 +217,31 @@ proc put*(tc: var TieredCache; entry: StoredEntry): seq[TierVerdict] =
     let v = tier.backend.put(e)
     tc.tripBreaker(tier.name, v)
     result.add (tier.name, v)
+
+proc putLocal*(tc: var TieredCache; entry: StoredEntry): TierVerdict =
+  ## RFC-0005 B0 "Deferred remote puts": the SYNCHRONOUS half of a store —
+  ## writes ONLY to tier 0 ("l1", pinned first by construction — RFC-0005
+  ## "Local-fs root") at live finalize, applying the SAME put rule + circuit
+  ## breaker `put` would for that one tier (signs once via `tc.trust.sign`,
+  ## exactly like `put` — deterministic for both ed25519 and HMAC, so signing
+  ## the SAME entry again at drain time, via the full `put`, produces
+  ## byte-identical attestation bytes; no double-sign hazard). Tiers 1..N
+  ## (remote) are the CALLER's job to queue and flush later via
+  ## `drainPending` — never touched here. `("", cvMiss)` when `tc.tiers` is
+  ## empty (defensive; unreachable in practice — every `TieredCache` has at
+  ## least an "l1" tier by construction).
+  if tc.tiers.len == 0:
+    return (tier: "", verdict: cvMiss)
+  var e = entry
+  tc.trust.sign(e)
+  let tier = tc.tiers[0]
+  if not (e.attestation.isSome or not tier.verifyTrust):
+    return (tier: tier.name, verdict: cvUnauthorized)
+  if tc.breakerTripped(tier.name):
+    return (tier: tier.name, verdict: cvOffline)
+  let v = tier.backend.put(e)
+  tc.tripBreaker(tier.name, v)
+  (tier: tier.name, verdict: v)
 
 proc drainPending*(tc: var TieredCache; pending: openArray[StoredEntry];
                     budget: int = high(int)): seq[TierVerdict] =

@@ -45,6 +45,9 @@
 ##      earlier in the SAME lookup call.
 ##   10. the deferred-put drain (`drainPending`): flushes a caller-owned
 ##       queue, and respects a total attempt budget.
+##   10b. RFC-0005 A3c-ii: `putLocal` — the synchronous, tier-0-only half of
+##       the deferred-put split (put rule + breaker, scoped to tier 0);
+##       paired with `drainPending` for the remote tiers.
 ##   11. `tekBackfillErr`'s producer (`cachetelemetry.backfillErrEvents`
 ##       over `CacheLookup.backfillVerdicts`) + its fold into
 ##       `aggregateCacheStats.remoteErrors`.
@@ -66,6 +69,14 @@
 ##      actually walked (and evictable) by `gcResultCacheAt`; a
 ##      `storeCachedAt` entry is visible to `localFsBackend.get` — the
 ##      A2a-era divergence this fixes.
+##   14. RFC-0005 A3c-ii: `cacheregistry.configuredCache` — builds a real
+##      multi-tier `TieredCache` from `CacheConfig.remotes`; no-remotes ->
+##      `localOnlyCache`-equivalent; rejects an `"l1"`-named remote, a
+##      `file://` root inside `stateDir` (equal OR nested), and an
+##      unresolvable scheme, each as `CrisolError(cekConfig)`; resolves
+##      `verify-trust`'s default to `false` (no `cache-trust` parser before
+##      C4) while honoring an explicit override; the built tier is exercised
+##      live through the real file backend.
 
 import std/[json, options, os, strutils, tables]
 import crisol/types
@@ -548,6 +559,52 @@ block test_drain_pending_respects_a_total_budget:
   assert putCalls[] == 2, "the third queued entry must never be attempted once the budget is spent"
 
 # ---------------------------------------------------------------------------
+# 10b. RFC-0005 A3c-ii: `putLocal` — the SYNCHRONOUS half of the deferred-put
+#      split. Writes ONLY tier 0 ("l1"); tiers 1..N are untouched (the
+#      caller's job to queue + `drainPending` later).
+# ---------------------------------------------------------------------------
+
+block test_put_local_writes_only_tier_zero:
+  let l1 = memory()
+  let remote = memory()
+  var tc = twoTier(l1, remote)
+  let entry = sampleEntry(SoundnessKey("a1a1000000000001"), exitCode = 3)
+  let v = tc.putLocal(entry)
+  assert v == (tier: "l1", verdict: cvOk)
+  assert tc.tiers[0].backend.get(entry.key).verdict == cvOk
+  assert tc.tiers[1].backend.get(entry.key).verdict == cvMiss,
+    "putLocal must never reach a downstream (remote) tier"
+
+block test_put_local_then_drain_pending_reaches_remote_too:
+  var tc = twoTier(memory(), memory())
+  let entry = sampleEntry(SoundnessKey("a1a1000000000002"), exitCode = 4)
+  discard tc.putLocal(entry)
+  assert tc.tiers[1].backend.get(entry.key).verdict == cvMiss, "not yet -- still queued by the caller"
+  let vs = tc.drainPending(@[entry])
+  assert vs == @[(tier: "l1", verdict: cvOk), (tier: "l2", verdict: cvOk)]
+  assert tc.tiers[1].backend.get(entry.key).verdict == cvOk, "the deferred flush publishes to the remote tier"
+
+block test_put_local_respects_the_put_rule:
+  ## An unattested entry must never land on a verifyTrust tier -- same put
+  ## rule `put` enforces, just scoped to tier 0 here.
+  var tc = twoTier(memory(), memory(), verifyTrust0 = true,
+                    trust = mockPolicy(cvOk, attest = false))
+  let entry = sampleEntry(SoundnessKey("a1a1000000000003"))
+  let v = tc.putLocal(entry)
+  assert v == (tier: "l1", verdict: cvUnauthorized)
+  assert tc.tiers[0].backend.get(entry.key).verdict == cvMiss, "the unauthorized write must not have landed"
+
+block test_put_local_respects_the_circuit_breaker:
+  let (backend, _, putCalls) = countingBackend(putResults = @[cvOffline])
+  var tc = oneTier(backend)
+  let entry = sampleEntry(SoundnessKey("a1a1000000000004"))
+  discard tc.putLocal(entry)
+  assert putCalls[] == 1
+  let v = tc.putLocal(entry)
+  assert v == (tier: "l1", verdict: cvOffline)
+  assert putCalls[] == 1, "a tripped l1 must never be attempted again by putLocal either"
+
+# ---------------------------------------------------------------------------
 # 11. RFC-0005 A3a coordinator ruling: tekBackfillErr's producer
 #     (`cachetelemetry.backfillErrEvents`, over `CacheLookup.backfillVerdicts`)
 #     + its fold into `aggregateCacheStats.remoteErrors`.
@@ -922,5 +979,102 @@ block test_read_sidecar_corrupt_json_is_treated_as_absent:
   let sc = readSidecar(root, path)
   assert sc.order.len == 0, "a corrupt sidecar must degrade to empty, never raise"
   assert sc.records.len == 0
+
+# ---------------------------------------------------------------------------
+# 14. RFC-0005 A3c-ii: cacheregistry.configuredCache — builds the run's
+#     TieredCache from parsed KDL (CacheConfig.remotes) via a BackendRegistry.
+#     Rejections raise CrisolError(cekConfig) — the SAME structural-failure
+#     channel a bad group/glob already uses (see api.runTestsWith).
+# ---------------------------------------------------------------------------
+
+proc freshStateDir14(tag: string): string =
+  result = getTempDir() / ("crisol_configuredcache_" & tag)
+  removeDir(result)
+  createDir(result)
+
+block test_configured_cache_no_remotes_is_local_only:
+  let sd = freshStateDir14("noremotes")
+  let rt = configuredCache(CacheConfig(remotes: @[]), sd, maxEntries = 0,
+                           reg = productionRegistry(), sink = NilSink[TelemetryEvent]())
+  assert rt.cache.tiers.len == 1
+  assert rt.cache.tiers[0].name == "l1"
+  assert rt.localRoot == sd / "cache"
+
+block test_configured_cache_rejects_l1_named_remote:
+  let sd = freshStateDir14("l1name")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "l1",
+                                              url: "file://" & freshLocalFsRoot("l1name_remote"))])
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a remote named 'l1' must be a config error"
+
+block test_configured_cache_rejects_root_inside_state_dir:
+  let sd = freshStateDir14("rootinside")
+  let nested = sd / "cache" / "nested"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)])
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a file:// root inside stateDir must be a config error (would recurse l1)"
+
+block test_configured_cache_rejects_root_equal_to_state_dir:
+  let sd = freshStateDir14("rootequal")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & sd)])
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            sink = NilSink[TelemetryEvent]())
+  except CrisolError:
+    caught = true
+  assert caught, "a remote rooted exactly AT stateDir must also be rejected"
+
+block test_configured_cache_rejects_unresolvable_scheme:
+  let sd = freshStateDir14("unknownscheme")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "https://example.com/cache")])
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "an unregistered scheme (http, not yet shipped) must be a config error, not a silent drop"
+
+block test_configured_cache_builds_a_real_second_tier:
+  let sd = freshStateDir14("realtier")
+  let remoteRoot = freshLocalFsRoot("configuredcache_remote")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot,
+                                              backfillOnHit: true)])
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           sink = NilSink[TelemetryEvent]())
+  assert rt.cache.tiers.len == 2
+  assert rt.cache.tiers[0].name == "l1"
+  assert rt.cache.tiers[1].name == "mirror"
+  assert rt.cache.tiers[1].backfillOnHit == true
+  assert rt.cache.tiers[1].verifyTrust == false, "no cache-trust block exists yet -- default is false"
+  assert rt.localRoot == sd / "cache"
+  # Live end to end through the real file backend (both tiers).
+  let key = SoundnessKey("c0c0c0c0c0c0c0c0")
+  var cache = rt.cache
+  let v = cache.put(sampleEntry(key, exitCode = 9))
+  assert v == @[(tier: "l1", verdict: cvOk), (tier: "mirror", verdict: cvOk)]
+
+block test_configured_cache_honors_explicit_verify_trust_true:
+  let sd = freshStateDir14("verifytrue")
+  let remoteRoot = freshLocalFsRoot("configuredcache_verifytrue")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot,
+                                              verifyTrust: some(true))])
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           sink = NilSink[TelemetryEvent]())
+  assert rt.cache.tiers[1].verifyTrust == true
 
 echo "test_cachetier: all blocks passed"

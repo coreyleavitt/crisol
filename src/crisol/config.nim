@@ -43,6 +43,9 @@
 ##                                       // resolved by configuredCache (A3c-ii)
 ##     backfill-on-hit #true            // optional; KDL default #true
 ## }
+## // --no-remote-cache (CLI-only, no KDL key -- a config-file remote-cache
+## // block describes what a fleet SHOULD use, not a one-run override) drops
+## // every configured remote-cache tier for one run; l1 stays active.
 ## ```
 ##
 ## ## Design notes

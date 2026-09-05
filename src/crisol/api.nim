@@ -52,8 +52,9 @@
 
 import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, times]
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock,
-               sandbox, cachedispatch, cacheregistry, cachetelemetry, resultcache, ccprobe,
-               nimprobe, planner, order, ledger, keys, depgraph, stats, compilereport]
+               sandbox, cachedispatch, cacheregistry, cachetier, cacheport, cachetelemetry,
+               resultcache, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
+               compilereport]
 # rfc-0007 A2b: `crisol/signals` (the process-global gotSignal flag) is no
 # longer this module's concern — `runner.execute`'s OWN Supervisor now owns
 # SIGINT/SIGTERM installation for the duration of the call (`installSignals`
@@ -334,6 +335,14 @@ type
     ## explainMiss); `runTests` reads `cfg.cacheStats`, never this raw field
     ## directly, so a config-file-only opt-in is honored identically.
     cacheStats*:          bool = false
+    ## RFC-0005 A3c-ii: --no-remote-cache. Drops every configured
+    ## `remote-cache` tier for THIS run -- the local ("l1") cache stays
+    ## active, so this is strictly weaker than `noCache` (which disables
+    ## caching entirely). No KDL equivalent (the RFC's own "Configuration"
+    ## flags list carries this as CLI-only; a config-file remote-cache
+    ## block describes what a fleet SHOULD use, not a one-run override).
+    ## false by default -- identical behavior to before this slice.
+    noRemoteCache*:       bool = false
 
   ResolvedSettings* = object
     ## Slim projection of the resolved Config (NOT the full Config).
@@ -939,22 +948,41 @@ type
     ## arbitrary, fully-built `CacheRuntime` once `stateDir`/`maxEntries`
     ## are known (post-plan; `runTests` cannot resolve them any earlier
     ## today either — see the `localOnlyCache` call site this replaces).
-    ## `buildRuntime` is that narrowest seam: production wraps today's
-    ## `localOnlyCache` call unchanged (`productionCacheDeps`, below); a
-    ## test closes over pre-built `memory://` backends + a mock policy and
-    ## returns the SAME `CacheRuntime` value on every call, so a warm
-    ## second `runTestsWith` call sees what the first one stored (the
-    ## backends' own `Table` state — not `rt` identity — is what persists;
-    ## see `cachememory.nim`). A3c reshapes this into the registry+secrets
-    ## form once `configuredCache` exists to consume it — narrowing the
-    ## seam, not the design.
-    buildRuntime*: proc(stateDir: string; maxEntries: int): CacheRuntime {.closure.}
+    ## `buildRuntime` is that narrowest seam: a test closes over pre-built
+    ## `memory://` backends + a mock policy and returns the SAME
+    ## `CacheRuntime` value on every call, so a warm second `runTestsWith`
+    ## call sees what the first one stored (the backends' own `Table`
+    ## state — not `rt` identity — is what persists; see `cachememory.nim`).
+    ##
+    ## **A3c-ii reshape (recorded):** `buildRuntime` now takes `cfg:
+    ## CacheConfig` (the run's resolved `Config.cache`, i.e. the parsed
+    ## `remote-cache "<name>" { }` blocks) as its first argument, so
+    ## `productionCacheDeps` (below) can wire the REAL `configuredCache`
+    ## into the production path. The RFC's end-state sketch also threads a
+    ## `registry: BackendRegistry` field on `CacheDeps` itself; that is NOT
+    ## added here — `productionCacheDeps`'s closure captures
+    ## `productionRegistry()` directly (a fresh, cheap-to-build value; no
+    ## state to share across calls), and a test wanting a different
+    ## registry (e.g. one more scheme than `productionRegistry` ships)
+    ## overrides `buildRuntime` wholesale, exactly as A3b's mock-policy test
+    ## already does — a `registry` field with a single caller (this same
+    ## closure) would be indirection with no consumer. `secrets:
+    ## CacheSecrets` is NOT added either: `configuredCache` in THIS slice
+    ## only ever resolves the `file` scheme, which has no credential axis
+    ## (`cacheregistry.fileBackendFactory` already discards its `token`
+    ## parameter) — a `secrets` field with no scheme that reads it would be
+    ## exactly the dead substrate the standing rules forbid. C-dep/C4 add it
+    ## when `http`/`s3`/trust need real credentials.
+    buildRuntime*: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime {.closure.}
 
 proc productionCacheDeps*(): CacheDeps =
-  ## The real dependency: exactly what `runTests` built inline before this
-  ## slice — `cacheregistry.localOnlyCache`, unchanged.
-  CacheDeps(buildRuntime: proc(stateDir: string; maxEntries: int): CacheRuntime =
-    localOnlyCache(stateDir, maxEntries))
+  ## The real dependency: RFC-0005 A3c-ii's `configuredCache`, via
+  ## `productionRegistry()` (the `file` scheme only — `http`/`s3` arrive in
+  ## Stage C) and a `NilSink` (the run's real sink, when `--cache-stats` is
+  ## on, is installed by `runTestsWith` AFTER `buildRuntime` returns, exactly
+  ## as it already did for `localOnlyCache` before this slice).
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+    configuredCache(cfg, stateDir, maxEntries, productionRegistry(), NilSink[TelemetryEvent]()))
 
 # ---------------------------------------------------------------------------
 # runTestsWith — full run facade; catches-and-encodes structural failures.
@@ -1017,6 +1045,35 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   let pr  = impl.pr   # public projection
   let cfg = impl.cfg  # full config (needed by execute)
   let pv  = impl.pv   # full view (needed for graph + runnable count)
+
+  # RFC-0005 A3c-ii: build the run's CacheRuntime (configuredCache, or
+  # localOnlyCache when no remote tier is configured) HERE — still inside
+  # the plan's structural-failure boundary, BEFORE acquireLock — so a
+  # rejected remote-cache config (an "l1"-named remote, a file:// root
+  # inside stateDir, an unresolvable scheme) is a plan-time exit 3, exactly
+  # like a bad group/glob, never a lock-then-fail (RFC: configuredCache "is
+  # invoked INSIDE the plan try, BEFORE acquireLock"). `rt` stays nil
+  # (`CacheRuntime`'s ref zero value) when `opts.noCache` is set — nothing
+  # below ever dereferences it on that path. `maxCacheEntries` mirrors
+  # clean.nim's own resolution of the SAME config field (0 = use
+  # DefaultMaxCacheEntries) so the live store path's soft cap and `clean`'s
+  # GC target agree — one knob, one resolution rule, both readers of it.
+  var rt: CacheRuntime
+  if not opts.noCache:
+    let maxCacheEntries =
+      if cfg.maxCacheEntries > 0: cfg.maxCacheEntries
+      else: DefaultMaxCacheEntries
+    # RFC-0005 A3c-ii: --no-remote-cache drops every configured remote tier
+    # for this run — the local ("l1") cache stays active (configuredCache
+    # degrades to its localOnlyCache-equivalent path when `remotes` is empty).
+    let effectiveCacheCfg =
+      if opts.noRemoteCache: CacheConfig(remotes: @[])
+      else: cfg.cache
+    try:
+      rt = deps.buildRuntime(effectiveCacheCfg, pr.settings.stateDir, maxCacheEntries)
+    except CrisolError as e:
+      let code = if e.kind == cekInternal: 2 else: 3
+      return structuralResultWithPlan(e.msg, code, pr)
 
   # Acquire advisory lock if requested.
   var lockHandle: LockHandle   # fd = -1 (default) = not held
@@ -1110,15 +1167,12 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       ctx
     else:
       # RFC-0005 A2b: keyContext built once (the key-derivation closure's
-      # captured state); the run's CacheRuntime built once via `deps.
-      # buildRuntime` (RFC-0005 A3b — production: `localOnlyCache`, the
-      # single-tier "l1" TieredCache over the local-fs backend, behaviorally
-      # identical to RFC-0004's direct loadCached/storeCached; tests: an
-      # injected multi-tier double, see CacheDeps's doc comment).
-      # maxCacheEntries mirrors clean.nim's own resolution of the SAME
-      # config field (0 = use DefaultMaxCacheEntries) so the live store
-      # path's soft cap and `clean`'s GC target agree — one knob, one
-      # resolution rule, both readers of it.
+      # captured state). `rt` (RFC-0005 A3c-ii: `configuredCache`/
+      # `localOnlyCache` via `deps.buildRuntime` — production: a single-tier
+      # "l1" TieredCache over the local-fs backend when no remote is
+      # configured, behaviorally identical to RFC-0004's direct
+      # loadCached/storeCached; tests: an injected multi-tier double, see
+      # CacheDeps's doc comment) was already built above, BEFORE the lock.
       let keyCtx = keyContext(
         nimVersion    = nimVer,
         ccVersion     = ccVer,
@@ -1126,10 +1180,6 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
         parentEnv     = toSeq(envPairs()),
         protocolMajor = CrisolProtocolMajor,
       )
-      let maxCacheEntries =
-        if cfg.maxCacheEntries > 0: cfg.maxCacheEntries
-        else: DefaultMaxCacheEntries
-      var rt = deps.buildRuntime(pr.settings.stateDir, maxCacheEntries)
       # RFC-0005 B2b: override BEFORE realSeams closes over `rt` — realSeams'
       # own store closure reads `rt.sink` (its embedded copy), so the swap
       # must happen here, not on the CacheContext built below (that sink
@@ -1174,6 +1224,30 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   except Exception as e:
     releaseLock(lockHandle)
     return structuralResultWithPlan("unexpected error during execute: " & e.msg, 2, pr)
+
+  # RFC-0005 B0/A3c-ii: flush queued remote puts at the end-of-run join
+  # point — after the poll loop drains (execute() just returned), before
+  # persistLastRun (RFC "Deferred remote puts"). `rt.pending` is empty for
+  # the common single-tier (no remote configured) run — `realSeams.store`
+  # only ever queues an entry when a remote tier actually exists — so this
+  # is a no-op there, never touching `drainPending` at all. `rt` is nil only
+  # when `opts.noCache` is set, in which case `rt.pending` is unreachable
+  # (guarded by the same condition here).
+  if not opts.noCache and rt.pending.len > 0:
+    let flushVerdicts = rt.cache.drainPending(rt.pending, DefaultDeferredPutBudget)
+    for v in flushVerdicts:
+      # Tier "l1" was already accounted for synchronously at finalize
+      # (cachedispatch.realSeams.store's own tekPublish/tekRemoteErr) —
+      # drainPending's full fan-out re-puts to it too (idempotent — last-
+      # writer-wins among validly-attested entries is sound, RFC
+      # "Integrity") but must not be double-counted in telemetry here.
+      if v.tier == "l1": continue
+      if v.verdict == cvOk:
+        rt.sink.emit(TelemetryEvent(kind: tekPublish, publishedTo: v.tier))
+      elif v.verdict in transportVerdicts:
+        rt.sink.emit(TelemetryEvent(kind: tekRemoteErr, putTier: v.tier,
+                                    putVerdict: v.verdict))
+    rt.pending.setLen(0)
 
   # rfc-0007 A6b: the ONE resolved OutcomePolicy for this run, built from
   # cfg.strictHygiene (CLI flag OR config-file, already merged by planImpl

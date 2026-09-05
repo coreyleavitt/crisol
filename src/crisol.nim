@@ -154,6 +154,7 @@ Usage:
               [--hermetic <none|isolated|network>]
               [--rlimit-nofile <N>]
               [--env-pin NAME=VALUE]...
+              [--no-remote-cache]
               [--explain-miss | --explain-miss-verbose]
               [--cache-stats]
               [--verify-cache [--verify-cache-pct <N>]
@@ -252,6 +253,15 @@ Additional options for 'run':
                   Like --explain-miss, but shows full untruncated component
                   values instead of the terse truncated form. Implies
                   --explain-miss.
+  --no-remote-cache
+                  Drop every configured `remote-cache` tier for this run.
+                  The local ("l1") cache stays active -- this is strictly
+                  weaker than --no-cache, which disables caching entirely.
+                  Useful for a one-off run when a shared tier is unreachable
+                  or you want to bypass it without editing crisol.kdl. No
+                  KDL equivalent (a config-file remote-cache block describes
+                  what a fleet should use, not a one-run override). Off by
+                  default.
   --cache-stats   Print a one-line cache-hit/miss/publish/wall-time-saved
                   summary after the run (also settable via crisol.kdl's
                   `cache-stats #true`) and add a `cacheStats` object to the
@@ -678,6 +688,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     baseRef:      string = ""   # D5: --base <ref>; "" means diff vs HEAD
     forceCompile: bool = false
     noCache:      bool = false  # A9: --no-cache: do NOT read/write the result cache
+    noRemoteCache: bool = false # RFC-0005 A3c-ii: --no-remote-cache: drop configured
+                                 # remote-cache tiers; l1 stays active
     filterTag:    string = ""   # C3: reporting-level record filter
     retries:      int  = -1     # B1: --retries N; -1 = not specified (use config)
     failOnFlaky:  bool = false  # B1: --fail-on-flaky: flaky-passes → exit 1
@@ -731,7 +743,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                  "perf-check", "hermetic", "measure-compile-reuse",
                  "rlimit-nofile", "verify-cache", "verify-cache-pct",
                  "verify-cache-seed", "verify-cache-strict", "env-pin",
-                 "explain-miss", "explain-miss-verbose", "cache-stats"] and isList:
+                 "explain-miss", "explain-miss-verbose", "cache-stats",
+                 "no-remote-cache"] and isList:
         stderr.write("crisol: '--" & key & "' is not valid for 'list'\n\n")
         stderr.write(usage())
         return ExitEnvironment
@@ -793,6 +806,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         forceCompile = true
       of "no-cache":
         noCache = true
+      of "no-remote-cache":
+        noRemoteCache = true
       of "retries":
         let raw = nextVal("retries")
         if raw == "":
@@ -1074,6 +1089,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     forceCompile:        forceCompile,
     failFast:            failFast,
     noCache:             noCache,
+    noRemoteCache:       noRemoteCache, # RFC-0005 A3c-ii: --no-remote-cache
     jobs:                jobs,
     timeoutSecs:         timeout,
     showProgress:        not jsonMode,
