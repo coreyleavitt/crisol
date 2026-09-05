@@ -47,14 +47,20 @@
 ## // block describes what a fleet SHOULD use, not a one-run override) drops
 ## // every configured remote-cache tier for one run; l1 stays active.
 ##
-## cache-trust {                         // RFC-0005 C4: CACHE-GLOBAL (one policy per
-##                                       // TieredCache); optional, default policy "none"
-##     policy "hmac"                    // none | hmac | ed25519 ("ed25519" parses; wiring
-##                                       // arrives in C5a -- configuredCache rejects it
-##                                       // as not-yet-supported until then)
+## cache-trust {                         // RFC-0005 C4/C5a: CACHE-GLOBAL (one
+##                                       // policy per TieredCache); optional,
+##                                       // default policy "none"
+##     policy "ed25519"                 // none | hmac | ed25519
 ##     key-id "ci-2026"                 // hmac only: the operator-chosen signer label,
 ##                                       // bound into the signed envelope; the secret
 ##                                       // itself is NEVER in config -- $CRISOL_CACHE_HMAC_KEY
+##     pinned-key "MCowBQ...="          // ed25519 only; repeatable -- one base64
+##                                       // ed25519 public key per node; policy
+##                                       // "ed25519" with zero pinned-keys is a
+##                                       // config error. Signing (if any) uses
+##                                       // $CRISOL_CACHE_SIGN_KEY (base64 of the
+##                                       // 32-byte seed) -- absent, this host
+##                                       // still verifies (read-only participant).
 ## }
 ## ```
 ##
@@ -403,17 +409,22 @@ proc parseCacheTrust(n: KdlNode; source: string;
   ##       key-id "ci-2026"   // hmac only; optional (empty string if absent)
   ##   }
   ##
-  ## C4 scope only: `pinned-key` (ed25519, repeatable) is C5a's own parser
-  ## addition -- an occurrence here today falls through to the unknown-key
-  ## warning below, same as any other not-yet-parsed child.
+  ## RFC-0005 C5a: `pinned-key` (ed25519, repeatable, order-preserving) is
+  ## the RAW base64 config string, unvalidated here -- decoding it into a
+  ## `PublicKey` (rejecting a malformed entry) is `cacheregistry.
+  ## buildTrustPolicy`'s job, the same layering `RemoteTier.url`'s scheme
+  ## validation already uses (`config.nim` must not import the cache
+  ## modules).
   ##
   ## Cross-field rejections that need MORE than this block alone (hmac
-  ## with no `$CRISOL_CACHE_HMAC_KEY`; an explicit `verify-trust #true`
-  ## under policy "none") are `configuredCache`'s job (`cacheregistry.nim`)
-  ## -- see that module's doc comment ("Misconfiguration is a config
-  ## error, not a silent dead tier").
+  ## with no `$CRISOL_CACHE_HMAC_KEY`; ed25519 with zero `pinned-key`s; an
+  ## explicit `verify-trust #true` under policy "none") are
+  ## `configuredCache`'s job (`cacheregistry.nim`) -- see that module's
+  ## doc comment ("Misconfiguration is a config error, not a silent dead
+  ## tier").
   var policy = "none"  # KDL default (RFC "optional, default none")
   var keyId = ""
+  var pinnedKeys: seq[string] = @[]
 
   for child in n.children:
     case child.name
@@ -428,10 +439,12 @@ proc parseCacheTrust(n: KdlNode; source: string;
       policy = p
     of "key-id":
       keyId = requireStrArg(child, 0, "cache-trust: 'key-id'")
+    of "pinned-key":
+      pinnedKeys.add requireStrArg(child, 0, "cache-trust: 'pinned-key'")
     else:
       warns.add makeConfigWarning(source, "cache-trust", child.name)
 
-  TrustConfig(policy: policy, keyId: keyId)
+  TrustConfig(policy: policy, keyId: keyId, pinnedKeys: pinnedKeys)
 
 # ---------------------------------------------------------------------------
 # C6: Sensitivity presets → (k, sampleFloor, absFloorMs)

@@ -1793,6 +1793,28 @@ group "unit" {
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
     check cfg.cache.trust.policy == "ed25519"
+    check cfg.cache.trust.pinnedKeys.len == 0
+
+  test "pinned-key parsed, repeatable, order-preserving (RFC-0005 C5a)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "ed25519"
+    pinned-key "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa="
+    pinned-key "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb="
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.trust.policy == "ed25519"
+    check cfg.cache.trust.pinnedKeys == @[
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=",
+    ]
 
   test "unknown policy string -> cekConfig":
     let tmp = makeTmpDir()

@@ -38,7 +38,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_api.nim
 
-import std/[json, options, os, osproc, strutils, times, unittest]
+import std/[base64, json, options, os, osproc, strutils, times, unittest]
 import crisol/api
 import crisol/types
 import crisol/process/types as ptypes
@@ -55,6 +55,11 @@ import crisol/cacheregistry  # CacheRuntime
 import crisol/cachetelemetry # NilSink
 import crisol/resultcache    # RFC-0005 C4 E2E-2: payloadFromJson/canonicalPayload/cacheVersionDirAt
 import crisol/fnv            # RFC-0005 C4 E2E-2: fnv1a64/toHex16 (recompute payloadChecksum by hand)
+import sello                 # RFC-0005 C5a: test-only fixture construction (Seed/
+                              # Keypair/PublicKey) for the real ed25519Policy E2E,
+                              # same precedent as test_cdep_crypto_smoke.nim --
+                              # cachetrust.nim stays the only PRODUCTION module
+                              # importing sello.
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -1157,6 +1162,99 @@ cache-trust {
       check rr2.results.len == 1
       check rr2.results[0].cacheLookup == cvCorrupt
       check rr2.results[0].cacheDecision == cdmStored  # self-heal here too
+
+# ---------------------------------------------------------------------------
+# RFC-0005 C5a -- ed25519 sign+verify happy path through the REAL entry
+# point (runTests -> planImpl -> configuredCache -> execute), a REAL
+# crisol.kdl `cache-trust { policy "ed25519" }` block with a `pinned-key`,
+# the REAL `ed25519Policy` (`cachetrust.nim`), and the REAL
+# `$CRISOL_CACHE_SIGN_KEY` env var (proving `api.nim`'s `CacheSecrets`
+# resolution for the ed25519 seed end to end). The full rejection matrix
+# (tamper / unpinned / signer-mismatch / unknown-alg) is C5b's job -- out
+# of scope here; this proves the HAPPY sign, then no-seed VERIFY-ONLY,
+# path only.
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 C5a -- ed25519 sign+verify through the real entry point (two file:// tiers)":
+
+  test "run 1 (signer) publishes an attested entry; run 2 (verify-only, no seed) hits + verifies it":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      let remoteRoot = getTempDir() / ("crisol_c5a_e2e_" & $getCurrentProcessId())
+      removeDir(remoteRoot)
+      createDir(remoteRoot)
+      defer: removeDir(remoteRoot)
+
+      let seedBytes: array[32, byte] = [
+        byte 11, 22, 33, 44, 55, 66, 77, 88, 99, 100, 111, 122, 133,
+        144, 155, 166, 177, 188, 199, 210, 221, 232, 243, 254,
+        9, 8, 7, 6, 5, 4, 3, 2]
+      let seedB64 = base64.encode(seedBytes)
+      let pubKeyB64 = base64.encode(toBytes(keypair(toSeed(seedBytes)).public))
+      # Precomputed separately (ordinary escaped string, not the triple-
+      # quoted KDL doc below) so the base64 splice needs no fragile
+      # quote-counting inside the triple-quoted literal.
+      let pinnedKeyLine = "pinned-key \"" & pubKeyB64 & "\""
+
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "mirror" {
+    url "file://""" & remoteRoot & """"
+}
+cache-trust {
+    policy "ed25519"
+    """ & pinnedKeyLine & """
+
+}
+""")
+      putEnv("CRISOL_CACHE_SIGN_KEY", seedB64)
+      defer: delEnv("CRISOL_CACHE_SIGN_KEY")  # safety net; api.nim scrubs it itself on the happy path
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+
+      # Run 1 (signer): cold -> live -> publishes an ATTESTED entry to L2
+      # (the "mirror" remote) by end of run (the deferred-put flush).
+      let rr1 = runTests(opts)
+      check rr1.status == rsOk
+      check rr1.results.len == 1
+      check rr1.results[0].cacheDecision == cdmStored
+      check remoteHasAnyEntry(remoteRoot)
+
+      # $CRISOL_CACHE_SIGN_KEY must be gone from THIS process's env by now
+      # (api.nim's resolveCacheSecrets scrubs it immediately after
+      # resolving it) -- proves the delEnv half of C5a's scope too.
+      check getEnv("CRISOL_CACHE_SIGN_KEY") == ""
+
+      let entryPath = findStoredEntryJson(remoteRoot)
+      let stored = parseJson(readFile(entryPath))
+      check stored.hasKey("attestation")
+      check stored["attestation"]["sigAlg"].getStr == "ed25519"
+      check stored["attestation"]["signer"].getStr == pubKeyB64
+
+      # Wipe l1 -- only the remote (verifying) tier can serve now.
+      removeDir(projectRoot / ".crisol" / "cache")
+
+      # Run 2: a READ-ONLY (verify-only) participant -- deliberately NO
+      # $CRISOL_CACHE_SIGN_KEY set at all (RFC-0005 "no-seed verify-only
+      # mode" proven through the real entry point, not just the policy in
+      # isolation). It still verifies what run 1 signed, using only the
+      # pinned public key already in crisol.kdl.
+      check getEnv("CRISOL_CACHE_SIGN_KEY") == ""
+      let rr2 = runTests(opts)
+      check rr2.status == rsOk
+      check rr2.results.len == 1
+      let r2 = rr2.results[0]
+      check r2.cacheDecision == cdmHit
+      check r2.cacheTier == "mirror"
+      check r2.cacheLookup == cvOk
+
+      # Wire-level assertion (RFC's own DoD wording, verbatim): the run/v2
+      # render, not just the in-process EntrypointResult.
+      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let epNode = node["entrypoints"][0]
+      check epNode["cacheTier"].getStr == "mirror"
+      check epNode["cacheDecision"].getStr == "hit"
 
 # ---------------------------------------------------------------------------
 # RFC-0005 A2c-ii — the post-compile consult, through the REAL entry point

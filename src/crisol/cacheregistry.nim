@@ -67,6 +67,14 @@ import crisol/cachetelemetry
 import crisol/cachetrust
 
 export cachetelemetry
+# RFC-0005 C5a: re-exports `cachetrust`'s public surface -- notably its
+# `PublicKey` re-export (itself re-exported from `sello`, needed to name
+# `seq[PublicKey]` below) and `ed25519Policy`/`decodeSignSeedB64`/
+# `decodePinnedKeyB64` -- so a caller of THIS module (e.g. a test building
+# `CacheConfig`/`CacheSecrets` fixtures) never needs its own `import
+# crisol/cachetrust` line. `cachetrust.nim` stays the only module with a
+# bare `import sello`/`import nimcrypto`.
+export cachetrust
 
 type
   BackendFactory* = proc(tier: RemoteTier; token: string): CacheBackend {.closure.}
@@ -163,15 +171,36 @@ type
     ## `resolveCacheSecrets`) and moves it into the `productionCacheDeps`
     ## closure; `configuredCache` (below) is the ONLY consumer.
     ##
-    ## `hmacKey` is the only field C4 needs (`$CRISOL_CACHE_HMAC_KEY`).
-    ## The RFC's end-state sketch also carries `signSeed: Option[sello.
-    ## Seed]` (ed25519, `$CRISOL_CACHE_SIGN_KEY`) and `httpTokens: Table[
-    ## string, string]` (`$CRISOL_CACHE_TOKEN[_<TIER>]`, C3b) -- neither is
-    ## added yet: this module has no consumer for either until C5a/C3b
-    ## land (a field nothing reads is exactly the dead substrate the
-    ## standing rules forbid), and `signSeed` would additionally pull
-    ## `sello` into this module's public surface ahead of its own slice.
-    hmacKey*: Option[string]
+    ## `hmacKey` (`$CRISOL_CACHE_HMAC_KEY`) is C4's field. `signSeedB64` (RFC-
+    ## 0005 C5a: raw `$CRISOL_CACHE_SIGN_KEY`, base64 of the 32-byte ed25519
+    ## seed, "" if absent) is decoded into a `sello.Seed` ON DEMAND, inside
+    ## `buildTrustPolicy`'s "ed25519" branch below, via `cachetrust.
+    ## decodeSignSeedB64` -- NOT eagerly here.
+    ##
+    ## **Judgment call (recorded):** the RFC's own inline sketch has
+    ## `api.nim` decode straight to `Option[sello.Seed]` and move THAT into
+    ## `CacheSecrets`/`ed25519Policy`. That does not typecheck through this
+    ## codebase's ACTUAL plumbing: `productionCacheDeps` (below) resolves
+    ## `CacheSecrets` ONCE and captures it in a `{.closure.}` `buildRuntime`
+    ## whose type permits more than one call; Nim's move analysis (correctly)
+    ## refuses to move a field out of a value shared by a closure's captured
+    ## environment, since a second call would then observe an
+    ## already-moved-from `Seed`. `sello.Seed`'s `=copy {.error.}` (by
+    ## design -- see `sello/signing.nim`) forecloses the alternative of just
+    ## copying it instead. Keeping the RAW STRING here (trivially copyable,
+    ## exactly like `hmacKey` already is) and decoding it FRESH on every
+    ## `buildTrustPolicy` call sidesteps the conflict entirely: each decode
+    ## produces its own independent, freshly-owned `Option[Seed]` temporary,
+    ## which is unconditionally safe to move into `ed25519Policy`'s `sink`
+    ## parameter no matter how many times `buildTrustPolicy` runs. The ONE
+    ## place the RFC's own "Keypair captured in the sign closure is
+    ## destroyed when CacheRuntime drops" guarantee actually matters --
+    ## the constructed `Keypair` inside `ed25519Policy`'s closure -- is
+    ## unaffected: it is still built exactly once, there, per `TieredCache`.
+    ## `httpTokens: Table[string, string]` (`$CRISOL_CACHE_TOKEN[_<TIER>]`,
+    ## C3b) is NOT added yet -- no consumer until that slice.
+    hmacKey*:     Option[string]
+    signSeedB64*: string
 
 proc buildTrustPolicy(trust: TrustConfig; secrets: CacheSecrets): TrustPolicy =
   ## RFC-0005 C4 "Misconfiguration is a config error, not a silent dead
@@ -194,8 +223,25 @@ proc buildTrustPolicy(trust: TrustConfig; secrets: CacheSecrets): TrustPolicy =
         "config: cache-trust policy 'hmac' requires $CRISOL_CACHE_HMAC_KEY to be set")
     hmacPolicy(secrets.hmacKey.get, trust.keyId)
   of "ed25519":
-    raise newCrisolError(cekConfig,
-      "config: cache-trust policy 'ed25519' is not yet implemented (RFC-0005 C5a)")
+    # RFC-0005 C5a: zero `pinned-key`s is a config error (an unverifiable,
+    # trust-nobody policy is exactly the "silent dead tier" the RFC forbids)
+    # -- checked BEFORE decoding, so the error names the real problem
+    # (nothing pinned) rather than an incidental empty-loop no-op. A
+    # missing `secrets.signSeedB64` is NOT rejected here: a read-only
+    # (verify-only) participant is a legitimate deployment (RFC "no-seed
+    # verify-only mode").
+    if trust.pinnedKeys.len == 0:
+      raise newCrisolError(cekConfig,
+        "config: cache-trust policy 'ed25519' requires at least one 'pinned-key'")
+    var pinned: seq[PublicKey] = @[]
+    for raw in trust.pinnedKeys:
+      let pk = decodePinnedKeyB64(raw)
+      if pk.isNone:
+        raise newCrisolError(cekConfig,
+          "config: cache-trust 'pinned-key' is not a valid base64 32-byte " &
+          "ed25519 public key: '" & raw & "'")
+      pinned.add pk.get
+    ed25519Policy(decodeSignSeedB64(secrets.signSeedB64), pinned)
   else:
     # Unreachable in practice: config.nim's parser already restricts
     # `policy` to {none, hmac, ed25519}. Kept as a defensive fail-closed
@@ -285,6 +331,11 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
   ##     cannot verify anything, so honoring it silently would make every
   ##     read on that tier a silent miss, indistinguishable from a cold
   ##     cache).
+  ##   - **C5a:** `cache-trust policy "ed25519"` with zero `pinned-key`s, or
+  ##     any `pinned-key` that does not decode to a valid base64 32-byte
+  ##     ed25519 public key (`buildTrustPolicy`, above) — a MISSING
+  ##     `$CRISOL_CACHE_SIGN_KEY` is NOT one of these: a read-only
+  ##     (verify-only) participant is a legitimate deployment.
   ##
   ## **`verify-trust` default (RFC, round 3, C4-live): `cache-trust.policy
   ## != "none"`.** An explicit `verify-trust #true`/`#false` on a remote

@@ -78,7 +78,7 @@
 ##      C4) while honoring an explicit override; the built tier is exercised
 ##      live through the real file backend.
 
-import std/[json, options, os, strutils, tables]
+import std/[base64, json, options, os, strutils, tables]
 import crisol/types
 import crisol/keys
 import crisol/cacheport
@@ -87,6 +87,10 @@ import crisol/cachetier
 import crisol/cachememory
 import crisol/cachelocalfs
 import crisol/cachetelemetry  # RFC-0005 A3a: backfillErrEvents/aggregateCacheStats wiring
+import sello                  # RFC-0005 C5a: test-only fixture construction (Seed/
+                               # Keypair/PublicKey) for the real ed25519Policy wiring
+                               # through configuredCache -- cachetrust.nim stays the
+                               # only PRODUCTION module importing sello.
 import crisol/cacheregistry   # RFC-0005 A3a: BackendRegistry/buildBackend
 import crisol/resultcache
 import crisol/depgraph  # fnv1a64/toHex16 -- recompute a matching checksum by hand (6b)
@@ -1137,12 +1141,15 @@ block test_configured_cache_rejects_hmac_policy_without_secret_even_with_no_remo
     assert e.kind == cekConfig
   assert caught, "policy 'hmac' with no secret must be a config error even with zero remotes"
 
-block test_configured_cache_rejects_ed25519_policy_not_yet_implemented:
-  let sd = freshStateDir14("ed25519_notyet")
-  let remoteRoot = freshLocalFsRoot("configuredcache_ed25519_notyet")
+block test_configured_cache_rejects_ed25519_policy_with_zero_pinned_keys:
+  # RFC-0005 C5a: `policy "ed25519"` with zero `pinned-key`s is a config
+  # error, not a silently-inert (unverifiable, unforgeable-by-nobody) trust
+  # layer -- mirrors hmac-without-secret above.
+  let sd = freshStateDir14("ed25519_nopinned")
+  let remoteRoot = freshLocalFsRoot("configuredcache_ed25519_nopinned")
   let cfg = CacheConfig(
     remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
-    trust:   TrustConfig(policy: "ed25519"),
+    trust:   TrustConfig(policy: "ed25519"),  # pinnedKeys left empty
   )
   var caught = false
   try:
@@ -1151,7 +1158,58 @@ block test_configured_cache_rejects_ed25519_policy_not_yet_implemented:
   except CrisolError as e:
     caught = true
     assert e.kind == cekConfig
-  assert caught, "policy 'ed25519' is C5a's job -- must be a clear config error, not a silent none"
+  assert caught, "policy 'ed25519' with zero pinned-keys must be a config error"
+
+block test_configured_cache_rejects_ed25519_policy_with_malformed_pinned_key:
+  # A `pinned-key` string that doesn't decode to a 32-byte ed25519 public
+  # key is ALSO a config error -- never a silently-dropped/ignored entry.
+  let sd = freshStateDir14("ed25519_badpinned")
+  let remoteRoot = freshLocalFsRoot("configuredcache_ed25519_badpinned")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+    trust:   TrustConfig(policy: "ed25519", pinnedKeys: @["not-valid-base64!!!"]),
+  )
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a malformed pinned-key must be a config error"
+
+block test_configured_cache_wires_ed25519_policy_end_to_end:
+  # A genuine two-tier flow, real ed25519Policy: sign at put (this host
+  # holds $CRISOL_CACHE_SIGN_KEY's decoded seed), verify at lookup, over
+  # the real localFs backend -- mirrors the hmac wiring test above.
+  let sd = freshStateDir14("ed25519_e2e")
+  let remoteRoot = freshLocalFsRoot("configuredcache_ed25519_e2e")
+  let seedBytes: array[32, byte] = [
+    byte 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6,
+    7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2]
+  let pubKeyB64 = base64.encode(toBytes(keypair(toSeed(seedBytes)).public))
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+    trust:   TrustConfig(policy: "ed25519", pinnedKeys: @[pubKeyB64]),
+  )
+  var rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           secrets = CacheSecrets(signSeedB64: base64.encode(seedBytes)),
+                           sink = NilSink[TelemetryEvent]())
+  assert rt.cache.tiers[1].verifyTrust == true, "no explicit verify-trust -- default is policy != none"
+  let key = SoundnessKey("e5e5e5e5e5e5e5e5")
+  let putVerdicts = rt.cache.put(sampleEntry(key, exitCode = 5))
+  assert putVerdicts == @[(tier: "l1", verdict: cvOk), (tier: "mirror", verdict: cvOk)]
+
+  # A verify-only consumer (no $CRISOL_CACHE_SIGN_KEY of its own, only the
+  # SAME pinned public key) must still be able to serve what the signer
+  # above published -- proves configuredCache's "no-seed verify-only mode"
+  # wiring, not just the policy in isolation.
+  var rtVerifyOnly = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                                     secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  let l = rtVerifyOnly.cache.lookup(key)
+  assert l.hit.isSome
+  assert l.hit.get.verified == true
+  assert l.hit.get.tier == "l1"
 
 block test_configured_cache_wires_hmac_policy_end_to_end:
   # A genuine two-tier flow, real hmacPolicy: sign at put, verify at

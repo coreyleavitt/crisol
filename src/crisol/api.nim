@@ -989,9 +989,9 @@ const CrisolCacheSecretPrefix = "CRISOL_CACHE_"
   ## `sandbox` for its public surface only.
 
 proc resolveCacheSecrets(): CacheSecrets =
-  ## RFC-0005 C4 "resolved once in api.nim from env, then delEnv'd":
-  ## reads every secret this slice knows about ($CRISOL_CACHE_HMAC_KEY),
-  ## THEN scrubs the WHOLE `CRISOL_CACHE_*` namespace from the process
+  ## RFC-0005 C4/C5a "resolved once in api.nim from env, then delEnv'd":
+  ## reads every secret this slice knows about ($CRISOL_CACHE_HMAC_KEY,
+  ## $CRISOL_CACHE_SIGN_KEY), THEN scrubs the WHOLE `CRISOL_CACHE_*` namespace from the process
   ## environment — not merely the vars just read — so a var this slice
   ## does not yet consume (e.g. a future $CRISOL_CACHE_TOKEN, C3b) can
   ## never reach a `--hermetic none` child's full-parent-env passthrough
@@ -1003,8 +1003,15 @@ proc resolveCacheSecrets(): CacheSecrets =
   ## only in the `CacheSecrets` value returned here (and whatever closure
   ## captures it) from this point on — no cache module ever calls `getEnv`.
   let hmacKey = getEnv("CRISOL_CACHE_HMAC_KEY")
+  # RFC-0005 C5a: $CRISOL_CACHE_SIGN_KEY (base64 of the 32-byte ed25519
+  # seed) is captured here as the RAW STRING (not yet decoded to a
+  # `sello.Seed`) -- see `CacheSecrets.signSeedB64`'s doc comment
+  # (`cacheregistry.nim`) for why: the actual base64 -> `Seed` decode
+  # happens fresh, on demand, inside `buildTrustPolicy`'s "ed25519" branch.
+  let signSeedB64 = getEnv("CRISOL_CACHE_SIGN_KEY")
   result = CacheSecrets(
-    hmacKey: if hmacKey.len > 0: some(hmacKey) else: none(string),
+    hmacKey:     if hmacKey.len > 0: some(hmacKey) else: none(string),
+    signSeedB64: signSeedB64,
   )
   for name in toSeq(envPairs()).mapIt(it.key):
     if name.startsWith(CrisolCacheSecretPrefix):

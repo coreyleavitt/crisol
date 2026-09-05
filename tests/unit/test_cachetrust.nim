@@ -25,14 +25,31 @@
 ## (see `test_cachewire.nim`/`test_cachetier.nim`'s localFs section, and
 ## `test_api.nim`'s E2E-2 for the full on-disk tamper proof).
 ##
+## RFC-0005 C5a adds:
+##   9.  ed25519 roundtrip: `sign` attaches an `ed25519` `Attestation` whose
+##       `signer` is `base64(toBytes(pk))`; `verify` -> `cvOk` against the
+##       pinned set.
+##   10. No-seed verify-only mode: a policy built with `none(Seed)` (no
+##       signing secret held) still verifies an entry signed by a DIFFERENT
+##       policy that shares the same pinned public key, and its OWN `sign`
+##       is a documented no-op (never sets an attestation).
+## The full rejection matrix (tamper / unpinned / signer-mismatch /
+## unknown-alg) is C5b's job -- out of scope here.
+##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_cachetrust.nim
 
-import std/[options]
+import std/[base64, options]
 import crisol/cacheport
 import crisol/cachetrust
 import crisol/cachewire       # storageFormatVersion
 import crisol/process/types as ptypes
+import sello                  # RFC-0005 C5a: test-only fixture construction
+                               # (Seed/Keypair/PublicKey) -- cachetrust.nim
+                               # stays the only PRODUCTION module importing
+                               # sello; this test file reaches for the raw
+                               # constructors the same way
+                               # test_cdep_crypto_smoke.nim already does.
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_cachetier.nim's sampleCachedResult/sampleEntry)
@@ -165,5 +182,56 @@ block test_none_policy_unconditional_ok:
   let e = sampleEntry(SoundnessKey("8888888888888888"))
   assert e.attestation.isNone
   assert policy.verify(e) == cvOk
+
+# ---------------------------------------------------------------------------
+# ed25519 fixtures (RFC-0005 C5a)
+# ---------------------------------------------------------------------------
+
+const FixedSeedBytesA: array[32, byte] = [
+  byte 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+  17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+
+proc pubKeyFor(seedBytes: array[32, byte]): PublicKey =
+  keypair(toSeed(seedBytes)).public
+
+# ---------------------------------------------------------------------------
+# 9. ed25519 roundtrip
+# ---------------------------------------------------------------------------
+
+block test_ed25519_roundtrip:
+  let pk = pubKeyFor(FixedSeedBytesA)
+  let policy = ed25519Policy(some(toSeed(FixedSeedBytesA)), @[pk])
+  var e = sampleEntry(SoundnessKey("9999999999999999"))
+  policy.sign(e)
+  assert e.attestation.isSome
+  let att = e.attestation.get
+  assert att.sigAlg == saEd25519
+  assert att.signer == base64.encode(toBytes(pk))
+  assert att.signature.len > 0
+  assert policy.verify(e) == cvOk
+
+# ---------------------------------------------------------------------------
+# 10. No-seed verify-only mode
+# ---------------------------------------------------------------------------
+
+block test_ed25519_no_seed_verify_only:
+  let pk = pubKeyFor(FixedSeedBytesA)
+  let signer = ed25519Policy(some(toSeed(FixedSeedBytesA)), @[pk])
+  var e = sampleEntry(SoundnessKey("aaaaaaaaaaaaaaaa"))
+  signer.sign(e)
+  assert e.attestation.isSome
+
+  # A read-only consumer -- no seed of its own, only the pinned public key --
+  # can still verify what `signer` produced (RFC-0005 "no-seed verify-only
+  # mode").
+  let verifier = ed25519Policy(none(Seed), @[pk])
+  assert verifier.verify(e) == cvOk
+
+  # `sign` on a verify-only policy is a documented no-op (RFC-0005
+  # `TrustPolicy` port doc: "no-op if no secret held") -- never sets an
+  # attestation.
+  var e2 = sampleEntry(SoundnessKey("bbbbbbbbbbbbbbbb"))
+  verifier.sign(e2)
+  assert e2.attestation.isNone
 
 echo "test_cachetrust: all blocks passed"

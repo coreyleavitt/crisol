@@ -251,17 +251,19 @@ type
     ## `config.nim`'s parser against exactly those three strings); `keyId`
     ## is HMAC-only (the operator-chosen `key-id` label, bound into the
     ## signed envelope as `signer` -- RFC-0005 "signer derivation is
-    ## pinned... HMAC: signer = keyId"). `pinnedKeys` (ed25519's
-    ## `pinned-key`, repeatable) is NOT added yet -- C5a's own parser adds
-    ## it alongside `ed25519Policy`; a field with no producer or consumer
-    ## before then would be exactly the dead substrate the standing rules
-    ## forbid.
+    ## pinned... HMAC: signer = keyId"). `pinnedKeys` (RFC-0005 C5a: ed25519's
+    ## `pinned-key`, repeatable, order-preserving) holds the RAW base64
+    ## config strings verbatim -- `cacheregistry.buildTrustPolicy` decodes
+    ## each into a `PublicKey` (a config error on a malformed entry) before
+    ## handing the decoded `seq[PublicKey]` to `cachetrust.ed25519Policy`;
+    ## `config.nim` itself never touches the cache/crypto modules.
     policy*: string = "none"  ## Nim 2's object-construction default: any `CacheConfig(remotes: ...)`
                               ## or `TrustConfig(...)` literal that omits `trust`/`policy` (every
                               ## pre-C4 test fixture, and a KDL doc with no `cache-trust` block)
                               ## gets the honest "none" default, not an empty string that
                               ## `buildTrustPolicy` would otherwise have to special-case.
     keyId*:  string
+    pinnedKeys*: seq[string]
 
   CacheConfig* = object
     ## RFC-0005 A3c-i: the parsed `remote-cache "<name>" { ... }` blocks
