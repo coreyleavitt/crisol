@@ -298,6 +298,70 @@ proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
   result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
   result.run = ptypes.Phase(kind: ptypes.pkCached, res: cr.run)
 
+proc consultReal(pep: PlannedEntrypoint; seams: CacheSeams;
+                 sink: TelemetrySink[TelemetryEvent]): PlanLookup =
+  ## The genuine (non-diagnostic) derive+load+recompute-check+synthesize
+  ## sequence, shared by the two REAL cache-consult call sites this RFC now
+  ## has: `lookupAtPlan`'s plan-time lookup for an `edRunFresh` entrypoint
+  ## (a binary already exists — the RFC-0004 case), and `consultPostCompile`
+  ## (RFC-0005 A2c-ii), the runner's post-compile consult for an
+  ## `edNeverBuilt`/`edStale` entrypoint immediately after a fresh compile —
+  ## the case `lookupAtPlan` could never reach (no binary existed BEFORE
+  ## that compile). Both callers have already confirmed eligibility (their
+  ## own `edecision` gate) and permission (`resolveCacheable().readOk`) —
+  ## this proc only does the consult itself, so the two sites can never
+  ## drift on the recompute rule, the telemetry emission, or the
+  ## PlanLookup shape.
+  ##
+  ## `pep.edecision` is threaded through verbatim as the returned
+  ## `PlanLookup.decision` on a miss/recompute-invalidated result ("edCached
+  ## on hit; otherwise unchanged" — see that field's own doc comment) —
+  ## `edRunFresh` for `lookupAtPlan`'s caller, `edNeverBuilt`/`edStale` for
+  ## `consultPostCompile`'s.
+  let d    = derive(seams, pep)
+  let kStr = $d.key
+  let l    = seams.load(pep, d)
+  # RFC-0005 B2a: the real (non-diagnostic) consult -- exactly one event.
+  # A later recompute-invalidated hit (cdmRecomputeMiss, below) still emits
+  # tekHit here: the cache-level lookup genuinely hit; see
+  # cachetelemetry.aggregateCacheStats's doc for why l1Hits is nonetheless
+  # decision-sourced rather than a raw tekHit count.
+  if l.hit.isSome:
+    sink.emit(TelemetryEvent(kind: tekHit, tier: l.hit.get.tier,
+                             durationMs: l.hit.get.result.run.durationUs div 1000))
+  else:
+    sink.emit(TelemetryEvent(kind: tekMiss, verdicts: l.verdicts))
+  if l.hit.isNone:
+    # RFC-0005 A3b: `lookup` = worst(l) -- the strongest verdict across every
+    # tier CONSULTED (cvMiss on an empty/cold cache; a trust code, e.g.
+    # cvTrustBadSignature, when a verifyTrust tier rejected an entry and the
+    # waterfall found nothing servable -- E2E-A-trust). `tier` stays "" (no
+    # tier served this lookup).
+    return PlanLookup(decision: pep.edecision, cacheDecision: cdmKeyMiss, inputHash: kStr,
+                      synthesized: none(EntrypointResult), explain: l.explain,
+                      tier: "", lookup: worst(l))
+
+  # rfc-0007 A1d-ii / §2: recompute the outcome at THIS trust boundary, never
+  # read it from storage.  A hit whose recomputed outcome is not oPassed is
+  # treated as a MISS and rerun — a derivation or policy change must never
+  # serve a stale/invalidated pass from cache forever with no rerun path.
+  let synth = synthesize(pep, l.hit.get.result, kStr)
+  if outcome(synth) != oPassed:
+    # RFC-0005 A3b (judgment call): the CACHE lookup itself genuinely hit
+    # (l.hit.isSome) -- `lookup` stays cvOk, honestly describing that fact;
+    # `tier` names which tier had the now-invalidated entry. Neither reaches
+    # the wire as "served" (EntrypointResult.cacheTier stays "" here) --
+    # only the runner's HIT stamp site copies `tier` onto a result, and this
+    # branch returns `synthesized: none`, so it never takes that path; the
+    # live rerun's own stamp threads `lookup` (cvOk) alongside cacheDecision
+    # "recomputeMiss" -- an honest, if unusual, combination: the lookup
+    # succeeded, a later check invalidated it.
+    return PlanLookup(decision: pep.edecision, cacheDecision: cdmRecomputeMiss,
+                      inputHash: kStr, synthesized: none(EntrypointResult),
+                      explain: l.explain, tier: l.hit.get.tier, lookup: cvOk)
+  PlanLookup(decision: edCached, cacheDecision: cdmHit, inputHash: kStr,
+             synthesized: some(synth), tier: l.hit.get.tier, lookup: cvOk)
+
 proc lookupAtPlan*(
   pep:    PlannedEntrypoint;
   policy: CachePolicy;
@@ -307,14 +371,17 @@ proc lookupAtPlan*(
 ): PlanLookup =
   ## Decide whether `pep` can be served from cache.
   ##
-  ## RFC-0005 B2a: on the REAL (non-diagnostic) consult below, emits exactly
-  ## one `tekHit`/`tekMiss` through `sink` — see `cachetelemetry.nim`'s
-  ## module doc for why this proc, not `realSeams.load`, owns the emission
-  ## (the diagnostic consult a few lines down calls that SAME `load` closure
-  ## and must emit nothing).
+  ## RFC-0005 B2a: on the REAL (non-diagnostic) consult (`consultReal`
+  ## below), emits exactly one `tekHit`/`tekMiss` through `sink` — see
+  ## `cachetelemetry.nim`'s module doc for why this proc, not
+  ## `realSeams.load`, owns the emission (the diagnostic consult a few
+  ## lines down calls that SAME `load` closure and must emit nothing).
   ##
   ## Only `edRunFresh` entrypoints are eligible (a fresh binary is required for
-  ## edCached).  edNeverBuilt / edStale are `cdmNotEligible` (cache not consulted).
+  ## edCached).  edNeverBuilt / edStale are `cdmNotEligible` HERE (cache not
+  ## consulted AT PLAN TIME) -- RFC-0005 A2c-ii adds a SECOND real consult
+  ## for exactly those two decisions, later, once a fresh compile makes a
+  ## binary exist: see `consultPostCompile`, the runner's own caller.
   ##
   ## On an eligible entrypoint:
   ##   - policy disabled (--no-cache) OR group cacheable #false
@@ -368,53 +435,43 @@ proc lookupAtPlan*(
     return PlanLookup(decision: edRunFresh, cacheDecision: res.decision,
                       inputHash: "", synthesized: none(EntrypointResult))
 
-  # Eligible + caching on: derive the soundness key once (RFC-0005 A2b).
-  # Surface it on the lookup so the runner can stamp it onto BOTH a hit
-  # (synthesized) and a live miss — run/v1 reports inputHash whenever the
-  # cache was actually consulted.
-  let d    = derive(seams, pep)
-  let kStr = $d.key
-  let l    = seams.load(pep, d)
-  # RFC-0005 B2a: the real (non-diagnostic) consult -- exactly one event.
-  # A later recompute-invalidated hit (cdmRecomputeMiss, below) still emits
-  # tekHit here: the cache-level lookup genuinely hit; see
-  # cachetelemetry.aggregateCacheStats's doc for why l1Hits is nonetheless
-  # decision-sourced rather than a raw tekHit count.
-  if l.hit.isSome:
-    sink.emit(TelemetryEvent(kind: tekHit, tier: l.hit.get.tier,
-                             durationMs: l.hit.get.result.run.durationUs div 1000))
-  else:
-    sink.emit(TelemetryEvent(kind: tekMiss, verdicts: l.verdicts))
-  if l.hit.isNone:
-    # RFC-0005 A3b: `lookup` = worst(l) -- the strongest verdict across every
-    # tier CONSULTED (cvMiss on an empty/cold cache; a trust code, e.g.
-    # cvTrustBadSignature, when a verifyTrust tier rejected an entry and the
-    # waterfall found nothing servable -- E2E-A-trust). `tier` stays "" (no
-    # tier served this lookup).
-    return PlanLookup(decision: edRunFresh, cacheDecision: cdmKeyMiss, inputHash: kStr,
-                      synthesized: none(EntrypointResult), explain: l.explain,
-                      tier: "", lookup: worst(l))
+  # Eligible + caching on: consultReal derives the soundness key once
+  # (RFC-0005 A2b) and surfaces it on the lookup so the runner can stamp it
+  # onto BOTH a hit (synthesized) and a live miss — run/v1 reports
+  # inputHash whenever the cache was actually consulted.
+  consultReal(pep, seams, sink)
 
-  # rfc-0007 A1d-ii / §2: recompute the outcome at THIS trust boundary, never
-  # read it from storage.  A hit whose recomputed outcome is not oPassed is
-  # treated as a MISS and rerun — a derivation or policy change must never
-  # serve a stale/invalidated pass from cache forever with no rerun path.
-  let synth = synthesize(pep, l.hit.get.result, kStr)
-  if outcome(synth) != oPassed:
-    # RFC-0005 A3b (judgment call): the CACHE lookup itself genuinely hit
-    # (l.hit.isSome) -- `lookup` stays cvOk, honestly describing that fact;
-    # `tier` names which tier had the now-invalidated entry. Neither reaches
-    # the wire as "served" (EntrypointResult.cacheTier stays "" here) --
-    # only the runner's HIT stamp site copies `tier` onto a result, and this
-    # branch returns `synthesized: none`, so it never takes that path; the
-    # live rerun's own stamp threads `lookup` (cvOk) alongside cacheDecision
-    # "recomputeMiss" -- an honest, if unusual, combination: the lookup
-    # succeeded, a later check invalidated it.
-    return PlanLookup(decision: edRunFresh, cacheDecision: cdmRecomputeMiss,
-                      inputHash: kStr, synthesized: none(EntrypointResult),
-                      explain: l.explain, tier: l.hit.get.tier, lookup: cvOk)
-  PlanLookup(decision: edCached, cacheDecision: cdmHit, inputHash: kStr,
-             synthesized: some(synth), tier: l.hit.get.tier, lookup: cvOk)
+proc consultPostCompile*(
+  pep:    PlannedEntrypoint;
+  policy: CachePolicy;
+  seams:  CacheSeams;
+  sink:   TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
+): PlanLookup =
+  ## RFC-0005 A2c-ii: the post-compile cache consult. `pep.edecision` is
+  ## `edNeverBuilt`/`edStale` here -- `lookupAtPlan`'s edRunFresh-only gate
+  ## never gave this entrypoint a real consult AT PLAN TIME, because no
+  ## binary existed yet to serve from cache. The runner (`finalizeSlot`)
+  ## calls this exactly once, immediately after a THIS-run compile
+  ## succeeds and `recordClosure` records its outcome (RFC-0005 A2c-i) --
+  ## `seams.keyOf`'s `closureContentHash` therefore reads the JUST-updated
+  ## depgraph entry, deriving the SAME key a later run's plan-time lookup
+  ## would derive for this exact content (the whole point: a hit here means
+  ## some other host/run already published this exact closure).
+  ##
+  ## Callers MUST call this only when the closure was recorded successfully
+  ## — see `finalizeSlot`'s own `rec.ok` guard; an unrecorded/invalidated
+  ## closure cannot be trusted to derive a correct key (the same reasoning
+  ## R9's store-gate already applies on the write side, applied here on the
+  ## read side).
+  ##
+  ## Shares `resolveCacheable` + `consultReal` with `lookupAtPlan` so the
+  ## --no-cache / group-opt-out precedence and the recompute/telemetry
+  ## rules can never drift between the two real consult sites.
+  let res = resolveCacheable(policy, pep.cacheable)
+  if not res.readOk:
+    return PlanLookup(decision: pep.edecision, cacheDecision: res.decision,
+                      inputHash: "", synthesized: none(EntrypointResult))
+  consultReal(pep, seams, sink)
 
 # ---------------------------------------------------------------------------
 # Store gate — decide whether a freshly-run result should be cached

@@ -30,6 +30,21 @@
 ## predict the subprocess's PID or filesystem permissions (the container
 ## runs as root, so a chmod-based fault would not work).
 ##
+## `--no-cache` on every `run` invocation (RFC-0005 A2c-ii): this test's
+## ONLY signal for "which binary actually ran" is an out-of-band marker
+## file the fixture writes as a side effect -- a proxy that is meaningless
+## once a run can be legitimately CACHE-SERVED (a hit never spawns the
+## binary, so the marker is never rewritten, even though the recompile
+## step 3 checks for still genuinely happened). Step 3 reverts the source
+## back to its step-1 content, which the depgraph's own persist-failure
+## fix (this test's actual target) correctly forces to RECOMPILE rather
+## than trust a stale entry -- but that recompiled content is, by
+## construction, identical to step 1's, so RFC-0005 A2c-ii's post-compile
+## consult then correctly finds step 1's own cache entry and serves it
+## instead of re-running. That is caching working exactly as designed; it
+## is simply orthogonal to issue #13.3's provenance invariant, which this
+## test isolates by disabling the cache entirely.
+##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_issue13_persist_failure.nim
@@ -140,7 +155,7 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
     let markerPath = root / "marker.txt"
 
     # Step 1: full run, marker == "1".
-    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
+    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
     check full.code == 0
     check fileExists(markerPath)
     check readFile(markerPath).strip == "1"
@@ -165,7 +180,7 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
     removeFile(tmpFaultDir)
     createDir(tmpFaultDir)
 
-    let broken = captureBoth(@["run", "--config", root / "crisol.kdl", "--json"])
+    let broken = captureBoth(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
     check readFile(markerPath).strip == "2"
     check "could not record its source closure" in broken.stderr
     check "dependency graph could not be persisted" in broken.stderr
@@ -186,6 +201,6 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
     removeDir(tmpFaultDir)
     writeFile(epPath, markerBody(root, "1"))
 
-    let reverted = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
+    let reverted = captureStdout(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
     check reverted.code == 0
     check readFile(markerPath).strip == "1"

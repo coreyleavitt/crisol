@@ -115,16 +115,22 @@ suite "B1c CLI — --explain-miss over --json: kcFlags on a flag change":
         check kd["curr"].getStr.len > 0
         check kd["prev"].getStr != kd["curr"].getStr
     check sawFlags
-    # Documented, not hidden (coordinator ruling item 4): a flag change
-    # makes this entrypoint recompile (edNeverBuilt -- planner.slug hashes
-    # ALL flags into the bin dir), so the depgraph has no (path, NEW
-    # flagHash) entry yet at the diagnostic consult -- keyOfProc derives a
-    # degenerate ("") closureContentHash for it, which legitimately diffs
-    # against the sidecar's real recorded hash from the populate run. This
-    # is an HONEST (if incidental) kcClosure line, not a bug to suppress.
-    # kcArgv also genuinely differs: argv's stable surrogate is
+    # A flag change makes this entrypoint recompile (edNeverBuilt --
+    # planner.slug hashes ALL flags into the bin dir). Before RFC-0005
+    # A2c-ii, the ONLY explain available for a recompiling entrypoint was
+    # B1c's plan-time DIAGNOSTIC consult, taken before the depgraph had a
+    # (path, NEW flagHash) entry -- keyOfProc derived a degenerate ("")
+    # closureContentHash there, which spuriously diffed against the
+    # sidecar's real recorded hash (an honest but incidental kcClosure
+    # line). A2c-ii's post-compile consult (finalizeSlot, right after THIS
+    # compile finishes) now runs a SECOND, REAL explain over the
+    # JUST-updated depgraph entry -- its correct closureContentHash matches
+    # the sidecar's (the source never changed, only the flags did), so the
+    # incidental kcClosure noise is gone: the post-compile explain, being
+    # strictly more accurate, is what the live result actually reports.
+    # kcArgv still genuinely differs: argv's stable surrogate is
     # `<slug>/<binName>`, and slug is itself flag-dependent.
-    check "kcClosure" in componentsSeen
+    check "kcClosure" notin componentsSeen
     check "kcArgv" in componentsSeen
 
     # The human explanation goes to STDERR in --json mode; stdout carries

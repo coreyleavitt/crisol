@@ -169,7 +169,13 @@ suite "execute — cache MISS stores on attempt-1 pass":
     check not results[0].cached
     # A real isolated run on this host should achieve hermeticity → stored once.
     check ms.storeCalls == 1
-    check ms.loadCalls == 0     # edNeverBuilt is not eligible for plan-time lookup
+    # RFC-0005 A2c-ii: edNeverBuilt is NOT eligible for the PLAN-TIME lookup
+    # (lookupAtPlan's own edRunFresh-only gate), but IS eligible for the
+    # post-compile consult, right after this compile finishes -- the mock
+    # cache is genuinely empty at that point (nothing stored yet), so it is
+    # a real, consulted MISS: exactly one `load` call, then the live run
+    # proceeds and the store gate fires once, same as before this slice.
+    check ms.loadCalls == 1
 
 # ---------------------------------------------------------------------------
 # 4. NO-CACHE — empty seams: live run, never stores

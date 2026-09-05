@@ -431,6 +431,104 @@ suite "lookupAtPlan — diagnostic consult for non-edRunFresh entrypoints (RFC-0
     check c2.loadCalls == 1
 
 # ---------------------------------------------------------------------------
+# RFC-0005 A2c-ii: consultPostCompile — the real consult for a
+# JUST-compiled edNeverBuilt/edStale entrypoint (never eligible for
+# lookupAtPlan's edRunFresh-only gate, since no binary existed before the
+# compile that just happened).
+# ---------------------------------------------------------------------------
+
+suite "consultPostCompile — post-compile consult (RFC-0005 A2c-ii)":
+
+  test "edNeverBuilt hit -> edCached, synthesized, cdmHit, tier/lookup populated":
+    var c: Calls
+    let look = consultPostCompile(freshPep(edNeverBuilt), onPolicy, seamsHit(c, sampleCached()))
+    check look.decision == edCached
+    check look.cacheDecision == cdmHit
+    check look.synthesized.isSome
+    let s = look.synthesized.get
+    check cached(s)
+    check outcome(s) == oPassed
+    check look.lookup == cvOk
+    check c.loadCalls == 1
+
+  test "edStale hit -> edCached, synthesized, cdmHit (same real consult as edNeverBuilt)":
+    var c: Calls
+    let look = consultPostCompile(freshPep(edStale), onPolicy, seamsHit(c, sampleCached()))
+    check look.decision == edCached
+    check look.cacheDecision == cdmHit
+    check look.synthesized.isSome
+
+  test "edNeverBuilt miss -> decision stays edNeverBuilt (unchanged), cdmKeyMiss, no synthesis":
+    var c: Calls
+    let look = consultPostCompile(freshPep(edNeverBuilt), onPolicy, seamsMiss(c))
+    check look.decision == edNeverBuilt
+    check look.cacheDecision == cdmKeyMiss
+    check look.synthesized.isNone
+    check c.loadCalls == 1
+
+  test "edStale miss -> decision stays edStale (unchanged), cdmKeyMiss":
+    var c: Calls
+    let look = consultPostCompile(freshPep(edStale), onPolicy, seamsMiss(c))
+    check look.decision == edStale
+    check look.cacheDecision == cdmKeyMiss
+
+  test "policy disabled -> cdmPolicyDisabled, load NOT called, decision unchanged":
+    var c: Calls
+    let look = consultPostCompile(freshPep(edNeverBuilt), offPolicy, seamsHit(c, sampleCached()))
+    check look.decision == edNeverBuilt
+    check look.cacheDecision == cdmPolicyDisabled
+    check look.synthesized.isNone
+    check c.loadCalls == 0
+
+  test "group opt-out (cacheable #false) -> cdmGroupOptOut, load NOT called":
+    var c: Calls
+    var pep = freshPep(edStale)
+    pep.cacheable = csFalse
+    let look = consultPostCompile(pep, onPolicy, seamsHit(c, sampleCached()))
+    check look.cacheDecision == cdmGroupOptOut
+    check look.synthesized.isNone
+    check c.loadCalls == 0
+
+  test "recompute-invalidated hit -> cdmRecomputeMiss, NOT promoted to edCached":
+    var c: Calls
+    var badCr = sampleCached()
+    badCr.run.exit = Exit(kind: ekExited, code: 1)   # now derives oFailed, not oPassed
+    let look = consultPostCompile(freshPep(edNeverBuilt), onPolicy, seamsHit(c, badCr))
+    check look.decision == edNeverBuilt
+    check look.cacheDecision == cdmRecomputeMiss
+    check look.synthesized.isNone
+    check look.inputHash.len > 0   # the cache WAS consulted
+
+  test "hit through the real seam -> exactly one tekHit":
+    let rt = localOnlyCache(getTempDir() / ("crisol_a2cii_tekhit_" & $getCurrentProcessId()), 100)
+    defer: removeDir(rt.localRoot)
+    let sink = newInMemorySink()
+    let ctx = keyContext("nim-v1", "cc-v1", SandboxSpec(), @[], CrisolProtocolMajor)
+    var graph: DepGraph
+    let seams = realSeams(ctx, addr graph, rt)
+    let pep = freshPep(edNeverBuilt)
+    # Warm the cache first via a plain store (as if some other host published
+    # this exact key already) -- consultPostCompile must then see it as a hit.
+    let d = derive(seams, pep)
+    discard seams.store(pep, d, sampleCached())
+    let look = consultPostCompile(pep, onPolicy, seams, sink.sink())
+    check look.cacheDecision == cdmHit
+    check sink.events.len >= 1
+    check sink.events[^1].kind == tekHit
+
+  test "miss through the real seam -> exactly one tekMiss":
+    let rt = localOnlyCache(getTempDir() / ("crisol_a2cii_tekmiss_" & $getCurrentProcessId()), 100)
+    defer: removeDir(rt.localRoot)
+    let sink = newInMemorySink()
+    let ctx = keyContext("nim-v1", "cc-v1", SandboxSpec(), @[], CrisolProtocolMajor)
+    var graph: DepGraph
+    let seams = realSeams(ctx, addr graph, rt)
+    let look = consultPostCompile(freshPep(edStale), onPolicy, seams, sink.sink())
+    check look.cacheDecision == cdmKeyMiss
+    check sink.events.len == 1
+    check sink.events[0].kind == tekMiss
+
+# ---------------------------------------------------------------------------
 # shouldStore gate
 # ---------------------------------------------------------------------------
 

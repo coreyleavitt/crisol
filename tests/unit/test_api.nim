@@ -844,16 +844,14 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
       check rr1.results.len == 1
       check rr1.results[0].cacheDecision == cdmStored
       # First-ever compile: the entrypoint is edNeverBuilt at plan time, not
-      # edRunFresh -- lookupAtPlan's cache-eligibility gate never runs a
-      # real consult for it (no binary exists yet to serve from cache), so
-      # PlanLookup.lookup stays at its cvOk zero value (same "not literally
-      # consulted, degenerate default" case cacheStats.misses already
-      # counts this index under -- see aggregateCacheStats's own doc: the
-      # fold is decision-sourced, not event-sourced, for exactly this
-      # reason). The wire still renders cacheLookup here (cacheDecision
-      # ends up "stored", not one of notConsultedDecisions) -- cvOk is the
-      # honest least-wrong value available.
-      check rr1.results[0].cacheLookup == cvOk
+      # edRunFresh -- lookupAtPlan's OWN plan-time gate never runs a real
+      # consult for it (no binary exists yet to serve from cache). But
+      # RFC-0005 A2c-ii adds a SECOND real consult, post-compile, for
+      # exactly this case (finalizeSlot's consultPostCompile, right after
+      # THIS compile finishes) -- both memory tiers are still genuinely
+      # empty at that instant (this is the very first store), so it is a
+      # real, consulted MISS, not the "never consulted" degenerate default.
+      check rr1.results[0].cacheLookup == cvMiss
 
       # Second call: SAME backends, SAME mock policy -- `verify` now
       # rejects the entry on EVERY consulted tier, so the waterfall finds
@@ -920,13 +918,15 @@ remote-cache "broken" {
 """)
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
 
-      # Run 1: first-ever compile (edNeverBuilt at plan time) never reaches
-      # a real cache consult at all (same "First-ever compile" fact
-      # E2E-A-trust's own test above already documents) -- cacheLookup stays
-      # the not-consulted cvOk zero value regardless of the remote's health.
-      # Live run stores into l1 fine; the broken remote is merely QUEUED and
-      # fails at the end-of-run flush (harmless -- proves nothing about the
-      # offline LOOKUP path this test targets).
+      # Run 1: first-ever compile (edNeverBuilt at plan time). RFC-0005
+      # A2c-ii's post-compile consult DOES run for it now (right after this
+      # compile finishes) -- l1 genuinely misses (cold) and the "broken"
+      # remote is ENOTDIR-offline, so this run's own cacheLookup is itself
+      # cvOffline too (not asserted here -- this test's own target is run
+      # 2's LOOKUP path, below). Either way the live run still stores into
+      # l1 fine; the broken remote is merely QUEUED and fails at the
+      # end-of-run flush (harmless -- proves nothing about the offline
+      # lookup path this test targets).
       let rr1 = runTests(opts)
       check rr1.status == rsOk
       check rr1.results[0].cacheDecision == cdmStored
@@ -996,6 +996,89 @@ remote-cache "mirror" {
 
       # backfill-on-hit (KDL default #true) must have re-seeded l1.
       check remoteHasAnyEntry(projectRoot / ".crisol" / "cache")
+
+# ---------------------------------------------------------------------------
+# RFC-0005 A2c-ii — the post-compile consult, through the REAL entry point
+# (runTests -> planImpl -> execute -> finalizeSlot's consultPostCompile),
+# driven by a REAL crisol.kdl file:// remote -- the load-bearing consumer
+# the A2c-i reorder exists for. A genuinely NEVER-BUILT entrypoint (its own
+# project root, its own stateDir -- no binary, no depgraph, no L1 entry
+# anywhere) can ONLY be served from cache through the post-compile consult:
+# lookupAtPlan's plan-time gate never even looks (edNeverBuilt, not
+# edRunFresh). The full three-run cold-host E2E-1 sequence is A2c-iii's
+# acceptance test, not this one -- this proves the HIT mechanism itself
+# fires end to end: the compile genuinely runs, the run phase never spawns,
+# and the promoted binary + depgraph are trustworthy afterward.
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 A2c-ii — post-compile consult: a genuinely cold project hits a remote already holding this closure":
+
+  test "P2's first-ever compile of an unseen entrypoint HITS the remote P1 published to -- no run child spawned":
+    let remoteRoot = getTempDir() / ("crisol_a2cii_e2e_remote_" & $getCurrentProcessId())
+    removeDir(remoteRoot)
+    createDir(remoteRoot)
+    defer: removeDir(remoteRoot)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n" &
+              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot & "\"\n}\n"
+
+    # Project P1: an ordinary live run publishes this exact closure to the
+    # shared remote (own project root, own stateDir -- P2 below shares
+    # NOTHING with it except the remote).
+    let p1 = getTempDir() / ("crisol_a2cii_e2e_p1_" & $getCurrentProcessId())
+    removeDir(p1)
+    createDir(p1 / "tests" / "unit")
+    defer: removeDir(p1)
+    writeFile(p1 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+    writeFile(p1 / "crisol.kdl", kdl)
+    let rr1 = runTests(RunOptions(configPath: p1 / "crisol.kdl"))
+    check rr1.status == rsOk
+    check rr1.results[0].cacheDecision == cdmStored
+    check remoteHasAnyEntry(remoteRoot)
+
+    # Project P2: a SEPARATE project root + stateDir, IDENTICAL source
+    # content (same closure -> same soundness key), never built before --
+    # a genuinely cold host for this entrypoint. Its compile is
+    # edNeverBuilt at plan time: no binary, no depgraph entry, no P2-local
+    # cache entry exist anywhere. The post-compile consult (A2c-ii) is the
+    # ONLY mechanism that can possibly serve this from cache -- the
+    # plan-time lookupAtPlan gate never even runs for it.
+    let p2 = getTempDir() / ("crisol_a2cii_e2e_p2_" & $getCurrentProcessId())
+    removeDir(p2)
+    createDir(p2 / "tests" / "unit")
+    defer: removeDir(p2)
+    writeFile(p2 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+    writeFile(p2 / "crisol.kdl", kdl)
+    let rr2 = runTests(RunOptions(configPath: p2 / "crisol.kdl"))
+    check rr2.status == rsOk
+    check rr2.results.len == 1
+    let r2 = rr2.results[0]
+    check r2.cacheDecision == cdmHit
+    check r2.cacheTier == "mirror"
+    # RFC-0005 A2c re-baseline: the compile genuinely ran (compile =
+    # Phase(pkRan, ...), compileSkipped == false) even though the run phase
+    # never spawned (run = Phase(pkCached, ...) -- the stored observation
+    # replayed verbatim).
+    check r2.compileSkipped == false
+    check r2.compile.kind == ptypes.pkRan
+    check r2.run.kind == ptypes.pkCached
+    check outcome(r2) == oPassed
+
+    # Wire-level assertion: the run/v2 render, not just the in-process
+    # EntrypointResult.
+    let node = parseJson(toJsonString(rr2.results, rr2.summary))
+    let epNode = node["entrypoints"][0]
+    check epNode["cacheTier"].getStr == "mirror"
+    check epNode["cacheDecision"].getStr == "hit"
+
+    # The just-compiled binary WAS promoted to P2's own stable path (B3's
+    # "every cdmHit has a stable binary" invariant) even though no run
+    # child was ever spawned for it -- proven behaviorally: P2's NEXT run
+    # sees a fresh binary + depgraph entry and skips compiling entirely
+    # (edRunFresh / cdSkipFresh), which is only possible if A2c-ii's hit
+    # path left P2's on-disk state exactly as a real compile+run would have.
+    let rr3 = runTests(RunOptions(configPath: p2 / "crisol.kdl"))
+    check rr3.status == rsOk
+    check rr3.results[0].compileSkipped == true
 
 suite "RFC-0005 A3c-ii — RunOptions.noRemoteCache (--no-remote-cache)":
 

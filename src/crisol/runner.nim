@@ -302,6 +302,21 @@ type
                                    # occupant's outcome.
     closureError:    string        # rfc-0005 A2c-i: `recordClosure`'s error message, paired
                                    # with `closureRecorded` (meaningful only when it is false).
+    postCompileConsulted: bool     # rfc-0005 A2c-ii: true iff finalizeSlot actually ran the
+                                   # post-compile cache consult for THIS compile (cache active,
+                                   # group eligible, closure recorded) AND it fell through to a
+                                   # real run (miss, recompute-invalidated, or a hit whose binary
+                                   # failed to promote) rather than being served as a fkCacheHit.
+                                   # Read back by the post-run cache-store gate so a compiling
+                                   # entrypoint's live result reports the REAL post-compile
+                                   # key/lookup/explain instead of the pre-compile ""/cvOk/[]
+                                   # placeholders. Reset at every slot claim.
+    postCompileInputHash: string   # rfc-0005 A2c-ii: the post-compile consult's derived key
+                                   # string, meaningful only when postCompileConsulted.
+    postCompileLookup:    CacheVerdict  # rfc-0005 A2c-ii: the post-compile consult's
+                                   # PlanLookup.lookup, meaningful only when postCompileConsulted.
+    postCompileExplain:   seq[KeyDiff]  # rfc-0005 A2c-ii: the post-compile consult's
+                                   # PlanLookup.explain, meaningful only when postCompileConsulted.
 
 # ---------------------------------------------------------------------------
 # rfc-0007 A2b: ONE stop/escalate machinery. The timeout path, the interrupt
@@ -449,10 +464,16 @@ type
                      ## unfinalized so the emission-set trim below counts it
                      ## in notStarted.
     fkDone          ## a result was produced; the slot goes idle.
+    fkCacheHit      ## rfc-0005 A2c-ii: compile succeeded AND the post-compile
+                    ## cache consult hit (recomputed outcome oPassed, binary
+                    ## promoted to the stable path) — a result was produced
+                    ## with NO run child ever spawned; the slot goes idle.
+                    ## Terminal like a plan-time edCached hit: never retried,
+                    ## no ledger row.
 
   FinalizeOutcome = object
     case kind: FinalizeKind
-    of fkDone: res: EntrypointResult
+    of fkDone, fkCacheHit: res: EntrypointResult
     of fkTransitioned, fkOmitted: discard
 
 proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
@@ -464,6 +485,15 @@ proc cleanupSlotTmp(slot: Slot)
   ## Forward-declared: defined below (unchanged from pre-A2b) — removes
   ## per-slot temp output files + the A4a scratch tmpdir; deliberately
   ## narrower than cleanupSlotOnTeardown (see that proc's doc comment).
+
+proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string): bool
+  ## Forward-declared: defined below, alongside spawnCompileStable (the
+  ## proc that lays out `binCompiled` in the first place) — copies a
+  ## per-slot compiled binary to its stable slug-keyed path. Shared by the
+  ## post-run promotion (the pre-existing site) and `finalizeSlot`'s
+  ## post-compile cache-hit branch (RFC-0005 A2c-ii), which needs the SAME
+  ## promotion to happen right after compile instead of after a run that
+  ## never spawns.
 
 proc classifyRunResult(
   ep: Entrypoint; output: string; elapsed: int64; compileSkipped: bool;
@@ -484,13 +514,21 @@ proc finalizeSlot(
   config:           Config;
   sourceIndex:      var SourceIndex;
   sourceIndexBuilt: var bool;
+  cache:            CacheContext;
 ): FinalizeOutcome =
   ## Called once `next` has reported weChildExited for `slots[idx].id`.
   ## Reaps it (the only place a ChildId is consumed, §1) and either
   ## transitions a successfully-compiled, un-stopped slot into its run
-  ## phase (fkTransitioned) or produces this pepIdx's EntrypointResult
-  ## (fkDone / fkOmitted). `allowTransition` is false only during interrupt
-  ## teardown.
+  ## phase (fkTransitioned), produces this pepIdx's EntrypointResult
+  ## straight from a post-compile cache hit with no run child ever spawned
+  ## (fkCacheHit — RFC-0005 A2c-ii), or produces this pepIdx's
+  ## EntrypointResult after a run/kill/spawn-failure (fkDone / fkOmitted).
+  ## `allowTransition` is false only during interrupt teardown.
+  ##
+  ## rfc-0005 A2c-ii: `cache` is the SAME `CacheContext` `execute()` resolves
+  ## once for the whole run — passed through so the post-compile consult can
+  ## run at exactly the point the closure/graph are fresh, before deciding
+  ## whether to spawn the run child at all (see the consult block below).
   ##
   ## rfc-0005 A2c-i: `graph`/`config`/`sourceIndex`/`sourceIndexBuilt` exist
   ## solely so a successfully-compiled slot can have its closure extracted
@@ -572,6 +610,50 @@ proc finalizeSlot(
                               binName(pep.ep), CrisolProtocolMajor, sourceIndex)
       slots[idx].closureRecorded = rec.ok
       slots[idx].closureError    = rec.error
+
+      # rfc-0005 A2c-ii: post-compile cache consult. The closure/graph are
+      # NOW fresh (just above) — derive this compile's key and consult the
+      # cache BEFORE spawning the run child. Only attempted when caching is
+      # active AND the closure recorded successfully: an unrecorded/
+      # invalidated closure cannot be trusted to derive a correct key (the
+      # same reasoning R9's store-gate already applies on the write side,
+      # applied here on the read side) — a group opted out of caching, or a
+      # globally-disabled policy, is handled by `consultPostCompile`'s own
+      # `resolveCacheable` gate exactly like the plan-time path.
+      if rec.ok and cache.isActive():
+        let look = consultPostCompile(pep, cache.policy, cache.seams, cache.sink)
+        if look.decision == edCached and look.synthesized.isSome:
+          if promoteCompiledBinary(pep.ep, config, slots[idx].binCompiled):
+            # Genuine post-compile hit: the compile really ran (compile =
+            # pkRan, replacing synthesize's default pkSkipped — the compile
+            # ProcessResult was captured just above onto the slot) while the
+            # run phase replays the stored observation (pkCached) verbatim;
+            # no run child is ever spawned. Terminal immediately, exactly
+            # like a plan-time edCached hit.
+            var res = look.synthesized.get
+            res.compileSkipped = false
+            res.compile        = ptypes.Phase(kind: ptypes.pkRan,
+                                              res: slots[idx].compileProcRes.get)
+            res.cacheTier       = look.tier
+            res.cacheLookup     = look.lookup
+            cleanupSlotTmp(slots[idx])
+            if slots[idx].slotBinDir.len > 0:
+              try: removeDir(slots[idx].slotBinDir) except: discard
+            slots[idx].state = ssIdle
+            return FinalizeOutcome(kind: fkCacheHit, res: res)
+          # Promotion failed: no stable binary would back cdmHit's own
+          # invariant (every cdmHit has a stable binary, B3 relies on it) —
+          # cannot safely serve this as a hit. Fall through to the normal
+          # run path below, exactly like a miss (promoteCompiledBinary
+          # already warned to stderr).
+        # Miss, recompute-invalidated, or a hit whose promotion failed:
+        # stash the REAL post-compile key/lookup/explain so the eventual
+        # live result (once the run below completes) reports them honestly
+        # instead of the pre-compile ""/cvOk/[] plan-time placeholders.
+        slots[idx].postCompileConsulted = true
+        slots[idx].postCompileInputHash = look.inputHash
+        slots[idx].postCompileLookup    = look.lookup
+        slots[idx].postCompileExplain   = look.explain
 
       let ok = transitionToRun(sv, slots[idx], slots[idx].runTimeoutMs, slots[idx].attempt,
                                projectRoot)
@@ -778,6 +860,43 @@ proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
       if not base.endsWith(".o"): continue
       if isModuleObjectName(base): continue
       removeFile(path)
+
+proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string): bool =
+  ## Copy a per-slot compiled binary to its stable slug-keyed path (what
+  ## `decideCompile` checks on future runs) and mark it executable. A no-op
+  ## (returns true) when there is nothing to promote — `binCompiled` empty,
+  ## or already the stable path itself. On any copy/chmod failure, warns to
+  ## stderr and removes whatever partial file landed at the stable path
+  ## (never leave a binary no depgraph entry describes, issue #13.3),
+  ## returning false so the caller can treat "no stable binary" as the
+  ## honest outcome — this is exactly what a genuine post-compile cache hit
+  ## (RFC-0005 A2c-ii) requires before it can be served: `cdmHit` relies on
+  ## a stable binary existing at rest.
+  let bname        = binName(ep)
+  let stableBinDir = binPath(ep, config)
+  let stableBin    = stableBinDir / bname
+  if binCompiled.len == 0 or binCompiled == stableBin:
+    return true
+  try:
+    createDir(stableBinDir)
+    copyFile(binCompiled, stableBin)
+    setFilePermissions(stableBin, {fpUserRead, fpUserWrite, fpUserExec,
+                                   fpGroupRead, fpGroupExec,
+                                   fpOthersRead, fpOthersExec})
+    true
+  except CatchableError as e:
+    # Promotion failed partway (e.g. copyFile succeeded but
+    # setFilePermissions did not) — whatever landed at stableBin has
+    # unknown/partial content and no depgraph entry describes it either
+    # way; discard it so the next run starts from cdNeverBuilt instead of
+    # trusting it. Not exercisable under test as root (chmod-based faults
+    # do not fail for root); this is untested hardening.
+    stderr.write("crisol: warning: " & ep.path &
+                 ": could not promote its compiled binary (" &
+                 e.msg & "); the previous binary was discarded\n")
+    try: stderr.flushFile() except CatchableError: discard
+    try: removeFile(stableBin) except CatchableError: discard
+    false
 
 proc spawnCompileStable(
   sv:               var Supervisor;
@@ -1007,6 +1126,12 @@ proc spawnCompileStable(
                                         # sets this for real once THIS compile succeeds and
                                         # transitions to its run phase.
   slot.closureError    = ""
+  slot.postCompileConsulted = false    # rfc-0005 A2c-ii: reset on every claim; finalizeSlot
+                                        # sets these for real only when THIS compile's
+                                        # post-compile consult falls through to a real run.
+  slot.postCompileInputHash = ""
+  slot.postCompileLookup    = cvOk
+  slot.postCompileExplain   = @[]
   result = true
 
 proc buildRunChildSpec(
@@ -1124,6 +1249,11 @@ proc spawnRunDirect(
   slot.closureRecorded = false         # rfc-0005 A2c-i: cdSkipFresh — no compile,
                                         # so no closure recording either; reset for hygiene.
   slot.closureError    = ""
+  slot.postCompileConsulted = false    # rfc-0005 A2c-ii: cdSkipFresh — no compile, so no
+                                        # post-compile consult either; reset for hygiene.
+  slot.postCompileInputHash = ""
+  slot.postCompileLookup    = cvOk
+  slot.postCompileExplain   = @[]
   result = true
 
 proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
@@ -1519,6 +1649,16 @@ proc execute*(
                                                           # the post-run promotion/cache-
                                                           # store gate below.
         let slotClosureError    = slots[idx].closureError
+        let slotPostCompileConsulted = slots[idx].postCompileConsulted  # rfc-0005
+                                                          # A2c-ii: capture before slot
+                                                          # cleared — set at the compile→run
+                                                          # transition ONLY when the post-
+                                                          # compile consult fell through to a
+                                                          # real run; read by the post-run
+                                                          # cache-store gate below.
+        let slotPostCompileInputHash = slots[idx].postCompileInputHash
+        let slotPostCompileLookup    = slots[idx].postCompileLookup
+        let slotPostCompileExplain   = slots[idx].postCompileExplain
 
         # S6b/rfc-0007 A2b: sample finish-time RSS BEFORE `finalizeSlot`
         # reaps — reap is the only place a ChildId is consumed (§1), and
@@ -1534,7 +1674,8 @@ proc execute*(
                               projectRoot = config.projectRoot.absolutePath.normalizedPath,
                               graph = graph, config = config,
                               sourceIndex = sourceIndex,
-                              sourceIndexBuilt = sourceIndexBuilt)
+                              sourceIndexBuilt = sourceIndexBuilt,
+                              cache = cache)
 
         case fo.kind
         of fkTransitioned:
@@ -1547,6 +1688,24 @@ proc execute*(
           # counts it in notStarted rather than fabricating a "run never
           # started" lie.
           ac.onSlotFinish(slotToken, finishRss)
+        of fkCacheHit:
+          # rfc-0005 A2c-ii: a genuine post-compile cache hit — no run child
+          # was ever spawned, so this mirrors the plan-time edCached hit
+          # block (execute()'s pre-dispatch loop) rather than fkDone's
+          # retry/ledger/store-gate machinery: terminal immediately, no
+          # ledger row (the ledger records executions), no store (a hit is
+          # never re-stored). `shuttingDown` cannot be true here — the
+          # consult only runs when `allowTransition` was true, i.e.
+          # `not shuttingDown` at the time this compile's finalizeSlot call
+          # began.
+          ac.onSlotFinish(slotToken, finishRss)
+          var res = fo.res
+          res.quarantined = isQuarantined(p.entrypoints[completedIdx].ep, res,
+                                          config.quarantine)
+          result[completedIdx] = res
+          finalized[completedIdx] = true
+          inc done
+          onResult(res)
         of fkDone:
           ac.onSlotFinish(slotToken, finishRss)  # S6b: feed real RSS so estJobPeak adapts
           result[completedIdx] = fo.res
@@ -1645,27 +1804,16 @@ proc execute*(
                   # binary paired with a stale or absent depgraph entry.
                   #
                   # Copy per-slot binary to the stable slug-keyed location.
-                  # The stable binary is what decideCompile checks on future runs.
-                  if slotBinCompiled.len > 0 and slotBinCompiled != stableBin:
-                    try:
-                      createDir(stableBinDir)
-                      copyFile(slotBinCompiled, stableBin)
-                      setFilePermissions(stableBin, {fpUserRead, fpUserWrite, fpUserExec,
-                                                     fpGroupRead, fpGroupExec,
-                                                     fpOthersRead, fpOthersExec})
-                    except CatchableError as e:
-                      # Promotion failed partway (e.g. copyFile succeeded but
-                      # setFilePermissions did not) — whatever landed at
-                      # stableBin has unknown/partial content and no depgraph
-                      # entry describes it either way; discard it so the next
-                      # run starts from cdNeverBuilt instead of trusting it.
-                      # Not exercisable under test as root (chmod-based faults
-                      # do not fail for root); this is untested hardening.
-                      stderr.write("crisol: warning: " & ep.path &
-                                   ": could not promote its compiled binary (" &
-                                   e.msg & "); the previous binary was discarded\n")
-                      try: stderr.flushFile() except CatchableError: discard
-                      try: removeFile(stableBin) except CatchableError: discard
+                  # The stable binary is what decideCompile checks on future
+                  # runs. `promoteCompiledBinary` (shared with finalizeSlot's
+                  # post-compile cache-hit branch, RFC-0005 A2c-ii) already
+                  # no-ops when `slotBinCompiled` is empty or already equals
+                  # `stableBin`, and already warns + discards any partial
+                  # `stableBin` on failure — this site's return value is
+                  # intentionally unused, matching the pre-extraction
+                  # behavior exactly (a promotion failure here does not, by
+                  # itself, block a store; only `closureRecorded` below does).
+                  discard promoteCompiledBinary(ep, config, slotBinCompiled)
 
                   # Closure recording itself already happened in `finalizeSlot`,
                   # right after this compile succeeded (rfc-0005 A2c-i) — recovery
@@ -1690,6 +1838,19 @@ proc execute*(
               # finalizeSlot already cleaned this on compile-fail; only clean here on success.
               if compiledThisRun and slotBinDir.len > 0:
                 try: removeDir(slotBinDir) except: discard
+
+              # rfc-0005 A2c-ii: a compiling (edNeverBuilt/edStale) entrypoint's
+              # post-compile consult (finalizeSlot, above) ran a REAL lookup
+              # this attempt — overwrite the plan-time ""/cvOk/[] placeholders
+              # with what it actually found, so the live result below reports
+              # the honest key/lookup/explain instead of "never consulted"
+              # (an edRunFresh entrypoint's plan-time lookupAtPlan values are
+              # already real and untouched here — this only fires for entries
+              # that just compiled).
+              if slotPostCompileConsulted:
+                inputHashes[completedIdx] = slotPostCompileInputHash
+                lookups[completedIdx]     = slotPostCompileLookup
+                explains[completedIdx]    = slotPostCompileExplain
 
               # ---------------------------------------------------------------
               # A6/A7: cache-store gate for a freshly-RUN (not cached) result.

@@ -638,9 +638,11 @@ type
     inputHash*:      string        ## RFC F3 (A8): the soundnessKey string for this entrypoint —
                                    ## the content fingerprint over all soundness inputs.  Wire/JSON
                                    ## name "inputHash".  Populated wherever the key is derived
-                                   ## (cache hit, fresh-run store gate, and plan-time lookup); "" when
-                                   ## caching was not consulted (edNeverBuilt/edStale, --no-cache, or
-                                   ## no seams wired).
+                                   ## (cache hit, fresh-run store gate, plan-time lookup for an
+                                   ## edRunFresh entrypoint, AND — RFC-0005 A2c-ii — the
+                                   ## post-compile consult for a JUST-compiled edNeverBuilt/edStale
+                                   ## one); "" only when caching was not consulted at all
+                                   ## (--no-cache, group cacheable #false, or no seams wired).
     keyDiff*:        seq[KeyDiff]  ## RFC-0005 B1c: populated ONLY on a genuine cache-miss
                                    ## decision (cacheDecision in the "ran live due to a miss"
                                    ## set -- cdmStored/cdmKeyMiss/cdmHermeticityDeg/cdmFlaky/
