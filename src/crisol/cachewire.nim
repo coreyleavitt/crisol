@@ -81,6 +81,52 @@ static:
     "you just bumped."
 
 # ---------------------------------------------------------------------------
+# HttpFetcher transport seam (RFC-0005 "HttpFetcher transport seam (round 3
+# shape)") — lives here per the RFC's module-ownership table ("cachewire.nim
+# owns... HttpRequest/HttpReply/HttpFetcher"), NOT in `cachehttp.nim`: the
+# seam is a vocabulary shared by every HTTP-shaped adapter (`cachehttp.nim`
+# now, an eventual S3 signer later reuses the same request/reply shape),
+# exactly like `CacheSerializer` is a vocabulary shared by every byte-
+# oriented backend. `cachehttp.nim` (the ONE current consumer) imports this
+# module for it, same as it imports `CacheSerializer`.
+#
+# `toTimeout`/`toUnreachable` are the ONLY transport-failure signals — no
+# other field is set in those cases (`HttpReply`'s `case` object enforces
+# this at the type level: `status`/`headers`/`body` exist only under
+# `toOk`). A conforming `HttpFetcher` NEVER raises; `cachehttp.nim`'s
+# adapter additionally treats an ESCAPED exception from a misbehaving
+# fetcher as a transport failure (`cvOffline`) rather than propagating it,
+# so the port's "adapters never raise" contract holds even against a
+# non-conforming double.
+# ---------------------------------------------------------------------------
+
+type
+  HttpRequest* = object
+    meth*, url*: string
+      ## Named fields, not three positional same-typed strings (RFC's own
+      ## stated rationale for this shape).
+    headers*: seq[(string, string)]
+    body*: string
+
+  TransportOutcome* = enum
+    toOk
+    toTimeout
+    toUnreachable
+
+  HttpReply* = object
+    case transport*: TransportOutcome
+    of toOk:
+      status*: int
+      headers*: seq[(string, string)]
+      body*: string
+    else: discard
+
+  HttpFetcher* = proc(req: HttpRequest): HttpReply {.closure.}
+    ## Fully synchronous, no socket knowledge here or in `cachehttp.nim` —
+    ## production wires the raw-`std/net` client (`httpraw.nim`, Stage C1b);
+    ## tests wire a pure in-memory fake server. NEVER raises, by contract.
+
+# ---------------------------------------------------------------------------
 # Limits <-> JSON (KeyInputs' resource-limit-REQUEST component).
 # ---------------------------------------------------------------------------
 
