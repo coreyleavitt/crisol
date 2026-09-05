@@ -58,7 +58,7 @@
 ## check"), and a key missing from a truncated first page is
 ## indistinguishable, from the caller's side, from a key that is genuinely
 ## absent — both degrade to "not reported present", which the RFC's own
-## Stage C3c prefetch (not yet built) will treat as a plan-time miss, i.e. a
+## Stage C3c prefetch treats as a plan-time miss, i.e. a
 ## live rerun that (self-healingly) republishes — exactly the fallback the
 ## RFC already accepts for a dropped signing key ("Entries signed with the
 ## dropped key become misses (self-healing: re-run re-publishes)"). The
