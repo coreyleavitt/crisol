@@ -131,6 +131,21 @@ proc evidenceSatisfies*(spec: SandboxSpec; ev: ptypes.Evidence): bool =
       return false
   true
 
+const knownCacheSchemes* = ["file", "http", "https", "s3"]
+  ## RFC-0005 C3a: the single scheme authority a `remote-cache` url's
+  ## scheme is validated against at CONFIG-PARSE time (`config.nim`'s
+  ## `parseRemoteCache`) -- independent of which `BackendRegistry` a given
+  ## run happens to wire (`productionRegistry`/`testRegistry`,
+  ## `cacheregistry.nim`). Lives here (not `cacheregistry.nim`) for the
+  ## SAME reason `RemoteTier` does: `config.nim` must not import the cache
+  ## modules. `"memory"`/`"memorybytes"` are deliberately absent -- those
+  ## schemes are registered ONLY by `testRegistry()` for in-process test
+  ## fixtures, so a `memory://` url in a real config FILE must fail here,
+  ## even though `cacheregistry.buildBackend` would happily resolve it
+  ## under a test-built registry (RFC "a typo'd `memory://` URL in
+  ## production KDL must be a config error, not a silently-empty
+  ## per-process tier").
+
 type
   Gate* = object
     ## A gate passes iff the named environment variable is set AND non-empty

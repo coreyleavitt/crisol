@@ -1748,6 +1748,189 @@ group "unit" {
     check warns[0].context == "remote-cache mirror"
 
 # ---------------------------------------------------------------------------
+# RFC-0005 C3a — per-remote endpoint/path-style, scheme allowlist,
+# unsigned-s3-without-verifying-policy rejection
+# ---------------------------------------------------------------------------
+
+suite "config — remote-cache endpoint/path-style + scheme validation (RFC-0005 C3a)":
+
+  test "s3 remote: endpoint and path-style parsed":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+}
+remote-cache "team-s3" {
+    url "s3://ci-cache/crisol"
+    endpoint "http://minio.local:9000"
+    path-style #true
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    let t = cfg.cache.remotes[0]
+    check t.endpoint == some("http://minio.local:9000")
+    check t.pathStyle == some(true)
+
+  test "s3 remote: endpoint/path-style absent -> none":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+}
+remote-cache "team-s3" {
+    url "s3://ci-cache/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    let t = cfg.cache.remotes[0]
+    check t.endpoint.isNone
+    check t.pathStyle.isNone
+
+  test "endpoint/path-style parsed for an http remote too (no scheme restriction enforced)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "mirror" {
+    url "https://cache.example.com/crisol"
+    path-style #false
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes[0].pathStyle == some(false)
+
+  test "memory:// scheme in a config file -> cekConfig (production config error)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "oops" {
+    url "memory://whatever"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "unregistered scheme 'ftp://' -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "oops" {
+    url "ftp://example.com/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "unsigned s3 with no cache-trust block -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "team-s3" {
+    url "s3://ci-cache/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "unsigned s3 with explicit verify-trust #false under a verifying policy -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+}
+remote-cache "team-s3" {
+    url "s3://ci-cache/crisol"
+    verify-trust #false
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "s3 with cache-trust policy hmac and no override -> valid (verify-trust defaults true)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+}
+remote-cache "team-s3" {
+    url "s3://ci-cache/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    check cfg.cache.trust.policy == "hmac"
+
+  # Note: `verify-trust #true` under `cache-trust policy "none"` is a
+  # SEPARATE, already-landed rejection that lives in `cacheregistry.
+  # configuredCache` (C4), not in `loadConfig`/`config.nim` -- config.nim
+  # never imports the cache modules, so that check is exercised in
+  # test_cachetier.nim, not here.
+
+# ---------------------------------------------------------------------------
 # RFC-0005 C4 — cache-trust block parse
 # ---------------------------------------------------------------------------
 

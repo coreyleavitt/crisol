@@ -37,11 +37,21 @@
 ##
 ## remote-cache "team-s3" {              // RFC-0005 A3c-i: a named tier appended after
 ##                                       // local L1; repeatable, order-preserving
-##     url "file:///mnt/shared/crisol"  // required; scheme selects the adapter (only
-##                                       // `file://` has a working adapter before C1/C2)
+##     url "s3://ci-cache/crisol"       // required; SCHEME selects the adapter, validated
+##                                       // against types.knownCacheSchemes (file/http/
+##                                       // https/s3 -- memory:// is a config error here)
+##     endpoint "http://minio.local:9000"  // RFC-0005 C3a: s3 only; absent = AWS default host
+##     path-style #true                 // RFC-0005 C3a: s3 only; default #true iff endpoint set
 ##     verify-trust #true               // optional; absent = policy != "none" default,
-##                                       // resolved by configuredCache (A3c-ii)
+##                                       // resolved by configuredCache (A3c-ii). Unsigned
+##                                       // s3:// with no verifying policy is a config error
+##                                       // (RFC-0005 C3a §Secure-by-default).
 ##     backfill-on-hit #true            // optional; KDL default #true
+## }
+## remote-cache "mirror" {
+##     url "https://cache.example.com/crisol"  // http: bearer token from
+##                                       // $CRISOL_CACHE_TOKEN_MIRROR (or $CRISOL_CACHE_TOKEN)
+##                                       // -- RFC-0005 C3b; never in config, env only
 ## }
 ## // --no-remote-cache (CLI-only, no KDL key -- a config-file remote-cache
 ## // block describes what a fleet SHOULD use, not a one-run override) drops
@@ -351,6 +361,12 @@ proc parseRemoteCache(n: KdlNode; source: string;
   ## A3c-i scope only: `endpoint`/`path-style` (s3-only) arrive in C3a, and
   ## scheme-allowlist validation (`memory://` etc. as a config error) is also
   ## C3a's job — this proc only rejects a url with no scheme at all.
+  ##
+  ## RFC-0005 C3a: `endpoint`/`path-style` (s3-only settings, harmless if
+  ## present on a non-s3 remote — nothing reads them) and scheme-allowlist
+  ## validation against `types.knownCacheSchemes` (`memory://` etc. ⇒
+  ## config error even though `cacheregistry.testRegistry()` resolves it —
+  ## see that const's doc comment).
   if n.arg(0).isNone or n.arg(0).get.kind != kvString:
     cfgErr("config: 'remote-cache' requires a string name as its first argument")
   let name = n.arg(0).get.strVal
@@ -358,6 +374,8 @@ proc parseRemoteCache(n: KdlNode; source: string;
     cfgErr("config: remote-cache name must not be empty")
 
   var url: Option[string]
+  var endpoint: Option[string]
+  var pathStyle: Option[bool]
   var verifyTrust: Option[bool]
   var backfillOnHit = true  # KDL default #true
 
@@ -367,6 +385,16 @@ proc parseRemoteCache(n: KdlNode; source: string;
       if url.isSome:
         cfgErr("config: remote-cache '" & name & "' has duplicate 'url' entries")
       url = some(requireStrArg(child, 0, "remote-cache '" & name & "': 'url'"))
+    of "endpoint":
+      if endpoint.isSome:
+        cfgErr("config: remote-cache '" & name & "' has duplicate 'endpoint' entries")
+      endpoint = some(requireStrArg(child, 0, "remote-cache '" & name & "': 'endpoint'"))
+    of "path-style":
+      # child node: path-style #true  or  path-style #false
+      let v = child.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: remote-cache '" & name & "': 'path-style' requires a boolean argument (#true/#false)")
+      pathStyle = some(v.get.boolVal)
     of "verify-trust":
       # child node: verify-trust #true  or  verify-trust #false
       let v = child.arg(0)
@@ -388,10 +416,16 @@ proc parseRemoteCache(n: KdlNode; source: string;
   if schemeIdx <= 0:
     cfgErr("config: remote-cache '" & name & "': 'url' must include a scheme " &
            "(e.g. 'file://', 'https://'), got '" & url.get & "'")
+  let scheme = url.get[0 ..< schemeIdx]
+  if scheme notin knownCacheSchemes:
+    cfgErr("config: remote-cache '" & name & "': unsupported url scheme '" & scheme &
+           "' in '" & url.get & "' (expected one of: " & knownCacheSchemes.join(", ") & ")")
 
   RemoteTier(
     name:          name,
     url:           url.get,
+    endpoint:      endpoint,
+    pathStyle:     pathStyle,
     verifyTrust:   verifyTrust,
     backfillOnHit: backfillOnHit,
   )
@@ -563,10 +597,27 @@ proc validate(cfg: Config) =
       cfgErr("config: duplicate group name '" & g.name & "'")
     seen.add g.name
   var seenTiers: seq[string]
+  let cacheVerifies = cfg.cache.trust.policy != "none"
   for t in cfg.cache.remotes:
     if t.name in seenTiers:
       cfgErr("config: duplicate remote-cache name '" & t.name & "'")
     seenTiers.add t.name
+    # RFC-0005 C3a / §Secure-by-default: unsigned S3/MinIO has no
+    # transport-level write authorization at all (no SigV4 -> no credential
+    # is ever transmitted), so a verifying `cache-trust` policy is a HARD
+    # requirement whenever an `s3://` tier is configured -- otherwise
+    # "poison the shared cache" is structurally possible (RFC "a verifying
+    # tier with a non-'none' policy is a hard requirement whenever the
+    # unsigned-s3 adapter is used"). The effective per-tier verify-trust
+    # mirrors `cacheregistry.configuredCache`'s own resolution rule
+    # (explicit override wins; absent -> cache-trust.policy != "none").
+    if t.url.startsWith("s3://"):
+      let effectiveVerifyTrust = t.verifyTrust.get(cacheVerifies)
+      if not effectiveVerifyTrust:
+        cfgErr("config: remote-cache '" & t.name & "': unsigned s3:// requires a " &
+               "verifying 'cache-trust' policy (policy != \"none\", and no explicit " &
+               "'verify-trust #false' on this tier) -- unsigned S3/MinIO has no " &
+               "transport-level write authorization")
   if cfg.timeoutSecs < 0:
     cfgErr("config: timeout-secs must be >= 0")
   if cfg.compileTimeoutSecs < 0:
