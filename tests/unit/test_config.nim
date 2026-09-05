@@ -1747,5 +1747,93 @@ group "unit" {
     check warns[0].key == "bogus-key"
     check warns[0].context == "remote-cache mirror"
 
+# ---------------------------------------------------------------------------
+# RFC-0005 C4 — cache-trust block parse
+# ---------------------------------------------------------------------------
+
+suite "config — cache-trust block parse (RFC-0005 C4)":
+
+  test "absent cache-trust block -> policy \"none\", empty key-id":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.trust.policy == "none"
+    check cfg.cache.trust.keyId == ""
+
+  test "policy + key-id parsed":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+    key-id "ci-2026"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.trust.policy == "hmac"
+    check cfg.cache.trust.keyId == "ci-2026"
+
+  test "policy \"ed25519\" parses (wiring arrives in C5a)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "ed25519"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.trust.policy == "ed25519"
+
+  test "unknown policy string -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "rot13"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "unknown child key in cache-trust -> warning, not error":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+    bogus-key 1
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, warns) = loadConfig(configPath = cfgPath)
+    check cfg.cache.trust.policy == "hmac"
+    check warns.len == 1
+    check warns[0].key == "bogus-key"
+    check warns[0].context == "cache-trust"
+
 when isMainModule:
   echo "All config tests passed."

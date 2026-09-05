@@ -238,6 +238,31 @@ type
                                     ## that want the KDL default set it explicitly, matching the
                                     ## codebase's constructor-proc convention over field defaults)
 
+  TrustConfig* = object
+    ## RFC-0005 C4: the parsed CACHE-GLOBAL `cache-trust { ... }` block --
+    ## ONE policy per `TieredCache` (RFC-0005 "One TrustPolicy per
+    ## TieredCache, by design": a backfilled entry is re-stored WITH the
+    ## attestation it arrived with, valid at the destination only under the
+    ## SAME policy, so per-tier policies would break backfill). Lives here
+    ## (not `cacheport`/`cachetrust`) for the SAME reason as `RemoteTier`
+    ## above: `config.nim` must not import the cache modules.
+    ##
+    ## `policy` is one of "none" | "hmac" | "ed25519" (validated by
+    ## `config.nim`'s parser against exactly those three strings); `keyId`
+    ## is HMAC-only (the operator-chosen `key-id` label, bound into the
+    ## signed envelope as `signer` -- RFC-0005 "signer derivation is
+    ## pinned... HMAC: signer = keyId"). `pinnedKeys` (ed25519's
+    ## `pinned-key`, repeatable) is NOT added yet -- C5a's own parser adds
+    ## it alongside `ed25519Policy`; a field with no producer or consumer
+    ## before then would be exactly the dead substrate the standing rules
+    ## forbid.
+    policy*: string = "none"  ## Nim 2's object-construction default: any `CacheConfig(remotes: ...)`
+                              ## or `TrustConfig(...)` literal that omits `trust`/`policy` (every
+                              ## pre-C4 test fixture, and a KDL doc with no `cache-trust` block)
+                              ## gets the honest "none" default, not an empty string that
+                              ## `buildTrustPolicy` would otherwise have to special-case.
+    keyId*:  string
+
   CacheConfig* = object
     ## RFC-0005 A3c-i: the parsed `remote-cache "<name>" { ... }` blocks
     ## (repeatable, order-preserving -- one per KDL node, in document order).
@@ -245,12 +270,18 @@ type
     ## scalar cache knobs below (`cacheStats`/`explainMiss`/`verifyCachePct`/
     ## `envPins`) -- because `configuredCache` (A3c-ii) consumes the remote
     ## tiers plus the cache-global trust policy as ONE parameter (RFC-0005
-    ## "Construction ergonomics"); `trust: TrustConfig` joins `remotes` here
-    ## when the `cache-trust { }` block parser lands (C4). Those four scalar
-    ## knobs already have a flat home on `Config` (landed in B1c/B2b/B3c/A0)
-    ## and are deliberately NOT duplicated here -- that would create two
-    ## sources of truth for the same value.
+    ## "Construction ergonomics"). Those four scalar knobs already have a
+    ## flat home on `Config` (landed in B1c/B2b/B3c/A0) and are deliberately
+    ## NOT duplicated here -- that would create two sources of truth for
+    ## the same value.
     remotes*: seq[RemoteTier]
+    trust*:   TrustConfig   ## RFC-0005 C4: omitted from a `CacheConfig(...)` object-construction
+                            ## literal (every pre-C4 fixture; `config.nim`'s own `docToConfig` when
+                            ## no `cache-trust` block is present), this resolves to `TrustConfig`'s
+                            ## OWN field default (`policy: "none"`) via Nim's nested-default
+                            ## propagation -- NOT an empty string. A bare `var`/zero-initialized
+                            ## `CacheConfig` (never constructed via `CacheConfig(...)`) is the one
+                            ## case that does NOT get this propagation; no code path relies on that.
 
   Config* = object
     ## Top-level runtime configuration parsed from the project config file or

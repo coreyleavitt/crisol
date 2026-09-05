@@ -995,7 +995,8 @@ proc freshStateDir14(tag: string): string =
 block test_configured_cache_no_remotes_is_local_only:
   let sd = freshStateDir14("noremotes")
   let rt = configuredCache(CacheConfig(remotes: @[]), sd, maxEntries = 0,
-                           reg = productionRegistry(), sink = NilSink[TelemetryEvent]())
+                           reg = productionRegistry(), secrets = CacheSecrets(),
+                           sink = NilSink[TelemetryEvent]())
   assert rt.cache.tiers.len == 1
   assert rt.cache.tiers[0].name == "l1"
   assert rt.localRoot == sd / "cache"
@@ -1007,7 +1008,7 @@ block test_configured_cache_rejects_l1_named_remote:
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
-                            sink = NilSink[TelemetryEvent]())
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
   except CrisolError as e:
     caught = true
     assert e.kind == cekConfig
@@ -1020,7 +1021,7 @@ block test_configured_cache_rejects_root_inside_state_dir:
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
-                            sink = NilSink[TelemetryEvent]())
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
   except CrisolError as e:
     caught = true
     assert e.kind == cekConfig
@@ -1032,7 +1033,7 @@ block test_configured_cache_rejects_root_equal_to_state_dir:
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
-                            sink = NilSink[TelemetryEvent]())
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
   except CrisolError:
     caught = true
   assert caught, "a remote rooted exactly AT stateDir must also be rejected"
@@ -1043,7 +1044,7 @@ block test_configured_cache_rejects_unresolvable_scheme:
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
-                            sink = NilSink[TelemetryEvent]())
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
   except CrisolError as e:
     caught = true
     assert e.kind == cekConfig
@@ -1055,12 +1056,12 @@ block test_configured_cache_builds_a_real_second_tier:
   let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot,
                                               backfillOnHit: true)])
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
-                           sink = NilSink[TelemetryEvent]())
+                           secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
   assert rt.cache.tiers.len == 2
   assert rt.cache.tiers[0].name == "l1"
   assert rt.cache.tiers[1].name == "mirror"
   assert rt.cache.tiers[1].backfillOnHit == true
-  assert rt.cache.tiers[1].verifyTrust == false, "no cache-trust block exists yet -- default is false"
+  assert rt.cache.tiers[1].verifyTrust == false, "no cache-trust block configured -- default is false"
   assert rt.localRoot == sd / "cache"
   # Live end to end through the real file backend (both tiers).
   let key = SoundnessKey("c0c0c0c0c0c0c0c0")
@@ -1068,13 +1069,116 @@ block test_configured_cache_builds_a_real_second_tier:
   let v = cache.put(sampleEntry(key, exitCode = 9))
   assert v == @[(tier: "l1", verdict: cvOk), (tier: "mirror", verdict: cvOk)]
 
-block test_configured_cache_honors_explicit_verify_trust_true:
+block test_configured_cache_honors_explicit_verify_trust_true_under_a_real_policy:
+  # RFC-0005 C4: an explicit `verify-trust #true` is honored as-is ONLY
+  # when paired with a real (non-"none") cache-trust policy -- see the
+  # negative case (rejected under policy "none") immediately below.
   let sd = freshStateDir14("verifytrue")
   let remoteRoot = freshLocalFsRoot("configuredcache_verifytrue")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot,
-                                              verifyTrust: some(true))])
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot, verifyTrust: some(true))],
+    trust:   TrustConfig(policy: "hmac", keyId: "ci"),
+  )
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           secrets = CacheSecrets(hmacKey: some("s3cr3t")),
                            sink = NilSink[TelemetryEvent]())
   assert rt.cache.tiers[1].verifyTrust == true
+
+# ---------------------------------------------------------------------------
+# RFC-0005 C4 -- configuredCache's trust-config rejections.
+# ---------------------------------------------------------------------------
+
+block test_configured_cache_rejects_verify_trust_true_under_policy_none:
+  let sd = freshStateDir14("verifytrue_nonepolicy")
+  let remoteRoot = freshLocalFsRoot("configuredcache_verifytrue_nonepolicy")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot, verifyTrust: some(true))],
+    # trust left at its default: policy "none"
+  )
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "explicit verify-trust #true under policy 'none' must be a config error"
+
+block test_configured_cache_rejects_hmac_policy_without_secret:
+  let sd = freshStateDir14("hmac_nosecret")
+  let remoteRoot = freshLocalFsRoot("configuredcache_hmac_nosecret")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+    trust:   TrustConfig(policy: "hmac", keyId: "ci"),
+  )
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "policy 'hmac' with no $CRISOL_CACHE_HMAC_KEY must be a config error"
+
+block test_configured_cache_rejects_hmac_policy_without_secret_even_with_no_remotes:
+  # RFC-0005 C4: the RFC's own "misconfiguration is a config error, not a
+  # silent dead tier" bullet is not conditioned on `cfg.remotes` -- a
+  # `cache-trust` block describes a fleet's shared-cache intent, same as
+  # `remote-cache`, so this must ALSO raise even before any remote tier is
+  # configured.
+  let sd = freshStateDir14("hmac_nosecret_noremotes")
+  let cfg = CacheConfig(trust: TrustConfig(policy: "hmac", keyId: "ci"))
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "policy 'hmac' with no secret must be a config error even with zero remotes"
+
+block test_configured_cache_rejects_ed25519_policy_not_yet_implemented:
+  let sd = freshStateDir14("ed25519_notyet")
+  let remoteRoot = freshLocalFsRoot("configuredcache_ed25519_notyet")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+    trust:   TrustConfig(policy: "ed25519"),
+  )
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "policy 'ed25519' is C5a's job -- must be a clear config error, not a silent none"
+
+block test_configured_cache_wires_hmac_policy_end_to_end:
+  # A genuine two-tier flow, real hmacPolicy: sign at put, verify at
+  # lookup, over the real localFs backend.
+  let sd = freshStateDir14("hmac_e2e")
+  let remoteRoot = freshLocalFsRoot("configuredcache_hmac_e2e")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+    trust:   TrustConfig(policy: "hmac", keyId: "ci-2026"),
+  )
+  var rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           secrets = CacheSecrets(hmacKey: some("s3cr3t")),
+                           sink = NilSink[TelemetryEvent]())
+  assert rt.cache.tiers[1].verifyTrust == true, "no explicit verify-trust -- default is policy != none"
+  let key = SoundnessKey("d0d0d0d0d0d0d0d0")
+  let putVerdicts = rt.cache.put(sampleEntry(key, exitCode = 3))
+  assert putVerdicts == @[(tier: "l1", verdict: cvOk), (tier: "mirror", verdict: cvOk)]
+  # A FRESH TieredCache built from a second `configuredCache` call (same
+  # keyId/secret) must be able to verify what the first one signed --
+  # proves the policy is genuinely reconstructed from config, not merely
+  # captured by identity from the first call.
+  var rt2 = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(hmacKey: some("s3cr3t")),
+                            sink = NilSink[TelemetryEvent]())
+  let l = rt2.cache.lookup(key)
+  assert l.hit.isSome
+  assert l.hit.get.verified == true
+  assert l.hit.get.tier == "l1"
 
 echo "test_cachetier: all blocks passed"

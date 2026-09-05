@@ -53,6 +53,8 @@ import crisol/cachetier      # Tier, TieredCache
 import crisol/cachememory    # memory()
 import crisol/cacheregistry  # CacheRuntime
 import crisol/cachetelemetry # NilSink
+import crisol/resultcache    # RFC-0005 C4 E2E-2: payloadFromJson/canonicalPayload/cacheVersionDirAt
+import crisol/fnv            # RFC-0005 C4 E2E-2: fnv1a64/toHex16 (recompute payloadChecksum by hand)
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -1004,6 +1006,157 @@ remote-cache "mirror" {
 
       # backfill-on-hit (KDL default #true) must have re-seeded l1.
       check remoteHasAnyEntry(projectRoot / ".crisol" / "cache")
+
+# ---------------------------------------------------------------------------
+# RFC-0005 C4 -- E2E-2 (RFC's own acceptance text, verbatim): "two file://
+# tiers, cache-trust { policy "hmac" key-id "t" }, secret via env, L2
+# verifying (default). Run 1 publishes an attested entry to L2. Flip one
+# payload byte in the L2 file and recompute payloadChecksum; delete
+# S/cache/v<N>/ only. Run 2: verify fails -> miss -> live ->
+# cacheLookup == "trustBadSignature", cacheDecision == cdmStored (self-heal
+# re-publish), cacheStats distinguishes it from a cold miss. Negative
+# control: bare byte-flip -> cacheLookup == "corrupt"."
+#
+# Through the REAL entry point (runTests -> planImpl -> configuredCache ->
+# execute), a REAL crisol.kdl `cache-trust` block, the REAL `hmacPolicy`
+# (`cachetrust.nim`), and the REAL `$CRISOL_CACHE_HMAC_KEY` env var (proving
+# api.nim's CacheSecrets resolution end to end) -- not a hand-built
+# CacheDeps override (test_cachetrust.nim's job is the policy in
+# isolation; this is the load-bearing slice property).
+# ---------------------------------------------------------------------------
+
+proc findStoredEntryJson(root: string): string =
+  ## The one `.json` entry a single-entrypoint fixture publishes under a
+  ## configured remote root (RFC-0005 "Local-fs root": entries live at
+  ## `<root>/v<N>/<key>.json`; no sidecar dir exists here -- sidecars are
+  ## tier-0/local-fs-adapter only, never written to a configured remote).
+  for f in walkDirRec(root):
+    if f.endsWith(".json"): return f
+  doAssert false, "expected exactly one stored entry under " & root
+
+suite "RFC-0005 C4 -- E2E-2: a forged entry is never served (hmacPolicy over two file:// tiers)":
+
+  test "tamper + recompute payloadChecksum -> cacheLookup trustBadSignature, self-heal republish":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      let remoteRoot = getTempDir() / ("crisol_c4_e2e2_badsig_" & $getCurrentProcessId())
+      removeDir(remoteRoot)
+      createDir(remoteRoot)
+      defer: removeDir(remoteRoot)
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "mirror" {
+    url "file://""" & remoteRoot & """"
+}
+cache-trust {
+    policy "hmac"
+    key-id "t"
+}
+""")
+      putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")
+      defer: delEnv("CRISOL_CACHE_HMAC_KEY")  # safety net; api.nim scrubs it itself on the happy path
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+
+      # Run 1: cold -> live -> publishes an ATTESTED entry to L2 (the
+      # "mirror" remote) by end of run (the deferred-put flush).
+      let rr1 = runTests(opts)
+      check rr1.status == rsOk
+      check rr1.results.len == 1
+      check rr1.results[0].cacheDecision == cdmStored
+      check remoteHasAnyEntry(remoteRoot)
+
+      # $CRISOL_CACHE_HMAC_KEY must be gone from THIS process's env by now
+      # (api.nim's resolveCacheSecrets scrubs it immediately after
+      # resolving it) -- proves the delEnv half of C4's scope, not just
+      # the sign/verify half.
+      check getEnv("CRISOL_CACHE_HMAC_KEY") == ""
+
+      let entryPath = findStoredEntryJson(remoteRoot)
+      let original = parseJson(readFile(entryPath))
+      # run 1 must have signed the entry it published to a verifying tier
+      check original.hasKey("attestation")
+
+      # Flip one payload byte AND recompute payloadChecksum (RFC's own
+      # E2E-2 wording, verbatim) -- integrity (the FNV checksum) now
+      # matches the tampered bytes, but the HMAC signature (bound to the
+      # OLD payload's SHA-256) no longer verifies.
+      var tampered = original
+      tampered["payload"]["cachedAt"] = newJInt(tampered["payload"]["cachedAt"].getBiggestInt + 1)
+      let retampered = payloadFromJson(tampered["payload"])
+      check retampered.isSome
+      tampered["payloadChecksum"] = newJString(toHex16(fnv1a64(canonicalPayload(retampered.get))))
+      writeFile(entryPath, $tampered)
+
+      # Delete S/cache/v<N>/ ONLY (wipe l1) -- the tampered L2 is now the
+      # only place a hit could come from.
+      removeDir(projectRoot / ".crisol" / "cache")
+
+      # api.nim's resolveCacheSecrets delEnv's the var after run 1 already
+      # resolved it (proven above) -- a SECOND in-process `runTests` call
+      # needs it set again, exactly as a fresh CLI process would read it
+      # fresh from its own environment.
+      putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")
+      let rr2 = runTests(opts)
+      check rr2.status == rsOk
+      check rr2.results.len == 1
+      let r2 = rr2.results[0]
+      check r2.cacheLookup == cvTrustBadSignature
+      check r2.cacheTier == ""              # never served from any tier
+      check r2.cacheDecision == cdmStored    # self-heal: the live rerun re-publishes
+      check r2.run.kind == ptypes.pkRan      # a genuine LIVE run, not a cache replay
+
+      # Wire-level assertion (RFC's own DoD wording, verbatim): the run/v2
+      # render, not just the in-process EntrypointResult.
+      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let epNode = node["entrypoints"][0]
+      check epNode["cacheLookup"].getStr == "trustBadSignature"
+      check epNode["cacheDecision"].getStr == "stored"
+
+  test "negative control: bare byte-flip (checksum NOT fixed) -> cacheLookup corrupt, not trust":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      let remoteRoot = getTempDir() / ("crisol_c4_e2e2_corrupt_" & $getCurrentProcessId())
+      removeDir(remoteRoot)
+      createDir(remoteRoot)
+      defer: removeDir(remoteRoot)
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "mirror" {
+    url "file://""" & remoteRoot & """"
+}
+cache-trust {
+    policy "hmac"
+    key-id "t"
+}
+""")
+      putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")
+      defer: delEnv("CRISOL_CACHE_HMAC_KEY")  # safety net; api.nim scrubs it itself on the happy path
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+
+      let rr1 = runTests(opts)
+      check rr1.status == rsOk
+      check remoteHasAnyEntry(remoteRoot)
+
+      let entryPath = findStoredEntryJson(remoteRoot)
+      var node = parseJson(readFile(entryPath))
+      # Bare tamper -- the payload changes but payloadChecksum is left
+      # stale: caught at the INTEGRITY layer (cvCorrupt), before trust
+      # verification is ever reached (RFC "Integrity vs. trust").
+      node["payload"]["cachedAt"] = newJInt(node["payload"]["cachedAt"].getBiggestInt + 1)
+      writeFile(entryPath, $node)
+
+      removeDir(projectRoot / ".crisol" / "cache")
+
+      putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")  # see the sibling test's comment
+      let rr2 = runTests(opts)
+      check rr2.status == rsOk
+      check rr2.results.len == 1
+      check rr2.results[0].cacheLookup == cvCorrupt
+      check rr2.results[0].cacheDecision == cdmStored  # self-heal here too
 
 # ---------------------------------------------------------------------------
 # RFC-0005 A2c-ii — the post-compile consult, through the REAL entry point

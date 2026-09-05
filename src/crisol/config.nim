@@ -46,6 +46,16 @@
 ## // --no-remote-cache (CLI-only, no KDL key -- a config-file remote-cache
 ## // block describes what a fleet SHOULD use, not a one-run override) drops
 ## // every configured remote-cache tier for one run; l1 stays active.
+##
+## cache-trust {                         // RFC-0005 C4: CACHE-GLOBAL (one policy per
+##                                       // TieredCache); optional, default policy "none"
+##     policy "hmac"                    // none | hmac | ed25519 ("ed25519" parses; wiring
+##                                       // arrives in C5a -- configuredCache rejects it
+##                                       // as not-yet-supported until then)
+##     key-id "ci-2026"                 // hmac only: the operator-chosen signer label,
+##                                       // bound into the signed envelope; the secret
+##                                       // itself is NEVER in config -- $CRISOL_CACHE_HMAC_KEY
+## }
 ## ```
 ##
 ## ## Design notes
@@ -381,6 +391,49 @@ proc parseRemoteCache(n: KdlNode; source: string;
   )
 
 # ---------------------------------------------------------------------------
+# RFC-0005 C4: parse the CACHE-GLOBAL `cache-trust` block → TrustConfig
+# ---------------------------------------------------------------------------
+
+proc parseCacheTrust(n: KdlNode; source: string;
+                     warns: var seq[ConfigWarning]): TrustConfig =
+  ## Parse the `cache-trust { ... }` DOM node → TrustConfig.
+  ##
+  ##   cache-trust {
+  ##       policy "hmac"      // required domain: none | hmac | ed25519
+  ##       key-id "ci-2026"   // hmac only; optional (empty string if absent)
+  ##   }
+  ##
+  ## C4 scope only: `pinned-key` (ed25519, repeatable) is C5a's own parser
+  ## addition -- an occurrence here today falls through to the unknown-key
+  ## warning below, same as any other not-yet-parsed child.
+  ##
+  ## Cross-field rejections that need MORE than this block alone (hmac
+  ## with no `$CRISOL_CACHE_HMAC_KEY`; an explicit `verify-trust #true`
+  ## under policy "none") are `configuredCache`'s job (`cacheregistry.nim`)
+  ## -- see that module's doc comment ("Misconfiguration is a config
+  ## error, not a silent dead tier").
+  var policy = "none"  # KDL default (RFC "optional, default none")
+  var keyId = ""
+
+  for child in n.children:
+    case child.name
+    of "policy":
+      let v = child.arg(0)
+      if v.isNone or v.get.kind != kvString:
+        cfgErr("config: 'cache-trust': 'policy' requires a string argument")
+      let p = v.get.strVal
+      if p notin ["none", "hmac", "ed25519"]:
+        cfgErr("config: 'cache-trust': unknown policy '" & p &
+               "' -- must be none, hmac, or ed25519")
+      policy = p
+    of "key-id":
+      keyId = requireStrArg(child, 0, "cache-trust: 'key-id'")
+    else:
+      warns.add makeConfigWarning(source, "cache-trust", child.name)
+
+  TrustConfig(policy: policy, keyId: keyId)
+
+# ---------------------------------------------------------------------------
 # C6: Sensitivity presets → (k, sampleFloor, absFloorMs)
 # ---------------------------------------------------------------------------
 
@@ -572,6 +625,11 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # in the second pass below (the block has children, same as perfCheck/
     # reuseCheck). Order-preserving; empty = single-tier local.
     remoteCaches: seq[RemoteTier]
+    # RFC-0005 C4: the CACHE-GLOBAL `cache-trust { }` block — parsed in the
+    # second pass (has children). Zero-value TrustConfig has policy == ""
+    # (Nim's default), so this starts at the KDL default "none" explicitly
+    # rather than relying on the zero value -- see below.
+    trustCfg: TrustConfig = TrustConfig(policy: "none")
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -685,6 +743,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     of "perf-check":   discard  # C6: parsed in second pass (has children)
     of "reuse-check":  discard  # M-report (b1): parsed in second pass (has children)
     of "remote-cache": discard  # RFC-0005 A3c-i: parsed in second pass (has children)
+    of "cache-trust":  discard  # RFC-0005 C4: parsed in second pass (has children)
     else:
       warns.add makeConfigWarning(source, "top-level", n.name)
 
@@ -701,6 +760,8 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       reuseCheck = parseReuseCheck(n, source, warns)
     elif n.name == "remote-cache":
       remoteCaches.add parseRemoteCache(n, source, warns)
+    elif n.name == "cache-trust":
+      trustCfg = parseCacheTrust(n, source, warns)
 
   result = Config(
     groups:             groups,
@@ -730,7 +791,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     explainMiss:        explainMiss,
     cacheStats:         cacheStats,
     envPins:            envPins,
-    cache:              CacheConfig(remotes: remoteCaches),
+    cache:              CacheConfig(remotes: remoteCaches, trust: trustCfg),
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).
   )

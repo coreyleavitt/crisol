@@ -967,22 +967,62 @@ type
     ## overrides `buildRuntime` wholesale, exactly as A3b's mock-policy test
     ## already does — a `registry` field with a single caller (this same
     ## closure) would be indirection with no consumer. `secrets:
-    ## CacheSecrets` is NOT added either: `configuredCache` in THIS slice
-    ## only ever resolves the `file` scheme, which has no credential axis
-    ## (`cacheregistry.fileBackendFactory` already discards its `token`
-    ## parameter) — a `secrets` field with no scheme that reads it would be
-    ## exactly the dead substrate the standing rules forbid. C-dep/C4 add it
-    ## when `http`/`s3`/trust need real credentials.
+    ## CacheSecrets` is likewise NOT added as a `CacheDeps` field: C4 needs
+    ## it (`configuredCache` now takes `secrets` to build a real
+    ## `hmacPolicy`), but `productionCacheDeps` (below) resolves it ONCE
+    ## via `resolveCacheSecrets()` and captures it directly in the
+    ## `buildRuntime` closure it returns — a test wanting different secrets
+    ## overrides `buildRuntime` wholesale (as A3b's mock-policy test
+    ## already does), so a `secrets` field on `CacheDeps` itself would be a
+    ## second way to reach the same one call site. `http`/`s3` credentials
+    ## (`httpTokens`) arrive in C3b the same way.
     buildRuntime*: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime {.closure.}
 
+const CrisolCacheSecretPrefix = "CRISOL_CACHE_"
+  ## RFC-0005 C4 "Secrets come from the environment... are then removed
+  ## from the process environment": mirrors `sandbox.nim`'s own
+  ## `CrisolCachePrefix` constant (the child-env scrub) — kept as a
+  ## SEPARATE local constant rather than importing `sandbox`'s (which is
+  ## private/unexported there) since the two scrubs are independent
+  ## concerns run at different times (process env once here, vs. every
+  ## spawned child's env in `filterEnv`) and this module already imports
+  ## `sandbox` for its public surface only.
+
+proc resolveCacheSecrets(): CacheSecrets =
+  ## RFC-0005 C4 "resolved once in api.nim from env, then delEnv'd":
+  ## reads every secret this slice knows about ($CRISOL_CACHE_HMAC_KEY),
+  ## THEN scrubs the WHOLE `CRISOL_CACHE_*` namespace from the process
+  ## environment — not merely the vars just read — so a var this slice
+  ## does not yet consume (e.g. a future $CRISOL_CACHE_TOKEN, C3b) can
+  ## never reach a `--hermetic none` child's full-parent-env passthrough
+  ## either (`sandbox.filterEnv`'s own tail strips the SAME prefix a
+  ## second time, unconditionally, at every hermeticity level — belt and
+  ## suspenders: this proc's scrub means there is nothing left to strip by
+  ## the time a child spawns; `filterEnv`'s own scrub covers any process
+  ## that reads the environment before this proc ever runs). Secrets live
+  ## only in the `CacheSecrets` value returned here (and whatever closure
+  ## captures it) from this point on — no cache module ever calls `getEnv`.
+  let hmacKey = getEnv("CRISOL_CACHE_HMAC_KEY")
+  result = CacheSecrets(
+    hmacKey: if hmacKey.len > 0: some(hmacKey) else: none(string),
+  )
+  for name in toSeq(envPairs()).mapIt(it.key):
+    if name.startsWith(CrisolCacheSecretPrefix):
+      delEnv(name)
+
 proc productionCacheDeps*(): CacheDeps =
-  ## The real dependency: RFC-0005 A3c-ii's `configuredCache`, via
+  ## The real dependency: RFC-0005 A3c-ii/C4's `configuredCache`, via
   ## `productionRegistry()` (the `file` scheme only — `http`/`s3` arrive in
-  ## Stage C) and a `NilSink` (the run's real sink, when `--cache-stats` is
-  ## on, is installed by `runTestsWith` AFTER `buildRuntime` returns, exactly
-  ## as it already did for `localOnlyCache` before this slice).
+  ## Stage C), `resolveCacheSecrets()` (called ONCE per `productionCacheDeps`
+  ## call, i.e. once per `runTests`/`runTestsWith(productionCacheDeps())`
+  ## invocation — env is resolved and scrubbed before `planTests` or any
+  ## child ever spawns) and a `NilSink` (the run's real sink, when
+  ## `--cache-stats` is on, is installed by `runTestsWith` AFTER
+  ## `buildRuntime` returns, exactly as it already did for `localOnlyCache`
+  ## before this slice).
+  let secrets = resolveCacheSecrets()
   CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
-    configuredCache(cfg, stateDir, maxEntries, productionRegistry(), NilSink[TelemetryEvent]()))
+    configuredCache(cfg, stateDir, maxEntries, productionRegistry(), secrets, NilSink[TelemetryEvent]()))
 
 # ---------------------------------------------------------------------------
 # runTestsWith — full run facade; catches-and-encodes structural failures.

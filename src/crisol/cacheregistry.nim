@@ -64,6 +64,7 @@ import crisol/cachelocalfs
 import crisol/cachememory
 import crisol/cachewire
 import crisol/cachetelemetry
+import crisol/cachetrust
 
 export cachetelemetry
 
@@ -153,6 +154,56 @@ type
       ## populated, so `drainPending` is never even called (RFC "A purely-
       ## local run... behaviorally identical to RFC-0004").
 
+type
+  CacheSecrets* = object
+    ## RFC-0005 C4 "Secrets come from the environment, are resolved once in
+    ## `api.nim`, are then removed from the process environment, and are
+    ## injected -- the cache modules never read env." `api.nim` builds
+    ## this ONCE per `runTests`/`runTestsWith` call (via
+    ## `resolveCacheSecrets`) and moves it into the `productionCacheDeps`
+    ## closure; `configuredCache` (below) is the ONLY consumer.
+    ##
+    ## `hmacKey` is the only field C4 needs (`$CRISOL_CACHE_HMAC_KEY`).
+    ## The RFC's end-state sketch also carries `signSeed: Option[sello.
+    ## Seed]` (ed25519, `$CRISOL_CACHE_SIGN_KEY`) and `httpTokens: Table[
+    ## string, string]` (`$CRISOL_CACHE_TOKEN[_<TIER>]`, C3b) -- neither is
+    ## added yet: this module has no consumer for either until C5a/C3b
+    ## land (a field nothing reads is exactly the dead substrate the
+    ## standing rules forbid), and `signSeed` would additionally pull
+    ## `sello` into this module's public surface ahead of its own slice.
+    hmacKey*: Option[string]
+
+proc buildTrustPolicy(trust: TrustConfig; secrets: CacheSecrets): TrustPolicy =
+  ## RFC-0005 C4 "Misconfiguration is a config error, not a silent dead
+  ## tier": resolves `CacheConfig.trust` (the parsed `cache-trust { }`
+  ## block) + the env-resolved `CacheSecrets` into a real `TrustPolicy`,
+  ## raising `CrisolError(cekConfig)` for a policy that cannot actually
+  ## verify/sign -- never a silently-inert trust layer. Called
+  ## UNCONDITIONALLY by `configuredCache` below, even when `cfg.remotes`
+  ## is empty: a `cache-trust` block describes what a fleet's shared
+  ## cache WILL use, exactly like a `remote-cache` block, so an
+  ## unsatisfiable policy (hmac with no resolvable secret) is a
+  ## misconfiguration regardless of whether a remote tier has been added
+  ## yet.
+  case trust.policy
+  of "none":
+    nonePolicy()
+  of "hmac":
+    if secrets.hmacKey.isNone:
+      raise newCrisolError(cekConfig,
+        "config: cache-trust policy 'hmac' requires $CRISOL_CACHE_HMAC_KEY to be set")
+    hmacPolicy(secrets.hmacKey.get, trust.keyId)
+  of "ed25519":
+    raise newCrisolError(cekConfig,
+      "config: cache-trust policy 'ed25519' is not yet implemented (RFC-0005 C5a)")
+  else:
+    # Unreachable in practice: config.nim's parser already restricts
+    # `policy` to {none, hmac, ed25519}. Kept as a defensive fail-closed
+    # branch rather than an unchecked `case` -- never silently downgrade
+    # an unrecognized policy string to `none`.
+    raise newCrisolError(cekConfig,
+      "config: cache-trust: unknown policy '" & trust.policy & "'")
+
 const DefaultDeferredPutBudget* = 1000
   ## RFC-0005 "Deferred remote puts" requires the end-of-run flush be bounded
   ## by "a total budget" but pins no concrete number (no CLI/config knob is
@@ -193,18 +244,25 @@ proc rootInsideStateDir(root, stateDir: string): bool =
   a == b or a.startsWith(b & DirSep)
 
 proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
-                      reg: BackendRegistry; sink: TelemetrySink[TelemetryEvent]): CacheRuntime =
-  ## RFC-0005 A3c-ii: build the run's `TieredCache` from parsed KDL
-  ## (`CacheConfig.remotes` — `types.RemoteTier`), via `reg` (scheme ->
-  ## adapter). Returns `localOnlyCache(stateDir, maxEntries)` unchanged when
-  ## `cfg.remotes` is empty — a purely-local run stays behaviorally
-  ## identical to RFC-0004 (RFC "What does not change").
+                      reg: BackendRegistry; secrets: CacheSecrets;
+                      sink: TelemetrySink[TelemetryEvent]): CacheRuntime =
+  ## RFC-0005 A3c-ii/C4: build the run's `TieredCache` from parsed KDL
+  ## (`CacheConfig.remotes` — `types.RemoteTier` — and, since C4,
+  ## `CacheConfig.trust` — `types.TrustConfig`), via `reg` (scheme ->
+  ## adapter) and `secrets` (env-resolved, `api.nim`'s job — see
+  ## `CacheSecrets`'s doc comment). Returns `localOnlyCache(stateDir,
+  ## maxEntries)` unchanged when `cfg.remotes` is empty — a purely-local
+  ## run stays behaviorally identical to RFC-0004 (RFC "What does not
+  ## change") EVEN when a `cache-trust` policy is configured: signing
+  ## local-only entries that no tier will ever verify (`l1.verifyTrust` is
+  ## always `false`) would cost real CPU/storage for zero security
+  ## benefit, so `localOnlyCache` keeps its own `nonePolicy()` regardless.
   ##
   ## **Invoked inside the plan `try`, BEFORE `acquireLock`** (`api.nim`'s
   ## `runTestsWith`): every rejection below raises `CrisolError(cekConfig)`,
   ## caught by the SAME structural-failure path a bad group/glob already
-  ## uses, so a misconfigured remote-cache block is a plan-time exit 3, never
-  ## a lock-then-fail.
+  ## uses, so a misconfigured remote-cache/cache-trust block is a plan-time
+  ## exit 3, never a lock-then-fail.
   ##
   ## Rejects (RFC "Misconfiguration is a config error, not a silent dead
   ## tier"):
@@ -217,17 +275,24 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
   ##     config error here, per `cacheregistry`'s own module doc ("the
   ##     config layer... decides whether it's fatal") — never a silently
   ##     inert tier.
+  ##   - **C4:** `cache-trust policy "hmac"` with no resolvable
+  ##     `$CRISOL_CACHE_HMAC_KEY` (`buildTrustPolicy`, above) — checked
+  ##     UNCONDITIONALLY, even when `cfg.remotes` is empty (a `cache-trust`
+  ##     block describes a fleet's shared-cache intent, same as
+  ##     `remote-cache`).
+  ##   - **C4:** an *explicit* `verify-trust #true` on a remote tier under
+  ##     `cache-trust policy "none"` (an unsatisfiable request: `nonePolicy`
+  ##     cannot verify anything, so honoring it silently would make every
+  ##     read on that tier a silent miss, indistinguishable from a cold
+  ##     cache).
   ##
-  ## **`verify-trust` default (RFC, round 3): `cache-trust.policy !=
-  ## "none"`.** No `cache-trust` block parser exists before C4 —
-  ## `CacheConfig` carries no `trust` field yet — so the policy is
-  ## UNCONDITIONALLY "none" today; the honest default is therefore `false`.
-  ## C4 replaces the literal below with `cfg.trust.policy != "none"` when the
-  ## trust block lands. An explicit `verify-trust #true` is honored as-is
-  ## (harmless today: `nonePolicy.verify` is unconditionally `cvOk`
-  ## regardless of a tier's `verifyTrust` flag) — REJECTING that explicit
-  ## combination is a C4 concern (it needs `TrustConfig.policy` to exist to
-  ## even state "under policy none"), not this slice's.
+  ## **`verify-trust` default (RFC, round 3, C4-live): `cache-trust.policy
+  ## != "none"`.** An explicit `verify-trust #true`/`#false` on a remote
+  ## tier always wins (`RemoteTier.verifyTrust.get(...)` below) except the
+  ## `#true`-under-`none` combination above, which is rejected outright.
+  let trust = buildTrustPolicy(cfg.trust, secrets)
+  let defaultVerifyTrust = cfg.trust.policy != "none"
+
   if cfg.remotes.len == 0:
     return localOnlyCache(stateDir, maxEntries)
 
@@ -255,6 +320,11 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
         "config: remote-cache '" & remote.name & "': the name 'l1' is " &
         "reserved for the local cache tier")
 
+    if remote.verifyTrust == some(true) and cfg.trust.policy == "none":
+      raise newCrisolError(cekConfig,
+        "config: remote-cache '" & remote.name & "': 'verify-trust #true' " &
+        "requires a 'cache-trust' policy other than 'none'")
+
     if remote.url.startsWith("file://"):
       let fsRoot = remote.url["file://".len .. ^1]
       if rootInsideStateDir(fsRoot, stateDir):
@@ -273,11 +343,11 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
       name:          remote.name,
       backend:       backendOpt.get,
       backfillOnHit: remote.backfillOnHit,
-      verifyTrust:   remote.verifyTrust.get(false),  # see doc comment above
+      verifyTrust:   remote.verifyTrust.get(defaultVerifyTrust),
     )
 
   CacheRuntime(
-    cache:     TieredCache(tiers: tiers, trust: nonePolicy()),
+    cache:     TieredCache(tiers: tiers, trust: trust),
     sink:      sink,
     localRoot: root,
   )
