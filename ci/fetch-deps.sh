@@ -137,7 +137,13 @@ if [ "${PRINT_ONLY}" -eq 0 ] && [ "${fail}" -eq 0 ] && [ ! -f "${PROJECT_DIR}/ni
         echo ''
         echo '--path:"src"'
         for name in $(dep_names); do
-            echo "--path:\"_deps/${name}/src\""
+            # match milpa's layout detection: src/ layout when present,
+            # else the repo root (e.g. nimcrypto keeps nimcrypto.nim at root)
+            if [ -d "${DEPS_DIR}/${name}/src" ]; then
+                echo "--path:\"_deps/${name}/src\""
+            else
+                echo "--path:\"_deps/${name}\""
+            fi
         done
     } > "${PROJECT_DIR}/nim.cfg"
     echo "fetch-deps.sh: generated nim.cfg ($(grep -c -- '--path' "${PROJECT_DIR}/nim.cfg") path entries)"
