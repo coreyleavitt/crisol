@@ -39,23 +39,37 @@
 ## bottom-up pattern `Tier`/`TieredCache` used in A1, ahead of A3c's KDL
 ## wiring.
 ##
-## `productionRegistry()` registers ONLY `"file"` in A3a (`http`/`https`/`s3`
-## arrive with Stage C's `HttpFetcher`/S3 adapters — registering a scheme
-## with no adapter built yet would be dormant). `testRegistry()` is
-## `productionRegistry()` PLUS `"memory"`/`"memorybytes"` — registered ONLY
-## here: a typo'd `memory://` URL in production KDL must be a config error,
-## never a silently-empty per-process tier (`cachememory.nim`'s own module
-## doc already states this constraint). A `file://<dir>` remote tier is
-## never auto-created and carries no soft cap (`autoCreate = false,
-## maxEntries = 0`) — RFC-0005 "Local-fs root": a shared tier's cap is an
-## O(n) `walkDir` per store, wrong for a shared root; the `l1`-name
-## rejection and root-inside-stateDir check are `configuredCache`'s job
-## (A3c-ii), not this scheme-resolution layer's.
+## `productionRegistry()` registered ONLY `"file"` through A3c-ii. RFC-0005
+## C3b adds `"http"`/`"https"`/`"s3"` — both PARAMETERIZED by the SAME
+## injected `HttpFetcher` (production default: `httpraw.rawHttpFetcher()`;
+## E2E-3 injects a fake one instead, so a test can drive the real KDL ->
+## `configuredCache` path with no socket). `testRegistry(fetcher)` is
+## `productionRegistry(fetcher)` PLUS `"memory"`/`"memorybytes"` — registered
+## ONLY here: a typo'd `memory://` URL in production KDL must be a config
+## error, never a silently-empty per-process tier (`cachememory.nim`'s own
+## module doc already states this constraint; C3a's `types.knownCacheSchemes`
+## enforces the same thing one layer up, at config-PARSE time). A
+## `file://<dir>` remote tier is never auto-created and carries no soft cap
+## (`autoCreate = false, maxEntries = 0`) — RFC-0005 "Local-fs root": a
+## shared tier's cap is an O(n) `walkDir` per store, wrong for a shared
+## root; the `l1`-name rejection and root-inside-stateDir check are
+## `configuredCache`'s job (A3c-ii), not this scheme-resolution layer's.
 ##
-## No `fetcher`/`HttpFetcher` parameter yet: that type does not exist until
-## Stage C1's transport seam lands; `productionRegistry`/`testRegistry`
-## grow that parameter when `http`/`https` registration arrives (a normal
-## signature evolution across slices, same as `realSeams`'s own history).
+## ## `http`/`s3` factories (RFC-0005 C3b)
+##
+## `httpBackendFactory(fetcher)` captures ONLY the fetcher and calls
+## `cachehttp.httpBackend(fetcher, base = tier.url, token)` per tier —
+## `tier.url` IS the http(s) base url verbatim (RFC "`<base>/
+## <storageFormatVersion>/<key>`"). `s3BackendFactory(fetcher)` splits
+## `tier.url` (`s3://<bucket>[/<prefix>]`) and threads `tier.endpoint`/
+## `tier.pathStyle` straight through to `caches3.s3Backend`, resolving
+## `pathStyle`'s config-time default HERE ("`#true` iff `endpoint` is set")
+## since `RemoteTier.pathStyle` stays `none` through C3a when the KDL never
+## sets it; `token` is discarded (unsigned s3 has no credential axis at
+## all). Per-tier bearer tokens ($CRISOL_CACHE_TOKEN[_<TIER>]) are resolved
+## by `httpTokenFor` below and threaded into EVERY factory uniformly
+## (matching `fileBackendFactory`'s existing `discard token` precedent) —
+## only the http factory actually reads it.
 
 import std/[options, os, strutils, tables]
 import crisol/cacheport
@@ -63,6 +77,9 @@ import crisol/cachetier
 import crisol/cachelocalfs
 import crisol/cachememory
 import crisol/cachewire
+import crisol/cachehttp
+import crisol/caches3
+import crisol/httpraw
 import crisol/cachetelemetry
 import crisol/cachetrust
 
@@ -106,12 +123,52 @@ proc fileBackendFactory(tier: RemoteTier; token: string): CacheBackend =
   let root = tier.url["file://".len .. ^1]
   localFsBackend(root, autoCreate = false, maxEntries = 0)
 
-proc productionRegistry*(): BackendRegistry =
+proc splitS3Url(url: string): tuple[bucket, prefix: string] =
+  ## RFC-0005 C3b: "splitting `RemoteTier.url` into these is the future
+  ## registry factory's job" (`caches3.nim`'s own module doc) — `s3://
+  ## <bucket>[/<prefix>]`. No further validation here: an empty bucket
+  ## (`s3:///prefix`) is not a shape this registry rejects; `parseRemoteCache`
+  ## already guarantees SOME non-empty scheme-tail reached this point.
+  let rest = url["s3://".len .. ^1]
+  let slashIdx = rest.find('/')
+  if slashIdx < 0:
+    (bucket: rest, prefix: "")
+  else:
+    (bucket: rest[0 ..< slashIdx], prefix: rest[slashIdx + 1 .. ^1])
+
+proc httpBackendFactory(fetcher: HttpFetcher): BackendFactory =
+  ## Captures ONLY `fetcher` (RFC-0005 "BackendFactory ... captures nothing
+  ## else") — `base`/`token` come from the `RemoteTier`/token this factory
+  ## is invoked with, per call.
+  result = proc(tier: RemoteTier; token: string): CacheBackend =
+    httpBackend(fetcher, base = tier.url, token = token)
+
+proc s3BackendFactory(fetcher: HttpFetcher): BackendFactory =
+  ## RFC-0005 C3b: `endpoint`/`path-style` come from the `RemoteTier`
+  ## (C3a's parser); unsigned s3 has no credential axis at all (`token` is
+  ## discarded — RFC "Secure-by-default": "Unsigned S3/MinIO has no
+  ## transport-level write authorization" — never even attempted).
+  ## `path-style`'s default ("`#true` iff `endpoint` is set", RFC
+  ## "Configuration") is resolved HERE, not at config-parse time: a config
+  ## file that never sets `path-style` leaves `RemoteTier.pathStyle` as
+  ## `none` (C3a), and THIS is where that absence becomes a concrete
+  ## `bool` for `s3Backend`'s plain-`bool` parameter.
+  result = proc(tier: RemoteTier; token: string): CacheBackend =
+    discard token  # unsigned -- no credential axis
+    let (bucket, prefix) = splitS3Url(tier.url)
+    s3Backend(fetcher, bucket = bucket, prefix = prefix,
+              endpoint = tier.endpoint.get(""),
+              pathStyle = tier.pathStyle.get(tier.endpoint.isSome))
+
+proc productionRegistry*(fetcher: HttpFetcher = rawHttpFetcher()): BackendRegistry =
   result = BackendRegistry()
   result.registerBackend("file", fileBackendFactory)
+  result.registerBackend("http", httpBackendFactory(fetcher))
+  result.registerBackend("https", httpBackendFactory(fetcher))
+  result.registerBackend("s3", s3BackendFactory(fetcher))
 
-proc testRegistry*(): BackendRegistry =
-  result = productionRegistry()
+proc testRegistry*(fetcher: HttpFetcher): BackendRegistry =
+  result = productionRegistry(fetcher)
   result.registerBackend("memory", proc(tier: RemoteTier; token: string): CacheBackend =
     discard tier; discard token
     memory())
@@ -197,10 +254,39 @@ type
     ## destroyed when CacheRuntime drops" guarantee actually matters --
     ## the constructed `Keypair` inside `ed25519Policy`'s closure -- is
     ## unaffected: it is still built exactly once, there, per `TieredCache`.
-    ## `httpTokens: Table[string, string]` (`$CRISOL_CACHE_TOKEN[_<TIER>]`,
-    ## C3b) is NOT added yet -- no consumer until that slice.
-    hmacKey*:     Option[string]
-    signSeedB64*: string
+    ## `defaultHttpToken`/`httpTokens` (RFC-0005 C3b): `$CRISOL_CACHE_TOKEN`
+    ## / `$CRISOL_CACHE_TOKEN_<TIER>` bearer tokens for the `http`/`https`
+    ## adapter (`s3` is unsigned -- no credential axis at all, so these are
+    ## never even read for an `s3://` tier). `api.resolveCacheSecrets`
+    ## captures BOTH before it scrubs the `CRISOL_CACHE_*` namespace, since
+    ## the scrub runs BEFORE the KDL config (and therefore the configured
+    ## tier NAMES) is even parsed -- there is no "look up by tier name" to
+    ## do yet at that point. So `httpTokens` is keyed by the raw env-var
+    ## SUFFIX as it appeared in the environment (e.g. `CRISOL_CACHE_TOKEN_
+    ## MIRROR` -> key `"MIRROR"`), and `httpTokenFor` below re-derives that
+    ## same suffix from a configured tier's NAME on demand, once `configuredCache`
+    ## actually has one. `defaultHttpToken` is the bare (un-suffixed)
+    ## `$CRISOL_CACHE_TOKEN`, the fallback for a tier whose own suffix was
+    ## never set.
+    hmacKey*:          Option[string]
+    signSeedB64*:      string
+    defaultHttpToken*: Option[string]
+    httpTokens*:       Table[string, string]
+
+proc tierEnvSuffix(tierName: string): string =
+  ## RFC-0005 C3b: "`<TIER>` = the KDL tier name upper-cased with `-`->`_`".
+  tierName.toUpperAscii.replace("-", "_")
+
+proc httpTokenFor(secrets: CacheSecrets; tierName: string): string =
+  ## The bearer token for one configured `http`/`https` tier: its own
+  ## `$CRISOL_CACHE_TOKEN_<TIER>` if set, else the bare `$CRISOL_CACHE_TOKEN`
+  ## fallback, else "" (no token configured at all -- `authHeaders` then
+  ## sends no `Authorization` header, a legitimate public-read mirror).
+  let suffix = tierEnvSuffix(tierName)
+  if secrets.httpTokens.hasKey(suffix):
+    secrets.httpTokens[suffix]
+  else:
+    secrets.defaultHttpToken.get("")
 
 proc buildTrustPolicy(trust: TrustConfig; secrets: CacheSecrets): TrustPolicy =
   ## RFC-0005 C4 "Misconfiguration is a config error, not a silent dead
@@ -384,7 +470,11 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
           "' resolves inside the state dir '" & stateDir & "' -- this would " &
           "recurse the local (l1) cache; point it somewhere else")
 
-    let backendOpt = reg.buildBackend(remote, token = "")
+    # RFC-0005 C3b: threaded uniformly for every scheme (matching the
+    # existing `file` factory's own `discard token` precedent) -- the s3
+    # factory discards it too (unsigned; no credential axis at all), so
+    # only the http/https factory actually reads it.
+    let backendOpt = reg.buildBackend(remote, token = httpTokenFor(secrets, remote.name))
     if backendOpt.isNone:
       raise newCrisolError(cekConfig,
         "config: remote-cache '" & remote.name & "': unsupported or " &

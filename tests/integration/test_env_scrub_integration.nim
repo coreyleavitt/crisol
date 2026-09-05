@@ -98,5 +98,40 @@ suite "spawn with SandboxSpec env resolution (end-to-end)":
     # With hlNone (no scrub), the secret var must be visible in the child.
     check output.contains("CRISOL_SECRET_XYZ=forbidden_value")
 
+  test "hlNone spec: CRISOL_CACHE_TOKEN never reaches the child, even though hlNone passes CRISOL_SECRET_XYZ through":
+    ## RFC-0005 C3b "the child-env CRISOL_CACHE_* scrub assertion under
+    ## --hermetic none": `filterEnv`'s tail strips `CRISOL_CACHE_*`
+    ## UNCONDITIONALLY, at every hermeticity level (C4) -- unlike the
+    ## sibling test above, where hlNone's whole point is "no scrub, full
+    ## parent-env passthrough". Proven here through a REAL spawned child
+    ## process (`process.nim`'s Supervisor), not merely `filterEnv` called
+    ## as a pure function (already covered by test_a0_env_pin.nim) -- the
+    ## end-to-end guarantee C3b pins down.
+    putEnv("CRISOL_CACHE_TOKEN", "super-secret-bearer-token")
+    defer: delEnv("CRISOL_CACHE_TOKEN")
+
+    let spec = resolveSandbox(level = hlNone)
+
+    var sv = initSupervisor(installSignals = false)
+    let outPath = tmpOutputFile()
+    var scratch = ""
+    let cs = buildChildSpec(probeBin, [], spec, outPath, scratch)
+    defer: cleanupScratch(scratch)
+
+    let (ok, report) = spawnAndWait(sv, cs, 5000)
+    check ok
+    check report.exit.kind == ekExited
+    check report.exit.code == 0
+    check report.stop.isNone
+
+    let output = readOutputFile(outPath)
+    removeFile(outPath)
+
+    check output.contains("CRISOL_CACHE_TOKEN=<UNSET>")
+    # Sanity check: hlNone really did pass an ordinary secret through in
+    # this SAME child -- proving the token's absence is the scrub, not an
+    # environment that happened to be empty.
+    check output.contains("CRISOL_SECRET_XYZ=forbidden_value")
+
 when isMainModule:
   echo "test_env_scrub_integration done"

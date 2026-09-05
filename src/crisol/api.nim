@@ -988,20 +988,42 @@ const CrisolCacheSecretPrefix = "CRISOL_CACHE_"
   ## spawned child's env in `filterEnv`) and this module already imports
   ## `sandbox` for its public surface only.
 
+const CrisolCacheTokenPrefix = "CRISOL_CACHE_TOKEN"
+  ## RFC-0005 C3b: `$CRISOL_CACHE_TOKEN` (bare) and `$CRISOL_CACHE_TOKEN_
+  ## <TIER>` (suffixed) both start with this. Matched with a plain
+  ## `startsWith` (not `==`/an underscore-boundary check) so the bare name
+  ## itself and every suffixed variant are both caught by ONE scan.
+
 proc resolveCacheSecrets(): CacheSecrets =
-  ## RFC-0005 C4/C5a "resolved once in api.nim from env, then delEnv'd":
+  ## RFC-0005 C4/C5a/C3b "resolved once in api.nim from env, then delEnv'd":
   ## reads every secret this slice knows about ($CRISOL_CACHE_HMAC_KEY,
-  ## $CRISOL_CACHE_SIGN_KEY), THEN scrubs the WHOLE `CRISOL_CACHE_*` namespace from the process
-  ## environment — not merely the vars just read — so a var this slice
-  ## does not yet consume (e.g. a future $CRISOL_CACHE_TOKEN, C3b) can
-  ## never reach a `--hermetic none` child's full-parent-env passthrough
-  ## either (`sandbox.filterEnv`'s own tail strips the SAME prefix a
-  ## second time, unconditionally, at every hermeticity level — belt and
-  ## suspenders: this proc's scrub means there is nothing left to strip by
-  ## the time a child spawns; `filterEnv`'s own scrub covers any process
-  ## that reads the environment before this proc ever runs). Secrets live
-  ## only in the `CacheSecrets` value returned here (and whatever closure
-  ## captures it) from this point on — no cache module ever calls `getEnv`.
+  ## $CRISOL_CACHE_SIGN_KEY, $CRISOL_CACHE_TOKEN[_<TIER>]), THEN scrubs the
+  ## WHOLE `CRISOL_CACHE_*` namespace from the process environment — not
+  ## merely the vars just read — so a var this slice does not yet consume
+  ## can never reach a `--hermetic none` child's full-parent-env
+  ## passthrough either (`sandbox.filterEnv`'s own tail strips the SAME
+  ## prefix a second time, unconditionally, at every hermeticity level —
+  ## belt and suspenders: this proc's scrub means there is nothing left to
+  ## strip by the time a child spawns; `filterEnv`'s own scrub covers any
+  ## process that reads the environment before this proc ever runs).
+  ## Secrets live only in the `CacheSecrets` value returned here (and
+  ## whatever closure captures it) from this point on — no cache module
+  ## ever calls `getEnv`.
+  ##
+  ## **`$CRISOL_CACHE_TOKEN[_<TIER>]` capture (RFC-0005 C3b), a genuine
+  ## ordering constraint, not a style choice:** this proc runs BEFORE the
+  ## KDL config is even parsed (`productionCacheDeps()` is called at
+  ## `runTests`'s own call site, ahead of `runTestsWith` -> `planImpl` ->
+  ## `loadConfig`), so the configured remote-cache tier NAMES do not exist
+  ## yet — there is no `tierName -> token` lookup to build. Every
+  ## `CRISOL_CACHE_TOKEN*` var is instead captured HERE, keyed by its own
+  ## raw env-var SUFFIX (`""` for the bare name, `"MIRROR"` for `_MIRROR`),
+  ## before the unconditional scrub below deletes it from the process env.
+  ## `cacheregistry.httpTokenFor` re-derives a configured tier's expected
+  ## suffix from its NAME (upper-cased, `-`->`_`) once `configuredCache`
+  ## actually has one, and looks it up in this already-captured table —
+  ## so the value survives the scrub even though the name it will
+  ## eventually be requested under is not known here.
   let hmacKey = getEnv("CRISOL_CACHE_HMAC_KEY")
   # RFC-0005 C5a: $CRISOL_CACHE_SIGN_KEY (base64 of the 32-byte ed25519
   # seed) is captured here as the RAW STRING (not yet decoded to a
@@ -1009,24 +1031,32 @@ proc resolveCacheSecrets(): CacheSecrets =
   # (`cacheregistry.nim`) for why: the actual base64 -> `Seed` decode
   # happens fresh, on demand, inside `buildTrustPolicy`'s "ed25519" branch.
   let signSeedB64 = getEnv("CRISOL_CACHE_SIGN_KEY")
+  let bareToken = getEnv("CRISOL_CACHE_TOKEN")
+  var httpTokens: Table[string, string]
+  for name in toSeq(envPairs()).mapIt(it.key):
+    if name.startsWith(CrisolCacheTokenPrefix & "_"):
+      httpTokens[name[(CrisolCacheTokenPrefix.len + 1) .. ^1]] = getEnv(name)
   result = CacheSecrets(
-    hmacKey:     if hmacKey.len > 0: some(hmacKey) else: none(string),
-    signSeedB64: signSeedB64,
+    hmacKey:          if hmacKey.len > 0: some(hmacKey) else: none(string),
+    signSeedB64:      signSeedB64,
+    defaultHttpToken: if bareToken.len > 0: some(bareToken) else: none(string),
+    httpTokens:       httpTokens,
   )
   for name in toSeq(envPairs()).mapIt(it.key):
     if name.startsWith(CrisolCacheSecretPrefix):
       delEnv(name)
 
 proc productionCacheDeps*(): CacheDeps =
-  ## The real dependency: RFC-0005 A3c-ii/C4's `configuredCache`, via
-  ## `productionRegistry()` (the `file` scheme only — `http`/`s3` arrive in
-  ## Stage C), `resolveCacheSecrets()` (called ONCE per `productionCacheDeps`
-  ## call, i.e. once per `runTests`/`runTestsWith(productionCacheDeps())`
-  ## invocation — env is resolved and scrubbed before `planTests` or any
-  ## child ever spawns) and a `NilSink` (the run's real sink, when
-  ## `--cache-stats` is on, is installed by `runTestsWith` AFTER
-  ## `buildRuntime` returns, exactly as it already did for `localOnlyCache`
-  ## before this slice).
+  ## The real dependency: RFC-0005 A3c-ii/C4/C3b's `configuredCache`, via
+  ## `productionRegistry()` (RFC-0005 C3b: `file`/`http`/`https`/`s3`, the
+  ## latter three over `httpraw.rawHttpFetcher()`, `productionRegistry`'s
+  ## own default), `resolveCacheSecrets()` (called ONCE per
+  ## `productionCacheDeps` call, i.e. once per `runTests`/
+  ## `runTestsWith(productionCacheDeps())` invocation — env is resolved and
+  ## scrubbed before `planTests` or any child ever spawns) and a `NilSink`
+  ## (the run's real sink, when `--cache-stats` is on, is installed by
+  ## `runTestsWith` AFTER `buildRuntime` returns, exactly as it already did
+  ## for `localOnlyCache` before this slice).
   let secrets = resolveCacheSecrets()
   CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
     configuredCache(cfg, stateDir, maxEntries, productionRegistry(), secrets, NilSink[TelemetryEvent]()))

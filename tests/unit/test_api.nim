@@ -38,7 +38,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_api.nim
 
-import std/[base64, json, options, os, osproc, strutils, times, unittest]
+import std/[base64, json, options, os, osproc, strutils, tables, times, unittest]
 import crisol/api
 import crisol/types
 import crisol/process/types as ptypes
@@ -52,6 +52,7 @@ import crisol/cacheport      # TrustPolicy, StoredEntry, Attestation, SigAlg, Ca
 import crisol/cachetier      # Tier, TieredCache
 import crisol/cachememory    # memory()
 import crisol/cacheregistry  # CacheRuntime
+import crisol/cachewire      # RFC-0005 C3b E2E-3: HttpRequest/HttpReply/HttpFetcher, jsonCacheSerializer
 import crisol/cachetelemetry # NilSink
 import crisol/resultcache    # RFC-0005 C4 E2E-2: payloadFromJson/canonicalPayload/cacheVersionDirAt
 import crisol/fnv            # RFC-0005 C4 E2E-2: fnv1a64/toHex16 (recompute payloadChecksum by hand)
@@ -1668,6 +1669,280 @@ remote-cache "l1" {
       # succeed regardless of the (moot) remote's own misconfiguration.
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", noRemoteCache: true))
       check rr.status == rsOk
+
+# ---------------------------------------------------------------------------
+# RFC-0005 C3b -- E2E-3 (RFC's own acceptance text, verbatim): "http/s3
+# remote configured in KDL, driven through runTestsWith(testRegistry(fakeFetcher))
+# -- hit / miss / offline (breaker trips once) / unauthorized-put /
+# oversized-body paths; --no-remote-cache reverts to local-only."
+#
+# End-to-end through the REAL entry path (runTestsWith -> planImpl ->
+# configuredCache -> execute), driven by a REAL crisol.kdl `remote-cache`
+# block parsed by config.nim and resolved via cacheregistry.testRegistry(fake)
+# -- NOT a hand-built Tier list (E2E-A-trust's job, above). Per-status
+# verdict-mapping correctness is already exhaustively unit-tested in
+# test_cachehttp.nim/test_caches3.nim (21/36 fake-driven blocks); this
+# suite's job is proving the WIRING carries a real KDL-configured http/s3
+# remote through a real run, end to end -- one fake `HttpFetcher`, driven
+# through `CacheDeps.buildRuntime -> configuredCache(..., testRegistry(fake), ...)`.
+# ---------------------------------------------------------------------------
+
+type
+  E2E3Server = ref object
+    calls*: seq[HttpRequest]
+    replies: seq[HttpReply]
+    idx: int
+
+proc newE2E3Server(replies: varargs[HttpReply]): E2E3Server =
+  E2E3Server(calls: @[], replies: @replies, idx: 0)
+
+proc e2e3Fetcher(fs: E2E3Server): HttpFetcher =
+  result = proc(req: HttpRequest): HttpReply =
+    fs.calls.add req
+    if fs.idx < fs.replies.len:
+      result = fs.replies[fs.idx]
+      inc fs.idx
+    else:
+      result = fs.replies[^1]
+
+proc e2e3OkReply(status: int; body = ""): HttpReply =
+  HttpReply(transport: toOk, status: status,
+            headers: @[("Content-Type", "application/json")], body: body)
+
+proc e2e3UnreachableReply(): HttpReply = HttpReply(transport: toUnreachable)
+
+proc e2e3SampleCachedResult(): CachedResult =
+  ## Miniature of test_cachehttp.nim's own `sampleCachedResult` -- no
+  ## import-graph reason for this file to depend on that one (same
+  ## precedent that file itself documents).
+  CachedResult(
+    run: ptypes.ProcessResult(
+      exit:  ptypes.Exit(kind: ptypes.ekExited, code: 0),
+      cause: ptypes.Cause(by: ptypes.cbProcess),
+      evidence: ptypes.Evidence(
+        killDomain: ptypes.kdsProcessGroup,
+        tree:       ptypes.toComplete,
+        escapees:   @[],
+        limits:     default(ptypes.LimitsAchieved),
+        hermetic:   ptypes.hlIsolated,
+        killSnapshot: @[],
+        cooperativeUnavailable: false,
+      ),
+      rusage: none(ptypes.Rusage),
+      durationUs: 1_000,
+    ),
+    records: @[],
+    cachedAt: 1_700_002_000'i64,
+    payloadChecksum: "",
+  )
+
+proc e2e3EncodedHitBody(): string =
+  ## The GET/lookup path stamps the REQUESTED key over whatever key this
+  ## body encodes (`cachehttp.httpBackend`'s `get`: `e.key = key`), so any
+  ## placeholder `SoundnessKey` here is fine. Used only where the tier's
+  ## resolved `verify-trust` is `false` (the http suite's default -- no
+  ## `cache-trust` block) -- an UNATTESTED entry under a VERIFYING tier
+  ## would be rejected (`cvTrustNoAttestation`); the s3 suite's hit test
+  ## needs a genuine attestation instead, so it drives a real two-run flow
+  ## (see `E2E3Store`, below) rather than hand-signing a canned reply.
+  let entry = StoredEntry(
+    key:            SoundnessKey("0000000000000000"),
+    keyInputs:      none(KeyInputs),
+    result:         e2e3SampleCachedResult(),
+    storageVersion: storageFormatVersion,
+    attestation:    none(Attestation),
+  )
+  jsonCacheSerializer().encode(entry)
+
+proc e2e3Deps(fs: E2E3Server; secrets = CacheSecrets()): CacheDeps =
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+    configuredCache(cfg, stateDir, maxEntries, testRegistry(fs.e2e3Fetcher),
+                    secrets, NilSink[TelemetryEvent]()))
+
+const E2E3SingleTestKdl = """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "mirror" {
+    url "https://cache.example.com/crisol"
+}
+"""
+
+suite "RFC-0005 C3b -- E2E-3: http remote wired live through runTestsWith(testRegistry(fake))":
+
+  test "hit: remote GET 200 -> served, cacheDecision hit, cacheTier == the configured name":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let fs = newE2E3Server(e2e3OkReply(200, e2e3EncodedHitBody()))
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let rr = runTestsWith(opts, e2e3Deps(fs))
+      check rr.status == rsOk
+      check rr.results.len == 1
+      check rr.results[0].cacheDecision == cdmHit
+      check rr.results[0].cacheTier == "mirror"
+      check rr.results[0].cacheLookup == cvOk
+      check fs.calls.len == 1
+      check fs.calls[0].meth == "GET"
+
+  test "miss: remote GET 404 -> live run, cacheDecision stored, publish flushed to the remote by PUT":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let fs = newE2E3Server(e2e3OkReply(404), e2e3OkReply(200))
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let rr = runTestsWith(opts, e2e3Deps(fs))
+      check rr.status == rsOk
+      check rr.results.len == 1
+      check rr.results[0].cacheDecision == cdmStored
+      check rr.results[0].cacheLookup == cvMiss
+      check fs.calls.len == 2
+      check fs.calls[0].meth == "GET"
+      check fs.calls[1].meth == "PUT"
+
+  test "offline (breaker trips once): two entrypoints, only ONE real fetcher call for the whole run":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "tests" / "unit" / "test_b.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let fs = newE2E3Server(e2e3UnreachableReply())
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
+      let rr = runTestsWith(opts, e2e3Deps(fs))
+      check rr.status == rsOk
+      check rr.results.len == 2
+      for r in rr.results:
+        check r.cacheLookup == cvOffline
+        check r.cacheDecision == cdmStored
+      check rr.cacheStats.remoteErrors > 0
+      # The per-tier circuit breaker (cachetier.nim, RFC "Per-tier circuit
+      # breaker") is a PERMANENT-for-the-run latch: the first offline reply
+      # trips it, so every OTHER lookup/put against the SAME tier for the
+      # rest of THIS run short-circuits without ever touching the fetcher
+      # again -- proven here by the total call count staying at 1 despite
+      # two entrypoints each needing a lookup AND a (queued) put.
+      check fs.calls.len == 1
+
+  test "unauthorized-put: remote PUT 401 -> local store still succeeds, remote publish rejected":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let fs = newE2E3Server(e2e3OkReply(404), e2e3OkReply(401))
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
+      let rr = runTestsWith(opts, e2e3Deps(fs))
+      check rr.status == rsOk
+      check rr.results.len == 1
+      check rr.results[0].cacheDecision == cdmStored  # l1 wrote fine regardless of the remote
+      check fs.calls.len == 2
+      check fs.calls[1].meth == "PUT"
+      check rr.cacheStats.remoteErrors > 0
+
+  test "oversized-body: remote GET body over the cap -> cvCorrupt, run proceeds live":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let hugeBody = "x".repeat(9_000_000)  # over cachehttp.DefaultBodyCapBytes (8 MiB)
+      let fs = newE2E3Server(e2e3OkReply(200, hugeBody), e2e3OkReply(200))
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let rr = runTestsWith(opts, e2e3Deps(fs))
+      check rr.status == rsOk
+      check rr.results.len == 1
+      check rr.results[0].cacheLookup == cvCorrupt
+      check rr.results[0].cacheDecision == cdmStored
+
+  test "--no-remote-cache reverts to local-only: the fake fetcher is never even called":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let fs = newE2E3Server(e2e3OkReply(200, e2e3EncodedHitBody()))
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", noRemoteCache: true)
+      let rr = runTestsWith(opts, e2e3Deps(fs))
+      check rr.status == rsOk
+      check rr.results.len == 1
+      check rr.results[0].cacheDecision == cdmStored
+      check rr.results[0].cacheTier == ""       # never served from any tier -- l1 only
+      check fs.calls.len == 0                   # the remote was dropped before configuredCache saw it
+
+type
+  E2E3Store = ref object
+    ## A tiny STATEFUL in-memory HTTP object store (GET/PUT over `req.url`
+    ## as the key) -- unlike `E2E3Server`'s programmable reply queue, this
+    ## one actually remembers what a prior PUT wrote, so a SECOND run's GET
+    ## reads back whatever the FIRST run's live execution genuinely signed
+    ## (RFC's own hmacPolicy, over the REAL soundness key) -- the same
+    ## two-run pattern E2E-1's genuine file:// hit test uses, just over a
+    ## fake http/s3 transport instead of a real filesystem.
+    objects: Table[string, string]
+    calls*:  seq[HttpRequest]
+
+proc newE2E3Store(): E2E3Store = E2E3Store(objects: initTable[string, string](), calls: @[])
+
+proc e2e3StoreFetcher(st: E2E3Store): HttpFetcher =
+  result = proc(req: HttpRequest): HttpReply =
+    st.calls.add req
+    case req.meth
+    of "GET":
+      if st.objects.hasKey(req.url):
+        HttpReply(transport: toOk, status: 200,
+                  headers: @[("Content-Type", "application/json")], body: st.objects[req.url])
+      else:
+        HttpReply(transport: toOk, status: 404, headers: @[], body: "")
+    of "PUT":
+      st.objects[req.url] = req.body
+      HttpReply(transport: toOk, status: 200, headers: @[], body: "")
+    else:
+      HttpReply(transport: toOk, status: 400, headers: @[], body: "")
+
+proc e2e3StoreDeps(st: E2E3Store; secrets: CacheSecrets): CacheDeps =
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+    configuredCache(cfg, stateDir, maxEntries, testRegistry(st.e2e3StoreFetcher),
+                    secrets, NilSink[TelemetryEvent]()))
+
+suite "RFC-0005 C3b -- E2E-3: s3 remote wired live through runTestsWith(testRegistry(fake))":
+
+  test "hit over s3 (path-style, endpoint set): remote GET 200 -> served, cacheTier == the configured name":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "team-s3" {
+    url "s3://ci-cache/crisol"
+    endpoint "http://minio.local:9000"
+}
+cache-trust {
+    policy "hmac"
+}
+""")
+      # `team-s3` resolves `verify-trust` to its default (`cache-trust.policy
+      # != "none"` -- true here): a hand-canned unattested reply would be
+      # REJECTED (cvTrustNoAttestation), not served, so this drives a
+      # genuine two-run flow instead -- run 1 signs+publishes for real
+      # (the real soundness key, the real hmacPolicy); run 2 (l1 wiped)
+      # reads that SAME genuinely-signed object back.
+      let st = newE2E3Store()
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let secrets = CacheSecrets(hmacKey: some("e2e3-s3-hmac-secret"))
+      let deps = e2e3StoreDeps(st, secrets)
+
+      let rr1 = runTestsWith(opts, deps)
+      check rr1.status == rsOk
+      check rr1.results[0].cacheDecision == cdmStored
+      check st.objects.len == 1  # the deferred-put flush published to s3 by end of run
+
+      removeDir(projectRoot / ".crisol" / "cache")  # wipe l1 only
+
+      let rr2 = runTestsWith(opts, deps)
+      check rr2.status == rsOk
+      check rr2.results.len == 1
+      check rr2.results[0].cacheDecision == cdmHit
+      check rr2.results[0].cacheTier == "team-s3"
+      # unsigned s3: no Authorization header ever, even with hmac secrets configured.
+      var sawAuth = false
+      for req in st.calls:
+        for (k, _) in req.headers:
+          if k == "Authorization": sawAuth = true
+      check not sawAuth
 
 # ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.

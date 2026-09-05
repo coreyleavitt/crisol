@@ -725,16 +725,151 @@ block test_production_registry_has_no_memory_scheme:
   assert reg.buildBackend(tier, token = "").isNone,
     "a typo'd memory:// URL in production must be a config error, not a silent tier"
 
+proc stubFetcher(req: HttpRequest): HttpReply =
+  ## A never-called-in-these-blocks `HttpFetcher` stub — RFC-0005 C3b
+  ## reshapes `productionRegistry`/`testRegistry` to be PARAMETERIZED by
+  ## `HttpFetcher` (so E2E-3 can drive the real KDL -> configuredCache path
+  ## with a fake fetcher); these registry-shape tests only exercise
+  ## memory/memorybytes/file, so a fetcher that is never invoked is enough.
+  discard req
+  HttpReply(transport: toUnreachable)
+
 block test_test_registry_adds_memory_and_memorybytes_and_keeps_file:
-  let reg = testRegistry()
+  let reg = testRegistry(stubFetcher)
   assert reg.buildBackend(RemoteTier(name: "m", url: "memory://x"), token = "").isSome
   assert reg.buildBackend(RemoteTier(name: "mb", url: "memorybytes://x"), token = "").isSome
   let root = freshLocalFsRoot("registry_test_file")
   assert reg.buildBackend(RemoteTier(name: "f", url: "file://" & root), token = "").isSome
 
 block test_registry_unknown_scheme_is_none:
-  let reg = testRegistry()
-  assert reg.buildBackend(RemoteTier(name: "x", url: "s3://bucket/key"), token = "").isNone
+  let reg = testRegistry(stubFetcher)
+  assert reg.buildBackend(RemoteTier(name: "x", url: "ftp://bucket/key"), token = "").isNone
+
+# ---------------------------------------------------------------------------
+# 12b. RFC-0005 C3b: cacheregistry — productionRegistry/testRegistry now
+#      register "http"/"s3" too (parameterized by the injected HttpFetcher),
+#      and configuredCache threads per-tier bearer tokens ($CRISOL_CACHE_TOKEN
+#      / $CRISOL_CACHE_TOKEN_<TIER>) into the http factory only (s3 is
+#      unsigned -- no credential axis at all, RFC "Secure-by-default").
+# ---------------------------------------------------------------------------
+
+type
+  RecordingServer = ref object
+    calls: seq[HttpRequest]
+    reply: HttpReply
+
+proc recorder(rs: RecordingServer): HttpFetcher =
+  result = proc(req: HttpRequest): HttpReply =
+    rs.calls.add req
+    rs.reply
+
+proc okReply(body = ""): HttpReply =
+  HttpReply(transport: toOk, status: 200,
+            headers: @[("Content-Type", "application/json")], body: body)
+
+proc authHeader(req: HttpRequest): Option[string] =
+  for (k, v) in req.headers:
+    if k == "Authorization": return some(v)
+  none(string)
+
+block test_production_registry_resolves_http_scheme:
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let reg = productionRegistry(rs.recorder)
+  let tier = RemoteTier(name: "mirror", url: "https://cache.example.com/crisol")
+  let backend = reg.buildBackend(tier, token = "")
+  assert backend.isSome
+  assert backend.get.scheme == "http"
+
+block test_production_registry_resolves_s3_scheme:
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let reg = productionRegistry(rs.recorder)
+  let tier = RemoteTier(name: "team-s3", url: "s3://ci-cache/crisol")
+  let backend = reg.buildBackend(tier, token = "")
+  assert backend.isSome
+  assert backend.get.scheme == "s3"
+
+block test_s3_url_split_into_bucket_and_prefix:
+  # MinIO/path-style (the shipped/tested mode) needs `endpoint` set --
+  # `pathStyle`'s default is false with no endpoint (AWS virtual-hosted),
+  # per RFC-0005 "Configuration": "path-style ... default #true iff
+  # endpoint set".
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let reg = productionRegistry(rs.recorder)
+  let tier = RemoteTier(name: "team-s3", url: "s3://ci-cache/crisol",
+                         endpoint: some("http://minio.local:9000"))
+  let backend = reg.buildBackend(tier, token = "").get
+  let key = SoundnessKey("bbbb222233334444")
+  discard backend.get(key)
+  assert rs.calls.len == 1
+  assert rs.calls[0].url.contains("/ci-cache/") and rs.calls[0].url.contains("/crisol/"),
+    "bucket 'ci-cache' and prefix 'crisol' must both reach the request url: " & rs.calls[0].url
+
+block test_s3_endpoint_and_path_style_threaded_from_remote_tier:
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let reg = productionRegistry(rs.recorder)
+  let tier = RemoteTier(name: "team-s3", url: "s3://ci-cache/crisol",
+                         endpoint: some("http://minio.local:9000"),
+                         pathStyle: some(true))
+  let backend = reg.buildBackend(tier, token = "").get
+  discard backend.get(SoundnessKey("cccc333344445555"))
+  assert rs.calls[0].url.startsWith("http://minio.local:9000/ci-cache/"),
+    "configured endpoint + path-style must reach the s3 adapter: " & rs.calls[0].url
+
+block test_s3_never_sends_authorization_even_with_a_token:
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let reg = productionRegistry(rs.recorder)
+  let tier = RemoteTier(name: "team-s3", url: "s3://ci-cache/crisol")
+  let backend = reg.buildBackend(tier, token = "some-token").get
+  discard backend.get(SoundnessKey("dddd444455556666"))
+  assert authHeader(rs.calls[0]).isNone,
+    "unsigned s3 must never send Authorization, even when a token is threaded in"
+
+block test_http_sends_bearer_token_when_configured:
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let reg = productionRegistry(rs.recorder)
+  let tier = RemoteTier(name: "mirror", url: "https://cache.example.com/crisol")
+  let backend = reg.buildBackend(tier, token = "secret-tok").get
+  discard backend.get(SoundnessKey("eeee555566667777"))
+  assert authHeader(rs.calls[0]) == some("Bearer secret-tok")
+
+block test_configured_cache_wires_http_remote_with_per_tier_token:
+  let sd = freshLocalFsRoot("configured_cache_http_token_sd")
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let cfg = CacheConfig(remotes: @[
+    RemoteTier(name: "mirror", url: "https://cache.example.com/crisol", backfillOnHit: true)
+  ])
+  let secrets = CacheSecrets(httpTokens: {"MIRROR": "abc123"}.toTable)
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(rs.recorder),
+                           secrets = secrets, sink = NilSink[TelemetryEvent]())
+  discard rt.cache.lookup(SoundnessKey("ffff666677778888"))
+  assert rs.calls.len == 1
+  assert authHeader(rs.calls[0]) == some("Bearer abc123")
+
+block test_configured_cache_falls_back_to_bare_token_when_no_tier_suffix_set:
+  let sd = freshLocalFsRoot("configured_cache_http_bare_token_sd")
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let cfg = CacheConfig(remotes: @[
+    RemoteTier(name: "mirror", url: "https://cache.example.com/crisol", backfillOnHit: true)
+  ])
+  let secrets = CacheSecrets(defaultHttpToken: some("bare-tok"))
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(rs.recorder),
+                           secrets = secrets, sink = NilSink[TelemetryEvent]())
+  discard rt.cache.lookup(SoundnessKey("aaaa777788889999"))
+  assert rs.calls.len == 1
+  assert authHeader(rs.calls[0]) == some("Bearer bare-tok")
+
+block test_configured_cache_dash_tier_name_maps_to_underscore_env_suffix:
+  let sd = freshLocalFsRoot("configured_cache_http_dash_token_sd")
+  let rs = RecordingServer(calls: @[], reply: okReply())
+  let cfg = CacheConfig(remotes: @[
+    RemoteTier(name: "team-mirror", url: "https://cache.example.com/crisol", backfillOnHit: true)
+  ])
+  let secrets = CacheSecrets(httpTokens: {"TEAM_MIRROR": "dash-tok"}.toTable)
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(rs.recorder),
+                           secrets = secrets, sink = NilSink[TelemetryEvent]())
+  discard rt.cache.lookup(SoundnessKey("bbbb888899990000"))
+  assert rs.calls.len == 1
+  assert authHeader(rs.calls[0]) == some("Bearer dash-tok")
 
 # ---------------------------------------------------------------------------
 # 13. localFs-specific (rfc-0005 A2a)
@@ -1106,8 +1241,11 @@ block test_configured_cache_rejects_root_equal_to_state_dir:
   assert caught, "a remote rooted exactly AT stateDir must also be rejected"
 
 block test_configured_cache_rejects_unresolvable_scheme:
+  # RFC-0005 C3b registers "http"/"https"/"s3" too -- this now needs a
+  # scheme genuinely unregistered by ANY registry (not merely "not yet
+  # shipped") to still exercise `buildBackend`'s `none` path.
   let sd = freshStateDir14("unknownscheme")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "https://example.com/cache")])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "ftp://example.com/cache")])
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
@@ -1115,7 +1253,7 @@ block test_configured_cache_rejects_unresolvable_scheme:
   except CrisolError as e:
     caught = true
     assert e.kind == cekConfig
-  assert caught, "an unregistered scheme (http, not yet shipped) must be a config error, not a silent drop"
+  assert caught, "an unregistered scheme (ftp) must be a config error, not a silent drop"
 
 block test_configured_cache_builds_a_real_second_tier:
   let sd = freshStateDir14("realtier")

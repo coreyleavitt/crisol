@@ -13,7 +13,11 @@
 
 import std/os
 
-const probeVars = ["PATH", "CRISOL_SECRET_XYZ", "HOME", "LC_ALL", "TMPDIR"]
+const probeVars = ["PATH", "CRISOL_SECRET_XYZ", "HOME", "LC_ALL", "TMPDIR",
+                   "CRISOL_CACHE_TOKEN"]
+  ## RFC-0005 C3b: CRISOL_CACHE_TOKEN rides along here so
+  ## test_env_scrub_integration.nim can assert the child NEVER sees it,
+  ## even under hlNone (where CRISOL_SECRET_XYZ, above, DOES pass through).
 
 for name in probeVars:
   let val = getEnv(name, "<UNSET>")
