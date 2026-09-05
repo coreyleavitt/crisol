@@ -19,7 +19,16 @@
 ##   via the pure decoder in `crisol/chunkedcodec.nim` -- see "Judgment
 ##   call: a chunked RESPONSE" below for how it's wired into this file's
 ##   cap/deadline machinery.
-## - **C1b-iii (follow-on, NOT here):** TLS under `-d:ssl`.
+## - **C1b-iii (this file):** TLS under `-d:ssl` -- an `https://` request
+##   wraps the connected socket (`std/net`'s `newContext`/
+##   `wrapConnectedSocket`) with the SAME deadline discipline as everything
+##   else here. See "Judgment call: TLS (C1b-iii)" below. **Manual, out-of-
+##   suite verification only** (RFC-0005's own C1b bullet) -- no network
+##   test is added to the suite for this; `tools/verify_https_manual.sh` is
+##   the human-run check (real endpoint + a local self-signed-reject
+##   probe), and `tests/unit/ssl/test_https_handshake_compiles.nim` is this
+##   slice's compile-time (link/typecheck, no I/O) coverage, alongside
+##   C1a's existing `test_ssl_link.nim`.
 ##
 ## ## Total-function contract
 ##
@@ -93,6 +102,62 @@
 ## cap is hit) rather than assumed to be always-empty -- more correct than
 ## silently returning `body = ""`, and free given `Connection: close`
 ## already guarantees the peer closes when it's done.
+##
+## ## Judgment call: TLS (C1b-iii)
+##
+## The RFC pins ONLY "TLS via `wrapConnectedSocket` under `-d:ssl`" (B0(a))
+## plus the deadline mechanism (below) -- it is silent on verify mode and
+## SNI. This file makes the secure-by-default call: `newContext(verifyMode
+## = CVerifyPeer)` (also `newContext`'s own default) verifies the peer
+## certificate against the SYSTEM CA store (`std/net`'s `scanSSLCertificates`
+## -- a fixed list of well-known bundle paths, consulted automatically when
+## no `caFile`/`caDir` is given); `wrapConnectedSocket`'s `hostname`
+## parameter is set to the REQUEST's own host, which drives BOTH the SNI
+## extension (`SSL_set_tlsext_host_name`) and the post-handshake
+## certificate-name check (`checkCertName`, SAN/CN match) -- one field,
+## two jobs, both from the URL the caller actually asked for. Nothing here
+## is configurable (no `-k`/insecure knob): a cache transport that silently
+## downgraded to unverified TLS on request would defeat the point of using
+## TLS at all.
+##
+## Scheme detection is purely syntactic (`parseHttpUrl` below recognizes
+## both `http://` and `https://` regardless of `-d:ssl` -- a `ParsedUrl` is
+## just data). Whether this BUILD can actually service an `https://` request
+## is a SEPARATE, compile-time question: without `-d:ssl`, `rawHttpFetcher`
+## rejects a `tls: true` URL with `toUnreachable` before ever opening a
+## socket -- "this fetcher simply cannot dial it", the exact same precedent
+## an unparseable URL or unsupported scheme already gets. This keeps every
+## OpenSSL symbol behind `when defined(ssl)`, so a default (non-`-d:ssl`)
+## build of this module stays exactly as OpenSSL-free as it was before this
+## slice.
+##
+## The handshake (`SSL_connect`, inside `wrapConnectedSocket`) is bounded by
+## the SAME `SO_SNDTIMEO`/`SO_RCVTIMEO`-to-the-deadline-remainder mechanism
+## as every other blocking call in this file -- RFC-0005 B0, fact (3):
+## "TLS on `std/net` has no deadline either... a hand-rolled non-blocking
+## TLS state machine is far beyond a 'minimal client'"; decision (a): "the
+## only way to bound the blocking SSL path". A handshake failure (bad cert,
+## connection reset mid-handshake, protocol mismatch) raises inside
+## `wrapConnectedSocket` rather than returning a sentinel like this file's
+## own raw send/recv helpers do -- so `performTlsHandshake` classifies the
+## caught exception by comparing `epochTime()` against the SAME deadline at
+## the moment of failure: still before it -> `toUnreachable` (a live peer
+## rejected the handshake for cause -- bad cert, reset, etc.); at or past it
+## -> `toTimeout` (the socket-level timeout fired inside the blocking
+## `SSL_connect` and OpenSSL surfaced it as a handshake exception rather
+## than a plain `EAGAIN` return, unlike this file's own raw I/O). Once the
+## handshake succeeds, ALL further I/O for this request (the request send,
+## the response read) goes through `std/net`'s own `send`/`recv` (which
+## route to `SSL_write`/`SSL_read` when the socket `isSsl`) instead of a
+## raw `posix.send`/`recv` on the fd -- see `sendAllRaw`/`recvChunk` below,
+## which now take the `Socket` itself (constructed `buffered = false`, so
+## the plaintext case still resolves to the exact same single
+## `recv(fd,...)`/`send(fd,...)` syscall as before this slice -- only the
+## TLS case actually changes behavior). The deadline/EINTR/cap discipline
+## in those two procs is completely unaware of TLS -- it is exactly as
+## total a function of "did this syscall return data, an error, or would it
+## block" as it always was, whether that syscall happens to be a raw
+## `recv(2)` or an OpenSSL `SSL_read` underneath.
 import std/[net, os, posix, strutils, times]
 import crisol/cachewire
 import crisol/chunkedcodec
@@ -124,25 +189,41 @@ type
     rioError
 
 # ---------------------------------------------------------------------------
-# URL parsing -- deliberately hand-rolled and minimal. Only "http://" is
-# supported (https:// arrives with C1b-iii's TLS wiring); anything else
+# URL parsing -- deliberately hand-rolled and minimal. "http://" and
+# "https://" are the only two recognized schemes; anything else
 # (unparseable authority, missing host, unsupported scheme) is a transport-
 # level `toUnreachable` -- this fetcher simply cannot dial it, exactly like
-# a real DNS/connect failure would be.
+# a real DNS/connect failure would be. Recognizing "https://" here is
+# PURELY syntactic and does not depend on `-d:ssl` -- see the module doc's
+# "Judgment call: TLS (C1b-iii)" for why whether this build can actually
+# SERVICE a `tls: true` URL is a separate question, decided in
+# `rawHttpFetcher` below.
 # ---------------------------------------------------------------------------
 
 type
   ParsedUrl = object
     ok: bool
+    tls: bool
     host: string
     port: Port
     path: string
 
 proc parseHttpUrl(url: string): ParsedUrl =
-  const prefix = "http://"
-  if not url.startsWith(prefix):
+  const httpPrefix = "http://"
+  const httpsPrefix = "https://"
+  var rest: string
+  var tls: bool
+  var defaultPort: int
+  if url.startsWith(httpsPrefix):
+    rest = url[httpsPrefix.len .. ^1]
+    tls = true
+    defaultPort = 443
+  elif url.startsWith(httpPrefix):
+    rest = url[httpPrefix.len .. ^1]
+    tls = false
+    defaultPort = 80
+  else:
     return ParsedUrl(ok: false)
-  let rest = url[prefix.len .. ^1]
   let slashIdx = rest.find('/')
   let authority = if slashIdx < 0: rest else: rest[0 ..< slashIdx]
   let path = if slashIdx < 0: "/" else: rest[slashIdx .. ^1]
@@ -150,7 +231,7 @@ proc parseHttpUrl(url: string): ParsedUrl =
     return ParsedUrl(ok: false)
   let colonIdx = authority.rfind(':')
   var host = authority
-  var portNum = 80
+  var portNum = defaultPort
   if colonIdx >= 0:
     host = authority[0 ..< colonIdx]
     try:
@@ -159,7 +240,7 @@ proc parseHttpUrl(url: string): ParsedUrl =
       return ParsedUrl(ok: false)
   if host.len == 0 or portNum <= 0 or portNum > 65535:
     return ParsedUrl(ok: false)
-  ParsedUrl(ok: true, host: host, port: Port(portNum), path: path)
+  ParsedUrl(ok: true, tls: tls, host: host, port: Port(portNum), path: path)
 
 # ---------------------------------------------------------------------------
 # Deadline-remainder bookkeeping + raw send/recv, both EINTR-retrying and
@@ -183,13 +264,22 @@ proc setTimeoutOpt(fd: SocketHandle; opt: cint; ms: int) =
   tv.tv_usec = Suseconds(ms mod 1000 * 1000)
   discard setsockopt(fd, SOL_SOCKET, opt, addr tv, SockLen(sizeof(tv)))
 
-proc sendAllRaw(fd: SocketHandle; data: string; deadline: float): RawIoResult =
+proc sendAllRaw(socket: Socket; data: string; deadline: float): RawIoResult =
+  ## Takes the `Socket` (not a bare `fd`) so a TLS-wrapped connection's
+  ## `send` routes to `SSL_write` -- see the module doc's "Judgment call:
+  ## TLS (C1b-iii)". `socket.send(pointer, size)` is `std/net`'s own
+  ## low-level, non-raising overload: for a plaintext (non-SSL) socket it
+  ## is the exact same single `send(fd,...)` syscall this proc issued
+  ## before this slice (`socket` is always constructed `buffered = false`,
+  ## so no internal buffering machinery is involved); it never raises
+  ## either way, so this loop's own errno-based EINTR/EAGAIN handling below
+  ## is unchanged and applies identically to both cases.
   var sent = 0
   while sent < data.len:
     let rem = remainingMs(deadline)
     if rem <= 0: return rioTimeout
-    setTimeoutOpt(fd, SO_SNDTIMEO, rem)
-    let n = send(fd, unsafeAddr data[sent], data.len - sent, 0)
+    setTimeoutOpt(socket.getFd(), SO_SNDTIMEO, rem)
+    let n = send(socket, unsafeAddr data[sent], data.len - sent)
     if n > 0:
       inc(sent, n)
     elif n == 0:
@@ -204,12 +294,15 @@ proc sendAllRaw(fd: SocketHandle; data: string; deadline: float): RawIoResult =
         return rioError
   rioOk
 
-proc recvChunk(fd: SocketHandle; buf: var openArray[byte]; deadline: float): tuple[res: RawIoResult, n: int] =
+proc recvChunk(socket: Socket; buf: var openArray[byte]; deadline: float): tuple[res: RawIoResult, n: int] =
+  ## Same `Socket`-not-`fd` rationale as `sendAllRaw` above -- `socket.recv`
+  ## routes to `SSL_read` for a TLS-wrapped connection, and to the exact
+  ## same plain `recv(fd,...)` syscall as before this slice otherwise.
   while true:
     let rem = remainingMs(deadline)
     if rem <= 0: return (rioTimeout, 0)
-    setTimeoutOpt(fd, SO_RCVTIMEO, rem)
-    let n = recv(fd, addr buf[0], buf.len, 0)
+    setTimeoutOpt(socket.getFd(), SO_RCVTIMEO, rem)
+    let n = recv(socket, addr buf[0], buf.len)
     if n > 0:
       return (rioOk, n)
     elif n == 0:
@@ -222,6 +315,64 @@ proc recvChunk(fd: SocketHandle; buf: var openArray[byte]; deadline: float): tup
         return (rioTimeout, 0)
       else:
         return (rioError, 0)
+
+# ---------------------------------------------------------------------------
+# TLS handshake (RFC-0005 C1b-iii) -- see the module doc's "Judgment call:
+# TLS (C1b-iii)" for the verify-mode/SNI/deadline rationale. Entirely
+# behind `when defined(ssl)`: every symbol this proc names
+# (`SslContext`/`newContext`/`wrapConnectedSocket`/`CVerifyPeer`/
+# `handshakeAsClient`/`destroyContext`) exists in `std/net` ONLY under
+# `-d:ssl` (or `-d:nimdoc`) -- referencing any of them outside this guard
+# would fail to compile a default build, exactly the import-purity property
+# `tests/unit/ssl/config.nims` polices for `test_ssl_link.nim`.
+# ---------------------------------------------------------------------------
+
+when defined(ssl):
+  proc performTlsHandshake(socket: Socket; host: string; deadline: float): TransportOutcome =
+    ## Wraps an already-TCP-connected `socket` in TLS as a client, verifying
+    ## the peer against the system CA store and checking the certificate
+    ## name against `host` (which also drives SNI) -- `wrapConnectedSocket`
+    ## does both from its one `hostname` parameter. Bounded by the SAME
+    ## deadline-remainder discipline as every other blocking call in this
+    ## file (`SO_SNDTIMEO`/`SO_RCVTIMEO` re-armed immediately before the
+    ## blocking `SSL_connect`, since there is no non-blocking TLS path in
+    ## `std/net` -- RFC-0005 B0 fact (3)/decision (a)). Never raises: a
+    ## fresh `SslContext` per call keeps this proc free of any state a
+    ## concurrent/later request could observe, and is `destroyContext`'d
+    ## before returning either way (OpenSSL reference-counts the
+    ## underlying `SSL_CTX`; `SSL_new`, called inside `wrapConnectedSocket`,
+    ## already took its own reference, so freeing the Nim wrapper's copy
+    ## immediately after the handshake is the standard, safe OpenSSL
+    ## idiom -- the live `SSL*`/`sslHandle` on `socket` is unaffected).
+    let rem = remainingMs(deadline)
+    if rem <= 0:
+      return toTimeout
+    setTimeoutOpt(socket.getFd(), SO_SNDTIMEO, rem)
+    setTimeoutOpt(socket.getFd(), SO_RCVTIMEO, rem)
+
+    var ctx: SslContext
+    try:
+      ctx = newContext(verifyMode = CVerifyPeer)
+    except CatchableError:
+      # No usable system CA store, or context construction otherwise
+      # failed -- can't verify a peer, so can't proceed; never a crash.
+      return toUnreachable
+
+    try:
+      wrapConnectedSocket(ctx, socket, handshakeAsClient, host)
+      result = toOk
+    except CatchableError:
+      # `SSL_connect` (inside `wrapConnectedSocket`) raises on failure
+      # instead of returning a sentinel the way this file's own raw
+      # send/recv helpers do -- classify by the SAME deadline this proc
+      # itself re-armed the socket to: still before it fired -> a live
+      # peer rejected the handshake for cause (bad/self-signed cert,
+      # reset mid-handshake, protocol mismatch) -> `toUnreachable`; at or
+      # past it -> the socket-level timeout is what actually ended the
+      # blocking `SSL_connect` -> `toTimeout`.
+      result = (if epochTime() >= deadline: toTimeout else: toUnreachable)
+    finally:
+      destroyContext(ctx)
 
 # ---------------------------------------------------------------------------
 # Request framing.
@@ -248,13 +399,13 @@ proc headerValue(headers: seq[(string, string)]; name: string): string =
     if cmpIgnoreCase(k, name) == 0: return v
   ""
 
-proc readHeaderBlock(fd: SocketHandle; deadline: float): tuple[res: RawIoResult, raw: string] =
+proc readHeaderBlock(socket: Socket; deadline: float): tuple[res: RawIoResult, raw: string] =
   var raw = ""
   var buf: array[4096, byte]
   while raw.find("\r\n\r\n") < 0:
     if raw.len > MaxHeaderBytes:
       return (rioError, raw)
-    let (res, n) = recvChunk(fd, buf, deadline)
+    let (res, n) = recvChunk(socket, buf, deadline)
     case res
     of rioOk:
       for i in 0 ..< n: raw.add(char(buf[i]))
@@ -283,7 +434,7 @@ proc parseStatusAndHeaders(headerBlock: string): tuple[ok: bool, status: int, he
     headers.add((k, v))
   (true, status, headers)
 
-proc readChunkedBody(fd: SocketHandle; deadline: float; bodyCapBytes: int;
+proc readChunkedBody(socket: Socket; deadline: float; bodyCapBytes: int;
                      initial: string): tuple[res: RawIoResult, body: string] =
   ## Drives `chunkedcodec.ChunkedDecoder` from the socket: feeds `initial`
   ## (bytes already read past the header block by `readHeaderBlock`'s
@@ -309,7 +460,7 @@ proc readChunkedBody(fd: SocketHandle; deadline: float; bodyCapBytes: int;
       # existing post-hoc `body.len > bodyCapBytes -> cvCorrupt` check
       # fires, same as the bounded-`Content-Length` path.
       return (rioOk, decoder.body)
-    let (res, n) = recvChunk(fd, buf, deadline)
+    let (res, n) = recvChunk(socket, buf, deadline)
     case res
     of rioOk:
       var piece = newString(n)
@@ -323,8 +474,8 @@ proc readChunkedBody(fd: SocketHandle; deadline: float; bodyCapBytes: int;
     return (rioOk, "")  # malformed stream -- see this proc's doc comment
   (rioOk, decoder.body)
 
-proc readResponse(fd: SocketHandle; deadline: float; bodyCapBytes: int): HttpReply =
-  let (headerRes, raw) = readHeaderBlock(fd, deadline)
+proc readResponse(socket: Socket; deadline: float; bodyCapBytes: int): HttpReply =
+  let (headerRes, raw) = readHeaderBlock(socket, deadline)
   case headerRes
   of rioTimeout: return HttpReply(transport: toTimeout)
   of rioError: return HttpReply(transport: toUnreachable)
@@ -340,7 +491,7 @@ proc readResponse(fd: SocketHandle; deadline: float; bodyCapBytes: int): HttpRep
 
   let isChunked = "chunked" in toLowerAscii(headerValue(headers, "Transfer-Encoding"))
   if isChunked:
-    let (chunkedRes, chunkedBody) = readChunkedBody(fd, deadline, bodyCapBytes, bodySoFar)
+    let (chunkedRes, chunkedBody) = readChunkedBody(socket, deadline, bodyCapBytes, bodySoFar)
     case chunkedRes
     of rioTimeout: return HttpReply(transport: toTimeout)
     of rioError: return HttpReply(transport: toUnreachable)
@@ -363,7 +514,7 @@ proc readResponse(fd: SocketHandle; deadline: float; bodyCapBytes: int): HttpRep
 
   var buf: array[4096, byte]
   while body.len < capTarget:
-    let (res, n) = recvChunk(fd, buf, deadline)
+    let (res, n) = recvChunk(socket, buf, deadline)
     case res
     of rioOk:
       let want = capTarget - body.len
@@ -388,23 +539,34 @@ proc readResponse(fd: SocketHandle; deadline: float; bodyCapBytes: int): HttpRep
 proc rawHttpFetcher*(connectTimeoutMs = DefaultConnectTimeoutMs;
                      recvTimeoutMs = DefaultRecvTimeoutMs;
                      bodyCapBytes = DefaultBodyCapBytes): HttpFetcher =
-  ## Production `HttpFetcher` (RFC-0005 C1b-i): plaintext HTTP/1.1 GET/PUT
-  ## over `std/net`/`std/posix` raw sockets. `connectTimeoutMs` bounds the
-  ## TCP connect phase (via `Socket.connect`'s own non-blocking-connect +
-  ## poll, `net.nim:2126`); `recvTimeoutMs` bounds EVERYTHING after connect
-  ## succeeds (request send + status line + headers + body) as ONE
-  ## deadline, re-armed via `SO_SNDTIMEO`/`SO_RCVTIMEO` before every
-  ## syscall. Never raises -- see the module doc's "Total-function
-  ## contract".
+  ## Production `HttpFetcher` (RFC-0005 C1b-i/ii/iii): plaintext or TLS
+  ## HTTP/1.1 GET/PUT over `std/net`/`std/posix` raw sockets, scheme-
+  ## selected per request from the URL (`parseHttpUrl`'s `tls` field).
+  ## `connectTimeoutMs` bounds the TCP connect phase (via `Socket.connect`'s
+  ## own non-blocking-connect + poll, `net.nim:2126`); `recvTimeoutMs` bounds
+  ## EVERYTHING after connect succeeds (the TLS handshake, when `tls`;
+  ## request send; status line; headers; body) as ONE deadline, re-armed
+  ## via `SO_SNDTIMEO`/`SO_RCVTIMEO` before every syscall. Never raises --
+  ## see the module doc's "Total-function contract". Without `-d:ssl`, an
+  ## `https://` URL resolves to `toUnreachable` before any socket is opened
+  ## -- see the module doc's "Judgment call: TLS (C1b-iii)".
   result = proc(req: HttpRequest): HttpReply =
     try:
       let parsed = parseHttpUrl(req.url)
       if not parsed.ok:
         return HttpReply(transport: toUnreachable)
 
+      when not defined(ssl):
+        if parsed.tls:
+          # This build has no TLS support at all (no OpenSSL symbol is even
+          # linked in) -- exactly the same "this fetcher simply cannot dial
+          # it" outcome an unsupported/unparseable URL already gets, never
+          # attempted, and never a crash.
+          return HttpReply(transport: toUnreachable)
+
       var socket: Socket
       try:
-        socket = newSocket()
+        socket = newSocket(buffered = false)
       except OSError:
         return HttpReply(transport: toUnreachable)
 
@@ -416,17 +578,23 @@ proc rawHttpFetcher*(connectTimeoutMs = DefaultConnectTimeoutMs;
         except OSError:
           return HttpReply(transport: toUnreachable)
 
-        let fd = socket.getFd()
         let deadline = epochTime() + (recvTimeoutMs.float / 1000.0)
+
+        when defined(ssl):
+          if parsed.tls:
+            let handshakeOutcome = performTlsHandshake(socket, parsed.host, deadline)
+            if handshakeOutcome != toOk:
+              return HttpReply(transport: handshakeOutcome)
+
         let reqBytes = buildRequestBytes(req, parsed.host, parsed.path)
 
-        let sendRes = sendAllRaw(fd, reqBytes, deadline)
+        let sendRes = sendAllRaw(socket, reqBytes, deadline)
         case sendRes
         of rioTimeout: return HttpReply(transport: toTimeout)
         of rioError: return HttpReply(transport: toUnreachable)
         of rioOk: discard
 
-        readResponse(fd, deadline, bodyCapBytes)
+        readResponse(socket, deadline, bodyCapBytes)
       finally:
         socket.close()
     except CatchableError:
