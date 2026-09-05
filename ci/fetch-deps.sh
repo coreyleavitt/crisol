@@ -68,10 +68,11 @@ fail=0
 for name in $(dep_names); do
     block="$(dep_block "${name}")"
 
-    # provenance's url is the plain-quoted ssh://git@...git form (source's is
-    # the type-annotated `url (url)"ssh://github.com/..."` form, without
-    # git@ or the .git suffix — deliberately not what we want here).
-    raw_url="$(printf '%s\n' "${block}" | grep -oE 'url "ssh://git@[^"]+"' | tail -1 | sed -E 's/^url "//; s/"$//')"
+    # provenance's url is the plain-quoted form (source's is the
+    # type-annotated `url (url)"..."` form, without the .git suffix —
+    # deliberately not what we want here). Deps vendored over ssh carry
+    # ssh://git@... here; deps added with --git https://... carry https://.
+    raw_url="$(printf '%s\n' "${block}" | grep -oE 'url "(ssh://git@|https://)[^"]+"' | tail -1 | sed -E 's/^url "//; s/"$//')"
     # ref appears in both `source` and `provenance`; provenance's (the last
     # occurrence in the block) is the one paired with commit_sha below.
     ref="$(printf '%s\n' "${block}" | grep -oE '^[[:space:]]*ref "[^"]+"' | tail -1 | sed -E 's/^[[:space:]]*ref "//; s/"$//')"
