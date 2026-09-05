@@ -21,6 +21,12 @@
 ##      raw `SocketHandle` (a plain cint) and a `ServerScenario` enum value
 ##      cross the thread boundary -- both value types, so no GC'd data
 ##      (Socket refs, strings) is ever shared across threads.
+##   1b. A CHUNKED 200 (RFC-0005 C1b-ii) -- multiple chunks, a chunk
+##      extension, and a trailer, proving `httpraw.nim` decodes a real
+##      chunked response end to end through `rawHttpFetcher` (not just the
+##      pure `chunkedcodec` unit -- see tests/unit/test_chunkedcodec.nim
+##      for the exhaustive RFC-7230-shape/malformed-input vectors; this is
+##      the ONE wiring proof the RFC's single-socket-test rule allows).
 ##   2. A 404 (status-line/verdict passthrough distinct from 200).
 ##   3. A connect-timeout to a non-listening port. **Judgment call:**
 ##      loopback connect to a definitely-unbound port on Linux returns
@@ -65,6 +71,7 @@ import crisol/httpraw
 type
   ServerScenario = enum
     ssOk200
+    ssChunked
     ss404
     ssSilent
 
@@ -79,6 +86,14 @@ proc serverThreadProc(args: ServerArgs) {.thread.} =
     let body = "{\"ok\":true}"
     let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Fake: yes\r\n" &
                "Content-Length: " & $body.len & "\r\n\r\n" & body
+    discard send(clientFd, resp.cstring, resp.len, 0)
+  of ssChunked:
+    # Multiple chunks, a chunk extension (ignored), and a trailer -- the
+    # same RFC-7230 shapes test_chunkedcodec.nim vector-tests in isolation,
+    # here proving the real socket path decodes them identically.
+    let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" &
+               "Transfer-Encoding: chunked\r\n\r\n" &
+               "4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-Trailer: done\r\n\r\n"
     discard send(clientFd, resp.cstring, resp.len, 0)
   of ss404:
     let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
@@ -136,6 +151,24 @@ block test_200_put_with_body_completes:
 
   assert reply.transport == toOk
   assert reply.status == 200
+
+# ---------------------------------------------------------------------------
+# 1b. A chunked 200 (RFC-0005 C1b-ii) -- through the real fetcher.
+# ---------------------------------------------------------------------------
+
+block test_chunked_200_decodes_through_real_fetcher:
+  let (thr, listener, port) = startFakeServer(ssChunked)
+  let fetcher = rawHttpFetcher(connectTimeoutMs = 500, recvTimeoutMs = 500)
+  let req = HttpRequest(meth: "GET", url: "http://127.0.0.1:" & $port.int & "/x",
+                        headers: @[], body: "")
+  let reply = fetcher(req)
+  joinThread(thr[])
+  listener.close()
+
+  assert reply.transport == toOk
+  assert reply.status == 200
+  assert reply.body == "Wikipedia",
+    "chunked body must be decoded (extension ignored, trailer consumed), got: " & reply.body
 
 # ---------------------------------------------------------------------------
 # 2. A 404.

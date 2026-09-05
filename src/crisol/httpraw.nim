@@ -15,7 +15,10 @@
 ##   the body-size cap enforced WHILE READING (never buffers an oversized
 ##   body in memory first), and `EINTR` retried (never treated as a hard
 ##   failure, never busy-spun past the deadline).
-## - **C1b-ii (follow-on, NOT here):** chunked RESPONSE decoding.
+## - **C1b-ii (this file, response path only):** chunked RESPONSE decoding,
+##   via the pure decoder in `crisol/chunkedcodec.nim` -- see "Judgment
+##   call: a chunked RESPONSE" below for how it's wired into this file's
+##   cap/deadline machinery.
 ## - **C1b-iii (follow-on, NOT here):** TLS under `-d:ssl`.
 ##
 ## ## Total-function contract
@@ -30,21 +33,42 @@
 ## `cachehttp.nim`'s own stance that a misbehaving fetcher must never let an
 ## exception escape the port.
 ##
-## ## Judgment call: a chunked RESPONSE in C1b-i
+## ## Judgment call: a chunked RESPONSE (C1b-ii)
 ##
-## This slice does not implement chunked-transfer decoding (C1b-ii owns
-## that). A response carrying `Transfer-Encoding: chunked` is recognized
-## (case-insensitively) and deliberately returned as `toOk` with `status`/
-## `headers` parsed through but `body = ""` -- the socket is closed
-## immediately after without attempting to read (and mis-decode) the
-## chunked stream. This composes cleanly with `cachehttp.nim`'s EXISTING
-## pinned rule for a 2xx response ("an oversized/undecodable body ->
-## `cvCorrupt`"): an empty body fails the JSON decode there and lands on
-## exactly that bucket -- "this response is real (a genuine status came
-## back) but this transport can't understand its framing yet", never
-## mistaken for a transport-level outage (`cvOffline`/`cvTimeout`, which
-## would incorrectly trip the caller's circuit breaker for what is, in
-## fact, a live and responding server).
+## A response carrying `Transfer-Encoding: chunked` is decoded via
+## `crisol/chunkedcodec.ChunkedDecoder` -- a pure, vector-tested state
+## machine (no socket knowledge) fed one `recv()`'s worth of bytes at a
+## time. This file owns the two things the decoder deliberately does NOT
+## know about, so they apply to a chunked body EXACTLY as they already do
+## to a `Content-Length`-bounded one:
+##
+## - **The recv deadline** -- every `recvChunk` call while decoding a
+##   chunked body re-arms `SO_RCVTIMEO` to the SAME remaining-deadline
+##   bookkeeping as every other read in this file; a `rioTimeout` mid-decode
+##   maps to `toTimeout`, a `rioError` (peer closed) while the decoder still
+##   `needsMore` maps to `toUnreachable` -- symmetric with the existing
+##   bounded-`Content-Length` rule ("closed before the declared length
+##   arrived -> `toUnreachable`"; EOF is only ever "natural" for an
+##   UNDECLARED-length body, which chunked framing is not).
+## - **The body cap** -- checked against `decoder.body.len` after every
+##   `feed`, exactly like the existing bounded-body loop's `capTarget`
+##   check. Once it exceeds `bodyCapBytes`, reading stops immediately (the
+##   connection is simply closed -- `Connection: close` was always sent)
+##   and the TRUNCATED decoded-so-far body is returned via `toOk`, letting
+##   `cachehttp.nim`'s existing post-hoc `body.len > bodyCapBytes ->
+##   cvCorrupt` check fire, same as the bounded-body path.
+##
+## A MALFORMED chunked stream (bad hex, a violated CRLF, or a chunk-size
+## that overflows `int` -- `chunkedcodec.ChunkedError`) is a live,
+## responding server sending framing this transport cannot understand, not
+## a connectivity failure -- so it reuses C1b-i's own precedent for exactly
+## this situation: `toOk` with `status`/`headers` parsed through but
+## `body = ""`. `cachehttp.nim`'s EXISTING pinned rule for a 2xx response
+## ("an oversized/undecodable body -> `cvCorrupt`") then fires on the empty
+## body exactly as it always has, never mistaken for a transport-level
+## outage (`cvOffline`/`cvTimeout`, which would incorrectly trip the
+## caller's circuit breaker for what is, in fact, a live and responding
+## server).
 ##
 ## ## Judgment call: enforcing the body cap AT the raw layer
 ##
@@ -71,6 +95,7 @@
 ## already guarantees the peer closes when it's done.
 import std/[net, os, posix, strutils, times]
 import crisol/cachewire
+import crisol/chunkedcodec
 
 export cachewire.HttpFetcher
 
@@ -258,6 +283,46 @@ proc parseStatusAndHeaders(headerBlock: string): tuple[ok: bool, status: int, he
     headers.add((k, v))
   (true, status, headers)
 
+proc readChunkedBody(fd: SocketHandle; deadline: float; bodyCapBytes: int;
+                     initial: string): tuple[res: RawIoResult, body: string] =
+  ## Drives `chunkedcodec.ChunkedDecoder` from the socket: feeds `initial`
+  ## (bytes already read past the header block by `readHeaderBlock`'s
+  ## single-buffer overrun, exactly like the bounded-`Content-Length` path
+  ## reuses `bodySoFar`), then further `recvChunk`'d bytes, re-arming the
+  ## SAME deadline before every read. `res` reuses `RawIoResult`:
+  ## `rioOk` covers a COMPLETE decode -- `isDone` (`decoder.body` is
+  ## returned as-is) AND a MALFORMED one (`isError` -- an empty body is
+  ## returned; see this file's module doc's "Judgment call: a chunked
+  ## RESPONSE" for why a malformed stream is `rioOk`/`toOk`, not a
+  ## transport failure). `rioTimeout`/`rioError` are true transport
+  ## failures: the deadline fired, or the peer closed before the decoder
+  ## reached a terminal state (symmetric with the bounded-body rule
+  ## "closed before the declared length arrived -> toUnreachable").
+  var decoder = initChunkedDecoder()
+  decoder = decoder.feed(initial)
+  var buf: array[4096, byte]
+  while decoder.needsMore:
+    if decoder.body.len > bodyCapBytes:
+      # Cap hit while still mid-stream -- stop reading immediately (the
+      # caller always sends `Connection: close`, so simply closing here is
+      # sufficient) and hand back the truncated-so-far body so the
+      # existing post-hoc `body.len > bodyCapBytes -> cvCorrupt` check
+      # fires, same as the bounded-`Content-Length` path.
+      return (rioOk, decoder.body)
+    let (res, n) = recvChunk(fd, buf, deadline)
+    case res
+    of rioOk:
+      var piece = newString(n)
+      for i in 0 ..< n: piece[i] = char(buf[i])
+      decoder = decoder.feed(piece)
+    of rioTimeout:
+      return (rioTimeout, "")
+    of rioError:
+      return (rioError, "")  # peer closed before the stream completed
+  if decoder.isError:
+    return (rioOk, "")  # malformed stream -- see this proc's doc comment
+  (rioOk, decoder.body)
+
 proc readResponse(fd: SocketHandle; deadline: float; bodyCapBytes: int): HttpReply =
   let (headerRes, raw) = readHeaderBlock(fd, deadline)
   case headerRes
@@ -275,9 +340,11 @@ proc readResponse(fd: SocketHandle; deadline: float; bodyCapBytes: int): HttpRep
 
   let isChunked = "chunked" in toLowerAscii(headerValue(headers, "Transfer-Encoding"))
   if isChunked:
-    # C1b-ii's job to decode -- deliberately empty body (see module doc's
-    # "Judgment call: a chunked RESPONSE in C1b-i").
-    return HttpReply(transport: toOk, status: status, headers: headers, body: "")
+    let (chunkedRes, chunkedBody) = readChunkedBody(fd, deadline, bodyCapBytes, bodySoFar)
+    case chunkedRes
+    of rioTimeout: return HttpReply(transport: toTimeout)
+    of rioError: return HttpReply(transport: toUnreachable)
+    of rioOk: return HttpReply(transport: toOk, status: status, headers: headers, body: chunkedBody)
 
   let contentLengthStr = headerValue(headers, "Content-Length")
   var contentLength = -1
