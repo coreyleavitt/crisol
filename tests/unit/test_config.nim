@@ -1561,5 +1561,191 @@ group "unit" {
     let (cfg, _) = loadConfig(configPath = cfgPath)
     check cfg.envPins == @[("LC_ALL", "")]
 
+# ---------------------------------------------------------------------------
+# RFC-0005 A3c-i — remote-cache tier parse
+# ---------------------------------------------------------------------------
+
+suite "config — remote-cache tier parse (RFC-0005 A3c-i)":
+
+  test "absent remote-cache blocks -> cfg.cache.remotes is empty":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 0
+
+  test "full block -> all fields parsed":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "team-s3" {
+    url "file:///mnt/shared/crisol"
+    verify-trust #true
+    backfill-on-hit #false
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    let t = cfg.cache.remotes[0]
+    check t.name == "team-s3"
+    check t.url == "file:///mnt/shared/crisol"
+    check t.verifyTrust == some(true)
+    check t.backfillOnHit == false
+
+  test "defaults when optional children absent: backfill-on-hit true, verify-trust none":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "mirror" {
+    url "https://cache.example.com/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    let t = cfg.cache.remotes[0]
+    check t.name == "mirror"
+    check t.url == "https://cache.example.com/crisol"
+    check t.verifyTrust.isNone
+    check t.backfillOnHit == true
+
+  test "multiple remote-cache blocks preserve document order":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "first" {
+    url "file:///mnt/a"
+}
+remote-cache "second" {
+    url "file:///mnt/b"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 2
+    check cfg.cache.remotes[0].name == "first"
+    check cfg.cache.remotes[1].name == "second"
+
+  test "duplicate remote-cache names -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "dup" {
+    url "file:///mnt/a"
+}
+remote-cache "dup" {
+    url "file:///mnt/b"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "missing url -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "no-url" {
+    backfill-on-hit #true
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "malformed url (no scheme) -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "bad-url" {
+    url "not-a-url"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "empty remote-cache name -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "" {
+    url "file:///mnt/a"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "unknown child key in remote-cache -> warning, not error":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "mirror" {
+    url "file:///mnt/a"
+    bogus-key 1
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, warns) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    check warns.len == 1
+    check warns[0].key == "bogus-key"
+    check warns[0].context == "remote-cache mirror"
+
 when isMainModule:
   echo "All config tests passed."

@@ -34,6 +34,15 @@
 ##     flags "-d:integration"
 ##     globs "tests/integration/test_*.nim" "tests/integration/**/it_*.nim"
 ## }
+##
+## remote-cache "team-s3" {              // RFC-0005 A3c-i: a named tier appended after
+##                                       // local L1; repeatable, order-preserving
+##     url "file:///mnt/shared/crisol"  // required; scheme selects the adapter (only
+##                                       // `file://` has a working adapter before C1/C2)
+##     verify-trust #true               // optional; absent = policy != "none" default,
+##                                       // resolved by configuredCache (A3c-ii)
+##     backfill-on-hit #true            // optional; KDL default #true
+## }
 ## ```
 ##
 ## ## Design notes
@@ -303,6 +312,72 @@ proc parseGroup(n: KdlNode; globalFlags: seq[string];
   )
 
 # ---------------------------------------------------------------------------
+# RFC-0005 A3c-i: parse a single `remote-cache` node → RemoteTier
+# ---------------------------------------------------------------------------
+
+proc parseRemoteCache(n: KdlNode; source: string;
+                      warns: var seq[ConfigWarning]): RemoteTier =
+  ## Parse a `remote-cache "<name>" { ... }` DOM node → RemoteTier.
+  ## Modelled on `parseGroup` — `n.children` makes it trivial.
+  ##
+  ##   remote-cache "team-s3" {
+  ##       url "file:///mnt/shared/crisol"   // required; scheme selects the adapter
+  ##       verify-trust #true                // optional; absent = none(bool) — the
+  ##                                          // config-layer default (policy != "none")
+  ##                                          // is resolved by configuredCache (A3c-ii),
+  ##                                          // NOT here.
+  ##       backfill-on-hit #true             // optional; KDL default #true
+  ##   }
+  ##
+  ## A3c-i scope only: `endpoint`/`path-style` (s3-only) arrive in C3a, and
+  ## scheme-allowlist validation (`memory://` etc. as a config error) is also
+  ## C3a's job — this proc only rejects a url with no scheme at all.
+  if n.arg(0).isNone or n.arg(0).get.kind != kvString:
+    cfgErr("config: 'remote-cache' requires a string name as its first argument")
+  let name = n.arg(0).get.strVal
+  if name.len == 0:
+    cfgErr("config: remote-cache name must not be empty")
+
+  var url: Option[string]
+  var verifyTrust: Option[bool]
+  var backfillOnHit = true  # KDL default #true
+
+  for child in n.children:
+    case child.name
+    of "url":
+      if url.isSome:
+        cfgErr("config: remote-cache '" & name & "' has duplicate 'url' entries")
+      url = some(requireStrArg(child, 0, "remote-cache '" & name & "': 'url'"))
+    of "verify-trust":
+      # child node: verify-trust #true  or  verify-trust #false
+      let v = child.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: remote-cache '" & name & "': 'verify-trust' requires a boolean argument (#true/#false)")
+      verifyTrust = some(v.get.boolVal)
+    of "backfill-on-hit":
+      # child node: backfill-on-hit #true  or  backfill-on-hit #false
+      let v = child.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: remote-cache '" & name & "': 'backfill-on-hit' requires a boolean argument (#true/#false)")
+      backfillOnHit = v.get.boolVal
+    else:
+      warns.add makeConfigWarning(source, "remote-cache " & name, child.name)
+
+  if url.isNone or url.get.len == 0:
+    cfgErr("config: remote-cache '" & name & "' has no 'url' — a url is required")
+  let schemeIdx = url.get.find("://")
+  if schemeIdx <= 0:
+    cfgErr("config: remote-cache '" & name & "': 'url' must include a scheme " &
+           "(e.g. 'file://', 'https://'), got '" & url.get & "'")
+
+  RemoteTier(
+    name:          name,
+    url:           url.get,
+    verifyTrust:   verifyTrust,
+    backfillOnHit: backfillOnHit,
+  )
+
+# ---------------------------------------------------------------------------
 # C6: Sensitivity presets → (k, sampleFloor, absFloorMs)
 # ---------------------------------------------------------------------------
 
@@ -418,6 +493,11 @@ proc validate(cfg: Config) =
     if g.name in seen:
       cfgErr("config: duplicate group name '" & g.name & "'")
     seen.add g.name
+  var seenTiers: seq[string]
+  for t in cfg.cache.remotes:
+    if t.name in seenTiers:
+      cfgErr("config: duplicate remote-cache name '" & t.name & "'")
+    seenTiers.add t.name
   if cfg.timeoutSecs < 0:
     cfgErr("config: timeout-secs must be >= 0")
   if cfg.compileTimeoutSecs < 0:
@@ -485,6 +565,10 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # RFC-0005 A0: repeatable `env-pin "NAME" "VALUE"` nodes -> NAME=VALUE
     # pairs pinned into every child env (see sandbox.filterEnv's tail).
     envPins: seq[(string, string)]
+    # RFC-0005 A3c-i: repeatable `remote-cache "<name>" { }` blocks — parsed
+    # in the second pass below (the block has children, same as perfCheck/
+    # reuseCheck). Order-preserving; empty = single-tier local.
+    remoteCaches: seq[RemoteTier]
 
   # First pass: collect all globals (so flag-merge is correct for groups).
   for n in doc.rootNodes:
@@ -597,6 +681,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     of "group":        discard
     of "perf-check":   discard  # C6: parsed in second pass (has children)
     of "reuse-check":  discard  # M-report (b1): parsed in second pass (has children)
+    of "remote-cache": discard  # RFC-0005 A3c-i: parsed in second pass (has children)
     else:
       warns.add makeConfigWarning(source, "top-level", n.name)
 
@@ -611,6 +696,8 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       perfCheck = parsePerfCheck(n, source, warns)
     elif n.name == "reuse-check":
       reuseCheck = parseReuseCheck(n, source, warns)
+    elif n.name == "remote-cache":
+      remoteCaches.add parseRemoteCache(n, source, warns)
 
   result = Config(
     groups:             groups,
@@ -640,6 +727,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     explainMiss:        explainMiss,
     cacheStats:         cacheStats,
     envPins:            envPins,
+    cache:              CacheConfig(remotes: remoteCaches),
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).
   )

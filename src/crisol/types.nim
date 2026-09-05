@@ -238,6 +238,20 @@ type
                                     ## that want the KDL default set it explicitly, matching the
                                     ## codebase's constructor-proc convention over field defaults)
 
+  CacheConfig* = object
+    ## RFC-0005 A3c-i: the parsed `remote-cache "<name>" { ... }` blocks
+    ## (repeatable, order-preserving -- one per KDL node, in document order).
+    ## Bundled as its own object -- not flattened onto `Config` like the
+    ## scalar cache knobs below (`cacheStats`/`explainMiss`/`verifyCachePct`/
+    ## `envPins`) -- because `configuredCache` (A3c-ii) consumes the remote
+    ## tiers plus the cache-global trust policy as ONE parameter (RFC-0005
+    ## "Construction ergonomics"); `trust: TrustConfig` joins `remotes` here
+    ## when the `cache-trust { }` block parser lands (C4). Those four scalar
+    ## knobs already have a flat home on `Config` (landed in B1c/B2b/B3c/A0)
+    ## and are deliberately NOT duplicated here -- that would create two
+    ## sources of truth for the same value.
+    remotes*: seq[RemoteTier]
+
   Config* = object
     ## Top-level runtime configuration parsed from the project config file or
     ## built by the consuming library / CLI.
@@ -369,6 +383,12 @@ type
                                 ## human summary-line render and the run/v2 `cacheStats` field's
                                 ## PRESENCE. Default false: a run that never asks for --cache-stats
                                 ## pays nothing for the telemetry it never asked to see.
+    cache*: CacheConfig        ## RFC-0005 A3c-i: parsed `remote-cache "<name>" { }` blocks
+                                ## (order-preserving, repeatable). Empty `remotes` seq (the
+                                ## zero-value default -- no config block present) means
+                                ## single-tier local, matching RFC-0005 "Config additions":
+                                ## absent ⇒ single-tier local. `configuredCache` (A3c-ii) is
+                                ## this field's first consumer.
     workerBinary*: string       ## INTERNAL plumbing (not user-facing; no KDL node). Absolute path
                                 ## to a binary whose `main()` dispatches the
                                 ## `--internal-measure-compile` token (see measureworker.nim /
