@@ -33,8 +33,32 @@
 ##       signing secret held) still verifies an entry signed by a DIFFERENT
 ##       policy that shares the same pinned public key, and its OWN `sign`
 ##       is a documented no-op (never sets an attestation).
-## The full rejection matrix (tamper / unpinned / signer-mismatch /
-## unknown-alg) is C5b's job -- out of scope here.
+##
+## RFC-0005 C5b adds the ed25519 rejection matrix:
+##   11. Unattested entry -> `cvTrustNoAttestation` (mirrors HMAC's #3).
+##   12. Tamper after signing (payload changes, attestation does not) ->
+##       `cvTrustBadSignature` (mirrors HMAC's #2).
+##   13. Valid signature from a signer whose public key is NOT in the
+##       verifier's pinned set -> `cvTrustUnpinnedSigner`.
+##   14. Wrong `sigAlg` on the attestation -> `cvTrustUnknownAlg` (mirrors
+##       HMAC's #4).
+##   15. Forged `signer` field (naming a key that IS pinned) on an
+##       attestation actually produced by a DIFFERENT key -> resolves to
+##       `cvTrustBadSignature`, NOT `cvTrustSignerMismatch`. This is a
+##       deliberate architectural fact, not a gap: `cvTrustSignerMismatch`
+##       is this module's verdict for HMAC's single-active-secret model
+##       (attested `signer` label != the one configured `keyId`, RFC-0005
+##       "signer derivation is pinned" + this file's own module doc,
+##       above). ed25519's pinned-SET model has no analogous state --
+##       `envelopeBytes` binds `signer` into the signed bytes themselves
+##       (RFC-0005 "Including signer binds the claimed identity to the
+##       verifying key, defeating key-confusion"), so ANY forged `signer`
+##       is either not in the pinned set at all (`cvTrustUnpinnedSigner`,
+##       #13) or names a real pinned key whose public key then fails to
+##       validate a signature it never produced (`cvTrustBadSignature`,
+##       tested here as #15). `ed25519Policy.verify` (`cachetrust.nim`)
+##       has no `cvTrustSignerMismatch` return path at all -- confirmed by
+##       reading its full body, not merely by this test's silence.
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_cachetrust.nim
@@ -233,5 +257,106 @@ block test_ed25519_no_seed_verify_only:
   var e2 = sampleEntry(SoundnessKey("bbbbbbbbbbbbbbbb"))
   verifier.sign(e2)
   assert e2.attestation.isNone
+
+# ---------------------------------------------------------------------------
+# RFC-0005 C5b -- ed25519 rejection matrix
+# ---------------------------------------------------------------------------
+
+const FixedSeedBytesB: array[32, byte] = [
+  byte 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+  16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+
+# ---------------------------------------------------------------------------
+# 11. Unattested entry -> cvTrustNoAttestation (mirrors HMAC's #3)
+# ---------------------------------------------------------------------------
+
+block test_ed25519_no_attestation:
+  let pkA = pubKeyFor(FixedSeedBytesA)
+  let policy = ed25519Policy(some(toSeed(FixedSeedBytesA)), @[pkA])
+  let e = sampleEntry(SoundnessKey("cccccccccccccccc"))
+  assert e.attestation.isNone
+  assert policy.verify(e) == cvTrustNoAttestation
+
+# ---------------------------------------------------------------------------
+# 12. Tamper after signing -> cvTrustBadSignature (mirrors HMAC's #2)
+# ---------------------------------------------------------------------------
+
+block test_ed25519_tamper_after_sign_is_bad_signature:
+  let pkA = pubKeyFor(FixedSeedBytesA)
+  let policy = ed25519Policy(some(toSeed(FixedSeedBytesA)), @[pkA])
+  var e = sampleEntry(SoundnessKey("dddddddddddddddd"))
+  policy.sign(e)
+  assert policy.verify(e) == cvOk
+  # Mutate the payload the attestation was computed over WITHOUT re-signing
+  # (mirrors the RFC's "flip a payload byte" -- the recomputed SHA-256
+  # inside `verify` no longer matches what `sign` bound into the envelope).
+  e.result.run.exit.code = 1
+  assert policy.verify(e) == cvTrustBadSignature
+
+# ---------------------------------------------------------------------------
+# 13. Valid signature, signer's key NOT in the verifier's pinned set
+#     -> cvTrustUnpinnedSigner
+# ---------------------------------------------------------------------------
+
+block test_ed25519_unpinned_signer:
+  let pkA = pubKeyFor(FixedSeedBytesA)
+  let pkB = pubKeyFor(FixedSeedBytesB)
+  # Signed for real by key B -- a genuinely valid ed25519 attestation --
+  # but the verifier below pins ONLY key A (mirrors the RFC's "unpinned
+  # second signer" framing; the C5b E2E-2 repeat in test_api.nim is the
+  # same shape through the real entry point).
+  let signerB = ed25519Policy(some(toSeed(FixedSeedBytesB)), @[pkB])
+  var e = sampleEntry(SoundnessKey("eeeeeeeeeeeeeeee"))
+  signerB.sign(e)
+  assert e.attestation.isSome
+  assert e.attestation.get.signer == base64.encode(toBytes(pkB))
+
+  let verifierPinningOnlyA = ed25519Policy(none(Seed), @[pkA])
+  assert verifierPinningOnlyA.verify(e) == cvTrustUnpinnedSigner
+
+# ---------------------------------------------------------------------------
+# 14. Wrong sigAlg -> cvTrustUnknownAlg (mirrors HMAC's #4)
+# ---------------------------------------------------------------------------
+
+block test_ed25519_wrong_sigalg:
+  let pkA = pubKeyFor(FixedSeedBytesA)
+  let policy = ed25519Policy(some(toSeed(FixedSeedBytesA)), @[pkA])
+  var e = sampleEntry(SoundnessKey("ffffffffffffffff"))
+  e.attestation = some(Attestation(sigAlg: saHmacSha256, signer: base64.encode(toBytes(pkA)),
+                                   signature: "irrelevant", signedAt: 0))
+  assert policy.verify(e) == cvTrustUnknownAlg
+
+# ---------------------------------------------------------------------------
+# 15. Forged `signer` field naming a PINNED key, signature actually from a
+#     DIFFERENT key -> cvTrustBadSignature, NOT cvTrustSignerMismatch
+#     (judgment call -- see this file's header doc, item 15, and
+#     `cachetrust.nim`'s `ed25519Policy` doc comment for the full
+#     first-principles argument: the pinned-SET architecture has no
+#     `cvTrustSignerMismatch` state distinct from "unpinned" or "bad
+#     signature", because `signer` is bound INTO the signed bytes).
+# ---------------------------------------------------------------------------
+
+block test_ed25519_forged_signer_field_is_bad_signature_not_mismatch:
+  let pkA = pubKeyFor(FixedSeedBytesA)
+  let pkB = pubKeyFor(FixedSeedBytesB)
+  # Genuinely signed by key B, over the envelope that (correctly) names B
+  # as signer.
+  let signerB = ed25519Policy(some(toSeed(FixedSeedBytesB)), @[pkB])
+  var e = sampleEntry(SoundnessKey("1010101010101010"))
+  signerB.sign(e)
+  assert e.attestation.isSome
+
+  # Forge the wire-level `signer` field to claim key A instead (A IS in
+  # the verifier's pinned set) -- the signature bytes are untouched, still
+  # key B's.
+  var forged = e
+  forged.attestation.get.signer = base64.encode(toBytes(pkA))
+
+  let verifierPinningA = ed25519Policy(none(Seed), @[pkA])
+  # A is pinned, so this is NOT the unpinned-signer path -- but the
+  # recomputed envelope (which binds the FORGED signer="A" string) can
+  # never validate against a signature key B produced over a DIFFERENT
+  # envelope (signer="B"), regardless of which public key is tried.
+  assert verifierPinningA.verify(forged) == cvTrustBadSignature
 
 echo "test_cachetrust: all blocks passed"

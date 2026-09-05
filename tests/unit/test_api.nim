@@ -1257,6 +1257,110 @@ cache-trust {
       check epNode["cacheDecision"].getStr == "hit"
 
 # ---------------------------------------------------------------------------
+# RFC-0005 C5b -- E2E-2 repeated under ed25519 with an unpinned second
+# signer (RFC's own wording, verbatim): "a forged entry is never served" --
+# here "forged" means "genuinely, validly signed, but by a key this
+# consumer project does not trust". `crisol.kdl` pins ONLY key A the whole
+# time; run 1 plays a DIFFERENT party who happens to hold key B's secret
+# (never pinned here) and publishes a real, validly-signed entry to the
+# shared "mirror" remote -- exactly as an untrusted or since-rotated-out
+# publisher might. Run 2 is this project's own consumer: cold L1, no
+# signing secret of its own, `$CRISOL_CACHE_SIGN_KEY` unset entirely. Its
+# lookup must reject the remote entry as `cvTrustUnpinnedSigner` (key B is
+# a valid signer, just not one THIS project trusts), never serve it, and
+# fall through to a genuine live run (self-heal republish to l1, same
+# shape as the C4/C5a E2E-2 self-heal).
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 C5b -- E2E-2 repeat: ed25519 unpinned second signer never served (two file:// tiers)":
+
+  test "consumer pins only key A; a valid entry signed by unpinned key B -> cacheLookup trustUnpinnedSigner, live run":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      let remoteRoot = getTempDir() / ("crisol_c5b_e2e2_unpinned_" & $getCurrentProcessId())
+      removeDir(remoteRoot)
+      createDir(remoteRoot)
+      defer: removeDir(remoteRoot)
+
+      let seedBytesA: array[32, byte] = [
+        byte 11, 22, 33, 44, 55, 66, 77, 88, 99, 100, 111, 122, 133,
+        144, 155, 166, 177, 188, 199, 210, 221, 232, 243, 254,
+        9, 8, 7, 6, 5, 4, 3, 2]
+      let seedBytesB: array[32, byte] = [
+        byte 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212,
+        213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223,
+        1, 2, 3, 4, 5, 6, 7, 8]
+      let seedB64B = base64.encode(seedBytesB)
+      let pubKeyB64A = base64.encode(toBytes(keypair(toSeed(seedBytesA)).public))
+      let pubKeyB64B = base64.encode(toBytes(keypair(toSeed(seedBytesB)).public))
+      # Precomputed separately, same reason as the C5a test above (a
+      # fragile quote-counted splice inside the triple-quoted KDL literal).
+      let pinnedKeyLine = "pinned-key \"" & pubKeyB64A & "\""
+
+      # This crisol.kdl -- pinning ONLY key A -- is used, unmodified, by
+      # BOTH runs below; only the signing env var differs between them.
+      writeFile(projectRoot / "crisol.kdl", """
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+remote-cache "mirror" {
+    url "file://""" & remoteRoot & """"
+}
+cache-trust {
+    policy "ed25519"
+    """ & pinnedKeyLine & """
+
+}
+""")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+
+      # Run 1 (a DIFFERENT party, holding key B's secret -- never pinned by
+      # this crisol.kdl): cold cache regardless -> live -> publishes a
+      # genuinely, validly-signed entry to the "mirror" remote.
+      putEnv("CRISOL_CACHE_SIGN_KEY", seedB64B)
+      let rr1 = runTests(opts)
+      check rr1.status == rsOk
+      check rr1.results.len == 1
+      check rr1.results[0].cacheDecision == cdmStored
+      check remoteHasAnyEntry(remoteRoot)
+
+      # api.nim's resolveCacheSecrets scrubs the var after run 1 resolves it.
+      check getEnv("CRISOL_CACHE_SIGN_KEY") == ""
+
+      let entryPath = findStoredEntryJson(remoteRoot)
+      let stored = parseJson(readFile(entryPath))
+      check stored.hasKey("attestation")
+      check stored["attestation"]["sigAlg"].getStr == "ed25519"
+      # Confirms the test actually set up what it claims: the published
+      # entry is signed by B, NOT A.
+      check stored["attestation"]["signer"].getStr == pubKeyB64B
+      check stored["attestation"]["signer"].getStr != pubKeyB64A
+
+      # Wipe l1 -- only the remote (verifying) tier can serve now.
+      removeDir(projectRoot / ".crisol" / "cache")
+
+      # Run 2: this project's own consumer -- deliberately NO
+      # $CRISOL_CACHE_SIGN_KEY at all (a read-only participant, same as
+      # C5a's verify-only run). It pins only key A via the SAME
+      # crisol.kdl -- key B was never trusted.
+      check getEnv("CRISOL_CACHE_SIGN_KEY") == ""
+      let rr2 = runTests(opts)
+      check rr2.status == rsOk
+      check rr2.results.len == 1
+      let r2 = rr2.results[0]
+      check r2.cacheLookup == cvTrustUnpinnedSigner
+      check r2.cacheTier == ""              # never served from any tier
+      check r2.cacheDecision == cdmStored    # self-heal: the live rerun re-publishes (to l1 only -- no secret to attest a mirror write)
+      check r2.run.kind == ptypes.pkRan      # a genuine LIVE run, not a cache replay
+
+      # Wire-level assertion (RFC's own DoD wording, verbatim): the run/v2
+      # render, not just the in-process EntrypointResult.
+      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let epNode = node["entrypoints"][0]
+      check epNode["cacheLookup"].getStr == "trustUnpinnedSigner"
+      check epNode["cacheDecision"].getStr == "stored"
+
+# ---------------------------------------------------------------------------
 # RFC-0005 A2c-ii — the post-compile consult, through the REAL entry point
 # (runTests -> planImpl -> execute -> finalizeSlot's consultPostCompile),
 # driven by a REAL crisol.kdl file:// remote -- the load-bearing consumer
