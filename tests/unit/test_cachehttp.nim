@@ -33,6 +33,27 @@
 ##       http. `scheme == "http"`.
 ##   11. Total-function: a fetcher that raises never escapes `get`/`put` --
 ##       both surface as `cvOffline`.
+##
+## Coverage (C6 -- secure-by-default credential scopes end to end): this
+## adapter forwards exactly ONE opaque bearer token (RFC-0005 "Env":
+## `$CRISOL_CACHE_TOKEN[_<TIER>]`, resolved once in `api.nim`) on EVERY
+## request, GET or PUT alike -- it has no notion of "read" vs "write"
+## itself. Read/write SCOPE is a property the SERVER attaches to a given
+## token's value; C6's job is proving crisol behaves correctly against a
+## server that actually enforces that split, via the `AuthValidatingServer`
+## double below (unlike `FakeServer`'s scripted reply queue, this one
+## inspects the incoming `Authorization` header itself and decides):
+##   12. A read-scoped token authorizes GET, is refused (403 ->
+##       cvUnauthorized) on PUT.
+##   13. A write-scoped token authorizes both GET and PUT.
+##   14. No token configured against a public-read server -> GET still
+##       serves; PUT is still refused (a public mirror is never
+##       write-open).
+##   15. No token configured against a private server -> GET is refused
+##       too (cvUnauthorized) -- credential-less access is not a special
+##       case, it is simply "no read token".
+##   16. An unauthorized PUT is a clean one-call no-op: no retry, exactly
+##       one fetcher call.
 
 import std/[options, strutils, unittest]
 import crisol/cacheport
@@ -320,5 +341,97 @@ block test_get_3xx_repeated_calls_still_return_offline:
   let backend = httpBackend(fs.fetcher, base = "https://cache.example.com")
   assert backend.get(SoundnessKey("1111111111111111")).verdict == cvOffline
   assert backend.get(SoundnessKey("2222222222222222")).verdict == cvOffline
+
+# ---------------------------------------------------------------------------
+# RFC-0005 C6 -- an auth-validating fake server. Unlike `FakeServer`'s
+# programmable status QUEUE (which returns whatever a test scripts
+# regardless of the request), this double actually INSPECTS the incoming
+# `Authorization` header and decides the status itself, per HTTP verb --
+# modeling a real server's read/write credential split so these tests prove
+# crisol's behavior against genuine enforcement, not just against a status
+# code a test happened to script.
+# ---------------------------------------------------------------------------
+
+type
+  AuthValidatingServer = ref object
+    calls*: seq[HttpRequest]
+    readTokens: seq[string]   ## accepted on GET (a write token also reads)
+    writeTokens: seq[string]  ## accepted on PUT
+    getStatus: int            ## status returned to an AUTHORIZED GET
+    getBody: string
+
+proc newAuthValidatingServer(readTokens, writeTokens: seq[string] = @[];
+                              getStatus = 200; getBody = ""): AuthValidatingServer =
+  AuthValidatingServer(calls: @[], readTokens: readTokens, writeTokens: writeTokens,
+                        getStatus: getStatus, getBody: getBody)
+
+proc bearerToken(req: HttpRequest): string =
+  let auth = headerValue(req.headers, "Authorization")
+  if auth.isSome and auth.get.startsWith("Bearer "):
+    auth.get["Bearer ".len .. ^1]
+  else:
+    ""
+
+proc fetcher(fs: AuthValidatingServer): HttpFetcher =
+  result = proc(req: HttpRequest): HttpReply =
+    fs.calls.add req
+    let token = bearerToken(req)
+    case req.meth
+    of "GET":
+      if token in fs.readTokens or token in fs.writeTokens:
+        okReply(fs.getStatus, fs.getBody)
+      else:
+        okReply(403)
+    of "PUT":
+      if token in fs.writeTokens:
+        okReply(200)
+      else:
+        okReply(403)
+    else:
+      okReply(400)
+
+block test_c6_read_token_serves_get_but_refused_on_put:
+  let key = SoundnessKey("c6c6c6c6c6c6c601")
+  let fs = newAuthValidatingServer(readTokens = @["read-tok"], writeTokens = @["write-tok"],
+                                    getBody = encodedBody(key))
+  let backend = httpBackend(fs.fetcher, base = "https://cache.example.com", token = "read-tok")
+  assert backend.get(key).verdict == cvOk, "a read-scoped token must serve a GET"
+  assert backend.put(sampleEntry(key)) == cvUnauthorized,
+    "a read-only token must be refused (server 403) on PUT"
+  assert fs.calls.len == 2
+
+block test_c6_write_token_serves_both_get_and_put:
+  let key = SoundnessKey("c6c6c6c6c6c6c602")
+  let fs = newAuthValidatingServer(readTokens = @["read-tok"], writeTokens = @["write-tok"],
+                                    getBody = encodedBody(key))
+  let backend = httpBackend(fs.fetcher, base = "https://cache.example.com", token = "write-tok")
+  assert backend.get(key).verdict == cvOk
+  assert backend.put(sampleEntry(key)) == cvOk
+
+block test_c6_no_token_public_read_server_serves_get_but_refuses_put:
+  let key = SoundnessKey("c6c6c6c6c6c6c603")
+  let fs = newAuthValidatingServer(readTokens = @[""], writeTokens = @["write-tok"],
+                                    getBody = encodedBody(key))
+  let backend = httpBackend(fs.fetcher, base = "https://cache.example.com")  # no token configured
+  assert backend.get(key).verdict == cvOk,
+    "a public-read mirror (bare token \"\" accepted) serves an unauthenticated GET"
+  assert backend.put(sampleEntry(key)) == cvUnauthorized,
+    "publish still requires the write credential, even against a public-read mirror"
+
+block test_c6_no_token_private_server_refuses_get_too:
+  let key = SoundnessKey("c6c6c6c6c6c6c604")
+  let fs = newAuthValidatingServer(readTokens = @["read-tok"], writeTokens = @["write-tok"])
+  let backend = httpBackend(fs.fetcher, base = "https://cache.example.com")  # no token configured
+  assert backend.get(key).verdict == cvUnauthorized,
+    "credential-less access to a private server is simply \"no read token\" -- not a special case"
+
+block test_c6_unauthorized_put_is_a_clean_single_call_no_op:
+  ## No retry logic exists in this adapter at all -- one call, one verdict.
+  ## A refused publish must never storm the server with retries.
+  let key = SoundnessKey("c6c6c6c6c6c6c605")
+  let fs = newAuthValidatingServer(readTokens = @["read-tok"])
+  let backend = httpBackend(fs.fetcher, base = "https://cache.example.com", token = "read-tok")
+  assert backend.put(sampleEntry(key)) == cvUnauthorized
+  assert fs.calls.len == 1, "an unauthorized put must not retry"
 
 echo "test_cachehttp: all blocks passed"

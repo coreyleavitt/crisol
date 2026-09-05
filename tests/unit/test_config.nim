@@ -1747,6 +1747,33 @@ group "unit" {
     check warns[0].key == "bogus-key"
     check warns[0].context == "remote-cache mirror"
 
+  test "'token' is not a config key -- credentials never come from KDL (RFC-0005 C6)":
+    ## RFC-0005 C6/"Secrets come from the environment ... are never in
+    ## config files": `RemoteTier` (types.nim) has no credential field at
+    ## all, and `parseRemoteCache` only recognizes `url`/`endpoint`/
+    ## `path-style`/`verify-trust`/`backfill-on-hit` -- a `token` child
+    ## falls through to the SAME unknown-key warning path as any other
+    ## unrecognized key (proven generically above), never a silently-wired
+    ## credential. Pinned explicitly, by name, so a future config-file
+    ## token path can never land unnoticed.
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "mirror" {
+    url "https://cache.example.com/crisol"
+    token "sk-should-be-ignored"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, warns) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    check warns.len == 1
+    check warns[0].key == "token"
+    check warns[0].context == "remote-cache mirror"
+
 # ---------------------------------------------------------------------------
 # RFC-0005 C3a — per-remote endpoint/path-style, scheme allowlist,
 # unsigned-s3-without-verifying-policy rejection

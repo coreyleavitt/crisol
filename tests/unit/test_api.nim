@@ -796,6 +796,23 @@ suite "runTestsWith / CacheDeps — production parity":
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored
 
+  test "productionCacheDeps() scrubs $CRISOL_CACHE_TOKEN[_<TIER>] from the process env (RFC-0005 C6)":
+    ## Mirrors the existing hmac/sign-key scrub proofs (E2E-2, below) for
+    ## the bearer-token vars specifically: `resolveCacheSecrets` (api.nim)
+    ## captures BOTH the bare and suffixed forms, then delEnv's the whole
+    ## `CRISOL_CACHE_*` namespace unconditionally. No remote-cache tier is
+    ## configured here, so `configuredCache` never resolves a backend and
+    ## no real socket is ever touched -- this proves only the env
+    ## capture-then-scrub half.
+    putEnv("CRISOL_CACHE_TOKEN", "should-be-scrubbed")
+    putEnv("CRISOL_CACHE_TOKEN_MIRROR", "should-also-be-scrubbed")
+    defer:
+      delEnv("CRISOL_CACHE_TOKEN")
+      delEnv("CRISOL_CACHE_TOKEN_MIRROR")
+    discard productionCacheDeps()
+    check getEnv("CRISOL_CACHE_TOKEN") == ""
+    check getEnv("CRISOL_CACHE_TOKEN_MIRROR") == ""
+
 # ---------------------------------------------------------------------------
 # RFC-0005 A3b — E2E-A-trust (RFC §Definition of done, verbatim): two
 # `memory` tiers via `runTestsWith`, a mock `TrustPolicy` returning
@@ -1943,6 +1960,127 @@ cache-trust {
         for (k, _) in req.headers:
           if k == "Authorization": sawAuth = true
       check not sawAuth
+
+# ---------------------------------------------------------------------------
+# RFC-0005 C6 — secure-by-default credential scopes end to end: the RFC's
+# own acceptance text, verbatim: "publish iff write-credentialed
+# (cvUnauthorized put -> no-op, reads still serve)". A real KDL
+# `remote-cache` block, driven through
+# runTestsWith(testRegistry(fake)) exactly like the C3b E2E-3 suite above,
+# but against an AUTH-VALIDATING fake server that actually inspects the
+# `Authorization` header per verb (`E2E3Server`'s reply queue returns
+# whatever a test scripts regardless of the request -- this double decides
+# for itself, modeling a real server's read/write credential split). Per-
+# status verdict-mapping is exhaustively unit-tested in
+# test_cachehttp.nim's own C6 blocks; this suite's job is proving the
+# WIRING carries a real read-scoped (or write-scoped) token, resolved
+# exactly the way `api.resolveCacheSecrets`/`cacheregistry.httpTokenFor`
+# resolve it, through a real run, end to end.
+# ---------------------------------------------------------------------------
+
+type
+  E2E3AuthServer = ref object
+    calls*: seq[HttpRequest]
+    readTokens: seq[string]
+    writeTokens: seq[string]
+    getStatus: int
+    getBody: string
+
+proc newE2E3AuthServer(readTokens, writeTokens: seq[string];
+                        getStatus = 404; getBody = ""): E2E3AuthServer =
+  E2E3AuthServer(calls: @[], readTokens: readTokens, writeTokens: writeTokens,
+                  getStatus: getStatus, getBody: getBody)
+
+proc e2e3AuthBearer(req: HttpRequest): string =
+  for (k, v) in req.headers:
+    if k == "Authorization" and v.startsWith("Bearer "):
+      return v["Bearer ".len .. ^1]
+  ""
+
+proc e2e3AuthFetcher(fs: E2E3AuthServer): HttpFetcher =
+  result = proc(req: HttpRequest): HttpReply =
+    fs.calls.add req
+    let token = e2e3AuthBearer(req)
+    case req.meth
+    of "GET":
+      if token in fs.readTokens or token in fs.writeTokens:
+        e2e3OkReply(fs.getStatus, fs.getBody)
+      else:
+        e2e3OkReply(403)
+    of "PUT":
+      if token in fs.writeTokens:
+        e2e3OkReply(200)
+      else:
+        e2e3OkReply(403)
+    else:
+      e2e3OkReply(400)
+
+proc e2e3AuthDeps(fs: E2E3AuthServer; token: string): CacheDeps =
+  let secrets = CacheSecrets(defaultHttpToken: some(token))
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+    configuredCache(cfg, stateDir, maxEntries, testRegistry(fs.e2e3AuthFetcher),
+                    secrets, NilSink[TelemetryEvent]()))
+
+suite "RFC-0005 C6 -- secure-by-default credential scopes end to end (auth-validating fake server)":
+
+  test "read-only token: GET hit serves normally, cacheTier == the configured name":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let fs = newE2E3AuthServer(readTokens = @["read-tok"], writeTokens = @["write-tok"],
+                                  getStatus = 200, getBody = e2e3EncodedHitBody())
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let rr = runTestsWith(opts, e2e3AuthDeps(fs, "read-tok"))
+      check rr.status == rsOk
+      check rr.results.len == 1
+      check rr.results[0].cacheDecision == cdmHit
+      check rr.results[0].cacheTier == "mirror"
+      check rr.results[0].cacheLookup == cvOk
+      check fs.calls.len == 1
+      check fs.calls[0].meth == "GET"
+
+  test "read-only token: publish attempt refused (403) -> local store succeeds, run stays green, " &
+       "breaker does not latch (a second entrypoint's publish is still attempted)":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "tests" / "unit" / "test_b.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let fs = newE2E3AuthServer(readTokens = @["read-tok"], writeTokens = @["write-tok"])
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
+      let rr = runTestsWith(opts, e2e3AuthDeps(fs, "read-tok"))
+      check rr.status == rsOk
+      check rr.results.len == 2
+      for r in rr.results:
+        check r.cacheDecision == cdmStored  # l1 wrote fine regardless of the remote refusal
+      check rr.cacheStats.remoteErrors == 2  # each entrypoint's refused remote flush accounted
+      check rr.cacheStats.published == 2     # l1's OWN publish still fires -- unaffected by the
+                                              # remote refusal (tekPublish/tier "l1" is emitted at
+                                              # live finalize, before the remote is ever touched)
+      # Each entrypoint costs its own GET(miss)+PUT(refused): 2 entrypoints *
+      # 2 calls = 4 -- NOT collapsed to fewer calls the way the plain-offline
+      # E2E-3 scenario above collapses to 1. That collapse is the circuit
+      # breaker; its ABSENCE here is the proof that cvUnauthorized never
+      # trips it (cachetier.nim's tripBreaker only latches on
+      # {cvOffline, cvTimeout} -- unit-proven directly in test_cachetier.nim).
+      check fs.calls.len == 4
+
+  test "write token: publish succeeds -> l1 AND remote publish both counted, no remoteErrors":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+      writeFile(projectRoot / "crisol.kdl", E2E3SingleTestKdl)
+      let fs = newE2E3AuthServer(readTokens = @["read-tok"], writeTokens = @["write-tok"])
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
+      let rr = runTestsWith(opts, e2e3AuthDeps(fs, "write-tok"))
+      check rr.status == rsOk
+      check rr.results.len == 1
+      check rr.results[0].cacheDecision == cdmStored
+      check fs.calls.len == 2
+      check fs.calls[0].meth == "GET"
+      check fs.calls[1].meth == "PUT"
+      check rr.cacheStats.published == 2  # tier "l1" at live finalize + tier "mirror" at the
+                                           # end-of-run deferred-put flush -- the write token
+                                           # actually authorized the remote half this time.
+      check rr.cacheStats.remoteErrors == 0
 
 # ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.

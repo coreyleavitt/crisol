@@ -609,6 +609,35 @@ block test_circuit_breaker_short_circuits_a_backfill_target:
     "a tier tripped earlier in the SAME lookup call must short-circuit its own backfill write too"
   assert put0[] == 0, "a tripped tier's backend.put must never be reached by backfill either"
 
+block test_circuit_breaker_does_not_trip_on_unauthorized_get:
+  ## RFC-0005 C6: `cvUnauthorized` (a read-scope refusal, e.g. an http 401/403)
+  ## is NOT a transport fault -- `tripBreaker` only latches on
+  ## `{cvOffline, cvTimeout}` (cachetier.nim, above). A credential problem on
+  ## one lookup must never poison every LATER lookup against that same tier
+  ## for the rest of the run.
+  let (backend, getCalls, _) = countingBackend(getResults = @[cvUnauthorized, cvOk])
+  var tc = oneTier(backend)
+  let key = SoundnessKey("c6c6000000000001")
+  discard tc.lookup(key)
+  discard tc.lookup(key)
+  assert getCalls[] == 2,
+    "cvUnauthorized must never trip the breaker -- the second lookup must still reach the backend"
+
+block test_circuit_breaker_does_not_trip_on_unauthorized_put:
+  ## RFC-0005 C6: a refused publish (no write credential) is a clean per-call
+  ## no-op, not a fault -- it must never latch the breaker either, so a
+  ## SECOND entrypoint's publish attempt against the same tier still reaches
+  ## the backend (proven end to end in test_api.nim's C6 suite via real
+  ## fetcher call counts; this is the same property in isolation).
+  let (backend, _, putCalls) = countingBackend(putResults = @[cvUnauthorized, cvOk])
+  var tc = oneTier(backend)
+  let entry = sampleEntry(SoundnessKey("c6c6000000000002"))
+  discard tc.put(entry)
+  assert putCalls[] == 1
+  discard tc.put(entry)
+  assert putCalls[] == 2,
+    "cvUnauthorized must never trip the breaker -- the second put must still reach the backend"
+
 # ---------------------------------------------------------------------------
 # 10. RFC-0005 A3a/B0: deferred-put drain -- a budget-bounded fold over a
 #     caller-owned queue of previously-unpublished entries.
