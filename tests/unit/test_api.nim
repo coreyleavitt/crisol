@@ -899,6 +899,14 @@ proc remoteHasAnyEntry(root: string): bool =
     if f.endsWith(".json"): return true
   false
 
+proc anyFileUnder(root: string): bool =
+  ## Generic version of remoteHasAnyEntry for directories whose entries are
+  ## not `.json` (e.g. `<stateDir>/bin/<slug>/<binName>`).
+  if not dirExists(root): return false
+  for f in walkDirRec(root):
+    if fileExists(f): return true
+  false
+
 const RemoteCacheProjectFixture = "quit(0)\n"
 
 suite "RFC-0005 A3c-ii — E2E-1: offline file:// remote (ENOTDIR)":
@@ -1079,6 +1087,117 @@ suite "RFC-0005 A2c-ii — post-compile consult: a genuinely cold project hits a
     let rr3 = runTests(RunOptions(configPath: p2 / "crisol.kdl"))
     check rr3.status == rsOk
     check rr3.results[0].compileSkipped == true
+
+# ---------------------------------------------------------------------------
+# RFC-0005 A2c-iii — E2E-1, the RFC's own acceptance text verbatim ("E2E-1
+# under (a)", §FORK-2): the cold-host three-run sequence + the secondary
+# L1-evict refallback. The A2c-ii suite above proves the post-compile HIT
+# MECHANISM fires end to end (no run child spawned, binary promoted); this
+# suite is the full E2E-1 clause-by-clause acceptance:
+#
+#   Run 1 (P1/S1): live -> cdmStored, an entry in L1 AND L2.
+#   Run 2 (P2/S2 -- a separate project root/stateDir, identical source, a
+#     genuinely cold host: no binary, no depgraph, no P2-local cache entry
+#     anywhere): compileSkipped == false, cacheDecision == cdmHit, cacheTier
+#     == the remote's configured name ("mirror" -- this codebase names
+#     tiers by KDL name; "l1" is reserved for the pinned local tier, see
+#     cacheregistry.nim -- the RFC's "l2" is a generic placeholder for
+#     "the second/remote tier", already the convention the landed A3c-ii
+#     warm-host test uses), attempts == 0, the binary now present under
+#     S2/bin, and S2's own L1 backfilled.
+#   Run 3 (P2/S2, now warm everywhere -- binary, depgraph, AND L1): cacheTier
+#     == "l1", compileSkipped == true.
+#   Secondary: evict S2's L1 only (binary + depgraph stay warm) -> cacheTier
+#     == the remote's name again (L2 refallback + re-backfill).
+#
+# This completes slice A2c: nothing about E2E-1 remains deferred after this
+# test.
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary L1-evict refallback)":
+
+  test "run 1 (P1) stores to L1+L2; run 2 (cold P2) hits L2 post-compile & backfills L1; run 3 (warm P2) hits L1; evicting P2's L1 falls back to L2":
+    let remoteRoot = getTempDir() / ("crisol_a2ciii_e2e1_remote_" & $getCurrentProcessId())
+    removeDir(remoteRoot)
+    createDir(remoteRoot)  # a configured remote is never auto-created
+    defer: removeDir(remoteRoot)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n" &
+              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot & "\"\n}\n"
+
+    # --- Run 1: project P1 / stateDir S1 -- an ordinary live run. ----------
+    let p1 = getTempDir() / ("crisol_a2ciii_e2e1_p1_" & $getCurrentProcessId())
+    removeDir(p1)
+    createDir(p1 / "tests" / "unit")
+    defer: removeDir(p1)
+    writeFile(p1 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+    writeFile(p1 / "crisol.kdl", kdl)
+    let rr1 = runTests(RunOptions(configPath: p1 / "crisol.kdl"))
+    check rr1.status == rsOk
+    check rr1.results.len == 1
+    check rr1.results[0].cacheDecision == cdmStored
+    check anyFileUnder(p1 / ".crisol" / "cache")  # entry in L1 (P1's own)
+    check remoteHasAnyEntry(remoteRoot)           # entry in L2 (the shared remote)
+
+    # --- Run 2: project P2 / stateDir S2 -- a SEPARATE project root, ------
+    # identical source content (same closure -> same soundness key), never
+    # built before: no binary, no depgraph entry, no P2-local cache entry
+    # anywhere -- a genuinely cold host for this entrypoint. edNeverBuilt at
+    # plan time; only A2c-ii's post-compile consult can serve this hit.
+    let p2 = getTempDir() / ("crisol_a2ciii_e2e1_p2_" & $getCurrentProcessId())
+    removeDir(p2)
+    createDir(p2 / "tests" / "unit")
+    defer: removeDir(p2)
+    writeFile(p2 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+    writeFile(p2 / "crisol.kdl", kdl)
+    let rr2 = runTests(RunOptions(configPath: p2 / "crisol.kdl", cacheStats: true))
+    check rr2.status == rsOk
+    check rr2.results.len == 1
+    let r2 = rr2.results[0]
+    check r2.compileSkipped == false
+    check r2.cacheDecision == cdmHit
+    check r2.cacheTier == "mirror"
+    check r2.attempts == 0
+    # the compiled binary WAS promoted to P2's own stable path (B3's "every
+    # cdmHit has a stable binary" invariant) even though no run child was
+    # ever spawned for it.
+    check anyFileUnder(p2 / ".crisol" / "bin")
+    # backfill-on-hit (KDL default #true) re-seeded P2's OWN L1.
+    check anyFileUnder(p2 / ".crisol" / "cache")
+    check rr2.cacheStats.hitPct == 100.0
+
+    # Wire-level assertion: the run/v2 render, not just the in-process
+    # EntrypointResult.
+    let node2 = parseJson(toJsonString(rr2.results, rr2.summary))
+    let epNode2 = node2["entrypoints"][0]
+    check epNode2["cacheTier"].getStr == "mirror"
+    check epNode2["cacheDecision"].getStr == "hit"
+
+    # --- Run 3: P2/S2 again -- binary + depgraph + P2's L1 all warm now. --
+    let rr3 = runTests(RunOptions(configPath: p2 / "crisol.kdl", cacheStats: true))
+    check rr3.status == rsOk
+    check rr3.results.len == 1
+    let r3 = rr3.results[0]
+    check r3.compileSkipped == true
+    check r3.cacheDecision == cdmHit
+    check r3.cacheTier == "l1"
+    check rr3.cacheStats.hitPct == 100.0
+
+    let node3 = parseJson(toJsonString(rr3.results, rr3.summary))
+    let epNode3 = node3["entrypoints"][0]
+    check epNode3["cacheTier"].getStr == "l1"
+    check epNode3["cacheDecision"].getStr == "hit"
+
+    # --- Secondary: evict P2's L1 only -- binary + depgraph stay warm. ----
+    removeDir(p2 / ".crisol" / "cache")
+    let rr4 = runTests(RunOptions(configPath: p2 / "crisol.kdl", cacheStats: true))
+    check rr4.status == rsOk
+    check rr4.results.len == 1
+    let r4 = rr4.results[0]
+    check r4.compileSkipped == true          # binary + depgraph still warm
+    check r4.cacheDecision == cdmHit
+    check r4.cacheTier == "mirror"            # L2 refallback (L1 was empty)
+    check rr4.cacheStats.hitPct == 100.0
+    check anyFileUnder(p2 / ".crisol" / "cache")  # re-backfilled
 
 suite "RFC-0005 A3c-ii — RunOptions.noRemoteCache (--no-remote-cache)":
 
