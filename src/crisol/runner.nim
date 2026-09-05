@@ -293,6 +293,15 @@ type
                                    # (spawnCompileStable / spawnRunDirect) so a
                                    # reused physical slot never leaks a prior
                                    # occupant's compile observation.
+    closureRecorded: bool          # rfc-0005 A2c-i: `recordClosure`'s outcome, captured
+                                   # the moment a this-run compile succeeds and transitions
+                                   # to its run phase (finalizeSlot, before `transitionToRun`)
+                                   # — read back by the post-run promotion/cache-store gate,
+                                   # which no longer calls `recordClosure` itself. Reset at
+                                   # every slot claim so a reused slot never leaks a prior
+                                   # occupant's outcome.
+    closureError:    string        # rfc-0005 A2c-i: `recordClosure`'s error message, paired
+                                   # with `closureRecorded` (meaningful only when it is false).
 
 # ---------------------------------------------------------------------------
 # rfc-0007 A2b: ONE stop/escalate machinery. The timeout path, the interrupt
@@ -464,13 +473,17 @@ proc classifyRunResult(
   ## with no protocol records.
 
 proc finalizeSlot(
-  sv:              var Supervisor;
-  slots:           var seq[Slot];
-  idx:             int;
-  plan:            RunPlan;
-  maxOutputBytes:  int;
-  allowTransition: bool;
-  projectRoot:     string;
+  sv:               var Supervisor;
+  slots:            var seq[Slot];
+  idx:              int;
+  plan:             RunPlan;
+  maxOutputBytes:   int;
+  allowTransition:  bool;
+  projectRoot:      string;
+  graph:            var DepGraph;
+  config:           Config;
+  sourceIndex:      var SourceIndex;
+  sourceIndexBuilt: var bool;
 ): FinalizeOutcome =
   ## Called once `next` has reported weChildExited for `slots[idx].id`.
   ## Reaps it (the only place a ChildId is consumed, §1) and either
@@ -478,6 +491,19 @@ proc finalizeSlot(
   ## phase (fkTransitioned) or produces this pepIdx's EntrypointResult
   ## (fkDone / fkOmitted). `allowTransition` is false only during interrupt
   ## teardown.
+  ##
+  ## rfc-0005 A2c-i: `graph`/`config`/`sourceIndex`/`sourceIndexBuilt` exist
+  ## solely so a successfully-compiled slot can have its closure extracted
+  ## and its dependency-graph entry updated RIGHT HERE — before the run
+  ## child is spawned — instead of after the entire run completes (the
+  ## pre-existing site, now just a reader of `slot.closureRecorded`/
+  ## `.closureError`). `sourceIndex`/`sourceIndexBuilt` are `execute`'s own
+  ## locals threaded through by `var` so the "built at most once per
+  ## `execute` call, only when something actually compiles" invariant
+  ## (see `execute`'s doc comment) survives the move unchanged. Pure
+  ## sequencing prep for A2c-ii's post-compile cache consult, which will
+  ## need the closure/graph available at exactly this point; no cache
+  ## lookup happens here.
   ##
   ## rfc-0007 §2: `report.stop` is the SINGLE source of authorship —
   ## `toProcessResult`'s `classifyCause` call already consults it before the
@@ -531,6 +557,22 @@ proc finalizeSlot(
         cleanupSlotOnTeardown(slots[idx])
         slots[idx].state = ssIdle
         return FinalizeOutcome(kind: fkOmitted)
+
+      # rfc-0005 A2c-i: extract this compile's closure and update the
+      # dependency graph entry NOW — right after compile finishes, before
+      # the run child is spawned — instead of after the whole run
+      # completes (the pre-existing site). The post-run promotion/
+      # cache-store gate (in `execute`) reads `closureRecorded`/
+      # `closureError` back off the slot rather than calling
+      # `recordClosure` itself; the WHAT is unchanged, only the WHEN moved.
+      if not sourceIndexBuilt:
+        sourceIndex = buildSourceIndex(config)
+        sourceIndexBuilt = true
+      let rec = recordClosure(graph, config, pep.ep, slots[idx].cacheDir,
+                              binName(pep.ep), CrisolProtocolMajor, sourceIndex)
+      slots[idx].closureRecorded = rec.ok
+      slots[idx].closureError    = rec.error
+
       let ok = transitionToRun(sv, slots[idx], slots[idx].runTimeoutMs, slots[idx].attempt,
                                projectRoot)
       if not ok:
@@ -961,6 +1003,10 @@ proc spawnCompileStable(
                                         # so a reused slot never leaks a prior occupant's
                                         # compile observation; finalizeSlot sets this for
                                         # real once THIS compile is reaped.
+  slot.closureRecorded = false         # rfc-0005 A2c-i: reset on every claim; finalizeSlot
+                                        # sets this for real once THIS compile succeeds and
+                                        # transitions to its run phase.
+  slot.closureError    = ""
   result = true
 
 proc buildRunChildSpec(
@@ -1075,6 +1121,9 @@ proc spawnRunDirect(
                                         # no compile happened this run; reset so a
                                         # reused slot never leaks a prior occupant's
                                         # compile observation.
+  slot.closureRecorded = false         # rfc-0005 A2c-i: cdSkipFresh — no compile,
+                                        # so no closure recording either; reset for hygiene.
+  slot.closureError    = ""
   result = true
 
 proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
@@ -1237,8 +1286,10 @@ proc execute*(
   ## For cdSkipFresh entrypoints: compile is skipped; the existing binary is
   ## run directly.  compileSkipped=true is set on the resulting EntrypointResult.
   ##
-  ## After each successful compile+run, records the closure and content hash in
-  ## `graph` and saves the depgraph (single writer, main poll loop).
+  ## After each successful compile (rfc-0005 A2c-i: right after compile
+  ## finishes, before its run child is spawned — no longer after the run
+  ## completes), records the closure and content hash in `graph` and saves
+  ## the depgraph (single writer, main poll loop).
   ##
   ## failFast=true: once any completed entrypoint has a failure outcome, no NEW
   ## entrypoints are dispatched.  In-flight entrypoints drain to completion.
@@ -1270,14 +1321,15 @@ proc execute*(
   # pure function of the source tree (config.projectRoot + config.depRoots),
   # never of any single entrypoint/compile — build it at most ONCE per
   # execute() call, lazily on the first closure recording, and thread it
-  # through every recordClosure call below. A run that compiles nothing
-  # (every entrypoint fresh or cached) never pays the walk.
+  # through every recordClosure call. A run that compiles nothing (every
+  # entrypoint fresh or cached) never pays the walk.
+  #
+  # rfc-0005 A2c-i: the lazy-build check itself now lives inside
+  # `finalizeSlot` (recordClosure moved there, right after compile
+  # finishes) — these two locals are threaded through by `var` so the
+  # "at most once per execute() call" invariant survives the move.
   var sourceIndex: SourceIndex
   var sourceIndexBuilt = false
-  proc ensureSourceIndex() =
-    if not sourceIndexBuilt:
-      sourceIndex = buildSourceIndex(config)
-      sourceIndexBuilt = true
 
   # nimcache-persistence (RFC-0006): computed ONCE per execute() call, not
   # per slot/compile — both are pure functions of the plan/toolchain, never
@@ -1461,6 +1513,12 @@ proc execute*(
         let slotBinDir       = slots[idx].slotBinDir     # per-slot bin dir (M15)
         let slotToken        = slots[idx].token          # S3: capture before slot cleared
         let slotAttempt      = slots[idx].attempt        # B0/B1: current attempt number
+        let slotClosureRecorded = slots[idx].closureRecorded  # rfc-0005 A2c-i: capture
+                                                          # before slot cleared — set at the
+                                                          # compile→run transition, read by
+                                                          # the post-run promotion/cache-
+                                                          # store gate below.
+        let slotClosureError    = slots[idx].closureError
 
         # S6b/rfc-0007 A2b: sample finish-time RSS BEFORE `finalizeSlot`
         # reaps — reap is the only place a ChildId is consumed (§1), and
@@ -1473,7 +1531,10 @@ proc execute*(
 
         let fo = finalizeSlot(sv, slots, idx, p, maxOutputBytes,
                               allowTransition = not shuttingDown,
-                              projectRoot = config.projectRoot.absolutePath.normalizedPath)
+                              projectRoot = config.projectRoot.absolutePath.normalizedPath,
+                              graph = graph, config = config,
+                              sourceIndex = sourceIndex,
+                              sourceIndexBuilt = sourceIndexBuilt)
 
         case fo.kind
         of fkTransitioned:
@@ -1558,7 +1619,11 @@ proc execute*(
                 anyFailed = true
 
               # After run completes for a compiled-this-run slot: copy the binary
-              # to the stable slug-keyed path, then record freshness in the depgraph.
+              # to the stable slug-keyed path, then consult the closure-recording
+              # outcome captured back at the compile→run transition (rfc-0005
+              # A2c-i: `finalizeSlot` calls `recordClosure` itself, right after
+              # compile finishes and before the run child is spawned — this site
+              # only reads `slotClosureRecorded`/`slotClosureError` back).
               # Binary is valid (compile succeeded) whenever outcome is not
               # oCompileFailed or oSpawnError.
               # R9: default true — only a compiled-this-run entry whose closure
@@ -1602,15 +1667,12 @@ proc execute*(
                       try: stderr.flushFile() except CatchableError: discard
                       try: removeFile(stableBin) except CatchableError: discard
 
-                  # Record the closure — recovery policy lives in recordClosure
-                  # (see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE, and
-                  # recordClosure's doc comment in depgraph.nim).
-                  ensureSourceIndex()
-                  let rec = recordClosure(graph, config, ep,
-                                          slotCacheDir, bname, CrisolProtocolMajor,
-                                          sourceIndex)
-                  closureRecorded = rec.ok
-                  if not rec.ok:
+                  # Closure recording itself already happened in `finalizeSlot`,
+                  # right after this compile succeeded (rfc-0005 A2c-i) — recovery
+                  # policy still lives beside the invariant it protects, in
+                  # `recordClosure` (depgraph.nim); this reads its outcome back.
+                  closureRecorded = slotClosureRecorded
+                  if not closureRecorded:
                     # The depgraph entry for this compile is either invalidated
                     # or (on a persist failure) not reliably reflected on disk
                     # at all — either way, the stable binary just promoted
@@ -1619,7 +1681,7 @@ proc execute*(
                     # with it (issue #13.3).
                     try: removeFile(stableBin) except CatchableError: discard
                     stderr.write("crisol: warning: " & ep.path & ": could not record its " &
-                                 "source closure (" & rec.error & "); dependency record " &
+                                 "source closure (" & slotClosureError & "); dependency record " &
                                  "invalidated and its binary was discarded — it will be " &
                                  "recompiled and force-selected next run\n")
                     try: stderr.flushFile() except CatchableError: discard
