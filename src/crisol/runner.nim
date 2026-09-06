@@ -626,8 +626,22 @@ proc finalizeSlot(
       # applied here on the read side) — a group opted out of caching, or a
       # globally-disabled policy, is handled by `consultPostCompile`'s own
       # `resolveCacheable` gate exactly like the plan-time path.
-      if rec.ok and cache.isActive():
-        let look = consultPostCompile(pep, cache.policy, cache.seams, cache.sink)
+      #
+      # RFC-0005 SO3 fix: ALSO gated on `slots[idx].attempt == 1`, mirroring
+      # `shouldStore`'s own `attempt != 1 ⇒ cdmFlaky` rule on the write side.
+      # Without this, a retry (attempt 2+) reaches this same consult every
+      # time — `pep.edecision` is immutable across attempts, so
+      # `spawnCompileStable` re-dispatches the SAME edNeverBuilt/edStale
+      # decision on every attempt — and can hit a pass some OTHER host
+      # published to the SAME key between attempt 1 and this attempt,
+      # serving `fkCacheHit` (attempts=0, no ledger row, `flaky()`
+      # structurally false) and silently masking what may be a genuine
+      # local failure. On attempt > 1 the consult is skipped entirely: the
+      # compile result falls straight through to `transitionToRun` below,
+      # a real run every time, exactly like a cache-inactive run.
+      if rec.ok and cache.isActive() and slots[idx].attempt == 1:
+        let look = consultPostCompile(pep, cache.policy, cache.seams, cache.sink,
+                                      cache.spec, cache.outcomePolicy)
         if look.decision == edCached and look.synthesized.isSome:
           if promoteCompiledBinary(pep.ep, config, slots[idx].binCompiled):
             # Genuine post-compile hit: the compile really ran (compile =
@@ -1601,7 +1615,7 @@ proc execute*(
       # own interrupt handling (the poll loop's weShutdown case) takes over.
       break
     let look = lookupAtPlan(p.entrypoints[i], cache.policy, cache.seams, explainMiss,
-                            cache.sink)
+                            cache.sink, cache.spec, cache.outcomePolicy)
     cacheDecisions[i] = look.cacheDecision
     inputHashes[i]    = look.inputHash  # A8: stamped onto live miss results below
     explains[i]       = look.explain    # RFC-0005 B1c: stamped onto live miss results below

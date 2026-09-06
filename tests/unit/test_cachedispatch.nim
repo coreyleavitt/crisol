@@ -253,6 +253,68 @@ suite "lookupAtPlan — promotion + decision":
                                                 # disqualified it as a hit.
 
 # ---------------------------------------------------------------------------
+# RFC-0005 SO1: serve-time recompute is policy-aware AND re-checks evidence
+#
+# `sampleCachedWithEscapees` plants OBSERVED escapee evidence on an otherwise-
+# passing stored entry -- exactly the shape the local publish gate
+# (`shouldStore`) could never itself have produced (a passing local run's own
+# `evidenceSatisfies` check would have refused the store), but that
+# `cachetier`'s populate-on-hit backfill CAN re-store verbatim from a
+# foreign/remote tier without ever re-running `shouldStore`. The read
+# boundary (`consultReal`, shared by `lookupAtPlan`/`consultPostCompile`)
+# must enforce what the write boundary promises.
+# ---------------------------------------------------------------------------
+
+suite "lookupAtPlan — RFC-0005 SO1: policy-aware recompute + evidence re-check":
+
+  let isoSpec      = resolveSandbox(hlIsolated)
+  let strictPolicy = OutcomePolicy(strictHygiene: true)
+
+  proc sampleCachedWithEscapees(): CachedResult =
+    result = sampleCached()
+    result.run.evidence.escapees =
+      @[ProcSnapshot(pid: 4242, ppid: 1, command: "leaked", rssBytes: 1024)]
+
+  test "escapee-evidence hit -> cdmRecomputeMiss under an UNSTRICT run (evidenceSatisfies, not policy)":
+    ## The stored observation's OWN outcome (exit 0, no fail records) is
+    ## oPassed even under DefaultPolicy -- strictHygiene is what would flip
+    ## it, and this run does NOT have it set. The miss must come from the
+    ## evidence re-check alone: "observed escapee ⇒ uncacheable" is absolute,
+    ## not conditional on --strict-hygiene.
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy,
+                            seamsHit(c, sampleCachedWithEscapees()),
+                            spec = isoSpec, outcomePolicy = DefaultPolicy)
+    check look.decision == edRunFresh            # treated as a miss: run it live
+    check look.cacheDecision == cdmRecomputeMiss
+    check look.synthesized.isNone
+    check c.loadCalls == 1                       # the entry WAS found; the
+                                                  # evidence check disqualified it.
+
+  test "escapee-evidence hit -> cdmRecomputeMiss under a STRICT-HYGIENE run too":
+    var c: Calls
+    let look = lookupAtPlan(freshPep(edRunFresh), onPolicy,
+                            seamsHit(c, sampleCachedWithEscapees()),
+                            spec = isoSpec, outcomePolicy = strictPolicy)
+    check look.decision == edRunFresh
+    check look.cacheDecision == cdmRecomputeMiss
+    check look.synthesized.isNone
+
+  test "guard: a clean entry still serves cdmHit under both policies (no regression)":
+    var c1, c2: Calls
+    let lookUnstrict = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c1, sampleCached()),
+                                    spec = isoSpec, outcomePolicy = DefaultPolicy)
+    check lookUnstrict.decision == edCached
+    check lookUnstrict.cacheDecision == cdmHit
+    check lookUnstrict.synthesized.isSome
+
+    let lookStrict = lookupAtPlan(freshPep(edRunFresh), onPolicy, seamsHit(c2, sampleCached()),
+                                  spec = isoSpec, outcomePolicy = strictPolicy)
+    check lookStrict.decision == edCached
+    check lookStrict.cacheDecision == cdmHit
+    check lookStrict.synthesized.isSome
+
+# ---------------------------------------------------------------------------
 # RFC-0005 A3b: PlanLookup.tier / PlanLookup.lookup threading
 # ---------------------------------------------------------------------------
 

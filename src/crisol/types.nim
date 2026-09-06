@@ -379,11 +379,21 @@ type
                                 ## a would-be pass with an OBSERVED escapee (evidence.escapees.len
                                 ## > 0) derives oFailed instead of oPassed at every REPORTING trust
                                 ## boundary (summarize -> exit code, render, JSON/junit wire,
-                                ## lastrun.json) — never at the cache's own outcome() call, which
-                                ## stays DefaultPolicy always (the cache stores/derives unstrict,
-                                ## RFC-0007 §2); nor at live scheduling decisions (retry
-                                ## eligibility, quarantine matching, ledger rows), which read the
-                                ## unstrict observation like the cache does. Default false:
+                                ## lastrun.json). RFC-0005 SO1 fix: the cache's SERVE-time recompute
+                                ## (cachedispatch.lookupAtPlan/consultPostCompile, via consultReal)
+                                ## ALSO reads this SAME resolved value now (threaded through
+                                ## CacheContext.outcomePolicy from api.nim's single cacheEnabled call
+                                ## site) — a cache hit is judged by the run's OWN reporting policy,
+                                ## so a strict-hygiene run never serves an entry it would itself
+                                ## report as failed (an unstrict run may still hit that same entry;
+                                ## that asymmetry is intentional, not a bug). The STORE gate
+                                ## (cachedispatch.shouldStore) stays policy-UNCONDITIONAL — it never
+                                ## reads strictHygiene at all; `evidenceSatisfies` alone gates
+                                ## publication regardless of policy (RFC-0007 §2's "the cache stores
+                                ## unstrict" — publication, not serving, is what stays unstrict).
+                                ## Live scheduling decisions (retry eligibility, quarantine
+                                ## matching, ledger rows) are unaffected by this fix and still read
+                                ## the unstrict (DefaultPolicy) observation. Default false:
                                 ## byte-for-byte unchanged until an operator opts in
                                 ## (`--strict-hygiene` / `strict-hygiene #true` in crisol.kdl).
     rlimitNofile*: Option[int64]

@@ -1266,7 +1266,14 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
         CachePolicy(enabled: true),
         realSeams(keyCtx, addr graph, rt),
         rt.sink,          # RFC-0005 B2a: NilSink by default; B2b's statsSink above when installed
-        realPrefetch(rt)) # RFC-0005 C3c: resolves each canProbe tier's key-existence set once
+        realPrefetch(rt), # RFC-0005 C3c: resolves each canProbe tier's key-existence set once
+        # RFC-0005 SO1 fix: the run's resolved reporting policy, threaded to
+        # the cache's serve-side recompute (lookupAtPlan/consultPostCompile)
+        # so a strict-hygiene run never serves what it would itself report
+        # as failed — see CacheContext.outcomePolicy's own doc comment
+        # (cachedispatch.nim) and the `let policy = ...` comment further
+        # down this proc for why this is built here too, ahead of execute().
+        outcomePolicy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene))
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
   # are written by execute() itself (via ptr out-params) rather than caught as
@@ -1331,11 +1338,17 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # cfg.strictHygiene (CLI flag OR config-file, already merged by planImpl
   # above) — recomputed at every REPORTING trust boundary from here on
   # (summarize -> exit code; render/JSON/junit/lastrun.json below via
-  # rr.plan.settings.strictHygiene). The cache's own outcome() calls
-  # (cachedispatch.shouldStore/lookupAtPlan) and live scheduling decisions
-  # (retry eligibility, quarantine matching, ledger rows) deliberately never
-  # see this value — they stay DefaultPolicy (unstrict), matching the
-  # cache's "stores/derives unstrict" rule (RFC-0007 §2).
+  # rr.plan.settings.strictHygiene). RFC-0005 SO1 fix: the cache's SERVE-side
+  # recompute (cachedispatch.lookupAtPlan/consultPostCompile) ALSO reads this
+  # same resolved value now — see the `cacheEnabled(..., outcomePolicy = ...)`
+  # call further up this proc, which builds an equal `OutcomePolicy` from the
+  # same `cfg.strictHygiene` BEFORE `execute()` runs (this `policy` local is
+  # built too late for that call site, hence the duplicate construction, not
+  # a second independent resolution). The STORE gate
+  # (cachedispatch.shouldStore) and live scheduling decisions (retry
+  # eligibility, quarantine matching, ledger rows) still deliberately never
+  # see it — they stay DefaultPolicy (unstrict), matching the cache's
+  # "publishes unstrict" rule (RFC-0007 §2).
   let policy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene)
   var s = summarize(results, policy)
   # rfc-0007 A1e-ii §2: notStarted is bookkeeping about entries OMITTED from

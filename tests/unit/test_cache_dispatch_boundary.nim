@@ -57,6 +57,25 @@ proc cachedPass(durationMs: int64): CachedResult =
     ),
     records: @[], cachedAt: 1_700_000_000'i64)
 
+proc cachedPassWithEscapees(durationMs: int64): CachedResult =
+  ## RFC-0005 SO1: a stored entry whose payload evidence carries an OBSERVED
+  ## escapee -- exactly the shape `cachetier`'s populate-on-hit backfill can
+  ## re-store verbatim from a foreign/remote tier (it never re-runs
+  ## `shouldStore`), even though the LOCAL publish gate could never have
+  ## produced one itself (`evidenceSatisfies` would have refused it at
+  ## store time). Constructed directly here for that reason.
+  CachedResult(
+    run: ptypes.ProcessResult(
+      exit:  ptypes.Exit(kind: ptypes.ekExited, code: 0),
+      cause: ptypes.Cause(by: ptypes.cbProcess),
+      evidence: ptypes.Evidence(
+        escapees: @[ptypes.ProcSnapshot(pid: 4242, ppid: 1, command: "leaked",
+                                        rssBytes: 1024)]),
+      rusage: none(ptypes.Rusage),
+      durationUs: durationMs * 1000,
+    ),
+    records: @[], cachedAt: 1_700_000_000'i64)
+
 proc plannedFresh(path: string): PlannedEntrypoint =
   ## An edRunFresh planned entrypoint (binary fresh; eligible for cache).
   PlannedEntrypoint(
@@ -403,5 +422,191 @@ suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set
                                        compileTimeoutSecs: 120, timeoutSecs: 60),
                     graph = g, showProgress = false, cache = ctx)
     check prefetchCalls == 0
+
+# ---------------------------------------------------------------------------
+# 7. RFC-0005 SO1: serve-time recompute is policy-aware + re-checks evidence
+#
+# Drives the same real execute() poll-loop as suite 3 (edNeverBuilt on a
+# REAL passing fixture, so the post-compile consult -- `consultPostCompile`,
+# sharing `consultReal` with `lookupAtPlan` -- is the one exercised here),
+# but the mock cache is pre-seeded with an escapee-tainted entry under this
+# fixture's OWN key. A served `cdmHit` would skip the run entirely; instead
+# the real compile+run happens (a genuinely clean, isolated `quit(0)`, so it
+# passes for real and self-heals the entry: `cdmStored`, not `cdmHit`) --
+# proof the tainted entry was never served.
+# ---------------------------------------------------------------------------
+
+suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real rerun":
+
+  test "unstrict run: escapee entry never served (evidenceSatisfies re-check, not policy)":
+    let dir = getTempDir() / "crisol_so1_escapee_a"
+    removeDir(dir); createDir(dir)
+    defer: removeDir(dir)
+    let fixt = dir / "test_pass.nim"
+    writeFile(fixt, "quit(0)\n")
+
+    let ms = MockState(store: initTable[string, CachedResult]())
+    ms.store["mk-" & fixt] = cachedPassWithEscapees(9999)
+
+    let pep = PlannedEntrypoint(
+      ep: Entrypoint(path: fixt, group: "unit", flags: @[]),
+      edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    let p = RunPlan(entrypoints: @[pep], jobs: 1)
+    var g = emptyDepGraph()
+    let results = execute(
+      p, config = Config(projectRoot: dir, stateDir: ".crisol",
+                         compileTimeoutSecs: 120, timeoutSecs: 60),
+      graph = g, showProgress = false,
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)))
+
+    check results.len == 1
+    check ms.loadCalls == 1                 # the post-compile consult WAS made
+    check not results[0].cached             # ... and rejected the tainted hit
+    check results[0].outcome == oPassed     # a REAL run of this genuinely clean fixture
+    check results[0].cacheDecision == cdmStored   # self-heals the key with real evidence
+    check ms.storeCalls == 1
+
+  test "strict-hygiene run: same escapee entry, same recompute-miss":
+    let dir = getTempDir() / "crisol_so1_escapee_b"
+    removeDir(dir); createDir(dir)
+    defer: removeDir(dir)
+    let fixt = dir / "test_pass.nim"
+    writeFile(fixt, "quit(0)\n")
+
+    let ms = MockState(store: initTable[string, CachedResult]())
+    ms.store["mk-" & fixt] = cachedPassWithEscapees(9999)
+
+    let pep = PlannedEntrypoint(
+      ep: Entrypoint(path: fixt, group: "unit", flags: @[]),
+      edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    let p = RunPlan(entrypoints: @[pep], jobs: 1)
+    var g = emptyDepGraph()
+    let strictPolicy = ptypes.OutcomePolicy(strictHygiene: true)
+    let results = execute(
+      p, config = Config(projectRoot: dir, stateDir: ".crisol",
+                         compileTimeoutSecs: 120, timeoutSecs: 60),
+      graph = g, showProgress = false,
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms),
+                           outcomePolicy = strictPolicy))
+
+    check results.len == 1
+    check ms.loadCalls == 1
+    check not results[0].cached
+    check results[0].outcome == oPassed
+    check results[0].cacheDecision == cdmStored
+    check ms.storeCalls == 1
+
+  test "guard: a normal clean entry still serves cdmHit under a strict-hygiene run (no regression)":
+    let ms = MockState(store: initTable[string, CachedResult]())
+    ms.store["mk-tests/unit/test_bogus_clean.nim"] = cachedPass(111)
+
+    let pep = plannedFresh("tests/unit/test_bogus_clean.nim")
+    let p = RunPlan(entrypoints: @[pep], jobs: 1)
+    var g = emptyDepGraph()
+    let strictPolicy = ptypes.OutcomePolicy(strictHygiene: true)
+    let results = execute(
+      p, config = Config(projectRoot: getTempDir()), graph = g, showProgress = false,
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms),
+                           outcomePolicy = strictPolicy))
+
+    check results.len == 1
+    check results[0].cacheDecision == cdmHit
+    check results[0].cached
+
+# ---------------------------------------------------------------------------
+# 8. RFC-0005 SO3: post-compile consult is attempt-gated
+#
+# `edNeverBuilt`/`edStale` retries ALWAYS recompile (edecision is immutable —
+# spawnCompileStable dispatches on every attempt, runner.nim's fill-scan),
+# so finalizeSlot's spCompiling branch — and therefore its post-compile
+# `consultPostCompile` call — runs again on attempt 2+ unless explicitly
+# gated. Without the SO3 fix, a pass published to the SAME key by some OTHER
+# host between attempt 1 and attempt 2 would be served as a `fkCacheHit`,
+# masking what may be a genuine local failure (attempts=0, no ledger row,
+# `flaky()` structurally false). `raceSeams` below simulates exactly that
+# race deterministically: its `load` is a MISS on the very first call (the
+# real attempt-1 consult) and a HIT on every call after — proving the fix
+# by proving `load` is never called a SECOND time at all (the attempt-gate
+# skips the consult entirely on attempt 2, not merely discards its result).
+# ---------------------------------------------------------------------------
+
+type RaceState = ref object
+  loadCalls: int
+  planted:   bool
+
+proc raceSeams(rs: RaceState; passResult: CachedResult): CacheSeams =
+  legacySeams(
+    keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
+             SoundnessKey("mk-" & pep.ep.path),
+    load = proc(key: SoundnessKey): Option[CachedResult] =
+             inc rs.loadCalls
+             if rs.planted:
+               some(passResult)
+             else:
+               # Simulate a concurrent publish landing between THIS
+               # (attempt-1) consult and any later one.
+               rs.planted = true
+               none(CachedResult),
+    store = proc(key: SoundnessKey; res: CachedResult): bool =
+             false,   # irrelevant: a failing attempt is never store-eligible
+  )
+
+suite "execute — RFC-0005 SO3: post-compile consult attempt-gating":
+
+  test "retry (attempt 2) does NOT consult the cache; a real rerun happens; attempts recorded honestly":
+    let dir = getTempDir() / "crisol_so3_retry"
+    removeDir(dir); createDir(dir)
+    defer: removeDir(dir)
+    let fixt = dir / "test_always_fail.nim"
+    writeFile(fixt, "quit(1)\n")   # deterministic failure on EVERY real attempt
+
+    let rs = RaceState()
+    let pep = PlannedEntrypoint(
+      ep: Entrypoint(path: fixt, group: "unit", flags: @[]),
+      edecision: edNeverBuilt, runTimeoutMs: 60_000, retries: 1)  # maxAttempts = 2
+    let p = RunPlan(entrypoints: @[pep], jobs: 1)
+    var g = emptyDepGraph()
+    let results = execute(
+      p, config = Config(projectRoot: dir, stateDir: ".crisol",
+                         compileTimeoutSecs: 120, timeoutSecs: 60),
+      graph = g, showProgress = false,
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), raceSeams(rs, cachedPass(1))))
+
+    check results.len == 1
+    check results[0].attempts == 2         # both attempts genuinely ran -- not masked as a cache hit
+    check results[0].outcome == oFailed    # the real, deterministic failure -- never the planted pass
+    check not results[0].cached
+    check results[0].cacheDecision == cdmKeyMiss   # a real fresh-run miss, never cdmHit
+    check rs.loadCalls == 1                 # the post-compile consult ran ONCE (attempt 1) --
+                                             # attempt 2's consult was skipped entirely, not just
+                                             # ignored: proves the GATE, not merely the recompute rule.
+
+  test "guard: an attempt-1 post-compile hit still serves (no regression)":
+    let ms = MockState(store: initTable[string, CachedResult]())
+
+    let dir = getTempDir() / "crisol_so3_guard"
+    removeDir(dir); createDir(dir)
+    defer: removeDir(dir)
+    let fixt = dir / "test_pass.nim"
+    writeFile(fixt, "quit(0)\n")
+
+    let pep = PlannedEntrypoint(
+      ep: Entrypoint(path: fixt, group: "unit", flags: @[]),
+      edecision: edNeverBuilt, runTimeoutMs: 60_000)   # retries: 0 (default) -- single attempt
+    let p = RunPlan(entrypoints: @[pep], jobs: 1)
+    var g = emptyDepGraph()
+    # Seed the mock cache under the REAL key this fixture derives (mockSeams'
+    # legacyKey is "mk-" & pep.ep.path -- see the module-level mockSeams proc).
+    ms.store["mk-" & fixt] = cachedPass(111)
+    let results = execute(
+      p, config = Config(projectRoot: dir, stateDir: ".crisol",
+                         compileTimeoutSecs: 120, timeoutSecs: 60),
+      graph = g, showProgress = false,
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)))
+
+    check results.len == 1
+    check results[0].cacheDecision == cdmHit
+    check results[0].cached
+    check ms.loadCalls == 1
 
 echo "test_cache_dispatch_boundary: done"

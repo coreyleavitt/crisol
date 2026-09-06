@@ -205,6 +205,20 @@ type
       ## call site predating C3c pays nothing for it; production installs
       ## `realPrefetch(rt)` (see that proc) at the same call site `sink`
       ## already threads `rt` through.
+    outcomePolicy*: ptypes.OutcomePolicy
+      ## RFC-0005 SO1 fix: the run's RESOLVED reporting policy (CLI
+      ## `--strict-hygiene` / config, already merged by the caller — see
+      ## `api.nim`'s single production `cacheEnabled` call site), threaded
+      ## through to `lookupAtPlan`/`consultPostCompile`'s serve-time
+      ## recompute (`consultReal`, below) so a hit is judged by the SAME
+      ## policy this run will REPORT under — never a fixed `DefaultPolicy`
+      ## that could silently disagree with `--strict-hygiene` and serve an
+      ## entry the run's own summary/exit-code/render would call a failure.
+      ## Defaults to `ptypes.DefaultPolicy` (unstrict) so every existing
+      ## `cacheEnabled` call site predating this fix is unaffected. Distinct
+      ## from `shouldStore`'s STORE-side check, which stays policy-
+      ## unconditional (`evidenceSatisfies` alone gates publication,
+      ## RFC-0007 §2) — this field only ever reaches the READ side.
 
 proc noopPrefetch(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) =
   discard
@@ -220,12 +234,14 @@ proc cacheDisabled*(spec: SandboxSpec): CacheContext =
     active: false,
     sink:   NilSink[TelemetryEvent](),
     prefetch: noopPrefetch,
+    outcomePolicy: ptypes.DefaultPolicy,
   )
 
 proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
                    seams: CacheSeams;
                    sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
                    prefetch: PrefetchProc = noopPrefetch,
+                   outcomePolicy: ptypes.OutcomePolicy = ptypes.DefaultPolicy,
                    ): CacheContext =
   ## Construct a CacheContext with caching enabled.
   ## `seams.keyOf` MUST be non-nil; asserted at construction time so an
@@ -234,6 +250,9 @@ proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
   ## `InMemorySink`'s, or, production, the `CacheRuntime`'s) to observe
   ## `lookupAtPlan`'s hit/miss events. `prefetch` defaults to a no-op — RFC-
   ## 0005 C3c; pass `realPrefetch(rt)` in production, or a spy in a test.
+  ## `outcomePolicy` defaults to `ptypes.DefaultPolicy` (unstrict) — RFC-0005
+  ## SO1 fix; production passes the run's resolved `--strict-hygiene` policy
+  ## (see `outcomePolicy`'s own field doc, above).
   doAssert seams.keyOf != nil,
     "cacheEnabled: seams.keyOf must be non-nil (use cacheDisabled if not caching)"
   doAssert policy.enabled,
@@ -245,6 +264,7 @@ proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
     active: true,
     sink:   sink,
     prefetch: prefetch,
+    outcomePolicy: outcomePolicy,
   )
 
 proc isActive*(ctx: CacheContext): bool {.inline.} =
@@ -310,10 +330,14 @@ proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
   ## rfc-0007 §2: `run` replays the REAL stored observation verbatim --
   ## `Phase(kind: pkCached, res: cr.run)` -- so `outcome(this)`/`cached(this)`
   ## derive genuinely from it, not from a re-stated value here. The CALLER
-  ## (`lookupAtPlan`) has ALREADY checked `outcome(this) == oPassed` before
-  ## returning this synthesis as a hit; a recompute-invalidated synthesis is
-  ## discarded (cdmRecomputeMiss) before any caller sees it. `compile` stays
-  ## pkSkipped: edCached genuinely never compiles.
+  ## (`consultReal`, shared by `lookupAtPlan`/`consultPostCompile`) has
+  ## ALREADY checked, under the RUN'S resolved `OutcomePolicy` (RFC-0005
+  ## SO1) AND `evidenceSatisfies` (SO1 defense-in-depth: a foreign/backfilled
+  ## entry can carry escapee evidence the local publish gate would have
+  ## refused), that this synthesis is genuinely servable, before returning it
+  ## as a hit; an invalidated synthesis (either check) is discarded
+  ## (cdmRecomputeMiss) before any caller sees it. `compile` stays pkSkipped:
+  ## edCached genuinely never compiles.
   result = EntrypointResult(
     ep:             pep.ep,
     records:        cr.records,
@@ -325,9 +349,18 @@ proc synthesize(pep: PlannedEntrypoint; cr: CachedResult;
   )
   result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
   result.run = ptypes.Phase(kind: ptypes.pkCached, res: cr.run)
+  # RFC-0005 SO3 (investigated, not changed): `attempts` is left at its
+  # zero-value default deliberately. A plan-time `edCached` hit (runner.nim's
+  # pre-dispatch loop) never stamps `.attempts` onto its synthesized result
+  # either -- both a plan-time hit and this post-compile hit report
+  # attempts=0, consistent with each other and with `flaky()`'s own
+  # "attempts > 1" reading (a served-from-cache result was never actually
+  # attempted THIS run). Changing this convention is a separate finding, not
+  # this one.
 
 proc consultReal(pep: PlannedEntrypoint; seams: CacheSeams;
-                 sink: TelemetrySink[TelemetryEvent]): PlanLookup =
+                 sink: TelemetrySink[TelemetryEvent];
+                 spec: SandboxSpec; outcomePolicy: ptypes.OutcomePolicy): PlanLookup =
   ## The genuine (non-diagnostic) derive+load+recompute-check+synthesize
   ## sequence, shared by the two REAL cache-consult call sites this RFC now
   ## has: `lookupAtPlan`'s plan-time lookup for an `edRunFresh` entrypoint
@@ -346,6 +379,13 @@ proc consultReal(pep: PlannedEntrypoint; seams: CacheSeams;
   ## on hit; otherwise unchanged" — see that field's own doc comment) —
   ## `edRunFresh` for `lookupAtPlan`'s caller, `edNeverBuilt`/`edStale` for
   ## `consultPostCompile`'s.
+  ##
+  ## `spec`/`outcomePolicy` (RFC-0005 SO1 fix) are the run's OWN hermeticity
+  ## spec and resolved reporting policy (both come from the caller's
+  ## `CacheContext` — `cache.spec`/`cache.outcomePolicy`) -- the same two
+  ## inputs the STORE gate (`shouldStore`) already reasons over, applied
+  ## here on the READ side. See the recompute check below for why both are
+  ## needed, not just the outcome recompute alone.
   let d    = derive(seams, pep)
   let kStr = $d.key
   let l    = seams.load(pep, d)
@@ -369,12 +409,32 @@ proc consultReal(pep: PlannedEntrypoint; seams: CacheSeams;
                       synthesized: none(EntrypointResult), explain: l.explain,
                       tier: "", lookup: worst(l))
 
-  # rfc-0007 A1d-ii / §2: recompute the outcome at THIS trust boundary, never
-  # read it from storage.  A hit whose recomputed outcome is not oPassed is
-  # treated as a MISS and rerun — a derivation or policy change must never
-  # serve a stale/invalidated pass from cache forever with no rerun path.
+  # rfc-0007 A1d-ii / §2 + RFC-0005 SO1: recompute the outcome at THIS trust
+  # boundary, never read it from storage -- UNDER THE RUN'S OWN resolved
+  # `outcomePolicy`, not a fixed `DefaultPolicy`: a strict-hygiene run must
+  # never serve an entry it would itself report as failed (an unstrict run
+  # may still hit the SAME entry -- that asymmetry is the point, not a bug).
+  # A hit whose recomputed outcome is not oPassed is treated as a MISS and
+  # rerun — a derivation or policy change must never serve a stale/
+  # invalidated pass from cache forever with no rerun path.
+  #
+  # SO1 defense in depth: `evidenceSatisfies` is ALSO re-checked here, on the
+  # STORED evidence, mirroring the exact named-guarantee check `shouldStore`
+  # already applies before ever publishing (cachedispatch.shouldStore, same
+  # module). The publish gate cannot produce an evidence-failing entry
+  # itself, but `cachetier`'s populate-on-hit backfill re-stores a FETCHED
+  # remote/foreign `StoredEntry` verbatim -- it never re-runs `shouldStore`.
+  # A foreign entry with observed escapees (or a failed per-limit readback)
+  # can therefore land in a local tier having bypassed the publish gate
+  # entirely; without this check it would serve as `cdmHit` forever, even
+  # though "observed escapee ⇒ uncacheable" is supposed to be absolute
+  # (rfc-0007 §6). Folded into the SAME `cdmRecomputeMiss` arm rather than a
+  # new `CacheDecision` -- from the caller's perspective both are "this hit
+  # doesn't hold up under a fresh look", the exact case `cdmRecomputeMiss`
+  # already names.
   let synth = synthesize(pep, l.hit.get.result, kStr)
-  if outcome(synth) != oPassed:
+  if outcome(synth, outcomePolicy) != oPassed or
+     not evidenceSatisfies(spec, runEvidence(synth)):
     # RFC-0005 A3b (judgment call): the CACHE lookup itself genuinely hit
     # (l.hit.isSome) -- `lookup` stays cvOk, honestly describing that fact;
     # `tier` names which tier had the now-invalidated entry. Neither reaches
@@ -396,6 +456,8 @@ proc lookupAtPlan*(
   seams:  CacheSeams;
   explainDiag: bool = false;
   sink:   TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
+  spec:   SandboxSpec = default(SandboxSpec);
+  outcomePolicy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
 ): PlanLookup =
   ## Decide whether `pep` can be served from cache.
   ##
@@ -404,6 +466,14 @@ proc lookupAtPlan*(
   ## `cachetelemetry.nim`'s module doc for why this proc, not
   ## `realSeams.load`, owns the emission (the diagnostic consult a few
   ## lines down calls that SAME `load` closure and must emit nothing).
+  ##
+  ## `spec`/`outcomePolicy` (RFC-0005 SO1 fix): threaded straight to
+  ## `consultReal`'s serve-time recompute -- the caller (runner.nim) passes
+  ## `cache.spec`/`cache.outcomePolicy`. Both default to the pre-SO1 values
+  ## (`default(SandboxSpec)` / `ptypes.DefaultPolicy`) so every existing
+  ## direct caller of this proc (the A9/M8 unit suites, which construct a
+  ## `PlannedEntrypoint`/`CachedResult` pair with default `Evidence` and
+  ## never touch hermeticity) is unaffected.
   ##
   ## Only `edRunFresh` entrypoints are eligible (a fresh binary is required for
   ## edCached).  edNeverBuilt / edStale are `cdmNotEligible` HERE (cache not
@@ -467,13 +537,15 @@ proc lookupAtPlan*(
   # (RFC-0005 A2b) and surfaces it on the lookup so the runner can stamp it
   # onto BOTH a hit (synthesized) and a live miss — run/v1 reports
   # inputHash whenever the cache was actually consulted.
-  consultReal(pep, seams, sink)
+  consultReal(pep, seams, sink, spec, outcomePolicy)
 
 proc consultPostCompile*(
   pep:    PlannedEntrypoint;
   policy: CachePolicy;
   seams:  CacheSeams;
   sink:   TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
+  spec:   SandboxSpec = default(SandboxSpec);
+  outcomePolicy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
 ): PlanLookup =
   ## RFC-0005 A2c-ii: the post-compile cache consult. `pep.edecision` is
   ## `edNeverBuilt`/`edStale` here -- `lookupAtPlan`'s edRunFresh-only gate
@@ -492,6 +564,15 @@ proc consultPostCompile*(
   ## R9's store-gate already applies on the write side, applied here on the
   ## read side).
   ##
+  ## Callers MUST also gate this on the slot's OWN attempt number being 1
+  ## (RFC-0005 SO3 fix) -- see `finalizeSlot`'s `slots[idx].attempt == 1`
+  ## guard, runner.nim. Mirrors `shouldStore`'s `attempt != 1 ⇒ cdmFlaky`
+  ## rule on the write side: a retried (attempt > 1) entrypoint must always
+  ## re-run for real, never let a concurrently-published pass from some
+  ## other host mask what may be a genuine local failure. This proc has no
+  ## attempt parameter of its own -- attempt-1-only is a CALL-SITE
+  ## discipline, exactly like the `rec.ok` guard just above.
+  ##
   ## Shares `resolveCacheable` + `consultReal` with `lookupAtPlan` so the
   ## --no-cache / group-opt-out precedence and the recompute/telemetry
   ## rules can never drift between the two real consult sites.
@@ -499,7 +580,7 @@ proc consultPostCompile*(
   if not res.readOk:
     return PlanLookup(decision: pep.edecision, cacheDecision: res.decision,
                       inputHash: "", synthesized: none(EntrypointResult))
-  consultReal(pep, seams, sink)
+  consultReal(pep, seams, sink, spec, outcomePolicy)
 
 # ---------------------------------------------------------------------------
 # Store gate — decide whether a freshly-run result should be cached
