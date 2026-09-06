@@ -47,6 +47,16 @@
 ##      sleeps well past the client's `recvTimeoutMs` before ever writing a
 ##      byte -- proving `SO_RCVTIMEO` (not the connect path) is what bounds
 ##      a peer that accepts but never answers.
+##   5. A present-but-invalid `Content-Length` (`-1`, an overflowing value,
+##      and garbage) -- each must resolve to `toUnreachable`, never be
+##      reclassified as the "header absent" EOF-delimited path (the bug
+##      this slice fixes; see httpraw.nim's `hasContentLength`/
+##      `contentLengthValid` split).
+##   6. A lying `Content-Length` (declares more than the peer actually
+##      sends, then closes) -- `toUnreachable` (httpraw.nim:529's
+##      truncation rule).
+##   7. A garbage status line (not an HTTP response at all) -- the
+##      `parseStatusAndHeaders`-rejects-it -> `toUnreachable` branch.
 ##
 ## Timeouts are short (low hundreds of ms) but margined generously against
 ## each other (server sleeps are >=5x the client's deadline) so the test is
@@ -58,7 +68,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_httpraw_real.nim
 
-import std/[nativesockets, net, os, posix, times]
+import std/[nativesockets, net, os, posix, strutils, times]
 import crisol/cachewire
 import crisol/httpraw
 
@@ -74,6 +84,11 @@ type
     ssChunked
     ss404
     ssSilent
+    ssNegativeContentLength
+    ssContentLengthOverflow
+    ssContentLengthGarbage
+    ssLyingContentLength
+    ssGarbageStatusLine
 
   ServerArgs = tuple[fd: SocketHandle, scenario: ServerScenario]
 
@@ -86,6 +101,28 @@ proc serverThreadProc(args: ServerArgs) {.thread.} =
     let body = "{\"ok\":true}"
     let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Fake: yes\r\n" &
                "Content-Length: " & $body.len & "\r\n\r\n" & body
+    discard send(clientFd, resp.cstring, resp.len, 0)
+  of ssNegativeContentLength:
+    # T2: `Content-Length: -1` must never be read as the "header absent"
+    # sentinel -- it's malformed framing, not an EOF-delimited body.
+    let resp = "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\nhello"
+    discard send(clientFd, resp.cstring, resp.len, 0)
+  of ssContentLengthOverflow:
+    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\nhello"
+    discard send(clientFd, resp.cstring, resp.len, 0)
+  of ssContentLengthGarbage:
+    let resp = "HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhello"
+    discard send(clientFd, resp.cstring, resp.len, 0)
+  of ssLyingContentLength:
+    # T1a: declares 100 bytes of body, sends 40, then closes -- must map to
+    # `toUnreachable` (httpraw.nim:529's claimed "closed before the
+    # declared length arrived" rule), never a served (truncated) body.
+    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" & "x".repeat(40)
+    discard send(clientFd, resp.cstring, resp.len, 0)
+  of ssGarbageStatusLine:
+    # T1b: not an HTTP response at all -- `parseStatusAndHeaders` must
+    # reject it (`parsedOk == false`), mapping to `toUnreachable`.
+    let resp = "NOT AN HTTP RESPONSE\r\n\r\ntrailing junk that must never be parsed"
     discard send(clientFd, resp.cstring, resp.len, 0)
   of ssChunked:
     # Multiple chunks, a chunk extension (ignored), and a trailer -- the
@@ -241,5 +278,80 @@ block test_accept_then_silent_server_recv_deadline_fires:
   assert elapsedMs < 1200.0,
     "recv deadline should fire long before the server's silence ends, got " &
     $elapsedMs & "ms"
+
+# ---------------------------------------------------------------------------
+# T2: a present-but-invalid Content-Length is malformed framing, never the
+# "header absent" EOF-delimited path -- see httpraw.nim's fixed
+# `hasContentLength`/`contentLengthValid` split in `readResponse`.
+# ---------------------------------------------------------------------------
+
+block test_negative_content_length_is_transport_error_not_served_body:
+  let (thr, listener, port) = startFakeServer(ssNegativeContentLength)
+  let fetcher = rawHttpFetcher(connectTimeoutMs = 500, recvTimeoutMs = 500)
+  let req = HttpRequest(meth: "GET", url: "http://127.0.0.1:" & $port.int & "/x",
+                        headers: @[], body: "")
+  let reply = fetcher(req)
+  joinThread(thr[])
+  listener.close()
+
+  assert reply.transport == toUnreachable,
+    "Content-Length: -1 must never be reclassified as an absent header"
+
+block test_overflowing_content_length_is_transport_error:
+  let (thr, listener, port) = startFakeServer(ssContentLengthOverflow)
+  let fetcher = rawHttpFetcher(connectTimeoutMs = 500, recvTimeoutMs = 500)
+  let req = HttpRequest(meth: "GET", url: "http://127.0.0.1:" & $port.int & "/x",
+                        headers: @[], body: "")
+  let reply = fetcher(req)
+  joinThread(thr[])
+  listener.close()
+
+  assert reply.transport == toUnreachable
+
+block test_garbage_content_length_is_transport_error:
+  let (thr, listener, port) = startFakeServer(ssContentLengthGarbage)
+  let fetcher = rawHttpFetcher(connectTimeoutMs = 500, recvTimeoutMs = 500)
+  let req = HttpRequest(meth: "GET", url: "http://127.0.0.1:" & $port.int & "/x",
+                        headers: @[], body: "")
+  let reply = fetcher(req)
+  joinThread(thr[])
+  listener.close()
+
+  assert reply.transport == toUnreachable
+
+# ---------------------------------------------------------------------------
+# T1a: a lying Content-Length (declares more than the peer actually sends,
+# then closes) -- the truncation rule httpraw.nim:529 already claims,
+# asserted here for the first time.
+# ---------------------------------------------------------------------------
+
+block test_lying_content_length_closes_early_is_transport_error:
+  let (thr, listener, port) = startFakeServer(ssLyingContentLength)
+  let fetcher = rawHttpFetcher(connectTimeoutMs = 500, recvTimeoutMs = 500)
+  let req = HttpRequest(meth: "GET", url: "http://127.0.0.1:" & $port.int & "/x",
+                        headers: @[], body: "")
+  let reply = fetcher(req)
+  joinThread(thr[])
+  listener.close()
+
+  assert reply.transport == toUnreachable,
+    "a connection closed before the declared Content-Length arrived must " &
+    "never be served as a (truncated) 200 body"
+
+# ---------------------------------------------------------------------------
+# T1b: a garbage status line -- `parseStatusAndHeaders`'s `not parsedOk`
+# branch, asserted here for the first time.
+# ---------------------------------------------------------------------------
+
+block test_garbage_status_line_is_transport_error:
+  let (thr, listener, port) = startFakeServer(ssGarbageStatusLine)
+  let fetcher = rawHttpFetcher(connectTimeoutMs = 500, recvTimeoutMs = 500)
+  let req = HttpRequest(meth: "GET", url: "http://127.0.0.1:" & $port.int & "/x",
+                        headers: @[], body: "")
+  let reply = fetcher(req)
+  joinThread(thr[])
+  listener.close()
+
+  assert reply.transport == toUnreachable
 
 echo "test_httpraw_real: all blocks passed"

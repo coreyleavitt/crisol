@@ -174,7 +174,7 @@ const
     ## `cachehttp.DefaultBodyCapBytes` -- kept as its own constant here
     ## (this module must not import `cachehttp.nim`; the adapter layer
     ## imports the transport, never the reverse).
-  MaxHeaderBytes = 64 * 1024
+  MaxHeaderBytes* = 64 * 1024
     ## Defensive cap on the status-line+headers block only (never the
     ## body, which has its own explicit cap parameter). Guards against a
     ## server that never sends a blank line at all -- otherwise the header
@@ -183,7 +183,7 @@ const
     ## pathological peer that dribbles bytes forever within the deadline.
 
 type
-  RawIoResult = enum
+  RawIoResult* = enum
     rioOk
     rioTimeout
     rioError
@@ -399,13 +399,23 @@ proc headerValue(headers: seq[(string, string)]; name: string): string =
     if cmpIgnoreCase(k, name) == 0: return v
   ""
 
-proc readHeaderBlock(socket: Socket; deadline: float): tuple[res: RawIoResult, raw: string] =
+type
+  HeaderReader* = proc(buf: var openArray[byte]): tuple[res: RawIoResult, n: int]
+    ## The seam `readHeaderBlock` reads bytes through -- a single-call
+    ## "fill this buffer" primitive with the SAME shape as `recvChunk`'s
+    ## return, deliberately NOT `recvChunk` itself: this is what lets
+    ## `tests/unit/test_httpraw_parser.nim` feed the header-accumulation
+    ## loop (including the `MaxHeaderBytes` cap) synthetic bytes with no
+    ## socket at all, while production (`readResponse` below) just wraps
+    ## `recvChunk(socket, buf, deadline)` in a one-line closure.
+
+proc readHeaderBlock*(read: HeaderReader): tuple[res: RawIoResult, raw: string] =
   var raw = ""
   var buf: array[4096, byte]
   while raw.find("\r\n\r\n") < 0:
     if raw.len > MaxHeaderBytes:
       return (rioError, raw)
-    let (res, n) = recvChunk(socket, buf, deadline)
+    let (res, n) = read(buf)
     case res
     of rioOk:
       for i in 0 ..< n: raw.add(char(buf[i]))
@@ -413,7 +423,7 @@ proc readHeaderBlock(socket: Socket; deadline: float): tuple[res: RawIoResult, r
     of rioError: return (rioError, raw)
   (rioOk, raw)
 
-proc parseStatusAndHeaders(headerBlock: string): tuple[ok: bool, status: int, headers: seq[(string, string)]] =
+proc parseStatusAndHeaders*(headerBlock: string): tuple[ok: bool, status: int, headers: seq[(string, string)]] =
   let lines = headerBlock.split("\r\n")
   if lines.len == 0: return (false, 0, @[])
   let statusParts = lines[0].split(' ')
@@ -475,7 +485,8 @@ proc readChunkedBody(socket: Socket; deadline: float; bodyCapBytes: int;
   (rioOk, decoder.body)
 
 proc readResponse(socket: Socket; deadline: float; bodyCapBytes: int): HttpReply =
-  let (headerRes, raw) = readHeaderBlock(socket, deadline)
+  let (headerRes, raw) = readHeaderBlock(proc(buf: var openArray[byte]): tuple[res: RawIoResult, n: int] =
+    recvChunk(socket, buf, deadline))
   case headerRes
   of rioTimeout: return HttpReply(transport: toTimeout)
   of rioError: return HttpReply(transport: toUnreachable)
@@ -498,14 +509,33 @@ proc readResponse(socket: Socket; deadline: float; bodyCapBytes: int): HttpReply
     of rioOk: return HttpReply(transport: toOk, status: status, headers: headers, body: chunkedBody)
 
   let contentLengthStr = headerValue(headers, "Content-Length")
-  var contentLength = -1
-  if contentLengthStr.len > 0:
+  let hasContentLength = contentLengthStr.len > 0
+  var contentLength = 0
+  var contentLengthValid = true
+  if hasContentLength:
     try:
       contentLength = parseInt(contentLengthStr)
+      contentLengthValid = contentLength >= 0
     except ValueError:
-      contentLength = -1
+      contentLengthValid = false  # garbage, or overflow -- parseInt raises on both
 
-  let bounded = contentLength >= 0
+  if hasContentLength and not contentLengthValid:
+    # A Content-Length header that IS present but is not a valid
+    # non-negative integer (negative, overflow, or garbage) is malformed
+    # framing, not an absent header -- must never fall through to
+    # `bounded = false`'s EOF-delimited path (reserved for a genuinely
+    # ABSENT header, see this file's module doc's "Judgment call: no
+    # Content-Length and not chunked"). `hasContentLength`/
+    # `contentLengthValid` are two independent booleans specifically so
+    # "present but invalid" can never again collide with the "absent"
+    # sentinel the way a literal `Content-Length: -1` used to (parseInt
+    # happily returns -1, which was also this proc's old in-band marker
+    # for "no header at all"). Classed like every other framing violation
+    # below: a live peer sent bytes this transport cannot trust to frame
+    # the response, so it's a transport failure, never a served body.
+    return HttpReply(transport: toUnreachable)
+
+  let bounded = hasContentLength
   let capTarget = if bounded: min(contentLength, bodyCapBytes + 1) else: bodyCapBytes + 1
 
   var body = bodySoFar
