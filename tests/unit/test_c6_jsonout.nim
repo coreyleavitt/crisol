@@ -42,8 +42,9 @@ suite "C6 — run/v1 regressions + render":
     ## rfc-0007 A7 bumped 17->18 (top-level `substrate` node);
     ## rfc-0005 B3c bumped 18->19 (top-level `verifyFails`);
     ## rfc-0005 B1c bumped 19->20 (per-result `keyDiff` under --explain-miss);
-    ## rfc-0005 B2b bumped 20->21 (top-level `cacheStats` under --cache-stats).
-    check RunSchemaRevision == 21
+    ## rfc-0005 B2b bumped 20->21 (top-level `cacheStats` under --cache-stats);
+    ## rfc-0005 code-review D1 bumped 21->22 (`cacheStats.localErrors`).
+    check RunSchemaRevision == 22
 
   test "regressions array present and empty when no regressions":
     let results = @[

@@ -56,11 +56,16 @@ import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runn
                resultcache, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
 # rfc-0007 A2b: `crisol/signals` (the process-global gotSignal flag) is no
-# longer this module's concern — `runner.execute`'s OWN Supervisor now owns
-# SIGINT/SIGTERM installation for the duration of the call (`installSignals`
-# param, threaded from `opts.installSignals` below) and reports the real
-# signum it observed via `shutdownSignalOut`, superseding
-# `installSignalHandlers`/`clearSignal`/`pendingSignal`.
+# longer needed to drive `interrupted` — `runner.execute`'s OWN Supervisor
+# now owns SIGINT/SIGTERM installation for the duration of the call
+# (`installSignals` param, threaded from `opts.installSignals` below) and
+# reports the real signum it observed via `shutdownSignalOut`, superseding
+# `installSignalHandlers`/`clearSignal`/`pendingSignal`. RFC-0005 code-
+# review SO2 reintroduces ONE narrow use: `shutdownRequested()` as the
+# `abandoned` predicate for the end-of-run deferred-put drain below, the
+# SAME "abandon more I/O on a pending shutdown" query the plan-time
+# prefetch/consult loops already use (cachetier.nim/runner.nim).
+import crisol/signals
 # rfc-0007 A1c: the §2 result-model facade (Phase/ProcessResult/Exit/Cause/
 # Evidence/Rusage/OutcomePolicy) plus the runResult/failureLine digest
 # helpers below. `import nil` so nothing unqualified leaks into this
@@ -230,7 +235,13 @@ type
     failFast*:     bool = false
     noCache*:      bool = false  ## RFC-0004 F3: --no-cache → do NOT read and do NOT
                                  ## write the result cache (full bypass).  Caching is
-                                 ## ON by default.
+                                 ## ON by default. RFC-0005 code-review D5: `true`
+                                 ## ALSO skips `resolveCacheSecrets`'s env scan +
+                                 ## `delEnv` scrub of the `CRISOL_CACHE_*` namespace
+                                 ## (a deliberate defense-in-depth measure, `runTests`'s
+                                 ## own doc comment below) — a library embedder that
+                                 ## opts out of caching entirely sees no host-process
+                                 ## environment mutation from this call at all.
     retries*:      int  = -1     ## B1: global retry count override.  -1 = use config.
                                  ## 0 = no retry (override to no-retry regardless of config).
                                  ## N >= 1 = retry up to N times (maxAttempts = N+1).
@@ -419,6 +430,22 @@ type
                                   ## re-entrancy... three guards") — a verify
                                   ## re-execution is diagnostic, never a substitute
                                   ## observation for the entrypoint's reported outcome.
+    verifyCouldNotReexec*: seq[Entrypoint]  ## RFC-0005 code-review SO4: sampled
+                                  ## --verify-cache entries whose fresh
+                                  ## re-execution produced NO observation at all
+                                  ## (fresh run phase pkSkipped/pkSpawnFailed —
+                                  ## e.g. the promoted stable binary vanished
+                                  ## between the main run and the verify pass).
+                                  ## A verify-INFRASTRUCTURE failure, NOT
+                                  ## evidence of cache nondeterminism — never
+                                  ## included in `verifyDivergences` (so
+                                  ## --verify-cache-strict, which gates on
+                                  ## `verifyDivergences.len`, never exits 1 for
+                                  ## it), never silent (a stderr warning still
+                                  ## names each entry — see verifyCachePassImpl).
+                                  ## ALWAYS empty when opts.verifyCache.enabled
+                                  ## is false, same convention as
+                                  ## verifyDivergences above.
     cacheStats*: CacheStats       ## RFC-0005 B2b: `aggregateCacheStats(events, decisions)`
                                   ## over the run's real telemetry (hit/miss/publish/
                                   ## remote-error/verifyFail) and per-result cacheDecisions.
@@ -598,13 +625,27 @@ proc recordsDiverge(a, b: seq[TestRecord]): bool =
       return true
   false
 
-proc verifyCachePass*(results: seq[EntrypointResult];
+type
+  VerifyPassResult = tuple
+    divergences:    seq[VerifyDivergence]
+    couldNotReexec: seq[Entrypoint]
+    ## RFC-0005 code-review SO4: entries sampled for --verify-cache whose
+    ## fresh re-execution never produced an observation at all (fresh run
+    ## phase `pkSkipped`/`pkSpawnFailed` — e.g. the promoted stable binary
+    ## vanished between the main run and this verify sub-run, or the verify
+    ## sub-run itself got killed). A verify-INFRASTRUCTURE failure, NOT
+    ## evidence of cache nondeterminism — never counted in `divergences`
+    ## (so --verify-cache-strict, which gates on `divergences.len`, must
+    ## never exit 1 for it), never silent (verifyCachePassImpl still warns
+    ## on stderr for every entry landing here).
+
+proc verifyCachePassImpl(results: seq[EntrypointResult];
                      entrypoints: seq[PlannedEntrypoint];
                      vc: VerifyCache; config: Config; graph: var DepGraph;
                      nimVersion, ccVersion: string;
                      sandboxSpec: SandboxSpec;
                      sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()
-                     ): seq[VerifyDivergence] =
+                     ): VerifyPassResult =
   ## The --verify-cache determinism backstop (RFC-0005 §Stage B). Samples
   ## this run's `cdmHit` entries (seeded sampler, B3a `sampleHitIndices`),
   ## builds a SYNTHETIC plan from them (B3a `buildVerifyPlan` — never a
@@ -624,18 +665,17 @@ proc verifyCachePass*(results: seq[EntrypointResult];
   ## `edRunFresh` at plan time, i.e. the binary exists) holds only while the
   ## stateDir lock is held, and lastrun.json must reflect the main run only.
   ##
-  ## Exported* (RFC-0005 B2a) so a test can drive this pass directly — with
-  ## its own `results`/`entrypoints` built via `runner.execute` + a real
-  ## `CacheRuntime`/`InMemorySink` — without needing the `--cache-stats`
-  ## surface `runTests*` doesn't install until Stage B2b. `runTests*` remains
-  ## the only production call site (that binary/lock precondition is its
-  ## contract to keep, not this proc's).
-  if not vc.enabled: return @[]
+  ## This is the actual implementation; `verifyCachePass*` (below) is a thin
+  ## back-compat wrapper over just the `divergences` half, kept for its
+  ## existing direct callers (test_cachedispatch.nim's B2a telemetry test).
+  ## `runTests*` calls THIS proc directly so it can also thread
+  ## `couldNotReexec` onto `RunReport`.
+  if not vc.enabled: return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
 
   let decisions = results.mapIt(it.cacheDecision)
   let seed = vc.seed.get(defaultVerifySeed())
   let indices = sampleHitIndices(decisions, vc.pct, seed)
-  if indices.len == 0: return @[]
+  if indices.len == 0: return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
 
   let verifyPlan = buildVerifyPlan(entrypoints, indices)
   var verifyResults: seq[EntrypointResult]
@@ -658,17 +698,40 @@ proc verifyCachePass*(results: seq[EntrypointResult];
     # verify-pass failure must never take down an otherwise-successful main
     # run's real results.
     stderr.write("crisol: warning: --verify-cache pass failed: " & e.msg & "\n")
-    return @[]
+    return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
 
   for j, i in indices:
     if j >= verifyResults.len: break   # defensive: an interrupted verify sub-run
     let stored = results[i]
     let fresh  = verifyResults[j]
-    let exitDiverged = exitsDiverge(phaseExit(stored.run), phaseExit(fresh.run))
+    let freshExit = phaseExit(fresh.run)
+
+    # RFC-0005 code-review SO4 fix: a stored `cdmHit` always has a real
+    # observation (`stored.run.kind` is `pkCached` — `phaseExit` is always
+    # `some` for it), so it is ONLY the fresh side that can come back with
+    # no observation at all: `fresh.run.kind` in `{pkSkipped,
+    # pkSpawnFailed}` (e.g. `spawnRunDirect` failed because the sampled
+    # entry's promoted stable binary was missing/unreadable when this
+    # verify sub-run tried to reuse it — see buildVerifyPlan's SO5 fix).
+    # Before this fix, `exitsDiverge`'s `a.isSome != b.isSome` branch
+    # counted that as an EXIT divergence — a verify-INFRASTRUCTURE failure
+    # misfiled as evidence of cache nondeterminism, tripping
+    # --verify-cache-strict for a reason that has nothing to do with the
+    # cache. This never happened at all if the comparison itself never
+    # ran, so it is reported in its own category instead.
+    if freshExit.isNone:
+      result.couldNotReexec.add stored.ep
+      stderr.write("crisol: warning: --verify-cache could not re-execute " &
+                   stored.ep.path & " (verify sub-run phase: " &
+                   $fresh.run.kind & "); not counted as a divergence\n")
+      try: stderr.flushFile() except CatchableError: discard
+      continue
+
+    let exitDiverged = exitsDiverge(phaseExit(stored.run), freshExit)
     let recDiverged  = recordsDiverge(stored.records, fresh.records)
     if not (exitDiverged or recDiverged): continue
 
-    result.add VerifyDivergence(
+    result.divergences.add VerifyDivergence(
       ep:              stored.ep,
       exitDiverged:    exitDiverged,
       recordsDiverged: recDiverged,
@@ -687,6 +750,25 @@ proc verifyCachePass*(results: seq[EntrypointResult];
                  stored.ep.path & " (" & what.join(", ") &
                  " diverged from the cached result)\n")
     try: stderr.flushFile() except CatchableError: discard
+
+proc verifyCachePass*(results: seq[EntrypointResult];
+                     entrypoints: seq[PlannedEntrypoint];
+                     vc: VerifyCache; config: Config; graph: var DepGraph;
+                     nimVersion, ccVersion: string;
+                     sandboxSpec: SandboxSpec;
+                     sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()
+                     ): seq[VerifyDivergence] =
+  ## Back-compat public facade over `verifyCachePassImpl` — returns only the
+  ## `divergences` half (this proc's ORIGINAL, pre-SO4 return shape).
+  ##
+  ## Exported* (RFC-0005 B2a) so a test can drive this pass directly — with
+  ## its own `results`/`entrypoints` built via `runner.execute` + a real
+  ## `CacheRuntime`/`InMemorySink` — without needing the `--cache-stats`
+  ## surface `runTests*` doesn't install until Stage B2b. `runTests*` itself
+  ## does NOT call this — it calls `verifyCachePassImpl` directly so it can
+  ## also thread `couldNotReexec` onto `RunReport` (see there).
+  verifyCachePassImpl(results, entrypoints, vc, config, graph, nimVersion,
+                     ccVersion, sandboxSpec, sink).divergences
 
 # ---------------------------------------------------------------------------
 # H2 — PlanReport-typed facade overloads for planview procs
@@ -1050,15 +1132,26 @@ proc productionCacheDeps*(): CacheDeps =
   ## The real dependency: RFC-0005 A3c-ii/C4/C3b's `configuredCache`, via
   ## `productionRegistry()` (RFC-0005 C3b: `file`/`http`/`https`/`s3`, the
   ## latter three over `httpraw.rawHttpFetcher()`, `productionRegistry`'s
-  ## own default), `resolveCacheSecrets()` (called ONCE per
-  ## `productionCacheDeps` call, i.e. once per `runTests`/
-  ## `runTestsWith(productionCacheDeps())` invocation — env is resolved and
-  ## scrubbed before `planTests` or any child ever spawns) and a `NilSink`
-  ## (the run's real sink, when `--cache-stats` is on, is installed by
-  ## `runTestsWith` AFTER `buildRuntime` returns, exactly as it already did
-  ## for `localOnlyCache` before this slice).
-  let secrets = resolveCacheSecrets()
+  ## own default), `resolveCacheSecrets()`, and a `NilSink` (the run's real
+  ## sink, when `--cache-stats` is on, is installed by `runTestsWith` AFTER
+  ## `buildRuntime` returns, exactly as it already did for `localOnlyCache`
+  ## before this slice).
+  ##
+  ## **RFC-0005 code-review D5: `resolveCacheSecrets()` is resolved LAZILY,
+  ## inside the closure below, NOT here.** `runTests*` (the public facade)
+  ## calls THIS proc unconditionally, before `runTestsWith` ever sees
+  ## `opts.noCache` — resolving eagerly here means a `noCache: true` caller
+  ## (e.g. an embedding library that asked for NO caching at all) still
+  ## pays `resolveCacheSecrets`'s full `CRISOL_CACHE_*` env SCAN-THEN-
+  ## `delEnv` — an undocumented host-process mutation with no caching
+  ## benefit to show for it. `runTestsWith` only ever calls `deps.
+  ## buildRuntime` when `not opts.noCache` (see that proc's own `if not
+  ## opts.noCache: rt = deps.buildRuntime(...)`), so deferring the
+  ## resolution into the closure makes the scrub happen exactly when the
+  ## cache actually activates — once per REAL (cache-enabled) run, same as
+  ## before, just no longer unconditionally.
   CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+    let secrets = resolveCacheSecrets()
     configuredCache(cfg, stateDir, maxEntries, productionRegistry(), secrets, NilSink[TelemetryEvent]()))
 
 # ---------------------------------------------------------------------------
@@ -1235,12 +1328,27 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # (CLI flag OR config-file `cache-stats #true`, already merged above) —
   # reading it here, not opts.cacheStats directly, matches explainMiss's own
   # precedent. `nil` (not installed) when the run never asked for telemetry:
-  # NilSink stays free, exactly as before this slice.
+  # NilSink stays free, exactly as before this slice. `RunReport.cacheStats`
+  # stays the documented zero value on this path — see the `cacheStats`
+  # local built from `statsSink` (not `warnSink` below) further down.
   let statsSink = if cfg.cacheStats: newInMemorySink() else: nil
+  # RFC-0005 code-review L2: the RFC-pinned per-tier 100%-error/breaker
+  # stderr warning ("Hit-rate telemetry") is UNCONDITIONAL — it must fire on
+  # a default run too, not only under --cache-stats. `erroredTiers` folds
+  # over collected events, so it needs a REAL sink even when `statsSink`
+  # above is `nil`. `warnSink` reuses `statsSink`'s own collector when
+  # `--cache-stats` already installed one (same events, no double
+  # collection, no double warning) and falls back to a fresh, cheap
+  # `InMemorySink` dedicated ONLY to this fold otherwise -- `RunReport.
+  # cacheStats`/the run/v2 `cacheStats` object stay wired to `statsSink`
+  # specifically (see the `cacheStats` local below), so this does not
+  # disturb their documented "zero value / absent when --cache-stats is
+  # off" contract.
+  let warnSink = if statsSink != nil: statsSink else: newInMemorySink()
   let cacheCtx =
     if opts.noCache:
       var ctx = cacheDisabled(spec)   # fully off; spec still governs sandbox hermeticity
-      if statsSink != nil: ctx.sink = statsSink.sink()
+      ctx.sink = warnSink.sink()
       ctx
     else:
       # RFC-0005 A2b: keyContext built once (the key-derivation closure's
@@ -1257,15 +1365,19 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
         parentEnv     = toSeq(envPairs()),
         protocolMajor = CrisolProtocolMajor,
       )
-      # RFC-0005 B2b: override BEFORE realSeams closes over `rt` — realSeams'
-      # own store closure reads `rt.sink` (its embedded copy), so the swap
-      # must happen here, not on the CacheContext built below (that sink
-      # only reaches lookupAtPlan's hit/miss emission, the READ side).
-      if statsSink != nil: rt.sink = statsSink.sink()
+      # RFC-0005 B2b/L2: override BEFORE realSeams closes over `rt` —
+      # realSeams' own store closure reads `rt.sink` (its embedded copy),
+      # so the swap must happen here, not on the CacheContext built below
+      # (that sink only reaches lookupAtPlan's hit/miss emission, the READ
+      # side). Unconditional (`warnSink`, not `if statsSink != nil`) since
+      # L2: the per-tier error warning needs real events collected on
+      # every run, not only under --cache-stats.
+      rt.sink = warnSink.sink()
       cacheEnabled(spec,
         CachePolicy(enabled: true),
         realSeams(keyCtx, addr graph, rt),
-        rt.sink,          # RFC-0005 B2a: NilSink by default; B2b's statsSink above when installed
+        rt.sink,          # RFC-0005 B2a/L2: always `warnSink` now (statsSink's own
+                          # collector when --cache-stats is on, else a dedicated one)
         realPrefetch(rt), # RFC-0005 C3c: resolves each canProbe tier's key-existence set once
         # RFC-0005 SO1 fix: the run's resolved reporting policy, threaded to
         # the cache's serve-side recompute (lookupAtPlan/consultPostCompile)
@@ -1318,8 +1430,21 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # is a no-op there, never touching `drainPending` at all. `rt` is nil only
   # when `opts.noCache` is set, in which case `rt.pending` is unreachable
   # (guarded by the same condition here).
-  if not opts.noCache and rt.pending.len > 0:
-    let flushVerdicts = rt.cache.drainPending(rt.pending, DefaultDeferredPutBudget)
+  #
+  # RFC-0005 code-review SO2: `not interrupted` mirrors the `persistLastRun`
+  # gate further down this proc verbatim — an interrupted run's `results`
+  # is an honest PARTIAL set (§2), so queuing MORE network I/O for entries
+  # this run never even finished observing is the wrong thing to do on the
+  # way out, exactly like persisting would be. `abandoned` covers the
+  # OTHER half of SO2: a shutdown signal that arrives DURING this drain
+  # itself, on an otherwise-uninterrupted run (`interrupted == false` —
+  # execute() already returned normally) — `signals.shutdownRequested()` is
+  # the SAME process-global, level-triggered query the plan-time
+  # prefetch/consult loops already use for exactly this "abandon more I/O
+  # on a pending shutdown" purpose (cachetier.nim's own doc comment).
+  if not opts.noCache and not interrupted and rt.pending.len > 0:
+    let flushVerdicts = rt.cache.drainPending(rt.pending, DefaultDeferredPutBudget,
+      abandoned = proc(): bool = signals.shutdownRequested().isSome)
     for v in flushVerdicts:
       # Tier "l1" was already accounted for synchronously at finalize
       # (cachedispatch.realSeams.store's own tekPublish/tekRemoteErr) —
@@ -1431,11 +1556,16 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # synthetic plan depends on). Never runs on an interrupted run: a partial
   # `results`/`pr.entrypoints` pairing would break the index alignment
   # `buildVerifyPlan`/sampling relies on.
-  let verifyDivergences =
+  # RFC-0005 code-review SO4: calls `verifyCachePassImpl` directly (not the
+  # public `verifyCachePass*` facade) so `couldNotReexec` is available to
+  # thread onto `RunReport` below, alongside `divergences`.
+  let verifyPassResult =
     if opts.verifyCache.enabled and not interrupted:
-      verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
+      verifyCachePassImpl(results, pr.entrypoints, opts.verifyCache, cfg, graph,
                       nimVer, ccVer, spec, cacheCtx.sink)
-    else: @[]
+    else: (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
+  let verifyDivergences    = verifyPassResult.divergences
+  let verifyCouldNotReexec = verifyPassResult.couldNotReexec
 
   # RFC-0005 B2b: aggregate the run's real telemetry (hit/miss/publish/
   # remote-error events, PLUS verifyCachePass's tekVerifyFail above, since
@@ -1451,15 +1581,22 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
                           results.mapIt((decision: it.cacheDecision, tier: it.cacheTier)))
     else: CacheStats()
 
-  # RFC-0005 B2b: "crisol additionally writes a stderr warning when a
+  # RFC-0005 B2b/L2: "crisol additionally writes a stderr warning when a
   # configured remote tier errored on every call in a run" (RFC "Hit-rate
-  # telemetry"). Only meaningful when telemetry was actually collected;
-  # unconditional stderr like every other warning in this codebase (no
-  # --quiet exists). See cachetelemetry.erroredTiers's doc for the scope
-  # note on "remote" vs. today's single "l1" tier.
-  if statsSink != nil:
-    for terr in erroredTiers(statsSink.events):
-      stderr.write("crisol: warning: " & tierErrorWarning(terr) & "\n")
+  # telemetry") is UNCONDITIONAL, per the RFC's own wording -- not gated on
+  # --cache-stats. `warnSink` (built above) always has real events
+  # regardless of `cfg.cacheStats`, so this loop is no longer conditional
+  # on `statsSink`. Unconditional stderr like every other warning in this
+  # codebase (no --quiet exists) — writes to stderr in BOTH --json and
+  # human modes (run/v2 owns stdout in --json mode). See
+  # cachetelemetry.erroredTiers's doc for the scope note on "remote" vs.
+  # today's single "l1" tier. When --cache-stats IS on, `warnSink` and
+  # `statsSink` are the SAME `InMemorySink` instance (see `warnSink`'s own
+  # doc comment above) — this fold sees the SAME event list `cacheStats`
+  # above was aggregated from, never a second, independently-collected
+  # copy, so a tripped tier is reported here exactly once.
+  for terr in erroredTiers(warnSink.events):
+    stderr.write("crisol: warning: " & tierErrorWarning(terr) & "\n")
 
   releaseLock(lockHandle)
 
@@ -1478,6 +1615,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     compileBlock:      compileBlock,
     interrupted:       interrupted,
     verifyDivergences: verifyDivergences,
+    verifyCouldNotReexec: verifyCouldNotReexec,  # RFC-0005 code-review SO4
     cacheStats:        cacheStats,  # RFC-0005 B2b
   )
 
@@ -1491,4 +1629,16 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   ## real dependency (`cacheregistry.localOnlyCache`, unchanged behavior).
   ## See `runTestsWith`'s doc comment for the full flow; see `CacheDeps`'s
   ## for why the split exists.
+  ##
+  ## **Deliberate defense-in-depth (RFC-0005 C4, unchanged by code-review
+  ## D5):** whenever the cache actually activates (`opts.noCache == false`,
+  ## the default), this call resolves `$CRISOL_CACHE_HMAC_KEY`/
+  ## `$CRISOL_CACHE_SIGN_KEY`/`$CRISOL_CACHE_TOKEN[_<TIER>]` from the
+  ## process environment ONCE and then `delEnv`'s the WHOLE `CRISOL_CACHE_*`
+  ## namespace (`resolveCacheSecrets`, this module) — a write credential
+  ## must never linger in the process environment for a later, unrelated
+  ## child to inherit. D5's fix is scope, not removal: this scrub is now
+  ## skipped entirely under `opts.noCache: true` (see `RunOptions.noCache`'s
+  ## own doc comment) rather than running unconditionally regardless of
+  ## whether caching was ever going to touch the network at all.
   runTestsWith(opts, productionCacheDeps())

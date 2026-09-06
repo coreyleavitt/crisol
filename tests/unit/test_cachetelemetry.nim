@@ -28,6 +28,7 @@ suite "aggregateCacheStats — empty input":
     check s.remoteHits == 0
     check s.misses == 0
     check s.remoteErrors == 0
+    check s.localErrors == 0
     check s.total == 0
     check s.notConsulted == 0
     check s.hitPct == 0.0
@@ -133,11 +134,24 @@ suite "aggregateCacheStats — event-sourced counts":
 
   test "tekRemoteErr events -> remoteErrors, carrying putTier/putVerdict":
     let events = @[
+      TelemetryEvent(kind: tekRemoteErr, putTier: "mirror", putVerdict: cvOffline),
+      TelemetryEvent(kind: tekRemoteErr, putTier: "mirror", putVerdict: cvUnauthorized),
+    ]
+    let s = aggregateCacheStats(events, @[(cdmKeyMiss, ""), (cdmKeyMiss, "")])
+    check s.remoteErrors == 2
+    check s.localErrors == 0
+
+  test "RFC-0005 code-review D1: a tekRemoteErr with putTier == l1 -> localErrors, NOT remoteErrors":
+    ## A local-fs write failure (unwritable cache root, full disk) is not a
+    ## "remote" error just because the run has zero remote tiers -- keyed
+    ## off the FAILING tier, mirroring the l1Hits/remoteHits split.
+    let events = @[
       TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvOffline),
       TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvUnauthorized),
     ]
     let s = aggregateCacheStats(events, @[(cdmKeyMiss, ""), (cdmKeyMiss, "")])
-    check s.remoteErrors == 2
+    check s.localErrors == 2
+    check s.remoteErrors == 0
 
   test "tekPublish events -> published":
     let events = @[
@@ -158,26 +172,56 @@ suite "aggregateCacheStats — event-sourced counts":
 
   test "tekBackfillErr events -> remoteErrors, carrying putTier/putVerdict (RFC-0005 A3a)":
     let events = @[
+      TelemetryEvent(kind: tekBackfillErr, putTier: "mirror", putVerdict: cvOffline),
+      TelemetryEvent(kind: tekBackfillErr, putTier: "mirror", putVerdict: cvTimeout),
+    ]
+    let s = aggregateCacheStats(events, @[(cdmHit, "l1"), (cdmHit, "l1")])
+    check s.remoteErrors == 2
+    check s.localErrors == 0
+
+  test "RFC-0005 code-review D1: a tekBackfillErr with putTier == l1 -> localErrors, NOT remoteErrors":
+    let events = @[
       TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvOffline),
       TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvTimeout),
     ]
     let s = aggregateCacheStats(events, @[(cdmHit, "l1"), (cdmHit, "l1")])
-    check s.remoteErrors == 2
+    check s.localErrors == 2
+    check s.remoteErrors == 0
 
   test "tekRemoteErr and tekBackfillErr pool into the SAME remoteErrors count":
+    let events = @[
+      TelemetryEvent(kind: tekRemoteErr, putTier: "mirror", putVerdict: cvOffline),
+      TelemetryEvent(kind: tekBackfillErr, putTier: "mirror", putVerdict: cvOffline),
+    ]
+    let s = aggregateCacheStats(events, @[(cdmHit, "l1")])
+    check s.remoteErrors == 2
+    check s.localErrors == 0
+
+  test "tekRemoteErr and tekBackfillErr pool into the SAME localErrors count when putTier == l1":
     let events = @[
       TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvOffline),
       TelemetryEvent(kind: tekBackfillErr, putTier: "l1", putVerdict: cvOffline),
     ]
     let s = aggregateCacheStats(events, @[(cdmHit, "l1")])
-    check s.remoteErrors == 2
+    check s.localErrors == 2
+    check s.remoteErrors == 0
+
+  test "a mixed run: an l1 put failure and a mirror put failure attribute independently":
+    let events = @[
+      TelemetryEvent(kind: tekRemoteErr, putTier: "l1", putVerdict: cvOffline),
+      TelemetryEvent(kind: tekRemoteErr, putTier: "mirror", putVerdict: cvOffline),
+    ]
+    let s = aggregateCacheStats(events, @[(cdmStored, ""), (cdmStored, "")])
+    check s.localErrors == 1
+    check s.remoteErrors == 1
 
 suite "aggregateCacheStats — a full run-shaped mixed vector":
 
-  test "a plausible run: hits, a miss-then-store, a not-eligible entry, one remote-err, one verifyFail":
+  test "a plausible run: hits, a miss-then-store, a not-eligible entry, one LOCAL err (l1), one verifyFail":
     # 5 entrypoints: 2 served from cache, 1 ran live and stored, 1 not
     # eligible (edNeverBuilt), 1 ran live but its store attempt hit an
-    # unwritable root (remote-err).
+    # unwritable LOCAL root -- zero remote tier configured, so this must
+    # land in localErrors (RFC-0005 code-review D1), never remoteErrors.
     let decisions: seq[DecisionTier] =
       @[(cdmHit, "l1"), (cdmHit, "l1"), (cdmStored, ""), (cdmNotEligible, ""), (cdmKeyMiss, "")]
     let events = @[
@@ -198,7 +242,8 @@ suite "aggregateCacheStats — a full run-shaped mixed vector":
     check s.hitPct == 50.0        # 2 / 4 * 100
     check s.wallSavedMs == 100
     check s.published == 1
-    check s.remoteErrors == 1
+    check s.localErrors == 1
+    check s.remoteErrors == 0
     check s.verifyFails == 1
 
   test "a plausible run WITH a remote tier: l1 hits + a mirror hit -> both counted, hitPct sums both":

@@ -39,7 +39,12 @@
 ##         tests/unit/test_api.nim
 
 import std/[base64, json, options, os, osproc, strutils, tables, times, unittest]
+from std/posix as posix_mod import nil  # RFC-0005 code-review L2's captureStderr
+                                         # only -- `import nil` so `Rusage` etc.
+                                         # never collide unqualified with
+                                         # crisol/process/types's own
 import crisol/api
+import crisol/render     # RFC-0005 code-review D1: renderCacheStats
 import crisol/types
 import crisol/process/types as ptypes
 # RFC-0005 A3b — E2E-A-trust: runTestsWith/CacheDeps injects a real
@@ -56,6 +61,21 @@ import crisol/cachewire      # RFC-0005 C3b E2E-3: HttpRequest/HttpReply/HttpFet
 import crisol/cachetelemetry # NilSink
 import crisol/resultcache    # RFC-0005 C4 E2E-2: payloadFromJson/canonicalPayload/cacheVersionDirAt
 import crisol/fnv            # RFC-0005 C4 E2E-2: fnv1a64/toHex16 (recompute payloadChecksum by hand)
+# RFC-0005 code-review SO4/SO5 -- drives runner.execute()/verifyCachePass
+# directly (bypassing the planner entirely, same precedent as
+# test_cachedispatch.nim's own B2a suite) so a sampled cdmHit's promoted
+# stable binary can be deleted BETWEEN two execute() calls without a
+# decideCompile re-plan silently self-healing it first (a full `crisol run`
+# / runTests() round trip re-derives `edecision` from disk state on every
+# invocation, so a deleted-then-recreated stable binary is invisible to a
+# black-box CLI-level test -- this is why SO4/SO5 are exercised at this
+# layer, not through runTests()).
+import crisol/runner         # execute() -- drives a real run directly (no planner)
+import crisol/cachedispatch  # defaultCachePolicy/cacheEnabled/keyContext/realSeams
+import crisol/sandbox        # resolveSandbox
+import crisol/depgraph       # emptyDepGraph, depgraphPath, loadStoredDepGraph, DepGraphDiscard
+import crisol/planner        # binPath/binName -- the stable per-entrypoint binary path
+import crisol/config         # loadConfig -- to derive a Config for depgraphPath/binPath
 import sello                 # RFC-0005 C5a: test-only fixture construction (Seed/
                               # Keypair/PublicKey) for the real ed25519Policy E2E,
                               # same precedent as test_cdep_crypto_smoke.nim --
@@ -780,6 +800,209 @@ suite "RunReport.cacheStats — RFC-0005 B2b end-to-end (real runTests, no CLI)"
       check rr.cacheStats.hitPct > 0.0
 
 # ---------------------------------------------------------------------------
+# RFC-0005 code-review L2: the RFC-pinned UNCONDITIONAL per-tier 100%-error/
+# breaker stderr warning must fire on a DEFAULT run too, not only under
+# --cache-stats (the sole erroredTiers caller was gated behind
+# `if statsSink != nil`, which is nil unless --cache-stats is on).
+# ---------------------------------------------------------------------------
+
+proc alwaysOfflineBackend(): CacheBackend =
+  ## Every `get`/`put` transport-fails (cvOffline) -- a minimal double for
+  ## forcing the per-tier 100%-error diagnostic without any real filesystem
+  ## fault (mirrors test_cachedispatch.nim's own `offlinePutBackend`,
+  ## extended to `get` since this diagnostic is READ-side, `cachetelemetry.
+  ## erroredTiers`'s own scope note).
+  CacheBackend(
+    scheme: "test-always-offline",
+    get:  proc(key: SoundnessKey): Fetched[StoredEntry] = Fetched[StoredEntry](verdict: cvOffline),
+    put:  proc(entry: StoredEntry): CacheVerdict = cvOffline,
+    probe: nil,
+  )
+
+proc offlineTierDeps(): CacheDeps =
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+    discard cfg; discard stateDir; discard maxEntries
+    CacheRuntime(
+      cache: TieredCache(
+        tiers: @[Tier(name: "l1", backend: alwaysOfflineBackend(), backfillOnHit: false, verifyTrust: false)],
+        trust: nonePolicy(),
+      ),
+      sink: NilSink[TelemetryEvent](),
+    ))
+
+proc captureStderr(body: proc()): string =
+  ## fd-level stderr redirect (mirrors test_b2b_cache_stats_cli.nim's own
+  ## `captureBoth`) -- works regardless of whether the write goes through
+  ## Nim's `stderr` object or a lower-level handle, since it swaps the real
+  ## OS file descriptor 2, not a Nim-level reference.
+  let tag = $getCurrentProcessId() & "_" & $epochTime().int64
+  let errPath = getTempDir() / ("crisol_l2_err_" & tag & ".txt")
+  let errF = open(errPath, fmWrite)
+  let errFd: cint = errF.getFileHandle.cint
+  let savedErrFd: cint = posix_mod.dup(2.cint)
+  discard posix_mod.dup2(errFd, 2.cint)
+  errF.close()
+  try:
+    body()
+  finally:
+    flushFile(stderr)
+    discard posix_mod.dup2(savedErrFd, 2.cint)
+    discard posix_mod.close(savedErrFd)
+  result = readFile(errPath)
+  try: removeFile(errPath) except CatchableError: discard
+
+suite "RFC-0005 code-review L2 — unconditional per-tier 100%-error warning":
+
+  test "default run (cacheStats off), always-offline l1 -> stderr carries the warning":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      var rr: RunReport
+      let errText = captureStderr(proc() = rr = runTestsWith(opts, offlineTierDeps()))
+      check rr.status == rsOk
+      check "cache tier 'l1' errored on every consulted read this run" in errText
+
+  test "--cache-stats on, always-offline l1 -> warning present exactly once (no dup)":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
+      var rr: RunReport
+      let errText = captureStderr(proc() = rr = runTestsWith(opts, offlineTierDeps()))
+      check rr.status == rsOk
+      check errText.count("cache tier 'l1' errored on every consulted read this run") == 1
+
+  test "healthy tier -> no per-tier warning":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      var rr: RunReport
+      let errText = captureStderr(proc() = rr = runTestsWith(opts, productionCacheDeps()))
+      check rr.status == rsOk
+      check "errored on every consulted read" notin errText
+
+# ---------------------------------------------------------------------------
+# RFC-0005 code-review D1: a LOCAL ("l1") put failure must never be folded
+# into remoteErrors/"N remote-errors" -- it goes to the new, additive
+# `localErrors` count instead (`cachetelemetry.CacheStats.localErrors`,
+# run/v2 rev 22). Reuses `offlineTierDeps()`/`alwaysOfflineBackend()` from
+# the L2 suite above: a single-tier ("l1"-only, zero remote configured)
+# runtime whose every get/put transport-fails.
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 code-review D1 — local (l1) put failures count as localErrors, not remoteErrors":
+
+  test "local-only run, forced l1 put failure -> cacheStats.localErrors == 1, remoteErrors == 0":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
+      let rr = runTestsWith(opts, offlineTierDeps())
+      check rr.status == rsOk
+      check rr.cacheStats.localErrors == 1
+      check rr.cacheStats.remoteErrors == 0
+
+      # Wire-level assertion (not just the in-process struct): the run/v2
+      # JSON `cacheStats` object under --cache-stats.
+      let node = parseJson(toJsonString(rr.results, rr.summary,
+                                        cacheStats = rr.cacheStats, showCacheStats = true))
+      check node["cacheStats"]["localErrors"].getInt == 1
+      check node["cacheStats"]["remoteErrors"].getInt == 0
+
+      # Human-render: "N local-errors" appears, distinct from remote-errors.
+      let line = renderCacheStats(rr.cacheStats)
+      check "1 local-errors" in line
+      check "0 remote-errors" in line
+
+# ---------------------------------------------------------------------------
+# RFC-0005 code-review SO4 — a verify re-execution that never produced an
+# observation (its promoted stable binary vanished between the main run
+# and the verify sub-run) must be reported as "could not re-execute", a
+# category DISTINCT from a divergence -- never counted toward
+# `verifyDivergences` (so --verify-cache-strict, which gates on
+# `verifyDivergences.len`, never trips for it), never silent (a stderr
+# warning still names the entrypoint).
+#
+# Driven via `runner.execute()` + the public `verifyCachePass()` facade
+# directly (crisol/cachedispatch's real `localOnlyCache`/`realSeams`, same
+# precedent as test_cachedispatch.nim's own B2a suite), bypassing the
+# planner (`decideCompile`) entirely -- a full `crisol run` / `runTests()`
+# round trip re-derives `edecision` fresh from ON-DISK state on every
+# invocation, so deleting a stable binary BETWEEN two separate `runTests()`
+# calls gets silently "healed" by a real recompile + post-compile-consult
+# re-promotion before the verify pass ever runs (empirically confirmed
+# while writing this test). Going through `execute()` directly sidesteps
+# this entirely: `PlannedEntrypoint.edecision` is a value THIS TEST sets
+# once, immune to any disk-state re-derivation, so deleting the stable
+# binary after run 2's cdmHit is exactly the TOCTOU this fix defends
+# against, reproduced deterministically.
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a divergence":
+
+  test "sampled hit whose promoted stable binary is missing at verify-sub-run time":
+    let dir = getTempDir() / ("crisol_so4_couldnotreexec_" & $getCurrentProcessId())
+    removeDir(dir)
+    createDir(dir)
+    defer: removeDir(dir)
+    let epPath = dir / "test_pass.nim"
+    writeFile(epPath, "quit(0)\n")
+
+    let cfg = Config(projectRoot: dir, stateDir: ".crisol",
+                     compileTimeoutSecs: 120, timeoutSecs: 60)
+    let spec = sandbox.resolveSandbox(ptypes.hlIsolated)
+    var g = emptyDepGraph()
+    let rt = localOnlyCache(dir / ".crisol", maxEntries = 0)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+
+    # Run 1: edNeverBuilt -- compiles + runs live, stores via the real cache
+    # (also promotes the stable binary + records its closure into `g`).
+    let pep1 = PlannedEntrypoint(ep: Entrypoint(path: epPath, group: "unit", flags: @[]),
+                                 edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    let results1 = execute(
+      RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
+    check results1.len == 1
+    check results1[0].cacheDecision == cdmStored
+
+    # Run 2: edRunFresh -- `g` now has epPath's closureHash, so lookupAtPlan
+    # derives the SAME key -> cdmHit (a plan-time hit; no fresh execution,
+    # no touching of the stable binary either way).
+    let pep2 = PlannedEntrypoint(ep: Entrypoint(path: epPath, group: "unit", flags: @[]),
+                                 edecision: edRunFresh, runTimeoutMs: 60_000)
+    let results2 = execute(
+      RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
+    check results2.len == 1
+    check results2[0].cacheDecision == cdmHit
+
+    # Delete the promoted STABLE binary the verify sub-run's spawnRunDirect
+    # needs to reuse (SO5's fix) -- the CACHE's own stored blob (which run
+    # 2's cdmHit synthesis read) is untouched; only the per-entrypoint
+    # stable path is gone.
+    let stableBin = binPath(pep2.ep, cfg) / binName(pep2.ep)
+    check fileExists(stableBin)
+    removeFile(stableBin)
+
+    # The verify pass: buildVerifyPlan forces edRunFresh (SO5) -> dispatch
+    # tries spawnRunDirect -> the binary is gone -> pkSpawnFailed -> SO4's
+    # distinct category.
+    var divergences: seq[VerifyDivergence]
+    let errText = captureStderr(proc () =
+      divergences = verifyCachePass(
+        results2, @[pep2], verifySample(pct = 100), cfg, g,
+        "2.2.10", "gcc 13.2.0", spec))
+
+    check divergences.len == 0   # SO4: never misfiled as a divergence
+    check epPath in errText
+    check "could not re-execute" in errText.toLowerAscii
+    # Never ALSO reported via the divergence wording ("--verify-cache
+    # divergence for ... diverged from the cached result") -- distinct
+    # from the could-not-reexec message's own use of the word
+    # "divergence" (as in "not counted as a divergence").
+    check "--verify-cache divergence for" notin errText
+    check "diverged from the cached result" notin errText
+
+# ---------------------------------------------------------------------------
 # RFC-0005 A3b — runTestsWith / CacheDeps: the internal injection seam.
 # ---------------------------------------------------------------------------
 
@@ -796,7 +1019,7 @@ suite "runTestsWith / CacheDeps — production parity":
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored
 
-  test "productionCacheDeps() scrubs $CRISOL_CACHE_TOKEN[_<TIER>] from the process env (RFC-0005 C6)":
+  test "productionCacheDeps().buildRuntime scrubs $CRISOL_CACHE_TOKEN[_<TIER>] from the process env (RFC-0005 C6/D5)":
     ## Mirrors the existing hmac/sign-key scrub proofs (E2E-2, below) for
     ## the bearer-token vars specifically: `resolveCacheSecrets` (api.nim)
     ## captures BOTH the bare and suffixed forms, then delEnv's the whole
@@ -804,14 +1027,53 @@ suite "runTestsWith / CacheDeps — production parity":
     ## configured here, so `configuredCache` never resolves a backend and
     ## no real socket is ever touched -- this proves only the env
     ## capture-then-scrub half.
+    ##
+    ## RFC-0005 code-review D5: `resolveCacheSecrets()` now runs LAZILY,
+    ## inside the closure `buildRuntime` returns -- calling
+    ## `productionCacheDeps()` alone (as this test did before D5) no longer
+    ## touches the environment at all; the scrub only happens once
+    ## `buildRuntime` is actually invoked (which `runTestsWith` only does
+    ## when `not opts.noCache` -- see the D5 suite below for the
+    ## `noCache:true` half of this proof).
     putEnv("CRISOL_CACHE_TOKEN", "should-be-scrubbed")
     putEnv("CRISOL_CACHE_TOKEN_MIRROR", "should-also-be-scrubbed")
     defer:
       delEnv("CRISOL_CACHE_TOKEN")
       delEnv("CRISOL_CACHE_TOKEN_MIRROR")
-    discard productionCacheDeps()
+    let deps = productionCacheDeps()
+    discard deps.buildRuntime(CacheConfig(), getTempDir() / "crisol_d5_scrub_state", 0)
     check getEnv("CRISOL_CACHE_TOKEN") == ""
     check getEnv("CRISOL_CACHE_TOKEN_MIRROR") == ""
+
+# ---------------------------------------------------------------------------
+# RFC-0005 code-review D5: `runTests()` eagerly called `productionCacheDeps()`
+# -> `resolveCacheSecrets()` (a scan + delEnv of the WHOLE CRISOL_CACHE_*
+# namespace) even under `noCache: true` -- an undocumented host-process
+# mutation for a library embedder that asked for NO caching at all. Fixed
+# by moving the resolution inside `buildRuntime`'s own closure (see the
+# test immediately above), which `runTestsWith` only ever calls when `not
+# opts.noCache`.
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 code-review D5 — no env mutation under opts.noCache":
+
+  test "noCache: true -> CRISOL_CACHE_* env is left untouched":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      putEnv("CRISOL_CACHE_TOKEN", "must-survive-noCache")
+      defer: delEnv("CRISOL_CACHE_TOKEN")
+      let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", noCache: true))
+      check rr.status == rsOk
+      check getEnv("CRISOL_CACHE_TOKEN") == "must-survive-noCache"
+
+  test "cache-enabled (default, noCache: false) -> CRISOL_CACHE_* env IS scrubbed (existing behavior, pinned)":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      putEnv("CRISOL_CACHE_TOKEN", "should-be-scrubbed-cache-on")
+      defer: delEnv("CRISOL_CACHE_TOKEN")
+      let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl"))
+      check rr.status == rsOk
+      check getEnv("CRISOL_CACHE_TOKEN") == ""
 
 # ---------------------------------------------------------------------------
 # RFC-0005 A3b — E2E-A-trust (RFC §Definition of done, verbatim): two
@@ -975,6 +1237,10 @@ remote-cache "broken" {
       check rr2.results.len == 1
       check rr2.results[0].cacheLookup == cvOffline
       check rr2.cacheStats.remoteErrors > 0
+      # RFC-0005 code-review D1: the "broken" tier is a genuinely REMOTE
+      # (configured `remote-cache`) tier, so its failure stays remoteErrors
+      # -- never localErrors, which is reserved for the pinned "l1" tier.
+      check rr2.cacheStats.localErrors == 0
       # Zero network, zero crypto: still just the local-fs adapter, offline.
 
 suite "RFC-0005 A3c-ii — E2E-1: genuine two-tier file:// flow (warm host) + deferred-put flush":
@@ -1087,7 +1353,7 @@ cache-trust {
 """)
       putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")
       defer: delEnv("CRISOL_CACHE_HMAC_KEY")  # safety net; api.nim scrubs it itself on the happy path
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
 
       # Run 1: cold -> live -> publishes an ATTESTED entry to L2 (the
       # "mirror" remote) by end of run (the deferred-put flush).
@@ -1144,6 +1410,39 @@ cache-trust {
       check epNode["cacheLookup"].getStr == "trustBadSignature"
       check epNode["cacheDecision"].getStr == "stored"
 
+      # RFC-0005 code-review T8: the RFC's own E2E-2 acceptance text (this
+      # suite's own doc comment, above) claims "cacheStats distinguishes it
+      # from a cold miss". Empirically it does NOT: aggregateCacheStats
+      # (cachetelemetry.nim) folds `l1Hits`/`remoteHits`/`misses`/`total`/
+      # `notConsulted` purely from each entrypoint's FINAL `cacheDecision`
+      # (+`cacheTier`) — never from `cacheLookup`/the tier verdicts. A
+      # trust-rejected read's `PlanLookup.decision` is `cdmKeyMiss` at
+      # lookup time (cachedispatch.lookupAtPlan: `l.hit.isNone` — "nothing
+      # servable" — is the SAME code path a genuine empty-cache cold miss
+      # takes), then `cdmStored` after the self-heal republish — EXACTLY
+      # the same two decisions a first-ever cold run produces. The
+      # trust-rejection verdict IS captured on the wire (`tekMiss.verdicts`
+      # carries it), but `aggregateCacheStats`'s `tekMiss` arm is a bare
+      # `discard` (miss COUNT is decision-sourced; the verdict itself is
+      # simply never folded into any `CacheStats` field). `tekRemoteErr`/
+      # `tekBackfillErr` (the only other candidates, feeding
+      # `remoteErrors`/`localErrors`) are PUT/backfill-failure events only
+      # — a READ-side trust rejection never emits either. This test PINS
+      # the actual (gap) shape rather than silently asserting the RFC's
+      # claim: `misses` reads 1 either way — a trust-rejected-then-healed
+      # run is byte-for-byte cacheStats-identical to a genuine cold miss
+      # in an equally-tiered setup (compare this to the plain "cold run"
+      # case in the "cache-stats resolution" suite above: same
+      # l1Hits/remoteHits/misses/hitPct shape). BLOCKER finding for the
+      # RFC text / a follow-up slice, not something this fix silently
+      # redefines.
+      check rr2.cacheStats.misses == 1
+      check rr2.cacheStats.l1Hits == 0
+      check rr2.cacheStats.remoteHits == 0
+      check rr2.cacheStats.remoteErrors == 0   # NOT counted as a remote error
+      check rr2.cacheStats.localErrors == 0    # NOT counted as a local error either
+      check rr2.cacheStats.hitPct == 0.0
+
   test "negative control: bare byte-flip (checksum NOT fixed) -> cacheLookup corrupt, not trust":
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
@@ -1165,7 +1464,7 @@ cache-trust {
 """)
       putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")
       defer: delEnv("CRISOL_CACHE_HMAC_KEY")  # safety net; api.nim scrubs it itself on the happy path
-      let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
 
       let rr1 = runTests(opts)
       check rr1.status == rsOk
@@ -1187,6 +1486,18 @@ cache-trust {
       check rr2.results.len == 1
       check rr2.results[0].cacheLookup == cvCorrupt
       check rr2.results[0].cacheDecision == cdmStored  # self-heal here too
+
+      # RFC-0005 code-review T8 (see the sibling "tamper + recompute
+      # payloadChecksum" test's comment for the full analysis): `cvCorrupt`
+      # takes the SAME `l.hit.isNone` ("nothing servable") path through
+      # lookupAtPlan as a genuine cold miss, so it lands in the identical
+      # cacheStats bucket -- confirmed here for the INTEGRITY-layer verdict
+      # too, not just the trust-layer one.
+      check rr2.cacheStats.misses == 1
+      check rr2.cacheStats.l1Hits == 0
+      check rr2.cacheStats.remoteHits == 0
+      check rr2.cacheStats.remoteErrors == 0
+      check rr2.cacheStats.localErrors == 0
 
 # ---------------------------------------------------------------------------
 # RFC-0005 C5a -- ed25519 sign+verify happy path through the REAL entry
@@ -1637,6 +1948,97 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     check rr4.cacheStats.remoteHits == 1
     check rr4.cacheStats.l1Hits == 0
     check anyFileUnder(p2 / ".crisol" / "cache")  # re-backfilled
+
+# ---------------------------------------------------------------------------
+# RFC-0005 code-review SO5 -- the --verify-cache pass must never persist the
+# depgraph, including for a sampled hit that came from the POST-COMPILE
+# consult (A2c-ii above) rather than a plan-time hit. Reuses the exact
+# cold-host P1/P2 recipe the A2c-ii suite (immediately above) already
+# proved produces a genuine post-compile-consult hit (`compileSkipped ==
+# false`, `cacheDecision == cdmHit`) -- now with `--verify-cache` ALSO
+# enabled on P2's own (single, cold) run, so the verify pass samples THAT
+# SAME hit within the SAME runTests() call the post-compile consult fires
+# in (the only way the SO5 scenario can occur at all -- see
+# buildVerifyPlan's own fix comment, runner.nim).
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 code-review SO5 — verify-cache never persists the depgraph for a post-compile-consult hit":
+
+  test "post-compile-consult hit + --verify-cache: depgraph is not written again after persistLastRun; state stays self-consistent":
+    let remoteRoot = getTempDir() / ("crisol_so5_remote_" & $getCurrentProcessId())
+    removeDir(remoteRoot)
+    createDir(remoteRoot)
+    defer: removeDir(remoteRoot)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n" &
+              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot & "\"\n}\n"
+
+    # P1: an ordinary live run publishes this exact closure to the shared remote.
+    let p1 = getTempDir() / ("crisol_so5_p1_" & $getCurrentProcessId())
+    removeDir(p1)
+    createDir(p1 / "tests" / "unit")
+    defer: removeDir(p1)
+    writeFile(p1 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+    writeFile(p1 / "crisol.kdl", kdl)
+    let rr1 = runTests(RunOptions(configPath: p1 / "crisol.kdl"))
+    check rr1.status == rsOk
+    check rr1.results[0].cacheDecision == cdmStored
+    check remoteHasAnyEntry(remoteRoot)
+
+    # P2: a SEPARATE, genuinely cold project (own root, own stateDir) --
+    # edNeverBuilt at plan time, so ONLY the post-compile consult (A2c-ii)
+    # can serve this hit -- with --verify-cache ALSO enabled on this SAME
+    # run, sampling that exact hit.
+    let p2 = getTempDir() / ("crisol_so5_p2_" & $getCurrentProcessId())
+    removeDir(p2)
+    createDir(p2 / "tests" / "unit")
+    defer: removeDir(p2)
+    writeFile(p2 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
+    writeFile(p2 / "crisol.kdl", kdl)
+    let rr2 = runTests(RunOptions(configPath: p2 / "crisol.kdl",
+                                  verifyCache: verifySample(pct = 100)))
+    check rr2.status == rsOk
+    check rr2.results.len == 1
+    let r2 = rr2.results[0]
+    # Proves this hit genuinely came from the POST-COMPILE consult, not a
+    # plan-time lookup (A2c-ii's own distinguishing signal).
+    check r2.compileSkipped == false
+    check r2.cacheDecision == cdmHit
+    check r2.cacheTier == "mirror"
+    # The sampled verify re-run reused the promoted stable binary cleanly
+    # (SO5's fix) -- no false divergence, no could-not-reexec either.
+    check rr2.verifyDivergences.len == 0
+    check rr2.verifyCouldNotReexec.len == 0
+
+    let (cfg2, cfg2Errs) = loadConfig(p2 / "crisol.kdl")
+    doAssert cfg2Errs.len == 0, "loadConfig failed: " & $cfg2Errs
+
+    # SO5's own ordering proof: `persistLastRun` (which writes lastrun.json)
+    # runs strictly BEFORE the verify pass (RFC "Binary precondition... the
+    # pass runs before releaseLock, after persistLastRun" -- already the
+    # contract test_b3b_verify_cache.nim's "placement proof" pins via
+    # lastrun.json's CONTENT). If the verify pass illegitimately recompiled
+    # and re-persisted the depgraph (the SO5 bug), that second
+    # `saveDepGraph` call would happen AFTER persistLastRun already wrote
+    # lastrun.json -- so the depgraph's mtime would be STRICTLY LATER than
+    # lastrun.json's. Fixed: the depgraph's last write is the MAIN run's own
+    # legitimate post-compile-consult recordClosure, which happens BEFORE
+    # persistLastRun -- so its mtime must be <= lastrun.json's.
+    let depgraphMtime = getFileInfo(depgraphPath(cfg2)).lastWriteTime
+    let lastrunMtime  = getFileInfo(p2 / ".crisol" / "lastrun.json").lastWriteTime
+    check depgraphMtime <= lastrunMtime
+
+    # State self-consistency: P2's depgraph correctly describes ONE entry
+    # (not corrupted/duplicated by an extra write), and P2's NEXT run (still
+    # no --verify-cache) sees it as fully warm -- exactly the same
+    # regression-safety proof the A2c-ii suite's own run 3 draws, now run
+    # AFTER a verify-cache-enabled run instead of a plain one.
+    var discarded: DepGraphDiscard
+    let onDisk = loadStoredDepGraph(cfg2, discarded)
+    check onDisk.entries.len == 1
+
+    let rr3 = runTests(RunOptions(configPath: p2 / "crisol.kdl"))
+    check rr3.status == rsOk
+    check rr3.results[0].compileSkipped == true
 
 suite "RFC-0005 A3c-ii — RunOptions.noRemoteCache (--no-remote-cache)":
 

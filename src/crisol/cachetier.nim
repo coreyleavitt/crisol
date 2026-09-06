@@ -323,7 +323,8 @@ proc putLocal*(tc: var TieredCache; entry: StoredEntry): TierVerdict =
   (tier: tier.name, verdict: v)
 
 proc drainPending*(tc: var TieredCache; pending: openArray[StoredEntry];
-                    budget: int = high(int)): seq[TierVerdict] =
+                    budget: int = high(int);
+                    abandoned: proc(): bool {.closure.} = proc(): bool = false): seq[TierVerdict] =
   ## RFC-0005 B0 "Deferred remote puts": a caller (the runner's end-of-run
   ## join point, after the poll loop drains and before `persistLastRun` --
   ## wiring that lands with the first slice that has a real non-"l1" tier
@@ -339,9 +340,26 @@ proc drainPending*(tc: var TieredCache; pending: openArray[StoredEntry];
   ## loses queued remote puts -- acceptable" (the loss is warmth, never
   ## correctness, since a future run re-publishes from its own live
   ## results).
+  ##
+  ## `abandoned` (RFC-0005 code-review SO2) is an injected predicate
+  ## (default: never abandon), mirroring `resolveProbes`'s own "no real
+  ## clock/signal dependency, call-counting/injected-predicate only"
+  ## discipline (see that proc's doc comment) -- checked BETWEEN puts, so a
+  ## pending shutdown stops the drain immediately rather than finishing out
+  ## whatever remains of `pending`/`budget`. Exactly like a plan-time
+  ## abandoned prefetch, an abandoned drain degrades to "never attempted"
+  ## for the untouched remainder, not a partial/best-effort attempt --
+  ## remote warmth lost this way is the SAME acceptable loss `budget`
+  ## already documents, just triggered by a shutdown instead of a budget
+  ## exhaustion. The production caller wires `proc(): bool =
+  ## signals.shutdownRequested().isSome` (api.nim) -- the SAME global,
+  ## level-triggered query the plan-time prefetch/consult loops already
+  ## use, so a shutdown observed by ANY installSignals=true Supervisor in
+  ## the process (not just this run's own) stops the drain too.
   result = @[]
   var attempted = 0
   for entry in pending:
     if attempted >= budget: break
+    if abandoned(): break
     result.add tc.put(entry)
     inc attempted

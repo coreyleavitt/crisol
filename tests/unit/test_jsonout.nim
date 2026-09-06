@@ -21,6 +21,7 @@ import crisol/jsonout
 import crisol/render
 import crisol/process/types as ptypes
 import crisol/runner  # for summarize
+import crisol/cachetelemetry  # RFC-0005 code-review T16: CacheStats field construction
 import crisol
 
 # ---------------------------------------------------------------------------
@@ -514,6 +515,63 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     check cacheVerdictString(cvTrustUnpinnedSigner) == "trustUnpinnedSigner"
     check cacheVerdictString(cvTrustSignerMismatch) == "trustSignerMismatch"
     check cacheVerdictString(cvTrustBadSignature) == "trustBadSignature"
+
+  test "RFC-0005 code-review T16: cacheStats renders EVERY field from a fully-populated value":
+    # Every field gets a DISTINCT value so a transposition (e.g. l1Hits
+    # swapped with remoteHits) is a visible test failure, not a
+    # coincidental pass -- same rationale as RlimitOverrides' named-field
+    # bundling (types.nim).
+    let stats = CacheStats(
+      l1Hits: 3, remoteHits: 5, misses: 7, remoteErrors: 11, localErrors: 13,
+      total: 17, notConsulted: 19, hitPct: 23.5, wallSavedMs: 29'i64,
+      published: 31, verifyFails: 37,
+    )
+    let node = toJson(syntheticResults(), syntheticSummary(),
+                      cacheStats = stats, showCacheStats = true)
+    check node.hasKey("cacheStats")
+    let cs = node["cacheStats"]
+    check cs["l1Hits"].getInt       == 3
+    check cs["remoteHits"].getInt   == 5
+    check cs["misses"].getInt       == 7
+    check cs["remoteErrors"].getInt == 11
+    check cs["localErrors"].getInt  == 13
+    check cs["total"].getInt        == 17
+    check cs["notConsulted"].getInt == 19
+    check cs["hitPct"].getFloat     == 23.5
+    check cs["wallSavedMs"].getInt  == 29
+    check cs["published"].getInt    == 31
+    check cs["verifyFails"].getInt  == 37
+
+  test "RFC-0005 code-review T16: cacheStats is ABSENT when showCacheStats is false, even with a non-zero value":
+    # Mirrors the keyDiff/cacheLookup absence convention: an all-default OR
+    # a genuinely populated CacheStats must both be OMITTED (never emitted
+    # as a zero-value placeholder) when the caller didn't ask for it.
+    let stats = CacheStats(l1Hits: 3, remoteHits: 5, misses: 7, total: 17,
+                           hitPct: 23.5, published: 31, verifyFails: 37)
+    let node = toJson(syntheticResults(), syntheticSummary(),
+                      cacheStats = stats, showCacheStats = false)
+    check not node.hasKey("cacheStats")
+
+  test "RFC-0005 code-review T16: toJsonString threads cacheStats through unchanged, stdout stays parseable":
+    let stats = CacheStats(
+      l1Hits: 3, remoteHits: 5, misses: 7, remoteErrors: 11, localErrors: 13,
+      total: 17, notConsulted: 19, hitPct: 23.5, wallSavedMs: 29'i64,
+      published: 31, verifyFails: 37,
+    )
+    let s = toJsonString(syntheticResults(), syntheticSummary(),
+                         cacheStats = stats, showCacheStats = true)
+    let cs = parseJson(s)["cacheStats"]
+    check cs["l1Hits"].getInt       == 3
+    check cs["remoteHits"].getInt   == 5
+    check cs["misses"].getInt       == 7
+    check cs["remoteErrors"].getInt == 11
+    check cs["localErrors"].getInt  == 13
+    check cs["total"].getInt        == 17
+    check cs["notConsulted"].getInt == 19
+    check cs["hitPct"].getFloat     == 23.5
+    check cs["wallSavedMs"].getInt  == 29
+    check cs["published"].getInt    == 31
+    check cs["verifyFails"].getInt  == 37
 
   test "a run-phase interrupt-killed entry: outcome killed, run.cause {by: runner, reason: interrupt}":
     let r    = killedByInterruptDuringRun()
@@ -1613,8 +1671,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 21 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats)":
-    check RunSchemaRevision == 21
+  test "RunSchemaRevision is 22 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors)":
+    check RunSchemaRevision == 22
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default

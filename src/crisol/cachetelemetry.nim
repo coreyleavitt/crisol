@@ -136,6 +136,18 @@ type
       ## served a hit this run (identical to the pre-A3a behavior).
     misses*:       int
     remoteErrors*: int
+      ## RFC-0005 code-review D1: keyed off the FAILING tier, not the local/
+      ## remote SHAPE of the run — a put/backfill failure whose `putTier ==
+      ## "l1"` (the pinned local tier) counts toward `localErrors` instead
+      ## (below), never here, even when zero remote tier is configured. A
+      ## put failure against any OTHER (configured `remote-cache`) tier
+      ## name counts here, exactly as before.
+    localErrors*:  int
+      ## RFC-0005 code-review D1: a `tekRemoteErr`/`tekBackfillErr` event
+      ## whose `putTier == "l1"` — a local-fs write failure (unwritable
+      ## cache root, full disk, etc.), never a network/remote fault. Kept
+      ## OUT of `remoteErrors` so "N remote-errors" is never rendered for a
+      ## run with zero remote tiers configured (the bug this field fixes).
     total*:        int
       ## Lookups actually consulted: every per-result `CacheDecision` NOT in
       ## `notConsultedDecisions` (RFC: "hit + keyMiss + recomputeMiss +
@@ -207,7 +219,7 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
   ## that was accurate only before a remote tier could ever serve a hit
   ## (pre-A3c-ii). `hitPct`/`misses` are unaffected (both already summed
   ## `l1Hits + remoteHits`).
-  var remoteErrors, published, verifyFails: int
+  var remoteErrors, localErrors, published, verifyFails: int
   var wallSavedMs: int64
   for ev in events:
     case ev.kind
@@ -216,7 +228,13 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
     of tekMiss:
       discard  # miss count is decision-sourced (see `misses` below)
     of tekRemoteErr, tekBackfillErr:
-      inc remoteErrors
+      # RFC-0005 code-review D1: keyed off the FAILING tier, mirroring the
+      # l1Hits/remoteHits split below (`d.tier == "l1"`) — a local-fs write
+      # failure is not a "remote" error just because the event kind is
+      # named `tekRemoteErr` (a pre-A3a name, from when "l1" was the only
+      # tier that could ever fail a put at all).
+      if ev.putTier == "l1": inc localErrors
+      else: inc remoteErrors
     of tekPublish:
       inc published
     of tekVerifyFail:
@@ -237,6 +255,7 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
     remoteHits:   remoteHits,
     misses:       misses,
     remoteErrors: remoteErrors,
+    localErrors:  localErrors,
     total:        total,
     notConsulted: notConsulted,
     hitPct:       hitPct,

@@ -425,8 +425,16 @@ proc renderCacheStats*(s: CacheStats): string =
   ## newline, no "crisol: " prefix — callers add both (render()'s footer
   ## just appends "\n"; the CLI's --json branch prefixes "crisol: " to match
   ## its other stderr diagnostics, same as explainMissLines' callers).
+  ##
+  ## `local-errors` (RFC-0005 code-review D1) renders right next to
+  ## `remote-errors` -- a local-fs put/backfill failure (`putTier == "l1"`)
+  ## is never folded into `remote-errors`, so a local-only run (zero
+  ## configured remote tiers) with an unwritable cache root reads "N
+  ## local-errors, 0 remote-errors", never the dishonest "N remote-errors"
+  ## it rendered before this fix.
   "cache: " & $s.l1Hits & " l1 hits, " & $s.remoteHits & " remote hits, " &
-  $s.misses & " misses, " & $s.remoteErrors & " remote-errors, " &
+  $s.misses & " misses, " & $s.localErrors & " local-errors, " &
+  $s.remoteErrors & " remote-errors, " &
   $s.total & " consulted (" & $s.notConsulted & " not consulted), " &
   formatFloat(s.hitPct, ffDecimal, 1) & "% hit rate, " &
   $s.wallSavedMs & "ms saved, " & $s.published & " published, " &

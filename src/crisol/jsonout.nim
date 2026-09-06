@@ -73,8 +73,8 @@
 ##     // NO "substrate" key: absent until A7 lands the substrate-identity
 ##     // block.  Absence IS the honest placeholder — no null, no stub object.
 ##     "cacheStats": {   // rev 21 (RFC-0005 B2b); PRESENT ONLY under --cache-stats
-##       l1Hits, remoteHits, misses, remoteErrors, total, notConsulted,
-##       hitPct, wallSavedMs, published, verifyFails
+##       l1Hits, remoteHits, misses, remoteErrors, localErrors,  // localErrors: rev 22 (D1)
+##       total, notConsulted, hitPct, wallSavedMs, published, verifyFails
 ##     }
 ##   }
 ##
@@ -255,7 +255,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 21
+const RunSchemaRevision* = 22
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -528,6 +528,38 @@ const RunSchemaRevision* = 21
   ##                     `l1Hits` iff its `cacheTier == "l1"`, else toward
   ##                     `remoteHits` -- zero only when no configured
   ##                     remote-cache tier has ever served a hit this run.
+  ##   rev 22 (RFC-0005 code-review D1) — the existing `cacheStats` object
+  ##                     (rev 21, above) gains one additive field:
+  ##                     `localErrors` (int). A put/backfill failure is now
+  ##                     attributed by the FAILING tier, not folded
+  ##                     unconditionally into `remoteErrors`: a failure
+  ##                     whose `putTier == "l1"` (the pinned local tier --
+  ##                     a local-fs write fault, e.g. an unwritable cache
+  ##                     root) counts toward `localErrors`; any OTHER
+  ##                     (configured `remote-cache`) tier's failure still
+  ##                     counts toward `remoteErrors`, unchanged. Before
+  ##                     this rev, a run with ZERO remote tiers configured
+  ##                     could still report a nonzero `remoteErrors` from a
+  ##                     purely-local fault, which was dishonest ("remote"
+  ##                     implies a configured remote tier exists). Same
+  ##                     presence gating as rev 21 -- both fields live on
+  ##                     the SAME object, so `localErrors` is absent
+  ##                     exactly when `cacheStats` itself is absent (no
+  ##                     `--cache-stats`), never independently gated.
+  ##   (RFC-0005 code-review SO4, no rev bump) — top-level `verifyFails`
+  ##                     (rev 19, above) becomes more ACCURATE, not
+  ##                     differently shaped: a sampled --verify-cache entry
+  ##                     whose fresh re-execution produced no observation at
+  ##                     all (fresh run phase pkSkipped/pkSpawnFailed) was
+  ##                     previously misfiled as an exit divergence and
+  ##                     counted here; it no longer is (a new,
+  ##                     Nim-API-only `RunReport.verifyCouldNotReexec` field
+  ##                     carries it instead -- not on the wire; see that
+  ##                     field's own doc comment in api.nim). Same rationale
+  ##                     as rfc-0007 A5/A6a's "no new field, an existing
+  ##                     field's CONTENT changes" entries above: no reader
+  ##                     depended on the OLD (incorrect) count, and the
+  ##                     field's type/presence/meaning are unchanged.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -848,6 +880,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     cs["remoteHits"]   = newJInt(cacheStats.remoteHits)
     cs["misses"]       = newJInt(cacheStats.misses)
     cs["remoteErrors"] = newJInt(cacheStats.remoteErrors)
+    cs["localErrors"]  = newJInt(cacheStats.localErrors)  # rev 22 (RFC-0005 code-review D1)
     cs["total"]        = newJInt(cacheStats.total)
     cs["notConsulted"] = newJInt(cacheStats.notConsulted)
     cs["hitPct"]       = newJFloat(cacheStats.hitPct)

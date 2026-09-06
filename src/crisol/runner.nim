@@ -1338,17 +1338,48 @@ proc buildVerifyPlan*(entrypoints: seq[PlannedEntrypoint];
   ## `jobs = 1` (determinism — the RFC requires the verify pass to run
   ## serially) and each sampled entry's `retries` is forced to 0 (single
   ## attempt: a retry would mask the very flakiness verify exists to find).
-  ## Every other `PlannedEntrypoint` field is carried through unchanged —
-  ## the sampled entries are still `edRunFresh` at this point (the promotion
-  ## to `edCached` lives only in `PlanLookup.decision`, never written back to
-  ## `edecision`) and dispatch to `spawnRunDirect` exactly like the original
-  ## run's cache hits did.
   ##
-  ## Pure: never mutates `entrypoints` (the caller's original plan/report).
+  ## RFC-0005 code-review SO5 fix: `edecision` is ALSO forced to
+  ## `edRunFresh` here, overriding whatever the MAIN run's plan actually
+  ## carried for this entry. A plan-time cache hit's `edecision` genuinely
+  ## already IS `edRunFresh` (the promotion to `edCached` lives only in
+  ## `PlanLookup.decision`, never written back to `edecision`) — but a
+  ## `cdmHit` can ALSO come from `finalizeSlot`'s POST-COMPILE cache consult
+  ## (RFC-0005 A2c-ii), and such an entry's `edecision` at plan time is
+  ## `edNeverBuilt`/`edStale` (that is WHY the consult had to run: the plan
+  ## didn't know about the hit until after compiling). Left unforced,
+  ## `execute()`'s own dispatch (`if pep.edecision == edRunFresh:
+  ## spawnRunDirect else: spawnCompileStable`) would route such an entry
+  ## through `spawnCompileStable` in THIS diagnostic-only verify sub-run —
+  ## a genuine recompile whose `finalizeSlot` calls `recordClosure`, which
+  ## unconditionally calls `saveDepGraph` (depgraph.nim) and PERSISTS the
+  ## mutation to disk — exactly the "no depgraph mutation/save" contract
+  ## this proc's own doc line (above) promises but did not, before this
+  ## fix, actually keep for post-compile-consult-originated hits.
+  ##
+  ## The override is sound because every `cdmHit` entry — from EITHER a
+  ## plan-time hit or a post-compile consult hit — already has a stable
+  ## binary at `binPath(ep, config)/binName(ep)` by construction (see
+  ## `finalizeSlot`'s A2c-ii promotion path, and `verifyCachePass`'s own
+  ## "Binary precondition" doc note: "`cdmHit` this run implies `edRunFresh`
+  ## at plan time, i.e. the binary exists" — true for the ORIGINAL hit;
+  ## this override makes it true for the SYNTHETIC one too). Forcing
+  ## `edRunFresh` makes every sampled entry dispatch to `spawnRunDirect`
+  ## (cdSkipFresh: reuse the already-promoted stable binary, no recompile
+  ## at all) exactly like a plan-time hit always did — `spawnCompileStable`,
+  ## and therefore `recordClosure`/`saveDepGraph`, are never reached from
+  ## this pass, period.
+  ##
+  ## Every other `PlannedEntrypoint` field is carried through unchanged.
+  ##
+  ## Pure: never mutates `entrypoints` (the caller's original plan/report) —
+  ## the override lands only on the synthetic copy `e`, never written back.
   result = RunPlan(jobs: 1)
   for i in indices:
     var e = entrypoints[i]
     e.retries = 0
+    e.edecision = edRunFresh   # SO5 fix: always reuse the promoted stable
+                               # binary; never recompile in a verify pass.
     result.entrypoints.add e
 
 # ---------------------------------------------------------------------------

@@ -55,7 +55,8 @@
 ##       paired with `drainPending` for the remote tiers.
 ##   11. `tekBackfillErr`'s producer (`cachetelemetry.backfillErrEvents`
 ##       over `CacheLookup.backfillVerdicts`) + its fold into
-##       `aggregateCacheStats.remoteErrors`.
+##       `aggregateCacheStats.remoteErrors`/`.localErrors` (RFC-0005
+##       code-review D1: keyed off the failing tier -- "l1" -> localErrors).
 ##   12. `cacheregistry`: `BackendRegistry`/`buildBackend` resolves by URL
 ##       scheme; `productionRegistry` has no `memory://`; `testRegistry`
 ##       adds `memory://`/`memorybytes://` and keeps `file://`; an unknown
@@ -735,7 +736,11 @@ block test_backfill_err_events_and_stats:
   assert events[0].putVerdict == cvOffline
 
   let stats = aggregateCacheStats(events, @[(cdmHit, "l1")])
-  assert stats.remoteErrors == 1
+  # RFC-0005 code-review D1: the backfill TARGET here is "l1" (the pinned
+  # local tier, `twoTier`'s tier-0 name) -- a local-fs write failure, so it
+  # must land in localErrors, never remoteErrors.
+  assert stats.localErrors == 1
+  assert stats.remoteErrors == 0
 
 block test_backfill_err_events_is_empty_on_a_successful_backfill:
   var tc = twoTier(memory(), memory(), backfill0 = true)
@@ -1813,5 +1818,135 @@ block test_post_compile_key_outside_probed_set_still_does_a_real_get:
   let l = tc.lookup(postCompileKey)
   assert getCalls[] == 1, "a key outside the probed candidate set must always fall through to a real get"
   assert l.hit.isSome, "the real get (probingBackend's default cvOk) must be allowed to serve it"
+
+# ---------------------------------------------------------------------------
+# 16. RFC-0005 code-review SO2: `drainPending`'s own `abandoned` predicate --
+#     mirrors `resolveProbes`'s injected-predicate discipline (no real
+#     clock/signal dependency here either). Checked BETWEEN puts so a
+#     pending shutdown stops the drain mid-queue, leaving every entry from
+#     that point on untouched (never attempted).
+# ---------------------------------------------------------------------------
+
+block test_drain_pending_abandoned_predicate_stops_mid_queue:
+  let (backend, _, putCalls) = countingBackend(getResults = @[cvMiss],
+                                                putResults = @[cvOk, cvOk, cvOk, cvOk])
+  var tc = oneTier(backend)
+  let entries = @[sampleEntry(SoundnessKey("9999000000000001")),
+                  sampleEntry(SoundnessKey("9999000000000002")),
+                  sampleEntry(SoundnessKey("9999000000000003")),
+                  sampleEntry(SoundnessKey("9999000000000004"))]
+  var calls = 0
+  let vs = tc.drainPending(entries, abandoned = proc(): bool =
+    inc calls
+    calls > 2)  # flips true right after the 2nd check -- 2 entries attempted, 2 left untouched
+  assert vs.len == 2, "the drain must stop as soon as `abandoned` reports true"
+  assert putCalls[] == 2, "an abandoned drain must never attempt the remaining queued entries"
+  assert tc.tiers[0].backend.get(entries[2].key).verdict == cvMiss,
+    "entry 3 must be untouched -- the drain abandoned before reaching it"
+  assert tc.tiers[0].backend.get(entries[3].key).verdict == cvMiss,
+    "entry 4 must be untouched -- the drain abandoned before reaching it"
+
+block test_drain_pending_default_abandoned_never_stops:
+  ## The default predicate (`proc(): bool = false`, mirroring
+  ## `resolveProbes`'s own default) never abandons -- every production call
+  ## site that does not opt in explicitly keeps today's unconditional-drain
+  ## behavior.
+  var tc = oneTier(memory())
+  let entries = @[sampleEntry(SoundnessKey("9999000000000005")),
+                  sampleEntry(SoundnessKey("9999000000000006"))]
+  let vs = tc.drainPending(entries)
+  assert vs.len == 2
+
+# ---------------------------------------------------------------------------
+# T11(b) (coverage gap, Medium): key rotation -- once a tier's pinned key
+# set drops the old key, an entry signed under it must waterfall to a
+# plain MISS through the real `TieredCache.lookup`, never a raise, never
+# served -- exactly the "never serve a failed entry" rule `lookup` already
+# applies to every other trust rejection (see cachetrust.nim's own
+# rejection-matrix tests for the `TrustPolicy.verify` verdict in
+# isolation; this pins the same fact through the tier engine).
+# ---------------------------------------------------------------------------
+
+const T11SeedOld: array[32, byte] = [
+  byte 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+  116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131]
+const T11SeedNew: array[32, byte] = [
+  byte 131, 130, 129, 128, 127, 126, 125, 124, 123, 122, 121, 120, 119, 118, 117, 116,
+  115, 114, 113, 112, 111, 110, 109, 108, 107, 106, 105, 104, 103, 102, 101, 100]
+
+block test_t11b_key_rotation_drop_becomes_miss_not_error_in_tier_lookup:
+  let pkOld = keypair(toSeed(T11SeedOld)).public
+  let pkNew = keypair(toSeed(T11SeedNew)).public
+  let signerOld = ed25519Policy(some(toSeed(T11SeedOld)), @[pkOld, pkNew])
+  let key = SoundnessKey("1111000000000b0b")
+  var e = sampleEntry(key, exitCode = 1)
+  signerOld.sign(e)
+
+  # Operator drops the old key -- this tier's policy now pins ONLY the new key.
+  let verifierAfterRotation = ed25519Policy(none(Seed), @[pkNew])
+  var tc = oneVerifyingTier(verifyTrust = true, policy = verifierAfterRotation)
+  discard tc.tiers[0].backend.put(e)
+
+  let l = tc.lookup(key)
+  assert l.hit.isNone,
+    "an entry signed by a since-dropped key must become a miss through the tier engine -- never served, never a raise"
+  assert l.verdicts == @[(tier: "l1", verdict: cvTrustUnpinnedSigner)],
+    "the specific rejection verdict is recorded, not swallowed into a generic cvMiss"
+  assert worst(l) == cvTrustUnpinnedSigner
+
+# ---------------------------------------------------------------------------
+# T19 (coverage gap, Medium): the waterfall past a FAILING tier -- a decode
+# failure (cvCorrupt) and a breaker-tripped tier must both fall through to
+# a serving downstream tier exactly like any other non-cvOk verdict
+# (cachetier.nim's `lookup`: ANY `fetched.verdict != cvOk` just records and
+# `continue`s -- nothing there special-cases which non-ok verdict it was).
+# Backfill into the failed tier is then governed ONLY by `backfillOnHit` +
+# the verified-bit rule (read directly from `lookup`'s backfill loop
+# before writing these -- it does not consult what THIS tier's own `get`
+# verdict was at all), so a tier that just failed to DECODE is still a
+# legitimate backfill target, while a tier the breaker has already latched
+# dead short-circuits its backfill write to cvOffline too (the SAME
+# breaker check `get` uses).
+# ---------------------------------------------------------------------------
+
+block test_t19_corrupt_tier_waterfalls_and_still_backfills:
+  let (b0, get0, put0) = countingBackend(getResults = @[cvCorrupt], putResults = @[cvOk])
+  var tc = twoTier(b0, memory(), backfill0 = true)
+  let key = SoundnessKey("1919000000000001")
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 3))
+
+  let l = tc.lookup(key)
+  assert l.hit.isSome
+  assert l.hit.get.tier == "l2"
+  assert l.hit.get.result.run.exit.code == 3
+  assert l.verdicts == @[(tier: "l1", verdict: cvCorrupt), (tier: "l2", verdict: cvOk)],
+    "tier0's specific decode failure is recorded, not swallowed into a generic miss"
+  assert get0[] == 1
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOk)],
+    "a tier that just failed to DECODE is still a legitimate backfill target -- the backfill " &
+    "rule does not consult the tier's own prior get verdict, only backfillOnHit + the verified bit"
+  assert put0[] == 1, "the backfill actually attempted the write against tier0's backend"
+
+block test_t19_pretripped_breaker_tier_skips_immediately_and_backfills_offline:
+  let (b0, get0, put0) = countingBackend(getResults = @[cvOffline], putResults = @[cvOk])
+  var tc = twoTier(b0, memory(), backfill0 = true)
+  let primeKey = SoundnessKey("1919000000000002")
+  let key      = SoundnessKey("1919000000000003")
+
+  # Trip the breaker on l1 with an EARLIER, separate lookup call (l2 is
+  # also empty for this priming key -- the whole call is a clean miss).
+  let primed = tc.lookup(primeKey)
+  assert primed.hit.isNone
+  assert get0[] == 1, "the priming call is what trips the breaker"
+
+  discard tc.tiers[1].backend.put(sampleEntry(key, exitCode = 4))
+  let l = tc.lookup(key)
+  assert get0[] == 1, "a tier already tripped from a PRIOR call must never reach backend.get again"
+  assert l.hit.isSome
+  assert l.hit.get.tier == "l2"
+  assert l.verdicts == @[(tier: "l1", verdict: cvOffline), (tier: "l2", verdict: cvOk)]
+  assert l.backfillVerdicts == @[(tier: "l1", verdict: cvOffline)],
+    "a pre-tripped backfill target short-circuits to cvOffline, exactly like a live get would"
+  assert put0[] == 0, "a pre-tripped tier's backend.put must never be reached by backfill either"
 
 echo "test_cachetier: all blocks passed"
