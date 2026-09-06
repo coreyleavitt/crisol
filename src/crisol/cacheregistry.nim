@@ -327,7 +327,24 @@ proc buildTrustPolicy(trust: TrustConfig; secrets: CacheSecrets): TrustPolicy =
           "config: cache-trust 'pinned-key' is not a valid base64 32-byte " &
           "ed25519 public key: '" & raw & "'")
       pinned.add pk.get
-    ed25519Policy(decodeSignSeedB64(secrets.signSeedB64), pinned)
+    # SO6/T9: a PRESENT-but-malformed $CRISOL_CACHE_SIGN_KEY (bad base64,
+    # or a decoded length != 32) is a hard config error, same treatment as
+    # a malformed `pinned-key` above -- `decodeSignSeedB64` returns `none`
+    # for BOTH "absent" and "malformed" (it cannot distinguish the two by
+    # itself, see its own doc comment), so the distinction is made HERE,
+    # the only place that still has the raw string: `signSeedB64.len == 0`
+    # is the legitimate "no seed" verify-only case (RFC "no-seed
+    # verify-only mode", left unchanged); non-empty-but-undecodable must
+    # never silently degrade `ed25519Policy` to verify-only (every `put`
+    # would then be a silent `cvUnauthorized` no-op -- exactly the "silent
+    # dead tier" this whole config-error family exists to prevent).
+    let decodedSeed = decodeSignSeedB64(secrets.signSeedB64)
+    if secrets.signSeedB64.len > 0 and decodedSeed.isNone:
+      raise newCrisolError(cekConfig,
+        "config: cache-trust: $CRISOL_CACHE_SIGN_KEY is set but malformed -- " &
+        "must be base64 of exactly 32 bytes (a present-but-unusable signing " &
+        "key is a config error, not a silent downgrade to verify-only)")
+    ed25519Policy(decodedSeed, pinned)
   else:
     # Unreachable in practice: config.nim's parser already restricts
     # `policy` to {none, hmac, ed25519}. Kept as a defensive fail-closed
@@ -462,6 +479,35 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
         "config: remote-cache '" & remote.name & "': 'verify-trust #true' " &
         "requires a 'cache-trust' policy other than 'none'")
 
+    # SEC5: `config.validate`'s unsigned-s3 / unsigned-http rejections
+    # (below, both mirrored from `config.nim` — see that proc's own
+    # authority-note comment) are duplicated HERE, independently, so a
+    # programmatic `CacheConfig` built by an embedder that never goes
+    # through KDL parsing cannot bypass either rule -- `config.validate`
+    # stays too, for the better plan-time CLI error UX (defense in depth,
+    # not one delegating to the other).
+    let effectiveVerifyTrust = remote.verifyTrust.get(defaultVerifyTrust)
+    if remote.url.startsWith("s3://") and not effectiveVerifyTrust:
+      raise newCrisolError(cekConfig,
+        "config: remote-cache '" & remote.name & "': unsigned s3:// requires a " &
+        "verifying 'cache-trust' policy (policy != \"none\", and no explicit " &
+        "'verify-trust #false' on this tier) -- unsigned S3/MinIO has no " &
+        "transport-level write authorization")
+    # SEC1: symmetric with the s3 rule above -- an unkeyed FNV-1a-64
+    # checksum is attacker-computable and a `none` trust policy serves
+    # anything requested of it (read-side spoofing/MITM). `https://` is
+    # NOT rejected here (TLS authenticates the channel; `config.nim`'s
+    # `validate` emits the "server operator fully trusted" warning for
+    # that combination -- this proc has no `ConfigWarning` sink to route
+    # through, only the hard-error authority duplicated).
+    if remote.url.startsWith("http://") and not effectiveVerifyTrust:
+      raise newCrisolError(cekConfig,
+        "config: remote-cache '" & remote.name & "': unsigned http:// requires a " &
+        "verifying 'cache-trust' policy (policy != \"none\", and no explicit " &
+        "'verify-trust #false' on this tier) -- an unkeyed FNV-1a-64 checksum is " &
+        "attacker-computable and a 'none' trust policy serves anything requested " &
+        "of it (read-side spoofing/MITM)")
+
     if remote.url.startsWith("file://"):
       let fsRoot = remote.url["file://".len .. ^1]
       if rootInsideStateDir(fsRoot, stateDir):
@@ -474,7 +520,21 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
     # existing `file` factory's own `discard token` precedent) -- the s3
     # factory discards it too (unsigned; no credential axis at all), so
     # only the http/https factory actually reads it.
-    let backendOpt = reg.buildBackend(remote, token = httpTokenFor(secrets, remote.name))
+    let token = httpTokenFor(secrets, remote.name)
+    # SEC2: a write credential must never travel cleartext. A resolvable
+    # bearer token for a plaintext `http://` tier is a hard error --
+    # checked here (not in the http factory) so it fires uniformly for
+    # BOTH the generic `$CRISOL_CACHE_TOKEN` and the per-tier
+    # `$CRISOL_CACHE_TOKEN_<TIER>` forms (`httpTokenFor` already resolved
+    # both into this one string). The message names the tier and the env
+    # var SHAPE only -- never the token value.
+    if remote.url.startsWith("http://") and token.len > 0:
+      raise newCrisolError(cekConfig,
+        "config: remote-cache '" & remote.name & "': a bearer token is configured " &
+        "($CRISOL_CACHE_TOKEN or $CRISOL_CACHE_TOKEN_" & tierEnvSuffix(remote.name) &
+        ") for plaintext url '" & remote.url & "' -- a write credential must never " &
+        "travel cleartext; use https:// or unset the token")
+    let backendOpt = reg.buildBackend(remote, token = token)
     if backendOpt.isNone:
       raise newCrisolError(cekConfig,
         "config: remote-cache '" & remote.name & "': unsupported or " &

@@ -1758,7 +1758,14 @@ group "unit" {
     ## token path can never land unnoticed.
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
+    # A verifying cache-trust policy keeps this test isolated to its own
+    # concern (the unknown 'token' key) -- an https:// tier under the
+    # default policy "none" would otherwise ALSO emit SEC1's "server
+    # operator fully trusted" warning (see the dedicated SEC1 suite below).
     let kdl = """
+cache-trust {
+    policy "hmac"
+}
 remote-cache "mirror" {
     url "https://cache.example.com/crisol"
     token "sk-should-be-ignored"
@@ -1956,6 +1963,125 @@ group "unit" {
   # configuredCache` (C4), not in `loadConfig`/`config.nim` -- config.nim
   # never imports the cache modules, so that check is exercised in
   # test_cachetier.nim, not here.
+
+# ---------------------------------------------------------------------------
+# SEC1 — unsigned http:// is a hard config error, symmetric with unsigned
+# s3://; https:// under policy "none" is a WARNING (TLS authenticates the
+# channel, not the content), never an error.
+# ---------------------------------------------------------------------------
+
+suite "config — remote-cache http/https trust rules (SEC1)":
+
+  test "http:// with no cache-trust block (policy none) -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "mirror" {
+    url "http://cache.example.com/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "http:// with explicit verify-trust #false under a verifying policy -> cekConfig":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+}
+remote-cache "mirror" {
+    url "http://cache.example.com/crisol"
+    verify-trust #false
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+  test "http:// under a verifying cache-trust policy -> accepted":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+}
+remote-cache "mirror" {
+    url "http://cache.example.com/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, warns) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    check warns.len == 0
+
+  test "https:// with no cache-trust block (policy none) -> accepted, with a warning":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+remote-cache "mirror" {
+    url "https://cache.example.com/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, warns) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    check warns.len == 1
+    check warns[0].context == "remote-cache mirror"
+    check "fully trusted" in warns[0].message
+    check "TLS authenticates the channel" in warns[0].message
+
+  test "https:// under a verifying cache-trust policy -> accepted, no warning":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+cache-trust {
+    policy "hmac"
+}
+remote-cache "mirror" {
+    url "https://cache.example.com/crisol"
+}
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, warns) = loadConfig(configPath = cfgPath)
+    check cfg.cache.remotes.len == 1
+    check warns.len == 0
+
+  # Note: an explicit `verify-trust #true` on an https:// tier under
+  # `policy "none"` is the pre-existing, SEPARATE configuredCache-only
+  # rejection (see the s3 suite's own trailing note above) -- the SEC1
+  # warning above fires only for the DEFAULT (absent verify-trust)
+  # resolution of an https:// tier under "none".
 
 # ---------------------------------------------------------------------------
 # RFC-0005 C4 — cache-trust block parse

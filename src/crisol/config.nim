@@ -590,7 +590,7 @@ proc parseReuseCheck(n: KdlNode; source: string;
 # Validate a completed Config
 # ---------------------------------------------------------------------------
 
-proc validate(cfg: Config) =
+proc validate(cfg: Config; source: string; warns: var seq[ConfigWarning]) =
   var seen: seq[string]
   for g in cfg.groups:
     if g.name in seen:
@@ -611,6 +611,11 @@ proc validate(cfg: Config) =
     # unsigned-s3 adapter is used"). The effective per-tier verify-trust
     # mirrors `cacheregistry.configuredCache`'s own resolution rule
     # (explicit override wins; absent -> cache-trust.policy != "none").
+    # **Authority note (SEC5):** this is the CLI-facing plan-time error;
+    # `cacheregistry.configuredCache` carries the SAME rejection (defense
+    # in depth) so a programmatic `CacheConfig` caller that never goes
+    # through KDL cannot bypass it either -- the two are independent, not
+    # one delegating to the other.
     if t.url.startsWith("s3://"):
       let effectiveVerifyTrust = t.verifyTrust.get(cacheVerifies)
       if not effectiveVerifyTrust:
@@ -618,6 +623,36 @@ proc validate(cfg: Config) =
                "verifying 'cache-trust' policy (policy != \"none\", and no explicit " &
                "'verify-trust #false' on this tier) -- unsigned S3/MinIO has no " &
                "transport-level write authorization")
+    # SEC1: an unkeyed FNV-1a-64 checksum (the only integrity guard a
+    # `none`-policy tier has) is trivially attacker-computable -- exactly
+    # the read-side spoofing/MITM exposure the s3 rule above closes for
+    # writes. Symmetric rule, same rationale style: `http://` (no
+    # transport authentication at all) under a non-verifying effective
+    # trust is a hard config error. `https://` is NOT rejected here — TLS
+    # authenticates the CHANNEL (the bytes really came from that server),
+    # it just doesn't make the SERVER trustworthy about cache *content*
+    # under `policy "none"` — so that combination is a warning, not an
+    # error (below), and the authority note above applies here too:
+    # `configuredCache` carries the same http:// rejection independently.
+    if t.url.startsWith("http://"):
+      let effectiveVerifyTrust = t.verifyTrust.get(cacheVerifies)
+      if not effectiveVerifyTrust:
+        cfgErr("config: remote-cache '" & t.name & "': unsigned http:// requires a " &
+               "verifying 'cache-trust' policy (policy != \"none\", and no explicit " &
+               "'verify-trust #false' on this tier) -- an unkeyed FNV-1a-64 checksum " &
+               "is attacker-computable and a 'none' trust policy serves anything " &
+               "requested of it (read-side spoofing/MITM)")
+    elif t.url.startsWith("https://"):
+      let effectiveVerifyTrust = t.verifyTrust.get(cacheVerifies)
+      if not effectiveVerifyTrust:
+        warns.add ConfigWarning(
+          source:  source,
+          context: "remote-cache " & t.name,
+          key:     "verify-trust",
+          message: "remote-cache '" & t.name & "': cache-trust policy is \"none\" -- " &
+                   "the https:// server operator at '" & t.url & "' is fully trusted " &
+                   "(TLS authenticates the channel, not the content)",
+        )
   if cfg.timeoutSecs < 0:
     cfgErr("config: timeout-secs must be >= 0")
   if cfg.compileTimeoutSecs < 0:
@@ -859,7 +894,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).
   )
-  validate(result)
+  validate(result, source, warns)
 
 # ---------------------------------------------------------------------------
 # parseConfigFile — read + parse a crisol.kdl path → Config

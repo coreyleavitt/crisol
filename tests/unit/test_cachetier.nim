@@ -1482,6 +1482,187 @@ block test_configured_cache_wires_hmac_policy_end_to_end:
   assert l.hit.get.tier == "l1"
 
 # ---------------------------------------------------------------------------
+# SEC5: configuredCache duplicates the unsigned-s3 / unsigned-http rejection
+# `config.validate` already carries (defense in depth for a programmatic
+# `CacheConfig` caller that never goes through KDL parsing).
+# ---------------------------------------------------------------------------
+
+block test_configured_cache_rejects_unsigned_s3_without_verifying_policy:
+  let sd = freshStateDir14("sec5_s3_unsigned")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "team-s3", url: "s3://ci-cache/crisol")])
+    # trust left at its default: policy "none"
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "unsigned s3:// with no verifying cache-trust policy must be a config " &
+                 "error at configuredCache too, not only config.validate"
+
+# ---------------------------------------------------------------------------
+# SEC1: an http:// tier under a non-verifying effective trust is a hard
+# config error, symmetric with the unsigned-s3 rule above -- an unkeyed
+# FNV-1a-64 checksum is attacker-computable and a "none" policy serves
+# anything. https:// is not rejected (config.nim's `validate` emits the
+# "server operator fully trusted" ConfigWarning instead; configuredCache has
+# no ConfigWarning sink to route through, so only the hard-error half is
+# duplicated here).
+# ---------------------------------------------------------------------------
+
+block test_configured_cache_rejects_unsigned_http_without_verifying_policy:
+  let sd = freshStateDir14("sec1_http_unsigned")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "http://cache.example.com/crisol")])
+    # trust left at its default: policy "none"
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "unsigned http:// with no verifying cache-trust policy must be a config error"
+
+block test_configured_cache_accepts_http_under_a_verifying_policy:
+  let sd = freshStateDir14("sec1_http_verifying")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "http://cache.example.com/crisol")],
+    trust:   TrustConfig(policy: "hmac", keyId: "ci"),
+  )
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           secrets = CacheSecrets(hmacKey: some("s3cr3t")),
+                           sink = NilSink[TelemetryEvent]())
+  assert rt.cache.tiers.len == 2
+  assert rt.cache.tiers[1].name == "mirror"
+
+# ---------------------------------------------------------------------------
+# SEC2: a resolvable bearer token for a plaintext http:// tier is a hard
+# error (a write credential must never travel cleartext) -- fires for BOTH
+# the per-tier ($CRISOL_CACHE_TOKEN_<TIER>) and the generic (bare
+# $CRISOL_CACHE_TOKEN) forms; error text names the tier, never the token.
+# ---------------------------------------------------------------------------
+
+block test_configured_cache_rejects_http_tier_with_a_per_tier_token:
+  let sd = freshStateDir14("sec2_http_token_pertier")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "http://cache.example.com/crisol")],
+    trust:   TrustConfig(policy: "hmac", keyId: "ci"),  # verifying, so SEC1 doesn't fire first
+  )
+  let secrets = CacheSecrets(hmacKey: some("s3cr3t"), httpTokens: {"MIRROR": "sekrit"}.toTable)
+  var caught = false
+  var msg = ""
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = secrets, sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+    msg = e.msg
+  assert caught, "a resolvable per-tier bearer token for a plaintext http:// tier must be " &
+                 "a config error"
+  assert "mirror" in msg
+  assert "CRISOL_CACHE_TOKEN" in msg
+  assert "sekrit" notin msg, "the token VALUE must never appear in the error message"
+
+block test_configured_cache_rejects_http_tier_with_the_bare_token:
+  let sd = freshStateDir14("sec2_http_token_bare")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "http://cache.example.com/crisol")],
+    trust:   TrustConfig(policy: "hmac", keyId: "ci"),
+  )
+  let secrets = CacheSecrets(hmacKey: some("s3cr3t"), defaultHttpToken: some("bare-sekrit"))
+  var caught = false
+  var msg = ""
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = secrets, sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+    msg = e.msg
+  assert caught, "a resolvable bare bearer token for a plaintext http:// tier must be " &
+                 "a config error too"
+  assert "bare-sekrit" notin msg, "the token VALUE must never appear in the error message"
+
+block test_configured_cache_accepts_http_tier_with_no_token_under_a_verifying_policy:
+  # SEC2's check stacks on top of SEC1: an http:// tier only survives at
+  # all under a verifying cache-trust policy (SEC1); given that, an ABSENT
+  # token is fine (SEC2 has nothing to reject).
+  let sd = freshStateDir14("sec2_http_notoken")
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "http://cache.example.com/crisol")],
+    trust:   TrustConfig(policy: "hmac", keyId: "ci"),
+  )
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           secrets = CacheSecrets(hmacKey: some("s3cr3t")),
+                           sink = NilSink[TelemetryEvent]())
+  assert rt.cache.tiers.len == 2
+  assert rt.cache.tiers[1].name == "mirror"
+
+# https tier + token -> fine is already exercised end-to-end (with a real
+# Authorization header assertion) by
+# test_configured_cache_wires_http_remote_with_per_tier_token and
+# test_configured_cache_falls_back_to_bare_token_when_no_tier_suffix_set
+# above -- both configure an https:// RemoteTier with a resolvable token
+# and observe a successful, unrejected request.
+
+# ---------------------------------------------------------------------------
+# SO6/T9: a PRESENT-but-malformed $CRISOL_CACHE_SIGN_KEY (bad base64, or a
+# decoded length != 32) is a hard config error -- it must never silently
+# degrade `ed25519Policy` to verify-only (every `put` would then be a
+# silent `cvUnauthorized` no-op). An ABSENT key stays the legitimate
+# verify-only case, already pinned by
+# test_configured_cache_wires_ed25519_policy_end_to_end above (its
+# `rtVerifyOnly` half, built from a bare `CacheSecrets()`).
+# ---------------------------------------------------------------------------
+
+block test_configured_cache_rejects_malformed_base64_sign_key:
+  let sd = freshStateDir14("so6_seed_badbase64")
+  let remoteRoot = freshLocalFsRoot("configuredcache_so6_seed_badbase64")
+  let seedBytes: array[32, byte] = [
+    byte 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6,
+    7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2]
+  let pubKeyB64 = base64.encode(toBytes(keypair(toSeed(seedBytes)).public))
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+    trust:   TrustConfig(policy: "ed25519", pinnedKeys: @[pubKeyB64]),
+  )
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(signSeedB64: "not-valid-base64!!!"),
+                            sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a present but non-base64 $CRISOL_CACHE_SIGN_KEY must be a config error"
+
+block test_configured_cache_rejects_wrong_length_sign_key:
+  let sd = freshStateDir14("so6_seed_wronglen")
+  let remoteRoot = freshLocalFsRoot("configuredcache_so6_seed_wronglen")
+  let seedBytes: array[32, byte] = [
+    byte 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6,
+    7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2]
+  let pubKeyB64 = base64.encode(toBytes(keypair(toSeed(seedBytes)).public))
+  let cfg = CacheConfig(
+    remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+    trust:   TrustConfig(policy: "ed25519", pinnedKeys: @[pubKeyB64]),
+  )
+  # Valid base64, but only 5 decoded bytes -- not the required 32-byte seed.
+  let shortSeedB64 = base64.encode("short")
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(signSeedB64: shortSeedB64),
+                            sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a base64-valid but wrong-decoded-length $CRISOL_CACHE_SIGN_KEY must be " &
+                 "a config error"
+
+# ---------------------------------------------------------------------------
 # 15. RFC-0005 C3c (prefetch): resolveProbes + lookup's probe-set consult.
 # ---------------------------------------------------------------------------
 
