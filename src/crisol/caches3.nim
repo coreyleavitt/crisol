@@ -6,9 +6,14 @@
 ## "Initial S3 = unsigned/MinIO path-style (no SigV4). Authenticated S3 via
 ## SigV4 is a follow-on"). Import-pure like the other adapters (RFC-0005
 ## "Module layout": "one adapter each" importing only `cacheport`/
-## `cachewire`) — this module does NOT import `cachehttp.nim`; the shared
-## status-mapping logic is duplicated here (see below) rather than
-## extracted, matching the RFC's stated module boundary.
+## `cachewire`) — this module does NOT import `cachehttp.nim`. The
+## HTTP-status -> `CacheVerdict` mapping IS shared with `cachehttp.nim`
+## (`cachewire.httpStatusVerdict`/`isRedirectStatus`) rather than duplicated:
+## that mapping is pure status POLICY, not transport knowledge, so the RFC's
+## "one adapter per file" boundary (which is about transport knowledge —
+## sockets, URL layout, XML parsing — never about this table) does not
+## require copying it per-adapter; both adapters already import
+## `cachewire.nim` for `CacheSerializer`/`HttpFetcher`.
 ##
 ## No credential axis at all: unsigned means no SigV4 AND no bearer token —
 ## `Authorization` is never sent, unlike `cachehttp.nim`'s optional token
@@ -32,7 +37,8 @@
 ##
 ## ## Status table
 ##
-## IDENTICAL to `cachehttp.nim`'s pinned table (see there for the full
+## IDENTICAL to `cachehttp.nim`'s pinned table, via the SAME shared
+## `cachewire.httpStatusVerdict` mapping (see `cachewire.nim` for the full
 ## per-code rationale) — GET: 200 -> decode; 404/410 -> cvMiss (S3
 ## NoSuchKey); 401/403 -> cvUnauthorized (S3 AccessDenied-class); 408/429/5xx
 ## -> cvOffline; 3xx -> cvOffline + one-time stderr hint; 2xx wrong
@@ -199,28 +205,13 @@ proc extractKeys(xml: string): seq[string] =
 
 # ---------------------------------------------------------------------------
 # Status mapping — IDENTICAL to `cachehttp.nim`'s pinned table (RFC-0005
-# "Adapters", round 3: "s3 (same contract...)"). Duplicated, not imported
-# (see module doc comment) — see `cachehttp.nim` for the full rationale
-# behind each unpinned-status fallback; the same reasoning applies verbatim
-# here.
+# "Adapters", round 3: "s3 (same contract...)"). Shared via
+# `cachewire.httpStatusVerdict`/`isRedirectStatus` (this pure status POLICY
+# carries no transport knowledge, so it does not belong to either adapter
+# individually — see `cachewire.nim`'s module doc comment for the full
+# rationale behind each unpinned-status fallback; the same reasoning applies
+# verbatim here since S3's REST surface reuses plain HTTP status semantics).
 # ---------------------------------------------------------------------------
-
-proc isRedirect(status: int): bool = status >= 300 and status <= 399
-proc isServerBusy(status: int): bool =
-  status == 408 or status == 429 or (status >= 500 and status <= 599)
-
-proc getVerdictForUnhandledStatus(status: int): CacheVerdict =
-  if status == 404 or status == 410: cvMiss        # S3: NoSuchKey
-  elif status == 401 or status == 403: cvUnauthorized  # S3: AccessDenied-class
-  elif isServerBusy(status): cvOffline
-  else: cvCorrupt  # unpinned -- documented fallback, same as cachehttp.nim
-
-proc putVerdictForUnhandledStatus(status: int): CacheVerdict =
-  if status == 409 or status == 412: cvUnauthorized  # best-effort non-ok, first-writer-wins
-  elif status == 413: cvCorrupt
-  elif status == 401 or status == 403: cvUnauthorized
-  elif isServerBusy(status): cvOffline
-  else: cvUnauthorized  # unpinned -- generic "write did not land" bucket
 
 proc headerValue(headers: seq[(string, string)]; name: string): string =
   for (k, v) in headers:
@@ -265,11 +256,11 @@ proc s3Backend*(fetcher: HttpFetcher; bucket: string; prefix: string = "";
         e.key = key
         return Fetched[StoredEntry](verdict: cvOk, value: e)
 
-      if isRedirect(reply.status):
+      if isRedirectStatus(reply.status):
         warnRedirectOnce()
         return Fetched[StoredEntry](verdict: cvOffline)
 
-      Fetched[StoredEntry](verdict: getVerdictForUnhandledStatus(reply.status))
+      Fetched[StoredEntry](verdict: httpStatusVerdict(reply.status, forGet = true))
     ,
     put: proc(entry: StoredEntry): CacheVerdict =
       let body = jsonCacheSerializer().encode(entry)
@@ -293,11 +284,11 @@ proc s3Backend*(fetcher: HttpFetcher; bucket: string; prefix: string = "";
       if reply.status >= 200 and reply.status <= 299:
         return cvOk
 
-      if isRedirect(reply.status):
+      if isRedirectStatus(reply.status):
         warnRedirectOnce()
         return cvOffline
 
-      putVerdictForUnhandledStatus(reply.status)
+      httpStatusVerdict(reply.status, forGet = false)
     ,
     probe: proc(keys: openArray[SoundnessKey]): Fetched[HashSet[SoundnessKey]] =
       let req = HttpRequest(meth: "GET",
@@ -339,10 +330,10 @@ proc s3Backend*(fetcher: HttpFetcher; bucket: string; prefix: string = "";
               present.incl bare
         return Fetched[HashSet[SoundnessKey]](verdict: cvOk, value: present)
 
-      if isRedirect(reply.status):
+      if isRedirectStatus(reply.status):
         warnRedirectOnce()
         return Fetched[HashSet[SoundnessKey]](verdict: cvOffline)
 
-      Fetched[HashSet[SoundnessKey]](verdict: getVerdictForUnhandledStatus(reply.status))
+      Fetched[HashSet[SoundnessKey]](verdict: httpStatusVerdict(reply.status, forGet = true))
     ,
   )

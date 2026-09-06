@@ -19,6 +19,12 @@
 ##       most-recent; pruning bound drops the oldest-touched flagHash;
 ##       mostRecentRecord returns the globally most-recent record regardless
 ##       of its own flagHash; malformed sidecar JSON shapes -> none.
+##   12. httpStatusVerdict/isRedirectStatus (RFC-0005 "Adapters", round 3
+##       pinned status table — the mapping SHARED by `cachehttp.nim` and
+##       `caches3.nim`, pinned once here at its owning module rather than
+##       per-adapter): every GET row (404/410/401/403/408/429/5xx/3xx/
+##       unpinned) and every PUT row (2xx/409/412/413, plus the rows shared
+##       with GET) named in the module doc comment above `httpStatusVerdict`.
 
 import std/[json, options, strutils, tables]
 import crisol/types
@@ -382,5 +388,62 @@ block test_sidecar_from_json_malformed_shapes:
   dangling["order"] = orderArr
   dangling["records"] = newJObject()
   assert sidecarFromJson(dangling).isNone
+
+# ---------------------------------------------------------------------------
+# httpStatusVerdict / isRedirectStatus (RFC-0005 "Adapters", round 3 pinned
+# status table) — the ONE shared home for the mapping `cachehttp.nim` and
+# `caches3.nim` both call into. Pinned here, distinctly per row, so the two
+# adapters' own tests (which exercise the SAME rows end-to-end through a
+# fake HTTP fetcher) can never silently drift from this policy.
+# ---------------------------------------------------------------------------
+
+block test_http_status_verdict_get_404_410_are_miss:
+  for status in [404, 410]:
+    assert httpStatusVerdict(status, forGet = true) == cvMiss,
+      "GET " & $status & " -> cvMiss"
+
+block test_http_status_verdict_get_401_403_are_unauthorized:
+  for status in [401, 403]:
+    assert httpStatusVerdict(status, forGet = true) == cvUnauthorized,
+      "GET " & $status & " -> cvUnauthorized"
+
+block test_http_status_verdict_get_408_429_5xx_are_offline:
+  for status in [408, 429, 500, 503, 599]:
+    assert httpStatusVerdict(status, forGet = true) == cvOffline,
+      "GET " & $status & " -> cvOffline"
+
+block test_http_status_verdict_get_unpinned_is_corrupt:
+  for status in [400, 405, 100]:
+    assert httpStatusVerdict(status, forGet = true) == cvCorrupt,
+      "GET unpinned " & $status & " -> cvCorrupt"
+
+block test_http_status_verdict_put_409_412_are_unauthorized:
+  for status in [409, 412]:
+    assert httpStatusVerdict(status, forGet = false) == cvUnauthorized,
+      "PUT " & $status & " -> cvUnauthorized"
+
+block test_http_status_verdict_put_413_is_corrupt:
+  assert httpStatusVerdict(413, forGet = false) == cvCorrupt
+
+block test_http_status_verdict_put_401_403_are_unauthorized:
+  for status in [401, 403]:
+    assert httpStatusVerdict(status, forGet = false) == cvUnauthorized,
+      "PUT " & $status & " -> cvUnauthorized"
+
+block test_http_status_verdict_put_408_429_5xx_are_offline:
+  for status in [408, 429, 500, 599]:
+    assert httpStatusVerdict(status, forGet = false) == cvOffline,
+      "PUT " & $status & " -> cvOffline"
+
+block test_http_status_verdict_put_unpinned_is_unauthorized:
+  for status in [400, 405, 100]:
+    assert httpStatusVerdict(status, forGet = false) == cvUnauthorized,
+      "PUT unpinned " & $status & " -> cvUnauthorized"
+
+block test_is_redirect_status:
+  for status in [300, 301, 302, 307, 399]:
+    assert isRedirectStatus(status), $status & " must be a redirect"
+  for status in [200, 299, 400, 500]:
+    assert not isRedirectStatus(status), $status & " must not be a redirect"
 
 echo "test_cachewire: all blocks passed"

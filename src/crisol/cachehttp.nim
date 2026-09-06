@@ -14,36 +14,22 @@
 ##
 ## ## The pinned status table (RFC-0005 "Adapters", round 3)
 ##
-## GET: `200` -> decode; `404`/`410` -> `cvMiss`; `401`/`403` ->
-## `cvUnauthorized`; `408`/`429`/`5xx` -> `cvOffline` (transient, trips the
-## caller's circuit breaker); `3xx` -> `cvOffline` + a ONE-TIME stderr hint
+## GET: `200` -> decode; `3xx` -> `cvOffline` + a ONE-TIME stderr hint
 ## ("remote redirected; use the final URL") — no redirect is ever followed.
 ## Any `2xx` with the wrong `Content-Type`, an oversized body (over the
 ## configured cap), or an undecodable/version-skewed body -> `cvCorrupt`
 ## (the last case propagated verbatim from `CacheSerializer.decode`, which
-## already distinguishes `cvCorrupt` from `cvVersionSkew`).
+## already distinguishes `cvCorrupt` from `cvVersionSkew`). Every other
+## status (`404`/`410`/`401`/`403`/`408`/`429`/`5xx`/unpinned) is resolved by
+## `cachewire.httpStatusVerdict` — see there for the full per-code rationale,
+## including the unpinned-status judgment call; this module owns only the
+## `2xx`/`3xx` cases, which need the response body / a one-time side effect
+## respectively.
 ##
-## **Judgment call (unpinned status, e.g. `400`/`405`/`1xx`):** the RFC's
-## table does not name every possible status. Total-function coverage
-## still requires ONE typed outcome. `cvCorrupt` — "this response is not
-## something the adapter understands or trusts" — is the closest existing
-## bucket: it is not a miss (something WAS returned), not an auth problem,
-## and, critically, it must NOT be `cvOffline`/`cvTimeout` (those trip the
-## per-tier circuit breaker for the rest of the run over what is, for an
-## unpinned code, more likely a server-side protocol mismatch than a
-## transient outage).
-##
-## PUT: `2xx` -> `cvOk`; `409`/`412` -> `cvUnauthorized` (the RFC's own
-## "best-effort non-ok, first publisher wins" bucket — reusing
-## `cvUnauthorized` as the generic "the write did not land" verdict is the
-## SAME precedent `cachelocalfs.nim` documents for its own non-reachability
-## write failures); `413` -> `cvCorrupt` (the entry, as sent, is unusable to
-## the server); `401`/`403` -> `cvUnauthorized`; `408`/`429`/`5xx` -> `cvOffline`;
-## `3xx` -> `cvOffline` + the same one-time hint. **Judgment call:** an
-## unpinned PUT status also falls to `cvUnauthorized` — the generic
-## write-did-not-land bucket — rather than `cvCorrupt`, since (unlike GET) a
-## non-2xx PUT response carries no body the adapter needs to trust; the
-## write simply did not succeed, for a reason the table does not name.
+## PUT: `2xx` -> `cvOk`; `3xx` -> `cvOffline` + the same one-time hint.
+## Every other status (`409`/`412`/`413`/`401`/`403`/`408`/`429`/`5xx`/
+## unpinned) is resolved by `cachewire.httpStatusVerdict(forGet = false)` —
+## see there for the full rationale.
 ##
 ## A **put pre-check** (RFC-0005 "Adapters": "a `put` pre-check skips
 ## entries over the body cap") never even calls the fetcher for an entry
@@ -84,27 +70,6 @@ proc headerValue(headers: seq[(string, string)]; name: string): string =
     if cmpIgnoreCase(k, name) == 0: return v
   ""
 
-proc isRedirect(status: int): bool = status >= 300 and status <= 399
-proc isServerBusy(status: int): bool =
-  status == 408 or status == 429 or (status >= 500 and status <= 599)
-
-proc getVerdictForUnhandledStatus(status: int): CacheVerdict =
-  ## The pinned GET buckets that do not need the response body, PLUS the
-  ## unpinned-status fallback (see module doc comment above). Callers
-  ## handle `2xx` and `3xx` themselves (2xx needs the body; 3xx needs the
-  ## one-time-warning side effect) before falling back here.
-  if status == 404 or status == 410: cvMiss
-  elif status == 401 or status == 403: cvUnauthorized
-  elif isServerBusy(status): cvOffline
-  else: cvCorrupt  # unpinned -- documented fallback
-
-proc putVerdictForUnhandledStatus(status: int): CacheVerdict =
-  if status == 409 or status == 412: cvUnauthorized  # best-effort non-ok, first-writer-wins
-  elif status == 413: cvCorrupt
-  elif status == 401 or status == 403: cvUnauthorized
-  elif isServerBusy(status): cvOffline
-  else: cvUnauthorized  # unpinned -- generic "write did not land" bucket
-
 proc httpBackend*(fetcher: HttpFetcher; base: string; token: string = "";
                   bodyCapBytes: int = DefaultBodyCapBytes): CacheBackend =
   var redirectWarned = false
@@ -141,11 +106,11 @@ proc httpBackend*(fetcher: HttpFetcher; base: string; token: string = "";
         e.key = key
         return Fetched[StoredEntry](verdict: cvOk, value: e)
 
-      if isRedirect(reply.status):
+      if isRedirectStatus(reply.status):
         warnRedirectOnce()
         return Fetched[StoredEntry](verdict: cvOffline)
 
-      Fetched[StoredEntry](verdict: getVerdictForUnhandledStatus(reply.status))
+      Fetched[StoredEntry](verdict: httpStatusVerdict(reply.status, forGet = true))
     ,
     put: proc(entry: StoredEntry): CacheVerdict =
       let body = jsonCacheSerializer().encode(entry)
@@ -170,11 +135,11 @@ proc httpBackend*(fetcher: HttpFetcher; base: string; token: string = "";
       if reply.status >= 200 and reply.status <= 299:
         return cvOk
 
-      if isRedirect(reply.status):
+      if isRedirectStatus(reply.status):
         warnRedirectOnce()
         return cvOffline
 
-      putVerdictForUnhandledStatus(reply.status)
+      httpStatusVerdict(reply.status, forGet = false)
     ,
     # No standard bulk-existence op over plain HTTP (RFC-0005 "Adapters":
     # "http has no standard bulk-existence so probe = nil").

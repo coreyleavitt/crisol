@@ -127,6 +127,67 @@ type
     ## tests wire a pure in-memory fake server. NEVER raises, by contract.
 
 # ---------------------------------------------------------------------------
+# HTTP-status -> CacheVerdict mapping (RFC-0005 "Adapters", round 3 pinned
+# table) — shared by every `HttpFetcher`-based adapter (`cachehttp.nim`'s
+# `http` backend, `caches3.nim`'s unsigned/path-style `s3` backend): both map
+# the exact same status codes to the exact same verdicts (S3's REST surface
+# reuses plain HTTP status semantics verbatim — 404/410 is `NoSuchKey`,
+# 401/403 is `AccessDenied`-class, etc.), so this is pure status POLICY, not
+# transport knowledge. It lives here, alongside `HttpFetcher` itself, rather
+# than in either adapter: the RFC's "one adapter per file" module boundary
+# (`cachehttp.nim`/`caches3.nim` importing only `cacheport`/`cachewire`) is
+# about TRANSPORT knowledge (sockets, XML parsing, URL layout) — this table
+# has none of that, so duplicating it per-adapter bought nothing but drift
+# risk. Both adapters import this module already (for `CacheSerializer`/
+# `HttpFetcher`), so calling into it here adds no new coupling.
+# ---------------------------------------------------------------------------
+
+proc isRedirectStatus*(status: int): bool =
+  status >= 300 and status <= 399
+
+proc isServerBusyStatus*(status: int): bool =
+  status == 408 or status == 429 or (status >= 500 and status <= 599)
+
+proc httpStatusVerdict*(status: int; forGet: bool): CacheVerdict =
+  ## The pinned non-2xx/non-3xx status table (RFC-0005 "Adapters", round 3).
+  ## Callers handle `2xx` (needs the response body) and `3xx` (needs the
+  ## one-time-warning side effect, via `isRedirectStatus`) themselves before
+  ## falling back here.
+  ##
+  ## `forGet = true` (GET): `404`/`410` -> `cvMiss`; `401`/`403` ->
+  ## `cvUnauthorized`; `408`/`429`/`5xx` -> `cvOffline` (transient, trips the
+  ## caller's circuit breaker); anything else (unpinned, e.g. `400`/`405`/
+  ## `1xx`) -> `cvCorrupt` — the closest existing bucket for "this response
+  ## is not something the adapter understands or trusts": not a miss
+  ## (something WAS returned), not an auth problem, and, critically, NOT
+  ## `cvOffline`/`cvTimeout` (an unpinned code is more likely a server-side
+  ## protocol mismatch than a transient outage, so it must not trip the
+  ## per-tier breaker).
+  ##
+  ## `forGet = false` (PUT): `409`/`412` -> `cvUnauthorized` (the RFC's own
+  ## "best-effort non-ok, first publisher wins" bucket — reusing
+  ## `cvUnauthorized` as the generic "the write did not land" verdict, the
+  ## same precedent `cachelocalfs.nim` documents for its own
+  ## non-reachability write failures); `413` -> `cvCorrupt` (the entry, as
+  ## sent, is unusable to the server); `401`/`403` -> `cvUnauthorized`;
+  ## `408`/`429`/`5xx` -> `cvOffline`; anything else (unpinned) ->
+  ## `cvUnauthorized` — the generic write-did-not-land bucket, rather than
+  ## `cvCorrupt`, since (unlike GET) a non-2xx PUT response carries no body
+  ## the adapter needs to trust; the write simply did not succeed, for a
+  ## reason the table does not name.
+  if forGet:
+    if status == 404 or status == 410: cvMiss
+    elif status == 401 or status == 403: cvUnauthorized
+    elif isServerBusyStatus(status): cvOffline
+    else: cvCorrupt  # unpinned -- documented fallback
+  else:
+    if status == 409 or status == 412: cvUnauthorized  # best-effort non-ok, first-writer-wins
+    elif status == 413: cvCorrupt
+    elif status == 401 or status == 403: cvUnauthorized
+    elif isServerBusyStatus(status): cvOffline
+    else: cvUnauthorized  # unpinned -- generic "write did not land" bucket
+
+# ---------------------------------------------------------------------------
 # Limits <-> JSON (KeyInputs' resource-limit-REQUEST component).
 # ---------------------------------------------------------------------------
 
