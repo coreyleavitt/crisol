@@ -474,6 +474,30 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
         "config: remote-cache '" & remote.name & "': the name 'l1' is " &
         "reserved for the local cache tier")
 
+    # RFC-0005 review fix (L1/T-guard): a binary compiled WITHOUT `-d:ssl`
+    # cannot dial `https://` at all -- `httpraw.rawHttpFetcher`'s `when not
+    # defined(ssl)` branch resolves every such request to `toUnreachable`
+    # before ever opening a socket (see that module's doc comment), which
+    # previously left a misconfigured https:// tier as a SILENT dead tier
+    # (latching the circuit breaker, never surfaced to the operator). Made a
+    # HARD config error here instead, at the same plan-time point every other
+    # "misconfiguration, not a silent dead tier" rejection in this proc
+    # fires -- `when defined(ssl)` makes the guard itself compile-time-aware
+    # (never reachable code in an ssl-enabled build), so this is a single
+    # `if` in a build that has TLS, and an unconditional rejection in one
+    # that doesn't. Independent of WHICH `BackendRegistry`/`HttpFetcher` is
+    # actually wired in (a test double can dial an "https://" URL just fine)
+    # -- this is a whole-BUILD capability question ("can this process ever
+    # perform a TLS handshake"), not a per-call one, so it is not delegated
+    # to `buildBackend`/the registry's own scheme resolution.
+    when not defined(ssl):
+      if remote.url.startsWith("https://"):
+        raise newCrisolError(cekConfig,
+          "config: remote-cache '" & remote.name & "': url '" & remote.url &
+          "' requires TLS, but this crisol build lacks TLS support (-d:ssl) -- " &
+          "rebuild with -d:ssl (the default for the produced binary; see " &
+          "src/crisol.nim.cfg), or point 'url' at a non-https scheme")
+
     if remote.verifyTrust == some(true) and cfg.trust.policy == "none":
       raise newCrisolError(cekConfig,
         "config: remote-cache '" & remote.name & "': 'verify-trust #true' " &

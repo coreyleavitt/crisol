@@ -59,6 +59,35 @@ jobs:
             -e CRISOL_TIER=ci-linux \
             ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh
 
+      # RFC-0005 review fix (L1): before this step, NOTHING in CI ever built
+      # the actual produced binary (`nimble build`/`nim c src/crisol.nim`) —
+      # the steps above only compile individual test files, never
+      # src/crisol.nim as a whole program — so a regression dropping
+      # `-d:ssl` back out of the default build path had no automated gate
+      # at all. `src/crisol.nim.cfg` is what now supplies `-d:ssl`
+      # automatically whenever `src/crisol.nim` is the compiled main file
+      # (`nimble build` shells out to exactly that); no explicit -d:ssl flag
+      # is passed here ON PURPOSE — this step proves the DEFAULT, not a
+      # flag someone remembered to pass. `strings` for the OpenSSL FFI
+      # symbol name is the cheapest reliable proof the TLS path was
+      # actually compiled in: Nim's `std/net` openssl wrapper dlopen's
+      # libssl at CALL time rather than link time (Dockerfile's own
+      # comment), so there is no linker-level dependency to check instead.
+      - name: Build production binary — confirm -d:ssl is the default
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            ghcr.io/coreyleavitt/nim:2.2.10 bash -c '
+              set -euo pipefail
+              nimble build -y
+              if ! strings ./crisol | grep -q SSL_connect; then
+                echo "L1 REGRESSION: the produced crisol binary has no SSL_connect symbol -- -d:ssl is no longer the default build-path define (see src/crisol.nim.cfg)" >&2
+                exit 1
+              fi
+              echo "OK: crisol binary built with -d:ssl by default (SSL_connect symbol present)"
+            '
+
   timing:
     runs-on: ubuntu-latest
     steps:

@@ -29,6 +29,7 @@ nim.cfg
 !/tests/integration/*/
 /tests/unit/*
 !/tests/unit/*.nim
+!/tests/unit/*.nim.cfg
 !/tests/unit/*/
 /tests/timing/*
 !/tests/timing/*.nim

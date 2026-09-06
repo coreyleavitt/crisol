@@ -8,6 +8,18 @@ srcDir      = "src"
 
 bin = @["crisol"]
 
+# RFC-0005 review fix (L1): `-d:ssl` is the DEFAULT for the produced
+# `crisol` binary, so an `https://` remote-cache tier actually works out of
+# the box instead of silently latching the circuit breaker. This is NOT
+# wired here (a top-level `switch("define", "ssl")` and a `before build`/
+# `before install` hook were both tried and traced with `nimble build
+# --verbose`; neither reached nimble 0.22.2's own build-command compiler
+# invocation) — it lives in `src/crisol.nim.cfg` instead, a plain Nim
+# per-mainfile config file that `nim c` (which `nimble build`/`install`
+# shell out to under the hood) loads automatically whenever `src/crisol.nim`
+# is the compiled main module. See that file's own comment for the exact
+# mechanism and its scope limits.
+
 # Dependencies
 
 requires "nim >= 2.0"

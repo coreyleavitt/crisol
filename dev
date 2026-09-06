@@ -93,6 +93,10 @@ case "${cmd}" in
         podman_run bash ci/run-tests.sh
         ;;
     build)
+        # RFC-0005 review fix (L1): -d:ssl is now the DEFAULT here, supplied
+        # by src/crisol.nim.cfg (a plain Nim per-mainfile config, loaded
+        # automatically since `nimble build` compiles src/crisol.nim as its
+        # main module) -- no extra flag needed on this line.
         podman_run nimble build
         ;;
     run)

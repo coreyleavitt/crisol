@@ -22,13 +22,19 @@
 ## - **C1b-iii (this file):** TLS under `-d:ssl` -- an `https://` request
 ##   wraps the connected socket (`std/net`'s `newContext`/
 ##   `wrapConnectedSocket`) with the SAME deadline discipline as everything
-##   else here. See "Judgment call: TLS (C1b-iii)" below. **Manual, out-of-
-##   suite verification only** (RFC-0005's own C1b bullet) -- no network
-##   test is added to the suite for this; `tools/verify_https_manual.sh` is
-##   the human-run check (real endpoint + a local self-signed-reject
-##   probe), and `tests/unit/ssl/test_https_handshake_compiles.nim` is this
-##   slice's compile-time (link/typecheck, no I/O) coverage, alongside
-##   C1a's existing `test_ssl_link.nim`.
+##   else here. See "Judgment call: TLS (C1b-iii)" below.
+##   `tests/unit/ssl/test_https_handshake_compiles.nim` is this slice's
+##   compile-time (link/typecheck, no I/O) coverage, alongside C1a's
+##   existing `test_ssl_link.nim`. **RFC-0005 review fix (T5):**
+##   certificate/hostname verification itself is now an AUTOMATED, in-suite
+##   check -- `tests/unit/ssl/test_https_reject_selfsigned.nim` drives a
+##   real handshake against a real `openssl s_server` on loopback serving a
+##   self-signed cert generated at test runtime, and asserts this file
+##   rejects it (`toUnreachable`, never a served body). Only the
+##   POSITIVE-path handshake against a REAL, publicly-trusted endpoint
+##   stays manual, out-of-suite (`tools/verify_https_manual.sh`'s remaining
+##   check) -- that needs actual outbound network access, which the suite
+##   must not depend on.
 ##
 ## ## Total-function contract
 ##

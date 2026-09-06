@@ -602,6 +602,21 @@ proc validate(cfg: Config; source: string; warns: var seq[ConfigWarning]) =
     if t.name in seenTiers:
       cfgErr("config: duplicate remote-cache name '" & t.name & "'")
     seenTiers.add t.name
+    # RFC-0005 review fix (L1/T-guard): mirrors `cacheregistry.
+    # configuredCache`'s own identical rejection (defense in depth, same
+    # "authority note" pattern as the s3/http checks below — a programmatic
+    # `CacheConfig` caller that never goes through KDL cannot bypass either
+    # copy). A binary compiled WITHOUT `-d:ssl` cannot dial `https://` at
+    # all (`httpraw.rawHttpFetcher`'s `when not defined(ssl)` branch, see
+    # that module's doc comment) — this is a HARD config error here too,
+    # not a silent dead tier discovered only once a run actually misses.
+    when not defined(ssl):
+      if t.url.startsWith("https://"):
+        cfgErr("config: remote-cache '" & t.name & "': url '" & t.url &
+               "' requires TLS, but this crisol build lacks TLS support " &
+               "(-d:ssl) -- rebuild with -d:ssl (the default for the " &
+               "produced binary; see src/crisol.nim.cfg), or point 'url' " &
+               "at a non-https scheme")
     # RFC-0005 C3a / §Secure-by-default: unsigned S3/MinIO has no
     # transport-level write authorization at all (no SigV4 -> no credential
     # is ever transmitted), so a verifying `cache-trust` policy is a HARD
