@@ -6,6 +6,94 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### Fixed — cache serve-path hardening: policy-aware recompute, an evidence re-check on read, and an attempt-gated post-compile consult (RFC-0005 code-review SO1/SO3)
+
+Two confirmed findings from the RFC-0005 build's code-review, both closed
+without adding a new `CacheDecision` variant:
+
+- **SO1 — serve-time recompute now reads the run's OWN resolved
+  `OutcomePolicy`, not a fixed unstrict default, and re-checks
+  `evidenceSatisfies` on the stored observation.** Previously
+  `lookupAtPlan`/`consultPostCompile` (via their shared `consultReal`)
+  recomputed a cache hit's outcome under `DefaultPolicy` regardless of
+  `--strict-hygiene`, so a strict-hygiene run could serve an entry it
+  would itself go on to report as failed. Worse, the read side never
+  re-ran the same named-guarantee check (`evidenceSatisfies`) the publish
+  gate (`shouldStore`) already applies — a foreign/backfilled entry
+  (`cachetier`'s populate-on-hit re-stores a fetched remote entry
+  verbatim, never through `shouldStore`) could carry an OBSERVED escapee
+  and still serve as `cdmHit` forever, even though "observed escapee ⇒
+  uncacheable" is meant to be absolute. Both are now enforced at
+  `consultReal`: a recompute under the run's resolved policy that is not
+  `oPassed`, OR a failing `evidenceSatisfies` re-check, is `cdmRecomputeMiss`
+  — the same honest "found it, but it doesn't hold up" outcome the recompute
+  rule already used. The run's resolved policy is threaded through a new
+  `CacheContext.outcomePolicy` field (default `DefaultPolicy`, so every
+  pre-existing caller is unaffected); the STORE side (`shouldStore`) stays
+  policy-unconditional, matching RFC-0007 §2's "the cache publishes
+  unstrict" rule — only serving became policy-aware.
+- **SO3 — the post-compile consult (`consultPostCompile`, RFC-0005 A2c-ii)
+  is now gated on the slot's attempt number being 1**, mirroring
+  `shouldStore`'s existing `attempt != 1 ⇒ cdmFlaky` rule on the write
+  side. `edNeverBuilt`/`edStale` retries always recompile (the
+  entrypoint's `edecision` never changes across attempts), so a retry's
+  finalize previously re-ran the SAME post-compile consult every attempt
+  — a pass published to the same key by another host between attempts
+  could serve a `fkCacheHit` and silently mask a genuine local failure
+  (reporting `attempts=0`, no ledger row, `flaky()` structurally false).
+  On attempt > 1 the consult is now skipped entirely; the compile always
+  falls through to a real run.
+
+### BREAKING CHANGE — secure-by-default cache config: unsigned `http://` and cleartext bearer tokens now rejected; a malformed cache-trust sign key is now a config error
+
+Four RFC-0005 security-review findings, closed as hard config-time
+rejections (never a silent downgrade):
+
+- **Unsigned `http://` remote-cache tiers now require a verifying
+  `cache-trust` policy**, symmetric with the existing unsigned-`s3://`
+  rule: an `http://` tier whose effective `verify-trust` resolves `false`
+  (policy `"none"`, or an explicit `verify-trust #false`) is a config
+  error — an unkeyed FNV-1a-64 checksum is attacker-computable and a
+  `"none"` trust policy serves anything requested of it (read-side
+  spoofing/MITM). `https://` under policy `"none"` is unaffected —
+  **not** an error, but now emits a one-line config warning: TLS
+  authenticates the channel, not the content, so the server operator is
+  fully trusted. Both rejections are enforced in `config.validate` (the
+  KDL-facing error) **and independently** in `cacheregistry.
+  configuredCache`, so a programmatic `CacheConfig` built by an embedder
+  cannot bypass either check by skipping KDL parsing — this closes the
+  same gap for the pre-existing unsigned-`s3://` rule, which previously
+  lived in `config.validate` only.
+- **A resolvable bearer token for a plaintext `http://` tier is now a
+  config error.** `$CRISOL_CACHE_TOKEN` / `$CRISOL_CACHE_TOKEN_<TIER>` are
+  write credentials; sending one in cleartext is rejected outright,
+  before any request is made. `https://` tiers are unaffected. The error
+  names the tier and the env var shape, never the token value.
+- **A present-but-malformed `$CRISOL_CACHE_SIGN_KEY` (invalid base64, or a
+  decoded length other than 32 bytes) is now a config error**, instead of
+  silently degrading the configured `ed25519` policy to verify-only —
+  previously every subsequent `put` became a silent `cvUnauthorized`
+  no-op with no diagnostic. An *absent* key is unchanged: a genuine
+  verify-only (read-only) participant remains a legitimate deployment.
+
+### Fixed — `httpraw.nim`: a present-but-invalid `Content-Length` is now a transport error, never a served body
+
+A response header `Content-Length: -1` parsed via `parseInt` and collided,
+by VALUE, with the `-1` sentinel `readResponse` used internally to mean
+"header absent" — silently reclassifying malformed framing as an
+EOF-delimited body read to completion instead of the transport failure it
+actually is. The same collision let an overflowing (`Content-Length:
+99999999999999999999`) or garbage (`Content-Length: abc`) value fall
+through the same way, since `parseInt`'s `ValueError` was caught and mapped
+back onto that same `-1`.
+
+`readResponse` now decides "bounded vs. EOF-delimited" from a structural
+`hasContentLength` flag — never from comparing the parsed value against a
+sentinel — and a present-but-not-a-valid-non-negative-integer header
+(negative, overflowing, or garbage) now returns `toUnreachable` before any
+body is read, the same classification already used for a connection that
+closes before a validly-declared `Content-Length` is fully delivered.
+
 ### BREAKING CHANGE — run/v1 → run/v2 on the wire; the library result model rebuilt on the process contract (rfc-0007 Stage A, 2026-09-03)
 
 Stage A of RFC-0007 replaces crisol's stored, advisory result fields with
