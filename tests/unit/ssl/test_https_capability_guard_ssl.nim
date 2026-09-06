@@ -1,5 +1,5 @@
 ## test_https_capability_guard_ssl.nim — RFC-0005 review fix (L1/T-guard):
-## the SSL-side counterpart of tests/integration/test_https_capability_guard.nim
+## the SSL-side counterpart of tests/unit/test_https_capability_guard.nim
 ## — proves that under `-d:ssl` (this directory's own config.nims scopes the
 ## define here, same convention as test_ssl_link.nim/
 ## test_https_handshake_compiles.nim), configuring an `https://` remote-cache

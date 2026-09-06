@@ -26,6 +26,11 @@
 ##      unit test has no socket or deadline at all, so a real hang is not
 ##      even possible; the assertion that matters is the CAP itself firing
 ##      before the accumulator grows without bound).
+##   4. `classifyContentLength` (R2-SEC-A): presence is the header NAME
+##      appearing, independent of value emptiness -- a present-but-empty
+##      or whitespace-only `Content-Length` classifies as present-and-
+##      invalid (readResponse's `toUnreachable` branch), never as the
+##      genuinely-absent/EOF-delimited case.
 
 import std/strutils
 import crisol/httpraw
@@ -109,5 +114,50 @@ block test_header_block_cap_fires_without_terminator:
   # exactly, +1 more (whose result the NEXT loop iteration's check catches).
   assert callCount <= (MaxHeaderBytes div chunk.len) + 1,
     "must stop reading at the cap, not keep calling the reader past it"
+
+# ---------------------------------------------------------------------------
+# 4. classifyContentLength: presence must key on the header NAME appearing,
+#    never on the (stripped) value being non-empty (R2-SEC-A).
+# ---------------------------------------------------------------------------
+
+block test_content_length_present_but_empty_value_is_invalid_not_absent:
+  # "Content-Length:" with nothing after the colon -- parseStatusAndHeaders
+  # strips it to "". Must classify present-and-invalid, never absent.
+  let (ok, _, headers) = parseStatusAndHeaders(
+    "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n")
+  assert ok
+  let (present, valid, _) = classifyContentLength(headers)
+  assert present, "the header NAME appeared -- must never be classified absent"
+  assert not valid, "an empty value is malformed framing, not a valid length"
+
+block test_content_length_present_but_whitespace_only_is_invalid_not_absent:
+  # "Content-Length:   " -- whitespace-only value, also stripped to "" by
+  # parseStatusAndHeaders. Same malformed-framing classification as the
+  # flatly-empty case above, not the EOF-delimited "absent" path.
+  let (ok, _, headers) = parseStatusAndHeaders(
+    "HTTP/1.1 200 OK\r\nContent-Length:   \r\n\r\n")
+  assert ok
+  let (present, valid, _) = classifyContentLength(headers)
+  assert present, "the header NAME appeared -- must never be classified absent"
+  assert not valid, "a whitespace-only value is malformed framing, not a valid length"
+
+block test_content_length_genuinely_absent_stays_absent:
+  # No Content-Length header at all -- the ONLY case that may take the
+  # EOF-delimited path. Pinned so the R2-SEC-A fix cannot regress this.
+  let (ok, _, headers) = parseStatusAndHeaders(
+    "HTTP/1.1 204 No Content\r\nX-Other: yes\r\n\r\n")
+  assert ok
+  let (present, valid, _) = classifyContentLength(headers)
+  assert not present, "no Content-Length header was sent at all"
+  assert valid, "an absent header must not be flagged invalid"
+
+block test_content_length_present_and_valid:
+  let (ok, _, headers) = parseStatusAndHeaders(
+    "HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n")
+  assert ok
+  let (present, valid, length) = classifyContentLength(headers)
+  assert present
+  assert valid
+  assert length == 42
 
 echo "test_httpraw_parser: all blocks passed"

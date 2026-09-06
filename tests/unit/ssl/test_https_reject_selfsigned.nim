@@ -109,7 +109,10 @@ suite "T5 -- httpraw rejects a self-signed TLS certificate (automated, in-suite)
 
     let port = freePort()
     var server = startProcess("openssl",
-      args = @["s_server", "-quiet", "-accept", $port.int,
+      # R2-SEC-B: bind loopback ONLY (OpenSSL 3.x accepts "host:port" here)
+      # -- a bare port number binds 0.0.0.0, exposing this throwaway
+      # self-signed server to the whole network for the life of the test.
+      args = @["s_server", "-quiet", "-accept", "127.0.0.1:" & $port.int,
                "-cert", certPath, "-key", keyPath, "-www"],
       options = {poUsePath, poStdErrToStdOut})
     defer:

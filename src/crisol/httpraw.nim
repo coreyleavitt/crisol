@@ -450,6 +450,36 @@ proc parseStatusAndHeaders*(headerBlock: string): tuple[ok: bool, status: int, h
     headers.add((k, v))
   (true, status, headers)
 
+proc classifyContentLength*(headers: seq[(string, string)]):
+    tuple[present: bool, valid: bool, length: int] =
+  ## Pure classification pulled out of `readResponse` so
+  ## `tests/unit/test_httpraw_parser.nim` can pin the presence/validity
+  ## split with fed bytes, no socket. **R2-SEC-A:** `present` means the
+  ## header NAME appeared at all, independent of whether its (already
+  ## `.strip()`ed by `parseStatusAndHeaders`) value is empty -- a
+  ## `Content-Length:` or `Content-Length:   ` line is present-but-empty,
+  ## and per RFC 9110 an empty value is malformed framing, not an absent
+  ## header. Using `headerValue(...).len > 0` for presence (the old bug)
+  ## silently reclassified that case as "header absent", sending it down
+  ## the EOF-delimited path instead of `readResponse`'s
+  ## present-but-invalid -> `toUnreachable` branch below.
+  var raw = ""
+  var present = false
+  for (k, v) in headers:
+    if cmpIgnoreCase(k, "Content-Length") == 0:
+      present = true
+      raw = v
+      break
+  var length = 0
+  var valid = true
+  if present:
+    try:
+      length = parseInt(raw)  # parseInt("") / whitespace-only both raise ValueError
+      valid = length >= 0
+    except ValueError:
+      valid = false  # empty, whitespace-only, garbage, negative, or overflow
+  (present, valid, length)
+
 proc readChunkedBody(socket: Socket; deadline: float; bodyCapBytes: int;
                      initial: string): tuple[res: RawIoResult, body: string] =
   ## Drives `chunkedcodec.ChunkedDecoder` from the socket: feeds `initial`
@@ -514,21 +544,13 @@ proc readResponse(socket: Socket; deadline: float; bodyCapBytes: int): HttpReply
     of rioError: return HttpReply(transport: toUnreachable)
     of rioOk: return HttpReply(transport: toOk, status: status, headers: headers, body: chunkedBody)
 
-  let contentLengthStr = headerValue(headers, "Content-Length")
-  let hasContentLength = contentLengthStr.len > 0
-  var contentLength = 0
-  var contentLengthValid = true
-  if hasContentLength:
-    try:
-      contentLength = parseInt(contentLengthStr)
-      contentLengthValid = contentLength >= 0
-    except ValueError:
-      contentLengthValid = false  # garbage, or overflow -- parseInt raises on both
+  let (hasContentLength, contentLengthValid, contentLength) = classifyContentLength(headers)
 
   if hasContentLength and not contentLengthValid:
     # A Content-Length header that IS present but is not a valid
-    # non-negative integer (negative, overflow, or garbage) is malformed
-    # framing, not an absent header -- must never fall through to
+    # non-negative integer (negative, overflow, garbage, or -- R2-SEC-A --
+    # empty/whitespace-only) is malformed framing, not an absent header --
+    # must never fall through to
     # `bounded = false`'s EOF-delimited path (reserved for a genuinely
     # ABSENT header, see this file's module doc's "Judgment call: no
     # Content-Length and not chunked"). `hasContentLength`/

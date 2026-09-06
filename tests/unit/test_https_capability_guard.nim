@@ -1,27 +1,21 @@
 ## test_https_capability_guard.nim — RFC-0005 review fix (L1/T-guard):
 ## proves the FAIL-CLOSED half of the https-capability guard added to
 ## `cacheregistry.configuredCache` and `config.validate` — a binary
-## compiled WITHOUT `-d:ssl` (this file's own compile: tests/integration/
-## carries no ssl-scoping config.nims, so it builds exactly like every
-## other non-ssl unit/integration file) must turn an `https://`
-## remote-cache tier into a HARD `CrisolError(cekConfig)` at plan time,
-## never a silent dead tier that only shows up as an inexplicable cache
-## miss once a run actually happens.
+## compiled WITHOUT `-d:ssl` (this file's own compile: tests/unit/ carries
+## no ssl-scoping config.nims, so it builds exactly like every other
+## non-ssl unit test) must turn an `https://` remote-cache tier into a
+## HARD `CrisolError(cekConfig)` at plan time, never a silent dead tier
+## that only shows up as an inexplicable cache miss once a run actually
+## happens. No sockets, no subprocess -- pure unit-test shape.
 ##
 ## The SSL-side counterpart (proving the SAME configuration does NOT raise
 ## this guard under `-d:ssl`) lives in
 ## tests/unit/ssl/test_https_capability_guard_ssl.nim, compiled under that
 ## directory's own `config.nims`.
 ##
-## Lives in tests/integration/ rather than tests/unit/ purely because this
-## agent's edit allowlist scoped new test files to tests/unit/ssl/* and
-## tests/integration/ — there is nothing integration-specific about this
-## test otherwise (no sockets, no subprocess; it is exactly the shape of a
-## unit test).
-##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
-##     tests/integration/test_https_capability_guard.nim
+##     tests/unit/test_https_capability_guard.nim
 
 import std/[os, strutils, unittest]
 import crisol/types

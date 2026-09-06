@@ -614,9 +614,10 @@ proc validate(cfg: Config; source: string; warns: var seq[ConfigWarning]) =
       if t.url.startsWith("https://"):
         cfgErr("config: remote-cache '" & t.name & "': url '" & t.url &
                "' requires TLS, but this crisol build lacks TLS support " &
-               "(-d:ssl) -- rebuild with -d:ssl (the default for the " &
-               "produced binary; see src/crisol.nim.cfg), or point 'url' " &
-               "at a non-https scheme")
+               "(-d:ssl) -- the produced crisol binary has -d:ssl by " &
+               "default (see src/crisol.nim.cfg); an embedding project " &
+               "must pass -d:ssl in its own build, or point 'url' at a " &
+               "non-https scheme")
     # RFC-0005 C3a / §Secure-by-default: unsigned S3/MinIO has no
     # transport-level write authorization at all (no SigV4 -> no credential
     # is ever transmitted), so a verifying `cache-trust` policy is a HARD
@@ -657,6 +658,9 @@ proc validate(cfg: Config; source: string; warns: var seq[ConfigWarning]) =
                "'verify-trust #false' on this tier) -- an unkeyed FNV-1a-64 checksum " &
                "is attacker-computable and a 'none' trust policy serves anything " &
                "requested of it (read-side spoofing/MITM)")
+    # Cross-ref SEC2 (`cacheregistry.configuredCache`): the token-over-http
+    # check deliberately lives ONLY there, never here -- secrets resolve
+    # lazily (D5), and plan-time `validate` must not force an eager env scan.
     elif t.url.startsWith("https://"):
       let effectiveVerifyTrust = t.verifyTrust.get(cacheVerifies)
       if not effectiveVerifyTrust:

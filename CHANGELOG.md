@@ -6,6 +6,55 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### Fixed — a present-but-empty Content-Length is malformed framing, never an absent header (RFC-0005 review R2-SEC-A)
+
+`httpraw.readResponse` keyed `Content-Length` "presence" on the header's
+stripped value being non-empty, so a literally-present-but-empty header
+(`Content-Length:` or whitespace-only) was silently reclassified as absent
+and read via the EOF-delimited path instead of the present-but-invalid
+`toUnreachable` rejection every other malformed value (negative, overflow,
+garbage) already gets. Presence is now determined by the header NAME
+appearing at all (new pure `httpraw.classifyContentLength`); the
+genuinely-absent-header EOF path is unaffected and pinned by unit tests.
+
+### Fixed — secrets are resolved+scrubbed before ANY child spawns (not merely before the cache activates), and `--cache-stats` now distinguishes a trust-rejected/corrupt cache read from a cold miss (RFC-0005 code-review R2-D5a/R2-T8b)
+
+Two confirmed findings from the round-2 re-review of the RFC-0005 build's
+code-review fixes:
+
+- **R2-D5a — `runTests()`/`runTestsWith()` now resolve and scrub the
+  `CRISOL_CACHE_*` environment BEFORE `planTests`/`planImpl`, not merely
+  before the cache activates.** Round-1's D5 fix deferred
+  `resolveCacheSecrets()` (the env scan-then-`delEnv`) into
+  `productionCacheDeps().buildRuntime`'s own closure, correct in SCOPE (a
+  `noCache: true` run still performs zero env mutation) but wrong in
+  TIMING: that closure only runs AFTER `planImpl` returns successfully, and
+  `planImpl` unconditionally spawns the Nim compiler fingerprint-probe
+  child (`buildRunPlan`'s `cachedNimFingerprint()` argument) regardless of
+  whether the plan itself later succeeds — so every cache-enabled run's
+  probe child inherited the UNSCRUBBED `CRISOL_CACHE_SIGN_KEY`/
+  `_HMAC_KEY`/`_TOKEN*` environment. The resolve+scrub now happens once, at
+  the very top of `runTestsWith` (still gated on `not opts.noCache` — the
+  D5 guarantee is unchanged), strictly before `planImpl` or any child ever
+  spawns. `CacheDeps.buildRuntime` gains a fourth parameter,
+  `resolvedSecrets: CacheSecrets`, threaded down from that single
+  resolution point instead of re-derived inside the closure —
+  `productionCacheDeps` no longer touches the environment at all itself.
+- **R2-T8b — `cacheStats` now distinguishes a trust-rejected or corrupt
+  cache read from a genuine cold miss**, closing the gap the round-1 T8
+  finding pinned rather than fixed (see the superseded "Known gap" note
+  this entry replaces, below). `CacheStats` gains two additive counters,
+  `trustRejects` and `corruptReads` (run/v2 `cacheStats.trustRejects`/
+  `.corruptReads`, `schemaRevision` 22 → 23): `aggregateCacheStats` now
+  folds `tekMiss.verdicts` (previously discarded — miss COUNT is
+  decision-sourced, but the per-tier VERDICT information those events
+  carry was simply never folded into any `CacheStats` field) into a count
+  of consulted lookups whose per-tier verdicts include at least one
+  `types.trustVerdicts` code (`trustRejects`) or `cvCorrupt`
+  (`corruptReads`) — both additive to, not separate from, the existing
+  `misses` count. `render.renderCacheStats` gains a matching "N misses (M
+  trust-rejects, K corrupt-reads)" segment.
+
 ### Fixed — -d:ssl is now the default for the produced crisol binary (RFC-0005 code-review L1/T5)
 
 `src/crisol.nim.cfg` (Nim's per-mainfile config) supplies `--define:ssl` to
@@ -61,20 +110,15 @@ Two confirmed findings from the RFC-0005 build's code-review:
   since it removes the recompile itself rather than merely suppressing its
   side effect.
 
-**Known gap, not fixed by this change (RFC-0005 code-review T8):** the RFC's
-own E2E-2 acceptance text claims a trust-rejected or corrupt cache read
-("cacheStats distinguishes it from a cold miss") is distinguishable from a
-genuine cold miss via `--cache-stats`. This does NOT hold in the current
-implementation: `cachetelemetry.aggregateCacheStats` derives
-`l1Hits`/`remoteHits`/`misses`/`total`/`notConsulted` purely from each
-entrypoint's final `cacheDecision` (a trust-rejected/corrupt read and a
-genuine cold miss both resolve to `cdmKeyMiss` then `cdmStored`, identical
-to a first-ever cold run), and its `tekMiss` telemetry arm discards the
-verdict information (`ev.verdicts`) that WOULD distinguish them.
-`tests/unit/test_api.nim`'s E2E-2 suite now pins this actual (gap) shape
-rather than silently asserting the RFC's claim — left for a follow-up
-slice to decide how `CacheStats` should surface the distinction, if at
-all.
+**Fixed (round-2 re-review, RFC-0005 code-review R2-T8b):** the gap noted
+here in round 1 — `cacheStats` could not distinguish a trust-rejected/
+corrupt cache read from a genuine cold miss, despite the RFC's own E2E-2
+acceptance text claiming otherwise — is closed. See this changelog's own
+"secrets are resolved+scrubbed before ANY child spawns... R2-D5a/R2-T8b"
+entry, above, for the fix (`CacheStats.trustRejects`/`.corruptReads`,
+`schemaRevision` 23). `tests/unit/test_api.nim`'s E2E-2 suite now asserts
+distinguishability directly (a tamper case reads a nonzero counter; a
+genuine cold-miss case reads zero) rather than pinning the gap.
 
 ### Fixed — end-of-run drain honors interruption, the per-tier error warning is unconditional, local vs. remote put failures are counted honestly, and `noCache` no longer touches the host environment (RFC-0005 code-review SO2/L2/D1/D5)
 
