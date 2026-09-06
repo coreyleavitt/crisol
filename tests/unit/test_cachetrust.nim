@@ -359,4 +359,77 @@ block test_ed25519_forged_signer_field_is_bad_signature_not_mismatch:
   # envelope (signer="B"), regardless of which public key is tried.
   assert verifierPinningA.verify(forged) == cvTrustBadSignature
 
+# ---------------------------------------------------------------------------
+# T10 (coverage gap, Low): mutating `signedAt` AFTER signing must never
+# affect `verify` -- RFC-0005's clock-skew-immunity guarantee. `signedAt`
+# is informational only (this module's doc: "signedAt is never signed and
+# never consulted by verify") -- never part of either policy's envelope.
+# ---------------------------------------------------------------------------
+
+block test_t10_signedat_mutation_after_sign_does_not_affect_verify:
+  let policy = hmacPolicy("s3cr3t", "ci-2026")
+  var e = sampleEntry(SoundnessKey("1010101010101011"))
+  policy.sign(e)
+  assert policy.verify(e) == cvOk
+  # A verifier running on a clock wildly skewed from the signer's -- or a
+  # replay long after signing -- must not change the verdict.
+  e.attestation.get.signedAt = e.attestation.get.signedAt + 1_000_000_000
+  assert policy.verify(e) == cvOk,
+    "signedAt is never part of the signed envelope -- mutating it must never flip the verdict"
+
+# ---------------------------------------------------------------------------
+# T11 (coverage gap, Medium): key rotation.
+#
+# (a) Dual-pinned-key window: a policy pinning BOTH the old and the new
+#     ed25519 key -- entries genuinely signed by EITHER key must verify
+#     cvOk (RFC-0005 key-rotation practice: add the new key alongside the
+#     old one before dropping it).
+# (b) Dropping the old key: once the operator removes it from the pinned
+#     set, an entry signed under the old key fails -- specifically
+#     `cvTrustUnpinnedSigner` (ed25519's pinned-SET model, per this
+#     module's own `ed25519Policy` doc and rejection-matrix item #13,
+#     above) -- fail-closed, never an accidental serve.
+#
+# HMAC's single-active-secret analog (`keyId` rotation) is NOT a new case
+# here: `hmacPolicy` has exactly ONE active secret/keyId by construction
+# (this module's own doc comment, "signer derivation is pinned" section --
+# "There is exactly ONE active secret for hmacPolicy"), so an old-keyId
+# entry against a policy now configured with a NEW keyId is already
+# pinned, exhaustively, by test #5 above
+# (`test_hmac_wrong_keyid_is_signer_mismatch` -> `cvTrustSignerMismatch`)
+# -- there is no separate "multi-keyId HMAC" architecture to add a case
+# for.
+# ---------------------------------------------------------------------------
+
+block test_t11a_ed25519_dual_pinned_key_rotation_window:
+  let pkOld = pubKeyFor(FixedSeedBytesA)
+  let pkNew = pubKeyFor(FixedSeedBytesB)
+  let signerOld = ed25519Policy(some(toSeed(FixedSeedBytesA)), @[pkOld, pkNew])
+  let signerNew = ed25519Policy(some(toSeed(FixedSeedBytesB)), @[pkOld, pkNew])
+  let verifier  = ed25519Policy(none(Seed), @[pkOld, pkNew])
+
+  var eOld = sampleEntry(SoundnessKey("1111222233334444"))
+  signerOld.sign(eOld)
+  assert verifier.verify(eOld) == cvOk,
+    "an entry genuinely signed by the OLD key must still verify while both keys are pinned"
+
+  var eNew = sampleEntry(SoundnessKey("4444333322221111"))
+  signerNew.sign(eNew)
+  assert verifier.verify(eNew) == cvOk,
+    "an entry genuinely signed by the NEW key must verify during the same rotation window"
+
+block test_t11b_ed25519_dropping_old_key_rejects_old_signed_entry:
+  let pkOld = pubKeyFor(FixedSeedBytesA)
+  let pkNew = pubKeyFor(FixedSeedBytesB)
+  let signerOld = ed25519Policy(some(toSeed(FixedSeedBytesA)), @[pkOld, pkNew])
+  var eOld = sampleEntry(SoundnessKey("5555666677778888"))
+  signerOld.sign(eOld)
+  assert signerOld.verify(eOld) == cvOk, "sanity: valid while the old key is still pinned"
+
+  # Operator drops the old key from config -- the verifier now pins ONLY
+  # the new key.
+  let verifierAfterRotation = ed25519Policy(none(Seed), @[pkNew])
+  assert verifierAfterRotation.verify(eOld) == cvTrustUnpinnedSigner,
+    "an entry signed by a since-dropped key must fail closed, not verify, once the key is dropped"
+
 echo "test_cachetrust: all blocks passed"
