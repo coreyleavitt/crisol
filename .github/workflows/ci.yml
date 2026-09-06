@@ -82,11 +82,22 @@ jobs:
       # reliable proof the TLS path was compiled in: Nim's `std/net` openssl
       # wrapper dlopen's libssl at CALL time rather than link time, so there
       # is no linker-level dependency to check instead.
+      #
+      # Dedicated .gate-nimcache, NOT the shared/restored .ci-nimcache: this
+      # is a correctness gate, so it must compile from a clean cache. The
+      # shared cache is restored across runs (actions/cache, keyed on
+      # milpa.lock+crisol.nimble) and is written by other steps and — during
+      # the very regression that produced this step's first red — by a
+      # different nim binary; a partial/cross-nim cache left openssl.nim
+      # recompiled but httpraw's ssl branch stale, so openssl.o was dropped
+      # at link and SSL_connect vanished from a genuinely -d:ssl build. A
+      # fresh per-step nimcache (never listed in actions/cache) forecloses
+      # that entire class of false signal for the cost of one clean compile.
       - name: Build production binary — confirm -d:ssl is the default
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
-            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            -e XDG_CACHE_HOME=/workspace/.gate-nimcache \
             ghcr.io/coreyleavitt/nim:2.2.10 bash -c '
               set -euo pipefail
               nim c --path:src -o:crisol src/crisol.nim
