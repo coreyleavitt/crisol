@@ -238,8 +238,8 @@ type
     ## **Judgment call (recorded):** the RFC's own inline sketch has
     ## `api.nim` decode straight to `Option[sello.Seed]` and move THAT into
     ## `CacheSecrets`/`ed25519Policy`. That does not typecheck through this
-    ## codebase's ACTUAL plumbing: `productionCacheDeps` (below) resolves
-    ## `CacheSecrets` ONCE and captures it in a `{.closure.}` `buildRuntime`
+    ## codebase's ACTUAL plumbing: `runTestsWith` resolves `CacheSecrets` ONCE
+    ## (R2-D5a) and passes it to `CacheDeps.buildRuntime`, a `{.closure.}`
     ## whose type permits more than one call; Nim's move analysis (correctly)
     ## refuses to move a field out of a value shared by a closure's captured
     ## environment, since a second call would then observe an

@@ -1,7 +1,7 @@
 ## test_c6_jsonout.nim — C6: regression serialization in run/v1 + render tag
 ##
 ## Coverage:
-##   1. RunSchemaRevision is 13.
+##   1. RunSchemaRevision matches the current schema revision.
 ##   2. regressions array is present in output (empty when no regressions).
 ##   3. regressed=false results do NOT appear in regressions array.
 ##   4. regressed=true results appear in regressions array with correct fields.
@@ -22,7 +22,7 @@ proc makeEp(path: string): Entrypoint =
 
 suite "C6 — run/v1 regressions + render":
 
-  test "RunSchemaRevision is 13":
+  test "RunSchemaRevision matches the current schema revision":
     ## M8 bumped 5->6 for expanded CacheDecision wire vocabulary;
     ## M-report pass (a) bumped 6->7 for the additive top-level `compile` field;
     ## M-report pass (b1) bumped 7->8 for the additive top-level `reuseAlerts`

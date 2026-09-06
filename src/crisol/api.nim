@@ -1104,8 +1104,8 @@ proc resolveCacheSecrets(): CacheSecrets =
   ##
   ## **`$CRISOL_CACHE_TOKEN[_<TIER>]` capture (RFC-0005 C3b), a genuine
   ## ordering constraint, not a style choice:** this proc runs BEFORE the
-  ## KDL config is even parsed (`productionCacheDeps()` is called at
-  ## `runTests`'s own call site, ahead of `runTestsWith` -> `planImpl` ->
+  ## KDL config is even parsed (the resolve is the first act of
+  ## `runTestsWith` (R2-D5a), ahead of `planImpl` ->
   ## `loadConfig`), so the configured remote-cache tier NAMES do not exist
   ## yet — there is no `tierName -> token` lookup to build. Every
   ## `CRISOL_CACHE_TOKEN*` var is instead captured HERE, keyed by its own

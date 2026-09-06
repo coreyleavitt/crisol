@@ -120,3 +120,83 @@ Boundary tests at the port via in-memory adapter (tier waterfall / populate-on-h
 
 ## Resume
 Round 3 is APPLIED. **0007 Stage A is complete (2026-09-03) and the A7-gate re-baseline is applied** (§A7-gate re-baseline above; RFC doc updated in the same pass). FORK-2 is resolved (a) and recorded here + in the RFC status line; `/tdd` from slice **B3a** (no remaining prereq — issue #1 landed in 0007 A2b). If Corey wants another architect pass: `/architect docs/rfc/0005-distributed-cache-and-trust.md round 4` (fable).
+
+## RFC-0005 build /code-review ledger (stage 4; round 1 findings 2026-09-06; scope 6133c0d..a6fea2d)
+
+Lenses: soundness+liveness+security on fable, design+test on sonnet. Every High + load-bearing Medium adversarially verified (refute-briefed sonnet verifiers). Statuses: open / fixed / deferred / wontfix / refuted.
+
+| id | sev | finding (file:line at a6fea2d) | status | proof / reason |
+|----|-----|-------------------------------|--------|----------------|
+| SEC1 | HIGH | verifying-policy gate covers only s3://; http/https tiers accepted under default trust "none" → MITM/malicious server serves fabricated pass (unkeyed FNV checksum attacker-computable, nonePolicy.verify=cvOk, verifyTrust=false) as cdmHit AND backfills into l1 (persistent poison). config.nim:614-618, cacheregistry.nim:471-488, cachetier.nim backfill. VERIFIED: recompute is no obstacle (attacker authors the observation); RFC s3 gate rationale = write-auth only, silent on read-side spoofing | fixed fb438fc | verifier confirmed full chain |
+| L1 | HIGH | https:// tiers dark in every produced binary: no -d:ssl in crisol.nimble/./dev/Dockerfile/CI build path (only tests/unit/ssl/config.nims + manual tool); httpraw returns toUnreachable pre-socket → breaker latches; config's own doc example (https) = silent cold cache, no config-time/startup diagnostic | fixed 8b62710 | verified inline by grep |
+| SO1 | MED | serve-time recompute uses DefaultPolicy not run's resolved policy; read path never re-checks evidenceSatisfies; foreign/remote escapee-evidence entry (backfill re-stores verbatim, bypasses shouldStore) served as cdmHit forever while reporting derives oFailed under --strict-hygiene; no rerun/eviction escape (verify-cache blind to evidence). cachedispatch.nim:377, cachetier.nim:249-263 | fixed 58a410f | verifier confirmed; split is code-comment-documented but unvalidated vs foreign entries |
+| SO2 | MED | drainPending not shutdown-gated and drain call not gated on interrupted (api.nim:1314 vs persist gate :1391); post-Ctrl-C up to 1000 puts x ~2-4s vs slow-alive/5xx remote (breaker trips only on cvOffline/cvTimeout) | fixed 30960d3 | verifier confirmed |
+| SO3 | MED | post-compile consult not attempt-gated (consultPostCompile has no attempt param; retries always recompile — edecision immutable); concurrent publish between attempts masks genuine failure: fkCacheHit finalizes with attempts=0, no ledger row, flaky() structurally false; asymmetric with shouldStore's attempt!=1 gate. runner.nim:629,1724-1741,2058; cachedispatch.nim:302-322,552 | fixed 58a410f | verifier confirmed |
+| L2 | MED | RFC-pinned unconditional stderr warnings (100%-error tier, breaker line; RFC :199,:385) only fire under --cache-stats (sole erroredTiers caller inside statsSink!=nil, api.nim:1447-1449; NilSink drops events); default run silent on dead tier | fixed 30960d3 | verifier confirmed |
+| SEC2 | MED | bearer tokens attached on plaintext http:// (cacheregistry.nim:144, cachehttp.nim:76-80); passive attacker harvests write credential — defeats C6's poison-immunity property; no warning/rejection for token+http combo | fixed fb438fc | |
+| SO6/T9 | MED | malformed $CRISOL_CACHE_SIGN_KEY silently degrades ed25519Policy to verify-only (decodeSignSeedB64→none → sign no-op → every put cvUnauthorized); contrary to module's own "misconfig = config error" rule enforced for pinned-key/HMAC; untested. cachetrust.nim:140-152 | fixed fb438fc | dedup of SO6+T9 |
+| D1 | MED | local L1 put failures folded into tekRemoteErr/CacheStats.remoteErrors + "N remote-errors" render even with zero remotes configured; cvUnauthorized overloaded (auth vs soft-cap vs write-race). cachedispatch.nim:774-784, cachelocalfs.nim:192-220 | fixed 30960d3 | |
+| D2 | MED | ~35-line HTTP-status→CacheVerdict mapping copy-pasted verbatim cachehttp.nim:91-106 / caches3.nim:208-223; no drift guard; belongs in cachewire | fixed c759d03 | |
+| D5 | MED | runTests() eagerly evals productionCacheDeps() → resolveCacheSecrets() scans+delEnvs CRISOL_CACHE_* from host process even under noCache; undocumented global mutation for library embedders. api.nim:1475-1481,997-1054 | fixed 30960d3 | |
+| T1 | MED | httpraw real-socket suite = 5 scenarios; lying Content-Length (declared 100, send 40, close → toUnreachable) and garbage status line unasserted over live socket (code verified correct by inspection — regression-protection gap) | fixed b4a5ca3 | downgraded from High: behavior verified correct by 2 lenses |
+| T2 | MED | Content-Length: -1 parses and collides with "-1 = no header" sentinel → reclassified as EOF-delimited (capped) body; untested either way | fixed b4a5ca3 | bounded by body cap (sec lens) |
+| T3 | MED | no unit-level httpraw parser coverage; MaxHeaderBytes 64KiB cap zero coverage anywhere | fixed b4a5ca3 | |
+| T5 | MED | TLS cert/hostname rejection never in CI (manual script only); regression disabling CVerifyPeer undetected — fold into L1 fix (CI leg with -d:ssl) | fixed 8b62710 | |
+| T8 | MED | E2E-2 tamper tests never assert cacheStats distinguishes tamper from cold miss (RFC's own claim) | fixed 30960d3 (pins actual behavior; RFC distinguishability claim FALSE -> new finding R2-T8b) | |
+| T11 | MED | key rotation untested: dual-pinned-key window; dropping old key → old entries become misses | fixed 766116c | |
+| T12 | MED | VerifyDivergence.recordsDiverged never asserted true anywhere; sole fixture diverges on Exit only | fixed 30960d3 | |
+| T16 | MED | cacheStats JSON: 7 of 10 fields asserted only on struct, not rendered JSON; no absence-when-off test (keyDiff/cacheLookup have them) | fixed 30960d3 | |
+| T19 | MED | waterfall past a FAILING (cvCorrupt/offline/breaker-tripped) tier to a serving later tier untested as combined case (only miss/trust-reject covered) | fixed 766116c | |
+| T20 | MED | no real concurrent-writer test: two processes racing put on same key into shared file:// L2 | fixed 766116c | |
+| SO4 | LOW | verify-cache counts failed re-execution (pkSkipped/pkSpawnFailed → phaseExit none) as exit divergence; strict mode exits 1 on verify-infra failure. api.nim:575-583 | fixed 30960d3 | |
+| SO5 | LOW | buildVerifyPlan contract broken for post-compile hits (edecision still edNeverBuilt/edStale): verify pass recompiles + recordClosure mutates/saves depgraph during "diagnostic-only" pass; compile failure feeds SO4. runner.nim:1316-1339 | fixed 30960d3 | |
+| SO7 | LOW | --explain-miss diagnostic consult documented READ-ONLY but drives full lookup → remote GET + backfill PUTs + tekBackfillErr stats pollution at plan time. cachedispatch.nim:452-459 | open | |
+| SEC4 | LOW | keyInputs neither checksummed nor signed; malicious tier grafts arbitrary keyInputs onto validly-signed entry → persisted verbatim into l1 on backfill (diagnostics-only impact; key derivation local) | open | |
+| SEC5 | LOW | unsigned-s3-requires-trust rejection only in config validate, not configuredCache where RFC pins it; programmatic CacheConfig bypasses | fixed fb438fc | |
+| SEC6 | INFO | httpraw buildRequestBytes: no CRLF/control sanitization on method/path/host/headers (all operator-controlled today; future-caller hazard) | open | |
+| L3 | LOW | kcFixtures dark: fixtureHash hardcoded "" at sole production KeyInputs site ("A9" deferral); no config key; render arm + keyDiff name unreachable | open | known A9 deferral — candidate wontfix/defer |
+| L4 | LOW | probe-hit get-skip path never composed e2e (only s3 has probe; E2E-3 fake 404s the probe → probed never populated); unit-proven both halves | open | |
+| D3 | LOW | finalizeSlot 12 params / mixed concerns post-FORK-2(a); suggest PostCompileOutcome struct when next touched | open | acknowledged RFC tradeoff |
+| D4 | LOW | remote-configured runs sign+write L1 twice per entry (putLocal + drain full fan-out); documented idempotent | open | note; documented rationale |
+| T4 | LOW | chunkedcodec: 21 hand-picked vectors, no fuzz/property pass despite pre-trust-boundary parsing | open | |
+| T6 | LOW | caches3 decodeXmlEntities: out-of-range/negative codepoint (&#4000000000;) untested vs "probe never raises" contract | open | |
+| T7 | LOW | s3 <Key> mid-tag truncation untested (safe by inspection) | open | |
+| T10 | LOW | signedAt clock-skew immunity (mutate post-sign → still cvOk) untested despite named RFC guarantee | fixed 766116c | |
+| T13 | LOW | verify-cache exclusion boundary (differing rusage/durations/Cause/Evidence, same Exit+records → no divergence) not explicitly proven | fixed 30960d3 (duration-only case) | |
+| T14 | LOW | --verify-cache-pct >100 unvalidated/untested | open | |
+| T15 | LOW | verify-cache seed determinism never proven via two CLI invocations | open | |
+| T17 | LOW | explain-miss no-sidecar first-run degrade only unit-tested at render layer | open | |
+| T18 | LOW | CRISOL_CACHE_* scrub real-child proof covers TOKEN only; SIGN_KEY/HMAC_KEY/TOKEN_<TIER> delEnv-level only | open | |
+| SEC3 | — | claimed std/json depth-unbounded stack overflow DoS | refuted | Nim 2.2.10 std/json DepthLimit=1000 → catchable JsonParsingError → cvCorrupt net at cachewire.nim:458 |
+
+Verified-correct highlights (round 1, all lenses): key composition + staged completion (store-key == lookup-key); publish gate incl. named-guarantee evidenceSatisfies; outcome-advisory recompute shape; verify-cache observation-only comparison; wire codec fail-closed (Fetched makes hit-with-error unrepresentable); trust envelope (domain tag, recomputed SHA-256, key binding, constant-time HMAC, alg/signer pinning); tier waterfall + backfill/put rules (2x2x2 matrices enumerated); breaker semantics; TLS CVerifyPeer+SNI+hostname under -d:ssl; transport bounds (8MiB body cap enforced while reading, 64KiB header cap, chunk overflow guards); credential env-only handling + delEnv + filterEnv child scrub; atomic O_EXCL+rename 0600 local publish; port boundary crisp; process/resultjson single-owner rule respected; default-caller ergonomics unchanged; import DAG matches RFC table.
+
+Round-1 fix commits: fb438fc 58a410f c759d03 b4a5ca3 ac936aa (wave 1), 8b62710 30960d3 766116c 0b9336c (wave 2). Full suite green after each wave (175 then 182 test files OK). New finding carried into round 2: **R2-T8b (MED, open)** — cacheStats cannot distinguish a trust-rejected/corrupt read from a cold miss (tekMiss arm discards verdicts; RFC's diagnosability claim for this is false at the aggregate level; the per-tier 100%-error warning path does see trust codes). Candidate fix: additive trustRejected/corrupt counter(s) in CacheStats + run/v2 (rev 23). Still open from round 1 (deferred Lows): SO7, SEC4, SEC5-note n/a, SEC6 (info), L3 (A9 deferral), L4, D3, D4, T4, T6, T7, T14, T15, T17, T18.
+
+### Round 2 re-review (2026-09-06; scope a6fea2d..0b9336c, the 9 round-1 fix commits; soundness/security/liveness fable, design sonnet)
+
+| id | sev | finding | status | proof / reason |
+|----|-----|---------|--------|----------------|
+| R2-D5a | MED | D5's lazy resolveCacheSecrets runs in buildRuntime AFTER planImpl -> nim fingerprint probe child inherits unscrubbed CRISOL_CACHE_* on cache-enabled runs; hoist resolve+scrub to top of runTestsWith gated on not noCache, before any child | fixed 47f8cca | fable soundness, concrete chain api.nim:1153/1208/890 |
+| R2-T8b | MED | carried from round 1: cacheStats cannot distinguish trust-rejected/corrupt read from cold miss (tekMiss arm discards verdicts); RFC diagnosability claim false at aggregate | fixed 47f8cca (trustRejects/corruptReads, rev 23) | T8 pin work proved it empirically |
+| R2-D3 | LOW | trailing defaults (spec/outcomePolicy) on lookupAtPlan/consultPostCompile default to pre-SO1 unsound behavior; future call site forgetting them = silent regression; remove defaults | fixed 47f8cca | both production sites verified correct today |
+| R2-SEC-A | LOW | present-but-EMPTY Content-Length strips to "" and is classed absent (EOF path) instead of present-but-invalid | fixed 466bc7e | |
+| R2-D2 | LOW | verifyCachePass wrapper mislabeled back-compat; zero production callers; delete | fixed 47f8cca | |
+| R2-D4 | LOW | pure test misfiled in tests/integration (allowlist accident, self-admitted); move to tests/unit | fixed 466bc7e | |
+| R2-D1 | LOW | SEC2's deliberate non-mirroring into validate (lazy secrets, D5) undocumented; comment | fixed 466bc7e | asymmetry verified correct, just undocumented |
+| R2-L1b | NIT | non-ssl https error message parenthetical misleads embedders (points at src/crisol.nim.cfg) | fixed 466bc7e | |
+| R2-SEC-B | INFO | ssl test's s_server binds 0.0.0.0; bind 127.0.0.1 | fixed 466bc7e | test-only |
+| R2-SO2a | INFO | signals.nim doc claim stale (drain/prefetch now read sticky latch); sticky-latch drain abandonment in long-lived embedders = warmth-only, consistent with prefetch sites | fixed 47f8cca | |
+| R2-SO3a | INFO | SO3 skip: attempt-2 pass reports plan-time inputHash/cacheLookup placeholders (cdmFlaky honest; metadata only) | accepted | known consequence, recorded |
+| R2-SO4a | LOW | verifyCouldNotReexec not on run/v2 (stderr+Nim API only); JSON automation blind to it | accepted | deliberate no-rev-bump call; future additive field if verify auditing automates |
+| R2-L1a | INFO | -d:ssl CI gate never yet executed (commits unpushed); step audited sound (deps present, strings present, fail-closed) | accepted | first push proves it |
+| R2-L2a | INFO | dead-tier warning covered api-level only (runMain adds nothing between); acceptable | accepted | |
+| X-R2-1 | PRE-EXISTING | createDir raises IOError but cachelocalfs.put/resultcache.storeCachedAt guard except OSError -> blocked version dir escapes the guard | open, out-of-range | surfaced by b2b test header; candidate standalone issue |
+
+Round-2 verified-correct highlights: no false-miss storm from read-side evidenceSatisfies (unkeyed netIso previously produced a false HIT, now symmetric refusal); SO5 promotion invariant holds (sampled entries always have stable binaries); warnSink single-instance aliasing (no double emission); gate coverage complete incl. per-tier verify-trust overrides and case-variant schemes; both token forms caught pre-gate, never echoed; CVerifyPeer sole TLS mode; read-side gate cannot Defect on attacker-shaped evidence (decoder structurally bounds everything); crisol.nim.cfg mechanism empirically confirmed (Conf hint) incl. per-mainfile test cfgs; D1 localErrors chain live through real runMain CLI (rev 22).
+
+### Round 3 re-review (2026-09-06; scope 0b9336c..466bc7e; soundness+security and liveness+design, both fable) — FLOOR REACHED
+
+0 Critical / 0 High / 0 Medium. Lows: R3-1/R3-D1/R3-D2 (doc-comment drift from the round-2 fixes) + stale test_c6_jsonout test name — **fixed in the floor doc pass** (comment/test-name only). Deferred Lows (recorded, not fixed): R3-2 cvVersionSkew reads not counted in corruptReads (deliberate scope: skew = migration artifact; revisit if fleet migrations need it), R3-3 counters-vs-misses render sourcing quirk (event- vs decision-sourced; honest parenthetical), R3-4 scrub now applies to caller-supplied CacheDeps too (intended, strictly safer; contract note), R3-D3 lookupAtPlan test shorthand duplicated in 3 test files (candidate: tests/support/helpers.nim). Deferred from rounds 1-2: SO7, SEC4, SEC6 (info), L3 (A9), L4, D3, D4, T4, T6, T7, T14, T15, T17, T18, R2-SO4a (verifyCouldNotReexec not on wire). Out-of-range pre-existing: X-R2-1 (createDir IOError vs except OSError in cachelocalfs.put/storeCachedAt) — candidate standalone issue.
+
+**REVIEW LOOP COMPLETE.** Fix commits: fb438fc 58a410f c759d03 b4a5ca3 ac936aa (round 1 wave 1), 8b62710 30960d3 766116c 0b9336c (round 1 wave 2), 47f8cca 466bc7e (round 2), + floor doc pass. Wire moved rev 21 -> 23 (22: localErrors; 23: trustRejects/corruptReads). BREAKING config: http-under-none rejected, token-over-http rejected, malformed sign key rejected, https-without-ssl-build rejected. RFC Status line updated.

@@ -659,8 +659,9 @@ proc validate(cfg: Config; source: string; warns: var seq[ConfigWarning]) =
                "is attacker-computable and a 'none' trust policy serves anything " &
                "requested of it (read-side spoofing/MITM)")
     # Cross-ref SEC2 (`cacheregistry.configuredCache`): the token-over-http
-    # check deliberately lives ONLY there, never here -- secrets resolve
-    # lazily (D5), and plan-time `validate` must not force an eager env scan.
+    # check deliberately lives ONLY there, never here -- secrets are resolved
+    # only on the run path (`runTestsWith`, R2-D5a); plan-only paths reach
+    # `validate` with no secrets in play, and it must never force an env scan.
     elif t.url.startsWith("https://"):
       let effectiveVerifyTrust = t.verifyTrust.get(cacheVerifies)
       if not effectiveVerifyTrust:
