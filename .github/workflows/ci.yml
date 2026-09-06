@@ -66,33 +66,28 @@ jobs:
       # gate at all. `src/crisol.nim.cfg` is what now supplies `-d:ssl`
       # automatically whenever `src/crisol.nim` is the compiled main file.
       #
-      # This compiles src/crisol.nim DIRECTLY with the image's on-PATH nim
+      # Build: compile src/crisol.nim DIRECTLY with the image's on-PATH nim
       # (`/opt/nim/2.2.10-patched`), exactly as ci/run-tests.sh's nimble task
       # does its `nim r --path:src` — deliberately NOT `nimble build`: in a
-      # bare `docker run` (HOME=/root, no persisted choosenim state — unlike
-      # `./dev`, which mounts .docker-home) nimble 0.22.2's resolver does not
-      # find the image nim, downloads a VANILLA 2.2.10 from nim-lang.org, and
-      # builds with it — which does not pick up this repo's build config and
-      # produced a non-ssl binary (the regression this very step first hit).
-      # `nim c src/crisol.nim` loads both the milpa-generated root nim.cfg
-      # (dep --paths, from the Fetch-deps step, mounted in via $PWD) and the
-      # per-mainfile src/crisol.nim.cfg (-d:ssl); no explicit -d:ssl flag is
-      # passed here ON PURPOSE — this proves the DEFAULT, not a remembered
-      # flag. `strings` for the OpenSSL FFI symbol name is the cheapest
-      # reliable proof the TLS path was compiled in: Nim's `std/net` openssl
-      # wrapper dlopen's libssl at CALL time rather than link time, so there
-      # is no linker-level dependency to check instead.
+      # bare `docker run` (HOME=/root, no persisted choosenim state, unlike
+      # `./dev`'s mounted .docker-home) nimble 0.22.2's resolver misses the
+      # image nim and downloads a vanilla one that ignores this repo's build
+      # config. `nim c` loads both the fetch-deps-generated root nim.cfg (dep
+      # --paths) and the per-mainfile src/crisol.nim.cfg (-d:ssl). A dedicated
+      # .gate-nimcache (never in actions/cache) keeps the compile clean.
       #
-      # Dedicated .gate-nimcache, NOT the shared/restored .ci-nimcache: this
-      # is a correctness gate, so it must compile from a clean cache. The
-      # shared cache is restored across runs (actions/cache, keyed on
-      # milpa.lock+crisol.nimble) and is written by other steps and — during
-      # the very regression that produced this step's first red — by a
-      # different nim binary; a partial/cross-nim cache left openssl.nim
-      # recompiled but httpraw's ssl branch stale, so openssl.o was dropped
-      # at link and SSL_connect vanished from a genuinely -d:ssl build. A
-      # fresh per-step nimcache (never listed in actions/cache) forecloses
-      # that entire class of false signal for the cost of one clean compile.
+      # Gate: assert the PROPERTY, not a compilation artifact. The earlier
+      # `strings ./crisol | grep SSL_connect` proxy was fragile — the OpenSSL
+      # FFI wrapper's dynlib symbol name is an unreferenced .rodata string
+      # that link-time dead-stripping removes in some environments (it stayed
+      # in local ld builds, vanished on the CI runner) even for a genuinely
+      # -d:ssl binary (CI compiled openssl.nim, which Nim only does under
+      # -d:ssl). Instead, RUN the built binary against an https:// remote-cache
+      # tier: a -d:ssl build accepts it (config validates; SEC1 emits the
+      # "server operator fully trusted" warning), while a build lacking TLS
+      # hits the compile-time capability guard and errors "lacks TLS support
+      # (-d:ssl)". Absence of that error is the L1 property, directly tested
+      # and immune to link/strip differences.
       - name: Build production binary — confirm -d:ssl is the default
         run: |
           docker run --rm \
@@ -101,11 +96,14 @@ jobs:
             ghcr.io/coreyleavitt/nim:2.2.10 bash -c '
               set -euo pipefail
               nim c --path:src -o:crisol src/crisol.nim
-              if ! strings ./crisol | grep -q SSL_connect; then
-                echo "L1 REGRESSION: the produced crisol binary has no SSL_connect symbol -- -d:ssl is no longer the default build-path define (see src/crisol.nim.cfg)" >&2
+              printf "remote-cache \"gate\" {\n  url \"https://example.invalid/cache\"\n}\n" > .gate-https.kdl
+              out=$(./crisol list --config .gate-https.kdl 2>&1 || true)
+              if grep -qi "lacks TLS support" <<<"$out"; then
+                echo "L1 REGRESSION: the produced crisol binary rejects an https:// remote-cache tier -- -d:ssl is no longer the default build-path define (see src/crisol.nim.cfg)" >&2
+                echo "$out" >&2
                 exit 1
               fi
-              echo "OK: crisol binary built with -d:ssl by default (SSL_connect symbol present)"
+              echo "OK: crisol binary accepts https:// remote-cache tiers (-d:ssl is the default)"
             '
 
   timing:
