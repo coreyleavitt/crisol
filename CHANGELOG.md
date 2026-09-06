@@ -6,6 +6,124 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### Fixed — -d:ssl is now the default for the produced crisol binary (RFC-0005 code-review L1/T5)
+
+`src/crisol.nim.cfg` (Nim's per-mainfile config) supplies `--define:ssl` to
+every `nimble build`/`./dev build`, so `https://` remote-cache tiers work in
+the shipped binary instead of silently latching the circuit breaker. A binary
+built WITHOUT `-d:ssl` now rejects a configured `https://` remote-cache tier
+as a hard config error (in both `validate()` and `configuredCache`) instead
+of presenting a silent dead tier. TLS certificate verification (self-signed
+rejection) is now proven by an automated in-suite test
+(`tests/unit/ssl/test_https_reject_selfsigned.nim`) rather than a manual
+script, and CI asserts the produced binary carries the TLS symbols.
+
+### Fixed — --verify-cache no longer misfiles a dead verify sub-run as nondeterminism, and never recompiles/persists the depgraph for a post-compile-consult hit (RFC-0005 code-review SO4/SO5)
+
+Two confirmed findings from the RFC-0005 build's code-review:
+
+- **SO4 — a verify sub-run that never produced an observation (fresh run
+  phase `pkSkipped`/`pkSpawnFailed` — e.g. the sampled entry's promoted
+  stable binary vanished between the main run and the verify pass) is no
+  longer counted as an exit divergence.** `api.verifyCachePass`'s internal
+  comparison previously ran `exitsDiverge` unconditionally; since a stored
+  `cdmHit` always has an observation but a dead verify sub-run does not,
+  `exitsDiverge`'s `isSome != isSome` branch turned every such case into a
+  false "exit diverged" — a verify-INFRASTRUCTURE failure misfiled as cache
+  nondeterminism, tripping `--verify-cache-strict` for a reason unrelated
+  to the cache. Such entries are now excluded from `RunReport.
+  verifyDivergences` entirely and instead land in a new
+  `RunReport.verifyCouldNotReexec: seq[Entrypoint]` field — never silent
+  (a distinct stderr warning still names the entrypoint) and never
+  strict-mode-triggering (`--verify-cache-strict` gates on
+  `verifyDivergences.len`, unaffected by this new field). No wire/schema
+  change: `run/v2`'s `verifyFails` count simply becomes more accurate
+  (excludes what was never a real comparison); `RunSchemaRevision` stays
+  22 (an existing field's CONTENT corrected, not a new field — same
+  precedent as rfc-0007 A5/A6a's "no rev bump" entries in jsonout.nim's own
+  schema history).
+- **SO5 — the verify pass no longer recompiles (and therefore never
+  persists the depgraph) for a sampled hit that came from the POST-COMPILE
+  cache consult (RFC-0005 A2c-ii) rather than a plan-time hit.**
+  `runner.buildVerifyPlan`'s synthetic plan carried such an entry's
+  ORIGINAL `edecision` (`edNeverBuilt`/`edStale` — that is why the
+  post-compile consult had to run in the first place) unchanged, so
+  `execute()`'s dispatch sent it through `spawnCompileStable` in the
+  diagnostic-only verify sub-run: a genuine recompile whose `finalizeSlot`
+  calls `recordClosure`, which unconditionally calls `saveDepGraph` and
+  persists the mutation to disk — violating the pass's own "no depgraph
+  mutation/save" contract. Fixed by forcing every sampled entry's
+  `edecision` to `edRunFresh` in `buildVerifyPlan`, unconditionally: every
+  `cdmHit` (plan-time or post-compile) already has a stable binary
+  promoted by the time the verify pass runs, so this makes every sampled
+  entry dispatch through `spawnRunDirect` (reuse the stable binary, no
+  recompile at all) instead — the cleaner of the two options considered,
+  since it removes the recompile itself rather than merely suppressing its
+  side effect.
+
+**Known gap, not fixed by this change (RFC-0005 code-review T8):** the RFC's
+own E2E-2 acceptance text claims a trust-rejected or corrupt cache read
+("cacheStats distinguishes it from a cold miss") is distinguishable from a
+genuine cold miss via `--cache-stats`. This does NOT hold in the current
+implementation: `cachetelemetry.aggregateCacheStats` derives
+`l1Hits`/`remoteHits`/`misses`/`total`/`notConsulted` purely from each
+entrypoint's final `cacheDecision` (a trust-rejected/corrupt read and a
+genuine cold miss both resolve to `cdmKeyMiss` then `cdmStored`, identical
+to a first-ever cold run), and its `tekMiss` telemetry arm discards the
+verdict information (`ev.verdicts`) that WOULD distinguish them.
+`tests/unit/test_api.nim`'s E2E-2 suite now pins this actual (gap) shape
+rather than silently asserting the RFC's claim — left for a follow-up
+slice to decide how `CacheStats` should surface the distinction, if at
+all.
+
+### Fixed — end-of-run drain honors interruption, the per-tier error warning is unconditional, local vs. remote put failures are counted honestly, and `noCache` no longer touches the host environment (RFC-0005 code-review SO2/L2/D1/D5)
+
+Four confirmed findings from the RFC-0005 build's code-review:
+
+- **SO2 — the end-of-run deferred-put drain (`api.runTestsWith`) now skips
+  entirely on an interrupted run**, mirroring the `persistLastRun` gate:
+  queuing more network I/O for entries an interrupted run never finished
+  observing was the wrong thing to do on the way out. `cachetier.
+  drainPending` also gained its own injected `abandoned` predicate
+  (mirroring `resolveProbes`'s existing discipline), checked between puts
+  and wired in production to `signals.shutdownRequested().isSome` — so a
+  shutdown signal that arrives *during* the drain itself, on an otherwise-
+  uninterrupted run, stops it too.
+- **L2 — the RFC-pinned per-tier 100%-error/breaker stderr warning now
+  fires on every run, not only under `--cache-stats`.** Previously
+  `erroredTiers`'s sole caller was gated behind `if statsSink != nil`,
+  which is `nil` unless `--cache-stats` is on, so a default run with a
+  dead cache tier warned about nothing. `api.runTestsWith` now always
+  installs a cheap `InMemorySink` (`warnSink`) dedicated to this fold —
+  reusing `--cache-stats`'s own collector when it is already installed (no
+  duplicate collection, no duplicate warning), or a fresh throwaway one
+  otherwise. `RunReport.cacheStats`/the run/v2 `cacheStats` object are
+  unaffected: they stay the documented zero value / absent whenever
+  `--cache-stats` is off.
+- **D1 — a local ("l1") put/backfill failure is no longer folded into
+  `remoteErrors`.** `cachetelemetry.CacheStats` gains an additive
+  `localErrors` field (run/v2 `cacheStats.localErrors`, `schemaRevision`
+  21 → 22); `aggregateCacheStats` now attributes a
+  `tekRemoteErr`/`tekBackfillErr` event by its `putTier` — `"l1"` counts
+  toward `localErrors`, any other (configured `remote-cache`) tier still
+  counts toward `remoteErrors`, unchanged. Before this fix a purely local
+  fault (e.g. an unwritable cache root) on a run with ZERO remote tiers
+  configured could still report a nonzero `remoteErrors` and render "N
+  remote-errors" — dishonest, since "remote" implies a configured remote
+  tier exists. `render.renderCacheStats` gained a matching `"N
+  local-errors"` segment.
+- **D5 — `runTests()` no longer scrubs the `CRISOL_CACHE_*` environment
+  under `opts.noCache: true`.** `resolveCacheSecrets()` (the env
+  scan-then-`delEnv` of the whole `CRISOL_CACHE_*` namespace) now runs
+  lazily, inside `productionCacheDeps().buildRuntime`'s own closure,
+  rather than eagerly in `productionCacheDeps()` itself — `runTestsWith`
+  only ever calls `buildRuntime` when the cache actually activates, so a
+  library embedder that opts out of caching entirely no longer sees an
+  undocumented host-process environment mutation from `runTests()`. The
+  cache-enabled scrub itself is unchanged (still runs exactly once per
+  real run) and is now documented explicitly, in both `runTests`'s and
+  `RunOptions.noCache`'s doc comments, as deliberate defense-in-depth.
+
 ### Fixed — cache serve-path hardening: policy-aware recompute, an evidence re-check on read, and an attempt-gated post-compile consult (RFC-0005 code-review SO1/SO3)
 
 Two confirmed findings from the RFC-0005 build's code-review, both closed
