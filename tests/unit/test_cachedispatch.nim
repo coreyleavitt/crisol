@@ -129,6 +129,30 @@ let onPolicy  = defaultCachePolicy()
 let offPolicy = CachePolicy(enabled: false)
 
 # ---------------------------------------------------------------------------
+# RFC-0005 code-review R2-D3: `cachedispatch.lookupAtPlan`/`.consultPostCompile`
+# dropped their `spec`/`outcomePolicy` DEFAULTS (a future production call
+# site that forgets them must fail to compile, never silently revert to an
+# unsound default -- see cachedispatch.nim's own R2-D3 comment on each
+# proc). This file's call sites overwhelmingly never cared about
+# hermeticity/strict-hygiene recompute in the first place -- these two
+# local overloads restore the old shorthand for them, each explicitly
+# filling `default(SandboxSpec), DefaultPolicy`. A call site that DOES
+# care (the escapee-evidence / strict-hygiene suite, below) already passes
+# `spec =`/`outcomePolicy =` explicitly and resolves to `cachedispatch`'s
+# own (imported, 7/6-argument) proc instead -- ordinary Nim overload
+# resolution on argument count, not a name collision.
+proc lookupAtPlan(pep: PlannedEntrypoint; policy: CachePolicy; seams: CacheSeams;
+                  explainDiag: bool = false;
+                  sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()): PlanLookup =
+  cachedispatch.lookupAtPlan(pep, policy, seams, explainDiag, sink,
+                             default(SandboxSpec), DefaultPolicy)
+
+proc consultPostCompile(pep: PlannedEntrypoint; policy: CachePolicy; seams: CacheSeams;
+                        sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()): PlanLookup =
+  cachedispatch.consultPostCompile(pep, policy, seams, sink,
+                                   default(SandboxSpec), DefaultPolicy)
+
+# ---------------------------------------------------------------------------
 # lookupAtPlan
 # ---------------------------------------------------------------------------
 
@@ -1261,9 +1285,13 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
     # The verify pass: forces a genuine third execution (n=2 -> exit 1),
     # diverging from the stored exit-0 observation.
     let mem = newInMemorySink()
+    # RFC-0005 code-review R2-D2: `verifyCachePass` returns the full
+    # `VerifyPassResult` tuple now (the round-1 `.divergences`-only
+    # back-compat wrapper is deleted -- no compat obligation, zero
+    # production callers) -- project `.divergences` here explicitly.
     let divergences = verifyCachePass(
       results2, @[pep2], verifySample(pct = 100), cfg, g,
-      "2.2.10", "gcc 13.2.0", spec, mem.sink)
+      "2.2.10", "gcc 13.2.0", spec, mem.sink).divergences
 
     check readFile(dir / "verify_counter.txt").strip() == "2"   # proves a real re-execution
     check divergences.len == 1

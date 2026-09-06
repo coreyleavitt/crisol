@@ -432,8 +432,16 @@ proc renderCacheStats*(s: CacheStats): string =
   ## configured remote tiers) with an unwritable cache root reads "N
   ## local-errors, 0 remote-errors", never the dishonest "N remote-errors"
   ## it rendered before this fix.
+  ##
+  ## `trust-rejects`/`corrupt-reads` (RFC-0005 code-review R2-T8b) render
+  ## right after `misses` -- both are a SUBSET of `misses` already counted
+  ## above (a trust-rejected/corrupt read is still one of the run's
+  ## misses), not an additional total; they answer WHY a subset of those
+  ## misses happened, the distinguishing signal the RFC's own "Hit-rate
+  ## telemetry" text names.
   "cache: " & $s.l1Hits & " l1 hits, " & $s.remoteHits & " remote hits, " &
-  $s.misses & " misses, " & $s.localErrors & " local-errors, " &
+  $s.misses & " misses (" & $s.trustRejects & " trust-rejects, " &
+  $s.corruptReads & " corrupt-reads), " & $s.localErrors & " local-errors, " &
   $s.remoteErrors & " remote-errors, " &
   $s.total & " consulted (" & $s.notConsulted & " not consulted), " &
   formatFloat(s.hitPct, ffDecimal, 1) & "% hit rate, " &

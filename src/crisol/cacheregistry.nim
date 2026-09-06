@@ -225,8 +225,9 @@ type
     ## `api.nim`, are then removed from the process environment, and are
     ## injected -- the cache modules never read env." `api.nim` builds
     ## this ONCE per `runTests`/`runTestsWith` call (via
-    ## `resolveCacheSecrets`) and moves it into the `productionCacheDeps`
-    ## closure; `configuredCache` (below) is the ONLY consumer.
+    ## `resolveCacheSecrets`, at the top of `runTestsWith`, before any
+    ## child spawns -- R2-D5a) and passes it to `CacheDeps.buildRuntime`;
+    ## `configuredCache` (below) is the ONLY consumer.
     ##
     ## `hmacKey` (`$CRISOL_CACHE_HMAC_KEY`) is C4's field. `signSeedB64` (RFC-
     ## 0005 C5a: raw `$CRISOL_CACHE_SIGN_KEY`, base64 of the 32-byte ed25519
@@ -494,9 +495,11 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
       if remote.url.startsWith("https://"):
         raise newCrisolError(cekConfig,
           "config: remote-cache '" & remote.name & "': url '" & remote.url &
-          "' requires TLS, but this crisol build lacks TLS support (-d:ssl) -- " &
-          "rebuild with -d:ssl (the default for the produced binary; see " &
-          "src/crisol.nim.cfg), or point 'url' at a non-https scheme")
+          "' requires TLS, but this crisol build lacks TLS support " &
+          "(-d:ssl) -- the produced crisol binary has -d:ssl by " &
+          "default (see src/crisol.nim.cfg); an embedding project " &
+          "must pass -d:ssl in its own build, or point 'url' at a " &
+          "non-https scheme")
 
     if remote.verifyTrust == some(true) and cfg.trust.policy == "none":
       raise newCrisolError(cekConfig,

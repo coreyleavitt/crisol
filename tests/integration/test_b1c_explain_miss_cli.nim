@@ -6,12 +6,14 @@
 ##   1. Run 1 populates the cache (live pass, stored + sidecar written).
 ##   2. Changing a compile flag (crisol.kdl group `flags`) and re-running
 ##      with `--explain-miss --json` produces a per-entrypoint `keyDiff`
-##      array naming `kcFlags` with non-empty prev/curr, schemaRevision 22
+##      array naming `kcFlags` with non-empty prev/curr, schemaRevision 23
 ##      (this `keyDiff` field is still rev 20's own — `RunSchemaRevision`
-##      itself has since advanced to 22 via rev 21's `cacheStats` and rev
-##      22's additive `cacheStats.localErrors`, RFC-0005 code-review D1,
-##      neither of which changes this field), and stdout stays parseable
-##      JSON (the human explain line goes to stderr instead).
+##      itself has since advanced to 23 via rev 21's `cacheStats`, rev
+##      22's additive `cacheStats.localErrors` (RFC-0005 code-review D1),
+##      and rev 23's additive `cacheStats.trustRejects`/`.corruptReads`
+##      (RFC-0005 code-review R2-T8b) — none of which changes this
+##      field), and stdout stays parseable JSON (the human explain line
+##      goes to stderr instead).
 ##   3. Changing an allowlisted env var (via `--env-pin TERM=...`, which
 ##      routes through the SAME hermetic-env soundness component
 ##      regardless of the host's own TERM) and re-running with
@@ -104,7 +106,7 @@ suite "B1c CLI — --explain-miss over --json: kcFlags on a flag change":
 
     # stdout stays parseable JSON even with the flag on.
     let doc = parseJson(r.stdout)
-    check doc["schemaRevision"].getInt == 22
+    check doc["schemaRevision"].getInt == 23
     let eps = doc["entrypoints"]
     check eps.len == 1
     check eps[0].hasKey("keyDiff")

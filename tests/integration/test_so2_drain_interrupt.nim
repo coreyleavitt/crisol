@@ -104,8 +104,15 @@ suite "RFC-0005 code-review SO2 — end-of-run drain skipped on an interrupted r
       let l1 = memory()
       let (l2, l2PutCalls) = countingPutBackend(memory())
 
-      let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; sd: string; maxEntries: int): CacheRuntime =
-        discard cfg; discard sd; discard maxEntries
+      # RFC-0005 code-review R2-D5a: `buildRuntime` gained a fourth
+      # parameter, `resolvedSecrets` (the run's pre-resolved+scrubbed
+      # CacheSecrets, now threaded in by runTestsWith itself rather than
+      # resolved inside this closure) -- this fixture builds its own
+      # fixed two-tier CacheRuntime and never needs real secrets, so it is
+      # accepted and discarded like the other three unused params.
+      let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; sd: string; maxEntries: int;
+                                              resolvedSecrets: CacheSecrets): CacheRuntime =
+        discard cfg; discard sd; discard maxEntries; discard resolvedSecrets
         CacheRuntime(
           cache: TieredCache(
             tiers: @[

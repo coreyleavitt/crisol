@@ -164,6 +164,30 @@ type
       ## Sum of served hits' historical `run.durationUs`, rendered as ms.
     published*:    int
     verifyFails*:  int
+    trustRejects*: int
+      ## RFC-0005 code-review R2-T8b: a consulted lookup whose per-tier
+      ## verdicts (`tekMiss.verdicts`) include at least one code in
+      ## `types.trustVerdicts` — an entry EXISTED somewhere but was
+      ## REFUSED (bad signature, unpinned signer, unknown alg, no
+      ## attestation), not a genuine cold miss. Distinguishes what the
+      ## decision-sourced `misses`/`total`/`notConsulted` fold above
+      ## cannot: a trust-rejected read takes the SAME `l.hit.isNone`
+      ## ("nothing servable") path through `cachedispatch.lookupAtPlan` as
+      ## an empty cache, then the SAME `cdmKeyMiss` → `cdmStored` (self-
+      ## heal republish) decision pair a first-ever cold run produces — the
+      ## RFC's own E2E-2 acceptance text ("cacheStats distinguishes it from
+      ## a cold miss") names exactly this gap, previously unfixed (see the
+      ## CHANGELOG's superseded "Known gap" entry). ADDITIVE to (never
+      ## subtracted from) `misses` — a trust-rejected read is still one of
+      ## the `misses` this run counted; this field says WHY.
+    corruptReads*: int
+      ## Same distinguishing purpose as `trustRejects`, for `cvCorrupt`
+      ## specifically — an INTEGRITY-layer rejection (payload/checksum
+      ## mismatch), caught before trust verification is ever reached (RFC
+      ## "Integrity vs. trust"). Independent counter: a single `tekMiss`
+      ## event can in principle contribute to BOTH (two consulted tiers
+      ## rejecting the same lookup on two different bases) — each tier's
+      ## own verdict is judged on its own terms, not "first match wins".
 
 const notConsultedDecisions* = {cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled}
   ## RFC-0005 "Hit-rate telemetry" / `cachedispatch.inactiveDecision`'s own
@@ -220,13 +244,25 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
   ## (pre-A3c-ii). `hitPct`/`misses` are unaffected (both already summed
   ## `l1Hits + remoteHits`).
   var remoteErrors, localErrors, published, verifyFails: int
+  var trustRejects, corruptReads: int
   var wallSavedMs: int64
   for ev in events:
     case ev.kind
     of tekHit:
       wallSavedMs += ev.durationMs
     of tekMiss:
-      discard  # miss count is decision-sourced (see `misses` below)
+      # RFC-0005 code-review R2-T8b: miss COUNT stays decision-sourced (see
+      # `misses` below — a `tekMiss` event and a `cdmKeyMiss` decision are
+      # not guaranteed 1:1, e.g. the diagnostic --explain-miss consult), but
+      # the per-tier VERDICTS this event carries (`ev.verdicts`, threaded
+      # verbatim from `CacheLookup.verdicts`) are the only place a trust-
+      # rejected or corrupt read is ever distinguishable from a genuine
+      # cold miss — at most one increment of EACH counter per event (a
+      # per-ENTRYPOINT consult, not per-tier-verdict): two tiers both
+      # rejecting the SAME lookup on the SAME basis is still one rejected
+      # READ, not two.
+      if ev.verdicts.anyIt(it.verdict in trustVerdicts): inc trustRejects
+      if ev.verdicts.anyIt(it.verdict == cvCorrupt): inc corruptReads
     of tekRemoteErr, tekBackfillErr:
       # RFC-0005 code-review D1: keyed off the FAILING tier, mirroring the
       # l1Hits/remoteHits split below (`d.tier == "l1"`) — a local-fs write
@@ -262,6 +298,8 @@ proc aggregateCacheStats*(events: seq[TelemetryEvent];
     wallSavedMs:  wallSavedMs,
     published:    published,
     verifyFails:  verifyFails,
+    trustRejects: trustRejects,
+    corruptReads: corruptReads,
   )
 
 # ---------------------------------------------------------------------------

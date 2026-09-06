@@ -5,9 +5,10 @@
 ##
 ## Properties pinned (RFC-0005 line 561, B2b; line 542, E2E-B):
 ##   1. A cold run (--cache-stats --json) shows misses > 0, hitPct == 0.0,
-##      a nonzero `cacheStats.total`, and `schemaRevision == 22` (rev 21
-##      B2b's original cacheStats object + rev 22's additive `localErrors`,
-##      RFC-0005 code-review D1).
+##      a nonzero `cacheStats.total`, and `schemaRevision == 23` (rev 21
+##      B2b's original cacheStats object + rev 22's additive `localErrors`
+##      (RFC-0005 code-review D1) + rev 23's additive `trustRejects`/
+##      `corruptReads` (RFC-0005 code-review R2-T8b)).
 ##   2. A warm rerun of the SAME entrypoint (--cache-stats --json) shows
 ##      hits > 0 and hitPct > 0 -- sane values proving the aggregation is
 ##      wired to a REAL run, not a stub.
@@ -101,13 +102,18 @@ suite "B2b CLI — --cache-stats --json: cold run then warm rerun":
                           "--cache-stats", "--json"])
     check r1.code == 0
     let doc1 = parseJson(r1.stdout)
-    check doc1["schemaRevision"].getInt == 22  # rev 22: RFC-0005 code-review D1's cacheStats.localErrors
+    check doc1["schemaRevision"].getInt == 23  # rev 23: RFC-0005 code-review R2-T8b's cacheStats.trustRejects/corruptReads
     check doc1.hasKey("cacheStats")
     let cs1 = doc1["cacheStats"]
     check cs1["misses"].getInt > 0
     check cs1["l1Hits"].getInt == 0
     check cs1["hitPct"].getFloat == 0.0
     check cs1["total"].getInt > 0
+    # RFC-0005 code-review R2-T8b: a genuine cold miss (no cache-trust
+    # configured in this fixture) must read both distinguishing counters
+    # zero -- the CLI-level negative control for distinguishability.
+    check cs1["trustRejects"].getInt == 0
+    check cs1["corruptReads"].getInt == 0
     check cs1["localErrors"].getInt == 0
     check cs1["remoteErrors"].getInt == 0
 

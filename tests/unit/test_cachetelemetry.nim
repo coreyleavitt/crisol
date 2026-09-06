@@ -35,6 +35,8 @@ suite "aggregateCacheStats — empty input":
     check s.wallSavedMs == 0
     check s.published == 0
     check s.verifyFails == 0
+    check s.trustRejects == 0
+    check s.corruptReads == 0
 
 suite "aggregateCacheStats — decision-sourced counts":
 
@@ -121,7 +123,11 @@ suite "aggregateCacheStats — event-sourced counts":
     let s = aggregateCacheStats(events, decisions)
     check s.wallSavedMs == 357
 
-  test "tekMiss events contribute nothing beyond decision-sourced misses":
+  test "tekMiss events with only cvMiss/no verdicts contribute nothing beyond decision-sourced misses (genuine cold miss)":
+    ## A genuine cold miss (no entry existed anywhere, or the event carries
+    ## no verdicts at all) must NOT be misfiled as a rejection -- see the
+    ## sibling "RFC-0005 code-review R2-T8b" suite, below, for the case
+    ## where a tekMiss event's verdicts DO distinguish a rejection.
     let events = @[
       TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvMiss)]),
       TelemetryEvent(kind: tekMiss, verdicts: @[]),
@@ -131,6 +137,65 @@ suite "aggregateCacheStats — event-sourced counts":
     check s.misses == 2
     check s.total == 2
     check s.l1Hits == 0
+    check s.trustRejects == 0
+    check s.corruptReads == 0
+
+suite "aggregateCacheStats — RFC-0005 code-review R2-T8b: trustRejects/corruptReads distinguish a rejected read from a cold miss":
+
+  test "a tekMiss event whose verdicts include a trust code -> trustRejects, not corruptReads":
+    let events = @[
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvTrustBadSignature)]),
+    ]
+    let s = aggregateCacheStats(events, @[(cdmStored, "")])
+    check s.misses == 1
+    check s.trustRejects == 1
+    check s.corruptReads == 0
+
+  test "a tekMiss event whose verdicts include cvCorrupt -> corruptReads, not trustRejects":
+    let events = @[
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvCorrupt)]),
+    ]
+    let s = aggregateCacheStats(events, @[(cdmStored, "")])
+    check s.misses == 1
+    check s.trustRejects == 0
+    check s.corruptReads == 1
+
+  test "every trustVerdicts code trips trustRejects (not just cvTrustBadSignature)":
+    for v in [cvTrustNoAttestation, cvTrustUnknownAlg, cvTrustUnpinnedSigner,
+              cvTrustSignerMismatch, cvTrustBadSignature]:
+      let events = @[TelemetryEvent(kind: tekMiss, verdicts: @[("l1", v)])]
+      let s = aggregateCacheStats(events, @[(cdmStored, "")])
+      check s.trustRejects == 1
+      check s.corruptReads == 0
+
+  test "a genuine cvMiss/cvOffline/cvVersionSkew tekMiss event trips NEITHER counter":
+    for v in [cvMiss, cvOffline, cvTimeout, cvVersionSkew, cvUnauthorized]:
+      let events = @[TelemetryEvent(kind: tekMiss, verdicts: @[("l1", v)])]
+      let s = aggregateCacheStats(events, @[(cdmKeyMiss, "")])
+      check s.trustRejects == 0
+      check s.corruptReads == 0
+
+  test "two tiers on the SAME event, one trust-rejecting and one corrupt -> both counters increment once":
+    let events = @[
+      TelemetryEvent(kind: tekMiss,
+                     verdicts: @[("l1", cvCorrupt), ("mirror", cvTrustBadSignature)]),
+    ]
+    let s = aggregateCacheStats(events, @[(cdmStored, "")])
+    check s.trustRejects == 1
+    check s.corruptReads == 1
+
+  test "multiple rejected reads accumulate independently across events":
+    let events = @[
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvTrustBadSignature)]),
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvCorrupt)]),
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvCorrupt)]),
+      TelemetryEvent(kind: tekMiss, verdicts: @[("l1", cvMiss)]),  # genuine cold miss
+    ]
+    let s = aggregateCacheStats(events, @[(cdmStored, ""), (cdmStored, ""),
+                                          (cdmStored, ""), (cdmKeyMiss, "")])
+    check s.misses == 4
+    check s.trustRejects == 1
+    check s.corruptReads == 2
 
   test "tekRemoteErr events -> remoteErrors, carrying putTier/putVerdict":
     let events = @[

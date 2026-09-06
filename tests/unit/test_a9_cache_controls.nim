@@ -91,6 +91,17 @@ proc seamsMiss(c: var Calls): CacheSeams =
 let globalOn  = defaultCachePolicy()             # enabled=true
 let globalOff = CachePolicy(enabled: false)      # --no-cache
 
+# RFC-0005 code-review R2-D3: `cachedispatch.lookupAtPlan` dropped its
+# `spec`/`outcomePolicy` defaults (a future production call site that
+# forgets them must fail to compile, never silently revert to an unsound
+# default). None of this file's calls care about hermeticity/strict-
+# hygiene recompute -- this local overload restores the old 3-argument
+# shorthand, filling `default(SandboxSpec), ptypes.DefaultPolicy`
+# explicitly. Mirrors test_cachedispatch.nim's own R2-D3 fix.
+proc lookupAtPlan(pep: PlannedEntrypoint; policy: CachePolicy; seams: CacheSeams): PlanLookup =
+  cachedispatch.lookupAtPlan(pep, policy, seams,
+                             spec = default(SandboxSpec), outcomePolicy = ptypes.DefaultPolicy)
+
 proc writeFile(dir, name, content: string): string =
   result = dir / name
   writeFile(result, content)

@@ -28,9 +28,17 @@
 ##     installSignals=true Supervisor in this process has observed
 ##     SIGINT/SIGTERM; carries the real signum (RFC-0003's 128+n needs
 ##     `n`). Sticky: once set, stays set for the life of the process —
-##     there is no `clearSignal()` counterpart (nothing in production
-##     reads this to decide whether to run; it is a pure observability
-##     query for library callers).
+##     there is no `clearSignal()` counterpart. RFC-0005 code-review R2-SO2a
+##     correction: production DOES read this now, at three call sites
+##     (`cachetier.resolveProbes`'s plan-time prefetch loop, `runner.nim`'s
+##     plan-time consult loop, and `api.runTestsWith`'s end-of-run
+##     deferred-put drain) — all to decide whether to ABANDON further
+##     cache-related I/O once a shutdown is pending, never to decide
+##     whether the RUN itself proceeds (`execute()`'s own Supervisor owns
+##     that decision entirely). This module stays a pure VIEW over that
+##     Supervisor's state either way — never a control input to the run
+##     loop — but the earlier "nothing in production reads this" framing
+##     is stale now that the cache layer does.
 
 import std/options
 import crisol/process

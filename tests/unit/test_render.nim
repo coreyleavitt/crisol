@@ -765,11 +765,14 @@ suite "render — renderCacheStats (RFC-0005 B2b)":
   test "renders every field, in the RFC's own order":
     let s = CacheStats(l1Hits: 3, remoteHits: 0, misses: 1, remoteErrors: 2,
                        localErrors: 4, total: 4, notConsulted: 5, hitPct: 75.0,
-                       wallSavedMs: 120, published: 3, verifyFails: 1)
+                       wallSavedMs: 120, published: 3, verifyFails: 1,
+                       trustRejects: 0, corruptReads: 0)
     let line = renderCacheStats(s)
     check "3 l1 hits" in line
     check "0 remote hits" in line
     check "1 misses" in line
+    check "0 trust-rejects" in line
+    check "0 corrupt-reads" in line
     check "4 local-errors" in line
     check "2 remote-errors" in line
     check "4 consulted" in line
@@ -784,6 +787,11 @@ suite "render — renderCacheStats (RFC-0005 B2b)":
     let line = renderCacheStats(s)
     check "1 local-errors" in line
     check "0 remote-errors" in line
+
+  test "RFC-0005 code-review R2-T8b: trust-rejects and corrupt-reads render independently, as a subset of misses":
+    let s = CacheStats(misses: 3, trustRejects: 1, corruptReads: 2)
+    let line = renderCacheStats(s)
+    check "3 misses (1 trust-rejects, 2 corrupt-reads)" in line
 
   test "zero value renders 0.0% hit rate, never NaN":
     check "0.0% hit rate" in renderCacheStats(CacheStats())

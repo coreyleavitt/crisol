@@ -74,7 +74,8 @@
 ##     // block.  Absence IS the honest placeholder — no null, no stub object.
 ##     "cacheStats": {   // rev 21 (RFC-0005 B2b); PRESENT ONLY under --cache-stats
 ##       l1Hits, remoteHits, misses, remoteErrors, localErrors,  // localErrors: rev 22 (D1)
-##       total, notConsulted, hitPct, wallSavedMs, published, verifyFails
+##       total, notConsulted, hitPct, wallSavedMs, published, verifyFails,
+##       trustRejects, corruptReads  // rev 23 (code-review R2-T8b)
 ##     }
 ##   }
 ##
@@ -255,7 +256,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 22
+const RunSchemaRevision* = 23
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -546,6 +547,36 @@ const RunSchemaRevision* = 22
   ##                     the SAME object, so `localErrors` is absent
   ##                     exactly when `cacheStats` itself is absent (no
   ##                     `--cache-stats`), never independently gated.
+  ##   rev 23 (RFC-0005 code-review R2-T8b) — the existing `cacheStats`
+  ##                     object (rev 21/22, above) gains two additive
+  ##                     fields: `trustRejects` (int) and `corruptReads`
+  ##                     (int). Round-1's T8 finding pinned that the RFC's
+  ##                     own E2E-2 acceptance text ("cacheStats
+  ##                     distinguishes [a trust-rejected/corrupt read] from
+  ##                     a cold miss") did NOT hold: `aggregateCacheStats`
+  ##                     folded `l1Hits`/`remoteHits`/`misses`/`total`/
+  ##                     `notConsulted` purely from each entrypoint's FINAL
+  ##                     `cacheDecision`, which is byte-identical between a
+  ##                     trust-rejected-then-healed run and a genuine cold
+  ##                     run (`cdmKeyMiss` at lookup time, `cdmStored` after
+  ##                     the self-heal republish either way) -- the
+  ##                     distinguishing verdict (`tekMiss.verdicts`, carried
+  ##                     verbatim from `CacheLookup.verdicts`) was captured
+  ##                     on the wire per-result (`cacheLookup`, rev 19) but
+  ##                     never folded into the AGGREGATE. `trustRejects`
+  ##                     counts a consulted lookup whose per-tier verdicts
+  ##                     include at least one `types.trustVerdicts` code;
+  ##                     `corruptReads` the same for `cvCorrupt`
+  ##                     specifically (an integrity-layer, pre-trust
+  ##                     rejection). Both are ADDITIVE to (a subset of, not
+  ##                     separate from) the existing `misses` count -- a
+  ##                     trust-rejected/corrupt read is still one of the
+  ##                     run's misses; these fields say WHY. Same presence
+  ##                     gating as rev 21/22 -- both fields live on the SAME
+  ##                     object, absent exactly when `cacheStats` itself is
+  ##                     (no `--cache-stats`). `render.renderCacheStats`
+  ##                     gains a matching "N misses (M trust-rejects, K
+  ##                     corrupt-reads)" segment.
   ##   (RFC-0005 code-review SO4, no rev bump) — top-level `verifyFails`
   ##                     (rev 19, above) becomes more ACCURATE, not
   ##                     differently shaped: a sampled --verify-cache entry
@@ -887,6 +918,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     cs["wallSavedMs"]  = newJInt(cacheStats.wallSavedMs)
     cs["published"]    = newJInt(cacheStats.published)
     cs["verifyFails"]  = newJInt(cacheStats.verifyFails)
+    cs["trustRejects"] = newJInt(cacheStats.trustRejects)  # rev 23 (RFC-0005 code-review R2-T8b)
+    cs["corruptReads"] = newJInt(cacheStats.corruptReads)  # rev 23 (RFC-0005 code-review R2-T8b)
     result["cacheStats"] = cs
 
 proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;

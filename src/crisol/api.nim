@@ -442,7 +442,7 @@ type
                                   ## --verify-cache-strict, which gates on
                                   ## `verifyDivergences.len`, never exits 1 for
                                   ## it), never silent (a stderr warning still
-                                  ## names each entry — see verifyCachePassImpl).
+                                  ## names each entry — see verifyCachePass).
                                   ## ALWAYS empty when opts.verifyCache.enabled
                                   ## is false, same convention as
                                   ## verifyDivergences above.
@@ -626,7 +626,7 @@ proc recordsDiverge(a, b: seq[TestRecord]): bool =
   false
 
 type
-  VerifyPassResult = tuple
+  VerifyPassResult* = tuple
     divergences:    seq[VerifyDivergence]
     couldNotReexec: seq[Entrypoint]
     ## RFC-0005 code-review SO4: entries sampled for --verify-cache whose
@@ -636,10 +636,10 @@ type
     ## sub-run itself got killed). A verify-INFRASTRUCTURE failure, NOT
     ## evidence of cache nondeterminism — never counted in `divergences`
     ## (so --verify-cache-strict, which gates on `divergences.len`, must
-    ## never exit 1 for it), never silent (verifyCachePassImpl still warns
+    ## never exit 1 for it), never silent (verifyCachePass still warns
     ## on stderr for every entry landing here).
 
-proc verifyCachePassImpl(results: seq[EntrypointResult];
+proc verifyCachePass*(results: seq[EntrypointResult];
                      entrypoints: seq[PlannedEntrypoint];
                      vc: VerifyCache; config: Config; graph: var DepGraph;
                      nimVersion, ccVersion: string;
@@ -665,11 +665,21 @@ proc verifyCachePassImpl(results: seq[EntrypointResult];
   ## `edRunFresh` at plan time, i.e. the binary exists) holds only while the
   ## stateDir lock is held, and lastrun.json must reflect the main run only.
   ##
-  ## This is the actual implementation; `verifyCachePass*` (below) is a thin
-  ## back-compat wrapper over just the `divergences` half, kept for its
-  ## existing direct callers (test_cachedispatch.nim's B2a telemetry test).
-  ## `runTests*` calls THIS proc directly so it can also thread
-  ## `couldNotReexec` onto `RunReport`.
+  ## Exported* (RFC-0005 B2a) so a test can drive this pass directly — with
+  ## its own `results`/`entrypoints` built via `runner.execute` + a real
+  ## `CacheRuntime`/`InMemorySink` — without needing the `--cache-stats`
+  ## surface `runTests*` doesn't install until Stage B2b. `runTests*` also
+  ## calls THIS proc directly (not a wrapper) so it can thread
+  ## `couldNotReexec` onto `RunReport` alongside `divergences`.
+  ##
+  ## **RFC-0005 code-review R2-D2:** the `verifyCachePass*` back-compat
+  ## FACADE that used to sit here (returning only `.divergences`, this
+  ## proc's pre-SO4 return shape) is deleted — the feature was unreleased
+  ## when that wrapper was added, so "back-compat" named an obligation that
+  ## never existed, and it had zero production callers (`runTests*` always
+  ## called this proc, never the wrapper). Both of its test callers
+  ## (`test_api.nim`, `test_cachedispatch.nim`) now call THIS proc directly
+  ## and project `.divergences` themselves.
   if not vc.enabled: return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
 
   let decisions = results.mapIt(it.cacheDecision)
@@ -750,25 +760,6 @@ proc verifyCachePassImpl(results: seq[EntrypointResult];
                  stored.ep.path & " (" & what.join(", ") &
                  " diverged from the cached result)\n")
     try: stderr.flushFile() except CatchableError: discard
-
-proc verifyCachePass*(results: seq[EntrypointResult];
-                     entrypoints: seq[PlannedEntrypoint];
-                     vc: VerifyCache; config: Config; graph: var DepGraph;
-                     nimVersion, ccVersion: string;
-                     sandboxSpec: SandboxSpec;
-                     sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()
-                     ): seq[VerifyDivergence] =
-  ## Back-compat public facade over `verifyCachePassImpl` — returns only the
-  ## `divergences` half (this proc's ORIGINAL, pre-SO4 return shape).
-  ##
-  ## Exported* (RFC-0005 B2a) so a test can drive this pass directly — with
-  ## its own `results`/`entrypoints` built via `runner.execute` + a real
-  ## `CacheRuntime`/`InMemorySink` — without needing the `--cache-stats`
-  ## surface `runTests*` doesn't install until Stage B2b. `runTests*` itself
-  ## does NOT call this — it calls `verifyCachePassImpl` directly so it can
-  ## also thread `couldNotReexec` onto `RunReport` (see there).
-  verifyCachePassImpl(results, entrypoints, vc, config, graph, nimVersion,
-                     ccVersion, sandboxSpec, sink).divergences
 
 # ---------------------------------------------------------------------------
 # H2 — PlanReport-typed facade overloads for planview procs
@@ -1049,16 +1040,35 @@ type
     ## overrides `buildRuntime` wholesale, exactly as A3b's mock-policy test
     ## already does — a `registry` field with a single caller (this same
     ## closure) would be indirection with no consumer. `secrets:
-    ## CacheSecrets` is likewise NOT added as a `CacheDeps` field: C4 needs
-    ## it (`configuredCache` now takes `secrets` to build a real
-    ## `hmacPolicy`), but `productionCacheDeps` (below) resolves it ONCE
-    ## via `resolveCacheSecrets()` and captures it directly in the
-    ## `buildRuntime` closure it returns — a test wanting different secrets
-    ## overrides `buildRuntime` wholesale (as A3b's mock-policy test
-    ## already does), so a `secrets` field on `CacheDeps` itself would be a
-    ## second way to reach the same one call site. `http`/`s3` credentials
-    ## (`httpTokens`) arrive in C3b the same way.
-    buildRuntime*: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime {.closure.}
+    ## CacheSecrets` is likewise NOT added as a `CacheDeps` FIELD: a test
+    ## wanting different secrets overrides `buildRuntime` wholesale (as
+    ## A3b's mock-policy test already does), so a `secrets` field on
+    ## `CacheDeps` itself would be a second way to reach the same one call
+    ## site. `http`/`s3` credentials (`httpTokens`) arrive in C3b the same
+    ## way.
+    ##
+    ## **RFC-0005 code-review R2-D5a reshape:** `buildRuntime` now takes a
+    ## fourth argument, `resolvedSecrets: CacheSecrets`, handed to it by
+    ## `runTestsWith` at the call site rather than resolved inside the
+    ## closure. Round-1's D5 fix made `productionCacheDeps`'s closure call
+    ## `resolveCacheSecrets()` itself, lazily, so a `noCache: true` run paid
+    ## no env-scan/scrub cost — but that closure only runs AFTER
+    ## `planImpl`, which unconditionally spawns the Nim fingerprint-probe
+    ## child (`buildRunPlan`'s `cachedNimFingerprint()` argument, evaluated
+    ## before `buildRunPlan` itself, let alone before `buildRuntime`) — so
+    ## every cache-enabled run's probe child inherited the UNSCRUBBED
+    ## `CRISOL_CACHE_*` namespace regardless. `runTestsWith` now resolves
+    ## and scrubs ONCE, at its own top, still gated on `not opts.noCache`
+    ## (the D5 guarantee is unchanged — see its own comment there), and
+    ## passes the result down through this parameter. `productionCacheDeps`
+    ## (below) no longer calls `resolveCacheSecrets` at all — it just wires
+    ## whatever it is handed into `configuredCache`. A test double that
+    ## wants its OWN fixed secrets (the C3b/C6 http/s3 suites, the trust
+    ## E2E suites) names this parameter `resolvedSecrets` too but never
+    ## reads it — it closes over its own `secrets` local instead, exactly
+    ## as before this reshape.
+    buildRuntime*: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                        resolvedSecrets: CacheSecrets): CacheRuntime {.closure.}
 
 const CrisolCacheSecretPrefix = "CRISOL_CACHE_"
   ## RFC-0005 C4 "Secrets come from the environment... are then removed
@@ -1132,27 +1142,28 @@ proc productionCacheDeps*(): CacheDeps =
   ## The real dependency: RFC-0005 A3c-ii/C4/C3b's `configuredCache`, via
   ## `productionRegistry()` (RFC-0005 C3b: `file`/`http`/`https`/`s3`, the
   ## latter three over `httpraw.rawHttpFetcher()`, `productionRegistry`'s
-  ## own default), `resolveCacheSecrets()`, and a `NilSink` (the run's real
-  ## sink, when `--cache-stats` is on, is installed by `runTestsWith` AFTER
+  ## own default), and a `NilSink` (the run's real sink, when
+  ## `--cache-stats` is on, is installed by `runTestsWith` AFTER
   ## `buildRuntime` returns, exactly as it already did for `localOnlyCache`
   ## before this slice).
   ##
-  ## **RFC-0005 code-review D5: `resolveCacheSecrets()` is resolved LAZILY,
-  ## inside the closure below, NOT here.** `runTests*` (the public facade)
-  ## calls THIS proc unconditionally, before `runTestsWith` ever sees
-  ## `opts.noCache` — resolving eagerly here means a `noCache: true` caller
-  ## (e.g. an embedding library that asked for NO caching at all) still
-  ## pays `resolveCacheSecrets`'s full `CRISOL_CACHE_*` env SCAN-THEN-
-  ## `delEnv` — an undocumented host-process mutation with no caching
-  ## benefit to show for it. `runTestsWith` only ever calls `deps.
-  ## buildRuntime` when `not opts.noCache` (see that proc's own `if not
-  ## opts.noCache: rt = deps.buildRuntime(...)`), so deferring the
-  ## resolution into the closure makes the scrub happen exactly when the
-  ## cache actually activates — once per REAL (cache-enabled) run, same as
-  ## before, just no longer unconditionally.
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
-    let secrets = resolveCacheSecrets()
-    configuredCache(cfg, stateDir, maxEntries, productionRegistry(), secrets, NilSink[TelemetryEvent]()))
+  ## **RFC-0005 code-review R2-D5a: no longer resolves `CacheSecrets`
+  ## itself, eagerly OR lazily.** Round-1's D5 fix deferred
+  ## `resolveCacheSecrets()` into this closure so a `noCache: true` run
+  ## never paid its env-scan/scrub cost — correct in isolation, but it left
+  ## the scrub running AFTER `planImpl`, which unconditionally spawns the
+  ## Nim fingerprint-probe child (`cachedNimFingerprint()`, evaluated as a
+  ## `buildRunPlan` argument before `buildRunPlan` itself runs, let alone
+  ## before this closure) — so that child inherited the unscrubbed
+  ## `CRISOL_CACHE_*` namespace on every cache-enabled run regardless. The
+  ## resolve+scrub now happens ONCE, at the very top of `runTestsWith`
+  ## (still gated on `not opts.noCache` — the D5 guarantee is unchanged),
+  ## strictly before `planImpl`/any child ever spawns; the resolved
+  ## `CacheSecrets` value is threaded down through `buildRuntime`'s new
+  ## `resolvedSecrets` parameter instead of being re-derived here.
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                              resolvedSecrets: CacheSecrets): CacheRuntime =
+    configuredCache(cfg, stateDir, maxEntries, productionRegistry(), resolvedSecrets, NilSink[TelemetryEvent]()))
 
 # ---------------------------------------------------------------------------
 # runTestsWith — full run facade; catches-and-encodes structural failures.
@@ -1202,6 +1213,21 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       error:    msg,
     )
 
+  # RFC-0005 code-review R2-D5a: resolve + scrub `CRISOL_CACHE_*` FIRST —
+  # strictly before `planImpl` (and therefore before ITS unconditional Nim
+  # fingerprint-probe child spawn, `buildRunPlan`'s `cachedNimFingerprint()`
+  # argument) and before ANY other child this call could ever spawn. The
+  # round-1 D5 fix deferred the resolve+scrub into `productionCacheDeps`'s
+  # `buildRuntime` closure, which only runs below, AFTER `planImpl` returns
+  # successfully — so the probe child inherited the unscrubbed namespace on
+  # every cache-enabled run. Gated on `not opts.noCache`, exactly as D5
+  # requires: a `noCache: true` caller performs ZERO env mutation (see the
+  # "noCache: true -> CRISOL_CACHE_* env is left untouched" test) — env is
+  # resolved and scrubbed before planTests or any child ever spawns.
+  var secrets: CacheSecrets
+  if not opts.noCache:
+    secrets = resolveCacheSecrets()
+
   # Plan phase: catch CrisolError and encode into RunReport.
   var impl: PlanImplResult
   try:
@@ -1240,7 +1266,9 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       if opts.noRemoteCache: CacheConfig(remotes: @[])
       else: cfg.cache
     try:
-      rt = deps.buildRuntime(effectiveCacheCfg, pr.settings.stateDir, maxCacheEntries)
+      # R2-D5a: `secrets` was already resolved (+ scrubbed) above, before
+      # `planImpl` — this is a plain pass-through, not a new resolution.
+      rt = deps.buildRuntime(effectiveCacheCfg, pr.settings.stateDir, maxCacheEntries, secrets)
     except CrisolError as e:
       let code = if e.kind == cekInternal: 2 else: 3
       return structuralResultWithPlan(e.msg, code, pr)
@@ -1556,12 +1584,15 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # synthetic plan depends on). Never runs on an interrupted run: a partial
   # `results`/`pr.entrypoints` pairing would break the index alignment
   # `buildVerifyPlan`/sampling relies on.
-  # RFC-0005 code-review SO4: calls `verifyCachePassImpl` directly (not the
-  # public `verifyCachePass*` facade) so `couldNotReexec` is available to
-  # thread onto `RunReport` below, alongside `divergences`.
+  # RFC-0005 code-review SO4/R2-D2: calls `verifyCachePass` for its FULL
+  # `VerifyPassResult` (not just `.divergences`) so `couldNotReexec` is
+  # available to thread onto `RunReport` below, alongside `divergences` —
+  # the round-1 `verifyCachePass*` back-compat wrapper that hid this tuple
+  # behind a `seq[VerifyDivergence]`-only return is deleted (R2-D2: it had
+  # no compat obligation and zero production callers).
   let verifyPassResult =
     if opts.verifyCache.enabled and not interrupted:
-      verifyCachePassImpl(results, pr.entrypoints, opts.verifyCache, cfg, graph,
+      verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
                       nimVer, ccVer, spec, cacheCtx.sink)
     else: (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
   let verifyDivergences    = verifyPassResult.divergences
@@ -1630,15 +1661,23 @@ proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   ## See `runTestsWith`'s doc comment for the full flow; see `CacheDeps`'s
   ## for why the split exists.
   ##
-  ## **Deliberate defense-in-depth (RFC-0005 C4, unchanged by code-review
-  ## D5):** whenever the cache actually activates (`opts.noCache == false`,
-  ## the default), this call resolves `$CRISOL_CACHE_HMAC_KEY`/
+  ## **Deliberate defense-in-depth (RFC-0005 C4, scope unchanged by D5,
+  ## TIMING corrected by code-review R2-D5a):** whenever the cache actually
+  ## activates (`opts.noCache == false`, the default), `runTestsWith` (this
+  ## call's callee) resolves `$CRISOL_CACHE_HMAC_KEY`/
   ## `$CRISOL_CACHE_SIGN_KEY`/`$CRISOL_CACHE_TOKEN[_<TIER>]` from the
   ## process environment ONCE and then `delEnv`'s the WHOLE `CRISOL_CACHE_*`
   ## namespace (`resolveCacheSecrets`, this module) — a write credential
   ## must never linger in the process environment for a later, unrelated
-  ## child to inherit. D5's fix is scope, not removal: this scrub is now
+  ## child to inherit. D5's fix is scope, not removal: this scrub is
   ## skipped entirely under `opts.noCache: true` (see `RunOptions.noCache`'s
   ## own doc comment) rather than running unconditionally regardless of
-  ## whether caching was ever going to touch the network at all.
+  ## whether caching was ever going to touch the network at all. **R2-D5a:
+  ## the resolve+scrub itself now happens at the very TOP of `runTestsWith`
+  ## — before `planTests`/`planImpl` and therefore before the Nim
+  ## fingerprint-probe child `planImpl` unconditionally spawns — not
+  ## merely before `productionCacheDeps().buildRuntime` (round-1 D5's
+  ## placement, which left that probe child inheriting unscrubbed secrets
+  ## on every cache-enabled run).** See `runTestsWith`'s own comment at its
+  ## call site for the full rationale.
   runTestsWith(opts, productionCacheDeps())

@@ -456,10 +456,19 @@ proc lookupAtPlan*(
   seams:  CacheSeams;
   explainDiag: bool = false;
   sink:   TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
-  spec:   SandboxSpec = default(SandboxSpec);
-  outcomePolicy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
+  spec:   SandboxSpec;
+  outcomePolicy: ptypes.OutcomePolicy;
 ): PlanLookup =
   ## Decide whether `pep` can be served from cache.
+  ##
+  ## RFC-0005 code-review R2-D3: `spec`/`outcomePolicy` deliberately carry
+  ## NO default (unlike `sink`, above) — both gate real soundness/reporting
+  ## behavior (hermeticity + strict-hygiene recompute, see their own
+  ## threading in `runner.nim`/`api.nim`), so a future production call site
+  ## that forgets to pass them must be a COMPILE ERROR, never a silent
+  ## revert to an unsound default. A test wanting the old shorthand passes
+  ## `default(SandboxSpec), ptypes.DefaultPolicy` explicitly (mechanical,
+  ## see this proc's own test call sites).
   ##
   ## RFC-0005 B2a: on the REAL (non-diagnostic) consult (`consultReal`
   ## below), emits exactly one `tekHit`/`tekMiss` through `sink` — see
@@ -544,9 +553,13 @@ proc consultPostCompile*(
   policy: CachePolicy;
   seams:  CacheSeams;
   sink:   TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
-  spec:   SandboxSpec = default(SandboxSpec);
-  outcomePolicy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
+  spec:   SandboxSpec;
+  outcomePolicy: ptypes.OutcomePolicy;
 ): PlanLookup =
+  ## RFC-0005 code-review R2-D3: `spec`/`outcomePolicy` carry no default,
+  ## same rationale as `lookupAtPlan`'s own R2-D3 comment, above — a future
+  ## production call site that forgets them must fail to compile.
+  ##
   ## RFC-0005 A2c-ii: the post-compile cache consult. `pep.edecision` is
   ## `edNeverBuilt`/`edStale` here -- `lookupAtPlan`'s edRunFresh-only gate
   ## never gave this entrypoint a real consult AT PLAN TIME, because no

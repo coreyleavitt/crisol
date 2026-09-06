@@ -524,7 +524,7 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     let stats = CacheStats(
       l1Hits: 3, remoteHits: 5, misses: 7, remoteErrors: 11, localErrors: 13,
       total: 17, notConsulted: 19, hitPct: 23.5, wallSavedMs: 29'i64,
-      published: 31, verifyFails: 37,
+      published: 31, verifyFails: 37, trustRejects: 41, corruptReads: 43,
     )
     let node = toJson(syntheticResults(), syntheticSummary(),
                       cacheStats = stats, showCacheStats = true)
@@ -541,6 +541,8 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     check cs["wallSavedMs"].getInt  == 29
     check cs["published"].getInt    == 31
     check cs["verifyFails"].getInt  == 37
+    check cs["trustRejects"].getInt == 41  # rev 23 (RFC-0005 code-review R2-T8b)
+    check cs["corruptReads"].getInt == 43  # rev 23 (RFC-0005 code-review R2-T8b)
 
   test "RFC-0005 code-review T16: cacheStats is ABSENT when showCacheStats is false, even with a non-zero value":
     # Mirrors the keyDiff/cacheLookup absence convention: an all-default OR
@@ -556,7 +558,7 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     let stats = CacheStats(
       l1Hits: 3, remoteHits: 5, misses: 7, remoteErrors: 11, localErrors: 13,
       total: 17, notConsulted: 19, hitPct: 23.5, wallSavedMs: 29'i64,
-      published: 31, verifyFails: 37,
+      published: 31, verifyFails: 37, trustRejects: 41, corruptReads: 43,
     )
     let s = toJsonString(syntheticResults(), syntheticSummary(),
                          cacheStats = stats, showCacheStats = true)
@@ -572,6 +574,8 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     check cs["wallSavedMs"].getInt  == 29
     check cs["published"].getInt    == 31
     check cs["verifyFails"].getInt  == 37
+    check cs["trustRejects"].getInt == 41  # rev 23 (RFC-0005 code-review R2-T8b)
+    check cs["corruptReads"].getInt == 43  # rev 23 (RFC-0005 code-review R2-T8b)
 
   test "a run-phase interrupt-killed entry: outcome killed, run.cause {by: runner, reason: interrupt}":
     let r    = killedByInterruptDuringRun()
@@ -1671,8 +1675,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 22 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors)":
-    check RunSchemaRevision == 22
+  test "RunSchemaRevision is 23 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors; rev 23: rfc-0005 code-review R2-T8b cacheStats.trustRejects/corruptReads)":
+    check RunSchemaRevision == 23
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default

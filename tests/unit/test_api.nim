@@ -789,6 +789,13 @@ suite "RunReport.cacheStats — RFC-0005 B2b end-to-end (real runTests, no CLI)"
       check rr.cacheStats.misses > 0
       check rr.cacheStats.l1Hits == 0
       check rr.cacheStats.hitPct == 0.0
+      # RFC-0005 code-review R2-T8b: a genuine cold miss (no trust policy
+      # configured at all, nothing to reject) must read BOTH distinguishing
+      # counters zero -- the negative-control half of "distinguishable from
+      # a cold miss" (see the RFC-0005 C4 E2E-2 suite's tamper/corrupt tests
+      # for the positive half: trustRejects/corruptReads > 0 respectively).
+      check rr.cacheStats.trustRejects == 0
+      check rr.cacheStats.corruptReads == 0
 
   test "cacheStats requested, warm rerun -> a genuine hit (hits > 0, hitPct > 0)":
     withTempProject:
@@ -820,8 +827,14 @@ proc alwaysOfflineBackend(): CacheBackend =
   )
 
 proc offlineTierDeps(): CacheDeps =
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
-    discard cfg; discard stateDir; discard maxEntries
+  # RFC-0005 code-review R2-D5a: `buildRuntime` gained a fourth parameter,
+  # `resolvedSecrets` (threaded in by runTestsWith, pre-resolved+scrubbed) --
+  # this fixture builds its own fixed always-offline runtime and never
+  # needs real secrets, so it is accepted and discarded like the other
+  # three unused params.
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                              resolvedSecrets: CacheSecrets): CacheRuntime =
+    discard cfg; discard stateDir; discard maxEntries; discard resolvedSecrets
     CacheRuntime(
       cache: TieredCache(
         tiers: @[Tier(name: "l1", backend: alwaysOfflineBackend(), backfillOnHit: false, verifyTrust: false)],
@@ -986,11 +999,15 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     # The verify pass: buildVerifyPlan forces edRunFresh (SO5) -> dispatch
     # tries spawnRunDirect -> the binary is gone -> pkSpawnFailed -> SO4's
     # distinct category.
+    # RFC-0005 code-review R2-D2: `verifyCachePass` returns the full
+    # `VerifyPassResult` tuple now (the round-1 `.divergences`-only
+    # back-compat wrapper is deleted -- no compat obligation, zero
+    # production callers) -- project `.divergences` here explicitly.
     var divergences: seq[VerifyDivergence]
     let errText = captureStderr(proc () =
       divergences = verifyCachePass(
         results2, @[pep2], verifySample(pct = 100), cfg, g,
-        "2.2.10", "gcc 13.2.0", spec))
+        "2.2.10", "gcc 13.2.0", spec).divergences)
 
     check divergences.len == 0   # SO4: never misfiled as a divergence
     check epPath in errText
@@ -1019,40 +1036,31 @@ suite "runTestsWith / CacheDeps — production parity":
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored
 
-  test "productionCacheDeps().buildRuntime scrubs $CRISOL_CACHE_TOKEN[_<TIER>] from the process env (RFC-0005 C6/D5)":
-    ## Mirrors the existing hmac/sign-key scrub proofs (E2E-2, below) for
-    ## the bearer-token vars specifically: `resolveCacheSecrets` (api.nim)
-    ## captures BOTH the bare and suffixed forms, then delEnv's the whole
-    ## `CRISOL_CACHE_*` namespace unconditionally. No remote-cache tier is
-    ## configured here, so `configuredCache` never resolves a backend and
-    ## no real socket is ever touched -- this proves only the env
-    ## capture-then-scrub half.
-    ##
-    ## RFC-0005 code-review D5: `resolveCacheSecrets()` now runs LAZILY,
-    ## inside the closure `buildRuntime` returns -- calling
-    ## `productionCacheDeps()` alone (as this test did before D5) no longer
-    ## touches the environment at all; the scrub only happens once
-    ## `buildRuntime` is actually invoked (which `runTestsWith` only does
-    ## when `not opts.noCache` -- see the D5 suite below for the
-    ## `noCache:true` half of this proof).
-    putEnv("CRISOL_CACHE_TOKEN", "should-be-scrubbed")
-    putEnv("CRISOL_CACHE_TOKEN_MIRROR", "should-also-be-scrubbed")
-    defer:
-      delEnv("CRISOL_CACHE_TOKEN")
-      delEnv("CRISOL_CACHE_TOKEN_MIRROR")
+  test "productionCacheDeps().buildRuntime performs NO env scrub of its own (RFC-0005 code-review R2-D5a)":
+    ## Round-1 D5 made `buildRuntime`'s own closure call `resolveCacheSecrets()`
+    ## lazily; R2-D5a moves the resolve+scrub entirely OUT of this closure
+    ## and into `runTestsWith`, before `planImpl` (see the R2-D5a suite
+    ## below for the end-to-end ordering proof). `buildRuntime` now just
+    ## wires whatever `resolvedSecrets` it is handed straight into
+    ## `configuredCache` -- calling it directly, with a caller-supplied
+    ## `CacheSecrets()`, must not touch the process environment AT ALL,
+    ## even with `CRISOL_CACHE_*` vars present.
+    putEnv("CRISOL_CACHE_TOKEN", "must-survive-buildRuntime-called-alone")
+    defer: delEnv("CRISOL_CACHE_TOKEN")
     let deps = productionCacheDeps()
-    discard deps.buildRuntime(CacheConfig(), getTempDir() / "crisol_d5_scrub_state", 0)
-    check getEnv("CRISOL_CACHE_TOKEN") == ""
-    check getEnv("CRISOL_CACHE_TOKEN_MIRROR") == ""
+    discard deps.buildRuntime(CacheConfig(), getTempDir() / "crisol_d5_scrub_state", 0,
+                              CacheSecrets())
+    check getEnv("CRISOL_CACHE_TOKEN") == "must-survive-buildRuntime-called-alone"
 
 # ---------------------------------------------------------------------------
-# RFC-0005 code-review D5: `runTests()` eagerly called `productionCacheDeps()`
-# -> `resolveCacheSecrets()` (a scan + delEnv of the WHOLE CRISOL_CACHE_*
-# namespace) even under `noCache: true` -- an undocumented host-process
-# mutation for a library embedder that asked for NO caching at all. Fixed
-# by moving the resolution inside `buildRuntime`'s own closure (see the
-# test immediately above), which `runTestsWith` only ever calls when `not
-# opts.noCache`.
+# RFC-0005 code-review D5 (round 1): `runTests()` eagerly called
+# `productionCacheDeps()` -> `resolveCacheSecrets()` (a scan + delEnv of the
+# WHOLE CRISOL_CACHE_* namespace) even under `noCache: true` -- an
+# undocumented host-process mutation for a library embedder that asked for
+# NO caching at all. D5 fixed the SCOPE (gated on `not opts.noCache`); R2-D5a
+# (the suite below this one) fixes the TIMING (moved to before `planImpl`,
+# not merely before `buildRuntime`) without touching the scope guarantee
+# these two tests pin.
 # ---------------------------------------------------------------------------
 
 suite "RFC-0005 code-review D5 — no env mutation under opts.noCache":
@@ -1074,6 +1082,48 @@ suite "RFC-0005 code-review D5 — no env mutation under opts.noCache":
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl"))
       check rr.status == rsOk
       check getEnv("CRISOL_CACHE_TOKEN") == ""
+
+# ---------------------------------------------------------------------------
+# RFC-0005 code-review R2-D5a: the round-1 D5 fix deferred the resolve+scrub
+# into `productionCacheDeps().buildRuntime`'s own closure -- correct in
+# SCOPE (skipped under `noCache: true`, pinned above) but wrong in TIMING:
+# that closure only runs AFTER `planImpl` returns successfully, and
+# `planImpl` unconditionally spawns the Nim fingerprint-probe child
+# (`buildRunPlan`'s `cachedNimFingerprint()` argument) regardless of
+# whether the plan itself later succeeds or raises. A cache-enabled run
+# whose PLAN phase fails structurally (never reaches `buildRuntime` at
+# all -- `runTestsWith` returns `rsStructural` straight out of the
+# `planImpl` try/except) is the sharpest proof available in-process: if
+# the scrub happened inside `buildRuntime` (the old placement), such a run
+# would leave `CRISOL_CACHE_*` completely untouched. It does not.
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 code-review R2-D5a — env resolved+scrubbed BEFORE planImpl, not merely before buildRuntime":
+
+  test "cache-enabled run whose plan phase fails structurally still scrubs CRISOL_CACHE_* (proves the scrub precedes planImpl/buildRuntime, not merely the latter)":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      putEnv("CRISOL_CACHE_HMAC_KEY", "should-be-scrubbed-even-on-plan-failure")
+      defer: delEnv("CRISOL_CACHE_HMAC_KEY")
+      # An unknown group name makes planImpl raise CrisolError(cekConfig) ->
+      # runTestsWith's own except branch -> rsStructural, well before
+      # `deps.buildRuntime` is ever reached (that call sits AFTER the
+      # planImpl try/except returns successfully) or a probe child spawns.
+      let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl",
+                                   selection: namedGroups("no-such-group")))
+      check rr.status == rsStructural
+      check getEnv("CRISOL_CACHE_HMAC_KEY") == ""
+
+  test "noCache: true, same plan-failing config -> CRISOL_CACHE_* still left untouched (D5 guarantee holds through the reshape)":
+    withTempProject:
+      writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
+      putEnv("CRISOL_CACHE_HMAC_KEY", "must-survive-noCache-plan-failure")
+      defer: delEnv("CRISOL_CACHE_HMAC_KEY")
+      let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl",
+                                   selection: namedGroups("no-such-group"),
+                                   noCache: true))
+      check rr.status == rsStructural
+      check getEnv("CRISOL_CACHE_HMAC_KEY") == "must-survive-noCache-plan-failure"
 
 # ---------------------------------------------------------------------------
 # RFC-0005 A3b — E2E-A-trust (RFC §Definition of done, verbatim): two
@@ -1107,8 +1157,9 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let l1 = memory()
       let l2 = memory()
-      let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
-        discard cfg; discard stateDir; discard maxEntries
+      let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                                              resolvedSecrets: CacheSecrets): CacheRuntime =
+        discard cfg; discard stateDir; discard maxEntries; discard resolvedSecrets
         CacheRuntime(
           cache: TieredCache(
             tiers: @[
@@ -1410,33 +1461,18 @@ cache-trust {
       check epNode["cacheLookup"].getStr == "trustBadSignature"
       check epNode["cacheDecision"].getStr == "stored"
 
-      # RFC-0005 code-review T8: the RFC's own E2E-2 acceptance text (this
-      # suite's own doc comment, above) claims "cacheStats distinguishes it
-      # from a cold miss". Empirically it does NOT: aggregateCacheStats
-      # (cachetelemetry.nim) folds `l1Hits`/`remoteHits`/`misses`/`total`/
-      # `notConsulted` purely from each entrypoint's FINAL `cacheDecision`
-      # (+`cacheTier`) — never from `cacheLookup`/the tier verdicts. A
-      # trust-rejected read's `PlanLookup.decision` is `cdmKeyMiss` at
-      # lookup time (cachedispatch.lookupAtPlan: `l.hit.isNone` — "nothing
-      # servable" — is the SAME code path a genuine empty-cache cold miss
-      # takes), then `cdmStored` after the self-heal republish — EXACTLY
-      # the same two decisions a first-ever cold run produces. The
-      # trust-rejection verdict IS captured on the wire (`tekMiss.verdicts`
-      # carries it), but `aggregateCacheStats`'s `tekMiss` arm is a bare
-      # `discard` (miss COUNT is decision-sourced; the verdict itself is
-      # simply never folded into any `CacheStats` field). `tekRemoteErr`/
-      # `tekBackfillErr` (the only other candidates, feeding
-      # `remoteErrors`/`localErrors`) are PUT/backfill-failure events only
-      # — a READ-side trust rejection never emits either. This test PINS
-      # the actual (gap) shape rather than silently asserting the RFC's
-      # claim: `misses` reads 1 either way — a trust-rejected-then-healed
-      # run is byte-for-byte cacheStats-identical to a genuine cold miss
-      # in an equally-tiered setup (compare this to the plain "cold run"
-      # case in the "cache-stats resolution" suite above: same
-      # l1Hits/remoteHits/misses/hitPct shape). BLOCKER finding for the
-      # RFC text / a follow-up slice, not something this fix silently
-      # redefines.
+      # RFC-0005 code-review R2-T8b (fixes the round-1 T8 finding this test
+      # used to PIN as a gap): the RFC's own E2E-2 acceptance text ("cacheStats
+      # distinguishes it from a cold miss") now HOLDS. `misses` still reads 1
+      # either way (a trust-rejected-then-healed run is decision-sourced
+      # identically to a genuine cold miss — same `cdmKeyMiss` then
+      # `cdmStored` pair, see the "cache-stats resolution" suite above for
+      # the plain cold-run comparison) — the distinguishing signal is the
+      # ADDITIVE `trustRejects` counter, folded from `tekMiss.verdicts`
+      # (previously discarded; see cachetelemetry.aggregateCacheStats).
       check rr2.cacheStats.misses == 1
+      check rr2.cacheStats.trustRejects > 0    # THE distinguishing signal
+      check rr2.cacheStats.corruptReads == 0   # trust, not integrity -- see the sibling test
       check rr2.cacheStats.l1Hits == 0
       check rr2.cacheStats.remoteHits == 0
       check rr2.cacheStats.remoteErrors == 0   # NOT counted as a remote error
@@ -1487,13 +1523,18 @@ cache-trust {
       check rr2.results[0].cacheLookup == cvCorrupt
       check rr2.results[0].cacheDecision == cdmStored  # self-heal here too
 
-      # RFC-0005 code-review T8 (see the sibling "tamper + recompute
+      # RFC-0005 code-review R2-T8b (see the sibling "tamper + recompute
       # payloadChecksum" test's comment for the full analysis): `cvCorrupt`
       # takes the SAME `l.hit.isNone` ("nothing servable") path through
-      # lookupAtPlan as a genuine cold miss, so it lands in the identical
-      # cacheStats bucket -- confirmed here for the INTEGRITY-layer verdict
-      # too, not just the trust-layer one.
+      # lookupAtPlan as a genuine cold miss, so `misses` alone lands in the
+      # identical bucket -- confirmed here for the INTEGRITY-layer verdict
+      # too, not just the trust-layer one. `corruptReads` is the
+      # distinguishing signal this time (NOT `trustRejects` -- a bare
+      # byte-flip is caught at the integrity layer, before trust
+      # verification is ever reached).
       check rr2.cacheStats.misses == 1
+      check rr2.cacheStats.corruptReads > 0    # THE distinguishing signal
+      check rr2.cacheStats.trustRejects == 0   # integrity, not trust -- see the sibling test
       check rr2.cacheStats.l1Hits == 0
       check rr2.cacheStats.remoteHits == 0
       check rr2.cacheStats.remoteErrors == 0
@@ -2174,7 +2215,14 @@ proc e2e3EncodedHitBody(): string =
   jsonCacheSerializer().encode(entry)
 
 proc e2e3Deps(fs: E2E3Server; secrets = CacheSecrets()): CacheDeps =
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+  # RFC-0005 code-review R2-D5a: `buildRuntime`'s new `resolvedSecrets`
+  # param is deliberately named DIFFERENTLY from (and discarded, not used
+  # instead of) this proc's own `secrets` closure-over param -- this
+  # fixture wants ITS OWN fixed test secrets, never whatever runTestsWith
+  # resolved from the (in this suite, unset) real environment.
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                              resolvedSecrets: CacheSecrets): CacheRuntime =
+    discard resolvedSecrets
     configuredCache(cfg, stateDir, maxEntries, testRegistry(fs.e2e3Fetcher),
                     secrets, NilSink[TelemetryEvent]()))
 
@@ -2312,7 +2360,11 @@ proc e2e3StoreFetcher(st: E2E3Store): HttpFetcher =
       HttpReply(transport: toOk, status: 400, headers: @[], body: "")
 
 proc e2e3StoreDeps(st: E2E3Store; secrets: CacheSecrets): CacheDeps =
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+  # RFC-0005 code-review R2-D5a: see e2e3Deps's own comment, above, for why
+  # `resolvedSecrets` is named distinctly and discarded here.
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                              resolvedSecrets: CacheSecrets): CacheRuntime =
+    discard resolvedSecrets
     configuredCache(cfg, stateDir, maxEntries, testRegistry(st.e2e3StoreFetcher),
                     secrets, NilSink[TelemetryEvent]()))
 
@@ -2419,7 +2471,11 @@ proc e2e3AuthFetcher(fs: E2E3AuthServer): HttpFetcher =
 
 proc e2e3AuthDeps(fs: E2E3AuthServer; token: string): CacheDeps =
   let secrets = CacheSecrets(defaultHttpToken: some(token))
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int): CacheRuntime =
+  # RFC-0005 code-review R2-D5a: see e2e3Deps's own comment, above, for why
+  # `resolvedSecrets` is named distinctly and discarded here.
+  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                              resolvedSecrets: CacheSecrets): CacheRuntime =
+    discard resolvedSecrets
     configuredCache(cfg, stateDir, maxEntries, testRegistry(fs.e2e3AuthFetcher),
                     secrets, NilSink[TelemetryEvent]()))
 
