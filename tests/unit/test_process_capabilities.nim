@@ -53,10 +53,23 @@ suite "rfc-0007 A7 — capabilities() acceptance pins (per known tier, RFC-0007 
   let caps = capabilities()
 
   test "tier-pinned values hold on the tier this test is actually running on":
-    if getEnv("CRISOL_TIER") == "ci-linux":
+    case getEnv("CRISOL_TIER")
+    of "ci-linux":
       check caps.pidfd == true
       check caps.wait4Rusage == true
       check caps.flock == true
+      check caps.cgroupDelegation == false   # plain docker run: no delegation
+    of "ci-cgroup":
+      # rfc-0007 B3: ci.yml's `cgroup` job — same Linux CI container with a
+      # real cgroup-v2 subtree delegated before the suite starts, so every
+      # ci-linux pin holds PLUS delegation itself is real. An inert probe
+      # (or a regression) fails HERE, before B3's backend consumes it.
+      check caps.pidfd == true
+      check caps.wait4Rusage == true
+      check caps.flock == true
+      check caps.cgroupDelegation == true
+      check caps.cgroupKill == true
+      check caps.memoryPeak == true
     else:
       # rootless-podman dev tier (./dev test): no cgroup delegation, no
       # user-ns, but PR_SET_CHILD_SUBREAPER is unprivileged and unaffected.
