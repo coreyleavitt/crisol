@@ -60,6 +60,46 @@ when defined(linux):
     discard posix.close(cint(r))
     true
 
+  # -------------------------------------------------------------------------
+  # rfc-0007 B2 (§1/§3): pidfd + epoll-driven `next`, with timerfd deadlines.
+  # `posix/epoll` (a stdlib module living under lib/posix/, not the `std/`
+  # namespace) wraps epoll_create1/epoll_ctl/epoll_wait/EpollEvent
+  # already (Nim ships it); timerfd has no stdlib wrapper at all, so it is
+  # hand-rolled here with the same duplicate-importc idiom the rest of this
+  # module uses for RLIMIT_*/flock/prctl. Both are Linux-only kernel
+  # mechanisms (no Darwin equivalent) — guarded the same way probePidfd/
+  # probeSubreaper are, so `nim check --os:macosx` never even parses this
+  # branch.
+  # -------------------------------------------------------------------------
+  import posix/epoll
+
+  var EPOLL_CLOEXEC {.importc, header: "<sys/epoll.h>".}: cint
+
+  type
+    Itimerspec {.importc: "struct itimerspec", header: "<sys/timerfd.h>".} = object
+      it_interval: Timespec
+      it_value: Timespec
+
+  proc timerfd_create(clockid: ClockId; flags: cint): cint {.
+    importc: "timerfd_create", header: "<sys/timerfd.h>".}
+  proc timerfd_settime(fd: cint; flags: cint; new_value: ptr Itimerspec;
+                        old_value: ptr Itimerspec): cint {.
+    importc: "timerfd_settime", header: "<sys/timerfd.h>".}
+  var TFD_NONBLOCK {.importc, header: "<sys/timerfd.h>".}: cint
+  var TFD_CLOEXEC {.importc, header: "<sys/timerfd.h>".}: cint
+
+  proc forcePollRequested(): bool =
+    ## rfc-0007 B2 checklist item 544's env knob: forces `next()` onto the
+    ## poll(2) fallback path even on a pidfd-capable host, so the
+    ## conformance suite can be proven green under BOTH tiers (see
+    ## tests/conformance/test_conformance_timing.nim's B2 suite and this
+    ## repo's `./dev test` / CI wiring, which runs tests/conformance a
+    ## second time with this set). Read fresh per `initPosixCore` call
+    ## (a policy override, not a memoised environment fact like
+    ## `capabilities()` — nothing needs it to be process-global).
+    let v = getEnv("CRISOL_FORCE_POLL")
+    v.len > 0 and v != "0"
+
   # PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER: unprivileged since
   # Linux 3.4.
   proc c_prctl(option: cint): cint {.importc: "prctl", varargs,
@@ -94,6 +134,11 @@ type
     rusage: Option[types.Rusage]
     stop: Option[tuple[reason: KillReason, escalated: bool]]
     killSnapshot: seq[ProcSnapshot]
+    pidfd: cint                ## rfc-0007 B2: -1 unless `core.useEpoll` AND
+                                ## `pidfd_open` succeeded for this child —
+                                ## registered EPOLLIN in `core.epollFd` at
+                                ## spawn, closed + EPOLL_CTL_DEL'd at reap
+                                ## (the ONLY two touch points; never leaked).
 
   PosixCore* = object
     nextIdVal: int32
@@ -102,6 +147,11 @@ type
     pipeRead, pipeWrite: cint
     installedSignals: bool
     pendingShutdown: seq[ShutdownSignal]
+    epollFd: cint               ## rfc-0007 B2: -1 unless `useEpoll`.
+    timerFd: cint               ## rfc-0007 B2: -1 unless `useEpoll`.
+    useEpoll: bool               ## rfc-0007 B2: decided ONCE at init — Linux
+                                  ## + a real pidfd probe + CRISOL_FORCE_POLL
+                                  ## unset. Never re-evaluated mid-run.
 
 # ---------------------------------------------------------------------------
 # Self-pipe + shutdown signal handler.
@@ -152,7 +202,8 @@ proc initPosixCore*(installSignals: bool): PosixCore =
   ## is realistic at high --jobs fd pressure.
   result = PosixCore(nextIdVal: 0'i32, children: initTable[int32, ChildEntry](),
                       liveCount: 0, pipeRead: -1, pipeWrite: -1,
-                      installedSignals: installSignals)
+                      installedSignals: installSignals,
+                      epollFd: -1, timerFd: -1, useEpoll: false)
   var fds: array[2, cint]
   if posix.pipe(fds) != 0:
     raise newException(OSError, "initSupervisor: failed to create self-pipe")
@@ -168,6 +219,47 @@ proc initPosixCore*(installSignals: bool): PosixCore =
     raise newException(OSError, "initSupervisor: O_NONBLOCK failed on self-pipe read end")
   result.pipeRead = fds[0]
   result.pipeWrite = fds[1]
+  when defined(linux):
+    # rfc-0007 B2 (§1): event-driven `next` — chosen ONCE, here, never
+    # re-evaluated mid-run. `probePidfd()` (not `cachedCapabilities()`): a
+    # cheap, self-contained, idempotent probe (open+close a pidfd on our own
+    # pid) is all this decision needs; consulting the full memoised
+    # Capabilities would mean paying for cgroup/flock/wait4Rusage probes
+    # (real I/O: mkdir+write under /sys/fs/cgroup, a throwaway fork+wait4)
+    # merely to read one unrelated field. `capabilities().pidfd` (reported
+    # to callers/wire) and this internal decision are deliberately two
+    # separate calls to the SAME underlying mechanism — never made to share
+    # a code path, so a future divergence (e.g. `probePidfd` growing an
+    # extra check that should NOT gate backend selection) cannot silently
+    # couple the two.
+    if probePidfd() and not forcePollRequested():
+      let efd = epoll_create1(EPOLL_CLOEXEC)
+      if efd < 0:
+        discard posix.close(result.pipeRead)
+        discard posix.close(result.pipeWrite)
+        raise newException(OSError, "initSupervisor: epoll_create1 failed")
+      let tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK or TFD_CLOEXEC)
+      if tfd < 0:
+        discard posix.close(efd)
+        discard posix.close(result.pipeRead)
+        discard posix.close(result.pipeWrite)
+        raise newException(OSError, "initSupervisor: timerfd_create failed")
+      var pipeEv: EpollEvent
+      pipeEv.events = EPOLLIN.uint32
+      pipeEv.data.fd = result.pipeRead
+      var timerEv: EpollEvent
+      timerEv.events = EPOLLIN.uint32
+      timerEv.data.fd = tfd
+      if epoll_ctl(efd, EPOLL_CTL_ADD, result.pipeRead, addr pipeEv) != 0 or
+         epoll_ctl(efd, EPOLL_CTL_ADD, tfd, addr timerEv) != 0:
+        discard posix.close(tfd)
+        discard posix.close(efd)
+        discard posix.close(result.pipeRead)
+        discard posix.close(result.pipeWrite)
+        raise newException(OSError, "initSupervisor: epoll_ctl registration failed")
+      result.epollFd = efd
+      result.timerFd = tfd
+      result.useEpoll = true
   if installSignals:
     gShutdownWriteFd = fds[1]
     var sa: Sigaction
@@ -200,6 +292,12 @@ proc destroyPosixCore*(core: var PosixCore) =
     gShutdownWriteFd = -1
   if core.pipeRead >= 0: discard posix.close(core.pipeRead)
   if core.pipeWrite >= 0: discard posix.close(core.pipeWrite)
+  when defined(linux):
+    # rfc-0007 B2: the CORE-level epoll/timerfd fds (never per-child — those
+    # are `entry.pidfd`, closed at `reapCore`, which by the =destroy Defect
+    # guard above cannot still be outstanding here).
+    if core.epollFd >= 0: discard posix.close(core.epollFd)
+    if core.timerFd >= 0: discard posix.close(core.timerFd)
   core.children = initTable[int32, ChildEntry]()
   core.pendingShutdown = @[]
 
@@ -338,6 +436,27 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   discard posix.close(pipeWrite)
   discard setpgid(childPid, childPid)
 
+  var pidfd: cint = -1
+  when defined(linux):
+    # rfc-0007 B2: pidfd_open on our OWN just-forked child is valid
+    # immediately (no reap-vs-open race — the child cannot have been reaped
+    # by anything else yet, it isn't registered anywhere until this proc
+    # returns). A failure here (EMFILE, or a non-useEpoll core) is never
+    # fatal to the spawn: `pidfd` stays -1 and `pollSweepChildren`'s WNOHANG
+    # sweep — which runs every `nextEvent` iteration regardless of backend —
+    # is the honest, already-correct fallback observer for this one child.
+    if core.useEpoll:
+      let raw = c_syscall(SYS_pidfd_open, clong(childPid), 0.clong)
+      if raw >= 0:
+        let candidate = cint(raw)
+        var ev: EpollEvent
+        ev.events = EPOLLIN.uint32
+        ev.data.fd = candidate
+        if epoll_ctl(core.epollFd, EPOLL_CTL_ADD, candidate, addr ev) == 0:
+          pidfd = candidate
+        else:
+          discard posix.close(candidate)   # stays -1 — WNOHANG sweep covers it
+
   var rbuf: array[nLimits, uint8]
   var got = 0
   while got < rbuf.len:
@@ -363,7 +482,8 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   let id = core.nextIdVal
   inc core.nextIdVal
   core.children[id] = ChildEntry(pid: childPid, state: csSpawned,
-                                  reqLimits: spec.limits, achieved: achieved)
+                                  reqLimits: spec.limits, achieved: achieved,
+                                  pidfd: pidfd)
   inc core.liveCount
   SpawnResult(ok: true, id: ChildId(id))
 
@@ -474,11 +594,14 @@ proc groupRssBytesCore*(core: PosixCore; id: ChildId): Option[int64] =
   some(total)
 
 # ---------------------------------------------------------------------------
-# next — the ONE wait primitive. Poll-based (25 ms tick, the documented
-# fallback tier — pidfd/epoll is B1). Ready exits are ALWAYS drained before
-# weDeadline; the self-pipe is checked on every loop iteration, and blocking
-# happens via poll(2) on the self-pipe read fd so a signal wakes `next`
-# immediately instead of waiting out a fixed sleep (§1 shutdown-wakeup rule).
+# next — the ONE wait primitive. Event-driven via pidfd+epoll+timerfd when
+# `core.useEpoll` (rfc-0007 B2); poll(2) on the self-pipe with a 25ms tick
+# otherwise (non-Linux, or CRISOL_FORCE_POLL) — the ORIGINAL, still-live
+# fallback tier this file shipped with, unchanged in shape. Ready exits are
+# ALWAYS drained before weDeadline in both tiers; the self-pipe is checked on
+# every loop iteration, and a signal wakes `next` immediately instead of
+# waiting out a fixed sleep (§1 shutdown-wakeup rule), regardless of which
+# backend is blocking underneath.
 # ---------------------------------------------------------------------------
 
 proc decodeExit(wstatus: cint): Exit =
@@ -614,6 +737,62 @@ when defined(linux):
 else:
   proc sweepAdoptedOrphan(core: var PosixCore): Option[WaitEvent] = none(WaitEvent)
 
+proc pollBlock(core: PosixCore; now: MonoTime; deadline: MonoTime) =
+  ## The original (pre-B2) blocking step, unchanged: poll(2) on the
+  ## self-pipe, bounded to a 25ms tick (never past it — the top of
+  ## `nextEvent`'s loop re-checks everything regardless of why this
+  ## returned). Live on two tiers: every non-Linux backend this file backs
+  ## (no epoll/pidfd there at all), AND Linux with `CRISOL_FORCE_POLL` set
+  ## or `probePidfd()` false — the RFC's "falls back to polling when pidfd
+  ## is absent" requirement, proven by running the conformance suite with
+  ## the knob forced (tests/conformance/test_conformance_timing.nim's B2
+  ## suite).
+  let remainMs = (deadline - now).inMilliseconds
+  let tickMs = cint(min(25'i64, max(1'i64, remainMs)))
+  var pfd: TPollfd
+  pfd.fd = core.pipeRead
+  pfd.events = POLLIN
+  discard poll(addr pfd, 1, tickMs)
+
+when defined(linux):
+  proc epollBlock(core: PosixCore; now: MonoTime; deadline: MonoTime) =
+    ## rfc-0007 B2: the event-driven blocking step. Two independent, both
+    ## genuinely load-bearing bounds compose here:
+    ##   - `core.timerFd` is (re-)armed to the EXACT caller `deadline` on
+    ##     every pass, so a deadline nearer than 25ms away still wakes
+    ##     `epoll_wait` via a real registered event rather than merely
+    ##     being inferred from a rounded ms timeout — this is what keeps
+    ##     tight windows (term_ignores' 300ms grace, a runner slot's own
+    ##     imminent timeout) exact rather than rounded up to the next tick.
+    ##   - `epoll_wait`'s OWN ms timeout is separately capped at 25ms so the
+    ##     orphan sweep / RSS-sample ceiling still runs even when the
+    ##     caller's deadline is far away (conformance's 5s/10s deadlines) —
+    ##     the same cadence the pre-B2 poll(2) tick provided.
+    ## A registered child's pidfd becoming readable wakes this EARLY — the
+    ## actual latency win over the pre-B2 "wait out up to 25ms, then poll"
+    ## shape (proven by test_conformance_timing.nim's B2 latency case). The
+    ## returned event list is deliberately NOT inspected: `nextEvent`'s own
+    ## loop top unconditionally re-drains self-pipe / pollSweepChildren /
+    ## sweepAdoptedOrphan on every iteration regardless of which fd(s) woke
+    ## it — exactly what the old poll(2) step already did — so a spurious or
+    ## coalesced epoll wakeup is harmless, and the actual wait4() reap stays
+    ## the SAME single code path (pollSweepChildren) for both backends: a
+    ## registered child's exit is never observed-and-reaped via the pidfd
+    ## event itself, only woken by it, so there is no second reap path to
+    ## race the waitid(P_ALL, WNOWAIT) orphan sweep against (lesson from B1).
+    var spec: Itimerspec
+    zeroMem(addr spec, sizeof(spec))
+    let remainingNs = max(0'i64, (deadline - now).inNanoseconds)
+    spec.it_value.tv_sec = posix.Time(remainingNs div 1_000_000_000)
+    spec.it_value.tv_nsec = clong(remainingNs mod 1_000_000_000)
+    if remainingNs == 0:
+      spec.it_value.tv_nsec = 1   # 0 would DISARM (timerfd_settime semantics)
+    discard timerfd_settime(core.timerFd, 0.cint, addr spec, nil)
+    let remainMs = (deadline - now).inMilliseconds
+    let waitMs = cint(min(25'i64, max(1'i64, remainMs)))
+    var events: array[8, EpollEvent]
+    discard epoll_wait(core.epollFd, addr events[0], cint(events.len), waitMs)
+
 proc nextEvent*(core: var PosixCore; deadline: MonoTime): WaitEvent =
   while true:
     core.drainSelfPipe()
@@ -643,12 +822,13 @@ proc nextEvent*(core: var PosixCore; deadline: MonoTime): WaitEvent =
     if now >= deadline:
       return WaitEvent(kind: weDeadline)
 
-    let remainMs = (deadline - now).inMilliseconds
-    let tickMs = cint(min(25'i64, max(1'i64, remainMs)))
-    var pfd: TPollfd
-    pfd.fd = core.pipeRead
-    pfd.events = POLLIN
-    discard poll(addr pfd, 1, tickMs)
+    when defined(linux):
+      if core.useEpoll:
+        epollBlock(core, now, deadline)
+      else:
+        pollBlock(core, now, deadline)
+    else:
+      pollBlock(core, now, deadline)
     # Result ignored either way — the top of the loop re-checks everything
     # (self-pipe, exited-but-unreaped, and a fresh WNOHANG sweep).
 
@@ -859,7 +1039,16 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
     escapees: escapees,
     cooperativeUnavailable: false,   # POSIX: SIGTERM is always deliverable (§3)
   )
-  core.children[idx] = ChildEntry(state: csReaped)   # tombstone: pid dropped
+  when defined(linux):
+    # rfc-0007 B2: reap is the ONLY place a ChildId is consumed (§1) — so it
+    # is also the only correct place to release this child's pidfd
+    # registration. `entry.pidfd >= 0` iff spawnChild actually registered
+    # one (useEpoll AND pidfd_open/epoll_ctl both succeeded); otherwise this
+    # is a no-op, same as every other -1-sentinel guard in this file.
+    if entry.pidfd >= 0:
+      discard epoll_ctl(core.epollFd, EPOLL_CTL_DEL, entry.pidfd, nil)
+      discard posix.close(entry.pidfd)
+  core.children[idx] = ChildEntry(state: csReaped, pidfd: -1)   # tombstone: pid dropped
   dec core.liveCount
 
 # ---------------------------------------------------------------------------

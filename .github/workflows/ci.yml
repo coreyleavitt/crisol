@@ -59,6 +59,25 @@ jobs:
             -e CRISOL_TIER=ci-linux \
             ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh
 
+      # rfc-0007 B2: `next()` is event-driven (pidfd+epoll+timerfd) on this
+      # runner by default (Linux + a real pidfd probe) — CRISOL_FORCE_POLL
+      # forces the poll(2) fallback path instead, so the checklist's "green
+      # under both epoll and poll, forced via an env knob in tests"
+      # requirement (item 544) is proven every run, not just asserted. Only
+      # tests/conformance needs a second pass: it is the one suite that
+      # actually exercises `next()`'s backend selection
+      # (posixcore.initPosixCore); every other suite above already ran and
+      # is agnostic to which tier is live underneath.
+      - name: Run conformance suite forced onto the poll(2) fallback path
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            -e CRISOL_TIER=ci-linux \
+            -e CRISOL_FORCE_POLL=1 \
+            -e CRISOL_TEST_DIRS=tests/conformance \
+            ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh
+
       # RFC-0005 review fix (L1): before this step, NOTHING in CI ever built
       # the actual produced binary — the steps above only compile individual
       # test files, never src/crisol.nim as a whole program — so a regression

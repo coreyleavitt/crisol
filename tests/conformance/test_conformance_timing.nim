@@ -43,6 +43,7 @@ import ./helpers
 
 let hangBin        = compileFixture("hang_forever")
 let termIgnoresBin = compileFixture("term_ignores")
+let sleepBin       = compileFixture("sleep_then_exit")
 
 # ---------------------------------------------------------------------------
 # Timeout-kill grace timing.
@@ -170,6 +171,53 @@ suite "conformance timing — item 9: shutdown wakeup":
     check elapsed < initDuration(seconds = 2)   # well before the 10s deadline
     discard waitForExit(helper)
     close(helper)
+
+
+# ---------------------------------------------------------------------------
+# rfc-0007 B2 — event-driven exit detection: a registered child's pidfd
+# becoming readable wakes `next()` directly, instead of waiting out the
+# poll(2)-tier's up-to-25ms tick. `CRISOL_FORCE_POLL=1` (this file's own
+# knob-under-test) picks the OTHER bound deliberately, so running this suite
+# under both env states (see this repo's `./dev test` / `./dev timing` CI
+# wiring) proves both tiers live, not just the default one.
+#
+# Run BOTH tiers directly:
+#   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
+#     --path:src tests/conformance/test_conformance_timing.nim
+#   ./dev run env CRISOL_TIMING_TESTS=1 CRISOL_FORCE_POLL=1 nim r \
+#     --hints:off --warnings:off --path:src tests/conformance/test_conformance_timing.nim
+# ---------------------------------------------------------------------------
+
+suite "conformance timing — B2: event-driven exit detection":
+
+  test "a child's exit is observed promptly, not merely within the old 25ms poll tick":
+    var sv = initSupervisor(installSignals = false)
+    let outPath = tmpOutputFile("b2_latency")
+    const sleepMs = 200
+    let spec = ChildSpec(argv: @[sleepBin], cwd: getCurrentDir(),
+                          env: @[("CRISOL_SLEEP_MS", $sleepMs)],
+                          sinks: combinedSink(outPath))
+    let t0 = getMonoTime()
+    let sr = sv.spawn(spec)
+    check sr.ok
+    let ev = sv.next(t0 + initDuration(seconds = 5))
+    let elapsed = getMonoTime() - t0
+    check ev.kind == weChildExited
+    discard sv.reap(ev.id)
+    echo "  observed: exit detected ", elapsed.inMilliseconds,
+         " ms after spawn (fixture slept ", sleepMs, " ms)"
+    let forcedPoll = getEnv("CRISOL_FORCE_POLL", "") notin ["", "0"]
+    if forcedPoll:
+      # Poll(2) fallback tier: bounded by the retained ~25ms tick, same
+      # latency shape as pre-B2 — generous margin for scheduler noise.
+      check elapsed < initDuration(milliseconds = sleepMs + 60)
+    else:
+      # Event-driven tier: the child's pidfd becomes readable and wakes
+      # epoll_wait directly — detection latency is scheduling noise, not a
+      # poll quantum. A regression back to a poll-shaped wait (forgetting to
+      # register/consult the pidfd) would blow this bound.
+      check elapsed < initDuration(milliseconds = sleepMs + 20)
+    removeFile(outPath)
 
 when isMainModule:
   echo "test_conformance_timing done"

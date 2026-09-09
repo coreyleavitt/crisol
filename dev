@@ -8,7 +8,10 @@
 #   ./dev image          (re)build the dev image
 #   ./dev check          nim check (fast type/syntax verification)
 #   ./dev test           nimble test (serial bootstrap suite; excludes
-#                        tests/timing — see `./dev timing`)
+#                        tests/timing — see `./dev timing`); also re-runs
+#                        tests/conformance forced onto the poll(2) fallback
+#                        path (CRISOL_FORCE_POLL=1, rfc-0007 B2) so both
+#                        `next()` backends are proven every time
 #   ./dev timing         nimble test over tests/timing only, serially, with
 #                        CRISOL_TIMING_TESTS=1 (the timing/rlimits suite;
 #                        never part of `./dev test` — parallel host load
@@ -82,6 +85,15 @@ case "${cmd}" in
         # ci/run-tests.sh, not bare `nimble test`: nimble's custom-task exit
         # code is not trustworthy (see the script's header) — the wrapper is
         # the only honest signal.
+        podman_run bash ci/run-tests.sh
+        # rfc-0007 B2: prove the conformance suite is ALSO green forced onto
+        # the poll(2) fallback path (CRISOL_FORCE_POLL) -- the RFC checklist's
+        # "green under both epoll and poll, forced via an env knob in tests"
+        # requirement (item 544). Only tests/conformance needs a second pass
+        # here: it is the one suite that actually exercises `next()`'s
+        # backend selection (posixcore.initPosixCore); every other suite is
+        # agnostic to which tier is live underneath.
+        EXTRA_ENV=(--env CRISOL_FORCE_POLL=1 --env CRISOL_TEST_DIRS=tests/conformance)
         podman_run bash ci/run-tests.sh
         ;;
     timing)
