@@ -60,35 +60,47 @@ let binDir = fixtureDir / "bin"
 proc sabotageLeaf(leafPath: string) =
   ## Deterministically forces THIS leaf's `cgroup.procs` writes to fail —
   ## the "un-creatable leaf" the fault-injection test needs — WITHOUT
-  ## relying on filesystem tricks cgroupfs (a kernfs) does not actually
-  ## support (a plain `open(O_CREAT)` for an arbitrary regular file where
-  ## a directory needs to go is REJECTED by cgroupfs itself, not merely by
-  ## permission bits — confirmed empirically in CI), and without touching
-  ## the "no internal process" enable-while-populated constraint (also
-  ## tried and confirmed empirically NOT to reject a later cgroup.procs
-  ## write into an already-subtree_control-enabled-while-empty cgroup —
-  ## that constraint is checked at ENABLE time, not at migrate-in time).
-  ## Instead: pre-create the SAME leaf directory (harmless — `createDir`
+  ## relying on tricks that do not actually reject a migrate-in under this
+  ## kernel and a --privileged (root) CI container. Two earlier attempts
+  ## were empirically disproven against a real cgroup-v2 delegation
+  ## (kernel 6.12): (a) pre-creating a regular file where the leaf dir
+  ## goes — cgroupfs (a kernfs) rejects `open(O_CREAT)` outright, so the
+  ## sabotage itself errored; (b) `pids.max` = 0 on the leaf — the pids
+  ## controller charges FORKS, not MIGRATIONS, so moving an existing task
+  ## in is admitted regardless; (c) enabling `+cpu` on an empty leaf's own
+  ## `cgroup.subtree_control` — that constraint is checked at ENABLE time,
+  ## not at migrate-in time, and did not reject the later write.
+  ##
+  ## What DOES reject it, structurally and root-unbypassable: turning the
+  ## leaf into an INTERNAL node of the controller hierarchy, which cgroup
+  ## v2's "no internal process" rule forbids from holding member
+  ## processes. Pre-create the SAME leaf directory (harmless — `createDir`
   ## on an already-existing directory is a silent no-op, so `spawnChild`'s
-  ## own `createCgroupLeaf` still "succeeds"), then set the leaf's OWN
-  ## `pids.max` to 0. The `pids` controller is enabled root-down for the
-  ## whole delegated subtree (ci.yml's setup), so every leaf — including
-  ## this one — has a real, per-leaf `pids.max`; zero means the kernel
-  ## rejects ANY attempt to add a process to this cgroup (EAGAIN),
+  ## own `createCgroupLeaf` still "succeeds"), give it a real child
+  ## cgroup, and enable the MEMORY domain controller on the leaf's OWN
+  ## `cgroup.subtree_control` (memory is delegated root-down by ci.yml, so
+  ## every leaf has it available). The kernel then rejects ANY subsequent
+  ## write of a pid into THIS cgroup's `cgroup.procs` with EBUSY — exactly,
+  ## and only, the self-join step spawnChild's child performs,
   ## deterministically and regardless of privilege level (root cannot
-  ## write around a numeric admission-control ceiling) — exactly, and
-  ## only, the self-join step spawnChild's child performs.
+  ## write around a kernel structural invariant the way it can around a
+  ## permission bit). Verified against a --privileged cgroup-v2 container:
+  ## the memory controller triggers the rejection where `+cpu` did not.
   createDir(leafPath)
-  writeFile(leafPath / "pids.max", "0")
+  createDir(leafPath / "child")
+  writeFile(leafPath / "cgroup.subtree_control", "+memory")
 
 proc cleanupSabotagedLeaf(leafPath: string) =
   ## Safety-net teardown only — the production per-spawn honest-degrade
-  ## path (posixcore.spawnChild) is expected to have already rmdir'd this
-  ## leaf itself once it saw the child's join fail; this exists purely so
-  ## a test FAILURE (an assertion tripping before that path runs) never
-  ## leaves a stray sabotaged cgroup behind for the next test to collide
-  ## with. `pids.max` never blocks `rmdir` of an otherwise-empty leaf (it
-  ## only ever gates NEW admissions), so a bare rmdir is enough here.
+  ## path (posixcore.spawnChild) is expected to have already tried (and
+  ## harmlessly failed) to rmdir this now-non-empty leaf once it saw the
+  ## child's join fail; this exists purely so a test FAILURE (an assertion
+  ## tripping before that path runs) never leaves a stray sabotaged cgroup
+  ## behind for the next test to collide with. Unwind in reverse: disable
+  ## the controller, rmdir the child cgroup, then rmdir the leaf.
+  try: writeFile(leafPath / "cgroup.subtree_control", "-memory")
+  except CatchableError: discard
+  discard posix.rmdir((leafPath / "child").cstring)
   discard posix.rmdir(leafPath.cstring)   # bare rmdir — os.removeDir would try
                                             # (and fail) to unlink cgroupfs's
                                             # own control-file entries first
