@@ -1348,10 +1348,21 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
       escapees = cgroupLeafSurvivors(entry.cgroupLeaf)
       memOom = cgroupLeafOomKill(entry.cgroupLeaf)
       # Atomic, airtight teardown: kills anything still resident (a setsid
-      # escapee that outlived its own leader) in one write, then reclaim
-      # the leaf. Safe on an already-empty leaf (the normal-exit case) —
-      # cgroup.kill on nothing is a harmless no-op write.
+      # escapee that outlived its own leader) in one write. Safe on an
+      # already-empty leaf (the normal-exit case) — cgroup.kill on
+      # nothing is a harmless no-op write.
       killCgroupLeaf(entry.cgroupLeaf)
+      # A SIGKILL'd escapee leaves the cgroup (kernel `do_exit()`) almost
+      # immediately, but it does NOT leave the process table until its
+      # real OS parent wait()s it — same subreaper reparenting as the
+      # non-cgroup tier (this process set PR_SET_CHILD_SUBREAPER
+      # unconditionally in initPosixCore), so it is as reapable here as
+      # `discoverAndReapEscapees`'s own kills are. Reap each one the exact
+      # same bounded, non-blocking way (`reapBounded`, B1's own
+      # convention) — never leaked as an unreaped zombie waiting on the
+      # async orphan sweep's own timing.
+      for snap in escapees:
+        reapBounded(Pid(snap.pid))
       discard removeCgroupLeafBounded(entry.cgroupLeaf)   # never leak leaves
   if not usedCgroup:
     # rfc-0007 B1 (§3): the owning slot's LIVE + reparented escapees,
