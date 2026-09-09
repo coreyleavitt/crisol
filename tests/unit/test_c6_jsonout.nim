@@ -46,7 +46,7 @@ suite "C6 — run/v1 regressions + render":
     ## rfc-0005 code-review D1 bumped 21->22 (`cacheStats.localErrors`);
     ## rfc-0005 code-review R2-T8b bumped 22->23 (`cacheStats.trustRejects`/
     ## `cacheStats.corruptReads`).
-    check RunSchemaRevision == 23
+    check RunSchemaRevision == 24
 
   test "regressions array present and empty when no regressions":
     let results = @[

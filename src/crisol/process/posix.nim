@@ -83,10 +83,20 @@ proc forceKill*(sv: var Supervisor; id: ChildId) =
   ## same atomic no-op rule as requestStop (§1).
   forceKillCore(sv.core, id)
 
-proc reap*(sv: var Supervisor; id: ChildId): ReapReport =
+proc reap*(sv: var Supervisor; id: ChildId; runPhase: bool = false): ReapReport =
   ## The only place a ChildId is consumed (§1). Precondition: `weChildExited`
   ## was reported for this id — Defect otherwise.
-  reapCore(sv.core, id)
+  ##
+  ## `runPhase` (B1 regression fix, part B): pass `true` ONLY for a genuine
+  ## RUN-phase reap (the executor's `finalizeSlot` passes
+  ## `slot.phase == spRunning`) — it gates whether reparented-orphan
+  ## (ppid==ownPid) escapee discovery+kill engages at all in
+  ## `discoverAndReapEscapees`. Defaults to `false`: every other caller
+  ## (compile-phase reaps, a discarded teardown reap, direct-Supervisor
+  ## tests with no compile/run phase concept at all) gets the conservative,
+  ## pre-B1 pgid-only scan — never a false-positive escapee off a
+  ## reparented compile-toolchain transient.
+  reapCore(sv.core, id, runPhase)
 
 proc snapshotTree*(sv: Supervisor; id: ChildId): seq[ProcSnapshot] =
   ## Kill/reap FORENSICS only (§1) — never zero-filled where readable.

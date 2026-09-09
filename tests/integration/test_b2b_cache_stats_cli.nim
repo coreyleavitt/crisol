@@ -5,7 +5,7 @@
 ##
 ## Properties pinned (RFC-0005 line 561, B2b; line 542, E2E-B):
 ##   1. A cold run (--cache-stats --json) shows misses > 0, hitPct == 0.0,
-##      a nonzero `cacheStats.total`, and `schemaRevision == 23` (rev 21
+##      a nonzero `cacheStats.total`, and `schemaRevision == 24` (rev 21
 ##      B2b's original cacheStats object + rev 22's additive `localErrors`
 ##      (RFC-0005 code-review D1) + rev 23's additive `trustRejects`/
 ##      `corruptReads` (RFC-0005 code-review R2-T8b)).
@@ -102,7 +102,7 @@ suite "B2b CLI — --cache-stats --json: cold run then warm rerun":
                           "--cache-stats", "--json"])
     check r1.code == 0
     let doc1 = parseJson(r1.stdout)
-    check doc1["schemaRevision"].getInt == 23  # rev 23: RFC-0005 code-review R2-T8b's cacheStats.trustRejects/corruptReads
+    check doc1["schemaRevision"].getInt == 24  # rev 23: RFC-0005 code-review R2-T8b's cacheStats.trustRejects/corruptReads
     check doc1.hasKey("cacheStats")
     let cs1 = doc1["cacheStats"]
     check cs1["misses"].getInt > 0

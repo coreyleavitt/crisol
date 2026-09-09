@@ -23,7 +23,7 @@
 ## the same C symbol are safe and idiomatic in Nim (no C definition is
 ## emitted, only a reference through the header).
 
-import std/[options, os, posix, strutils, tables, monotimes, times]
+import std/[options, os, posix, sets, strutils, tables, monotimes, times]
 import crisol/process/types
 
 # ---------------------------------------------------------------------------
@@ -34,6 +34,49 @@ var RLIMIT_CORE   {.importc: "RLIMIT_CORE",   header: "<sys/resource.h>".}: cint
 var RLIMIT_FSIZE  {.importc: "RLIMIT_FSIZE",  header: "<sys/resource.h>".}: cint
 var RLIMIT_CPU    {.importc: "RLIMIT_CPU",    header: "<sys/resource.h>".}: cint
 var RLIMIT_AS     {.importc: "RLIMIT_AS",     header: "<sys/resource.h>".}: cint
+
+# ---------------------------------------------------------------------------
+# rfc-0007 B1 (§3): Linux-only syscall/prctl FFI, moved ahead of
+# initPosixCore/PosixCore so `initPosixCore` can set PR_SET_CHILD_SUBREAPER
+# DELIBERATELY (not merely as `probeSubreaper`'s capability-probe side
+# effect) — a Supervisor must be a subreaper by construction. Also used by
+# the escapee-kill/orphan-sweep mechanism further down this file
+# (discoverAndReapEscapees, nextEvent's orphan sweep). No Nim wrapper exists
+# for pidfd_open/pidfd_send_signal (even std/posix's own `syscall` helper is
+# `when defined(android)`-only) — importc syscall(2) directly, the same
+# duplicate-importc idiom this module's header sanctions.
+# ---------------------------------------------------------------------------
+
+when defined(linux):
+  proc c_syscall(number: clong): clong {.importc: "syscall", varargs,
+                                         header: "<unistd.h>".}
+  var SYS_pidfd_open {.importc: "SYS_pidfd_open", header: "<sys/syscall.h>".}: clong
+  var SYS_pidfd_send_signal {.importc: "SYS_pidfd_send_signal",
+                              header: "<sys/syscall.h>".}: clong
+
+  proc probePidfd(): bool =
+    let r = c_syscall(SYS_pidfd_open, clong(getpid()), 0.clong)
+    if r < 0: return false
+    discard posix.close(cint(r))
+    true
+
+  # PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER: unprivileged since
+  # Linux 3.4.
+  proc c_prctl(option: cint): cint {.importc: "prctl", varargs,
+                                     header: "<sys/prctl.h>".}
+  var PR_SET_CHILD_SUBREAPER {.importc, header: "<sys/prctl.h>".}: cint
+  var PR_GET_CHILD_SUBREAPER {.importc, header: "<sys/prctl.h>".}: cint
+
+  proc probeSubreaper(): bool =
+    ## Set-then-read-back is the real verification (not "the set call
+    ## returned 0, therefore assume it worked").
+    if c_prctl(PR_SET_CHILD_SUBREAPER, 1.cint) != 0: return false
+    var val: cint = -1
+    if c_prctl(PR_GET_CHILD_SUBREAPER, addr val) != 0: return false
+    val == 1
+else:
+  proc probePidfd(): bool = false
+  proc probeSubreaper(): bool = false
 
 # ---------------------------------------------------------------------------
 # PosixCore — the shared state: child registry, self-pipe, act ledger.
@@ -133,6 +176,15 @@ proc initPosixCore*(installSignals: bool): PosixCore =
     sa.sa_flags = SA_RESTART
     discard sigaction(SIGINT, sa, nil)
     discard sigaction(SIGTERM, sa, nil)
+  when defined(linux):
+    # rfc-0007 B1 (§3): a Supervisor IS a subreaper by construction — set
+    # DELIBERATELY here, independent of `probeSubreaper`'s capability probe
+    # (which may run lazily, before or after this call, memoised once per
+    # PROCESS rather than per Supervisor instance). Idempotent with the
+    # probe's own set-then-read-back; orphans at any depth reparent to this
+    # process from this point on, feeding `discoverAndReapEscapees` and
+    # `nextEvent`'s orphan sweep below.
+    discard c_prctl(PR_SET_CHILD_SUBREAPER, 1.cint)
 
 proc liveChildCount*(core: PosixCore): int =
   ## Spawned-but-not-reaped count — the `=destroy` Defect guard (§1).
@@ -322,16 +374,24 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
 # memprobe/admission to call through the Supervisor instead of duplicating it.
 # ---------------------------------------------------------------------------
 
-proc parseStatLine(content: string): tuple[ppid, pgrp: int; comm: string] =
-  ## /proc/<pid>/stat: "pid (comm) state ppid pgrp ...". comm may itself
-  ## contain spaces/parens, so split on the LAST ')' (same technique
-  ## test_pgroup.nim already uses for the same reason).
+proc parseStatLine*(content: string): tuple[ppid, pgrp: int; comm: string; starttime: int64] =
+  ## /proc/<pid>/stat: "pid (comm) state ppid pgrp ... starttime ...". comm
+  ## may itself contain spaces/parens, so split on the LAST ')' (same
+  ## technique test_pgroup.nim already uses for the same reason). Exported
+  ## (rfc-0007 B1) so its field-counting is unit-testable directly — see
+  ## tests/unit/test_rfc0007_b1_stat_parsing.nim.
+  ##
+  ## Field numbering (man proc(5), 1-indexed): 1 pid, 2 comm, 3 state,
+  ## 4 ppid, 5 pgrp, ..., 22 starttime. The post-')' remainder's tokens
+  ## start at field 3 (state), so token index `k` is field `3 + k`;
+  ## starttime (field 22) is token index 19 — the 20th token after comm.
   let openIdx = content.find('(')
   let closeIdx = content.rfind(')')
   let comm = if openIdx >= 0 and closeIdx > openIdx: content[openIdx + 1 ..< closeIdx]
              else: ""
   var ppid = -1
   var pgrp = -1
+  var starttime = int64(-1)
   if closeIdx >= 0 and closeIdx + 2 < content.len:
     let rest = content[closeIdx + 2 .. ^1]
     let parts = rest.splitWhitespace()
@@ -340,7 +400,10 @@ proc parseStatLine(content: string): tuple[ppid, pgrp: int; comm: string] =
       except ValueError: discard
       try: pgrp = parseInt(parts[2])
       except ValueError: discard
-  (ppid, pgrp, comm)
+    if parts.len >= 20:
+      try: starttime = parseBiggestInt(parts[19])
+      except ValueError: discard
+  (ppid, pgrp, comm, starttime)
 
 proc readVmRssBytes(pid: int): int64 =
   try:
@@ -354,12 +417,17 @@ proc readVmRssBytes(pid: int): int64 =
     discard
   0'i64
 
-proc scanProcessGroup*(pgid: Pid): seq[ProcSnapshot] =
-  ## Walk /proc, keep every pid whose pgrp == pgid. pgid-only tier — a
-  ## setsid escape is invisible (§3), which is exactly why `reapCore`
-  ## reports `tree = treeObservationFor(kdsProcessGroup)` (A6a: always
-  ## `toUnobservable` on this backend) regardless of what a given scan
-  ## finds — observability is a property of the mechanism, not the scan.
+type
+  ProcStatInfo = object
+    ## One /proc walk's raw yield per live pid — the shared source both
+    ## `scanProcessGroup` (pgid-only, pre-B1 tier) and B1's
+    ## `discoverAndReapEscapees`/orphan sweep fold over, so the two never
+    ## drift onto separate readings of the same instant.
+    pid, ppid, pgrp: int
+    comm: string
+    starttime: int64
+
+proc walkProcTable(): seq[ProcStatInfo] =
   result = @[]
   try:
     for kind, path in walkDir("/proc"):
@@ -369,14 +437,26 @@ proc scanProcessGroup*(pgid: Pid): seq[ProcSnapshot] =
       except ValueError: continue
       try:
         let stat = readFile(path / "stat")
-        let (ppid, pgrp, comm) = parseStatLine(stat)
-        if pgrp == int(pgid):
-          result.add ProcSnapshot(pid: pid, ppid: ppid, command: comm,
-                                   rssBytes: readVmRssBytes(pid))
+        let (ppid, pgrp, comm, starttime) = parseStatLine(stat)
+        result.add ProcStatInfo(pid: pid, ppid: ppid, pgrp: pgrp, comm: comm,
+                                starttime: starttime)
       except CatchableError:
         discard   # vanished between enumeration and read — skip it
   except CatchableError:
     discard         # /proc unreadable — empty snapshot, never fabricated
+
+proc scanProcessGroup*(pgid: Pid): seq[ProcSnapshot] =
+  ## Walk /proc, keep every pid whose pgrp == pgid. pgid-only tier — a
+  ## setsid escape is invisible (§3); on the (non-Linux) tier where B1's
+  ## subreaper mechanism never engages, `reapCore` reports
+  ## `tree = treeObservationFor(kdsProcessGroup)` (always `toUnobservable`)
+  ## regardless of what a given scan finds — observability is a property
+  ## of the mechanism, not the scan.
+  result = @[]
+  for info in walkProcTable():
+    if info.pgrp == int(pgid):
+      result.add ProcSnapshot(pid: info.pid, ppid: info.ppid, command: info.comm,
+                               rssBytes: readVmRssBytes(info.pid))
 
 proc snapshotTreeCore*(core: PosixCore; id: ChildId): seq[ProcSnapshot] =
   let idx = int32(id)
@@ -439,6 +519,101 @@ proc pollSweepChildren(core: var PosixCore): Option[int32] =
       return some(id)
   none(int32)
 
+when defined(linux):
+  var P_ALL {.importc, header: "<sys/wait.h>".}: cint
+
+  proc sweepAdoptedOrphan(core: var PosixCore): Option[WaitEvent] =
+    ## rfc-0007 B1 (§3): beside the registered-child wait set above, peek
+    ## for ANY exited child via `waitid(P_ALL, WNOWAIT)` — the ONLY way an
+    ## ADOPTED orphan (reparented via PR_SET_CHILD_SUBREAPER, never in the
+    ## spawn registry at all) is discovered: a naive `waitpid(-1)` loop
+    ## would consume it blind, with no chance to attribute it to anything
+    ## first. `WNOWAIT` leaves the zombie waitable — its pgid can still be
+    ## read from /proc before this proc reaps it for real.
+    ##
+    ## `pollSweepChildren`, above this in `nextEvent`'s call order, already
+    ## drains every registered exit it can SEE as of the top of this
+    ## iteration — but a registered child that exits in the gap between
+    ## `pollSweepChildren` returning "nothing yet" and this call's own
+    ## `waitid(P_ALL, ...)` running is still findable here (`P_ALL` matches
+    ## ANY exited child, registered or not). The own-pid check right after
+    ## `orphanPid` below handles exactly that race by re-attributing it as
+    ## the registered slot's normal exit, not an orphan — see its comment
+    ## (B1 regression fix). Genuinely unregistered descendants (the ones
+    ## this proc exists for) never match that check and fall through to
+    ## the pgrp-based attribution as before. (A registered slot that is
+    ## still ALIVE cannot match either path: `WEXITED` only matches
+    ## children that have already terminated.)
+    # Zeroing first is the portable way to detect "nothing ready" under
+    # WNOHANG: POSIX only guarantees `si_pid` is set when a child WAS
+    # found, not that it is zeroed when none was.
+    var info: SigInfo
+    zeroMem(addr info, sizeof(info))
+    let rc = waitid(P_ALL, Id(0), info, WEXITED or WNOWAIT or WNOHANG)
+    if rc != 0 or info.si_pid == 0:
+      # ECHILD (no children of ANY kind right now) or WNOHANG-empty —
+      # either way, nothing to report this call.
+      return none(WaitEvent)
+    let orphanPid = int(info.si_pid)
+    # B1 regression fix: this `waitid(P_ALL, WNOWAIT)` races `pollSweep-
+    # Children`'s per-pid `wait4(WNOHANG)` for a REGISTERED slot's OWN
+    # exit — if that slot's process transitions from alive to exited in
+    # the (nanosecond) gap between pollSweepChildren's loop finishing and
+    # THIS call starting, this call — not pollSweepChildren's — is the one
+    # that observes it (`P_ALL` matches ANY exited child, registered or
+    # not; the docstring's "by construction never a registered pid" claim
+    # above holds only for state as of the top of THIS `nextEvent`
+    # iteration, not for a fresh exit landing in the gap between the two
+    # checks within it). Left unhandled: the registered slot's own reap
+    # gets stolen here (the `wait4` below consumes it for good) while its
+    # `core.children` entry never leaves `csSpawned` — every future
+    # `pollSweepChildren` attempt on that pid then returns ECHILD (already
+    # reaped) forever, and the slot never reports `weChildExited`: a
+    # permanent event-loop livelock (the `a2b_shared_grace` hang this
+    # comment was written to fix). Checked BEFORE the pgrp-based orphan/
+    # escapee attribution below, by the OWN pid (not pgrp): if `orphanPid`
+    # IS some live registered slot's own pid, this is that slot's normal
+    # exit, not an orphan at all — handle it exactly like
+    # `pollSweepChildren` would and report `weChildExited` instead.
+    for cid, e in core.children.pairs:
+      if e.state == csSpawned and int(e.pid) == orphanPid:
+        var wstatus: cint
+        var ru: posix.Rusage
+        discard wait4(Pid(orphanPid), addr wstatus, 0.cint, addr ru)  # the real reap
+        var updated = e
+        updated.exit = decodeExit(wstatus)
+        updated.rusage = some(decodeRusage(ru))
+        updated.state = csExited
+        core.children[cid] = updated
+        return some(WaitEvent(kind: weChildExited, id: ChildId(cid)))
+    # Attribution BEFORE reap (§3): pgid, read while the zombie still
+    # exists (WNOWAIT did not consume it).
+    var ppid = -1
+    var pgrp = -1
+    var comm = ""
+    try:
+      let stat = readFile("/proc/" & $orphanPid & "/stat")
+      let parsed = parseStatLine(stat)
+      ppid = parsed.ppid
+      pgrp = parsed.pgrp
+      comm = parsed.comm
+    except CatchableError:
+      discard   # raced by something else reading it — attribution stays
+                # honestly empty; the reap below still clears the zombie.
+    let rss = readVmRssBytes(orphanPid)   # 0 for a zombie — honest, not fabricated
+    var ownedBy = none(ChildId)
+    for cid, e in core.children.pairs:
+      if e.state == csSpawned and int(e.pid) == pgrp:
+        ownedBy = some(ChildId(cid))
+        break
+    var wstatus: cint
+    var ru: posix.Rusage
+    discard wait4(Pid(orphanPid), addr wstatus, 0.cint, addr ru)  # the real reap
+    let snap = ProcSnapshot(pid: orphanPid, ppid: ppid, command: comm, rssBytes: rss)
+    return some(WaitEvent(kind: weOrphanReaped, orphan: snap, ownedBy: ownedBy))
+else:
+  proc sweepAdoptedOrphan(core: var PosixCore): Option[WaitEvent] = none(WaitEvent)
+
 proc nextEvent*(core: var PosixCore; deadline: MonoTime): WaitEvent =
   while true:
     core.drainSelfPipe()
@@ -456,6 +631,13 @@ proc nextEvent*(core: var PosixCore; deadline: MonoTime): WaitEvent =
     let found = pollSweepChildren(core)
     if found.isSome:
       return WaitEvent(kind: weChildExited, id: ChildId(found.get))
+
+    # rfc-0007 B1 (§3): the orphan sweep — LOWEST priority, checked only
+    # once every registered exit above has been drained (so it can never
+    # race a registered slot's own reap; see sweepAdoptedOrphan's doc).
+    let orphanEvent = sweepAdoptedOrphan(core)
+    if orphanEvent.isSome:
+      return orphanEvent.get
 
     let now = getMonoTime()
     if now >= deadline:
@@ -512,45 +694,168 @@ proc forceKillCore*(core: var PosixCore; id: ChildId) =
   core.children[idx] = entry
 
 # ---------------------------------------------------------------------------
+# rfc-0007 B1 (§3): the subreaper-tier escapee kill+reap mechanism —
+# reapCore's owning-slot discovery of LIVE + reparented descendants, killed
+# via pidfd_open + a starttime identity check (pid-reuse-safe), then reaped.
+# ---------------------------------------------------------------------------
+
+proc cachedCapabilities*(): Capabilities
+  ## Forward declaration — the real probe/memo lives in the capabilities
+  ## section below (this proc predates that section textually so
+  ## `reapCore` can consult it for the achieved killDomain).
+
+proc reapBounded(pid: Pid) =
+  ## B1 regression fix, part A: a SIGKILL target becomes a reapable zombie
+  ## essentially immediately, but `discoverAndReapEscapees` runs ON the
+  ## single-threaded event-loop thread — an unbounded blocking `wait4(pid,
+  ## 0)` here would starve the WHOLE loop (self-pipe/SIGINT wakeup included)
+  ## on any target that does not die promptly, turning a 6s interrupt into
+  ## a full wall-clock timeout downstream. Bounded, non-blocking WNOHANG
+  ## polling instead: try for up to ~300ms total (5ms between tries), then
+  ## give up WITHOUT ever blocking. The run-level `sweepAdoptedOrphan`
+  ## (nextEvent) is the honest fallback home for a genuine straggler, not
+  ## this proc — this bound only guards the pathological case.
+  const budgetMs = 300
+  const stepMs = 5
+  var waited = 0
+  while waited < budgetMs:
+    var wstatus: cint
+    var ru: posix.Rusage
+    let r = wait4(pid, addr wstatus, WNOHANG, addr ru)
+    if r == pid or r < 0:
+      return   # reaped, or ECHILD (not ours to reap) — either way, done
+    os.sleep(stepMs)
+    waited += stepMs
+
+when defined(linux):
+  proc discoverAndReapEscapees(core: PosixCore; excludeIdx: int32; pgid: Pid;
+                               caps: Capabilities; runPhase: bool): seq[ProcSnapshot] =
+    ## Owning-slot escapees (§3): every /proc entry whose pgrp matches this
+    ## slot's domain pgid (same-pgroup survivor, the pre-B1 case) OR whose
+    ## ppid is crisol's own pid (reparented via PR_SET_CHILD_SUBREAPER —
+    ## covers a setsid escape, invisible to the pgid test alone) —
+    ## excluding this process itself and every OTHER still-live registered
+    ## slot (their own descendants are none of THIS reap's business; each
+    ## slot's own eventual reap claims its own). Only engaged on the real
+    ## subreaper+pidfd tier (caps.subreaper and caps.pidfd) — otherwise
+    ## falls back to the pre-B1 observe-only pgid scan: without a real
+    ## subreaper a reparented-orphan claim would be unfounded, and without
+    ## pidfd there is no pid-reuse-safe kill handle.
+    ##
+    ## B1 regression fix, part B: `runPhase` scopes the ppid==ownPid
+    ## (reparented-orphan) half of this discovery to genuine RUN-phase
+    ## reaps only. `reapCore` runs for EVERY reap, including compile-phase
+    ## ones — and crisol's own compile toolchain (`nim` -> `cc`/`gcc`, both
+    ## `# process-contract-exempt`) can transiently reparent to crisol (a
+    ## subreaper) mid-compile. Without this guard that toolchain transient
+    ## would be misclassified as a test escapee: a normal compile would go
+    ## spuriously uncacheable and render a bogus `[ESCAPEE]` warning — test
+    ## escapees (spawn_grandchild/spawn_grandchild_setsid) are a RUN-phase
+    ## concept only. When `runPhase` is false this falls back to the exact
+    ## pre-B1 compile path: pgid-only `scanProcessGroup`, no ppid scan, no
+    ## kill. Accepted misattribution window (never unsound, per the RFC's
+    ## "named misattribution windows" posture): a concurrent toolchain
+    ## transient rarely reparenting during an ACTUAL run reap could still be
+    ## counted as that slot's escapee — conservatively uncacheable, that's
+    ## all.
+    if not runPhase or not (caps.subreaper and caps.pidfd):
+      return scanProcessGroup(pgid)
+    result = @[]
+    var livePids: HashSet[int]
+    for cid, e in core.children.pairs:
+      if cid != excludeIdx and e.state != csReaped:
+        livePids.incl int(e.pid)
+    let ownPid = int(getpid())
+    var seen: HashSet[int]
+    for info in walkProcTable():
+      if info.pid == ownPid: continue
+      if info.pid in livePids: continue
+      if info.pid in seen: continue
+      if info.pgrp != int(pgid) and info.ppid != ownPid: continue
+      seen.incl info.pid
+      let pidfd = cint(c_syscall(SYS_pidfd_open, clong(info.pid), 0.clong))
+      if pidfd < 0:
+        continue  # already vanished between the walk and here — a genuine
+                   # self-death this scan just missed; B1b's orphan sweep
+                   # (nextEvent) is the honest home for it, not here.
+      # Starttime identity check BEFORE signalling (§3): the pid could have
+      # been reused between the /proc walk above and this instant — killing
+      # by the raw snapshot pid alone is exactly the race the pgid design
+      # avoids everywhere else, so the fd from pidfd_open (bound to the
+      # specific process instance) is necessary but re-reading
+      # /proc/<pid>/stat is what confirms WHICH instance it is.
+      var curStarttime = int64(-1)
+      try:
+        let stat2 = readFile("/proc/" & $info.pid & "/stat")
+        let (_, _, _, st2) = parseStatLine(stat2)
+        curStarttime = st2
+      except CatchableError:
+        discard
+      if curStarttime != info.starttime:
+        discard posix.close(pidfd)
+        continue   # reused (or vanished) — do NOT kill; treat as vanished
+      let rss = readVmRssBytes(info.pid)
+      discard c_syscall(SYS_pidfd_send_signal, clong(pidfd), clong(cint(SIGKILL)),
+                        0.clong, 0.clong)
+      discard posix.close(pidfd)
+      reapBounded(Pid(info.pid))
+        # Bounded, not blocking (part A above): SIGKILL is unblockable, so
+        # the target becomes a reapable zombie essentially immediately in
+        # practice — `reapBounded` reaps it within a few ms. A failure to
+        # reap within the bound (e.g. ECHILD — a same-pgroup descendant
+        # several levels down whose OWN immediate parent is a different,
+        # still-uncollected orphan, so THIS process is not its real parent)
+        # is silently accepted: a documented, accepted misattribution/
+        # collection-depth window (the RFC's "named misattribution windows"
+        # posture), not a crash — and never a blocked event loop.
+      result.add ProcSnapshot(pid: info.pid, ppid: info.ppid, command: info.comm,
+                              rssBytes: rss)
+else:
+  proc discoverAndReapEscapees(core: PosixCore; excludeIdx: int32; pgid: Pid;
+                               caps: Capabilities; runPhase: bool): seq[ProcSnapshot] =
+    scanProcessGroup(pgid)
+
+# ---------------------------------------------------------------------------
 # reap — the only place a ChildId is consumed (§1).
 # ---------------------------------------------------------------------------
 
-proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
+proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
+  ## `runPhase` (B1 regression fix, part B): true iff this reap is for a
+  ## genuine RUN-phase child (the executor's `finalizeSlot` passes
+  ## `slot.phase == spRunning`) — gates `discoverAndReapEscapees`'s
+  ## reparented-orphan (ppid==ownPid) discovery+kill so it never engages on
+  ## a compile-phase reap. See that proc's doc comment for why.
   let idx = int32(id)
   if idx notin core.children:
     doAssert false, "reap: unknown ChildId " & $id
   let entry = core.children[idx]
   if entry.state != csExited:
     doAssert false, "reap: weChildExited was never reported for ChildId " & $id
-  # rfc-0007 A6a (§6): the post-reap pgid scan — ALWAYS performed, not
-  # gated on a stop act. `spawn_grandchild` leaks a same-pgroup grandchild
-  # while the entrypoint itself exits 0 on its own, no kill involved; the
-  # escapee fact must still be caught. `entry.pid` doubles as the pgid
-  # (spawnChild calls setpgid(childPid, childPid)) and is still valid here
-  # — the leader is gone from /proc (just reaped), so only real survivors
-  # remain in the scan.
-  let escapees = scanProcessGroup(entry.pid)
+  let caps = cachedCapabilities()
+  # rfc-0007 B1 (§3): the owning slot's LIVE + reparented escapees,
+  # discovered, killed (pidfd_open + starttime identity check), and reaped
+  # — see discoverAndReapEscapees above. `entry.pid` doubles as the domain
+  # pgid (spawnChild calls setpgid(childPid, childPid)); the leader itself
+  # is already gone from /proc (pollSweepChildren's wait4 already consumed
+  # it), so only real survivors/descendants remain in the scan.
+  let escapees = discoverAndReapEscapees(core, idx, entry.pid, caps, runPhase)
+  # A7/B1 (§4/§3): the per-spawn ACHIEVED domain — kdsProcessGroupSubreaper
+  # iff this process is REALLY a subreaper (initPosixCore sets
+  # PR_SET_CHILD_SUBREAPER deliberately; the probe's own readback confirms
+  # it), else the pre-B1 kdsProcessGroup. `treeObservationFor`
+  # (process/types.nim) ties `tree` to this by construction: a subreaper
+  # sees the WHOLE descendant tree by construction, so `toComplete` is
+  # honest here even when `escapees` is non-empty — tree completeness and
+  # "did anything survive" are separate axes (§2/§6).
+  let domain = if caps.subreaper: kdsProcessGroupSubreaper else: kdsProcessGroup
   result = ReapReport(
     exit: entry.exit,
     rusage: entry.rusage,
     stop: entry.stop,
-    killDomain: kdsProcessGroup,     # A7 (§4): the per-spawn ACHIEVED domain —
-                                      # genuinely always kdsProcessGroup on
-                                      # THIS backend, even now that subreaper
-                                      # is really enabled (capabilitiesCore's
-                                      # `subreaper` probe, above): the kernel
-                                      # reparents orphans to us, but
-                                      # scanProcessGroup (above) is still
-                                      # pgid-only — it does not walk the
-                                      # reparented-orphan ppid chain, so the
-                                      # kill/tree GUARANTEE this backend can
-                                      # actually back is unchanged until B1
-                                      # wires that consumer. Capability true,
-                                      # no elevated consumer yet — the same
-                                      # posture §4 sanctions for cgroup.
+    killDomain: domain,
     limits: entry.achieved,
     killSnapshot: entry.killSnapshot,
-    tree: treeObservationFor(kdsProcessGroup),
+    tree: treeObservationFor(domain),
     escapees: escapees,
     cooperativeUnavailable: false,   # POSIX: SIGTERM is always deliverable (§3)
   )
@@ -578,40 +883,6 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
 # ---------------------------------------------------------------------------
 
 when defined(linux):
-  # pidfd_open(2): needs no privilege, only kernel >= 5.3 (§4). No Nim
-  # wrapper exists (even std/posix's own `syscall` helper is `when
-  # defined(android)`-only) — importc syscall(2) directly, exactly the
-  # duplicate-importc idiom this module's header sanctions.
-  proc c_syscall(number: clong): clong {.importc: "syscall", varargs,
-                                         header: "<unistd.h>".}
-  var SYS_pidfd_open {.importc: "SYS_pidfd_open", header: "<sys/syscall.h>".}: clong
-
-  proc probePidfd(): bool =
-    let r = c_syscall(SYS_pidfd_open, clong(getpid()), 0.clong)
-    if r < 0: return false
-    discard posix.close(cint(r))
-    true
-
-  # PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER: unprivileged since
-  # Linux 3.4. Set-then-read-back is the real verification (not "the set
-  # call returned 0, therefore assume it worked") — and this DELIBERATELY
-  # stays set for the rest of the process: §4's dev-loop line says the
-  # rootless-podman tier "runs the processGroup+subreaper tier and says
-  # so" — present tense. B1 wires the orphan-adoption consumer; until then
-  # this is a real, live kernel-side effect (orphans reparent to us, not
-  # init) with no reader yet, same "capability true, no consumer until
-  # Stage B" posture §4 sanctions for the cgroup fields below.
-  proc c_prctl(option: cint): cint {.importc: "prctl", varargs,
-                                     header: "<sys/prctl.h>".}
-  var PR_SET_CHILD_SUBREAPER {.importc, header: "<sys/prctl.h>".}: cint
-  var PR_GET_CHILD_SUBREAPER {.importc, header: "<sys/prctl.h>".}: cint
-
-  proc probeSubreaper(): bool =
-    if c_prctl(PR_SET_CHILD_SUBREAPER, 1.cint) != 0: return false
-    var val: cint = -1
-    if c_prctl(PR_GET_CHILD_SUBREAPER, addr val) != 0: return false
-    val == 1
-
   # cgroup v2 delegation (§4): "mkdir a leaf + write cgroup.procs" is the
   # RFC's own recipe, tried on THIS process (moved back to its original
   # cgroup and the leaf removed afterward, on every path). A delegated
@@ -651,8 +922,6 @@ when defined(linux):
     try: removeDir(leaf)                                       # cgroup can't rmdir
     except CatchableError: discard
 else:
-  proc probePidfd(): bool = false
-  proc probeSubreaper(): bool = false
   proc probeCgroupV2(): tuple[delegation, kill, memoryPeak: bool] =
     (delegation: false, kill: false, memoryPeak: false)
 

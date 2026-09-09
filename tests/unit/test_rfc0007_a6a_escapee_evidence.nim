@@ -75,7 +75,7 @@ proc runEvidence(r: EntrypointResult): ptypes.Evidence =
 # Suite 1 — the observable escapee (spawn_grandchild)
 # ---------------------------------------------------------------------------
 
-suite "rfc-0007 A6a — spawn_grandchild: a same-pgroup grandchild IS observed":
+suite "rfc-0007 B1 — spawn_grandchild: a same-pgroup grandchild is observed, killed, and reaped":
 
   test "evidence.escapees carries the leaked grandchild (pid > 0)":
     let r = runSingle("spawn_grandchild.nim", "spawn_grandchild.pid", "gc")
@@ -84,30 +84,60 @@ suite "rfc-0007 A6a — spawn_grandchild: a same-pgroup grandchild IS observed":
     require ev.escapees.len == 1
     check ev.escapees[0].pid > 0
 
-  test "tree stays toUnobservable even WITH an observed escapee (pgid-only tier)":
-    ## §2/§3: a pgid-only tier may NEVER claim toComplete — "every pid I saw
-    ## is gone" is vacuous when the scan cannot see a setsid escape. That
-    ## honesty holds regardless of what THIS scan happened to find.
+  test "tree flips to toComplete: the subreaper tier sees the WHOLE descendant tree":
+    ## rfc-0007 B1 (§2/§3): killDomain is now capability-driven
+    ## (kdsProcessGroupSubreaper, since this process is really a subreaper
+    ## — B1a sets PR_SET_CHILD_SUBREAPER deliberately at Supervisor init),
+    ## so `treeObservationFor` honestly reports toComplete — EVEN WITH a
+    ## non-empty `escapees` (the two axes are separate, §6): "I can see
+    ## every pid in this domain" is a true claim on this tier regardless of
+    ## whether something happened to survive past the reap.
     let r = runSingle("spawn_grandchild.nim", "spawn_grandchild.pid", "gc2")
     let ev = runEvidence(r)
-    check ev.tree == ptypes.toUnobservable
+    check ev.tree == ptypes.toComplete
+
+  test "the escapee is actually reaped, not leaked: no live process at that pid afterward":
+    ## rfc-0007 B1 (§3) item 543's "reaped + counted" half: the fixture's
+    ## grandchild sleeps 30s on its own — a LEAKED escapee would still be
+    ## alive well after this run returns. B1a kills it via
+    ## pidfd_open + starttime-identity-check + pidfd_send_signal and reaps
+    ## it (wait4) inside reapCore, so by the time execute() returns, the
+    ## pid must be gone (posix.kill(pid, 0) -> ESRCH), not merely un-waited.
+    let r = runSingle("spawn_grandchild.nim", "spawn_grandchild.pid", "gc3")
+    let ev = runEvidence(r)
+    require ev.escapees.len == 1
+    let escapeePid = ev.escapees[0].pid
+    let rc = posix.kill(Pid(escapeePid), 0.cint)
+    check rc == -1
+    check errno == ESRCH
 
 # ---------------------------------------------------------------------------
-# Suite 2 — the invisible escapee (spawn_grandchild_setsid)
+# Suite 2 — the setsid escapee, invisible to the pgid test alone but caught
+# by the reparented-orphan (ppid == crisol) discovery path (rfc-0007 B1)
 # ---------------------------------------------------------------------------
 
-suite "rfc-0007 A6a — spawn_grandchild_setsid: invisible to a pgid scan by construction":
+suite "rfc-0007 B1 — spawn_grandchild_setsid: reparented to crisol, observed, killed, reaped":
 
-  test "evidence.escapees stays empty (the daemonized grandchild left the group)":
+  test "evidence.escapees carries the daemonized grandchild (reparented, not pgid-matched)":
     let r = runSingle("spawn_grandchild_setsid.nim", "spawn_grandchild_setsid.pid", "setsid")
     check r.outcome == oPassed
     let ev = runEvidence(r)
-    check ev.escapees.len == 0
+    require ev.escapees.len == 1
+    check ev.escapees[0].pid > 0
 
-  test "tree is the honest toUnobservable label, never a false toComplete":
+  test "tree flips to toComplete: PR_SET_CHILD_SUBREAPER sees past the setsid escape":
     let r = runSingle("spawn_grandchild_setsid.nim", "spawn_grandchild_setsid.pid", "setsid2")
     let ev = runEvidence(r)
-    check ev.tree == ptypes.toUnobservable
+    check ev.tree == ptypes.toComplete
+
+  test "the reparented escapee is actually reaped, not leaked":
+    let r = runSingle("spawn_grandchild_setsid.nim", "spawn_grandchild_setsid.pid", "setsid3")
+    let ev = runEvidence(r)
+    require ev.escapees.len == 1
+    let escapeePid = ev.escapees[0].pid
+    let rc = posix.kill(Pid(escapeePid), 0.cint)
+    check rc == -1
+    check errno == ESRCH
 
 # ---------------------------------------------------------------------------
 # Suite 3 — killSnapshot reaches Evidence, rssBytes populated (hang_forever)

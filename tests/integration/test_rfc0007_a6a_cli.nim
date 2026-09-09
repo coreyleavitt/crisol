@@ -13,10 +13,15 @@
 ##   1. spawn_grandchild: observed escapee ⇒ NOT stored — a second run
 ##      re-executes (still shows the same escapee, still not cached), and
 ##      the plain-text render carries a first-class warning tag.
-##   2. spawn_grandchild_setsid: escapee invisible to the pgid tier ⇒ the
-##      honest `toUnobservable` label, but EMPTY escapees ⇒ still
-##      cacheable — a second run IS served from cache, with the
-##      `toUnobservable` tree label replayed on the wire. No warning tag.
+##   2. spawn_grandchild_setsid (rfc-0007 B1): PRE-B1 this fixture's
+##      escapee was invisible to the pgid-only tier (empty escapees,
+##      `toUnobservable`, cacheable). B1's subreaper mechanism
+##      (PR_SET_CHILD_SUBREAPER + the reparented-orphan discovery path)
+##      sees past the setsid escape: same non-empty-escapees / NOT-cached
+##      / warning-tag story as spawn_grandchild now, with `tree` flipping
+##      to the honest `complete` label (a subreaper sees the whole
+##      descendant tree — separate axis from whether anything survived,
+##      §6).
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
@@ -121,12 +126,13 @@ suite "rfc-0007 A6a — spawn_grandchild: observed escapee is NOT cached":
     require ep2["run"]["evidence"]["escapees"].len == 1
 
 # ---------------------------------------------------------------------------
-# Suite 2 — invisible escapee (spawn_grandchild_setsid): cacheable-with-label
+# Suite 2 — the setsid escapee (rfc-0007 B1): reparented to crisol, observed,
+# killed, reaped — NOT cached (same "observed escapee" gate as suite 1).
 # ---------------------------------------------------------------------------
 
-suite "rfc-0007 A6a — spawn_grandchild_setsid: cacheable, honest toUnobservable label":
+suite "rfc-0007 B1 — spawn_grandchild_setsid: reparented escapee is NOT cached":
 
-  test "cold run then warm hit: served from cache, tree label replayed byte-equal":
+  test "cold run then warm re-run: both live, reparented escapee observed both times":
     let root = freshProjectRoot("setsid")
     defer:
       reapMarker(root, "spawn_grandchild_setsid.pid")
@@ -141,22 +147,25 @@ suite "rfc-0007 A6a — spawn_grandchild_setsid: cacheable, honest toUnobservabl
     let ep1 = firstEntrypoint(out1)
     check ep1["outcome"].getStr == "passed"
     check ep1["cached"].getBool == false
-    check ep1["run"]["evidence"]["escapees"].len == 0
-    check ep1["run"]["evidence"]["tree"].getStr == "unobservable"
-    # Cacheable: no escapee observed, even though the tier can't fully vouch.
-    check ep1["cacheDecision"].getStr == "stored"
+    require ep1["run"]["evidence"]["escapees"].len == 1
+    # rfc-0007 B1: the subreaper tier sees the WHOLE descendant tree —
+    # `tree` flips to "complete" even though a live descendant was found
+    # and killed (the two axes are separate, §6).
+    check ep1["run"]["evidence"]["tree"].getStr == "complete"
+    # Observed escapee ⇒ NOT stored — cdmHermeticityDeg, not cdmStored.
+    check ep1["cacheDecision"].getStr == "hermeticityDegraded"
+
+    reapMarker(root, "spawn_grandchild_setsid.pid")   # the cold run's grandchild
 
     let (code2, out2) = captureStdout(@["run", "--config", cfgPath,
                                         "--jobs", "1", "--json"])
     check code2 == 0
     let ep2 = firstEntrypoint(out2)
-    check ep2["cached"].getBool == true
-    check ep2["cacheDecision"].getStr == "hit"
-    check ep2["run"]["kind"].getStr == "cached"
-    # The honest label survives the roundtrip byte-equal, not a fabricated
-    # re-derivation.
-    check ep2["run"]["evidence"]["tree"].getStr == "unobservable"
-    check ep2["run"]["evidence"]["escapees"].len == 0
+    # NOT served from cache — the store never happened, so this is a fresh
+    # miss again (still ran live, still shows the escapee).
+    check ep2["cached"].getBool == false
+    check ep2["run"]["kind"].getStr == "ran"
+    require ep2["run"]["evidence"]["escapees"].len == 1
 
 # ---------------------------------------------------------------------------
 # Suite 3 — render warning (plain-text, non-JSON `crisol run` output)
@@ -177,7 +186,11 @@ suite "rfc-0007 A6a — render: a first-class warning tag on an observed escapee
     check code == 0
     check "[ESCAPEE]" in output
 
-  test "spawn_grandchild_setsid: plain render carries NO escapee warning":
+  test "spawn_grandchild_setsid: plain render ALSO shows an [ESCAPEE] tag (rfc-0007 B1)":
+    ## Pre-B1 this fixture's daemonized grandchild was invisible to the
+    ## pgid-only tier (no warning). B1's reparented-orphan discovery
+    ## (ppid == crisol) sees it too now — the warning tag is symmetric
+    ## across both fixtures on this tier.
     let root = freshProjectRoot("setsid_render")
     defer:
       reapMarker(root, "spawn_grandchild_setsid.pid")
@@ -188,7 +201,7 @@ suite "rfc-0007 A6a — render: a first-class warning tag on an observed escapee
 
     let (code, output) = captureStdout(@["run", "--config", cfgPath, "--jobs", "1"])
     check code == 0
-    check "[ESCAPEE]" notin output
+    check "[ESCAPEE]" in output
 
 when isMainModule:
   echo "test_rfc0007_a6a_cli done"

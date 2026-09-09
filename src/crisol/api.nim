@@ -405,6 +405,15 @@ type
     summary*:           Summary
     results*:           seq[EntrypointResult]
     memThrottledSlots*: int   ## # entrypoints delayed >=once by mem-aware scheduling; 0 if inactive
+    lateOrphansReaped*: int   ## rfc-0007 B1 (§3): count of adopted orphans
+                              ## (reparented via PR_SET_CHILD_SUBREAPER)
+                              ## reaped via the async waitid(P_ALL, WNOWAIT)
+                              ## sweep whose owning slot had already been
+                              ## reaped/emitted, or that were unattributable
+                              ## (e.g. a setsid escape) — counted + logged
+                              ## at run level, never retro-fitted into an
+                              ## already-emitted EntrypointResult. 0 when
+                              ## nothing of the kind occurred this run.
     status*:            RunStatus
     exitCode*:          int   ## ALWAYS set: 0/1 (rsOk), 3 (rsStructural; 2 internal), 128+n (rsInterrupted)
     error*:             string ## non-empty iff status == rsStructural
@@ -1421,6 +1430,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   var interrupted     = false
   var notStartedCount = 0
   var shutdownSignum  = 0  # rfc-0007 A2b: the real signum execute()'s own Supervisor observed
+  var lateOrphansReaped = 0  # rfc-0007 B1: written by execute() via its own ptr out-param
 
   try:
     results = execute(
@@ -1436,6 +1446,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       memThrottledOut    = addr memThrottled,
       interruptedOut     = addr interrupted,
       notStartedOut      = addr notStartedCount,
+      lateOrphansReapedOut = addr lateOrphansReaped,
       shutdownSignalOut  = addr shutdownSignum,
       installSignals     = opts.installSignals,
       cache              = cacheCtx,
@@ -1572,7 +1583,9 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # disabled or compileBlock is nil (measurement off / no telemetry yet).
     let reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
     persistLastRun(results, s, cfg, warnings = pr.warnings,
-                   memThrottledSlots = memThrottled, compileBlock = compileBlock,
+                   memThrottledSlots = memThrottled,
+                   lateOrphansReaped = lateOrphansReaped,
+                   compileBlock = compileBlock,
                    reuseAlerts = reuseAlerts, policy = policy)
 
   # RFC-0005 B3b: the --verify-cache post-run pass. Placement is load-
@@ -1640,6 +1653,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     summary:           s,
     results:           results,
     memThrottledSlots: memThrottled,
+    lateOrphansReaped: lateOrphansReaped,
     status:            if interrupted: rsInterrupted else: rsOk,
     exitCode:          if interrupted: 128 + shutdownSignum
                         else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating

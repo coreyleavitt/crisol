@@ -6,7 +6,7 @@
 ##   1. Run 1 populates the cache (live pass, stored + sidecar written).
 ##   2. Changing a compile flag (crisol.kdl group `flags`) and re-running
 ##      with `--explain-miss --json` produces a per-entrypoint `keyDiff`
-##      array naming `kcFlags` with non-empty prev/curr, schemaRevision 23
+##      array naming `kcFlags` with non-empty prev/curr, schemaRevision 24
 ##      (this `keyDiff` field is still rev 20's own — `RunSchemaRevision`
 ##      itself has since advanced to 23 via rev 21's `cacheStats`, rev
 ##      22's additive `cacheStats.localErrors` (RFC-0005 code-review D1),
@@ -106,7 +106,7 @@ suite "B1c CLI — --explain-miss over --json: kcFlags on a flag change":
 
     # stdout stays parseable JSON even with the flag on.
     let doc = parseJson(r.stdout)
-    check doc["schemaRevision"].getInt == 23
+    check doc["schemaRevision"].getInt == 24
     let eps = doc["entrypoints"]
     check eps.len == 1
     check eps[0].hasKey("keyDiff")

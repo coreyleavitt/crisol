@@ -42,6 +42,10 @@
 ##     "interrupted": bool,          // rev 16 (field), A1e-ii (real values):
 ##                                   // true iff this run was cut short by
 ##                                   // SIGINT/SIGTERM (rfc-0007 §2).
+##     "lateOrphansReaped": <int>,   // rev 24 (rfc-0007 B1, §3): adopted
+##                                   // orphans reaped after their owning
+##                                   // slot's result was already emitted (or
+##                                   // unattributable); 0 by default.
 ##     "summary": {
 ##       total, counts: { passed, exitNonZero, compileFailed, timedOut,
 ##                        signaled, spawnError, killed, crashed },
@@ -256,7 +260,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 23
+const RunSchemaRevision* = 24
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -591,6 +595,23 @@ const RunSchemaRevision* = 23
   ##                     field's CONTENT changes" entries above: no reader
   ##                     depended on the OLD (incorrect) count, and the
   ##                     field's type/presence/meaning are unchanged.
+  ##   rev 24 (rfc-0007 B1, §3) — top-level `lateOrphansReaped` (int):
+  ##                     count of adopted orphans (reparented via
+  ##                     PR_SET_CHILD_SUBREAPER) reaped via the async
+  ##                     waitid(P_ALL, WNOWAIT) sweep beside the registered
+  ##                     wait set, whose owning slot had already been
+  ##                     reaped/emitted by the time they were discovered, or
+  ##                     that were unattributable at all (e.g. a setsid
+  ##                     escape whose pgid matches no live slot). ALWAYS
+  ##                     PRESENT (mirrors `memThrottledSlots`), 0 on a run
+  ##                     where nothing of the kind occurred. A LATE orphan
+  ##                     is never retro-fitted into an already-emitted
+  ##                     `EntrypointResult` — this is its only wire home. An
+  ##                     orphan discovered WHILE its owning slot is still
+  ##                     live is folded into that slot's OWN
+  ##                     `run.evidence.escapees` instead (no new field —
+  ##                     same field, same semantics as rfc-0007 A6a/B1's
+  ##                     owning-slot escapee list).
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -694,6 +715,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              filterTag: string = "";
              warnings: seq[ConfigWarning] = @[];
              memThrottledSlots: int = 0;
+             lateOrphansReaped: int = 0;
              compileBlock: JsonNode = nil;
              reuseAlerts: JsonNode = nil;
              interrupted: bool = false;
@@ -743,6 +765,11 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## warnings: config warnings (unknown keys) threaded from loadConfig.
   ## memThrottledSlots: count of slots that were memory-blocked (S2a schema
   ## field; populated by AdmissionController in S6b).  Defaults to 0. # S6b
+  ## lateOrphansReaped: rfc-0007 B1 (rev 24, §3) -- count of adopted orphans
+  ## reaped via the async waitid(P_ALL, WNOWAIT) sweep after their owning
+  ## slot's result was already emitted, or that were unattributable at all
+  ## (e.g. a setsid escape) -- populated by runner.execute() via its own
+  ## ptr out-param.  Defaults to 0 (nothing of the kind occurred).
   ## compileBlock: M-report pass (a) segmented compile-reuse/cost-split block
   ## (crisol/compilereport.readCompileBlock), or nil when no telemetry exists
   ## (measureCompileReuse off). nil -> the "compileStats" field is OMITTED
@@ -888,6 +915,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   result["summary"]          = summaryNode
   result["entrypoints"]      = entrypointsNode
   result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
+  result["lateOrphansReaped"] = newJInt(lateOrphansReaped)  # rev 24 (rfc-0007 B1, §3)
   result["warnings"]         = warningsToJsonArray(warnings)
   result["regressions"]      = regressionsNode  # C6: empty when perf-check disabled
   if compileBlock != nil:
@@ -926,6 +954,7 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    filterTag: string = "";
                    warnings: seq[ConfigWarning] = @[];
                    memThrottledSlots: int = 0;
+                   lateOrphansReaped: int = 0;
                    compileBlock: JsonNode = nil;
                    reuseAlerts: JsonNode = nil;
                    interrupted: bool = false;
@@ -943,9 +972,10 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
   ## explainMiss: RFC-0005 B1c (rev 20) — threads through to toJson unchanged.
   ## cacheStats/showCacheStats: RFC-0005 B2b (rev 21) — threads through to
   ## toJson unchanged.
-  $toJson(results, summary, filterTag, warnings, memThrottledSlots, compileBlock,
-         reuseAlerts, interrupted, policy, substrate, verifyFails, explainMiss,
-         cacheStats, showCacheStats)
+  ## lateOrphansReaped: rfc-0007 B1 (rev 24) — threads through to toJson unchanged.
+  $toJson(results, summary, filterTag, warnings, memThrottledSlots, lateOrphansReaped,
+         compileBlock, reuseAlerts, interrupted, policy, substrate, verifyFails,
+         explainMiss, cacheStats, showCacheStats)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
@@ -955,6 +985,7 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
                      config: Config;
                      warnings: seq[ConfigWarning] = @[];
                      memThrottledSlots: int = 0;
+                     lateOrphansReaped: int = 0;
                      compileBlock: JsonNode = nil;
                      reuseAlerts: JsonNode = nil;
                      policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy) =
@@ -991,6 +1022,7 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   # in THIS process is removed first.
   let jsonStr = toJsonString(results, summary, warnings = warnings,
                              memThrottledSlots = memThrottledSlots,
+                             lateOrphansReaped = lateOrphansReaped,
                              compileBlock = compileBlock,
                              reuseAlerts = reuseAlerts,
                              policy = policy)

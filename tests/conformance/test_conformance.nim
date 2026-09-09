@@ -57,7 +57,11 @@ suite "conformance 1 — spawn/exit":
     check report.exit.kind == ekExited
     check report.exit.code == 0
     check report.stop.isNone
-    check report.killDomain == kdsProcessGroup
+    # rfc-0007 B1: killDomain is capability-driven — this process is really
+    # a subreaper (PR_SET_CHILD_SUBREAPER, set deliberately at Supervisor
+    # init), so the achieved domain is kdsProcessGroupSubreaper, not the
+    # pre-B1 hardcoded kdsProcessGroup.
+    check report.killDomain == kdsProcessGroupSubreaper
     removeFile(outPath)
 
   test "fail_always: exit code propagates losslessly (not just pass/fail)":

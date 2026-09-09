@@ -521,6 +521,7 @@ proc finalizeSlot(
   sourceIndex:      var SourceIndex;
   sourceIndexBuilt: var bool;
   cache:            CacheContext;
+  pendingEscapees:  var Table[int32, seq[ptypes.ProcSnapshot]];
 ): FinalizeOutcome =
   ## Called once `next` has reported weChildExited for `slots[idx].id`.
   ## Reaps it (the only place a ChildId is consumed, §1) and either
@@ -554,10 +555,25 @@ proc finalizeSlot(
   ## exit itself, so this proc never branches on "was this a timeout or an
   ## interrupt" anywhere: krTimeout and krInterrupt reach the exact same
   ## code from here on.
-  let report  = sv.reap(slots[idx].id)
+  # B1 regression fix, part B: `runPhase` is true only for the RUN child —
+  # a compile-phase reap must never engage reparented-orphan (ppid==ownPid)
+  # escapee discovery (it would catch crisol's own compile toolchain, a
+  # false positive) — see reap*'s doc comment (process/posix.nim).
+  var report  = sv.reap(slots[idx].id, slots[idx].phase == spRunning)
   let pepIdx  = slots[idx].pepIdx
   let pep     = plan.entrypoints[pepIdx]
   let elapsed = int64((epochTime() - slots[idx].t0) * 1000)
+
+  # rfc-0007 B1 (§3): splice in any orphan the async waitid sweep staged
+  # for THIS slot while it was still live (see `pendingEscapees`'s doc
+  # comment at its declaration in `execute`) — folded into the SAME
+  # ReapReport.escapees `report` already carries, so every downstream
+  # consumer (toProcessResult's Evidence, the cache-store gate, the
+  # render warning) sees one unified list, never a second parallel one.
+  let slotKey = int32(slots[idx].id)
+  if slotKey in pendingEscapees:
+    report.escapees.add pendingEscapees[slotKey]
+    pendingEscapees.del(slotKey)
 
   case slots[idx].phase
   of spCompiling:
@@ -758,7 +774,7 @@ proc teardownDiscard(sv: var Supervisor; slots: var seq[Slot]) =
     case ev.kind
     of weChildExited:
       let idx = slotIndexOf(slots, ev.id)
-      discard sv.reap(slots[idx].id)   # DISCARDED — no Phase, no Cause, no onResult
+      discard sv.reap(slots[idx].id, false)   # DISCARDED — no Phase, no Cause, no onResult; never authors an escapee here
       cleanupSlotOnTeardown(slots[idx])
       slots[idx].state = ssIdle
     of weDeadline:
@@ -1439,6 +1455,18 @@ proc execute*(
                                   ## per-process shard, per the RFC's
                                   ## `ledger.nim` shardSeq note); only the
                                   ## per-attempt row write is gated.
+  lateOrphansReapedOut: ptr int = nil;  ## rfc-0007 B1: if non-nil, written
+                                  ## with the count of adopted orphans
+                                  ## (reparented via PR_SET_CHILD_SUBREAPER)
+                                  ## reaped via the async waitid(P_ALL,
+                                  ## WNOWAIT) sweep AFTER their owning slot's
+                                  ## result had already been emitted (or
+                                  ## whose pgid matched no still-live slot at
+                                  ## all — an unattributable orphan, e.g. a
+                                  ## setsid escape). Counted + logged at RUN
+                                  ## level, never retro-fitted into an
+                                  ## already-emitted EntrypointResult (§3). 0
+                                  ## when nothing of the kind occurred.
   explainMiss:      bool = false;  ## RFC-0005 B1c: resolved --explain-miss
                                   ## (CLI OR config, already merged by
                                   ## api.planImpl into cfg.explainMiss before
@@ -1695,6 +1723,18 @@ proc execute*(
   var wasInterrupted = false
   var shutdownSignum = 0  # rfc-0007 A2b: the real signum, for shutdownSignalOut
 
+  # rfc-0007 B1 (§3): the run-level late-orphan count (lateOrphansReapedOut)
+  # and the per-slot pending-escapee staging table. An adopted orphan
+  # discovered via `sv.next`'s async waitid(P_ALL, WNOWAIT) sweep whose
+  # `ownedBy` names a slot that is STILL LIVE (not yet reaped/emitted) is
+  # staged here, keyed by the raw ChildId ordinal, and spliced into that
+  # slot's own evidence.escapees at the point `finalizeSlot` reaps it (see
+  # the `pendingEscapees` parameter threaded into `finalizeSlot` below) —
+  # never retro-fitted into an ALREADY-emitted result. Everything else
+  # (ownedBy none, or the owning slot already gone) is counted here instead.
+  var lateOrphansReaped = 0
+  var pendingEscapees = initTable[int32, seq[ptypes.ProcSnapshot]]()
+
   # rfc-0007 A2b: `shuttingDown` is the ONE flag that turns the SAME loop
   # below from normal dispatch into interrupt drain — no separate teardown
   # loop. Once true: no new work is dispatched (the fill pass is skipped
@@ -1753,7 +1793,8 @@ proc execute*(
                               graph = graph, config = config,
                               sourceIndex = sourceIndex,
                               sourceIndexBuilt = sourceIndexBuilt,
-                              cache = cache)
+                              cache = cache,
+                              pendingEscapees = pendingEscapees)
 
         case fo.kind
         of fkTransitioned:
@@ -2250,7 +2291,27 @@ proc execute*(
               slots[i].forceKilled = true
 
       of weOrphanReaped:
-        discard  # subreaper tier only (B1) — not reachable from this backend yet
+        # rfc-0007 B1 (§3): an adopted orphan the async waitid(P_ALL,
+        # WNOWAIT) sweep discovered+reaped beside the registered wait set.
+        # `ownedBy` was attributed BEFORE the reap (pgid match against a
+        # still-live registered slot's domain pgid, §3) — route to that
+        # slot's PENDING escapees if it is genuinely still live (unemitted);
+        # otherwise (ownedBy none — e.g. a setsid escape — or the owning
+        # slot already reaped/emitted) count + log at RUN level. Never
+        # retro-fitted into an already-emitted EntrypointResult.
+        var routed = false
+        if ev.ownedBy.isSome:
+          let ownerIdx = slotIndexOf(slots, ev.ownedBy.get)
+          if ownerIdx >= 0:
+            let key = int32(ev.ownedBy.get)
+            pendingEscapees.mgetOrPut(key, @[]).add ev.orphan
+            routed = true
+        if not routed:
+          inc lateOrphansReaped
+          stderr.write("crisol: warning: adopted orphan pid " & $ev.orphan.pid &
+                       " (" & ev.orphan.command &
+                       ") reaped after its owning slot's result was already " &
+                       "emitted (or unattributable) — counted, not retro-fitted\n")
 
       # -----------------------------------------------------------------------
       # failFast early-exit: if no slots are live and we would not dispatch any
@@ -2307,6 +2368,8 @@ proc execute*(
     notStartedOut[] = notStarted
   if shutdownSignalOut != nil:
     shutdownSignalOut[] = shutdownSignum
+  if lateOrphansReapedOut != nil:
+    lateOrphansReapedOut[] = lateOrphansReaped
 
 # ---------------------------------------------------------------------------
 # runEntrypoint — compile + run ONE entrypoint (M6: thin wrapper)

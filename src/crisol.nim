@@ -1239,7 +1239,9 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     if cacheStatsResolved:
       stderr.write("crisol: " & renderCacheStats(rr.cacheStats) & "\n")
     stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
-                              rr.memThrottledSlots, interrupted = rr.interrupted,
+                              rr.memThrottledSlots,
+                              lateOrphansReaped = rr.lateOrphansReaped,
+                              interrupted = rr.interrupted,
                               policy = policy, substrate = process.capabilities(),
                               verifyFails = rr.verifyDivergences.len,
                               explainMiss = explainMissResolved,
