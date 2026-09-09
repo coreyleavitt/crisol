@@ -319,16 +319,30 @@ jobs:
       - name: nim check — process.nim on real macOS
         run: nim check --hints:off --path:src src/crisol/process.nim
 
-      # The ladder's `macosx` arm maps to process/posix today (C1b is where
-      # process/darwin.nim is born) — so this IS the posix backend, proven
-      # live on Darwin's kqueue-less poll fallback. Import-purity first
-      # (cheap, catches a suite-wide mistake before the real cases run);
-      # then the non-timing conformance cases — the POLL-FALLBACK subset
-      # the A2d bullet asks for. test_conformance_timing.nim is
-      # deliberately NOT invoked here: it's CRISOL_TIMING_TESTS-gated and
-      # wall-clock-sensitive, out of scope for this leg's acceptance.
-      - name: Conformance suite — import purity
+      # Cheap pre-check: a suite-wide import mistake fails here before the
+      # slower full compile+run below pays the per-file `nim r` cost.
+      - name: Conformance suite — import purity (fast pre-check)
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_conformance_import_purity.nim
 
-      - name: Conformance suite — non-timing cases (poll fallback)
-        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_conformance.nim
+      # rfc-0007 C1a: the ladder's `macosx` arm maps to process/posix today
+      # (C1b is where process/darwin.nim is born) — so this proves the FULL
+      # unit + conformance suites, not just an import-purity/single-file
+      # spot check, live on Darwin's kqueue-less poll fallback. Same
+      # honest-exit wrapper the Linux legs use (`ci/run-tests.sh` ->
+      # `nimble test`, see that script's header for why the wrapper exists)
+      # — no docker here, windows/macos run Nim natively (A2d).
+      # CRISOL_TIER=macos tells test_process_capabilities.nim's tier-pinned
+      # acceptance suite which tier's honest capability values to assert
+      # (subreaper/pidfd/cgroupDelegation false, flock/wait4Rusage true —
+      # both real POSIX on Darwin).
+      #
+      # tests/integration is deliberately excluded (CRISOL_TEST_DIRS pins
+      # unit+conformance only) — heavier process-spawning integration
+      # coverage on Darwin is out of scope for this slice. Conformance's
+      # own TIMING-SENSITIVE cases stay inert: they self-gate on
+      # CRISOL_TIMING_TESTS (unset here), same convention as every other leg.
+      - name: Run unit + conformance suites (poll fallback)
+        env:
+          CRISOL_TIER: macos
+          CRISOL_TEST_DIRS: tests/unit:tests/conformance
+        run: bash ci/run-tests.sh

@@ -20,13 +20,17 @@
 import std/[os, posix, unittest]
 import crisol/process
 
-# Independent readback — NOT the same code path `capabilities()` uses
-# internally (posixcore.probeSubreaper duplicate-importc's its own; this is
-# a second, separate importc so the two can never accidentally share a bug).
-proc c_prctl_check(option: cint): cint {.importc: "prctl", varargs,
-                                        header: "<sys/prctl.h>".}
-var PR_GET_CHILD_SUBREAPER_check {.importc: "PR_GET_CHILD_SUBREAPER",
-                                   header: "<sys/prctl.h>".}: cint
+when defined(linux):
+  # Independent readback — NOT the same code path `capabilities()` uses
+  # internally (posixcore.probeSubreaper duplicate-importc's its own; this
+  # is a second, separate importc so the two can never accidentally share
+  # a bug). rfc-0007 C1a: <sys/prctl.h>/PR_SET_CHILD_SUBREAPER are Linux-only
+  # — no Darwin header to import against, so this whole cross-check is
+  # `when defined(linux)`, not merely runtime-gated on `caps.subreaper`.
+  proc c_prctl_check(option: cint): cint {.importc: "prctl", varargs,
+                                          header: "<sys/prctl.h>".}
+  var PR_GET_CHILD_SUBREAPER_check {.importc: "PR_GET_CHILD_SUBREAPER",
+                                     header: "<sys/prctl.h>".}: cint
 
 suite "rfc-0007 A7 — capabilities() is memoised":
 
@@ -45,8 +49,15 @@ suite "rfc-0007 A7 — capabilities() fields that are real on every Linux tier":
   test "wait4Rusage: true (a real fork+wait4 probe, not inferred from other call sites)":
     check caps.wait4Rusage == true
 
-  test "pidfd: true (pidfd_open(2) is unprivileged; kernel >= 5.3 on any tier this suite targets)":
-    check caps.pidfd == true
+  test "pidfd: platform-honest (true on Linux; pidfd_open(2) has no Darwin analog)":
+    ## rfc-0007 C1a: this suite's title predates the macOS leg — pidfd is
+    ## real (and pinned true) on every LINUX tier; on the macOS poll-fallback
+    ## tier (process/posix.nim, pre-C1b) there is no pidfd_open(2) at all,
+    ## so the honest value is false, not a degraded/skipped Linux feature.
+    when defined(linux):
+      check caps.pidfd == true
+    else:
+      check caps.pidfd == false
 
 suite "rfc-0007 A7 — capabilities() acceptance pins (per known tier, RFC-0007 line 539)":
 
@@ -70,6 +81,17 @@ suite "rfc-0007 A7 — capabilities() acceptance pins (per known tier, RFC-0007 
       check caps.cgroupDelegation == true
       check caps.cgroupKill == true
       check caps.memoryPeak == true
+    of "macos":
+      # rfc-0007 C1a: ci.yml's `macos` job — real macOS-latest runner, the
+      # posix backend's poll(2) fallback (process/posix.nim maps here until
+      # C1b births process/darwin.nim). subreaper/pidfd/cgroup delegation
+      # are Linux-only kernel mechanisms and honestly false; flock and
+      # wait4Rusage are real POSIX and hold on Darwin exactly as on Linux.
+      check caps.subreaper == false
+      check caps.pidfd == false
+      check caps.cgroupDelegation == false
+      check caps.flock == true
+      check caps.wait4Rusage == true
     else:
       # rootless-podman dev tier (./dev test): no cgroup delegation, no
       # user-ns, but PR_SET_CHILD_SUBREAPER is unprivileged and unaffected.
@@ -77,11 +99,18 @@ suite "rfc-0007 A7 — capabilities() acceptance pins (per known tier, RFC-0007 
       check caps.cgroupDelegation == false
 
   test "subreaper, independently cross-checked (not this test's own probe code)":
-    if caps.subreaper:
-      var val: cint = -1
-      let rc = c_prctl_check(PR_GET_CHILD_SUBREAPER_check, addr val)
-      check rc == 0
-      check val == 1
+    when defined(linux):
+      if caps.subreaper:
+        var val: cint = -1
+        let rc = c_prctl_check(PR_GET_CHILD_SUBREAPER_check, addr val)
+        check rc == 0
+        check val == 1
+    else:
+      # rfc-0007 C1a: no PR_SET_CHILD_SUBREAPER on Darwin — caps.subreaper
+      # is honestly false (asserted above), so there is nothing to cross-
+      # check here yet. Not a deferral: a real Darwin subreaper-equivalent
+      # (if any) is C1b's call, not this slice's.
+      skip()
 
 suite "rfc-0007 A7 — capabilities() internal consistency (§4, both tiers)":
 
