@@ -189,28 +189,22 @@ when defined(linux):
     except CatchableError:
       ""
 
-  proc moveIntoCgroupLeaf(leafPath: string; pid: Pid): bool =
-    ## The B3 fallback (clone3(CLONE_INTO_CGROUP) is impractical from Nim's
-    ## fork/exec path here — see spawnChild's comment for the full
-    ## reasoning): write the just-forked child's pid to the leaf's
-    ## `cgroup.procs` as the very first parent-side act after `fork()`
-    ## returns, to shrink (never eliminate) the documented small race
-    ## window between fork and this write, during which the child is
-    ## running but not yet cgroup-delegated.
-    try:
-      writeFile(leafPath / "cgroup.procs", $int(pid) & "\n")
-      true
-    except CatchableError:
-      false
-
   proc writeCgroupMemoryMax(leafPath: string; bytes: int64): bool =
     ## cgroup `memory.max` — the tagged successor to RLIMIT_AS on this tier
     ## (real RSS-backed enforcement + kernel OOM-kill accounting, vs.
     ## RLIMIT_AS's virtual-address-space-only ceiling). RLIMIT_AS itself is
     ## NOT removed (applyLimitsChildSide, unchanged) — both are attempted
     ## when a memory ceiling is requested; this is the cgroup-specific one.
+    ## Also disables swap for the leaf (`memory.swap.max` = 0): without
+    ## this, a process that hits `memory.max` can be pushed to swap
+    ## instead of OOM-killed, defeating the ceiling's whole purpose as a
+    ## deterministic Cause(cbLimit, lkMemory) producer. Best-effort — an
+    ## environment with no swap-accounting controller at all never fails
+    ## the memory.max write itself over it.
     try:
       writeFile(leafPath / "memory.max", $bytes)
+      try: writeFile(leafPath / "memory.swap.max", "0")
+      except CatchableError: discard
       true
     except CatchableError:
       false
@@ -269,18 +263,6 @@ when defined(linux):
     except CatchableError:
       discard
     false
-
-  proc cgroupLeafMemoryPeak(leafPath: string): Option[int64] =
-    ## `memory.peak` — the leaf's real, tree-accounted peak RSS+cache high
-    ## watermark (a real RLIMIT_AS/wait4-ru_maxrss replacement on this
-    ## tier: wait4 only ever saw the single reaped process, never its
-    ## descendants). Read before teardown, same reasoning as
-    ## `cgroupLeafOomKill`.
-    try:
-      return some(parseBiggestInt(readFile(leafPath / "memory.peak").strip()))
-    except CatchableError, ValueError:
-      discard
-    none(int64)
 
   proc removeCgroupLeafBounded(leafPath: string): bool =
     ## Never leak leaves (rfc-0007 B3), but NEVER an unbounded blocking
@@ -590,26 +572,31 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   let doChdir = spec.cwd.len > 0
 
   # rfc-0007 B3: per-slot cgroup-v2 leaf, created BEFORE fork so it's ready
-  # for the child immediately. Clone3(CLONE_INTO_CGROUP) (atomic — the
-  # child starts already in the leaf, needs the leaf fd passed through
-  # clone_args) would close the race window below entirely, but it is
-  # impractical from this fork/exec path: it would mean replacing the
-  # plain `fork()` this whole async-signal-safe child window is built
-  # around with a raw clone3 syscall (no Nim stdlib wrapper exists), and
-  # re-deriving every ordering invariant documented on that window (rlimit
-  # readback pipe, sink dup2 order, execve fallback) under a mechanism this
-  # codebase has zero prior experience with — a needless, high-risk rewrite
-  # of an already-delicate primitive for a race window the fallback below
-  # already shrinks to a few instructions. The accepted fallback (RFC's own
-  # words): create the leaf, then write the child's pid to its
-  # `cgroup.procs` as the FIRST parent-side act after `fork()` returns
-  # (right below) — the child is briefly running outside the leaf between
-  # `fork()` returning and that write landing; a `memory.max` ceiling is
-  # not yet enforced against it during that window. Never fatal to the
-  # spawn either way: any failure below just leaves `cgroupLeafPath` ""
-  # and this ONE spawn honestly degrades to the pre-B3 domain at reap.
+  # for the child immediately. clone3(CLONE_INTO_CGROUP) would place the
+  # child atomically at the kernel level, but is impractical from this
+  # fork/exec path: it would mean replacing the plain `fork()` this whole
+  # async-signal-safe child window is built around with a raw clone3
+  # syscall (no Nim stdlib wrapper exists), and re-deriving every ordering
+  # invariant documented on that window under a mechanism this codebase
+  # has zero prior experience with. Instead, the CHILD joins the leaf
+  # ITSELF, as the very FIRST action in its async-signal-safe window
+  # (below) — before setpgid, before dup2, before ANYTHING else — which is
+  # NOT the same as (and meaningfully safer than) the PARENT writing the
+  # child's pid in after fork: a parent-side write can race the child's
+  # OWN subsequent work (empirically real — under CI scheduling jitter a
+  # freshly-forked child can outrun a parent-side write by enough margin
+  # to fork its OWN children — e.g. a leaked grandchild fixture — before
+  # ever being cgroup-placed, leaving that grandchild outside the leaf
+  # entirely). A self-join needs no IPC round trip: `cgroupProcsCstr`
+  # (below) points into a string built here, in the PARENT, before fork —
+  # COW-inherited into the child's address space, no allocation needed
+  # there to use it. Never fatal to the spawn either way: any failure here
+  # (or reported back by the child, see the join-result byte below) just
+  # leaves `cgroupLeafPath` "" and this ONE spawn honestly degrades to the
+  # pre-B3 domain at reap.
   let plannedId = core.nextIdVal
   var cgroupLeafPath = ""
+  var cgroupProcsPath = ""
   var cgroupMemWriteOk = none(bool)   # none = never attempted this spawn
   let caps0 = cachedCapabilities()
   when defined(linux):
@@ -619,9 +606,12 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
         let created = createCgroupLeaf(parent, cgroupSlotLeafName(getpid(), plannedId))
         if created.len > 0:
           cgroupLeafPath = created
+          cgroupProcsPath = created / "cgroup.procs"
           if spec.limits.req[lkMemory].isSome:
             cgroupMemWriteOk = some(writeCgroupMemoryMax(cgroupLeafPath,
                                                           spec.limits.req[lkMemory].get))
+  let cgroupProcsCstr = cgroupProcsPath.cstring   # "" .cstring is valid, just unused
+  let cgroupHasLeaf = cgroupLeafPath.len > 0
 
   let childPid = fork()
   if childPid < 0:
@@ -638,6 +628,36 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
     # CHILD — only async-signal-safe operations from here to execve/_exit.
     # =========================================================================
     discard posix.close(pipeRead)
+
+    # rfc-0007 B3: self-join the cgroup leaf FIRST — see the comment above
+    # `let childPid = fork()` for why this is a self-join (not a
+    # parent-side write) and why it runs before literally everything
+    # else, including setpgid/dup2. Async-signal-safe: `cgroupProcsCstr`
+    # is a COW-inherited pointer (no allocation); the pid is hand-
+    # formatted into a fixed stack buffer (no allocation, no `$` string
+    # conversion) — the same "no Nim runtime, no alloc" discipline this
+    # window already follows for argv/envp/the achieved-bytes buffer.
+    var cgroupJoinByte: uint8 = 0        # 0 = no leaf requested this spawn
+    when defined(linux):
+      if cgroupHasLeaf:
+        cgroupJoinByte = 2              # 2 = attempted, failed (pessimistic default)
+        let procsFd = posix.open(cgroupProcsCstr, O_WRONLY)
+        if procsFd >= 0:
+          var buf: array[12, char]
+          var n = int(getpid())
+          var i = 12
+          if n == 0:
+            dec i
+            buf[i] = '0'
+          else:
+            while n > 0:
+              dec i
+              buf[i] = char(ord('0') + (n mod 10))
+              n = n div 10
+          let w = posix.write(procsFd, addr buf[i], 12 - i)
+          if w == 12 - i: cgroupJoinByte = 1   # 1 = success
+          discard posix.close(procsFd)
+
     discard setpgid(Pid(0), Pid(0))
     discard dup2(nullFd, cint(STDIN_FILENO))
     discard posix.close(nullFd)
@@ -656,6 +676,17 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
       if n > 0: off += int(n)
       elif n < 0 and errno == EINTR: continue
       else: break
+    # rfc-0007 B3: one more byte, the cgroup-join result — appended AFTER
+    # the achieved-bytes write so the parent's existing `got == rbuf.len`
+    # partial-read bound still means exactly what it always meant.
+    block:
+      var jb = [cgroupJoinByte]
+      var sent = 0
+      while sent < 1:
+        let n = posix.write(pipeWrite, addr jb[0], 1)
+        if n > 0: sent += int(n)
+        elif n < 0 and errno == EINTR: continue
+        else: break
     discard posix.close(pipeWrite)
 
     discard execve(exeCstr, cast[cstringArray](addr cargs[0]),
@@ -665,18 +696,6 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
     # =========================================================================
 
   # PARENT.
-  # rfc-0007 B3: the FIRST parent-side act, ahead of even the fd close-outs
-  # below — shrinking the documented small race (see the comment above
-  # `let childPid = fork()`) as much as this fork/exec path allows. A move
-  # failure here (the child already gone, somehow) is never fatal: the
-  # leaf is rmdir'd immediately (never leaked) and this spawn falls back to
-  # the pre-B3 domain, same as a leaf that failed to even get created.
-  when defined(linux):
-    if cgroupLeafPath.len > 0:
-      if not moveIntoCgroupLeaf(cgroupLeafPath, childPid):
-        discard posix.rmdir(cgroupLeafPath.cstring)
-        cgroupLeafPath = ""
-        cgroupMemWriteOk = none(bool)
   discard posix.close(nullFd)
   discard posix.close(sinkFd)
   discard posix.close(pipeWrite)
@@ -711,7 +730,36 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
     elif n == 0: break            # EOF — child died before writing
     elif errno == EINTR: continue
     else: break
+
+  # rfc-0007 B3: the cgroup-join result byte, appended after the achieved
+  # bytes above (see the child window's write side). Read regardless of
+  # whether `got == rbuf.len` — a child that died before finishing the
+  # achieved-bytes write will also EOF here immediately, honestly
+  # resolving to "never joined" (byte stays its 0 default) rather than
+  # blocking.
+  var cgroupJoinResult: uint8 = 0
+  if cgroupHasLeaf:
+    var jb: array[1, uint8]
+    var got2 = 0
+    while got2 < 1:
+      let n = posix.read(pipeRead, addr jb[0], 1)
+      if n > 0: got2 += int(n)
+      elif n == 0: break
+      elif errno == EINTR: continue
+      else: break
+    if got2 == 1: cgroupJoinResult = jb[0]
   discard posix.close(pipeRead)
+
+  when defined(linux):
+    if cgroupHasLeaf and cgroupJoinResult != 1:
+      # The child never actually confirmed joining (open/write failed on
+      # its side, or it died before reporting) — never leave an orphaned,
+      # empty leaf behind; this spawn honestly degrades to the pre-B3
+      # domain at reap, exactly like a leaf that failed to even be
+      # created above.
+      discard posix.rmdir(cgroupLeafPath.cstring)
+      cgroupLeafPath = ""
+      cgroupMemWriteOk = none(bool)
 
   var achieved: LimitsAchieved
   if got == rbuf.len:
@@ -1281,7 +1329,6 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
 
   var escapees: seq[ProcSnapshot] = @[]
   var memOom = false
-  var rusageOut = entry.rusage
   var usedCgroup = false
   when defined(linux):
     if entry.cgroupLeaf.len > 0:
@@ -1292,15 +1339,14 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
       # `cgroupLeafSurvivors`'s doc comment for why this needs no
       # `runPhase` guard (leaf-scoped membership cannot cross-attribute
       # between slots the way a global pgid/ppid scan can). Read BEFORE
-      # any teardown write below — `memory.events`/`memory.peak` must not
-      # race the leaf's own removal.
+      # any teardown write below — `memory.events` must not race the
+      # leaf's own removal. (`memory.peak` is intentionally NOT read into
+      # `rusage.maxRssBytes` here — the A5 ledger's wait4-sourced
+      # maxRssBytes/rssMechanism quantity is never replaced, only ever
+      # additively superseded by a NEW tagged column; that column is a
+      # future increment, out of scope for this producer.)
       escapees = cgroupLeafSurvivors(entry.cgroupLeaf)
       memOom = cgroupLeafOomKill(entry.cgroupLeaf)
-      let peak = cgroupLeafMemoryPeak(entry.cgroupLeaf)
-      if peak.isSome and rusageOut.isSome:
-        var r = rusageOut.get
-        r.maxRssBytes = peak.get   # the tagged successor to wait4's ru_maxrss (§7)
-        rusageOut = some(r)
       # Atomic, airtight teardown: kills anything still resident (a setsid
       # escapee that outlived its own leader) in one write, then reclaim
       # the leaf. Safe on an already-empty leaf (the normal-exit case) —
@@ -1335,7 +1381,7 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
     else: kdsProcessGroup
   result = ReapReport(
     exit: entry.exit,
-    rusage: rusageOut,
+    rusage: entry.rusage,
     stop: entry.stop,
     killDomain: domain,
     limits: entry.achieved,
