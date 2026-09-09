@@ -57,11 +57,14 @@ suite "conformance 1 — spawn/exit":
     check report.exit.kind == ekExited
     check report.exit.code == 0
     check report.stop.isNone
-    # rfc-0007 B1: killDomain is capability-driven — this process is really
-    # a subreaper (PR_SET_CHILD_SUBREAPER, set deliberately at Supervisor
-    # init), so the achieved domain is kdsProcessGroupSubreaper, not the
-    # pre-B1 hardcoded kdsProcessGroup.
-    check report.killDomain == kdsProcessGroupSubreaper
+    # rfc-0007 B1: killDomain is the per-spawn ACHIEVED domain, capability-
+    # driven — a real subreaper (PR_SET_CHILD_SUBREAPER, set deliberately at
+    # Supervisor init) reports kdsProcessGroupSubreaper; a backend without it
+    # (e.g. the macOS poll tier) honestly reports the pre-B1 kdsProcessGroup.
+    # This suite is backend-agnostic, so pin against the achieved capability,
+    # never a hardcoded tier.
+    check report.killDomain == (if sv.capabilities().subreaper: kdsProcessGroupSubreaper
+                                else: kdsProcessGroup)
     removeFile(outPath)
 
   test "fail_always: exit code propagates losslessly (not just pass/fail)":
