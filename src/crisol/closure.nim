@@ -323,6 +323,23 @@ proc buildSourceIndex*(config: Config): SourceIndex =
   ## `underAnyRoot`/the under-tracked-root filter (R5: a dep that has since
   ## vanished must still be reported, not silently dropped because its root
   ## no longer resolves).  Only EXISTING roots are actually walked.
+  ##
+  ## rfc-0007 C1a: `projectRoot`'s OWN realpath-expanded form is ALSO
+  ## recorded (alongside its lexical one) when the two differ — an ambient
+  ## host-filesystem symlink entirely OUTSIDE the project's control (macOS
+  ## routes `getTempDir()` through `/var` -> `/private/var`, so a fixture
+  ## rooted there sits under a ancestor symlink it never chose) makes
+  ## `resolveMangledAll`'s `@m` Case 2 fall back to a REALPATH candidate
+  ## (its documented fallback when no lexical/indexed match exists — see
+  ## that proc's comment) that IS genuinely under this project root, just
+  ## not under its lexical spelling. Deliberately projectRoot-only, NOT
+  ## extended to depRoots: a depRoot's realpath target is exactly what
+  ## `byReal`/`lookupByReal` already exist to recover BACK to the depRoot's
+  ## own lexical spelling (the symlinked-depRoot suite above) — adding the
+  ## depRoot's real form to `roots` directly would make `underAnyRoot`
+  ## short-circuit that recovery (the raw real path would look "already
+  ## tracked"), losing the lexical depRoot path the closure is supposed to
+  ## record instead.
   result = SourceIndex(byBasename: initTable[string, seq[IndexedFile]](),
                         byReal: initTable[string, seq[string]]())
   let stateDirAbs = stateDirOf(config)
@@ -330,6 +347,10 @@ proc buildSourceIndex*(config: Config): SourceIndex =
   let prAbs = config.projectRoot.absolutePath.normalizedPath
   result.roots.add prAbs
   if dirExists(prAbs):
+    let prReal =
+      try: prAbs.expandFilename.normalizedPath
+      except OSError: prAbs
+    if prReal != prAbs: result.roots.add prReal
     walkForIndex(prAbs, prAbs, stateDirAbs, result)
 
   for dr in config.depRoots:
@@ -467,7 +488,20 @@ proc toProjectRelative(absPath: string; projectRoot: string): string =
   elif norm == root:
     result = ""
   else:
-    result = norm          # fallback: return as-is (shouldn't happen post-filter)
+    # rfc-0007 C1a: `absPath` may be the REALPATH form `underAnyRoot`
+    # accepted via the root's own realpath-expanded entry
+    # (`buildSourceIndex`'s `addRootWithRealForm`) rather than its lexical
+    # one — mirror that same real-vs-lexical duality here so it strips
+    # correctly instead of falling through to the raw-path fallback below.
+    let realRoot =
+      try: root.expandFilename.normalizedPath
+      except OSError: root
+    if realRoot != root and norm.startsWith(realRoot & $DirSep):
+      result = norm[realRoot.len + 1 .. ^1]
+    elif realRoot != root and norm == realRoot:
+      result = ""
+    else:
+      result = norm          # fallback: return as-is (shouldn't happen post-filter)
   # Normalise to forward slashes on all platforms.
   result = result.replace($DirSep, "/")
 

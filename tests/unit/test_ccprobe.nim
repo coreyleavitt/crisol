@@ -152,11 +152,14 @@ suite "realRun — execv-style, no shell splitting":
     check trimmed == "1"
 
   test "realRun returns ok=true for a command that exits 0":
-    let (_, ok) = realRun("/bin/true", [])
+    ## rfc-0007 C1a: `true`/`false` live at /bin/true and /bin/false on
+    ## Linux but only at /usr/bin/true and /usr/bin/false on macOS — a
+    ## PATH lookup is the portable spelling on both, not a platform branch.
+    let (_, ok) = realRun(findExe("true"), [])
     check ok
 
   test "realRun returns ok=false for a command that exits non-zero":
-    let (_, ok) = realRun("/bin/false", [])
+    let (_, ok) = realRun(findExe("false"), [])
     check not ok
 
   test "realRun captures stdout output":
@@ -184,7 +187,13 @@ suite "realRunIn — subprocess cwd is the given workingDir, not the caller's":
     let run = realRunIn(target)
     let (output, ok) = run("/bin/pwd", [])
     check ok
-    check output.strip() == target.absolutePath.normalizedPath
+    # rfc-0007 C1a: compare against the REALPATH (symlinks resolved), not
+    # the lexical absolutePath — `chdir`'s effective cwd (what `pwd`
+    # actually observes via getcwd(2)) is inherently the resolved path.
+    # On Linux getTempDir() ("/tmp") is not itself a symlink, so this is a
+    # no-op there; on macOS getTempDir() routes through /var ->
+    # /private/var, so the two forms genuinely differ.
+    check output.strip() == target.expandFilename.normalizedPath
 
   test "workingDir = \"\" behaves exactly like realRun (inherits the caller's cwd)":
     let run = realRunIn("")

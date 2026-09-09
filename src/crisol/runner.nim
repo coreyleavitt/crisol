@@ -84,6 +84,18 @@ export cachedispatch.isActive
 # Helpers
 # ---------------------------------------------------------------------------
 
+when defined(macosx):
+  # rfc-0007 C1a: Apple's <stdlib.h> hides mkdtemp(3) (a BSD/POSIX
+  # extension) unless _DARWIN_C_SOURCE is defined for the translation
+  # unit — without it, real macOS clang sees no prototype at all, falls
+  # back to an implicit int-returning declaration, and errors outright
+  # (Clang defaults implicit-function-declaration to an error): "call to
+  # undeclared function 'mkdtemp'" / "incompatible integer to pointer
+  # conversion". Linux/glibc exposes mkdtemp with no such macro needed
+  # (glibc implies _DEFAULT_SOURCE when nothing else restricts it), which
+  # is why this was invisible until this file actually compiled on Darwin.
+  {.passC: "-D_DARWIN_C_SOURCE".}
+
 proc mkdtemp(tmpl: cstring): cstring
   {.importc: "mkdtemp", header: "<stdlib.h>".}
   ## POSIX mkdtemp(3): create a secure temp dir from a template ending in
