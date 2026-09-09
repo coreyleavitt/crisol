@@ -1094,7 +1094,32 @@ when defined(linux):
     let relPath = ownCgroupV2Path()
     if relPath.len == 0: return
     let base = "/sys/fs/cgroup" & relPath
-    let leaf = base / ("crisol-probe-" & $getpid())
+    # The probe leaf is created as a SIBLING of `base` (a child of base's
+    # PARENT), never as a child of `base` itself — this is load-bearing, not
+    # cosmetic, and it is exactly the topology B3's per-spawn backend must
+    # also use. cgroup v2's "no internal process" constraint (kernel docs,
+    # cgroup.procs) forbids a cgroup from enabling domain controllers in its
+    # OWN cgroup.subtree_control while it holds a resident process. `base`
+    # holds THIS process right now (that's how we found it), so `base` can
+    # never delegate the memory controller down to a child of `base` no
+    # matter how the surrounding environment is set up — a child-of-base
+    # leaf's memory.peak is therefore permanently, structurally absent, in
+    # EVERY environment, delegated or not. (Verified empirically against a
+    # real cgroup-v2 host — the earlier child-of-base probe reported
+    # memoryPeak:false even under a `docker run --privileged` container with
+    # the root cgroup's subtree_control already carrying `+memory`.) A child
+    # of base's PARENT has no such conflict: the parent is expected to be a
+    # process-free delegation point (the CI cgroup leg — and B3's real
+    # spawn-leaf placement — both keep the supervisor's own residence one
+    # level below the delegated root for exactly this reason), so its
+    # subtree_control can carry `+memory` while `base` simultaneously holds
+    # this process. Delegation itself (the "can I mkdir + move a pid at
+    # all" signal) is unaffected by which parent we pick — it only tests
+    # write access, not controller inheritance.
+    let parent = base.parentDir
+    if parent.len == 0 or not parent.startsWith("/sys/fs/cgroup"):
+      return   # at the cgroupfs root itself — no sibling location to probe
+    let leaf = parent / ("crisol-probe-" & $getpid())
     try:
       createDir(leaf)
     except CatchableError:

@@ -2,7 +2,7 @@
 ## the wire, through the real entry point (`crisol run --json` / `crisol run
 ## --dry-run --json`), not a hand-built JsonNode.
 ##
-## Tier detection (§4's two known tiers):
+## Tier detection (§4's known tiers):
 ##   - "Linux CI leg" (ci.yml's `test` job, a plain `docker run` on a GitHub-
 ##     hosted ubuntu-latest runner) — CRISOL_TIER=ci-linux is set explicitly
 ##     by that job's docker invocation (ci.yml), because GITHUB_ACTIONS itself
@@ -10,9 +10,14 @@
 ##     `docker run -e ...` unless named explicitly — same convention already
 ##     used for CRISOL_TIMING_TESTS/CRISOL_TEST_DIRS.
 ##   - "rootless-podman dev tier" (`./dev test`) — CRISOL_TIER unset.
-## Both tiers run this same file (tests/integration is a default discovery
-## dir); the assertions below are real, tier-appropriate pins, not dead
-## branches — each arm actually executes on the tier it names.
+##   - "delegated cgroup-v2 CI leg" (rfc-0007 B3, ci.yml's `cgroup` job) — a
+##     `docker run --privileged` container with a real cgroup-v2 subtree
+##     delegated to it before the suite runs; CRISOL_TIER=ci-cgroup pins the
+##     capabilities that ONLY hold once delegation is real, so an inert (or
+##     regressed) probe fails HERE rather than silently passing.
+## All three tiers run this same file (tests/integration is a default
+## discovery dir); the assertions below are real, tier-appropriate pins, not
+## dead branches — each arm actually executes on the tier it names.
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
@@ -73,10 +78,25 @@ proc checkTierPins(sub: JsonNode) =
   ## The acceptance pins from RFC-0007 line 539 — real assertions, gated to
   ## the tier they actually hold on, so an inert always-false (or always-
   ## true) probe fails HERE rather than silently passing on the wrong tier.
-  if getEnv("CRISOL_TIER") == "ci-linux":
+  case getEnv("CRISOL_TIER")
+  of "ci-linux":
     check sub["pidfd"].getBool == true
     check sub["wait4Rusage"].getBool == true
     check sub["flock"].getBool == true
+    check sub["cgroupDelegation"].getBool == false
+  of "ci-cgroup":
+    # rfc-0007 B3: ci.yml's `cgroup` job runs this same Linux CI container,
+    # just with a real cgroup-v2 subtree delegated to it before the suite
+    # starts (see that job's comment for the exact topology) — every
+    # ci-linux pin still holds, PLUS delegation itself is real. An inert
+    # probeCgroupV2 (or a regression that silently stops consuming what it
+    # promised) fails exactly HERE, before B3's backend ever reads it.
+    check sub["pidfd"].getBool == true
+    check sub["wait4Rusage"].getBool == true
+    check sub["flock"].getBool == true
+    check sub["cgroupDelegation"].getBool == true
+    check sub["cgroupKill"].getBool == true
+    check sub["memoryPeak"].getBool == true
   else:
     # rootless-podman dev tier (./dev test): no cgroup delegation, no
     # user-ns, but PR_SET_CHILD_SUBREAPER is unprivileged and unaffected.

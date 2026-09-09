@@ -157,6 +157,110 @@ jobs:
             -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
             ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh
 
+  # rfc-0007 B3 — the leg-first cgroup-v2 delegation canary. `test`/`timing`
+  # above run a plain `docker run` (no --privileged): the container's own
+  # cgroup is a regular, non-root cgroup handed to it by dockerd with an
+  # empty cgroup.subtree_control, so capabilities().cgroupDelegation is
+  # honestly false there (asserted by checkTierPins' ci-linux branch) — B3
+  # needs a leg where delegation is REALLY present, not asserted from a
+  # no-op probe (the #12 lesson).
+  #
+  # Approach chosen: `docker run --privileged` on the GH-hosted runner, NOT
+  # a bare sudo-delegated subtree on the runner host directly. Both were
+  # tried empirically (against a real cgroup-v2 host, not just read from
+  # docs) before landing here:
+  #   - Bare host subtree: the runner's login/job shell already sits deep in
+  #     a systemd-managed hierarchy (session/job scope) that it does not own
+  #     (cgroup.subtree_control there is root:root, not chown'd to the
+  #     runner uid) — every write needs `sudo` per-call, and the shell
+  #     process itself is a standing occupant of whatever scope holds it,
+  #     which collides with the very constraint below.
+  #   - `--privileged` container: dockerd hands the container a writable,
+  #     freshly-rooted cgroup-v2 view (0::/) with full delegation once the
+  #     no-internal-process topology (next paragraph) is set up inside it —
+  #     no per-call sudo, no pre-existing occupants to work around.
+  #
+  # The topology, and why it's shaped this way (verified empirically, not
+  # assumed from docs): cgroup v2's "no internal process constraint" means a
+  # cgroup can NEVER hold a resident process at the same time as it enables
+  # controllers in its OWN cgroup.subtree_control — attempting either while
+  # the other holds fails with EBUSY. Concretely this means the container's
+  # entrypoint shell (which starts AT the container's cgroup root) must
+  # vacate the root before the root can delegate anything:
+  #   1. mkdir a throwaway leaf, move the entrypoint shell into it — root is
+  #      now unoccupied.
+  #   2. NOW enable +cpu +memory +pids on the (unoccupied) root's
+  #      subtree_control.
+  #   3. mkdir the real runner leaf (a CHILD of root, i.e. a SIBLING of the
+  #      throwaway leaf) and move the shell there. Because root's
+  #      subtree_control already carries +memory, the runner leaf gets
+  #      real memory.peak/memory.max/cgroup.kill files on itself immediately
+  #      — this is the exact shape `probeCgroupV2` (posixcore.nim) now
+  #      checks (a SIBLING of the calling process's own cgroup, never a
+  #      CHILD of it — a child-of-self leaf can never get the memory
+  #      controller, structurally, no matter the environment, since the
+  #      calling process's own cgroup can never delegate to its own child
+  #      while occupied by that same process; see that proc's comment).
+  # Every child process forked afterward (the whole nimble test run) stays
+  # in the runner leaf by ordinary cgroup inheritance, so the crisol test
+  # binary itself is the process `probeCgroupV2` actually walks.
+  #
+  # CRISOL_TIER=ci-cgroup pins the acceptance in
+  # tests/integration/test_rfc0007_a7_substrate_cli.nim to
+  # cgroupDelegation/cgroupKill/memoryPeak all true — an inert probe (or a
+  # regressed one) fails HERE, not silently, the first time B3's backend
+  # tries to consume it.
+  cgroup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch vendored deps (milpa.lock)
+        run: bash ci/fetch-deps.sh
+
+      - name: Cache nim compile cache
+        uses: actions/cache@v4
+        with:
+          path: .ci-nimcache
+          key: nimcache-${{ runner.os }}-${{ hashFiles('milpa.lock', 'crisol.nimble') }}
+          restore-keys: |
+            nimcache-${{ runner.os }}-
+
+      - name: Establish real cgroup-v2 delegation and run the test suite inside it
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/workspace" -w /workspace \
+            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            -e CRISOL_TIER=ci-cgroup \
+            ghcr.io/coreyleavitt/nim:2.2.10 bash -c '
+              set -euo pipefail
+              echo "--- before delegation ---"
+              cat /proc/self/cgroup
+              cat /sys/fs/cgroup/cgroup.controllers
+
+              mkdir -p /sys/fs/cgroup/crisol-init
+              echo $$ > /sys/fs/cgroup/crisol-init/cgroup.procs
+
+              echo "+cpu +memory +pids" > /sys/fs/cgroup/cgroup.subtree_control
+
+              mkdir -p /sys/fs/cgroup/crisol-runner
+              echo $$ > /sys/fs/cgroup/crisol-runner/cgroup.procs
+
+              echo "--- after delegation ---"
+              cat /proc/self/cgroup
+              test -f /sys/fs/cgroup/crisol-runner/memory.peak || {
+                echo "SETUP FAILED: runner leaf has no memory.peak -- delegation was not actually established" >&2
+                exit 1
+              }
+              test -f /sys/fs/cgroup/crisol-runner/cgroup.kill || {
+                echo "SETUP FAILED: runner leaf has no cgroup.kill" >&2
+                exit 1
+              }
+              echo "delegation established: runner leaf has memory.peak and cgroup.kill"
+
+              bash ci/run-tests.sh
+            '
+
   # rfc-0007 A2d — the cross-platform contract spike (N=3 before A2b rebuilds
   # the runner on the contract). No docker here: docker-for-tooling is a
   # Linux pattern (the `test`/`timing` jobs above use a Linux container
