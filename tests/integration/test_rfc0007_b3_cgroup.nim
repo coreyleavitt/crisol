@@ -63,20 +63,23 @@ proc sabotageLeaf(leafPath: string) =
   ## relying on filesystem tricks cgroupfs (a kernfs) does not actually
   ## support (a plain `open(O_CREAT)` for an arbitrary regular file where
   ## a directory needs to go is REJECTED by cgroupfs itself, not merely by
-  ## permission bits — confirmed empirically in CI). Instead: pre-create
-  ## the SAME leaf directory (harmless — `createDir` on an already-
-  ## existing directory is a silent no-op, so `spawnChild`'s own
-  ## `createCgroupLeaf` still "succeeds"), then enable a controller on the
-  ## leaf's OWN `cgroup.subtree_control`. cgroup v2's "no internal
-  ## process" constraint (this codebase's own topology comments document
-  ## it extensively — see `cgroupSiblingParent`/`probeCgroupV2`) then
-  ## makes the KERNEL reject any subsequent attempt to write a pid into
-  ## THIS cgroup's `cgroup.procs` (EBUSY) — exactly, and only, the
-  ## self-join step spawnChild's child performs, deterministically and
-  ## regardless of privilege level (root cannot write around a kernel
-  ## invariant the way it can around a permission bit).
+  ## permission bits — confirmed empirically in CI), and without touching
+  ## the "no internal process" enable-while-populated constraint (also
+  ## tried and confirmed empirically NOT to reject a later cgroup.procs
+  ## write into an already-subtree_control-enabled-while-empty cgroup —
+  ## that constraint is checked at ENABLE time, not at migrate-in time).
+  ## Instead: pre-create the SAME leaf directory (harmless — `createDir`
+  ## on an already-existing directory is a silent no-op, so `spawnChild`'s
+  ## own `createCgroupLeaf` still "succeeds"), then set the leaf's OWN
+  ## `pids.max` to 0. The `pids` controller is enabled root-down for the
+  ## whole delegated subtree (ci.yml's setup), so every leaf — including
+  ## this one — has a real, per-leaf `pids.max`; zero means the kernel
+  ## rejects ANY attempt to add a process to this cgroup (EAGAIN),
+  ## deterministically and regardless of privilege level (root cannot
+  ## write around a numeric admission-control ceiling) — exactly, and
+  ## only, the self-join step spawnChild's child performs.
   createDir(leafPath)
-  writeFile(leafPath / "cgroup.subtree_control", "+cpu")
+  writeFile(leafPath / "pids.max", "0")
 
 proc cleanupSabotagedLeaf(leafPath: string) =
   ## Safety-net teardown only — the production per-spawn honest-degrade
@@ -84,12 +87,8 @@ proc cleanupSabotagedLeaf(leafPath: string) =
   ## leaf itself once it saw the child's join fail; this exists purely so
   ## a test FAILURE (an assertion tripping before that path runs) never
   ## leaves a stray sabotaged cgroup behind for the next test to collide
-  ## with. Disabling the controller first is required — an active
-  ## `cgroup.subtree_control` does not itself block `rmdir` on an
-  ## otherwise-empty leaf, but a best-effort disable keeps this cleanup
-  ## symmetric with the sabotage above regardless.
-  try: writeFile(leafPath / "cgroup.subtree_control", "-cpu")
-  except CatchableError: discard
+  ## with. `pids.max` never blocks `rmdir` of an otherwise-empty leaf (it
+  ## only ever gates NEW admissions), so a bare rmdir is enough here.
   discard posix.rmdir(leafPath.cstring)   # bare rmdir — os.removeDir would try
                                             # (and fail) to unlink cgroupfs's
                                             # own control-file entries first
