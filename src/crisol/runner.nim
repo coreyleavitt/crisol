@@ -186,15 +186,24 @@ proc noopResult*(r: EntrypointResult) = discard
 # ---------------------------------------------------------------------------
 
 proc wait4MaxRss(res: EntrypointResult): tuple[bytes: int64; mechanism: string] =
-  ## rfc-0007 A5: pull the run phase's wait4-reaped maxRss, when present.
-  ## Distinct from `peakRssBytes`/`rssBytes` (the RFC-0002 sampled group-sum
-  ## admission quantity) — this is the per-process max wait4 folds over
-  ## reaped descendants at exit (§7 "a new quantity, not a replacement").
-  ## ("", 0) when the run phase never produced a live ProcessResult (a
-  ## spawn failure, or a skipped phase) or the platform/attempt genuinely
-  ## had no rusage to report — never a fabricated non-zero value.
+  ## rfc-0007 A5: pull the run phase's reaped maxRss, when present. Distinct
+  ## from `peakRssBytes`/`rssBytes` (the RFC-0002 sampled group-sum
+  ## admission quantity) — this is the per-process max folded over reaped
+  ## descendants at exit (§7 "a new quantity, not a replacement"). ("", 0)
+  ## when the run phase never produced a live ProcessResult (a spawn
+  ## failure, or a skipped phase) or the platform/attempt genuinely had no
+  ## rusage to report — never a fabricated non-zero value.
+  ##
+  ## rfc-0007 B3: "wait4" tags the value on every tier except the cgroup
+  ## one, where posixcore's reapCore has already overwritten
+  ## `rusage.maxRssBytes` with the leaf's `memory.peak` — a tree-accounted
+  ## figure wait4 (single-reaped-process only) cannot produce — tagged
+  ## "cgroup" so a reader can tell which mechanism actually measured it,
+  ## never silently (the RFC's own "the tagged successor" framing).
   if res.run.kind in {ptypes.pkRan, ptypes.pkCached} and res.run.res.rusage.isSome:
-    (res.run.res.rusage.get.maxRssBytes, "wait4")
+    let mechanism = if res.run.res.evidence.killDomain == ptypes.kdsCgroup: "cgroup"
+                    else: "wait4"
+    (res.run.res.rusage.get.maxRssBytes, mechanism)
   else:
     (0'i64, "")
 
@@ -365,7 +374,8 @@ proc toProcessResult(report: ReapReport; limits: ptypes.Limits;
   ## net-isolation was actually achieved; see resolveSandbox/evidenceSatisfies).
   ptypes.ProcessResult(
     exit: report.exit,
-    cause: ptypes.classifyCause(report.exit, report.stop, limits, report.limits),
+    cause: ptypes.classifyCause(report.exit, report.stop, limits, report.limits,
+                                report.memoryOomKill),
     evidence: ptypes.Evidence(
       killDomain:             report.killDomain,
       tree:                   report.tree,

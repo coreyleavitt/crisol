@@ -21,7 +21,16 @@
 ##      / warning-tag story as spawn_grandchild now, with `tree` flipping
 ##      to the honest `complete` label (a subreaper sees the whole
 ##      descendant tree — separate axis from whether anything survived,
-##      §6).
+##      §6). rfc-0007 B3: on a host with real cgroup-v2 delegation (the CI
+##      `cgroup` job) this SAME fixture proves the cgroup tier's own escapee
+##      mechanism — setsid changes the POSIX process group/session, never
+##      cgroup membership, so the daemonized grandchild is caught by a
+##      `cgroup.procs` scan (and killed via `cgroup.kill`) exactly like a
+##      non-setsid one would be, contrasting the subreaper tier's pidfd-
+##      based kill path. Asserted below by the ONE tier-specific fact this
+##      file adds: `killDomain == "cgroup"` (everything else — escapees.len,
+##      tree, cacheDecision, the render warning — already holds identically
+##      on both tiers, per the shared observation above).
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
@@ -30,6 +39,7 @@
 import std/[json, os, posix, strutils, times, unittest]
 import std/posix as posix_mod
 import crisol         # imports runMain
+import crisol/process as procmod   # capabilities() — rfc-0007 B3 tier check
 
 # ---------------------------------------------------------------------------
 # Helpers (per-file idiom — no cross-test-file import, see
@@ -152,6 +162,14 @@ suite "rfc-0007 B1 — spawn_grandchild_setsid: reparented escapee is NOT cached
     # `tree` flips to "complete" even though a live descendant was found
     # and killed (the two axes are separate, §6).
     check ep1["run"]["evidence"]["tree"].getStr == "complete"
+    # rfc-0007 B3: on the delegated cgroup tier the achieved killDomain is
+    # the stronger "cgroup" claim instead — setsid changes the process
+    # group/session, never cgroup membership, so this SAME fixture proves
+    # the cgroup tier catches it too (contrast the subreaper tier's pidfd
+    # kill path). Pin against the achieved capability, never a hardcoded
+    # tier.
+    if procmod.capabilities().cgroupDelegation:
+      check ep1["run"]["evidence"]["killDomain"].getStr == "cgroup"
     # Observed escapee ⇒ NOT stored — cdmHermeticityDeg, not cdmStored.
     check ep1["cacheDecision"].getStr == "hermeticityDegraded"
 

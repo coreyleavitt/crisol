@@ -119,6 +119,190 @@ else:
   proc probeSubreaper(): bool = false
 
 # ---------------------------------------------------------------------------
+# rfc-0007 B3 (§3/§4): delegated cgroup-v2 leaf plumbing. Moved ahead of
+# `spawnChild`/`reapCore` — same reason `initPosixCore` needs
+# probeSubreaper/probePidfd this early — so both can call these directly.
+# `probeCgroupV2` (the capabilities-probe section, further down) is
+# rewritten to share `ownCgroupV2Path`/`cgroupSiblingParent` with the REAL
+# per-spawn leaf placement below, rather than duplicating the topology
+# decision in two places.
+# ---------------------------------------------------------------------------
+
+proc parseStatLine*(content: string): tuple[ppid, pgrp: int; comm: string; starttime: int64]
+  ## Forward declaration — the real proc (with its full doc comment) lives
+  ## in the "/proc forensics" section below; `cgroupLeafSurvivors` (B3,
+  ## right below) needs it this early for the same reason `initPosixCore`
+  ## needs `probeSubreaper` this early.
+proc readVmRssBytes(pid: int): int64
+  ## Forward declaration — real proc lives beside `parseStatLine` below.
+
+when defined(linux):
+  proc ownCgroupV2Path(): string =
+    ## Reads /proc/self/cgroup's unified (v2) line: "0::<path>".
+    try:
+      for line in lines("/proc/self/cgroup"):
+        if line.startsWith("0::"):
+          return line[3 .. ^1]
+    except CatchableError:
+      discard
+    ""
+
+  proc cgroupSiblingParent*(): string =
+    ## The REAL production topology, shared by the capabilities probe and
+    ## every per-spawn leaf below (and reused by the fault-injection test
+    ## to predict/collide a specific spawn's leaf path — rfc-0007 B3):
+    ## a SIBLING of this process's own cgroup residence (a child of its
+    ## PARENT), never a child of the residence itself. cgroup v2's "no
+    ## internal process" constraint forbids a cgroup from enabling
+    ## controllers in its OWN `cgroup.subtree_control` while it holds a
+    ## resident process — this process IS resident in its own cgroup right
+    ## now, so only a SIBLING (never a child of it) can inherit delegated
+    ## controllers (see `probeCgroupV2`'s longer comment, capabilities
+    ## section below, for the empirically-verified reasoning). "" when
+    ## there is nowhere to place a sibling (e.g. already at the cgroupfs
+    ## root, or /proc/self/cgroup unreadable).
+    let relPath = ownCgroupV2Path()
+    if relPath.len == 0: return ""
+    let base = "/sys/fs/cgroup" & relPath
+    let parent = base.parentDir
+    if parent.len == 0 or not parent.startsWith("/sys/fs/cgroup"): return ""
+    parent
+
+  proc cgroupSlotLeafName*(pid: Pid; id: int32): string =
+    ## Deterministic per-spawn leaf name — exported so the fault-injection
+    ## test (tests/integration/test_rfc0007_b3_cgroup.nim) can predict and
+    ## pre-collide ONE specific spawn's leaf path (a plain file where a
+    ## directory needs to go — un-creatable regardless of privilege level,
+    ## unlike a permission-based sabotage a `--privileged` CI container's
+    ## root would simply bypass).
+    "crisol-slot-" & $pid & "-" & $id
+
+  proc createCgroupLeaf(parent, name: string): string =
+    ## mkdir the leaf; returns its full path, or "" on ANY failure (already
+    ## exists as a non-directory, parent not writable, etc.) — the
+    ## per-spawn honest-degrade trigger (rfc-0007 B3): a failure here NEVER
+    ## aborts the spawn, it just leaves this one spawn off the cgroup tier.
+    let leaf = parent / name
+    try:
+      createDir(leaf)
+      leaf
+    except CatchableError:
+      ""
+
+  proc moveIntoCgroupLeaf(leafPath: string; pid: Pid): bool =
+    ## The B3 fallback (clone3(CLONE_INTO_CGROUP) is impractical from Nim's
+    ## fork/exec path here — see spawnChild's comment for the full
+    ## reasoning): write the just-forked child's pid to the leaf's
+    ## `cgroup.procs` as the very first parent-side act after `fork()`
+    ## returns, to shrink (never eliminate) the documented small race
+    ## window between fork and this write, during which the child is
+    ## running but not yet cgroup-delegated.
+    try:
+      writeFile(leafPath / "cgroup.procs", $int(pid) & "\n")
+      true
+    except CatchableError:
+      false
+
+  proc writeCgroupMemoryMax(leafPath: string; bytes: int64): bool =
+    ## cgroup `memory.max` — the tagged successor to RLIMIT_AS on this tier
+    ## (real RSS-backed enforcement + kernel OOM-kill accounting, vs.
+    ## RLIMIT_AS's virtual-address-space-only ceiling). RLIMIT_AS itself is
+    ## NOT removed (applyLimitsChildSide, unchanged) — both are attempted
+    ## when a memory ceiling is requested; this is the cgroup-specific one.
+    try:
+      writeFile(leafPath / "memory.max", $bytes)
+      true
+    except CatchableError:
+      false
+
+  proc killCgroupLeaf(leafPath: string) =
+    ## Atomic, airtight teardown (rfc-0007 B3): write "1" to `cgroup.kill`
+    ## — kills every process resident in the subtree in one syscall,
+    ## including a setsid escapee the pgid-only `killpg` can never reach.
+    ## Best-effort: a leaf whose `cgroup.kill` is already gone, or that was
+    ## never really delegated, has nothing to do here. Safe to call on an
+    ## EMPTY cgroup too (the normal-exit case) — a harmless no-op write.
+    try: writeFile(leafPath / "cgroup.kill", "1")
+    except CatchableError: discard
+
+  proc cgroupLeafSurvivors(leafPath: string): seq[ProcSnapshot] =
+    ## rfc-0007 B3: the cgroup-tier's OWN escapee/tree accounting — every
+    ## pid still listed in this leaf's `cgroup.procs` at reap time. No
+    ## /proc pgid/ppid scan needed (unlike the subreaper tier's
+    ## `discoverAndReapEscapees`): a process's cgroup membership is
+    ## LEAF-SCOPED by construction (each spawn gets its own leaf), so
+    ## unlike the pgid/ppid heuristics this can NEVER cross-attribute a
+    ## different slot's descendant — structurally sound regardless of
+    ## compile vs. run phase, which is why (unlike
+    ## `discoverAndReapEscapees`) this path never needs a `runPhase` guard.
+    result = @[]
+    var pids: seq[int]
+    try:
+      for line in lines(leafPath / "cgroup.procs"):
+        let s = line.strip()
+        if s.len == 0: continue
+        try: pids.add parseInt(s)
+        except ValueError: discard
+    except CatchableError:
+      discard
+    for pid in pids:
+      var ppid = 0
+      var comm = ""
+      try:
+        let parsed = parseStatLine(readFile("/proc/" & $pid & "/stat"))
+        ppid = parsed.ppid
+        comm = parsed.comm
+      except CatchableError:
+        discard
+      result.add ProcSnapshot(pid: pid, ppid: ppid, command: comm,
+                              rssBytes: readVmRssBytes(pid))
+
+  proc cgroupLeafOomKill(leafPath: string): bool =
+    ## `memory.events`' `oom_kill` counter > 0 — read BEFORE any teardown
+    ## write (killCgroupLeaf/removeCgroupLeafBounded), so a real OOM fact
+    ## is never raced by the leaf's own removal.
+    try:
+      for line in lines(leafPath / "memory.events"):
+        if line.startsWith("oom_kill "):
+          try: return parseInt(line.split(' ')[1].strip()) > 0
+          except ValueError: return false
+    except CatchableError:
+      discard
+    false
+
+  proc cgroupLeafMemoryPeak(leafPath: string): Option[int64] =
+    ## `memory.peak` — the leaf's real, tree-accounted peak RSS+cache high
+    ## watermark (a real RLIMIT_AS/wait4-ru_maxrss replacement on this
+    ## tier: wait4 only ever saw the single reaped process, never its
+    ## descendants). Read before teardown, same reasoning as
+    ## `cgroupLeafOomKill`.
+    try:
+      return some(parseBiggestInt(readFile(leafPath / "memory.peak").strip()))
+    except CatchableError, ValueError:
+      discard
+    none(int64)
+
+  proc removeCgroupLeafBounded(leafPath: string): bool =
+    ## Never leak leaves (rfc-0007 B3), but NEVER an unbounded blocking
+    ## wait in the event-loop path either (the B1 lesson). A `cgroup.kill`
+    ## target's cgroup membership drops at the kernel's `do_exit()` —
+    ## BEFORE its parent ever wait()s it (not dependent on THIS event
+    ## loop's own future orphan-sweep iteration reaping it first, so
+    ## polling here cannot self-deadlock the loop that would otherwise
+    ## have to do that reaping) — so a short bound is safe, mirroring
+    ## `reapBounded`'s identical accepted-bound convention for the exact
+    ## same "SIGKILL is near-instant" reasoning. Gives up (leaving the
+    ## leaf, a rare pathological case) only past the budget.
+    const budgetMs = 300
+    const stepMs = 5
+    var waited = 0
+    while waited < budgetMs:
+      if posix.rmdir(leafPath.cstring) == 0: return true
+      os.sleep(stepMs)
+      waited += stepMs
+    false
+
+# ---------------------------------------------------------------------------
 # PosixCore — the shared state: child registry, self-pipe, act ledger.
 # ---------------------------------------------------------------------------
 
@@ -139,6 +323,13 @@ type
                                 ## registered EPOLLIN in `core.epollFd` at
                                 ## spawn, closed + EPOLL_CTL_DEL'd at reap
                                 ## (the ONLY two touch points; never leaked).
+    cgroupLeaf: string          ## rfc-0007 B3: "" unless this spawn got a
+                                ## real cgroup-v2 leaf (capabilities().
+                                ## cgroupDelegation AND leaf creation AND the
+                                ## post-fork move both succeeded). Non-empty
+                                ## iff killDomain for this slot is kdsCgroup
+                                ## at reap — "" is the per-spawn honest
+                                ## degrade to the pre-B3 domain.
 
   PosixCore* = object
     nextIdVal: int32
@@ -343,6 +534,13 @@ proc applyLimitsChildSide(limits: Limits; achieved: var array[nLimits, uint8]) =
 # spawn — the fork/exec child window, generalized from ChildSpec.
 # ---------------------------------------------------------------------------
 
+proc cachedCapabilities*(): Capabilities
+  ## Forward declaration — the real probe/memo lives in the capabilities
+  ## section further below (this proc predates that section textually so
+  ## `spawnChild`/`reapCore` can both consult it — spawnChild for the
+  ## per-spawn cgroup-leaf decision (B3), reapCore for the achieved
+  ## killDomain).
+
 proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   if spec.argv.len == 0:
     return SpawnResult(ok: false, error: "empty argv")
@@ -391,12 +589,48 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   let exeCstr = exePath.cstring
   let doChdir = spec.cwd.len > 0
 
+  # rfc-0007 B3: per-slot cgroup-v2 leaf, created BEFORE fork so it's ready
+  # for the child immediately. Clone3(CLONE_INTO_CGROUP) (atomic — the
+  # child starts already in the leaf, needs the leaf fd passed through
+  # clone_args) would close the race window below entirely, but it is
+  # impractical from this fork/exec path: it would mean replacing the
+  # plain `fork()` this whole async-signal-safe child window is built
+  # around with a raw clone3 syscall (no Nim stdlib wrapper exists), and
+  # re-deriving every ordering invariant documented on that window (rlimit
+  # readback pipe, sink dup2 order, execve fallback) under a mechanism this
+  # codebase has zero prior experience with — a needless, high-risk rewrite
+  # of an already-delicate primitive for a race window the fallback below
+  # already shrinks to a few instructions. The accepted fallback (RFC's own
+  # words): create the leaf, then write the child's pid to its
+  # `cgroup.procs` as the FIRST parent-side act after `fork()` returns
+  # (right below) — the child is briefly running outside the leaf between
+  # `fork()` returning and that write landing; a `memory.max` ceiling is
+  # not yet enforced against it during that window. Never fatal to the
+  # spawn either way: any failure below just leaves `cgroupLeafPath` ""
+  # and this ONE spawn honestly degrades to the pre-B3 domain at reap.
+  let plannedId = core.nextIdVal
+  var cgroupLeafPath = ""
+  var cgroupMemWriteOk = none(bool)   # none = never attempted this spawn
+  let caps0 = cachedCapabilities()
+  when defined(linux):
+    if caps0.cgroupDelegation:
+      let parent = cgroupSiblingParent()
+      if parent.len > 0:
+        let created = createCgroupLeaf(parent, cgroupSlotLeafName(getpid(), plannedId))
+        if created.len > 0:
+          cgroupLeafPath = created
+          if spec.limits.req[lkMemory].isSome:
+            cgroupMemWriteOk = some(writeCgroupMemoryMax(cgroupLeafPath,
+                                                          spec.limits.req[lkMemory].get))
+
   let childPid = fork()
   if childPid < 0:
     discard posix.close(sinkFd)
     discard posix.close(nullFd)
     discard posix.close(pipeRead)
     discard posix.close(pipeWrite)
+    when defined(linux):
+      if cgroupLeafPath.len > 0: discard posix.rmdir(cgroupLeafPath.cstring)
     return SpawnResult(ok: false, error: "fork failed")
 
   if childPid == 0:
@@ -431,6 +665,18 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
     # =========================================================================
 
   # PARENT.
+  # rfc-0007 B3: the FIRST parent-side act, ahead of even the fd close-outs
+  # below — shrinking the documented small race (see the comment above
+  # `let childPid = fork()`) as much as this fork/exec path allows. A move
+  # failure here (the child already gone, somehow) is never fatal: the
+  # leaf is rmdir'd immediately (never leaked) and this spawn falls back to
+  # the pre-B3 domain, same as a leaf that failed to even get created.
+  when defined(linux):
+    if cgroupLeafPath.len > 0:
+      if not moveIntoCgroupLeaf(cgroupLeafPath, childPid):
+        discard posix.rmdir(cgroupLeafPath.cstring)
+        cgroupLeafPath = ""
+        cgroupMemWriteOk = none(bool)
   discard posix.close(nullFd)
   discard posix.close(sinkFd)
   discard posix.close(pipeWrite)
@@ -479,11 +725,26 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
     for lk in LimitKind:
       achieved[lk] = if spec.limits.req[lk].isSome: lsFailed else: lsNotRequested
 
+  # rfc-0007 B3: lkMemory's achieved status is a PARENT-side fact (the
+  # cgroup writes above, never the child's rlimit-readback pipe — that
+  # byte stayed the child's zero-initialized default, lsNotRequested,
+  # regardless of which branch above ran) — computed here, unconditionally
+  # overwriting whatever the byte-readback happened to produce for this
+  # one kind.
+  achieved[lkMemory] =
+    if spec.limits.req[lkMemory].isNone: lsNotRequested
+    elif cgroupLeafPath.len > 0: (if cgroupMemWriteOk == some(true): lsApplied else: lsFailed)
+    elif caps0.cgroupDelegation: lsFailed       # green probe, THIS leaf failed
+    else: lsUnsupported                          # mechanism absent on this tier
+
+  doAssert plannedId == core.nextIdVal,
+    "spawnChild: nextIdVal changed between the cgroup leaf's planned id and " &
+    "assignment below — the leaf name/pid predictability contract broke"
   let id = core.nextIdVal
   inc core.nextIdVal
   core.children[id] = ChildEntry(pid: childPid, state: csSpawned,
                                   reqLimits: spec.limits, achieved: achieved,
-                                  pidfd: pidfd)
+                                  pidfd: pidfd, cgroupLeaf: cgroupLeafPath)
   inc core.liveCount
   SpawnResult(ok: true, id: ChildId(id))
 
@@ -861,7 +1122,17 @@ proc forceKillCore*(core: var PosixCore; id: ChildId) =
   if entry.state == csExited:
     return   # atomic no-op — same rule as requestStop
   entry.killSnapshot = scanProcessGroup(entry.pid)   # refreshed at forced kill
-  discard killpg(entry.pid, SIGKILL)
+  when defined(linux):
+    if entry.cgroupLeaf.len > 0:
+      # rfc-0007 B3: cgroup.kill is atomic and airtight — one write kills
+      # the WHOLE subtree, including a setsid escapee `killpg` (pgid-only)
+      # can never reach. The cgroup-tier slot's ONE forceKill mechanism;
+      # `killpg` below is skipped entirely, not merely redundant with it.
+      killCgroupLeaf(entry.cgroupLeaf)
+    else:
+      discard killpg(entry.pid, SIGKILL)
+  else:
+    discard killpg(entry.pid, SIGKILL)
   if entry.stop.isSome:
     entry.stop = some((reason: entry.stop.get.reason, escalated: true))
   else:
@@ -878,11 +1149,6 @@ proc forceKillCore*(core: var PosixCore; id: ChildId) =
 # reapCore's owning-slot discovery of LIVE + reparented descendants, killed
 # via pidfd_open + a starttime identity check (pid-reuse-safe), then reaped.
 # ---------------------------------------------------------------------------
-
-proc cachedCapabilities*(): Capabilities
-  ## Forward declaration — the real probe/memo lives in the capabilities
-  ## section below (this proc predates that section textually so
-  ## `reapCore` can consult it for the achieved killDomain).
 
 proc reapBounded(pid: Pid) =
   ## B1 regression fix, part A: a SIGKILL target becomes a reapable zombie
@@ -1012,25 +1278,64 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
   if entry.state != csExited:
     doAssert false, "reap: weChildExited was never reported for ChildId " & $id
   let caps = cachedCapabilities()
-  # rfc-0007 B1 (§3): the owning slot's LIVE + reparented escapees,
-  # discovered, killed (pidfd_open + starttime identity check), and reaped
-  # — see discoverAndReapEscapees above. `entry.pid` doubles as the domain
-  # pgid (spawnChild calls setpgid(childPid, childPid)); the leader itself
-  # is already gone from /proc (pollSweepChildren's wait4 already consumed
-  # it), so only real survivors/descendants remain in the scan.
-  let escapees = discoverAndReapEscapees(core, idx, entry.pid, caps, runPhase)
-  # A7/B1 (§4/§3): the per-spawn ACHIEVED domain — kdsProcessGroupSubreaper
-  # iff this process is REALLY a subreaper (initPosixCore sets
-  # PR_SET_CHILD_SUBREAPER deliberately; the probe's own readback confirms
-  # it), else the pre-B1 kdsProcessGroup. `treeObservationFor`
-  # (process/types.nim) ties `tree` to this by construction: a subreaper
-  # sees the WHOLE descendant tree by construction, so `toComplete` is
-  # honest here even when `escapees` is non-empty — tree completeness and
-  # "did anything survive" are separate axes (§2/§6).
-  let domain = if caps.subreaper: kdsProcessGroupSubreaper else: kdsProcessGroup
+
+  var escapees: seq[ProcSnapshot] = @[]
+  var memOom = false
+  var rusageOut = entry.rusage
+  var usedCgroup = false
+  when defined(linux):
+    if entry.cgroupLeaf.len > 0:
+      usedCgroup = true
+      # rfc-0007 B3: escapee/tree/memory accounting for a cgroup-tier slot
+      # comes from the cgroup itself, not the /proc pgid/ppid heuristics
+      # `discoverAndReapEscapees` uses for the subreaper tier — see
+      # `cgroupLeafSurvivors`'s doc comment for why this needs no
+      # `runPhase` guard (leaf-scoped membership cannot cross-attribute
+      # between slots the way a global pgid/ppid scan can). Read BEFORE
+      # any teardown write below — `memory.events`/`memory.peak` must not
+      # race the leaf's own removal.
+      escapees = cgroupLeafSurvivors(entry.cgroupLeaf)
+      memOom = cgroupLeafOomKill(entry.cgroupLeaf)
+      let peak = cgroupLeafMemoryPeak(entry.cgroupLeaf)
+      if peak.isSome and rusageOut.isSome:
+        var r = rusageOut.get
+        r.maxRssBytes = peak.get   # the tagged successor to wait4's ru_maxrss (§7)
+        rusageOut = some(r)
+      # Atomic, airtight teardown: kills anything still resident (a setsid
+      # escapee that outlived its own leader) in one write, then reclaim
+      # the leaf. Safe on an already-empty leaf (the normal-exit case) —
+      # cgroup.kill on nothing is a harmless no-op write.
+      killCgroupLeaf(entry.cgroupLeaf)
+      discard removeCgroupLeafBounded(entry.cgroupLeaf)   # never leak leaves
+  if not usedCgroup:
+    # rfc-0007 B1 (§3): the owning slot's LIVE + reparented escapees,
+    # discovered, killed (pidfd_open + starttime identity check), and
+    # reaped — see discoverAndReapEscapees above. `entry.pid` doubles as
+    # the domain pgid (spawnChild calls setpgid(childPid, childPid)); the
+    # leader itself is already gone from /proc (pollSweepChildren's wait4
+    # already consumed it), so only real survivors/descendants remain in
+    # the scan.
+    escapees = discoverAndReapEscapees(core, idx, entry.pid, caps, runPhase)
+
+  # A7/B1/B3 (§4/§3): the per-spawn ACHIEVED domain — kdsCgroup iff this
+  # spawn got a real leaf (checked FIRST: cgroup is strictly the stronger
+  # claim when both it and subreaper hold, which they always do together
+  # on this tier — subreaper is set unconditionally in initPosixCore);
+  # else kdsProcessGroupSubreaper iff this process is REALLY a subreaper
+  # (initPosixCore sets PR_SET_CHILD_SUBREAPER deliberately; the probe's
+  # own readback confirms it); else the pre-B1 kdsProcessGroup.
+  # `treeObservationFor` (process/types.nim) ties `tree` to this by
+  # construction: both a subreaper and a cgroup leaf see the WHOLE
+  # descendant tree by construction, so `toComplete` is honest here even
+  # when `escapees` is non-empty — tree completeness and "did anything
+  # survive" are separate axes (§2/§6).
+  let domain =
+    if usedCgroup: kdsCgroup
+    elif caps.subreaper: kdsProcessGroupSubreaper
+    else: kdsProcessGroup
   result = ReapReport(
     exit: entry.exit,
-    rusage: entry.rusage,
+    rusage: rusageOut,
     stop: entry.stop,
     killDomain: domain,
     limits: entry.achieved,
@@ -1038,6 +1343,7 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
     tree: treeObservationFor(domain),
     escapees: escapees,
     cooperativeUnavailable: false,   # POSIX: SIGTERM is always deliverable (§3)
+    memoryOomKill: memOom,
   )
   when defined(linux):
     # rfc-0007 B2: reap is the ONLY place a ChildId is consumed (§1) — so it
@@ -1079,46 +1385,20 @@ when defined(linux):
   # lacks — cgroup.kill/memory.peak are only even CHECKED inside a leaf
   # that delegation itself proved writable; never probed independently
   # (never "fail per-file at spawn time" — §4).
-  proc ownCgroupV2Path(): string =
-    ## Reads /proc/self/cgroup's unified (v2) line: "0::<path>".
-    try:
-      for line in lines("/proc/self/cgroup"):
-        if line.startsWith("0::"):
-          return line[3 .. ^1]
-    except CatchableError:
-      discard
-    ""
-
+  #
+  # `cgroupSiblingParent()` (defined above, ahead of spawnChild) is the
+  # SAME topology decision B3's real per-spawn leaf placement uses — see
+  # its doc comment for the full "why a sibling, never a child of `base`"
+  # reasoning, empirically verified against a real cgroup-v2 host.
   proc probeCgroupV2(): tuple[delegation, kill, memoryPeak: bool] =
     result = (delegation: false, kill: false, memoryPeak: false)
-    let relPath = ownCgroupV2Path()
-    if relPath.len == 0: return
-    let base = "/sys/fs/cgroup" & relPath
-    # The probe leaf is created as a SIBLING of `base` (a child of base's
-    # PARENT), never as a child of `base` itself — this is load-bearing, not
-    # cosmetic, and it is exactly the topology B3's per-spawn backend must
-    # also use. cgroup v2's "no internal process" constraint (kernel docs,
-    # cgroup.procs) forbids a cgroup from enabling domain controllers in its
-    # OWN cgroup.subtree_control while it holds a resident process. `base`
-    # holds THIS process right now (that's how we found it), so `base` can
-    # never delegate the memory controller down to a child of `base` no
-    # matter how the surrounding environment is set up — a child-of-base
-    # leaf's memory.peak is therefore permanently, structurally absent, in
-    # EVERY environment, delegated or not. (Verified empirically against a
-    # real cgroup-v2 host — the earlier child-of-base probe reported
-    # memoryPeak:false even under a `docker run --privileged` container with
-    # the root cgroup's subtree_control already carrying `+memory`.) A child
-    # of base's PARENT has no such conflict: the parent is expected to be a
-    # process-free delegation point (the CI cgroup leg — and B3's real
-    # spawn-leaf placement — both keep the supervisor's own residence one
-    # level below the delegated root for exactly this reason), so its
-    # subtree_control can carry `+memory` while `base` simultaneously holds
-    # this process. Delegation itself (the "can I mkdir + move a pid at
-    # all" signal) is unaffected by which parent we pick — it only tests
-    # write access, not controller inheritance.
-    let parent = base.parentDir
-    if parent.len == 0 or not parent.startsWith("/sys/fs/cgroup"):
-      return   # at the cgroupfs root itself — no sibling location to probe
+    # Captured BEFORE the move below (moving into `leaf` changes what
+    # `ownCgroupV2Path()` would return) — this is where "move back" must
+    # restore this process to.
+    let base = "/sys/fs/cgroup" & ownCgroupV2Path()
+    let parent = cgroupSiblingParent()
+    if parent.len == 0:
+      return   # at the cgroupfs root, or /proc/self/cgroup unreadable
     let leaf = parent / ("crisol-probe-" & $getpid())
     try:
       createDir(leaf)

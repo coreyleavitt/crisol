@@ -32,9 +32,10 @@
 ## `maxRssBytes`/`rssMechanism` (rfc-0007 A5): additive columns, absent on any
 ## row written before A5. `rssBytes` stays RFC-0002's sampled group-sum (the
 ## admission quantity — unchanged); `maxRssBytes` is the DIFFERENT per-process
-## wait4 quantity reaped at exit, tagged by `rssMechanism` ("wait4" today, ""
-## = absent/unrecorded) so a future producer (e.g. cgroup memory.peak) can
-## supersede it explicitly by mechanism string, never silently.
+## quantity reaped at exit, tagged by `rssMechanism` ("wait4" on every tier,
+## "cgroup" on the delegated tier where B3's `memory.peak` supersedes it —
+## a tree-accounted figure wait4 alone cannot produce — "" = absent/
+## unrecorded) so a mechanism change is always explicit, never silent.
 ##
 ## ## Writes
 ##
@@ -91,12 +92,12 @@ type
                                ## row — a pre-A5 row, or the platform/attempt
                                ## had none).
     rssMechanism*:  string     ## which mechanism produced `maxRssBytes`:
-                               ## "wait4" today (A1b's reap-time rusage); ""
-                               ## means absent/unrecorded. A future cgroup
-                               ## memory.peak producer supersedes this field
-                               ## EXPLICITLY, by writing its own mechanism
-                               ## string here — never silently by redefining
-                               ## what an untagged value means.
+                               ## "wait4" (A1b's reap-time rusage) on every
+                               ## tier except the delegated cgroup one,
+                               ## where it reads "cgroup" (rfc-0007 B3's
+                               ## memory.peak, a tree-accounted figure wait4
+                               ## alone cannot produce); "" means absent/
+                               ## unrecorded.
     rowVersion*: int           ## must equal currentRowVersion to be accepted
 
   Ledger* = object

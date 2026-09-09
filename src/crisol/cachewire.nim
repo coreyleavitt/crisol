@@ -201,6 +201,7 @@ proc limitKindName(k: ptypes.LimitKind): string =
   of ptypes.lkFileSize: "fileSize"
   of ptypes.lkOpenFiles: "openFiles"
   of ptypes.lkCore: "core"
+  of ptypes.lkMemory: "memory"
 
 proc limitsToJson(l: ptypes.Limits): JsonNode =
   result = newJObject()

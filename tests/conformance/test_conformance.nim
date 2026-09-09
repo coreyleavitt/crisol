@@ -57,14 +57,17 @@ suite "conformance 1 — spawn/exit":
     check report.exit.kind == ekExited
     check report.exit.code == 0
     check report.stop.isNone
-    # rfc-0007 B1: killDomain is the per-spawn ACHIEVED domain, capability-
-    # driven — a real subreaper (PR_SET_CHILD_SUBREAPER, set deliberately at
-    # Supervisor init) reports kdsProcessGroupSubreaper; a backend without it
-    # (e.g. the macOS poll tier) honestly reports the pre-B1 kdsProcessGroup.
-    # This suite is backend-agnostic, so pin against the achieved capability,
-    # never a hardcoded tier.
-    check report.killDomain == (if sv.capabilities().subreaper: kdsProcessGroupSubreaper
-                                else: kdsProcessGroup)
+    # rfc-0007 B1/B3: killDomain is the per-spawn ACHIEVED domain,
+    # capability-driven — the delegated cgroup tier (B3) reports kdsCgroup;
+    # a real subreaper without cgroup delegation (PR_SET_CHILD_SUBREAPER,
+    # set deliberately at Supervisor init) reports kdsProcessGroupSubreaper;
+    # a backend without either (e.g. the macOS poll tier) honestly reports
+    # the pre-B1 kdsProcessGroup. This suite is backend-agnostic, so pin
+    # against the achieved capability, never a hardcoded tier.
+    check report.killDomain == (
+      if sv.capabilities().cgroupDelegation: kdsCgroup
+      elif sv.capabilities().subreaper: kdsProcessGroupSubreaper
+      else: kdsProcessGroup)
     removeFile(outPath)
 
   test "fail_always: exit code propagates losslessly (not just pass/fail)":
@@ -221,6 +224,9 @@ suite "conformance 6 — achieved readback":
     check report.limits[lkCpu] == lsNotRequested
     check report.limits[lkAddressSpace] == lsNotRequested
     check report.limits[lkOpenFiles] == lsNotRequested
+    # rfc-0007 B3: lkMemory's request rides lkAddressSpace's req slot (not
+    # requested here either) — lsNotRequested regardless of tier.
+    check report.limits[lkMemory] == lsNotRequested
     removeFile(outPath)
 
 # ---------------------------------------------------------------------------

@@ -73,6 +73,20 @@ suite "resultjson — roundtrip":
     check parsed.isSome
     check parsed.get == r
 
+  test "cbLimit(lkMemory) roundtrips its LimitKind payload (rfc-0007 B3)":
+    let r = ProcessResult(
+      exit: Exit(kind: ekSignaled, sig: 9, coreDumped: false),
+      cause: Cause(by: cbLimit, limit: lkMemory),
+      evidence: Evidence(killDomain: kdsCgroup, tree: toComplete, escapees: @[],
+                          limits: default(LimitsAchieved), hermetic: hlIsolated,
+                          killSnapshot: @[], cooperativeUnavailable: false),
+      rusage: none(Rusage),
+      durationUs: 1,
+    )
+    let parsed = fromJson(toJson(r))
+    check parsed.isSome
+    check parsed.get == r
+
   test "ekNtStatus roundtrips the raw uint32":
     let r = ProcessResult(
       exit: Exit(kind: ekNtStatus, status: 0xC0000005'u32),

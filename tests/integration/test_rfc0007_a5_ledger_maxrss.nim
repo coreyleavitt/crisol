@@ -32,6 +32,7 @@ import crisol/types
 import crisol/ledger
 import crisol/keys
 import crisol/depgraph
+import crisol/process as procmod   # capabilities() — rfc-0007 B3 tier check
 
 import "../support/helpers"
 
@@ -52,7 +53,11 @@ proc baseOpts(projectRoot: string): RunOptions =
 
 suite "A5 — ledger row carries wait4-tagged maxRssBytes (distinct from rssBytes)":
 
-  test "live pass_always run: ledger row maxRssBytes > 0, rssMechanism == \"wait4\"":
+  test "live pass_always run: ledger row maxRssBytes > 0, rssMechanism tagged for the achieved tier":
+    ## rfc-0007 B3: on the delegated cgroup tier the achieved mechanism is
+    ## "cgroup" (posixcore's memory.peak, the tagged successor) rather than
+    ## "wait4" — pin against the achieved capability, never a hardcoded
+    ## mechanism, same rule test_conformance.nim's killDomain check follows.
     withTempProject:
       let src = fixtureDir / "pass_always.nim"
       let dst = projectRoot / "tests" / "unit" / "test_pass_always.nim"
@@ -68,7 +73,9 @@ suite "A5 — ledger row carries wait4-tagged maxRssBytes (distinct from rssByte
       let rows = scanLedger(projectRoot / ".crisol", iKey)
       require rows.len == 1
       check rows[0].maxRssBytes > 0
-      check rows[0].rssMechanism == "wait4"
+      let expectedMechanism = if procmod.capabilities().cgroupDelegation: "cgroup"
+                              else: "wait4"
+      check rows[0].rssMechanism == expectedMechanism
 
 # ---------------------------------------------------------------------------
 # Suite 2 — old-format row (pre-A5 shape) parses with honest defaults

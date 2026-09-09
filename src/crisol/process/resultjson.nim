@@ -66,6 +66,7 @@ proc limitKindStr(k: LimitKind): string =
   of lkFileSize:       "fileSize"
   of lkOpenFiles:      "openFiles"
   of lkCore:           "core"
+  of lkMemory:         "memory"
 
 proc parseLimitKind(s: string): Option[LimitKind] =
   case s
@@ -74,6 +75,7 @@ proc parseLimitKind(s: string): Option[LimitKind] =
   of "fileSize":       some(lkFileSize)
   of "openFiles":      some(lkOpenFiles)
   of "core":            some(lkCore)
+  of "memory":          some(lkMemory)
   else:                   none(LimitKind)
 
 proc limitStatusStr(s: LimitStatus): string =

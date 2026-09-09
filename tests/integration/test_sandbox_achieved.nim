@@ -80,7 +80,15 @@ suite "A4d rlimit + env/cwd achievement through the Supervisor":
     check report.exit.kind == ekExited
     check report.exit.code == 0
     for lk in LimitKind:
-      check report.limits[lk] == lsApplied
+      if lk == lkMemory:
+        # rfc-0007 B3: lkMemory has its OWN req slot (never set by
+        # resolveSandbox/RlimitOverrides — no config/CLI surface exists
+        # for it yet) — always lsNotRequested here, regardless of tier.
+        # See tests/integration/test_rfc0007_b3_cgroup.nim for its real
+        # producer, exercised via a directly-built ChildSpec.
+        check report.limits[lk] == lsNotRequested
+      else:
+        check report.limits[lk] == lsApplied
 
   test "hlNone: nothing requested -> every kind reads lsNotRequested":
     let spec = resolveSandbox(level = hlNone)

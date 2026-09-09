@@ -138,15 +138,20 @@ suite "rfc-0007 A7 — run/v2 substrate node reaches the wire via crisol run --j
   test "cgroup.kill/memory.peak never true without delegation":
     checkInternalConsistency(doc["substrate"])
 
-  test "evidence.killDomain is the real per-spawn achieved domain (processGroupSubreaper, rfc-0007 B1)":
+  test "evidence.killDomain is the real per-spawn achieved domain (rfc-0007 B1/B3)":
     ## Locks the flow verified by source audit: runner.toProcessResult copies
     ## `report.killDomain` (posixcore.reapCore's ReapReport) verbatim into
     ## Evidence — never a literal re-stamped downstream at JSON-render time.
     ## rfc-0007 B1: this process is really a subreaper (PR_SET_CHILD_SUBREAPER,
-    ## set deliberately at Supervisor init) — the achieved domain is now
-    ## capability-driven, not the pre-B1 hardcoded "processGroup".
+    ## set deliberately at Supervisor init) — the achieved domain is
+    ## capability-driven, not a hardcoded literal. rfc-0007 B3: on the
+    ## delegated cgroup tier (CRISOL_TIER=ci-cgroup) the achieved domain is
+    ## the STRONGER "cgroup" claim instead — same capability-driven rule,
+    ## just a different tier's achieved capability.
     let ep = doc["entrypoints"][0]
-    check ep["run"]["evidence"]["killDomain"].getStr == "processGroupSubreaper"
+    let expectedDomain = if getEnv("CRISOL_TIER") == "ci-cgroup": "cgroup"
+                        else: "processGroupSubreaper"
+    check ep["run"]["evidence"]["killDomain"].getStr == expectedDomain
 
   removeDir(root)
 

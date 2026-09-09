@@ -70,7 +70,22 @@ type
   LimitKind* = enum          ## ONE vocabulary for limits: requested, achieved,
     lkAddressSpace, lkCpu,   ## and Cause.cbLimit all index by it.
     lkFileSize, lkOpenFiles,
-    lkCore
+    lkCore,
+    lkMemory                 ## rfc-0007 B3: the cgroup-tier memory ceiling
+      ## — a REAL RSS ceiling (cgroup `memory.max`), independent of
+      ## `lkAddressSpace` (RLIMIT_AS, a virtual-address-space ceiling that
+      ## must stay generous — see sandbox.nim's `MinSafeRlimitAs` — since
+      ## ORC reserves several hundred MiB of virtual space at startup
+      ## regardless of actual resident use). A caller wanting a tight
+      ## MEMORY ceiling without tripping ORC's RLIMIT_AS floor requests
+      ## `req[lkMemory]` directly — its own slot, its own producer
+      ## (posixcore's cgroup backend), never derived from another kind.
+      ## `req[lkMemory]` reads `none` (⇒ `achieved[lkMemory] =
+      ## lsNotRequested`) on every tier/config that never sets it — no
+      ## config/CLI surface exists for it yet (a future increment); this
+      ## phase supplies the producer a caller building `ChildSpec` directly
+      ## can already exercise (see the cgroup conformance/fault-injection/
+      ## OOM tests).
 
   Limits* = object           ## the SINGLE home for resource limits.
     req*: array[LimitKind, Option[int64]]
@@ -80,10 +95,11 @@ type
     ## §2): a default-initialized value must never encode a vouch.
   LimitsAchieved* = array[LimitKind, LimitStatus]
 
-const DeterministicLimits* = {lkCpu, lkFileSize}
-  ## The deterministic subset a Cause may cite (§2). B3 adds lkMemory WITH
-  ## its producer (cgroup memory.events); citing any other kind in cbLimit
-  ## is a bug by construction.
+const DeterministicLimits* = {lkCpu, lkFileSize, lkMemory}
+  ## The deterministic subset a Cause may cite (§2). B3 adds lkMemory: its
+  ## producer (posixcore's cgroup backend) asserts it ONLY when the child's
+  ## own Exit is SIGKILL AND the leaf's `memory.events` shows `oom_kill` >
+  ## 0 at reap — citing any other kind in cbLimit is a bug by construction.
 
 # ---------------------------------------------------------------------------
 # Cause — AUTHORSHIP, from the runner's recorded acts only (§2).
@@ -118,18 +134,33 @@ proc `==`*(a, b: Cause): bool =
 
 proc classifyCause*(exit: Exit;
                      stop: Option[tuple[reason: KillReason, escalated: bool]];
-                     limits: Limits; achieved: LimitsAchieved): Cause =
+                     limits: Limits; achieved: LimitsAchieved;
+                     memoryOomKill: bool = false): Cause =
   ## The SECOND pure function (§2). `cbRunner` iff a stop act was recorded
   ## before the backend observed the exit — the ONE owner of authorship
   ## (§2 "Authorship has ONE owner: the Supervisor's act ledger"); the exit
   ## signal is NOT consulted once a stop act is present, which is exactly
   ## the documented, accepted misattribution window (an external SIGTERM
   ## racing our own grace-window SIGTERM reads as cbRunner).
+  ##
+  ## `memoryOomKill` (rfc-0007 B3): true iff THIS reap's cgroup leaf showed
+  ## `memory.events` `oom_kill` > 0 — a fact only the cgroup backend can
+  ## supply (posixcore's producer), passed through verbatim. Defaults
+  ## false so every existing non-cgroup caller/test is unaffected.
   if stop.isSome:
     return Cause(by: cbRunner, reason: stop.get.reason, escalated: stop.get.escalated)
   if exit.kind == ekSignaled:
     case exit.sig
-    of 9:  # SIGKILL we did not send — OOM killer, operator, unknown.
+    of 9:  # SIGKILL we did not send — OOM killer, operator, unknown, OR
+           # (rfc-0007 B3) the cgroup tier's OWN memory.max ceiling. Unlike
+           # SIGXCPU/SIGXFSZ below, requested-and-achieved is NOT enough on
+           # its own: a raw SIGKILL is inherently ambiguous (an operator's
+           # `kill -9`, a real OOM killer OUTSIDE our cgroup, or our own
+           # ceiling firing all look identical here) — `memoryOomKill` (this
+           # reap's memory.events fact) must ALSO hold, per §2's rule.
+      if memoryOomKill and limits.req[lkMemory].isSome and
+         achieved[lkMemory] == lsApplied:
+        return Cause(by: cbLimit, limit: lkMemory)
       return Cause(by: cbExternal)
     of 24:  # SIGXCPU — requested-AND-achieved join, once, here.
       if limits.req[lkCpu].isSome and achieved[lkCpu] == lsApplied:
@@ -361,6 +392,10 @@ type
                                     ## (console topology, §3). Always false on
                                     ## POSIX — cooperative (SIGTERM) is always
                                     ## deliverable there.
+    memoryOomKill*: bool        ## rfc-0007 B3: this reap's cgroup leaf showed
+                                 ## memory.events oom_kill > 0. Always false
+                                 ## off the cgroup tier (default, zero value —
+                                 ## the house rule for every evidence field).
 
   Capabilities* = object      ## §4 — probed once, memoised, reported. A flat
     pidfd*: bool               ## object of per-mechanism booleans;

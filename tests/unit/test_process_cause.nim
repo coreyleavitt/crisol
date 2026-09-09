@@ -25,8 +25,13 @@ suite "process/types — Cause construction":
     let c = Cause(by: cbExternal)
     check c.by == cbExternal
 
-  test "DeterministicLimits names exactly {lkCpu, lkFileSize}":
-    check DeterministicLimits == {lkCpu, lkFileSize}
+  test "cbLimit(lkMemory) is a real, constructible payload (rfc-0007 B3)":
+    let c = Cause(by: cbLimit, limit: lkMemory)
+    check c.by == cbLimit
+    check c.limit == lkMemory
+
+  test "DeterministicLimits names exactly {lkCpu, lkFileSize, lkMemory}":
+    check DeterministicLimits == {lkCpu, lkFileSize, lkMemory}
 
 suite "classifyCause — authorship table (§2)":
   ## classifyCause(exit, stop, limits, achieved): Cause
@@ -99,6 +104,51 @@ suite "classifyCause — authorship table (§2)":
     let e = Exit(kind: ekSignaled, sig: 9, coreDumped: false)
     let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
                            noLimits, noneAchieved)
+    check c.by == cbExternal
+
+  test "rfc-0007 B3: SIGKILL classifies cbLimit(lkMemory) ONLY when a memory ceiling was requested (lkMemory's own slot), the cgroup leaf applied it, AND memory.events showed oom_kill>0":
+    var lim = Limits()
+    lim.req[lkMemory] = some(64 * 1024 * 1024'i64)
+    var ach: LimitsAchieved = default(LimitsAchieved)
+    ach[lkMemory] = lsApplied
+    let e = Exit(kind: ekSignaled, sig: 9, coreDumped: false)
+    let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
+                           lim, ach, memoryOomKill = true)
+    check c.by == cbLimit
+    check c.limit == lkMemory
+
+  test "rfc-0007 B3: SIGKILL with achieved lkMemory=lsApplied but NO oom_kill fact is cbExternal, not cbLimit":
+    ## The ambiguity SIGXCPU/SIGXFSZ never have: a raw SIGKILL could be an
+    ## operator, an external OOM killer, or our own ceiling — requested+
+    ## achieved alone is not enough here.
+    var lim = Limits()
+    lim.req[lkMemory] = some(64 * 1024 * 1024'i64)
+    var ach: LimitsAchieved = default(LimitsAchieved)
+    ach[lkMemory] = lsApplied
+    let e = Exit(kind: ekSignaled, sig: 9, coreDumped: false)
+    let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
+                           lim, ach, memoryOomKill = false)
+    check c.by == cbExternal
+
+  test "rfc-0007 B3: SIGKILL with oom_kill fact but achieved lkMemory=lsFailed (leaf never materialized) is cbExternal":
+    ## The per-spawn honest-degrade case: the probe was green, the ceiling
+    ## was requested, but THIS spawn's leaf failed — never attributed to a
+    ## limit we could not actually vouch was applied.
+    var lim = Limits()
+    lim.req[lkMemory] = some(64 * 1024 * 1024'i64)
+    var ach: LimitsAchieved = default(LimitsAchieved)
+    ach[lkMemory] = lsFailed
+    let e = Exit(kind: ekSignaled, sig: 9, coreDumped: false)
+    let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
+                           lim, ach, memoryOomKill = true)
+    check c.by == cbExternal
+
+  test "rfc-0007 B3: SIGKILL + oom_kill fact + achieved lsApplied but NO memory ceiling ever requested is cbExternal (unreachable in practice, same belt-and-suspenders shape as SIGXCPU/SIGXFSZ)":
+    var ach: LimitsAchieved = default(LimitsAchieved)
+    ach[lkMemory] = lsApplied
+    let e = Exit(kind: ekSignaled, sig: 9, coreDumped: false)
+    let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
+                           noLimits, ach, memoryOomKill = true)
     check c.by == cbExternal
 
   test "SIGXCPU classifies cbLimit(lkCpu) ONLY when lkCpu was requested and achieved":
