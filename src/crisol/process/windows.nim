@@ -62,13 +62,34 @@
 ## rule), and why, per proc:
 ##   - Limits: Win32 has NO pre-exec child window (no fork/exec split to
 ##     hook a status pipe into — CreateProcessW hands control straight to
-##     the image). Every REQUESTED limit reports `lsUnsupported`
-##     unconditionally — Job Objects CAN express a `lkCpu`/`lkAddressSpace`
-##     analog (PerProcessUserTimeLimit / ProcessMemoryLimit) but this module
-##     does not wire them yet (D1b's job, per §5 "Windows maps Limits to Job
-##     basic/extended limits"); `lkFileSize`/`lkOpenFiles`/`lkCore` have NO
-##     Windows analog at all, ever (§5: "openFiles has no analog and is
-##     reported lsUnsupported").
+##     the image), so unlike POSIX's child-side rlimit readback, EVERY
+##     Windows LimitsAchieved verdict is PARENT-COMPUTED (D1b-ii): it means
+##     "the SetInformationJobObject install call that carried this kind's
+##     flag succeeded/failed", never a child-observed confirmation — there
+##     is no stronger claim available on this platform. `lkCpu` and
+##     `lkAddressSpace` (§5's two real analogs — PerProcessUserTimeLimit /
+##     ProcessMemoryLimit) are REAL, kernel-enforced Job limits as of D1b-ii:
+##     `lsApplied` if the install call succeeded, `lsFailed` if it did not,
+##     `lsNotRequested` if the caller never asked. `lkFileSize`/
+##     `lkOpenFiles`/`lkCore`/`lkMemory` have NO Windows analog at all, ever
+##     (§5: "openFiles has no analog and is reported lsUnsupported") —
+##     `lsUnsupported` if requested, `lsNotRequested` otherwise.
+##
+##     Honest gap, left alone by design (a separate, tracked follow-up, NOT
+##     "a future round wires it"): a Job limit kill carries NO IOCP job-
+##     message decoding here (`next`'s completion-port tier never decodes
+##     its wakeup message — see that proc's header — and this module does
+##     not add a second, limit-specific decode path). So a process killed by
+##     PerProcessUserTimeLimit/ProcessMemoryLimit is classified purely by
+##     its Exit, same as any other exit — `classifyCause` (types.nim) only
+##     ever cites `cbLimit` for `lkCpu` on `exit.kind == ekSignaled and
+##     exit.sig == 24` (SIGXCPU), a POSIX-only path Windows exits never take
+##     (`ekExited`/`ekNtStatus`, never `ekSignaled`) — so a Windows limit
+##     kill reads as `cbProcess` here, not `cbLimit`, even though
+##     `achieved[lkCpu] == lsApplied`. That asymmetry against POSIX's
+##     SIGXCPU-to-cbLimit attribution is real and deliberate: annotating
+##     WHICH limit fired needs the IOCP job-message path, out of scope for
+##     this slice.
 ##   - groupRssBytes: returns `none()`. Job accounting's only cheap "memory"
 ##     figure is PeakJobMemoryUsed — a MONOTONIC peak-since-job-start, not
 ##     the CURRENT live sum this proc's contract promises (§1: "the
@@ -196,6 +217,13 @@ const
   jicAssociateCompletionPort = 7'i32
   jicExtendedLimit    = 9'i32
   JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE  = 0x00002000'i32
+  JOB_OBJECT_LIMIT_PROCESS_TIME       = 0x00000004'i32
+    ## rfc-0007 D1b-ii: gates `PerProcessUserTimeLimit` — the lkCpu analog
+    ## (§5). Basic-limit flag, carried in the same `limitFlags` DWORD as
+    ## KILL_ON_JOB_CLOSE.
+  JOB_OBJECT_LIMIT_PROCESS_MEMORY     = 0x00000100'i32
+    ## rfc-0007 D1b-ii: gates `ProcessMemoryLimit` — the lkAddressSpace
+    ## analog (§5). Extended-limit flag, same `limitFlags` DWORD.
   CREATE_SUSPENDED                    = 0x00000004'i32
   CREATE_NEW_PROCESS_GROUP            = 0x00000200'i32
   CTRL_C_EVENT                        = 0'i32
@@ -453,15 +481,30 @@ proc buildEnvBlock(env: seq[(string, string)]): string =
     result.add('\0')
   result.add('\0')
 
-proc honestLimitsAchieved(limits: Limits): LimitsAchieved =
-  ## No pre-exec child window on Windows to hook a readback pipe into
-  ## (CreateProcessW hands control straight to the image — no fork/exec
-  ## split) — the weakest-honest-claim rule (§1 LimitStatus doc) applies:
-  ## every REQUESTED limit reports `lsUnsupported` this spike, regardless
-  ## of kind. D1b is where Job Object memory/cpu limits actually get
-  ## requested and their real per-spawn achievement queried back.
+proc computeLimitsAchieved(limits: Limits; cpuAsInstallOk: bool): LimitsAchieved =
+  ## rfc-0007 D1b-ii: `lkCpu`/`lkAddressSpace` now have real Job Object
+  ## analogs (PerProcessUserTimeLimit / ProcessMemoryLimit, §5) — PARENT-
+  ## COMPUTED, because Win32 has NO pre-exec child window to hook a
+  ## readback pipe into (CreateProcessW hands control straight to the
+  ## image — no fork/exec split). `lsApplied` means "the
+  ## SetInformationJobObject install call that carried this kind's flag
+  ## succeeded — the kernel enforces it from here"; `lsFailed` means that
+  ## call failed. There is no third, stronger state to report (no child-
+  ## side confirmation is possible), and both kinds share ONE install call
+  ## (spawnChild's second SetInformationJobObject), so both share ONE
+  ## result — `cpuAsInstallOk`.
+  ##
+  ## `lkFileSize`/`lkOpenFiles`/`lkCore`/`lkMemory` have no Windows analog
+  ## at all (§5: "openFiles has no analog and is reported lsUnsupported") —
+  ## `lsUnsupported` if requested, `lsNotRequested` otherwise, same as the
+  ## D1a-era stub this replaces.
   for lk in LimitKind:
-    result[lk] = if limits.req[lk].isSome: lsUnsupported else: lsNotRequested
+    if limits.req[lk].isNone:
+      result[lk] = lsNotRequested
+    elif lk in {lkCpu, lkAddressSpace}:
+      result[lk] = if cpuAsInstallOk: lsApplied else: lsFailed
+    else:
+      result[lk] = lsUnsupported
 
 proc spawnChild(sv: var Supervisor; spec: ChildSpec): SpawnResult =
   if spec.argv.len == 0:
@@ -541,6 +584,38 @@ proc spawnChild(sv: var Supervisor; spec: ChildSpec): SpawnResult =
     return SpawnResult(ok: false,
       error: "AssignProcessToJobObject failed: GetLastError=" & $getLastError())
 
+  # rfc-0007 D1b-ii: a SECOND SetInformationJobObject call, non-fatal on
+  # failure (unlike the KILL_ON_JOB_CLOSE call above, whose failure aborts
+  # the spawn) — SetInformationJobObject(jicExtendedLimit, ...) REPLACES the
+  # Job's basic-limit state wholesale, so KILL_ON_JOB_CLOSE is re-included
+  # here to keep the kill domain intact regardless of whether this call
+  # succeeds. Only issued when a cpu or address-space limit was actually
+  # requested (§5's two real analogs: PerProcessUserTimeLimit / lkCpu,
+  # ProcessMemoryLimit / lkAddressSpace) — an unrequested pair never touches
+  # the Job's limit state a second time. Done AFTER assignProcessToJobObject
+  # (order note, D1b-ii brief): the child is still CREATE_SUSPENDED, so
+  # nothing has run yet either way; keeping it simple and post-assign avoids
+  # any question about whether an unassigned Job can take limits.
+  var cpuAsInstallOk = true
+  if spec.limits.req[lkCpu].isSome or spec.limits.req[lkAddressSpace].isSome:
+    var limits2: JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    var flags2 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if spec.limits.req[lkCpu].isSome:
+      flags2 = flags2 or JOB_OBJECT_LIMIT_PROCESS_TIME
+      # RLIMIT_CPU is seconds; PerProcessUserTimeLimit is 100ns units.
+      limits2.basicLimitInformation.perProcessUserTimeLimit =
+        spec.limits.req[lkCpu].get * 10_000_000'i64
+    if spec.limits.req[lkAddressSpace].isSome:
+      flags2 = flags2 or JOB_OBJECT_LIMIT_PROCESS_MEMORY
+      # RLIMIT_AS and ProcessMemoryLimit are both bytes — no conversion.
+      limits2.processMemoryLimit = uint(spec.limits.req[lkAddressSpace].get)
+    limits2.basicLimitInformation.limitFlags = flags2
+    cpuAsInstallOk = setInformationJobObject(hJob, jicExtendedLimit,
+      addr limits2, int32(sizeof(limits2))) != 0'i32
+    # Non-fatal: the kill domain from the first call is intact regardless —
+    # a failure here only degrades the requested cpu/as limits to lsFailed
+    # (computeLimitsAchieved below), it never aborts the spawn.
+
   # rfc-0007 D1a: associate this Job with the shared completion port so
   # `nextEvent`'s primary tier wakes on this child's exit. NON-FATAL on
   # failure (unlike KILL_ON_JOB_CLOSE above) — same discipline as
@@ -560,7 +635,7 @@ proc spawnChild(sv: var Supervisor; spec: ChildSpec): SpawnResult =
   inc sv.nextIdVal
   sv.children[id] = ChildEntry(hProcess: pi.hProcess, hJob: hJob, pid: pi.dwProcessId,
                                 state: wcsSpawned, reqLimits: spec.limits,
-                                achieved: honestLimitsAchieved(spec.limits))
+                                achieved: computeLimitsAchieved(spec.limits, cpuAsInstallOk))
   inc sv.liveCount
   SpawnResult(ok: true, id: ChildId(id))
 

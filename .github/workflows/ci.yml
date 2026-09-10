@@ -330,6 +330,10 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_coopstop.nim
 
+      - name: rfc-0007 D1b — windows Job limits (cpu/address-space)
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_limits.nim
+
   macos:
     runs-on: macos-latest
     steps:
