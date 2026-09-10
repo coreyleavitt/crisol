@@ -173,6 +173,11 @@ when defined(windows):
     {.importc: "strerror", header: "<string.h>".}
   proc c_errno_location(): ptr cint
     {.importc: "_errno", header: "<errno.h>".}
+  # Distinct-named binding (avoids any clash with a winlean export) — used
+  # by winOpen's noFollow PRE-CHECK below.
+  proc c_getFileAttributesW(path: WideCString): int32
+    {.stdcall, dynlib: "kernel32", importc: "GetFileAttributesW".}
+  const INVALID_FILE_ATTRIBUTES_CRT: int32 = -1  ## GetFileAttributesW failure sentinel (0xFFFFFFFF).
 
   const
     EINTR_CRT: cint = 4        ## MSVCRT errno value for EINTR.
@@ -204,6 +209,22 @@ when defined(windows):
 
     var flagsAttr = FILE_ATTRIBUTE_NORMAL
     if noFollow: flagsAttr = flagsAttr or FILE_FLAG_OPEN_REPARSE_POINT
+
+    if noFollow:
+      # O_NOFOLLOW analog — PRE-CHECK (before CreateFileW): refuse if a
+      # reparse point (symlink/junction) already sits at `path`. This must
+      # precede the open: with CREATE_ALWAYS the create-disposition truncates
+      # the reparse point and strips its FILE_ATTRIBUTE_REPARSE_POINT before
+      # the post-open GetFileInformationByHandle check can observe it, so the
+      # post-check alone lets a symlink through (and clobbers it). The
+      # post-open check below stays as defense-in-depth for the CREATE_NEW
+      # path; this pre-check is the one that actually closes the overwrite
+      # symlink-follow hole. TOCTOU-imperfect vs POSIX's atomic O_NOFOLLOW,
+      # but it refuses the planted-symlink case without ever writing through.
+      let existing = c_getFileAttributesW(newWideCString(path))
+      if existing != INVALID_FILE_ATTRIBUTES_CRT and
+         (existing and FILE_ATTRIBUTE_REPARSE_POINT) != 0:
+        return (cint(-1), ERROR_FILE_EXISTS)
 
     let h = createFileW(newWideCString(path), access,
                          FILE_SHARE_READ or FILE_SHARE_WRITE,
