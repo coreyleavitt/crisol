@@ -607,11 +607,23 @@ proc sweepExitedChildren(sv: var Supervisor) =
   ## very next sweep (at most one poll tick, capped 25ms, later) catches
   ## it — the same bound the old WaitForMultipleObjects-only tier gave
   ## every child.
-  const STILL_ACTIVE = 259'i32
   for id, entry in sv.children.mpairs:
     if entry.state == wcsSpawned:
-      var codeRaw: int32
-      if getExitCodeProcess(entry.hProcess, codeRaw) != 0'i32 and codeRaw != STILL_ACTIVE:
+      # `WaitForSingleObject(hProcess, 0)` is the non-blocking poll of the
+      # process's SIGNAL state — it returns WAIT_OBJECT_0 only once the
+      # process is fully terminated and the kernel has torn it down, at
+      # which point its open handles (including the inherited sink-file
+      # handles) are released. This is the sweep-form of the exact guarantee
+      # the retired `WaitForMultipleObjects(hProcess)` tier gave: gating on
+      # `GetExitCodeProcess != STILL_ACTIVE` ALONE races the child's
+      # file-handle teardown — a normal-exit child's sink file can still be
+      # locked when the caller reaps and removes it (the pass_always smoke
+      # regression this fixes). It also correctly handles a child that
+      # legitimately exits with code 259 (which the STILL_ACTIVE sentinel
+      # would otherwise misread as still-running forever).
+      if waitForSingleObject(entry.hProcess, 0'i32) == WAIT_OBJECT_0:
+        var codeRaw: int32
+        discard getExitCodeProcess(entry.hProcess, codeRaw)
         entry.exit = decodeExitCode(codeRaw)
         let (ru, ok) = queryJobAccounting(entry.hJob)
         entry.rusage = if ok: some(ru) else: none(Rusage)
