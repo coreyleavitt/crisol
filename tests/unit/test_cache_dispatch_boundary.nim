@@ -257,6 +257,14 @@ suite "execute — degraded hermeticity blocks the store":
     check results[0].outcome == oPassed
     check ms.storeCalls == 0                           # degraded ⇒ NOT stored
     check results[0].cacheDecision == cdmHermeticityDeg
+    # rfc-0007 C1b: netIso is a never-goal on EVERY platform (§5/§6) — this
+    # run's Evidence still carries the LABEL it was requested under
+    # (hlNetwork, "the level this ran under"), even though `evidenceSatisfies`
+    # honestly refuses it above. Proven through this same real execute() call
+    # on every platform this suite runs on, Darwin included — no macOS-
+    # specific code exists for this (nor should any): the uniform never-goal
+    # already produces the honest shape; this assertion just makes it visible.
+    check runEvidence(results[0]).hermetic == hlNetwork
 
 # ---------------------------------------------------------------------------
 # R2-1: no-cache discrimination — cdmPolicyDisabled vs cdmNotEligible

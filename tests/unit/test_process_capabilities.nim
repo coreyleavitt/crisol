@@ -92,6 +92,11 @@ suite "rfc-0007 A7 — capabilities() acceptance pins (per known tier, RFC-0007 
       check caps.cgroupDelegation == false
       check caps.flock == true
       check caps.wait4Rusage == true
+      # rfc-0007 C1b: kqueue is real on this tier now — darwin.nim's
+      # backend registers EVFILT_PROC for `next` and probes kqueue() for
+      # real (posixcore.probeKqueue), the same "attempt the mechanism,
+      # verify it worked" discipline every other field here already had.
+      check caps.kqueue == true
     else:
       # rootless-podman dev tier (./dev test): no cgroup delegation, no
       # user-ns, but PR_SET_CHILD_SUBREAPER is unprivileged and unaffected.

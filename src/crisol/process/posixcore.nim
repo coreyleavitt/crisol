@@ -3,9 +3,10 @@
 ##
 ## Nim has no partial module override (a backend cannot "re-export posix plus
 ## two procs"), so this is the sharing mechanism the §1 module-layout comment
-## specifies: every posix-family backend (today: process/posix.nim; C1b's
-## process/darwin.nim later) embeds a `PosixCore` and implements the full §1
-## contract surface as mostly one-line delegations onto the procs below.
+## specifies: every posix-family backend (process/posix.nim, and C1b's
+## process/darwin.nim, which re-exports it unchanged) embeds a `PosixCore`
+## and implements the full §1 contract surface as mostly one-line
+## delegations onto the procs below.
 ##
 ## SAFETY: the child window (between fork() and exec) executes ONLY
 ## async-signal-safe primitives — the same invariant crisol/spawn.nim used
@@ -46,6 +47,21 @@ var RLIMIT_AS     {.importc: "RLIMIT_AS",     header: "<sys/resource.h>".}: cint
 # `when defined(android)`-only) — importc syscall(2) directly, the same
 # duplicate-importc idiom this module's header sanctions.
 # ---------------------------------------------------------------------------
+
+proc forcePollRequested(): bool =
+  ## rfc-0007 B2 checklist item 544's env knob: forces `next()` onto the
+  ## poll(2) fallback path even on a pidfd/kqueue-capable host, so the
+  ## conformance suite can be proven green under BOTH tiers (see
+  ## tests/conformance/test_conformance_timing.nim's B2/C1b suites and this
+  ## repo's `./dev test` / CI wiring, which runs tests/conformance a
+  ## second time with this set). Read fresh per `initPosixCore` call
+  ## (a policy override, not a memoised environment fact like
+  ## `capabilities()` — nothing needs it to be process-global). Cross-platform
+  ## (rfc-0007 C1b): a trivial `getEnv` check, lifted out of the
+  ## `when defined(linux):` block it originally lived in so macOS's kqueue
+  ## tier can consult the SAME knob, not a duplicate.
+  let v = getEnv("CRISOL_FORCE_POLL")
+  v.len > 0 and v != "0"
 
 when defined(linux):
   proc c_syscall(number: clong): clong {.importc: "syscall", varargs,
@@ -88,18 +104,6 @@ when defined(linux):
   var TFD_NONBLOCK {.importc, header: "<sys/timerfd.h>".}: cint
   var TFD_CLOEXEC {.importc, header: "<sys/timerfd.h>".}: cint
 
-  proc forcePollRequested(): bool =
-    ## rfc-0007 B2 checklist item 544's env knob: forces `next()` onto the
-    ## poll(2) fallback path even on a pidfd-capable host, so the
-    ## conformance suite can be proven green under BOTH tiers (see
-    ## tests/conformance/test_conformance_timing.nim's B2 suite and this
-    ## repo's `./dev test` / CI wiring, which runs tests/conformance a
-    ## second time with this set). Read fresh per `initPosixCore` call
-    ## (a policy override, not a memoised environment fact like
-    ## `capabilities()` — nothing needs it to be process-global).
-    let v = getEnv("CRISOL_FORCE_POLL")
-    v.len > 0 and v != "0"
-
   # PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER: unprivileged since
   # Linux 3.4.
   proc c_prctl(option: cint): cint {.importc: "prctl", varargs,
@@ -117,6 +121,56 @@ when defined(linux):
 else:
   proc probePidfd(): bool = false
   proc probeSubreaper(): bool = false
+
+when defined(macosx):
+  # ---------------------------------------------------------------------
+  # rfc-0007 C1b (§1): the macOS backend's own mechanism — kqueue
+  # EVFILT_PROC event-driven `next` (this file's peer of Linux's
+  # pidfd+epoll above) and libproc process-table forensics (macOS has no
+  # `/proc` at all). `process/darwin.nim` is a pure shell (mirrors
+  # `process/linux.nim` exactly) — every macOS-specific mechanism lives
+  # HERE, beside the `when defined(linux):` blocks above, per this file's
+  # module-layout comment.
+  #
+  # `posix/kqueue` (stdlib, same "lives under lib/posix/, not std/" shape
+  # as `posix/epoll`) wraps kqueue()/kevent()/EV_SET()/the `KEvent` struct
+  # and the EVFILT_*/EV_*/NOTE_* consts already — no hand-importc needed.
+  # libproc has no stdlib wrapper at all, so `proc_listallpids`/
+  # `proc_pidinfo` and the two `incompleteStruct` payload types are
+  # importc'd directly against the real macOS headers (named fields only —
+  # robust against padding/field-order; the C compiler lays the struct
+  # out).
+  # ---------------------------------------------------------------------
+  import posix/kqueue
+
+  proc probeKqueue(): bool =
+    let kq = kqueue()
+    if kq < 0: return false
+    discard posix.close(kq)
+    true
+
+  proc proc_listallpids(buffer: pointer; buffersize: cint): cint
+    {.importc: "proc_listallpids", header: "<libproc.h>".}
+  proc proc_pidinfo(pid: cint; flavor: cint; arg: uint64; buffer: pointer;
+                     buffersize: cint): cint
+    {.importc: "proc_pidinfo", header: "<libproc.h>".}
+
+  type
+    ProcBsdInfo {.importc: "struct proc_bsdinfo", header: "<sys/proc_info.h>",
+                  incompleteStruct, pure.} = object
+      pbi_ppid {.importc: "pbi_ppid".}: uint32
+      pbi_pgid {.importc: "pbi_pgid".}: uint32
+      pbi_comm {.importc: "pbi_comm".}: array[16, char]  # MAXCOMLEN+1; may
+                                                          # truncate — fine
+                                                          # for forensics
+      pbi_start_tvsec {.importc: "pbi_start_tvsec".}: uint64
+    ProcTaskInfo {.importc: "struct proc_taskinfo", header: "<sys/proc_info.h>",
+                   incompleteStruct, pure.} = object
+      pti_resident_size {.importc: "pti_resident_size".}: uint64
+
+  const
+    PROC_PIDTBSDINFO = 3.cint   # -> ProcBsdInfo
+    PROC_PIDTASKINFO = 4.cint   # -> ProcTaskInfo
 
 # ---------------------------------------------------------------------------
 # rfc-0007 B3 (§3/§4): delegated cgroup-v2 leaf plumbing. Moved ahead of
@@ -325,6 +379,14 @@ type
     useEpoll: bool               ## rfc-0007 B2: decided ONCE at init — Linux
                                   ## + a real pidfd probe + CRISOL_FORCE_POLL
                                   ## unset. Never re-evaluated mid-run.
+    kqueueFd: cint               ## rfc-0007 C1b: -1 unless `useKqueue`.
+                                  ## Unconditional field decl (like epollFd/
+                                  ## timerFd) — only ever touched under
+                                  ## `when defined(macosx):`.
+    useKqueue: bool               ## rfc-0007 C1b: decided ONCE at init —
+                                  ## macOS + a real kqueue probe +
+                                  ## CRISOL_FORCE_POLL unset. Never
+                                  ## re-evaluated mid-run (useEpoll's peer).
 
 # ---------------------------------------------------------------------------
 # Self-pipe + shutdown signal handler.
@@ -376,7 +438,8 @@ proc initPosixCore*(installSignals: bool): PosixCore =
   result = PosixCore(nextIdVal: 0'i32, children: initTable[int32, ChildEntry](),
                       liveCount: 0, pipeRead: -1, pipeWrite: -1,
                       installedSignals: installSignals,
-                      epollFd: -1, timerFd: -1, useEpoll: false)
+                      epollFd: -1, timerFd: -1, useEpoll: false,
+                      kqueueFd: -1, useKqueue: false)
   var fds: array[2, cint]
   if posix.pipe(fds) != 0:
     raise newException(OSError, "initSupervisor: failed to create self-pipe")
@@ -433,6 +496,33 @@ proc initPosixCore*(installSignals: bool): PosixCore =
       result.epollFd = efd
       result.timerFd = tfd
       result.useEpoll = true
+  when defined(macosx):
+    # rfc-0007 C1b (§1): kqueue EVFILT_PROC event-driven `next` — the
+    # SAME "chosen once, here, never re-evaluated" discipline as Linux's
+    # epoll arm above. `probeKqueue()` (not `cachedCapabilities().kqueue`):
+    # the same self-contained-probe-vs-full-Capabilities separation the
+    # Linux comment above documents (a future divergence between the
+    # internal decision and the reported capability must never silently
+    # couple). The self-pipe read fd is registered EVFILT_READ|EV_ADD so a
+    # shutdown signal wakes `kevent` EARLY — exactly like the self-pipe is
+    # in the epoll set.
+    if probeKqueue() and not forcePollRequested():
+      let kq = kqueue()
+      if kq < 0:
+        discard posix.close(result.pipeRead)
+        discard posix.close(result.pipeWrite)
+        raise newException(OSError, "initSupervisor: kqueue() failed")
+      var ev: KEvent
+      EV_SET(addr ev, uint(result.pipeRead), cshort(EVFILT_READ),
+             cushort(EV_ADD), 0.cuint, 0, nil)
+      if kevent(kq, addr ev, 1.cint, nil, 0.cint, nil) < 0:
+        discard posix.close(kq)
+        discard posix.close(result.pipeRead)
+        discard posix.close(result.pipeWrite)
+        raise newException(OSError,
+          "initSupervisor: kevent self-pipe registration failed")
+      result.kqueueFd = kq
+      result.useKqueue = true
   if installSignals:
     gShutdownWriteFd = fds[1]
     var sa: Sigaction
@@ -471,6 +561,9 @@ proc destroyPosixCore*(core: var PosixCore) =
     # guard above cannot still be outstanding here).
     if core.epollFd >= 0: discard posix.close(core.epollFd)
     if core.timerFd >= 0: discard posix.close(core.timerFd)
+  when defined(macosx):
+    # rfc-0007 C1b: the CORE-level kqueue fd — epollFd/timerFd's peer.
+    if core.kqueueFd >= 0: discard posix.close(core.kqueueFd)
   core.children = initTable[int32, ChildEntry]()
   core.pendingShutdown = @[]
 
@@ -701,6 +794,20 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   discard posix.close(pipeWrite)
   discard setpgid(childPid, childPid)
 
+  when defined(macosx):
+    # rfc-0007 C1b: register the child's exit with kqueue — EVFILT_PROC's
+    # peer of Linux's pidfd_open above. `NOTE_EXIT` auto-removes the
+    # registration when the process exits (unlike pidfd there is no fd to
+    # close at reap). Non-fatal on failure — the WNOHANG `pollSweepChildren`
+    # sweep (runs every `nextEvent` iteration regardless of backend) is the
+    # honest fallback observer for this one child, same discipline as the
+    # pidfd arm's own failure path.
+    if core.useKqueue:
+      var ev: KEvent
+      EV_SET(addr ev, uint(childPid), cshort(EVFILT_PROC),
+             cushort(EV_ADD or EV_ONESHOT), NOTE_EXIT, 0, nil)
+      discard kevent(core.kqueueFd, addr ev, 1.cint, nil, 0.cint, nil)
+
   var pidfd: cint = -1
   when defined(linux):
     # rfc-0007 B2: pidfd_open on our OWN just-forked child is valid
@@ -834,17 +941,30 @@ proc parseStatLine*(content: string): tuple[ppid, pgrp: int; comm: string; start
       except ValueError: discard
   (ppid, pgrp, comm, starttime)
 
-proc readVmRssBytes(pid: int): int64 =
-  try:
-    let content = readFile("/proc/" & $pid & "/status")
-    for line in content.splitLines():
-      if line.startsWith("VmRSS:"):
-        let parts = line.splitWhitespace()
-        if parts.len >= 2:
-          return int64(parseBiggestInt(parts[1])) * 1024
-  except CatchableError:
-    discard
-  0'i64
+when defined(macosx):
+  proc readVmRssBytes(pid: int): int64 =
+    ## rfc-0007 C1b: macOS has no `/proc` — `proc_pidinfo(PROC_PIDTASKINFO)`
+    ## is the libproc equivalent. `pti_resident_size` is already BYTES
+    ## (unlike /proc's kB), so no *1024 here. A denied/vanished pid returns
+    ## a short/failed read — 0, honest, same as a zombie's VmRSS on Linux,
+    ## never fabricated.
+    var ti: ProcTaskInfo
+    let r = proc_pidinfo(pid.cint, PROC_PIDTASKINFO, 0'u64, addr ti,
+                         cint(sizeof(ti)))
+    if r == cint(sizeof(ti)): int64(ti.pti_resident_size)
+    else: 0'i64
+else:
+  proc readVmRssBytes(pid: int): int64 =
+    try:
+      let content = readFile("/proc/" & $pid & "/status")
+      for line in content.splitLines():
+        if line.startsWith("VmRSS:"):
+          let parts = line.splitWhitespace()
+          if parts.len >= 2:
+            return int64(parseBiggestInt(parts[1])) * 1024
+    except CatchableError:
+      discard
+    0'i64
 
 type
   ProcStatInfo = object
@@ -856,23 +976,54 @@ type
     comm: string
     starttime: int64
 
-proc walkProcTable(): seq[ProcStatInfo] =
-  result = @[]
-  try:
-    for kind, path in walkDir("/proc"):
-      if kind != pcDir: continue
-      var pid: int
-      try: pid = parseInt(path.extractFilename)
-      except ValueError: continue
-      try:
-        let stat = readFile(path / "stat")
-        let (ppid, pgrp, comm, starttime) = parseStatLine(stat)
-        result.add ProcStatInfo(pid: pid, ppid: ppid, pgrp: pgrp, comm: comm,
-                                starttime: starttime)
-      except CatchableError:
-        discard   # vanished between enumeration and read — skip it
-  except CatchableError:
-    discard         # /proc unreadable — empty snapshot, never fabricated
+when defined(macosx):
+  proc walkProcTable(): seq[ProcStatInfo] =
+    ## rfc-0007 C1b: the libproc equivalent of the /proc walk below —
+    ## `proc_listallpids(nil, 0)` returns a live PID COUNT (not bytes);
+    ## the second call (a real buffer) returns BYTES used, hence the
+    ## division by `sizeof(int32)` — the documented libproc idiom (ps/htop-
+    ## style tools use the same two-call shape). `pbi_pgid` is exactly the
+    ## process group id `scanProcessGroup(pgid)`'s `info.pgrp == pgid`
+    ## filter needs — no change required there or in
+    ## `scanProcessGroup`/`snapshotTreeCore`/`groupRssBytesCore`, which all
+    ## fold over this proc's output as before.
+    result = @[]
+    let count = proc_listallpids(nil, 0.cint)
+    if count <= 0: return
+    let cap = count + 64   # slack: processes can appear between the two calls
+    var pids = newSeq[int32](cap)
+    let gotBytes = proc_listallpids(addr pids[0], cint(cap * sizeof(int32)))
+    if gotBytes <= 0: return
+    let n = gotBytes div cint(sizeof(int32))
+    for i in 0 ..< int(n):
+      let pid = pids[i]
+      if pid <= 0: continue
+      var bi: ProcBsdInfo
+      let r = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0'u64, addr bi,
+                           cint(sizeof(bi)))
+      if r != cint(sizeof(bi)): continue   # vanished/denied — skip, never fabricate
+      let comm = $cast[cstring](addr bi.pbi_comm[0])
+      result.add ProcStatInfo(pid: int(pid), ppid: int(bi.pbi_ppid),
+                              pgrp: int(bi.pbi_pgid), comm: comm,
+                              starttime: int64(bi.pbi_start_tvsec))
+else:
+  proc walkProcTable(): seq[ProcStatInfo] =
+    result = @[]
+    try:
+      for kind, path in walkDir("/proc"):
+        if kind != pcDir: continue
+        var pid: int
+        try: pid = parseInt(path.extractFilename)
+        except ValueError: continue
+        try:
+          let stat = readFile(path / "stat")
+          let (ppid, pgrp, comm, starttime) = parseStatLine(stat)
+          result.add ProcStatInfo(pid: pid, ppid: ppid, pgrp: pgrp, comm: comm,
+                                  starttime: starttime)
+        except CatchableError:
+          discard   # vanished between enumeration and read — skip it
+    except CatchableError:
+      discard         # /proc unreadable — empty snapshot, never fabricated
 
 proc scanProcessGroup*(pgid: Pid): seq[ProcSnapshot] =
   ## Walk /proc, keep every pid whose pgrp == pgid. pgid-only tier — a
@@ -1102,6 +1253,31 @@ when defined(linux):
     var events: array[8, EpollEvent]
     discard epoll_wait(core.epollFd, addr events[0], cint(events.len), waitMs)
 
+when defined(macosx):
+  proc kqueueBlock(core: PosixCore; now: MonoTime; deadline: MonoTime) =
+    ## rfc-0007 C1b: the event-driven blocking step — epollBlock's Darwin
+    ## peer, same dual-bound rationale: `kevent`'s own timeout is capped at
+    ## 25ms so the orphan sweep / RSS-sample cadence still runs on a far
+    ## deadline (conformance's 5s/10s cases), while a nearer deadline
+    ## shortens it exactly. No timerfd needed — `kevent` takes the timeout
+    ## directly as a `Timespec`, unlike epoll's separate timerfd arm. A
+    ## registered child's `EVFILT_PROC`/`NOTE_EXIT` firing wakes this EARLY
+    ## — the actual latency win over the poll(2) tick (proven by
+    ## test_conformance_timing.nim's C1b latency case). The returned event
+    ## list is deliberately IGNORED, exactly like epollBlock's: `nextEvent`'s
+    ## own loop top unconditionally re-drains self-pipe / pollSweepChildren /
+    ## sweepAdoptedOrphan every iteration regardless of which fd(s) woke it,
+    ## so a spurious or coalesced kqueue wakeup is harmless, and the actual
+    ## reap stays the SAME single code path (pollSweepChildren) as every
+    ## other backend.
+    let remainMs = (deadline - now).inMilliseconds
+    let waitMs = min(25'i64, max(1'i64, remainMs))
+    var ts: Timespec
+    ts.tv_sec = posix.Time(waitMs div 1000)
+    ts.tv_nsec = clong((waitMs mod 1000) * 1_000_000)
+    var evs: array[8, KEvent]
+    discard kevent(core.kqueueFd, nil, 0.cint, addr evs[0], evs.len.cint, addr ts)
+
 proc nextEvent*(core: var PosixCore; deadline: MonoTime): WaitEvent =
   while true:
     core.drainSelfPipe()
@@ -1134,6 +1310,11 @@ proc nextEvent*(core: var PosixCore; deadline: MonoTime): WaitEvent =
     when defined(linux):
       if core.useEpoll:
         epollBlock(core, now, deadline)
+      else:
+        pollBlock(core, now, deadline)
+    elif defined(macosx):
+      if core.useKqueue:
+        kqueueBlock(core, now, deadline)
       else:
         pollBlock(core, now, deadline)
     else:
@@ -1420,13 +1601,15 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
 # literal) — pidfd/subreaper/cgroup are Linux-only kernel features (prctl(2)
 # and pidfd_open(2) do not exist on Darwin), so they are `when defined(linux)`
 # gated; this same file is also today's macOS backend (§1 module-layout
-# comment: "macosx maps to process/posix until C1b"), and an unconditional
-# importc of a Linux-only syscall constant would fail `nim check --os:macosx`
-# outright, not just report false at runtime. flock/wait4 are genuinely
-# POSIX-portable (both probed for real on any posix target this file backs).
-# kqueue/jobObjectNesting/ctrlBreakDeliverable are the OTHER backends' own
-# fields (windows.nim/darwin.nim) — always false here, never this module's
-# claim to make.
+# comment: darwin.nim re-exports posix.nim's Supervisor, which embeds
+# PosixCore), and an unconditional importc of a Linux-only syscall constant
+# would fail `nim check --os:macosx` outright, not just report false at
+# runtime. flock/wait4 are genuinely POSIX-portable (both probed for real on
+# any posix target this file backs). kqueue (rfc-0007 C1b) is a REAL probe
+# here too, `when defined(macosx)` gated the same way — this module is
+# darwin.nim's mechanism, not a separate claim it makes itself.
+# jobObjectNesting/ctrlBreakDeliverable stay windows.nim's own fields
+# (Stage D) — always false here, never this module's claim to make.
 #
 # Probed exactly once per process (`cachedCapabilities`, ccprobe/nimprobe's
 # `cachedX` idiom) — every real probe below does actual I/O (fork+wait4,
@@ -1528,7 +1711,13 @@ proc probeCapabilities*(): Capabilities =
     cgroupDelegation: cg.delegation,
     cgroupKill: cg.kill,
     memoryPeak: cg.memoryPeak,
-    kqueue: false,              # darwin.nim's field (C1b), never this module's
+    kqueue: (when defined(macosx): probeKqueue() else: false),
+                                # rfc-0007 C1b: THIS module's producer now —
+                                # darwin.nim re-exports posix.nim's Supervisor
+                                # unchanged (§1 module-layout comment); a real
+                                # probe, not a stub, exactly like pidfd/
+                                # subreaper/cgroup above (linux.nim doesn't
+                                # probe its own caps either — posixcore does).
     jobObjectNesting: false,    # windows.nim's field (Stage D), never this module's
     ctrlBreakDeliverable: false,# windows.nim's field (Stage D), never this module's
     flock: probeFlock(),

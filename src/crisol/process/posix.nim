@@ -1,9 +1,12 @@
 ## process/posix.nim — rfc-0007 §1: the POSIX Supervisor backend.
 ##
-## `macosx` maps here until C1b births `process/darwin.nim` (§1 module-layout
-## comment). Everything below is a thin, mostly one-line delegation onto
-## `process/posixcore.nim`'s `PosixCore` — the shared machinery every
-## posix-family backend embeds (Nim has no partial module override).
+## The generic POSIX arm (`process.nim`'s `else` branch) — poll(2) + a
+## `/proc`-shaped walk, for any posix-family host that isn't Linux or macOS.
+## `process/linux.nim` and `process/darwin.nim` (C1b) are both pure shells
+## over this same module (§1 module-layout comment); everything below is a
+## thin, mostly one-line delegation onto `process/posixcore.nim`'s
+## `PosixCore` — the shared machinery every posix-family backend embeds
+## (Nim has no partial module override).
 
 import std/options
 import std/monotimes

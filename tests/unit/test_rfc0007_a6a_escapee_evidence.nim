@@ -196,4 +196,33 @@ suite "rfc-0007 A6a — killSnapshot reaches Evidence with a real rssBytes":
       check ev.killSnapshot[0].pid > 0
       check ev.killSnapshot[0].rssBytes > 0
 
+# ---------------------------------------------------------------------------
+# Suite 4 — rfc-0007 C1b: the honest macOS shape — a setsid escapee is
+# INVISIBLE to the pgid-only domain (no subreaper mechanism exists on
+# Darwin), the mirror image of Suite 2's Linux subreaper-tier proof above.
+# ---------------------------------------------------------------------------
+
+suite "rfc-0007 C1b — spawn_grandchild_setsid on macOS: invisible to the pgid-only domain":
+
+  test "tree == toUnobservable, escapees empty — the setsid escape is genuinely unseen":
+    ## macOS has no PR_SET_CHILD_SUBREAPER (`caps.subreaper == false`), so
+    ## `reapCore` yields `killDomain == kdsProcessGroup` and
+    ## `treeObservationFor(kdsProcessGroup) == toUnobservable` — a pgid-only
+    ## scan can never see a process that setsid() moved into its own session
+    ## before the entrypoint (its former group leader) exited. Contrast
+    ## Suite 2 above: on the Linux subreaper tier the SAME fixture's
+    ## grandchild is reparented to crisol and DOES get discovered, killed,
+    ## and reaped (tree flips to toComplete, escapees non-empty). Gated the
+    ## same direction as every other macOS-tier case in this repo (skip on
+    ## a tier where the mechanism this proves the ABSENCE of is present).
+    if escapeeMechanismsAvailable():
+      skip()
+    else:
+      let r = runSingle("spawn_grandchild_setsid.nim", "spawn_grandchild_setsid.pid",
+                        "macos_setsid")
+      check r.outcome == oPassed   # the entrypoint itself is a clean pass
+      let ev = runEvidence(r)
+      check ev.tree == ptypes.toUnobservable
+      check ev.escapees.len == 0
+
 echo "test_rfc0007_a6a_escapee_evidence: done"

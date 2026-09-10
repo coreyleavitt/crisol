@@ -324,25 +324,44 @@ jobs:
       - name: Conformance suite — import purity (fast pre-check)
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_conformance_import_purity.nim
 
-      # rfc-0007 C1a: the ladder's `macosx` arm maps to process/posix today
-      # (C1b is where process/darwin.nim is born) — so this proves the FULL
-      # unit + conformance suites, not just an import-purity/single-file
-      # spot check, live on Darwin's kqueue-less poll fallback. Same
-      # honest-exit wrapper the Linux legs use (`ci/run-tests.sh` ->
+      # rfc-0007 C1b: the ladder's `macosx` arm now maps to process/darwin —
+      # kqueue EVFILT_PROC event-driven `next` + libproc process-table
+      # forensics, not the poll(2)/`/proc`-shaped fallback C1a proved this
+      # leg on. This proves the FULL unit + conformance suites, not just an
+      # import-purity/single-file spot check, live on Darwin's real backend.
+      # Same honest-exit wrapper the Linux legs use (`ci/run-tests.sh` ->
       # `nimble test`, see that script's header for why the wrapper exists)
       # — no docker here, windows/macos run Nim natively (A2d).
       # CRISOL_TIER=macos tells test_process_capabilities.nim's tier-pinned
       # acceptance suite which tier's honest capability values to assert
-      # (subreaper/pidfd/cgroupDelegation false, flock/wait4Rusage true —
-      # both real POSIX on Darwin).
+      # (subreaper/pidfd/cgroupDelegation false, kqueue/flock/wait4Rusage
+      # true — kqueue real since C1b, the rest real POSIX on Darwin).
       #
       # tests/integration is deliberately excluded (CRISOL_TEST_DIRS pins
       # unit+conformance only) — heavier process-spawning integration
       # coverage on Darwin is out of scope for this slice. Conformance's
-      # own TIMING-SENSITIVE cases stay inert: they self-gate on
-      # CRISOL_TIMING_TESTS (unset here), same convention as every other leg.
-      - name: Run unit + conformance suites (poll fallback)
+      # own TIMING-SENSITIVE cases stay inert here: they self-gate on
+      # CRISOL_TIMING_TESTS (unset in this step), same convention as every
+      # other leg — the step below turns them on for this leg specifically.
+      - name: Run unit + conformance suites (kqueue/libproc backend)
         env:
           CRISOL_TIER: macos
           CRISOL_TEST_DIRS: tests/unit:tests/conformance
+        run: bash ci/run-tests.sh
+
+      # rfc-0007 C1b: tests/conformance's TIMING-SENSITIVE cases (self-gated
+      # on CRISOL_TIMING_TESTS, unset in the step above) include this
+      # slice's kqueue latency proof (test_conformance_timing.nim's C1b
+      # suite) alongside the existing B2 Linux-mirrored case — the ONLY leg
+      # where the C1b suite actually compiles and runs (`when
+      # defined(macosx):`-gated). tests/timing/ itself is NOT included here
+      # (unlike the Linux `timing` job): several of its files exercise
+      # Linux-only subreaper mechanism this leg's Supervisor never enables
+      # (caps.subreaper is honestly false on Darwin) — out of scope for this
+      # slice, not a gap this step is meant to cover.
+      - name: Run conformance suite with timing enabled (kqueue latency proof)
+        env:
+          CRISOL_TIER: macos
+          CRISOL_TIMING_TESTS: 1
+          CRISOL_TEST_DIRS: tests/conformance
         run: bash ci/run-tests.sh
