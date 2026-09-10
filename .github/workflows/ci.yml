@@ -342,6 +342,10 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_memprobe.nim
 
+      - name: rfc-0007 D2a — windows advisory lock (LockFileEx)
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_lock.nim
+
   macos:
     runs-on: macos-latest
     steps:
