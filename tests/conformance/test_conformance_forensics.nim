@@ -33,12 +33,23 @@ suite "conformance — process forensics: groupRssBytes/snapshotTree are real":
     let sr = sv.spawn(spec)
     check sr.ok
 
-    # rss_hog touches ~8 MiB then holds it for 150ms before exiting (the
-    # same fixture C5's ledger-rssBytes test uses) — sample mid-hold, while
-    # the allocation and the process are both still live.
-    sleep(60)
-    let rss = sv.groupRssBytes(sr.id)
-    let tree = sv.snapshotTree(sr.id)
+    # rss_hog touches ~8 MiB then holds it (see rss_hog.nim) before exiting
+    # (the same fixture C5's ledger-rssBytes test uses). Poll-until-plausible
+    # rather than sampling once after a fixed delay: on a noisy CI runner the
+    # child's pages are not necessarily resident — nor is the child even
+    # scheduled into the process-group scan — by any fixed instant (the
+    # 2026-09-10 macOS flake, where a single 60ms sample saw <1 MiB and an
+    # empty tree). The fixture's hold is wide enough that a good sample is
+    # available within this bounded window on any backend.
+    var rss = sv.groupRssBytes(sr.id)
+    var tree = sv.snapshotTree(sr.id)
+    let sampleDeadline = getMonoTime() + initDuration(milliseconds = 1200)
+    while getMonoTime() < sampleDeadline and
+          not (rss.isSome and rss.get > 1 * 1024 * 1024 and
+               tree.len == 1 and "rss_hog" in tree[0].command):
+      sleep(25)
+      rss = sv.groupRssBytes(sr.id)
+      tree = sv.snapshotTree(sr.id)
 
     let ev = sv.next(getMonoTime() + initDuration(seconds = 5))
     check ev.kind == weChildExited

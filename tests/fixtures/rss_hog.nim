@@ -11,8 +11,13 @@ var i = 0
 while i < AllocBytes:
   buf[i] = byte(i and 0xff)
   i += 4096  # one write per 4 KiB page
-# Hold the allocation for 150ms to guarantee at least 2 poll samples (25ms each).
-sleep(150)
+# Hold the allocation for 1500ms. The window must be wide enough that a
+# consumer's forensics sample lands while the pages are resident AND the
+# process is still live even on a noisy CI runner where process startup +
+# ORC init + page-fault-in can lag well past a fixed short delay (the
+# 2026-09-10 macOS forensics flake: an 8 MiB touch was not yet resident when
+# sampled at a fixed 60ms). Consumers poll-until-plausible within this window.
+sleep(1500)
 # Prevent optimizer from eliminating the allocation.
 if buf[0] == 0xff and buf[4096] == 0xff:
   quit(1)  # never taken, but the condition references buf
