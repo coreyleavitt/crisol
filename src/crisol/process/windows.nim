@@ -217,7 +217,7 @@ const
   jicAssociateCompletionPort = 7'i32
   jicExtendedLimit    = 9'i32
   JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE  = 0x00002000'i32
-  JOB_OBJECT_LIMIT_PROCESS_TIME       = 0x00000004'i32
+  JOB_OBJECT_LIMIT_PROCESS_TIME       = 0x00000002'i32  # winnt.h: 0x4 is JOB_TIME (per-job), 0x2 is PROCESS_TIME (per-process)
     ## rfc-0007 D1b-ii: gates `PerProcessUserTimeLimit` — the lkCpu analog
     ## (§5). Basic-limit flag, carried in the same `limitFlags` DWORD as
     ## KILL_ON_JOB_CLOSE.
