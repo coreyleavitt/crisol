@@ -334,6 +334,10 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_limits.nim
 
+      - name: rfc-0007 D1b — windows containment / ppid forensics
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_containment.nim
+
   macos:
     runs-on: macos-latest
     steps:

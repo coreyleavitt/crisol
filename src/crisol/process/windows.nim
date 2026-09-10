@@ -47,12 +47,16 @@
 ##     (D1a) — a Job Object sees every process in it by construction, so this
 ##     is no longer the honest-but-conservative `toUnobservable` the A2d
 ##     spike hardcoded before snapshotTree existed to back the stronger claim.
-##   - snapshotTree (D1a): real, via JobObjectBasicProcessIdList (the pid
-##     list) + psapi GetProcessMemoryInfo (per-pid rssBytes, the RSS analog
-##     every other tier's forensics report) + QueryFullProcessImageNameW
-##     (command/image name). `ppid` is not resolved this tier (D1b/D2 —
-##     needs Toolhelp32Snapshot) — `-1`, an honest "not determined", never a
-##     fabricated `0` (a real, reserved pid on Windows).
+##   - snapshotTree (D1a real pid/command/rssBytes; D1b-iii real ppid): via
+##     JobObjectBasicProcessIdList (the pid list) + psapi
+##     GetProcessMemoryInfo (per-pid rssBytes, the RSS analog every other
+##     tier's forensics report) + QueryFullProcessImageNameW (command/image
+##     name). `ppid` is resolved via CreateToolhelp32Snapshot (D1b-iii):
+##     `snapshotJob` builds a system-wide pid->ppid map ONCE per call
+##     (`buildPpidMap`) and fills it in for every pid in the Job — `-1`
+##     stays the honest "not determined" fallback (a snapshot-build failure,
+##     or a pid the snapshot did not carry), never a fabricated `0` (a real,
+##     reserved pid on Windows).
 ##   - capabilities: jobObjectNesting is a REAL functional probe (spawns a
 ##     throwaway suspended process, never this process itself, and attempts
 ##     a double Job assignment); ctrlBreakDeliverable is a REAL console
@@ -99,8 +103,18 @@
 ##     A true current-sum needs psapi walked over the SAME
 ##     JobObjectBasicProcessIdList pid list snapshotTree now uses; D2's job
 ##     (memprobe wiring).
-##   - Evidence.escapees: `@[]` always — breakaway/DETACHED_PROCESS discovery
-##     is D1b's job (the escapee fixtures land there); `tree` is real (above).
+##   - Evidence.escapees: `@[]` always — and this is CORRECT, not a stub
+##     (D1b-iii): `spawnChild` never sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK` on
+##     the Job it creates, so `CREATE_BREAKAWAY_FROM_JOB` is always DENIED
+##     for anything spawned inside it (a child or grandchild attempting it
+##     gets `CreateProcessW` failure / ERROR_ACCESS_DENIED, never a process
+##     that actually left) — combined with KILL_ON_JOB_CLOSE, the Job is a
+##     COMPLETE containment domain: nothing spawned under it can ever be
+##     outside it. `tests/fixtures/breakaway_attempt.nim` +
+##     `test_windows_containment.nim` prove this directly: a grandchild that
+##     actively attempts breakaway fails, stays IN the Job, and shows up in
+##     `snapshotTree` — the escapee search space is provably empty on this
+##     backend, not merely undiscovered.
 ##
 ## FINDING (recorded per the A2d bullet's instruction — no signature change
 ## needed, but worth stating): §1's forceKill doc says escalated is false
@@ -760,11 +774,72 @@ proc next*(sv: var Supervisor; deadline: MonoTime): WaitEvent =
   nextEvent(sv, deadline)
 
 # ---------------------------------------------------------------------------
+# Toolhelp32 — rfc-0007 D1b-iii: CreateToolhelp32Snapshot/Process32{First,Next}W
+# resolve `ppid`, the one D1a-era forensics field snapshotJob could not fill.
+# Declared here (not with the kernel32 FFI block above) because it is used
+# solely by `buildPpidMap`, immediately below.
+# ---------------------------------------------------------------------------
+
+const
+  TH32CS_SNAPPROCESS = 0x00000002'i32
+
+type
+  PROCESSENTRY32W = object
+    ## rfc-0007 D1b-iii: the real Win32 ABI struct (tagPROCESSENTRY32W),
+    ## faithfully sized — `th32DefaultHeapID` is `ULONG_PTR` (pointer-sized:
+    ## 8 bytes on x64), NOT a DWORD; declaring it as a 4-byte field would
+    ## misalign every field after it (including `th32ParentProcessID`,
+    ## the one this module actually reads) on 64-bit Windows. `szExeFile`
+    ## is `WinChar` (winlean's `Utf16Char` alias, same wide-char type
+    ## `snapshotOnePid`'s QueryFullProcessImageNameW buffer already uses),
+    ## sized to Win32's `MAX_PATH` (260).
+    dwSize: int32                # DWORD — MUST be set before Process32FirstW
+    cntUsage: int32              # DWORD
+    th32ProcessID: int32         # DWORD
+    th32DefaultHeapID: uint      # ULONG_PTR — pointer-sized, see above
+    th32ModuleID: int32          # DWORD
+    cntThreads: int32            # DWORD
+    th32ParentProcessID: int32   # DWORD — the field this module needs
+    pcPriClassBase: int32        # LONG
+    dwFlags: int32               # DWORD
+    szExeFile: array[260, WinChar]
+
+proc createToolhelp32Snapshot(dwFlags: int32; th32ProcessID: int32): Handle
+  {.stdcall, dynlib: "kernel32", importc: "CreateToolhelp32Snapshot".}
+proc process32FirstW(hSnapshot: Handle; lppe: ptr PROCESSENTRY32W): WINBOOL
+  {.stdcall, dynlib: "kernel32", importc: "Process32FirstW".}
+proc process32NextW(hSnapshot: Handle; lppe: ptr PROCESSENTRY32W): WINBOOL
+  {.stdcall, dynlib: "kernel32", importc: "Process32NextW".}
+
+proc buildPpidMap(): Table[int32, int32] =
+  ## rfc-0007 D1b-iii: ONE system-wide pid->ppid snapshot per call — never
+  ## once-per-pid (that would be an O(pids-in-job * pids-on-system) waste
+  ## for no extra correctness). `snapshotJob` calls this exactly once, up
+  ## front, and looks every Job pid up in the resulting table. Degrades
+  ## honestly to an EMPTY table on any failure (snapshot creation or the
+  ## first enumeration call) — callers fall back to their own `-1` default
+  ## (`getOrDefault`), never a fabricated ppid. The snapshot handle is
+  ## closed on every path via `defer`.
+  result = initTable[int32, int32]()
+  let hSnap = createToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0'i32)
+  if hSnap == INVALID_HANDLE_VALUE:
+    return
+  defer: discard closeHandle(hSnap)
+  var entry: PROCESSENTRY32W
+  entry.dwSize = int32(sizeof(PROCESSENTRY32W))
+  if process32FirstW(hSnap, addr entry) == 0'i32:
+    return
+  while true:
+    result[entry.th32ProcessID] = entry.th32ParentProcessID
+    if process32NextW(hSnap, addr entry) == 0'i32:
+      break
+
+# ---------------------------------------------------------------------------
 # snapshotJob — rfc-0007 D1a: JobObjectBasicProcessIdList (pid list) + psapi
 # GetProcessMemoryInfo (per-pid rssBytes) + QueryFullProcessImageNameW
-# (command/image name). Shared by snapshotTree (below) and requestStop/
-# forceKill's killSnapshot (§1: "taken at the FIRST stop act... refreshed
-# at forceKill").
+# (command/image name); rfc-0007 D1b-iii: real `ppid` via `buildPpidMap`.
+# Shared by snapshotTree (below) and requestStop/forceKill's killSnapshot
+# (§1: "taken at the FIRST stop act... refreshed at forceKill").
 # ---------------------------------------------------------------------------
 
 proc queryJobPids(hJob: Handle): seq[int32] =
@@ -779,12 +854,15 @@ proc queryJobPids(hJob: Handle): seq[int32] =
     result[i] = int32(buf.processIdList[i])
 
 proc snapshotOnePid(pid: int32): Option[ProcSnapshot] =
-  ## `ppid` is NOT resolved this tier — a real answer needs
-  ## Toolhelp32Snapshot, beyond D1a's forensics ask (pid + command +
-  ## rssBytes). `-1`, the same "could not determine" sentinel posixcore's
-  ## own /proc-parse-failure path uses — never a fabricated `0` (pid 0 is
-  ## a real, reserved pid on Windows, the System Idle Process, so it is
-  ## not a safe stand-in for "unknown").
+  ## `ppid` is NOT resolved HERE — this proc only ever produces its own
+  ## default, `-1`. The real answer needs a system-wide
+  ## CreateToolhelp32Snapshot walk (wasteful to repeat once per pid), so
+  ## `snapshotJob` (below) builds that map ONCE per call and fills `ppid`
+  ## in for every pid this proc returns (rfc-0007 D1b-iii). `-1` is the
+  ## same "could not determine" sentinel posixcore's own /proc-parse-
+  ## failure path uses — never a fabricated `0` (pid 0 is a real, reserved
+  ## pid on Windows, the System Idle Process, so it is not a safe stand-in
+  ## for "unknown").
   let hProc = openProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0'i32, pid)
   if hProc == 0:
     return none(ProcSnapshot)  # exited between the pid-list read and here — honest skip, never fabricated
@@ -803,9 +881,13 @@ proc snapshotOnePid(pid: int32): Option[ProcSnapshot] =
 
 proc snapshotJob(hJob: Handle): seq[ProcSnapshot] =
   result = @[]
+  let ppidMap = buildPpidMap()   # D1b-iii: ONE system-wide snapshot per call
   for pid in queryJobPids(hJob):
     let snap = snapshotOnePid(pid)
-    if snap.isSome: result.add snap.get
+    if snap.isSome:
+      var s = snap.get
+      s.ppid = int(ppidMap.getOrDefault(pid, -1'i32))
+      result.add s
 
 # ---------------------------------------------------------------------------
 # requestStop / forceKill — non-blocking, idempotent, atomic-against-exit-
