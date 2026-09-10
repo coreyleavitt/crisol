@@ -1,11 +1,33 @@
-## ioutils.nim — low-level POSIX I/O helpers shared by ledger and resultcache,
-## plus the one text sanitizer every user-facing stdout/stderr write uses.
+## ioutils.nim — low-level raw-fd I/O helpers shared by ledger and
+## resultcache, plus the one text sanitizer every user-facing stdout/stderr
+## write uses.
 ##
-## This module is intentionally minimal: it imports only std/posix (and
-## std/os) so it sits at the very bottom of the crisol dependency graph and
-## cannot create cycles — which is also why `sanitizeControlBytes` lives
-## here rather than in render: crisol.nim, render.nim and depgraph.nim all
-## need it and depgraph must not depend on render.
+## This module is intentionally minimal: on posix it imports only std/posix
+## (and std/os); on windows it imports std/winlean + std/sysrand (and
+## std/os). Either way it sits at the very bottom of the crisol dependency
+## graph and cannot create cycles — which is also why `sanitizeControlBytes`
+## lives here rather than in render: crisol.nim, render.nim and depgraph.nim
+## all need it and depgraph must not depend on render.
+##
+## ## RFC-0007 D2a-4 — windows backend keeps the `cint` fd type
+##
+## Every public proc below keeps returning/accepting a `cint` fd on BOTH
+## platforms — `Ledger.fd: cint`, `ShardedLedger.fd: cint`, and every
+## `fd < 0`/`fd == -1` idiom in ledger.nim/shardedledger.nim are unchanged by
+## this module having two backends. On windows the `cint` is a real C
+## runtime fd obtained by opening the path with Win32 `CreateFileW` (for
+## `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND`-equivalent semantics and the
+## `O_NOFOLLOW` reparse-point guard) and then handing the resulting HANDLE to
+## `_open_osfhandle` — from that point on, `_write`/`_close`/`strerror`/
+## `_errno` (the same CRT calls `posix.write`/`posix.close`/`strerror`/
+## `errno` mirror on posix) operate on it exactly like any other CRT fd.
+## `_open_osfhandle` is always called with `_O_BINARY` — its absence would
+## silently let the CRT translate `\n` to `\r\n` on every write, corrupting
+## ledger/JSON content; a binary round-trip test in
+## `tests/conformance/test_windows_ioutils.nim` guards this. `_open_osfhandle`
+## TRANSFERS ownership of the HANDLE to the CRT fd on success — the HANDLE is
+## only closed directly (`CloseHandle`) on `_open_osfhandle`'s OWN failure
+## path; closing it again after success would double-close.
 ##
 ## ## RFC-0007 A3 — sole owner of raw file I/O
 ##
@@ -116,14 +138,98 @@
 ## `moveFile`'s rename(2).
 
 import std/os
-import std/posix as posix_mod
+when defined(windows):
+  import std/sysrand   # for readRandomBytes (BCryptGenRandom-backed urandom)
+  import std/winlean
+else:
+  import std/posix as posix_mod
 
-# O_NOFOLLOW is a Linux extension not declared in Nim's std/posix. Pulled
-# from <fcntl.h> via the emit+importc pattern — formerly crisol.nim's own
-# declaration (its `init` writer was the only user); A3 moved it here so
-# `crisol.nim` itself needs zero raw file-open machinery of its own.
-{.emit: "#include <fcntl.h>".}
-var O_NOFOLLOW_FLAG {.importc: "O_NOFOLLOW", nodecl.}: cint
+  # O_NOFOLLOW is a Linux extension not declared in Nim's std/posix. Pulled
+  # from <fcntl.h> via the emit+importc pattern — formerly crisol.nim's own
+  # declaration (its `init` writer was the only user); A3 moved it here so
+  # `crisol.nim` itself needs zero raw file-open machinery of its own.
+  {.emit: "#include <fcntl.h>".}
+  var O_NOFOLLOW_FLAG {.importc: "O_NOFOLLOW", nodecl.}: cint
+
+when defined(windows):
+  # ---------------------------------------------------------------------
+  # RFC-0007 D2a-4 — windows backend: the C runtime's int-fd API layered
+  # over a Win32 CreateFileW HANDLE, so every public proc in this module
+  # keeps returning a plain `cint` fd. No `header` pragma on the Win32
+  # calls (same no-header convention lock/windows.nim and process/windows.nim
+  # already use) so `nim check --os:windows` resolves everything from Nim
+  # source alone, never a MinGW header path; the CRT declarations DO carry
+  # `header` since `_write`/`_close`/`_open_osfhandle`/`strerror`/`_errno`
+  # are ordinary C-runtime calls, not raw Win32 API.
+  # ---------------------------------------------------------------------
+
+  proc c_write(fd: cint; buf: pointer; count: cint): cint
+    {.importc: "_write", header: "<io.h>".}
+  proc c_close(fd: cint): cint
+    {.importc: "_close", header: "<io.h>".}
+  proc c_open_osfhandle(osfhandle: int; flags: cint): cint
+    {.importc: "_open_osfhandle", header: "<io.h>".}
+  proc c_strerror(errnum: cint): cstring
+    {.importc: "strerror", header: "<string.h>".}
+  proc c_errno_location(): ptr cint
+    {.importc: "_errno", header: "<errno.h>".}
+
+  const
+    EINTR_CRT: cint = 4        ## MSVCRT errno value for EINTR.
+    O_BINARY_CRT: cint = 0x8000
+    O_APPEND_CRT: cint = 0x8
+    O_WRONLY_CRT: cint = 0x1
+    O_NOINHERIT_CRT: cint = 0x80
+
+  # Win32 surface referenced below but absent from std/winlean.
+  const
+    FILE_APPEND_DATA: int32 = 0x0004
+    ERROR_ALREADY_EXISTS: int32 = 183
+    ErrOpenOsfhandleFailed: int32 = -1
+      ## Sentinel meaning "_open_osfhandle itself failed" — the preceding
+      ## CreateFileW succeeded, so no GetLastError() code applies. Distinct
+      ## from every real Win32 error code, which are always non-negative.
+
+  proc winErrString(err: int32): string =
+    if err == ErrOpenOsfhandleFailed: "_open_osfhandle failed"
+    else: "GetLastError=" & $err
+
+  proc winOpen(path: string; disposition: int32; access: int32; noFollow: bool;
+               osfFlags: cint): tuple[fd: cint; err: int32] =
+    ## Shared CreateFileW + _open_osfhandle opener behind exclusiveCreate/
+    ## createOverwrite/appendOpen below. `err == 0'i32` iff `fd >= 0`.
+    var sa: SECURITY_ATTRIBUTES
+    sa.nLength = sizeof(sa).int32
+    sa.bInheritHandle = 0   # O_CLOEXEC analog: never inherited by a child.
+
+    var flagsAttr = FILE_ATTRIBUTE_NORMAL
+    if noFollow: flagsAttr = flagsAttr or FILE_FLAG_OPEN_REPARSE_POINT
+
+    let h = createFileW(newWideCString(path), access,
+                         FILE_SHARE_READ or FILE_SHARE_WRITE,
+                         addr sa, disposition, flagsAttr, 0)
+    if h == INVALID_HANDLE_VALUE:
+      return (cint(-1), getLastError())
+
+    if noFollow:
+      # O_NOFOLLOW analog: refuse a symlink/reparse point at `path`. Belt-
+      # and-suspenders alongside CREATE_NEW's own EEXIST-equivalent refusal
+      # of anything already at the path (exclusiveCreate's case).
+      var bhfi: BY_HANDLE_FILE_INFORMATION
+      if getFileInformationByHandle(h, addr bhfi) != 0 and
+         (bhfi.dwFileAttributes and FILE_ATTRIBUTE_REPARSE_POINT) != 0:
+        discard closeHandle(h)
+        return (cint(-1), ERROR_FILE_EXISTS)
+
+    # _open_osfhandle TRANSFERS ownership of `h` to the resulting CRT fd on
+    # success: closing the fd (c_close, via closeFd) closes the HANDLE too.
+    # Only close `h` ourselves on the FAILURE path below — closing it again
+    # after a successful _open_osfhandle would double-close the HANDLE.
+    let fd = c_open_osfhandle(cast[int](h), osfFlags)
+    if fd < 0:
+      discard closeHandle(h)
+      return (cint(-1), ErrOpenOsfhandleFailed)
+    (cint(fd), 0'i32)
 
 proc sanitizeControlBytes*(s: string): string =
   ## Sanitize untrusted-origin text before it reaches a terminal or CI log.
@@ -193,21 +299,36 @@ proc writeAllFd*(fd: cint; data: string): bool =
   ##
   ## Returns true when every byte has been written; false on the first
   ## unrecoverable error.  An empty `data` string is a no-op that returns true.
-  var remaining = data.len
-  var offset    = 0
-  while remaining > 0:
-    let n = posix_mod.write(fd,
-                             cast[pointer](unsafeAddr data[offset]),
-                             remaining)
-    if n < 0:
-      if posix_mod.errno == EINTR:
-        continue        # interrupted before any bytes — retry
-      return false      # genuine error (EBADF, ENOSPC, EIO, …)
-    elif n == 0:
-      return false      # should not happen, but guard anyway
-    offset    += n
-    remaining -= n
-  true
+  when defined(windows):
+    var remaining = data.len
+    var offset    = 0
+    while remaining > 0:
+      let n = c_write(fd, cast[pointer](unsafeAddr data[offset]), cint(remaining))
+      if n < 0:
+        if c_errno_location()[] == EINTR_CRT:
+          continue        # interrupted before any bytes — retry
+        return false      # genuine error
+      elif n == 0:
+        return false      # should not happen, but guard anyway
+      offset    += n.int
+      remaining -= n.int
+    true
+  else:
+    var remaining = data.len
+    var offset    = 0
+    while remaining > 0:
+      let n = posix_mod.write(fd,
+                               cast[pointer](unsafeAddr data[offset]),
+                               remaining)
+      if n < 0:
+        if posix_mod.errno == EINTR:
+          continue        # interrupted before any bytes — retry
+        return false      # genuine error (EBADF, ENOSPC, EIO, …)
+      elif n == 0:
+        return false      # should not happen, but guard anyway
+      offset    += n
+      remaining -= n
+    true
 
 proc closeFd*(fd: cint) =
   ## Close a raw posix fd. Idempotent is the CALLER's responsibility (mirrors
@@ -217,7 +338,10 @@ proc closeFd*(fd: cint) =
   ## `createOverwrite` (e.g. `ledger`/`shardedledger`, which keep one open
   ## across many appends rather than a single open-write-close) never needs
   ## `import std/posix` merely to close it.
-  discard posix_mod.close(fd)
+  when defined(windows):
+    discard c_close(fd)
+  else:
+    discard posix_mod.close(fd)
 
 proc lastErrorString*(): string =
   ## `strerror(errno)`, read the instant this is called. Only meaningful
@@ -227,7 +351,10 @@ proc lastErrorString*(): string =
   ## a caller that just got `false`/`fd < 0` back from `writeAllFd`/an open
   ## primitive report the specific OS reason without importing `std/posix`
   ## itself for `strerror`/`errno`.
-  $posix_mod.strerror(posix_mod.errno)
+  when defined(windows):
+    $c_strerror(c_errno_location()[])
+  else:
+    $posix_mod.strerror(posix_mod.errno)
 
 proc exclusiveCreate*(path: string; mode: int = 0o600; noFollow = false):
     tuple[fd: cint; error: string; alreadyExists: bool] =
@@ -245,14 +372,23 @@ proc exclusiveCreate*(path: string; mode: int = 0o600; noFollow = false):
   ## true iff the failure was `EEXIST` or `ELOOP` — letting a caller phrase
   ## "already exists" distinctly from a genuine I/O error without importing
   ## `std/posix` for the errno constants itself.
-  var flags = posix_mod.O_CREAT or posix_mod.O_EXCL or posix_mod.O_WRONLY or
-              posix_mod.O_CLOEXEC
-  if noFollow: flags = flags or O_NOFOLLOW_FLAG
-  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
-  if fd < 0:
-    let err = posix_mod.errno
-    return (cint(-1), $posix_mod.strerror(err), err == EEXIST or err == ELOOP)
-  (fd, "", false)
+  when defined(windows):
+    # `mode` (unix permission bits) is not applicable on windows — ignored.
+    let (fd, err) = winOpen(path, CREATE_NEW, GENERIC_WRITE, noFollow,
+                             O_BINARY_CRT or O_WRONLY_CRT or O_NOINHERIT_CRT)
+    if fd < 0:
+      return (cint(-1), winErrString(err),
+              err == ERROR_FILE_EXISTS or err == ERROR_ALREADY_EXISTS)
+    (fd, "", false)
+  else:
+    var flags = posix_mod.O_CREAT or posix_mod.O_EXCL or posix_mod.O_WRONLY or
+                posix_mod.O_CLOEXEC
+    if noFollow: flags = flags or O_NOFOLLOW_FLAG
+    let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
+    if fd < 0:
+      let err = posix_mod.errno
+      return (cint(-1), $posix_mod.strerror(err), err == EEXIST or err == ELOOP)
+    (fd, "", false)
 
 proc createOverwrite*(path: string; mode: int = 0o600; noFollow = false):
     tuple[fd: cint; error: string; alreadyExists: bool] =
@@ -270,14 +406,26 @@ proc createOverwrite*(path: string; mode: int = 0o600; noFollow = false):
   ## Same success/failure shape as `exclusiveCreate`; `alreadyExists` here is
   ## true iff the failure was `ELOOP` (an `O_TRUNC` open never fails with
   ## `EEXIST` — that errno is specifically `O_EXCL`'s signal).
-  var flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_TRUNC or
-              posix_mod.O_CLOEXEC
-  if noFollow: flags = flags or O_NOFOLLOW_FLAG
-  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
-  if fd < 0:
-    let err = posix_mod.errno
-    return (cint(-1), $posix_mod.strerror(err), err == ELOOP)
-  (fd, "", false)
+  when defined(windows):
+    # `mode` (unix permission bits) is not applicable on windows — ignored.
+    # CREATE_ALWAYS success is never "already exists" (it overwrites, unlike
+    # CREATE_NEW) — the only way this proc's alreadyExists comes back true is
+    # winOpen's own noFollow rejection, which mirrors posix's ELOOP-only
+    # signal here (an O_TRUNC-equivalent open never fails with EEXIST).
+    let (fd, err) = winOpen(path, CREATE_ALWAYS, GENERIC_WRITE, noFollow,
+                             O_BINARY_CRT or O_WRONLY_CRT or O_NOINHERIT_CRT)
+    if fd < 0:
+      return (cint(-1), winErrString(err), err == ERROR_FILE_EXISTS)
+    (fd, "", false)
+  else:
+    var flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_TRUNC or
+                posix_mod.O_CLOEXEC
+    if noFollow: flags = flags or O_NOFOLLOW_FLAG
+    let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
+    if fd < 0:
+      let err = posix_mod.errno
+      return (cint(-1), $posix_mod.strerror(err), err == ELOOP)
+    (fd, "", false)
 
 proc appendOpen*(path: string; mode: int = 0o600): tuple[fd: cint; error: string] =
   ## Open `path` for writing with `O_CREAT|O_WRONLY|O_APPEND|O_CLOEXEC`,
@@ -288,12 +436,24 @@ proc appendOpen*(path: string; mode: int = 0o600): tuple[fd: cint; error: string
   ## On success `fd >= 0` and `error == ""`. On failure `fd == -1` and
   ## `error` names the OS reason (`strerror(errno)`, captured immediately
   ## after the failing `open(2)`).
-  let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_APPEND or
-              posix_mod.O_CLOEXEC
-  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
-  if fd < 0:
-    return (cint(-1), $posix_mod.strerror(posix_mod.errno))
-  (fd, "")
+  when defined(windows):
+    # `mode` (unix permission bits) is not applicable on windows — ignored.
+    # noFollow=false: an existing shard path is always this same process's
+    # own file (see the ledger/shardedledger boot-id-composite naming
+    # scheme), never attacker-planted, so appendOpen never needs the guard.
+    let (fd, err) = winOpen(path, OPEN_ALWAYS, FILE_APPEND_DATA, false,
+                             O_BINARY_CRT or O_APPEND_CRT or O_WRONLY_CRT or
+                             O_NOINHERIT_CRT)
+    if fd < 0:
+      return (cint(-1), winErrString(err))
+    (fd, "")
+  else:
+    let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_APPEND or
+                posix_mod.O_CLOEXEC
+    let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(mode))
+    if fd < 0:
+      return (cint(-1), $posix_mod.strerror(posix_mod.errno))
+    (fd, "")
 
 proc readRandomBytes*(n: Natural): seq[byte] =
   ## Best-effort read of up to `n` bytes from `/dev/urandom`. Returns fewer
@@ -306,13 +466,19 @@ proc readRandomBytes*(n: Natural): seq[byte] =
   ## reason as `writeAllFd`. Callers already degrade gracefully (falling
   ## back to the epoch-microsecond timestamp alone) on a short/empty result.
   if n == 0: return @[]
-  let fd = posix_mod.open("/dev/urandom".cstring, posix_mod.O_RDONLY)
-  if fd < 0: return @[]
-  result = newSeq[byte](n)
-  let got = posix_mod.read(fd, addr result[0], n)
-  discard posix_mod.close(fd)
-  if got != n:
-    result = if got > 0: result[0 ..< got] else: @[]
+  when defined(windows):
+    # BCryptGenRandom-backed (std/sysrand); best-effort per this proc's
+    # contract — never raises, an empty seq signals "could not get any".
+    try: result = urandom(n)
+    except CatchableError: return @[]
+  else:
+    let fd = posix_mod.open("/dev/urandom".cstring, posix_mod.O_RDONLY)
+    if fd < 0: return @[]
+    result = newSeq[byte](n)
+    let got = posix_mod.read(fd, addr result[0], n)
+    discard posix_mod.close(fd)
+    if got != n:
+      result = if got > 0: result[0 ..< got] else: @[]
 
 proc atomicPublish*(finalPath: string; data: string): tuple[ok: bool; error: string] =
   ## Atomically write `data` into `finalPath`.
@@ -334,7 +500,7 @@ proc atomicPublish*(finalPath: string; data: string): tuple[ok: bool; error: str
   ## instead of a bare "could not write" with no cause.  This helper is
   ## reused for resultcache's JSON entries; it does not itself write to
   ## stderr — callers log using the returned `error`.
-  let tmpPath = finalPath & "." & $posix_mod.getpid() & ".tmp"
+  let tmpPath = finalPath & "." & $os.getCurrentProcessId() & ".tmp"
 
   # Best-effort removal of our own PID-specific leftover .tmp (a retry within
   # this same process).  A different process has a different pid, hence a

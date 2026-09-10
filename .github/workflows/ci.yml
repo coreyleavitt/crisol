@@ -350,6 +350,10 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_availmem.nim
 
+      - name: rfc-0007 D2a-4 — windows ioutils (CRT int-fd backend)
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_ioutils.nim
+
   macos:
     runs-on: macos-latest
     steps:
