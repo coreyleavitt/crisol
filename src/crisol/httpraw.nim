@@ -164,7 +164,11 @@
 ## total a function of "did this syscall return data, an error, or would it
 ## block" as it always was, whether that syscall happens to be a raw
 ## `recv(2)` or an OpenSSL `SSL_read` underneath.
-import std/[net, os, posix, strutils, times]
+import std/[net, os, strutils, times]
+when defined(windows):
+  import std/winlean   # setsockopt, SockLen, SocketHandle interop on winsock
+else:
+  import std/posix
 import crisol/cachewire
 import crisol/chunkedcodec
 
@@ -256,6 +260,33 @@ proc parseHttpUrl(url: string): ParsedUrl =
 # syscall, can't silently balloon past the intended total budget).
 # ---------------------------------------------------------------------------
 
+when defined(windows):
+  const
+    SOL_SOCKET: cint = 0xffff'i32
+    SO_RCVTIMEO: cint = 0x1006'i32
+    SO_SNDTIMEO: cint = 0x1005'i32
+      ## winsock2.h values -- std/posix isn't importable on windows, so
+      ## these can't come from there the way the posix branch below gets
+      ## them; `std/winlean` doesn't define them either, so they're
+      ## declared here directly.
+    EINTR = winlean.WSAEINTR
+    EAGAIN = winlean.WSAEWOULDBLOCK
+    EWOULDBLOCK = winlean.WSAEWOULDBLOCK
+      ## `sendAllRaw`/`recvChunk` below check `osLastError()` against
+      ## these three names unconditionally (posix errno constants there
+      ## today). Winsock has no EINTR/EAGAIN distinction of its own --
+      ## `WSAEINTR`/`WSAEWOULDBLOCK` are the winsock equivalents (a
+      ## blocking call cancelled / would-block respectively; winsock
+      ## does not distinguish EAGAIN from EWOULDBLOCK the way posix
+      ## does, so both alias the same code) -- aliased here so those two
+      ## procs' error-handling branches stay byte-identical to the posix
+      ## build and need no `when defined(windows)` of their own. Safe to
+      ## compare against `osLastError()` because winsock functions set
+      ## their error via `SetLastError` under the hood on all supported
+      ## (NT-based) Windows, so `GetLastError()` -- what `osLastError()`
+      ## calls on windows -- returns the same value `WSAGetLastError()`
+      ## would.
+
 proc remainingMs(deadline: float): int =
   let rem = (deadline - epochTime()) * 1000.0
   if rem <= 0.0: 0
@@ -263,12 +294,24 @@ proc remainingMs(deadline: float): int =
 
 proc setTimeoutOpt(fd: SocketHandle; opt: cint; ms: int) =
   # ms is always >= 1 here (callers check remainingMs > 0 first) -- a zero
-  # Timeval means "block forever" to the kernel, which is exactly the one
-  # value this proc must never be asked to set.
-  var tv: Timeval
-  tv.tv_sec = posix.Time(ms div 1000)
-  tv.tv_usec = Suseconds(ms mod 1000 * 1000)
-  discard setsockopt(fd, SOL_SOCKET, opt, addr tv, SockLen(sizeof(tv)))
+  # Timeval means "block forever" to the kernel (posix) / an infinite
+  # winsock timeout (windows), which is exactly the one value this proc
+  # must never be asked to set.
+  when defined(windows):
+    # Winsock's SO_RCVTIMEO/SO_SNDTIMEO optval is a DWORD of milliseconds
+    # -- NOT a `struct timeval` the way posix's identically-named options
+    # are. `fd` is `std/net`'s `SocketHandle` (what `getFd()` returns);
+    # `winlean.setsockopt`'s `s` param wants `winlean.SocketHandle` --
+    # the same underlying type, but the bridge is cast here so every call
+    # site above stays untouched.
+    var msDword: int32 = int32(ms)
+    discard winlean.setsockopt(winlean.SocketHandle(fd), SOL_SOCKET, opt,
+                                addr msDword, SockLen(sizeof(msDword)))
+  else:
+    var tv: Timeval
+    tv.tv_sec = posix.Time(ms div 1000)
+    tv.tv_usec = Suseconds(ms mod 1000 * 1000)
+    discard setsockopt(fd, SOL_SOCKET, opt, addr tv, SockLen(sizeof(tv)))
 
 proc sendAllRaw(socket: Socket; data: string; deadline: float): RawIoResult =
   ## Takes the `Socket` (not a bare `fd`) so a TLS-wrapped connection's

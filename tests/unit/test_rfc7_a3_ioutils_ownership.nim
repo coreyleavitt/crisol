@@ -8,7 +8,8 @@
 ## compiler, so only a scan of the text itself can catch a violation:
 ##
 ##   1. `std/posix` import count outside `crisol/process/*`, `ioutils.nim`,
-##      `lock/posix.nim` is zero — the A3 bullet's own acceptance test (A4 drops
+##      `lock/posix.nim`, `httpraw.nim` is zero — the A3 bullet's own
+##      acceptance test (A4 drops
 ##      `signals.nim` from this allow-list: it delegates onto
 ##      `crisol/process.globalShutdownSignal()` instead of installing its own
 ##      handler, so it no longer needs `std/posix` directly — see A4's
@@ -21,7 +22,10 @@
 ##      their actual usage required (`createOverwrite`, `closeFd`,
 ##      `readRandomBytes`, `lastErrorString`, `writeGuardedFile`) — see
 ##      ioutils.nim's module doc for the full primitive set and why each
-##      exists.
+##      exists. `httpraw.nim` joins the allow-list in RFC-0007 D2a-5
+##      (windows socket-timeout de-POSIX): its `SO_RCVTIMEO`/`SO_SNDTIMEO`
+##      setter takes the posix `struct timeval` path only on non-windows,
+##      behind a bare `import std/posix` in its `else` branch.
 ##   2. Every `std/osproc` import site carries the `# process-contract-exempt`
 ##      marker on the SAME line — RFC-0007 §"Scope": short-lived tool
 ##      invocations (git, the ccprobe/nimprobe probes, compiledriver's
@@ -44,6 +48,12 @@ const SrcDir = CrisolRoot / "src"
 const AllowedPosixFiles = [
   "crisol/ioutils.nim",
   "crisol/lock/posix.nim",
+  "crisol/httpraw.nim",
+    # windows socket-timeout de-POSIX (RFC-0007 D2a-5): `httpraw.nim` now
+    # has a bare `import std/posix` in its `when defined(windows): ...
+    # else: import std/posix` branch (the posix leg of the SO_RCVTIMEO/
+    # SO_SNDTIMEO timeval-vs-DWORD split) — one proc's worth of direct
+    # posix use, same rationale as the other allow-listed files here.
 ]
 
 proc allNimFiles(): seq[string] =
@@ -59,13 +69,22 @@ proc isAllowedPosixSite(rel: string): bool =
 
 proc importsStdPosixLine(line: string): bool =
   ## True iff `line` is (ignoring leading whitespace) an `import std/posix`
-  ## statement — as a bare import or via `as`/`except` — but NOT a doc
-  ## comment or prose line merely mentioning the module (those start with
-  ## `#`/`##`, which this check excludes by requiring the line to start
-  ## with the literal keyword `import`).
+  ## statement — as a bare import, via `as`/`except`, or as an element of
+  ## a bracketed `std/[...]` list (e.g. `import std/[net, posix, times]`)
+  ## — but NOT a doc comment or prose line merely mentioning the module
+  ## (those start with `#`/`##`, which this check excludes by requiring
+  ## the line to start with the literal keyword `import`).
   let s = line.strip
-  s == "import std/posix" or s.startsWith("import std/posix ") or
-    s.startsWith("import std/posix\t")
+  if s == "import std/posix" or s.startsWith("import std/posix ") or
+     s.startsWith("import std/posix\t"):
+    return true
+  if s.startsWith("import") and s.contains("std/["):
+    # bracketed form: match "posix" as a whole list element, not a
+    # substring of some other module name (mirrors
+    # `importsStdOsprocLine`'s identical scan below).
+    for part in s.split({'[', ']', ',', ' '}):
+      if part == "posix": return true
+  false
 
 proc importsStdOsprocLine(line: string): bool =
   ## True iff `line` is an import statement (bare `import`, a `std/[...]`
