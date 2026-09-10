@@ -303,6 +303,25 @@ jobs:
       - name: Compile and run the Windows smoke test
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_smoke.nim
 
+      # rfc-0007 D1a — the four load-bearing pieces, each with its own
+      # narrowly-scoped conformance file (mirrors the smoke test above, not
+      # test_conformance.nim's std/posix-importing full suite): the
+      # ekNtStatus producer proof (access-violation fixture), snapshotTree
+      # forensics, the completion-port `next` tier, and inherited-handle
+      # sink delivery. "Conformance SMOKE green" per the D1a bullet — full
+      # windows-suite parity remains RFC-0009's acceptance, not this leg's.
+      - name: D1a — ekNtStatus producer proof (access violation)
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_ntstatus.nim
+
+      - name: D1a — snapshotTree forensics
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_forensics.nim
+
+      - name: D1a — completion-port next (IOCP)
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_iocp.nim
+
+      - name: D1a — inherited handles to sinks
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_sinks.nim
+
   macos:
     runs-on: macos-latest
     steps:
