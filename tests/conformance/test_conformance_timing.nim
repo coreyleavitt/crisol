@@ -188,58 +188,19 @@ suite "conformance timing — item 9: shutdown wakeup":
 #     --hints:off --warnings:off --path:src tests/conformance/test_conformance_timing.nim
 # ---------------------------------------------------------------------------
 
-suite "conformance timing — B2: event-driven exit detection":
+when defined(linux):
+  # rfc-0007 C1b: gated to Linux — this is the pidfd/epoll latency-
+  # discrimination proof (event-driven wake vs the 25ms poll tick). On
+  # the macOS CI runner scheduling noise exceeds that 25ms delta, so the
+  # discrimination is not reliably observable there; the macosx suite
+  # below owns Darwin's kqueue backend with a functional-detection bound.
+  # (Before C1b the macos leg ran no timing cases at all — this restores
+  # that scope now that the leg enables CRISOL_TIMING_TESTS for kqueue.)
+  suite "conformance timing — B2: event-driven exit detection":
 
-  test "a child's exit is observed promptly, not merely within the old 25ms poll tick":
-    var sv = initSupervisor(installSignals = false)
-    let outPath = tmpOutputFile("b2_latency")
-    const sleepMs = 200
-    let spec = ChildSpec(argv: @[sleepBin], cwd: getCurrentDir(),
-                          env: @[("CRISOL_SLEEP_MS", $sleepMs)],
-                          sinks: combinedSink(outPath))
-    let t0 = getMonoTime()
-    let sr = sv.spawn(spec)
-    check sr.ok
-    let ev = sv.next(t0 + initDuration(seconds = 5))
-    let elapsed = getMonoTime() - t0
-    check ev.kind == weChildExited
-    discard sv.reap(ev.id)
-    echo "  observed: exit detected ", elapsed.inMilliseconds,
-         " ms after spawn (fixture slept ", sleepMs, " ms)"
-    let forcedPoll = getEnv("CRISOL_FORCE_POLL", "") notin ["", "0"]
-    if forcedPoll:
-      # Poll(2) fallback tier: bounded by the retained ~25ms tick, same
-      # latency shape as pre-B2 — generous margin for scheduler noise.
-      check elapsed < initDuration(milliseconds = sleepMs + 60)
-    else:
-      # Event-driven tier: the child's pidfd becomes readable and wakes
-      # epoll_wait directly — detection latency is scheduling noise, not a
-      # poll quantum. A regression back to a poll-shaped wait (forgetting to
-      # register/consult the pidfd) would blow this bound.
-      check elapsed < initDuration(milliseconds = sleepMs + 20)
-    removeFile(outPath)
-
-# ---------------------------------------------------------------------------
-# rfc-0007 C1b — kqueue EVFILT_PROC event-driven exit detection (macOS).
-# Mirrors the B2 latency case above exactly, pinned to Darwin's kqueue
-# backend rather than Linux's epoll/pidfd one. Only compiled on macOS: B2
-# above already proves the Linux side, and this suite exists specifically to
-# prove the OTHER platform's mechanism actually engages, not to duplicate the
-# same fact twice.
-#
-# Run BOTH tiers directly on a macOS host:
-#   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
-#     --path:src tests/conformance/test_conformance_timing.nim
-#   ./dev run env CRISOL_TIMING_TESTS=1 CRISOL_FORCE_POLL=1 nim r \
-#     --hints:off --warnings:off --path:src tests/conformance/test_conformance_timing.nim
-# ---------------------------------------------------------------------------
-
-when defined(macosx):
-  suite "conformance timing — C1b: kqueue event-driven exit detection (macOS)":
-
-    test "a child's exit is observed promptly on the real kqueue backend, not the poll(2) tick":
+    test "a child's exit is observed promptly, not merely within the old 25ms poll tick":
       var sv = initSupervisor(installSignals = false)
-      let outPath = tmpOutputFile("c1b_kqueue_latency")
+      let outPath = tmpOutputFile("b2_latency")
       const sleepMs = 200
       let spec = ChildSpec(argv: @[sleepBin], cwd: getCurrentDir(),
                             env: @[("CRISOL_SLEEP_MS", $sleepMs)],
@@ -255,20 +216,67 @@ when defined(macosx):
            " ms after spawn (fixture slept ", sleepMs, " ms)"
       let forcedPoll = getEnv("CRISOL_FORCE_POLL", "") notin ["", "0"]
       if forcedPoll:
-        # Poll(2) fallback tier: bounded by the retained ~25ms tick, widened
-        # relative to B2's Linux bound — GitHub's macos-latest runners are
-        # measurably slower/noisier under CI load (the same reason C1a
-        # widened `ccSpanUs`).
-        check elapsed < initDuration(milliseconds = sleepMs + 100)
+        # Poll(2) fallback tier: bounded by the retained ~25ms tick, same
+        # latency shape as pre-B2 — generous margin for scheduler noise.
+        check elapsed < initDuration(milliseconds = sleepMs + 60)
       else:
-        # Event-driven tier: the child's kqueue registration
-        # (EVFILT_PROC/NOTE_EXIT) fires and wakes `kevent` directly —
-        # detection latency is scheduling noise, not a poll quantum. Wider
-        # than B2's Linux `sleepMs + 20` for the same runner-noise reason,
-        # but still well under the poll(2) fallback's own worst case above —
-        # a regression back to a poll-shaped wait (forgetting to
-        # register/consult the kqueue fd) still fails this.
-        check elapsed < initDuration(milliseconds = sleepMs + 50)
+        # Event-driven tier: the child's pidfd becomes readable and wakes
+        # epoll_wait directly — detection latency is scheduling noise, not a
+        # poll quantum. A regression back to a poll-shaped wait (forgetting to
+        # register/consult the pidfd) would blow this bound.
+        check elapsed < initDuration(milliseconds = sleepMs + 20)
+      removeFile(outPath)
+
+# ---------------------------------------------------------------------------
+# rfc-0007 C1b — kqueue EVFILT_PROC event-driven exit detection (macOS).
+# Darwin's kqueue peer of the (Linux-gated) B2 case above. This is a
+# FUNCTIONAL liveness proof, deliberately NOT a latency-discrimination one:
+# `nextEvent` sweeps `pollSweepChildren` every ≤25ms tick on EVERY backend,
+# so the gap between an event-driven wake and the poll tick is ≤25ms — and
+# GitHub's macos-latest runners carry more than 25ms of spawn/scheduling
+# noise under CI load (observed ~50ms), so "event-driven, not poll" cannot
+# be told apart from noise here the way B2's tight bound tells it apart on
+# Linux. What this DOES prove, end-to-end through the real Supervisor, is
+# that the kqueue-backed `next()` delivers a child's exit PROMPTLY (far
+# inside the 5s deadline, not hung) — the C1b kqueue `next` is additionally
+# exercised on every spawn by the whole macos conformance run. The
+# CRISOL_FORCE_POLL branch proves the poll fallback stays reachable on
+# Darwin (forcePollRequested is cross-platform since C1b).
+#
+# Run both tiers directly on a macOS host:
+#   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
+#     --path:src tests/conformance/test_conformance_timing.nim
+#   ./dev run env CRISOL_TIMING_TESTS=1 CRISOL_FORCE_POLL=1 nim r \
+#     --hints:off --warnings:off --path:src tests/conformance/test_conformance_timing.nim
+# ---------------------------------------------------------------------------
+
+when defined(macosx):
+  suite "conformance timing — C1b: kqueue-backed next() delivers exits promptly (macOS)":
+
+    test "a child's exit is delivered promptly by the kqueue backend, far inside the deadline":
+      var sv = initSupervisor(installSignals = false)
+      let outPath = tmpOutputFile("c1b_kqueue_latency")
+      const sleepMs = 200
+      let spec = ChildSpec(argv: @[sleepBin], cwd: getCurrentDir(),
+                            env: @[("CRISOL_SLEEP_MS", $sleepMs)],
+                            sinks: combinedSink(outPath))
+      let t0 = getMonoTime()
+      let sr = sv.spawn(spec)
+      check sr.ok
+      let ev = sv.next(t0 + initDuration(seconds = 5))
+      let elapsed = getMonoTime() - t0
+      check ev.kind == weChildExited
+      discard sv.reap(ev.id)
+      echo "  observed: exit detected ", elapsed.inMilliseconds,
+           " ms after spawn (fixture slept ", sleepMs, " ms; ",
+           (if getEnv("CRISOL_FORCE_POLL", "") notin ["", "0"]: "poll" else: "kqueue"),
+           " tier)"
+      # A single CI-noise-safe functional bound for both tiers: detection
+      # lands just after the child's own sleep, never seconds later. Generous
+      # against macos-latest scheduling noise (the same reason C1a widened
+      # `ccSpanUs`), yet a hung/broken `next()` — kqueue fd never consulted
+      # AND the poll fallback also broken — blows straight through it.
+      check elapsed < initDuration(milliseconds = sleepMs + 300)
       removeFile(outPath)
 
 when isMainModule:
