@@ -948,11 +948,20 @@ when defined(macosx):
     ## (unlike /proc's kB), so no *1024 here. A denied/vanished pid returns
     ## a short/failed read — 0, honest, same as a zombie's VmRSS on Linux,
     ## never fabricated.
-    var ti: ProcTaskInfo
-    let r = proc_pidinfo(pid.cint, PROC_PIDTASKINFO, 0'u64, addr ti,
-                         cint(sizeof(ti)))
-    if r == cint(sizeof(ti)): int64(ti.pti_resident_size)
-    else: 0'i64
+    ##
+    ## A generously-sized raw buffer (never `sizeof(ProcTaskInfo)`): the
+    ## payload types are `incompleteStruct`, so Nim's `sizeof` reflects only
+    ## the FIELDS declared above, not the real C struct — passing that as
+    ## `buffersize` under-sizes the buffer and `proc_pidinfo` rejects it
+    ## (ENOSPC), which is exactly what left this empty on the first macos CI
+    ## run. The kernel writes `sizeof(struct proc_taskinfo)` bytes and
+    ## returns that count (> 0); field OFFSETS still come from the C header
+    ## via the cast, which is all `incompleteStruct` was ever needed for.
+    var buf: array[512, byte]
+    let r = proc_pidinfo(pid.cint, PROC_PIDTASKINFO, 0'u64, addr buf[0],
+                         cint(buf.len))
+    if r <= 0: return 0'i64
+    int64(cast[ptr ProcTaskInfo](addr buf[0]).pti_resident_size)
 else:
   proc readVmRssBytes(pid: int): int64 =
     try:
@@ -978,30 +987,40 @@ type
 
 when defined(macosx):
   proc walkProcTable(): seq[ProcStatInfo] =
-    ## rfc-0007 C1b: the libproc equivalent of the /proc walk below —
-    ## `proc_listallpids(nil, 0)` returns a live PID COUNT (not bytes);
-    ## the second call (a real buffer) returns BYTES used, hence the
-    ## division by `sizeof(int32)` — the documented libproc idiom (ps/htop-
-    ## style tools use the same two-call shape). `pbi_pgid` is exactly the
-    ## process group id `scanProcessGroup(pgid)`'s `info.pgrp == pgid`
-    ## filter needs — no change required there or in
+    ## rfc-0007 C1b: the libproc equivalent of the /proc walk below.
+    ## `proc_listallpids(nil, 0)` returns a sizing hint (a pid count on some
+    ## releases, a byte size on others); allocating `hint + 64` int32 slots
+    ## over-allocates safely under BOTH readings (bytes ⇒ far more slack).
+    ## The real call returns BYTES written, so `div sizeof(int32)` yields
+    ## the live pid count — the documented two-call libproc idiom.
+    ## `pbi_pgid` is exactly the process group id `scanProcessGroup(pgid)`'s
+    ## `info.pgrp == pgid` filter needs — no change required there or in
     ## `scanProcessGroup`/`snapshotTreeCore`/`groupRssBytesCore`, which all
     ## fold over this proc's output as before.
+    ##
+    ## Each `proc_pidinfo` reads into a generously-sized raw buffer, NOT a
+    ## `var ProcBsdInfo` sized by `sizeof` — the type is `incompleteStruct`
+    ## so Nim's `sizeof` counts only the declared fields (~a third of the
+    ## real C struct), under-sizing the buffer and drawing an ENOSPC that
+    ## skipped every pid on the first macos CI run (empty tree, zero RSS).
+    ## The kernel returns `sizeof(struct proc_bsdinfo)` (> 0); field offsets
+    ## come from the C header through the cast.
     result = @[]
-    let count = proc_listallpids(nil, 0.cint)
-    if count <= 0: return
-    let cap = count + 64   # slack: processes can appear between the two calls
+    let want = proc_listallpids(nil, 0.cint)
+    if want <= 0: return
+    let cap = int(want) + 64   # over-allocate: safe whether `want` is count or bytes
     var pids = newSeq[int32](cap)
     let gotBytes = proc_listallpids(addr pids[0], cint(cap * sizeof(int32)))
     if gotBytes <= 0: return
-    let n = gotBytes div cint(sizeof(int32))
-    for i in 0 ..< int(n):
+    let n = int(gotBytes div cint(sizeof(int32)))
+    var buf: array[512, byte]
+    for i in 0 ..< n:
       let pid = pids[i]
       if pid <= 0: continue
-      var bi: ProcBsdInfo
-      let r = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0'u64, addr bi,
-                           cint(sizeof(bi)))
-      if r != cint(sizeof(bi)): continue   # vanished/denied — skip, never fabricate
+      let r = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0'u64, addr buf[0],
+                           cint(buf.len))
+      if r <= 0: continue   # vanished/denied — skip, never fabricate
+      let bi = cast[ptr ProcBsdInfo](addr buf[0])
       let comm = $cast[cstring](addr bi.pbi_comm[0])
       result.add ProcStatInfo(pid: int(pid), ppid: int(bi.pbi_ppid),
                               pgrp: int(bi.pbi_pgid), comm: comm,
