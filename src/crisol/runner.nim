@@ -45,7 +45,7 @@
 ##   • Output captured to per-entrypoint temp files; read atomically after
 ##     completion; bounded by maxOutputBytes.
 
-import std/[envvars, json, monotimes, options, os, sequtils, sets, strutils, tables, times]
+import std/[envvars, json, monotimes, options, os, sequtils, sets, strutils, tables, tempfiles, times]
 import crisol/[types, config, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver]
 # rfc-0007 A2b: the runner is supervised entirely through `crisol/process`'s
 # Supervisor contract now — `std/posix` and `crisol/spawn` (forkExec/
@@ -84,40 +84,21 @@ export cachedispatch.isActive
 # Helpers
 # ---------------------------------------------------------------------------
 
-when defined(macosx):
-  # rfc-0007 C1a: Apple's <stdlib.h> hides mkdtemp(3) (a BSD/POSIX
-  # extension) unless _DARWIN_C_SOURCE is defined for the translation
-  # unit — without it, real macOS clang sees no prototype at all, falls
-  # back to an implicit int-returning declaration, and errors outright
-  # (Clang defaults implicit-function-declaration to an error): "call to
-  # undeclared function 'mkdtemp'" / "incompatible integer to pointer
-  # conversion". Linux/glibc exposes mkdtemp with no such macro needed
-  # (glibc implies _DEFAULT_SOURCE when nothing else restricts it), which
-  # is why this was invisible until this file actually compiled on Darwin.
-  {.passC: "-D_DARWIN_C_SOURCE".}
-
-proc mkdtemp(tmpl: cstring): cstring
-  {.importc: "mkdtemp", header: "<stdlib.h>".}
-  ## POSIX mkdtemp(3): create a secure temp dir from a template ending in
-  ## XXXXXX. Modifies the template in-place and returns it on success, or
-  ## nil on error. rfc-0007 A2b: this used to come in via `import std/
-  ## posix`; declared directly now that `std/posix` has left this file
-  ## (raw libc import, not a posix-module dependency — see spawn.nim's
-  ## former identical declaration, now dead code removed with that file).
-
 proc makeTmpDir(prefix: string): string =
-  ## Create a secure temporary directory using mkdtemp(3).
-  ## The template must end with exactly 6 'X' characters (POSIX requirement).
-  ## Returns the created directory path, or raises IOError on failure.
-  ## Using mkdtemp avoids PID-predictable temp paths (M8 fix).
-  var tmpl = getTempDir() / (prefix & "XXXXXX")
-  # mkdtemp modifies the template in-place.
-  var buf = newString(tmpl.len + 1)
-  copyMem(addr buf[0], tmpl.cstring, tmpl.len + 1)
-  let r = mkdtemp(buf.cstring)
-  if r == nil:
-    raise newException(IOError, "mkdtemp failed for template: " & tmpl)
-  result = $cast[cstring](r)
+  ## Create a secure temporary directory.
+  ## Returns the created directory path, or raises OSError on failure.
+  ##
+  ## rfc-0007 C1a: uses `std/tempfiles.createTempDir` — pure Nim (retries an
+  ## `existsOrCreateDir` against a randomized name), not a raw `mkdtemp(3)`
+  ## FFI — avoiding PID-predictable temp paths (M8's original goal) the same
+  ## way on every platform. The prior direct `importc: "mkdtemp", header:
+  ## "<stdlib.h>"` declaration compiled and ran fine on Linux, but real
+  ## macOS clang reported it as an undeclared function even with
+  ## `_DARWIN_C_SOURCE` defined for the translation unit — Apple's actual
+  ## header guard for this BSD extension did not yield to that macro in
+  ## practice, and chasing the exact guard was strictly worse than not
+  ## depending on the raw libc symbol at all.
+  createTempDir(prefix, "")
 
 proc readCapped(path: string; maxBytes: int): string =
   ## Read up to maxBytes from path; append a truncation notice if cut short.
