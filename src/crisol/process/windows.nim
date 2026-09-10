@@ -61,6 +61,28 @@
 ##     throwaway suspended process, never this process itself, and attempts
 ##     a double Job assignment); ctrlBreakDeliverable is a REAL console
 ##     probe (GetConsoleCP).
+##   - groupRssBytes (D2a-1): a REAL per-call live sum — walks the SAME
+##     JobObjectBasicProcessIdList pid list snapshotTree uses and sums each
+##     pid's psapi GetProcessMemoryInfo.workingSetSize (`snapshotOnePid`,
+##     already shared with snapshotTree/forensics). This is the CURRENT
+##     live sum §1 promises ("the group-RSS sum and nothing else", sampled
+##     every ~25 ms by the caller for admission) — NOT Job accounting's
+##     PeakJobMemoryUsed, which is a monotonic peak-since-job-start and
+##     would over-report a stale figure as current. An unreadable pid
+##     (exited between the pid-list read and the per-pid query) contributes
+##     0 rather than failing the whole call — best-effort over a
+##     best-effort pid list, same honesty rule snapshotOnePid already
+##     applies. No new sampler loop: this proc does the psapi walk once per
+##     call; the 25 ms cadence is the runner's admission-tick loop, not
+##     something this module owns.
+##   - globalShutdownSignal (D2a-1): a REAL process-global, level-triggered
+##     getter over `gShutdownSignum` — the same sticky global
+##     `ctrlHandlerProc` stamps (CTRL_C -> 2/SIGINT, CTRL_BREAK ->
+##     15/SIGTERM) and `next()`'s `weShutdown` already reads. Mirrors
+##     posixcore's `globalShutdownSignalCore` exactly (sticky, not
+##     edge-triggered/consumed like `weShutdown`); this is the seam
+##     `crisol/signals.shutdownRequested()` delegates onto, which now
+##     compiles and works against this backend.
 ##
 ## What is HONESTLY DEGRADED (never fabricated — §1's weakest-honest-claim
 ## rule), and why, per proc:
@@ -94,15 +116,6 @@
 ##     SIGXCPU-to-cbLimit attribution is real and deliberate: annotating
 ##     WHICH limit fired needs the IOCP job-message path, out of scope for
 ##     this slice.
-##   - groupRssBytes: returns `none()`. Job accounting's only cheap "memory"
-##     figure is PeakJobMemoryUsed — a MONOTONIC peak-since-job-start, not
-##     the CURRENT live sum this proc's contract promises (§1: "the
-##     group-RSS sum and nothing else", sampled every 25 ms for admission).
-##     Reporting a stale peak as "current" would systematically over-report
-##     and under-admit — a lie in the conservative direction, still a lie.
-##     A true current-sum needs psapi walked over the SAME
-##     JobObjectBasicProcessIdList pid list snapshotTree now uses; D2's job
-##     (memprobe wiring).
 ##   - Evidence.escapees: `@[]` always — and this is CORRECT, not a stub
 ##     (D1b-iii): `spawnChild` never sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK` on
 ##     the Job it creates, so `CREATE_BREAKAWAY_FROM_JOB` is always DENIED
@@ -212,8 +225,9 @@ type
   PROCESS_MEMORY_COUNTERS = object
     ## rfc-0007 D1a: psapi's GetProcessMemoryInfo — `workingSetSize` is the
     ## RSS analog `snapshotTree` forensics need (real, per-pid, over the
-    ## Job's pid list — NOT `groupRssBytes`'s live-sum sampler, which stays
-    ## D2's job; see this module's header).
+    ## Job's pid list). `groupRssBytes` (D2a-1) sums this SAME per-pid
+    ## field over the SAME pid list via `snapshotOnePid` — see this
+    ## module's header.
     cb: int32                           # DWORD
     pageFaultCount: int32
     peakWorkingSetSize: uint            # SIZE_T
@@ -407,6 +421,17 @@ proc probeJobObjectNesting(): bool =
     result = assignProcessToJobObject(job2, pi.hProcess) != 0'i32
   except CatchableError:
     result = false
+
+proc globalShutdownSignal*(): Option[ShutdownSignal] =
+  ## Process-global, level-triggered view of the last shutdown signal the
+  ## console control handler recorded (sticky, like posixcore's
+  ## globalShutdownSignalCore) — the seam crisol/signals.shutdownRequested()
+  ## delegates onto. gShutdownSignum is stamped by ctrlHandlerProc (CTRL_C
+  ## -> 2/SIGINT, CTRL_BREAK -> 15/SIGTERM), the SAME source next()'s
+  ## weShutdown reads.
+  let s = gShutdownSignum
+  if s != 0: some(ShutdownSignal(signum: int(s)))
+  else: none(ShutdownSignal)
 
 proc capabilities*(sv: Supervisor): Capabilities =
   ## Probed once, memoised (§4) — computed eagerly in `initSupervisor`
@@ -1015,11 +1040,10 @@ proc reap*(sv: var Supervisor; id: ChildId): ReapReport =
 # snapshotTree — real since rfc-0007 D1a: JobObjectBasicProcessIdList (pid
 # list) + psapi GetProcessMemoryInfo (per-pid rssBytes) + kernel32
 # QueryFullProcessImageNameW (command/image name) — see snapshotJob above.
-# groupRssBytes stays honestly degraded (see module header): its live-sum
-# sampler semantics need psapi walked on a 25ms cadence, D2's job
-# (memprobe wiring) — reporting Job accounting's PeakJobMemoryUsed here
-# instead would systematically over-report a monotonic peak as a current
-# sum, a lie in the conservative direction, still a lie.
+# groupRssBytes (D2a-1): real since this slice — a per-call live sum over
+# the SAME pid list, via `queryJobPids` + `snapshotOnePid` (see module
+# header). NOT Job accounting's PeakJobMemoryUsed — that is a monotonic
+# peak-since-job-start, not the current sum §1 promises.
 # ---------------------------------------------------------------------------
 
 proc snapshotTree*(sv: Supervisor; id: ChildId): seq[ProcSnapshot] =
@@ -1027,5 +1051,11 @@ proc snapshotTree*(sv: Supervisor; id: ChildId): seq[ProcSnapshot] =
   snapshotJob(sv.children[idx].hJob)
 
 proc groupRssBytes*(sv: Supervisor; id: ChildId): Option[int64] =
-  discard requireLive(sv, id)
-  none(int64)
+  let idx = requireLive(sv, id)
+  let pids = queryJobPids(sv.children[idx].hJob)
+  if pids.len == 0: return none(int64)
+  var total: int64 = 0
+  for pid in pids:
+    let snap = snapshotOnePid(pid)
+    if snap.isSome: total += snap.get.rssBytes   # best-effort; an unreadable pid contributes 0
+  some(total)

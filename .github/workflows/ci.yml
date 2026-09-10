@@ -338,6 +338,10 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_containment.nim
 
+      - name: rfc-0007 D2a — windows memprobe groupRssBytes + shutdown getter
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_memprobe.nim
+
   macos:
     runs-on: macos-latest
     steps:
