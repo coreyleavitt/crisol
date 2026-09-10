@@ -44,5 +44,18 @@ suite "process/types — Exit":
     check symbol(Exit(kind: ekNtStatus, status: 0xC0000005'u32)) == "STATUS_ACCESS_VIOLATION"
     check symbol(Exit(kind: ekNtStatus, status: 0xC00000FD'u32)) == "STATUS_STACK_OVERFLOW"
 
+  test "symbol names the rfc-0007 D1a NTSTATUS symbol table (rendered from the numeric status)":
+    # D1a: "reap with exit codes + ekNtStatus symbol table" — the numeric
+    # status stays authoritative (resultjson's wire), the symbol is a
+    # render-time label over the SAME table, same rule as POSIX signal
+    # names above. An unreachable-via-decodeExitCode's own >=0xC0000000
+    # partition (DBG_CONTROL_C, 0x40010005) still gets a symbol here: the
+    # table is a pure lookup over whatever ekNtStatus.status carries, not
+    # a claim about which codes decodeExitCode can produce.
+    check symbol(Exit(kind: ekNtStatus, status: 0xC000001D'u32)) == "STATUS_ILLEGAL_INSTRUCTION"
+    check symbol(Exit(kind: ekNtStatus, status: 0xC0000094'u32)) == "STATUS_INTEGER_DIVIDE_BY_ZERO"
+    check symbol(Exit(kind: ekNtStatus, status: 0xC0000409'u32)) == "STATUS_STACK_BUFFER_OVERRUN"
+    check symbol(Exit(kind: ekNtStatus, status: 0x40010005'u32)) == "DBG_CONTROL_C"
+
   test "symbol falls back to a hex label for an unnamed NTSTATUS":
     check symbol(Exit(kind: ekNtStatus, status: 0xC0000999'u32)) == "STATUS_0xC0000999"

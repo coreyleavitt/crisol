@@ -59,6 +59,17 @@ const signalNames = {
 const ntStatusNames = {
   0xC0000005'u32: "STATUS_ACCESS_VIOLATION",
   0xC00000FD'u32: "STATUS_STACK_OVERFLOW",
+  0xC000001D'u32: "STATUS_ILLEGAL_INSTRUCTION",
+  0xC0000094'u32: "STATUS_INTEGER_DIVIDE_BY_ZERO",
+  0xC0000409'u32: "STATUS_STACK_BUFFER_OVERRUN",
+  0x40010005'u32: "DBG_CONTROL_C",
+  # rfc-0007 D1a symbol table (§2 "reap with exit codes + ekNtStatus symbol
+  # table"). DBG_CONTROL_C (0x40010005) is an INFORMATIONAL-severity status
+  # (top bits 01, not the 11-severity ekNtStatus's own `>= 0xC0000000`
+  # partition targets) — it cannot arise via decodeExitCode's partition
+  # today, but the table is a pure lookup over whatever `Exit.status`
+  # carries, not a claim about which codes reach it that way; unknown
+  # codes still render numeric-only (below).
 }.toTable
 
 
