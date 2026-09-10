@@ -311,15 +311,19 @@ jobs:
       # sink delivery. "Conformance SMOKE green" per the D1a bullet — full
       # windows-suite parity remains RFC-0009's acceptance, not this leg's.
       - name: D1a — ekNtStatus producer proof (access violation)
+        if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_ntstatus.nim
 
       - name: D1a — snapshotTree forensics
+        if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_forensics.nim
 
       - name: D1a — completion-port next (IOCP)
+        if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_iocp.nim
 
       - name: D1a — inherited handles to sinks
+        if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_sinks.nim
 
   macos:
