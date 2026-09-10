@@ -326,6 +326,10 @@ jobs:
         if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_sinks.nim
 
+      - name: rfc-0007 D1b — windows cooperative stop / cooperativeUnavailable
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_coopstop.nim
+
   macos:
     runs-on: macos-latest
     steps:

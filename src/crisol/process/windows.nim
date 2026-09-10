@@ -28,9 +28,13 @@
 ##     only tier) is retired as dead weight now that the sweep subsumes its
 ##     job.
 ##   - requestStop: real GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) — gated
-##     on a REAL probed console-topology check, never assumed deliverable.
-##     Takes a real `killSnapshot` (D1a: snapshotJob) at this, the first
-##     stop act.
+##     on a REAL PER-CHILD probed deliverability check (D1b-i:
+##     `sv.consoleAttached AND GetConsoleProcessList` contains the child's
+##     pid), never assumed and never just the supervisor-global
+##     console-attached bit alone (that was the D1a-era stub — wrong the
+##     instant a child detaches its own console while the supervisor's
+##     stays attached; see `consoleHasPid`). Takes a real `killSnapshot`
+##     (D1a: snapshotJob) at this, the first stop act.
 ##   - forceKill: real TerminateJobObject — the guaranteed kill path,
 ##     independent of console topology; this is what the smoke test proves.
 ##     Refreshes `killSnapshot` (D1a), taken BEFORE the kill fires.
@@ -221,6 +225,8 @@ proc generateConsoleCtrlEvent(dwCtrlEvent, dwProcessGroupId: int32): WINBOOL
   {.stdcall, dynlib: "kernel32", importc: "GenerateConsoleCtrlEvent".}
 proc getConsoleCP(): int32
   {.stdcall, dynlib: "kernel32", importc: "GetConsoleCP".}
+proc getConsoleProcessList(lpdwProcessList: ptr int32; dwProcessCount: int32): int32
+  {.stdcall, dynlib: "kernel32", importc: "GetConsoleProcessList".}
 proc resetEventW(hEvent: Handle): WINBOOL
   {.stdcall, dynlib: "kernel32", importc: "ResetEvent".}
 proc getProcessMemoryInfo(hProcess: Handle; ppsmemCounters: ptr PROCESS_MEMORY_COUNTERS;
@@ -737,23 +743,59 @@ proc requireLive(sv: Supervisor; id: ChildId): int32 =
     doAssert false, "misuse: ChildId " & $id & " is unknown or already consumed"
   idx
 
+proc consoleHasPid(pid: int32): bool =
+  ## rfc-0007 D1b-i: the REAL per-child CTRL_BREAK deliverability probe.
+  ## `GenerateConsoleCtrlEvent` only reaches processes attached to the
+  ## CALLER's console (Win32-documented) — `GetConsoleProcessList` returns
+  ## exactly that pid set, so a child is deliverable iff its pid is in it.
+  ## This supersedes the D1a-era supervisor-GLOBAL stub
+  ## (`cooperativeUnavailable = not sv.consoleAttached`, ignoring the
+  ## per-child topology entirely — wrong the instant a child calls
+  ## `FreeConsole`/is launched detached while the supervisor's own console
+  ## stays attached) with the real per-child check §3 calls for.
+  ##
+  ## A 0 return is a probe failure (undocumented reason, e.g. no console at
+  ## all) — treated as "cannot prove deliverable" ⇒ false, never assumed
+  ## true (§1's weakest-honest-claim rule: fail closed, not open). If the
+  ## stack buffer is too small, the call reports the TRUE required count as
+  ## its return value rather than silently truncating, so this re-queries
+  ## into an exactly-sized `seq` instead of scanning a partial buffer.
+  var buf: array[256, int32]
+  let n = getConsoleProcessList(addr buf[0], 256'i32)
+  if n <= 0'i32:
+    return false
+  if n <= 256'i32:
+    for i in 0 ..< n.int:
+      if buf[i] == pid: return true
+    return false
+  var big = newSeq[int32](n.int)
+  let n2 = getConsoleProcessList(addr big[0], n)
+  if n2 <= 0'i32:
+    return false
+  for i in 0 ..< min(n2.int, big.len):
+    if big[i] == pid: return true
+  false
+
 proc requestStop*(sv: var Supervisor; id: ChildId; reason: KillReason) =
   ## Cooperative stop: GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) — gated on
-  ## the REAL probed console-topology deliverability (§3/§4), never
-  ## assumed. Undeliverable ⇒ `cooperativeUnavailable: true`, recorded now
-  ## so `escalated` stays meaningful at forceKill time (see this module's
-  ## header finding). Takes `killSnapshot` at this, the FIRST stop act
-  ## (§1) — real now that snapshotJob is wired (D1a): the common timeout
-  ## dies cooperatively inside grace, and the "what was this child's Job
-  ## doing" diagnostic must exist on THAT path, not only at escalation.
+  ## a REAL per-child probed deliverability (§3/§4: `sv.consoleAttached AND
+  ## consoleHasPid(entry.pid)`), never assumed and never just the
+  ## supervisor-global console-attached bit alone. Undeliverable ⇒
+  ## `cooperativeUnavailable: true`, recorded now so `escalated` stays
+  ## meaningful at forceKill time (see this module's header finding).
+  ## Takes `killSnapshot` at this, the FIRST stop act (§1) — real now that
+  ## snapshotJob is wired (D1a): the common timeout dies cooperatively
+  ## inside grace, and the "what was this child's Job doing" diagnostic
+  ## must exist on THAT path, not only at escalation.
   let idx = requireLive(sv, id)
   var entry = sv.children[idx]
   if entry.state == wcsExited: return   # atomic no-op — exit already observed
   if entry.stop.isSome: return          # first act wins
   entry.killSnapshot = snapshotJob(entry.hJob)
-  entry.cooperativeUnavailable = not sv.consoleAttached
+  let deliverable = sv.consoleAttached and consoleHasPid(entry.pid)
+  entry.cooperativeUnavailable = not deliverable
   entry.stop = some((reason: reason, escalated: false))
-  if sv.consoleAttached:
+  if deliverable:
     discard generateConsoleCtrlEvent(CTRL_BREAK_EVENT, entry.pid)
   sv.children[idx] = entry
 
@@ -763,9 +805,12 @@ proc forceKill*(sv: var Supervisor; id: ChildId) =
   ## `stop.isSome AND NOT cooperativeUnavailable` (this module's header
   ## finding): §1 says escalated is false when the cooperative step was
   ## never attempted — "nothing to escalate FROM" — and on Windows that is
-  ## reachable (unlike POSIX, where SIGTERM is always deliverable).
-  ## Refreshes `killSnapshot` (§1) — taken BEFORE TerminateJobObject fires:
-  ## a snapshot taken after would only see an already-dying Job.
+  ## reachable (unlike POSIX, where SIGTERM is always deliverable). When no
+  ## prior `requestStop` recorded a deliverability verdict, this computes
+  ## the SAME real per-child probe (`consoleHasPid`), not the D1a-era
+  ## supervisor-global bit. Refreshes `killSnapshot` (§1) — taken BEFORE
+  ## TerminateJobObject fires: a snapshot taken after would only see an
+  ## already-dying Job.
   let idx = requireLive(sv, id)
   var entry = sv.children[idx]
   if entry.state == wcsExited: return   # atomic no-op
@@ -775,7 +820,7 @@ proc forceKill*(sv: var Supervisor; id: ChildId) =
     let priorReason = entry.stop.get.reason
     entry.stop = some((reason: priorReason, escalated: not entry.cooperativeUnavailable))
   else:
-    entry.cooperativeUnavailable = not sv.consoleAttached
+    entry.cooperativeUnavailable = not (sv.consoleAttached and consoleHasPid(entry.pid))
     entry.stop = some((reason: krTimeout, escalated: not entry.cooperativeUnavailable))
   sv.children[idx] = entry
 
