@@ -171,8 +171,19 @@ suite "jsonout - toJson schema":
     require node.hasKey("substrate")
     let sub = node["substrate"]
     check sub.kind == JObject
-    for key in ["pidfd", "subreaper", "cgroupDelegation", "cgroupKill",
-               "memoryPeak", "flock", "wait4Rusage"]:
+    # rfc-0007 C1a: `capabilitiesToJson` (process/resultjson.nim) renders a
+    # DIFFERENT key set per backend by design (§4 — only the mechanisms
+    # that actually exist on that platform are meaningful to report) — the
+    # Linux/posix-generic shape below is not universal; mirror the exact
+    # same `when` this test exercises the real proc under.
+    when defined(windows):
+      let expectedKeys = ["jobObjectNesting", "ctrlBreakDeliverable"]
+    elif defined(macosx):
+      let expectedKeys = ["kqueue", "flock", "wait4Rusage"]
+    else:
+      let expectedKeys = ["pidfd", "subreaper", "cgroupDelegation", "cgroupKill",
+                          "memoryPeak", "flock", "wait4Rusage"]
+    for key in expectedKeys:
       require sub.hasKey(key)
       check sub[key].getBool == false
 
