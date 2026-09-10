@@ -1,30 +1,54 @@
-## process/windows.nim — rfc-0007 §1/§3 A2d: the Windows Supervisor backend
-## spike. Purpose (A2d bullet): freeze the §1 contract's SIGNATURES against
-## real Win32 — not "conformance-green" (that's RFC-0009 territory, Stage D),
-## but genuinely functional on the smoke path (spawn a child, observe its
-## exit code losslessly, kill a hanging child through the real kill domain)
-## with every other surface honestly degraded rather than faked.
+## process/windows.nim — rfc-0007 §1/§3: the Windows Supervisor backend.
+## Born as the A2d spike (§1 contract SIGNATURES frozen against real Win32,
+## smoke-path only); D1a made the core real: completion-port `next`,
+## `snapshotTree` forensics, and the `ekNtStatus` producer proof — "conformance
+## SMOKE green" per the RFC's D1a bullet, not RFC-0009's full-suite parity.
 ##
 ## What is REAL here:
 ##   - spawn: CreateProcessW (suspended) + a real Job Object with
 ##     KILL_ON_JOB_CLOSE, assigned before the child's main thread ever runs,
 ##     then ResumeThread — a genuine kill-domain guarantee (§3's "Job Object,
 ##     KILL_ON_JOB_CLOSE, breakaway disabled" row), not a bookkeeping fiction.
-##   - next: WaitForMultipleObjects over live child handles (+ the shutdown
-##     event when installed) — §1's small-N fallback tier, explicitly
-##     sanctioned by the contract text ("WaitForMultipleObjects only as a
-##     small-N fallback — its 64-handle cap is a real bound"); a full
-##     completion-port `next` is D1a territory, not this spike's.
+##     Inherited handles to sinks (STARTF_USESTDHANDLES + bInheritHandle) —
+##     real since the A2d spike, proven end-to-end by D1a's sink test.
+##   - next (D1a): PRIMARY tier is GetQueuedCompletionStatus on a completion
+##     port shared across every spawn (created once in initSupervisor;
+##     initSupervisor raises if creation fails, per §1's own "completion-port
+##     creation" among its documented fatal cases — mirrors posixcore's fatal
+##     epoll_create1). Each Job is associated with it at spawn
+##     (SetInformationJobObject, JobObjectAssociateCompletionPortInformation)
+##     — non-fatal on a per-child basis if that association fails. Detection
+##     itself is a uniform sweep (GetExitCodeProcess over every still-spawned
+##     child, every iteration) decoupled from whichever primitive woke the
+##     loop — a completion message is NEVER a second reap path, same
+##     discipline as the epoll/kqueue arms (posixcore's pollSweepChildren is
+##     the direct peer); this is also why an association failure degrades
+##     honestly to the same <=25ms poll-tick bound instead of needing a
+##     second parallel wait call. WaitForMultipleObjects (the A2d spike's
+##     only tier) is retired as dead weight now that the sweep subsumes its
+##     job.
 ##   - requestStop: real GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) — gated
 ##     on a REAL probed console-topology check, never assumed deliverable.
+##     Takes a real `killSnapshot` (D1a: snapshotJob) at this, the first
+##     stop act.
 ##   - forceKill: real TerminateJobObject — the guaranteed kill path,
 ##     independent of console topology; this is what the smoke test proves.
+##     Refreshes `killSnapshot` (D1a), taken BEFORE the kill fires.
 ##   - reap: real GetExitCodeProcess (the §2 Windows exit-code/ekNtStatus
-##     partition) and real Job accounting rusage (QueryInformationJobObject:
+##     partition — D1a's access-violation fixture is its producer proof) and
+##     real Job accounting rusage (QueryInformationJobObject:
 ##     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION for CPU time,
 ##     JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakJobMemoryUsed for
-##     maxRssBytes — a genuine peak-RSS analog to POSIX's ru_maxrss, no
-##     psapi dependency needed for this one).
+##     maxRssBytes). `tree` is `treeObservationFor(kdsJobObject)` == toComplete
+##     (D1a) — a Job Object sees every process in it by construction, so this
+##     is no longer the honest-but-conservative `toUnobservable` the A2d
+##     spike hardcoded before snapshotTree existed to back the stronger claim.
+##   - snapshotTree (D1a): real, via JobObjectBasicProcessIdList (the pid
+##     list) + psapi GetProcessMemoryInfo (per-pid rssBytes, the RSS analog
+##     every other tier's forensics report) + QueryFullProcessImageNameW
+##     (command/image name). `ppid` is not resolved this tier (D1b/D2 —
+##     needs Toolhelp32Snapshot) — `-1`, an honest "not determined", never a
+##     fabricated `0` (a real, reserved pid on Windows).
 ##   - capabilities: jobObjectNesting is a REAL functional probe (spawns a
 ##     throwaway suspended process, never this process itself, and attempts
 ##     a double Job assignment); ctrlBreakDeliverable is a REAL console
@@ -35,26 +59,23 @@
 ##   - Limits: Win32 has NO pre-exec child window (no fork/exec split to
 ##     hook a status pipe into — CreateProcessW hands control straight to
 ##     the image). Every REQUESTED limit reports `lsUnsupported`
-##     unconditionally this spike, regardless of kind — Job Objects CAN
-##     express a `lkCpu`/`lkAddressSpace` analog (PerProcessUserTimeLimit /
-##     ProcessMemoryLimit) but this spike does not wire them (D1b's job, per
-##     §5 "Windows maps Limits to Job basic/extended limits"); `lkFileSize`/
-##     `lkOpenFiles`/`lkCore` have NO Windows analog at all, ever
-##     (§5: "openFiles has no analog and is reported lsUnsupported").
-##   - snapshotTree: returns `@[]` unconditionally — toUnobservable-grade
-##     emptiness. A real implementation needs
-##     `JobObjectBasicProcessIdList` + a per-pid rssBytes source; D1a's job.
-##   - groupRssBytes: returns `none()`. Job accounting's only cheap
-##     "memory" figure is PeakJobMemoryUsed — a MONOTONIC peak-since-job-
-##     start, not the CURRENT live sum this proc's contract promises (§1:
-##     "the group-RSS sum and nothing else", sampled every 25 ms for
-##     admission). Reporting a stale peak as "current" would systematically
-##     over-report and under-admit — a lie in the conservative direction,
-##     still a lie. A true current-sum needs psapi
-##     (`GetProcessMemoryInfo`) walked over `JobObjectBasicProcessIdList`'s
-##     pid list; D2's job (memprobe wiring).
-##   - Evidence.tree / escapees: `toUnobservable` / `@[]` always — the same
-##     "no snapshot mechanism wired yet" honesty as above.
+##     unconditionally — Job Objects CAN express a `lkCpu`/`lkAddressSpace`
+##     analog (PerProcessUserTimeLimit / ProcessMemoryLimit) but this module
+##     does not wire them yet (D1b's job, per §5 "Windows maps Limits to Job
+##     basic/extended limits"); `lkFileSize`/`lkOpenFiles`/`lkCore` have NO
+##     Windows analog at all, ever (§5: "openFiles has no analog and is
+##     reported lsUnsupported").
+##   - groupRssBytes: returns `none()`. Job accounting's only cheap "memory"
+##     figure is PeakJobMemoryUsed — a MONOTONIC peak-since-job-start, not
+##     the CURRENT live sum this proc's contract promises (§1: "the
+##     group-RSS sum and nothing else", sampled every 25 ms for admission).
+##     Reporting a stale peak as "current" would systematically over-report
+##     and under-admit — a lie in the conservative direction, still a lie.
+##     A true current-sum needs psapi walked over the SAME
+##     JobObjectBasicProcessIdList pid list snapshotTree now uses; D2's job
+##     (memprobe wiring).
+##   - Evidence.escapees: `@[]` always — breakaway/DETACHED_PROCESS discovery
+##     is D1b's job (the escapee fixtures land there); `tree` is real (above).
 ##
 ## FINDING (recorded per the A2d bullet's instruction — no signature change
 ## needed, but worth stating): §1's forceKill doc says escalated is false
@@ -122,7 +143,53 @@ type
     totalTerminatedProcesses: int32
 
 const
+  maxJobPids = 256
+    ## rfc-0007 D1a: bounds JOBOBJECT_BASIC_PROCESS_ID_LIST's pid buffer
+    ## below — must precede that type (used as its array length).
+
+type
+  JOBOBJECT_BASIC_PROCESS_ID_LIST = object
+    ## rfc-0007 D1a: QueryInformationJobObject class 3 — the pid list
+    ## `snapshotTree` forensics need. `processIdList` is a fixed-capacity
+    ## stand-in for the real ABI's flexible array member (`ULONG_PTR[1]`,
+    ## C's "however many fit past here"); `maxJobPids` bounds it the same
+    ## documented way `next`'s WaitForMultipleObjects bounds at
+    ## MAXIMUM_WAIT_OBJECTS (§1's small-N-fallback pattern) — the OS reports
+    ## the true count in `numberOfProcessIdsInList`/`numberOfAssignedProcesses`
+    ## regardless of whether it fit.
+    numberOfAssignedProcesses: int32    # DWORD
+    numberOfProcessIdsInList: int32     # DWORD
+    processIdList: array[maxJobPids, uint]  # ULONG_PTR[]
+
+  JOBOBJECT_ASSOCIATE_COMPLETION_PORT = object
+    ## rfc-0007 D1a: SetInformationJobObject class 7. `completionKey` is
+    ## echoed back verbatim in `GetQueuedCompletionStatus`'s
+    ## `lpCompletionKey` — this backend uses the Job handle's own value so a
+    ## message can be traced to which spawn's Job posted it (never decoded
+    ## in `nextEvent`: the message is a wakeup only, see that proc's header).
+    completionKey: pointer              # PVOID
+    completionPort: Handle              # HANDLE
+
+  PROCESS_MEMORY_COUNTERS = object
+    ## rfc-0007 D1a: psapi's GetProcessMemoryInfo — `workingSetSize` is the
+    ## RSS analog `snapshotTree` forensics need (real, per-pid, over the
+    ## Job's pid list — NOT `groupRssBytes`'s live-sum sampler, which stays
+    ## D2's job; see this module's header).
+    cb: int32                           # DWORD
+    pageFaultCount: int32
+    peakWorkingSetSize: uint            # SIZE_T
+    workingSetSize: uint
+    quotaPeakPagedPoolUsage: uint
+    quotaPagedPoolUsage: uint
+    quotaPeakNonPagedPoolUsage: uint
+    quotaNonPagedPoolUsage: uint
+    pagefileUsage: uint
+    peakPagefileUsage: uint
+
+const
   jicBasicAccounting = 1'i32
+  jicBasicProcessIdList = 3'i32
+  jicAssociateCompletionPort = 7'i32
   jicExtendedLimit    = 9'i32
   JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE  = 0x00002000'i32
   CREATE_SUSPENDED                    = 0x00000004'i32
@@ -156,6 +223,12 @@ proc getConsoleCP(): int32
   {.stdcall, dynlib: "kernel32", importc: "GetConsoleCP".}
 proc resetEventW(hEvent: Handle): WINBOOL
   {.stdcall, dynlib: "kernel32", importc: "ResetEvent".}
+proc getProcessMemoryInfo(hProcess: Handle; ppsmemCounters: ptr PROCESS_MEMORY_COUNTERS;
+                           cb: int32): WINBOOL
+  {.stdcall, dynlib: "psapi", importc: "GetProcessMemoryInfo".}
+proc queryFullProcessImageNameW(hProcess: Handle; dwFlags: int32;
+                                 lpExeName: WideCString; lpdwSize: var int32): WINBOOL
+  {.stdcall, dynlib: "kernel32", importc: "QueryFullProcessImageNameW".}
 
 type ConsoleCtrlHandlerProc = proc (dwCtrlType: int32): WINBOOL {.stdcall.}
 proc setConsoleCtrlHandler(handlerRoutine: ConsoleCtrlHandlerProc;
@@ -209,6 +282,9 @@ type
     rusage: Option[Rusage]
     stop: Option[tuple[reason: KillReason, escalated: bool]]
     cooperativeUnavailable: bool
+    killSnapshot: seq[ProcSnapshot]  ## rfc-0007 D1a: taken at the first stop
+                                     ## act, refreshed at forceKill (§1) —
+                                     ## real now that snapshotTree is wired.
 
   Supervisor* = object       ## deep module: owns the wait set, the shutdown
     nextIdVal: int32          ## wakeup, and the child registry (§1). Fields
@@ -216,6 +292,9 @@ type
     liveCount: int
     installedSignals: bool
     shutdownEvent: Handle
+    completionPort: Handle     ## rfc-0007 D1a: the shared IOCP `next` blocks
+                               ## on (primary tier) — every spawned child's
+                               ## Job is associated with it (spawnChild).
     consoleAttached: bool      ## real probe (GetConsoleCP), cached (§4)
     capsCache: Capabilities    ## computed once in initSupervisor (§4)
 
@@ -234,6 +313,8 @@ proc `=destroy`*(sv: var Supervisor) =
     gShutdownEventHandle = 0
   if sv.shutdownEvent != 0:
     discard closeHandle(sv.shutdownEvent)
+  if sv.completionPort != 0:
+    discard closeHandle(sv.completionPort)
   sv.children = initTable[int32, ChildEntry]()
 
 # ---------------------------------------------------------------------------
@@ -294,15 +375,27 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
   ## made fatal on failure (mirrors posixcore's un-checked `sigaction`
   ## calls): a missing ctrl handler degrades `weShutdown` to never firing,
   ## a narrower failure than losing the wait primitive entirely.
+  ##
+  ## rfc-0007 D1a: also creates the ONE completion port `next` blocks on
+  ## (§1 explicitly lists "completion-port creation" among initSupervisor's
+  ## documented failure modes, alongside epoll/self-pipe) — a genuine
+  ## structural failure here (not a per-child degrade), mirroring
+  ## posixcore's fatal `epoll_create1`. Per-child association (spawnChild)
+  ## degrades non-fatally instead — see `nextEvent`'s sweep.
   var ev: Handle = 0
   if installSignals:
     ev = createEvent(nil, 1'i32, 0'i32, nil)
     if ev == 0:
       raise newException(OSError, "initSupervisor: CreateEventW failed for shutdown wakeup")
+  let iocp = createIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0)
+  if iocp == 0:
+    if ev != 0: discard closeHandle(ev)
+    raise newException(OSError, "initSupervisor: CreateIoCompletionPort failed")
   let consoleAttached = getConsoleCP() != 0'i32
   result = Supervisor(nextIdVal: 0'i32, children: initTable[int32, ChildEntry](),
                        liveCount: 0, installedSignals: installSignals,
-                       shutdownEvent: ev, consoleAttached: consoleAttached)
+                       shutdownEvent: ev, completionPort: iocp,
+                       consoleAttached: consoleAttached)
   if installSignals:
     gShutdownEventHandle = ev
     discard setConsoleCtrlHandler(ctrlHandlerProc, 1'i32)
@@ -442,6 +535,18 @@ proc spawnChild(sv: var Supervisor; spec: ChildSpec): SpawnResult =
     return SpawnResult(ok: false,
       error: "AssignProcessToJobObject failed: GetLastError=" & $getLastError())
 
+  # rfc-0007 D1a: associate this Job with the shared completion port so
+  # `nextEvent`'s primary tier wakes on this child's exit. NON-FATAL on
+  # failure (unlike KILL_ON_JOB_CLOSE above) — same discipline as
+  # posixcore's per-child pidfd_open/epoll_ctl registration: the kill
+  # domain (Job Object) does not depend on it, and `nextEvent`'s sweep
+  # still finds this child within one poll tick (<=25ms) either way.
+  if sv.completionPort != 0:
+    var assoc = JOBOBJECT_ASSOCIATE_COMPLETION_PORT(
+      completionKey: cast[pointer](hJob), completionPort: sv.completionPort)
+    discard setInformationJobObject(hJob, jicAssociateCompletionPort,
+                                     addr assoc, int32(sizeof(assoc)))
+
   discard resumeThread(pi.hThread)
   discard closeHandle(pi.hThread)
 
@@ -457,10 +562,12 @@ proc spawn*(sv: var Supervisor; spec: ChildSpec): SpawnResult =
   spawnChild(sv, spec)
 
 # ---------------------------------------------------------------------------
-# next — WaitForMultipleObjects over live child handles (+ the shutdown
-# event). §1's documented small-N fallback tier; MAXIMUM_WAIT_OBJECTS (64,
-# minus one slot for the shutdown event when installed) is the real,
-# accepted bound the contract names.
+# next — rfc-0007 D1a: a completion-port PRIMARY tier (GetQueuedCompletionStatus
+# over the shared IOCP every spawned child's Job is associated with,
+# spawnChild), with a poll-tick sweep as the always-present detector (never
+# a second wait primitive) — see sweepExitedChildren below for why this
+# mirrors posixcore's pidfd/epoll pattern rather than keeping a parallel
+# WaitForMultipleObjects call.
 # ---------------------------------------------------------------------------
 
 proc decodeExitCode(codeRaw: int32): Exit =
@@ -486,12 +593,38 @@ proc queryJobAccounting(hJob: Handle): tuple[ru: Rusage; ok: bool] =
           userCpuUs: basic.totalUserTime div 10,
           sysCpuUs: basic.totalKernelTime div 10), true)
 
+proc sweepExitedChildren(sv: var Supervisor) =
+  ## The ONE detector of "did this child exit" — decoupled from whatever
+  ## woke `next` (an IOCP completion message, the fallback poll tick, or a
+  ## plain deadline check). Mirrors posixcore's pollSweepChildren: pidfd/
+  ## epoll (and here, the Job's completion port) only decide WHEN to look;
+  ## a non-blocking readback (waitpid WNOHANG there, GetExitCodeProcess
+  ## here) is what's authoritative for WHICH child actually ended — a
+  ## completion message is NEVER a second reap path (the B1/C1b lesson,
+  ## restated for Windows in this module's header). This is also the
+  ## honest fallback for a child whose Job failed completion-port
+  ## association in spawnChild: no second wait primitive is needed, the
+  ## very next sweep (at most one poll tick, capped 25ms, later) catches
+  ## it — the same bound the old WaitForMultipleObjects-only tier gave
+  ## every child.
+  const STILL_ACTIVE = 259'i32
+  for id, entry in sv.children.mpairs:
+    if entry.state == wcsSpawned:
+      var codeRaw: int32
+      if getExitCodeProcess(entry.hProcess, codeRaw) != 0'i32 and codeRaw != STILL_ACTIVE:
+        entry.exit = decodeExitCode(codeRaw)
+        let (ru, ok) = queryJobAccounting(entry.hJob)
+        entry.rusage = if ok: some(ru) else: none(Rusage)
+        entry.state = wcsExited
+
 proc nextEvent(sv: var Supervisor; deadline: MonoTime): WaitEvent =
   while true:
     if sv.installedSignals:
       if waitForSingleObject(sv.shutdownEvent, 0'i32) == WAIT_OBJECT_0:
         discard resetEventW(sv.shutdownEvent)
         return WaitEvent(kind: weShutdown, signal: ShutdownSignal(signum: int(gShutdownSignum)))
+
+    sweepExitedChildren(sv)
 
     # LEVEL-TRIGGERED (§1): any child already wcsExited is re-reported every
     # call until reaped.
@@ -505,45 +638,81 @@ proc nextEvent(sv: var Supervisor; deadline: MonoTime): WaitEvent =
     let remainMs = (deadline - now0).inMilliseconds
     let tickMs = int32(min(25'i64, max(1'i64, remainMs)))
 
-    var handles: WOHandleArray
-    var ids: seq[int32] = @[]
-    if sv.installedSignals:
-      handles[0] = sv.shutdownEvent
-      ids.add(-1'i32)          # sentinel: index 0 is the shutdown event
-    for id, entry in sv.children.pairs:
-      if entry.state == wcsSpawned:
-        if ids.len >= MAXIMUM_WAIT_OBJECTS: break   # the documented 64-handle bound
-        handles[ids.len] = entry.hProcess
-        ids.add(id)
-
-    if ids.len == 0:
-      # Nothing to wait on at all (no signals installed, no live children) —
-      # tick and re-check the deadline; never a busy spin.
+    if sv.completionPort != 0:
+      # Primary tier (D1a): block on the completion port every live
+      # child's Job is associated with (spawnChild). JOB_OBJECT_MSG_
+      # EXIT_PROCESS / JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS wake this
+      # promptly on exit — but per the epoll/kqueue precedent (B2/C1b),
+      # the message is NEVER decoded or trusted as a second reap path:
+      # success or timeout, either way control falls through to the
+      # sweep above on the next iteration, which is what actually
+      # decides what happened. This also transparently covers a child
+      # whose Job failed association (spawnChild's non-fatal degrade) —
+      # the GQCS call still returns (on its timeout if nothing else),
+      # bounding that child's detection at this same poll tick.
+      var bytes: DWORD
+      var key: ULONG_PTR
+      var ov: POVERLAPPED
+      discard getQueuedCompletionStatus(sv.completionPort, addr bytes, addr key,
+                                         addr ov, DWORD(tickMs))
+    else:
+      # Structurally unreachable (initSupervisor raises if completion-port
+      # creation fails, mirroring posixcore's fatal epoll_create1) — kept
+      # as an honest, non-busy poll tick rather than assumed dead code,
+      # same defensive discipline as posixcore's own fallback arms.
       winlean.sleep(tickMs)
-      continue
-
-    let waitResult = waitForMultipleObjects(DWORD(ids.len), addr handles,
-                                             0'i32, DWORD(tickMs))
-    if waitResult >= WAIT_OBJECT_0 and int(waitResult - WAIT_OBJECT_0) < ids.len:
-      let cid = ids[int(waitResult - WAIT_OBJECT_0)]
-      if cid == -1'i32:
-        discard resetEventW(sv.shutdownEvent)
-        return WaitEvent(kind: weShutdown, signal: ShutdownSignal(signum: int(gShutdownSignum)))
-      else:
-        var entry = sv.children[cid]
-        var codeRaw: int32
-        discard getExitCodeProcess(entry.hProcess, codeRaw)
-        entry.exit = decodeExitCode(codeRaw)
-        let (ru, ok) = queryJobAccounting(entry.hJob)
-        entry.rusage = if ok: some(ru) else: none(Rusage)
-        entry.state = wcsExited
-        sv.children[cid] = entry
-        # Loop back to top — the level-triggered scan reports it.
-    # WAIT_TIMEOUT / WAIT_FAILED: loop — top re-checks shutdown, exited
-    # children, and the deadline.
+    # loop back to top — the sweep decides what happened, not this wait.
 
 proc next*(sv: var Supervisor; deadline: MonoTime): WaitEvent =
   nextEvent(sv, deadline)
+
+# ---------------------------------------------------------------------------
+# snapshotJob — rfc-0007 D1a: JobObjectBasicProcessIdList (pid list) + psapi
+# GetProcessMemoryInfo (per-pid rssBytes) + QueryFullProcessImageNameW
+# (command/image name). Shared by snapshotTree (below) and requestStop/
+# forceKill's killSnapshot (§1: "taken at the FIRST stop act... refreshed
+# at forceKill").
+# ---------------------------------------------------------------------------
+
+proc queryJobPids(hJob: Handle): seq[int32] =
+  var buf: JOBOBJECT_BASIC_PROCESS_ID_LIST
+  var retLen: int32
+  if queryInformationJobObject(hJob, jicBasicProcessIdList, addr buf,
+                                int32(sizeof(buf)), addr retLen) == 0'i32:
+    return @[]
+  let n = min(int(buf.numberOfProcessIdsInList), maxJobPids)
+  result = newSeq[int32](n)
+  for i in 0 ..< n:
+    result[i] = int32(buf.processIdList[i])
+
+proc snapshotOnePid(pid: int32): Option[ProcSnapshot] =
+  ## `ppid` is NOT resolved this tier — a real answer needs
+  ## Toolhelp32Snapshot, beyond D1a's forensics ask (pid + command +
+  ## rssBytes). `-1`, the same "could not determine" sentinel posixcore's
+  ## own /proc-parse-failure path uses — never a fabricated `0` (pid 0 is
+  ## a real, reserved pid on Windows, the System Idle Process, so it is
+  ## not a safe stand-in for "unknown").
+  let hProc = openProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0'i32, pid)
+  if hProc == 0:
+    return none(ProcSnapshot)  # exited between the pid-list read and here — honest skip, never fabricated
+  defer: discard closeHandle(hProc)
+  var command = ""
+  var nameBuf = newWideCString(260)
+  var sizeInOut = 260'i32
+  if queryFullProcessImageNameW(hProc, 0'i32, toWideCString(nameBuf), sizeInOut) != 0'i32:
+    command = $(toWideCString(nameBuf), int(sizeInOut))
+  var rss: int64 = 0
+  var mem: PROCESS_MEMORY_COUNTERS
+  mem.cb = int32(sizeof(mem))
+  if getProcessMemoryInfo(hProc, addr mem, mem.cb) != 0'i32:
+    rss = int64(mem.workingSetSize)
+  some(ProcSnapshot(pid: int(pid), ppid: -1, command: command, rssBytes: rss))
+
+proc snapshotJob(hJob: Handle): seq[ProcSnapshot] =
+  result = @[]
+  for pid in queryJobPids(hJob):
+    let snap = snapshotOnePid(pid)
+    if snap.isSome: result.add snap.get
 
 # ---------------------------------------------------------------------------
 # requestStop / forceKill — non-blocking, idempotent, atomic-against-exit-
@@ -561,11 +730,15 @@ proc requestStop*(sv: var Supervisor; id: ChildId; reason: KillReason) =
   ## the REAL probed console-topology deliverability (§3/§4), never
   ## assumed. Undeliverable ⇒ `cooperativeUnavailable: true`, recorded now
   ## so `escalated` stays meaningful at forceKill time (see this module's
-  ## header finding).
+  ## header finding). Takes `killSnapshot` at this, the FIRST stop act
+  ## (§1) — real now that snapshotJob is wired (D1a): the common timeout
+  ## dies cooperatively inside grace, and the "what was this child's Job
+  ## doing" diagnostic must exist on THAT path, not only at escalation.
   let idx = requireLive(sv, id)
   var entry = sv.children[idx]
   if entry.state == wcsExited: return   # atomic no-op — exit already observed
   if entry.stop.isSome: return          # first act wins
+  entry.killSnapshot = snapshotJob(entry.hJob)
   entry.cooperativeUnavailable = not sv.consoleAttached
   entry.stop = some((reason: reason, escalated: false))
   if sv.consoleAttached:
@@ -579,9 +752,12 @@ proc forceKill*(sv: var Supervisor; id: ChildId) =
   ## finding): §1 says escalated is false when the cooperative step was
   ## never attempted — "nothing to escalate FROM" — and on Windows that is
   ## reachable (unlike POSIX, where SIGTERM is always deliverable).
+  ## Refreshes `killSnapshot` (§1) — taken BEFORE TerminateJobObject fires:
+  ## a snapshot taken after would only see an already-dying Job.
   let idx = requireLive(sv, id)
   var entry = sv.children[idx]
   if entry.state == wcsExited: return   # atomic no-op
+  entry.killSnapshot = snapshotJob(entry.hJob)
   discard terminateJobObjectW(entry.hJob, jobForceKillExitCode)
   if entry.stop.isSome:
     let priorReason = entry.stop.get.reason
@@ -608,9 +784,12 @@ proc reap*(sv: var Supervisor; id: ChildId): ReapReport =
     stop: entry.stop,
     killDomain: kdsJobObject,               # real: Job Object + KILL_ON_JOB_CLOSE
     limits: entry.achieved,
-    killSnapshot: @[],                      # honest: toUnobservable-grade emptiness
-    tree: toUnobservable,
-    escapees: @[],
+    killSnapshot: entry.killSnapshot,       # real since D1a (snapshotJob); empty iff no stop act
+    tree: treeObservationFor(kdsJobObject), # rfc-0007 D1a: a Job Object sees every
+                                             # process in it by construction — toComplete,
+                                             # not the toUnobservable the A2d spike hard-
+                                             # coded before snapshotTree was real.
+    escapees: @[],                          # breakaway/DETACHED_PROCESS discovery is D1b's job
     cooperativeUnavailable: entry.cooperativeUnavailable,
   )
   discard closeHandle(entry.hProcess)
@@ -619,14 +798,19 @@ proc reap*(sv: var Supervisor; id: ChildId): ReapReport =
   dec sv.liveCount
 
 # ---------------------------------------------------------------------------
-# snapshotTree / groupRssBytes — honestly degraded this spike (see module
-# header). Real implementations need JobObjectBasicProcessIdList (+ psapi
-# for groupRssBytes's current-sum semantics) — D1a/D2 territory.
+# snapshotTree — real since rfc-0007 D1a: JobObjectBasicProcessIdList (pid
+# list) + psapi GetProcessMemoryInfo (per-pid rssBytes) + kernel32
+# QueryFullProcessImageNameW (command/image name) — see snapshotJob above.
+# groupRssBytes stays honestly degraded (see module header): its live-sum
+# sampler semantics need psapi walked on a 25ms cadence, D2's job
+# (memprobe wiring) — reporting Job accounting's PeakJobMemoryUsed here
+# instead would systematically over-report a monotonic peak as a current
+# sum, a lie in the conservative direction, still a lie.
 # ---------------------------------------------------------------------------
 
 proc snapshotTree*(sv: Supervisor; id: ChildId): seq[ProcSnapshot] =
-  discard requireLive(sv, id)
-  @[]
+  let idx = requireLive(sv, id)
+  snapshotJob(sv.children[idx].hJob)
 
 proc groupRssBytes*(sv: Supervisor; id: ChildId): Option[int64] =
   discard requireLive(sv, id)
