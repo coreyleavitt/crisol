@@ -358,6 +358,14 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_ioutils.nim
 
+      - name: rfc-0007 D2a — crisol CLI compiles on windows
+        if: always()
+        run: nim c --hints:off --warnings:off --path:src -o:crisol_win_smoke src/crisol.nim
+
+      - name: rfc-0007 D2a-6 — windows CLI liveness (crisol run --json)
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_cli_smoke.nim
+
   macos:
     runs-on: macos-latest
     steps:
