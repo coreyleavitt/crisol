@@ -2,7 +2,10 @@
 ##
 ## Effectful I/O, Linux-oriented.  All file reads go through an injectable
 ## `read` proc seam so unit tests can supply synthetic file contents without
-## touching the real filesystem.
+## touching the real filesystem.  On Windows, `availableMemBytes` bypasses
+## this seam entirely — there is no /proc or cgroup there — and instead
+## queries `GlobalMemoryStatusEx` directly for the live available-physical-
+## memory figure (see the `when defined(windows)` branch below).
 ##
 ## Seam contract
 ## -------------
@@ -45,6 +48,29 @@
 ##   /sys/fs/cgroup/memory/memory.usage_in_bytes
 
 import std/[options, os, strutils]
+
+# ---------------------------------------------------------------------------
+# Windows FFI — GlobalMemoryStatusEx
+# ---------------------------------------------------------------------------
+#
+# rfc-0007 D2a-3: Windows has no /proc or cgroup — the injectable `read` seam
+# above is a Linux construct. MEMORYSTATUSEX's layout MUST match the Win32
+# struct exactly (two DWORDs, then seven DWORDLONGs, in this order) or
+# ullAvailPhys reads garbage; dwLength must be set to sizeof(MEMORYSTATUSEX)
+# before the call or GlobalMemoryStatusEx fails.
+when defined(windows):
+  type MEMORYSTATUSEX = object
+    dwLength: uint32
+    dwMemoryLoad: uint32
+    ullTotalPhys: uint64
+    ullAvailPhys: uint64
+    ullTotalPageFile: uint64
+    ullAvailPageFile: uint64
+    ullTotalVirtual: uint64
+    ullAvailVirtual: uint64
+    ullAvailExtendedVirtual: uint64
+  proc globalMemoryStatusEx(buffer: ptr MEMORYSTATUSEX): int32
+    {.stdcall, dynlib: "kernel32", importc: "GlobalMemoryStatusEx".}
 
 # ---------------------------------------------------------------------------
 # realReadFile — default seam (wraps std readFile)
@@ -162,34 +188,45 @@ proc availableMemBytes*(read: proc(path: string): string = realReadFile): Option
   ## Result is min(MemAvailable, cgroupBudget) across the readable sources.
   ## Returns none only when neither /proc/meminfo nor any cgroup path is readable.
   ## Never raises.
-
-  var memAvailBytes: Option[int64] = none(int64)
-  var cgroupBytes:   Option[int64] = none(int64)
-
-  # --- (a) /proc/meminfo ---
-  try:
-    let content = read(MemInfoPath)
-    let kbOpt = parseMemAvailKb(content)
-    if kbOpt.isSome:
-      memAvailBytes = some(kbOpt.get * 1024'i64)
-  except CatchableError:
-    discard
-
-  # --- (b) cgroup budget ---
-  try:
-    cgroupBytes = cgroupBudget(read)
-  except CatchableError:
-    discard
-
-  # Return the minimum of the two sources.
-  if memAvailBytes.isNone and cgroupBytes.isNone:
+  when defined(windows):
+    ## Windows has no /proc or cgroup — the injectable `read` seam is a
+    ## Linux construct; go straight to GlobalMemoryStatusEx.ullAvailPhys
+    ## (the live available-physical-RAM figure admission needs). `read` is
+    ## unused here by construction (documented), kept only for signature
+    ## parity with the Linux/POSIX branch.
+    var msx: MEMORYSTATUSEX
+    msx.dwLength = uint32(sizeof(MEMORYSTATUSEX))
+    if globalMemoryStatusEx(addr msx) != 0'i32:
+      return some(int64(msx.ullAvailPhys))
     return none(int64)
-  elif memAvailBytes.isNone:
-    return cgroupBytes
-  elif cgroupBytes.isNone:
-    return memAvailBytes
   else:
-    return some(min(memAvailBytes.get, cgroupBytes.get))
+    var memAvailBytes: Option[int64] = none(int64)
+    var cgroupBytes:   Option[int64] = none(int64)
+
+    # --- (a) /proc/meminfo ---
+    try:
+      let content = read(MemInfoPath)
+      let kbOpt = parseMemAvailKb(content)
+      if kbOpt.isSome:
+        memAvailBytes = some(kbOpt.get * 1024'i64)
+    except CatchableError:
+      discard
+
+    # --- (b) cgroup budget ---
+    try:
+      cgroupBytes = cgroupBudget(read)
+    except CatchableError:
+      discard
+
+    # Return the minimum of the two sources.
+    if memAvailBytes.isNone and cgroupBytes.isNone:
+      return none(int64)
+    elif memAvailBytes.isNone:
+      return cgroupBytes
+    elif cgroupBytes.isNone:
+      return memAvailBytes
+    else:
+      return some(min(memAvailBytes.get, cgroupBytes.get))
 
 # ---------------------------------------------------------------------------
 # procGroupRssBytes

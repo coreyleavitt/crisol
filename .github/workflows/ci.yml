@@ -346,6 +346,10 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_lock.nim
 
+      - name: rfc-0007 D2a — windows availableMemBytes (GlobalMemoryStatusEx)
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_availmem.nim
+
   macos:
     runs-on: macos-latest
     steps:
