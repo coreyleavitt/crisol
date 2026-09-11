@@ -54,6 +54,13 @@ const AllowedPosixFiles = [
     # else: import std/posix` branch (the posix leg of the SO_RCVTIMEO/
     # SO_SNDTIMEO timeval-vs-DWORD split) — one proc's worth of direct
     # posix use, same rationale as the other allow-listed files here.
+  "crisol/paths.nim",
+    # RFC-0009 A1: `probeFoldPolicy`'s OS-query step (macOS `pathconf`
+    # _PC_CASE_SENSITIVE) and the create-and-stat fallback's `sameVolume`
+    # device-id check (`posix.stat`'s `st_dev`) are CAPABILITY QUERIES, not
+    # raw file I/O — outside `ioutils`'s remit (open/write/close/atomic
+    # publish), same rationale as `lock/posix.nim`'s direct `flock` use
+    # above.
 ]
 
 proc allNimFiles(): seq[string] =

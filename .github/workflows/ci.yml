@@ -370,6 +370,10 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_spike_import_case.nim
 
+      - name: rfc-0009 A1 — fold-probe real-volume runtime evidence
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_fold_probe.nim
+
   macos:
     runs-on: macos-latest
     steps:
