@@ -366,6 +366,10 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_cli_smoke.nim
 
+      - name: A0-spike — import-case manifest observation
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_spike_import_case.nim
+
   macos:
     runs-on: macos-latest
     steps:
