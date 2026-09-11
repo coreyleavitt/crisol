@@ -158,7 +158,20 @@ suite "RFC-0009 A0-spike — compiler import-case manifest observation":
           echo "SPIKE OBSERVATION: ", name,
                " distinct widget.nim spellings: ", $r.spellings
 
+      require s1.ok
+      require s2.ok
       require s3.ok
+      # Regression guard, pinned to the observed rule (CI runs 34567534296
+      # and 34570358383 — macos APFS + windows NTFS, both agreeing): Nim
+      # 2.2.10 canonicalizes module identity to the ON-DISK real case, so a
+      # dependency has exactly ONE spelling per committed tree regardless of
+      # importer case (S3) or import order (S1 vs S2). If a future Nim ever
+      # records the import spelling instead, these checks fail — and RFC-0009's
+      # canonicalization decision (canonicalMerge/CanonicalSet were deleted as
+      # unreachable on the strength of this) must be reopened.
+      check s1.spellings == @["widget.nim"]   # lower-first
+      check s2.spellings == @["widget.nim"]   # upper-first: order-independent
+      check s3.spellings == @["widget.nim"]   # upper-only: on-disk case wins
       # The decisive read: S3 has a lowercase file on disk and a single
       # UPPERCASE importer, so the one recorded spelling reveals Nim's rule.
       let s3spell = if s3.spellings.len == 1: s3.spellings[0] else: ""
