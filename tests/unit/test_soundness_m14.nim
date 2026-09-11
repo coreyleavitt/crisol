@@ -7,8 +7,13 @@
 ##
 ## Fix: also run `git ls-files --others --exclude-standard` to get untracked-but-not-
 ## ignored files, and union them into changedFiles.
+##
+## RFC-0009 A3b-i: changedFiles returns HashSet[TrackedPath], reduced via
+## fromCanonical against a TrackedRoots; assertions below go through
+## `display`/`fromCanonical` instead of bare strings, but the asserted
+## soundness properties are unchanged.
 
-import std/[os, osproc, sets, strutils]
+import std/[options, os, osproc, sequtils, sets, strutils]
 import crisol/types
 import crisol/gitdiff
 
@@ -26,24 +31,29 @@ proc initGitRepo(dir: string) =
 block test_m14_untracked_file_included:
   ## Create a git repo, then add an un-staged new file.
   ## changedFiles must include it.
-  let repoDir = getTempDir() / "crisol_m14_a"
+  let repoDir = expandFilename(getTempDir()) / "crisol_m14_a"
   defer: removeDir(repoDir)
   initGitRepo(repoDir)
+  let roots = initTrackedRoots(repoDir, @[], "")
 
   # Create a new file that is NOT added to git (untracked, not ignored)
   let newFile = repoDir / "src" / "new_untracked.nim"
   createDir(repoDir / "src")
   writeFile(newFile, "# new untracked")
 
-  let changed = changedFiles(repoDir)
-  assert "src/new_untracked.nim" in changed,
-    "M14: untracked new file must appear in changedFiles. Got: " & $changed
+  let changed = changedFiles(repoDir, roots)
+  let expected = fromCanonical("src/new_untracked.nim", roots)
+  assert expected.isSome, "M14: precondition: path must reduce cleanly"
+  assert expected.get in changed,
+    "M14: untracked new file must appear in changedFiles. Got: " &
+    $(changed.mapIt(it.display))
 
 block test_m14_gitignored_file_not_included:
   ## An untracked file that matches .gitignore must NOT be included.
-  let repoDir = getTempDir() / "crisol_m14_b"
+  let repoDir = expandFilename(getTempDir()) / "crisol_m14_b"
   defer: removeDir(repoDir)
   initGitRepo(repoDir)
+  let roots = initTrackedRoots(repoDir, @[], "")
 
   # Create a .gitignore that ignores *.tmp files
   writeFile(repoDir / ".gitignore", "*.tmp\n")
@@ -54,48 +64,56 @@ block test_m14_gitignored_file_not_included:
   let ignoredFile = repoDir / "temp.tmp"
   writeFile(ignoredFile, "# ignored")
 
-  let changed = changedFiles(repoDir)
-  assert "temp.tmp" notin changed,
-    "M14: gitignored untracked file must NOT appear in changedFiles. Got: " & $changed
+  let changed = changedFiles(repoDir, roots)
+  assert not changed.anyIt(it.display == "temp.tmp"),
+    "M14: gitignored untracked file must NOT appear in changedFiles. Got: " &
+    $(changed.mapIt(it.display))
 
 block test_m14_tracked_modified_file_still_included:
   ## Regression: tracked files that are modified still appear.
-  let repoDir = getTempDir() / "crisol_m14_c"
+  let repoDir = expandFilename(getTempDir()) / "crisol_m14_c"
   defer: removeDir(repoDir)
   initGitRepo(repoDir)
+  let roots = initTrackedRoots(repoDir, @[], "")
 
   # Modify the tracked README.md
   writeFile(repoDir / "README.md", "# changed")
 
-  let changed = changedFiles(repoDir)
-  assert "README.md" in changed,
-    "M14: modified tracked file must still appear in changedFiles. Got: " & $changed
+  let changed = changedFiles(repoDir, roots)
+  let expected = fromCanonical("README.md", roots)
+  assert expected.isSome, "M14: precondition: 'README.md' must reduce cleanly"
+  assert expected.get in changed,
+    "M14: modified tracked file must still appear in changedFiles. Got: " &
+    $(changed.mapIt(it.display))
 
 block test_m14_clean_repo_no_phantom_untracked:
   ## A completely clean repo with no untracked files → changedFiles is empty.
-  let repoDir = getTempDir() / "crisol_m14_d"
+  let repoDir = expandFilename(getTempDir()) / "crisol_m14_d"
   defer: removeDir(repoDir)
   initGitRepo(repoDir)
+  let roots = initTrackedRoots(repoDir, @[], "")
 
-  let changed = changedFiles(repoDir)
+  let changed = changedFiles(repoDir, roots)
   # Only README.md is committed and unchanged; no untracked files.
-  assert "README.md" notin changed,
-    "M14: clean tracked file must not appear as changed. Got: " & $changed
+  assert not changed.anyIt(it.display == "README.md"),
+    "M14: clean tracked file must not appear as changed. Got: " &
+    $(changed.mapIt(it.display))
 
 block test_p2_dash_ref_rejected_before_git_invocation:
   ## P2: a --base ref beginning with '-' must be rejected with cekEnvironment
   ## before any git invocation, to prevent git flag-injection.
   ## We use a real git repo so the path past the probe check is exercised,
   ## but the rejection must happen before changedFiles ever calls `git diff`.
-  let repoDir = getTempDir() / "crisol_p2_a"
+  let repoDir = expandFilename(getTempDir()) / "crisol_p2_a"
   defer: removeDir(repoDir)
   initGitRepo(repoDir)
+  let roots = initTrackedRoots(repoDir, @[], "")
 
   var caught = false
   var kind: CrisolErrorKind
   var msg = ""
   try:
-    discard changedFiles(repoDir, base = "--output=/tmp/evil")
+    discard changedFiles(repoDir, roots, base = "--output=/tmp/evil")
   except CrisolError as e:
     caught = true
     kind = e.kind
@@ -108,13 +126,14 @@ block test_p2_dash_ref_rejected_before_git_invocation:
 
 block test_p2_single_dash_also_rejected:
   ## A single '-' is also a git flag prefix; must be rejected.
-  let repoDir = getTempDir() / "crisol_p2_b"
+  let repoDir = expandFilename(getTempDir()) / "crisol_p2_b"
   defer: removeDir(repoDir)
   initGitRepo(repoDir)
+  let roots = initTrackedRoots(repoDir, @[], "")
 
   var caught = false
   try:
-    discard changedFiles(repoDir, base = "-p")
+    discard changedFiles(repoDir, roots, base = "-p")
   except CrisolError:
     caught = true
   assert caught, "P2: single-dash ref '-p' must raise CrisolError"
@@ -122,14 +141,15 @@ block test_p2_single_dash_also_rejected:
 block test_p2_normal_ref_still_accepted:
   ## A normal SHA-like or branch-like ref must NOT be rejected.
   ## Use "HEAD" which exists in our freshly-initialised repo.
-  let repoDir = getTempDir() / "crisol_p2_c"
+  let repoDir = expandFilename(getTempDir()) / "crisol_p2_c"
   defer: removeDir(repoDir)
   initGitRepo(repoDir)
+  let roots = initTrackedRoots(repoDir, @[], "")
 
   # Should not raise — HEAD is a valid ref, starts with 'H' not '-'.
   var raised = false
   try:
-    discard changedFiles(repoDir, base = "HEAD")
+    discard changedFiles(repoDir, roots, base = "HEAD")
   except CrisolError:
     raised = true
   assert not raised, "P2: normal ref 'HEAD' must not be rejected"

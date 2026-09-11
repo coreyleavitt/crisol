@@ -57,7 +57,7 @@ proc buildRunPlan*(
   failedKeys:   HashSet[tuple[path, group: string]] = initHashSet[tuple[path, group: string]]();
   useFailed:    bool = false;
   useChanged:   bool = false;
-  changed:      HashSet[string] = initHashSet[string]();
+  changed:      HashSet[TrackedPath] = initHashSet[TrackedPath]();
   nimVersion:   string = "";
   forceCompile: bool = false;
   warnings:     seq[ConfigWarning] = @[];
@@ -73,7 +73,10 @@ proc buildRunPlan*(
   ##   failedKeys   — (path, group) pairs from the prior run; used when useFailed.
   ##   useFailed    — when true, keep only entrypoints in failedKeys.
   ##   useChanged   — when true, keep only entrypoints whose closure ∩ changed ≠ ∅.
-  ##   changed      — set of changed file paths (relative); required when useChanged.
+  ##   changed      — set of changed files, as TrackedPath (RFC-0009 A3b-i);
+  ##                  required when useChanged. Converted to the
+  ##                  string-keyed shape narrowByDiff still expects via a
+  ##                  temporary adapter, below, at the call site.
   ##   nimVersion   — Nim compiler fingerprint for freshness checks; the api
   ##                  boundary threads the RUNTIME probe
   ##                  (nimprobe.cachedNimFingerprint()), not the compile-time
@@ -144,7 +147,14 @@ proc buildRunPlan*(
         newSeq[Entrypoint]()
     let changedNarrowed =
       if useChanged:
-        narrowByDiff(gated.run, changed, graph, cfg.projectRoot)
+        # TEMPORARY adapter (RFC-0009 A3b-i): narrowByDiff/selectByDiff still
+        # take the string-keyed HashSet[string] shape -- narrow.nim itself is
+        # not retyped until A3b-ii, which retypes narrow's own membership
+        # test to compare TrackedPath directly (the fold-soundness axis this
+        # RFC exists for) and deletes this adapter.
+        var changedDisplay = initHashSet[string]()
+        for tp in changed: changedDisplay.incl tp.display
+        narrowByDiff(gated.run, changedDisplay, graph, cfg.projectRoot)
       else:
         newSeq[Entrypoint]()
 

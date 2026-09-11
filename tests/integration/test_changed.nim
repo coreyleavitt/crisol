@@ -106,9 +106,10 @@ suite "crisol D5 — changedFiles":
     # Modify a.nim only (unstaged).
     writeF(repo, "a.nim", "echo 1\necho 99\n")
 
-    let changed = changedFiles(repo)
-    check "a.nim" in changed
-    check "b.nim" notin changed
+    let roots = initTrackedRoots(repo, @[], "")
+    let changed = changedFiles(repo, roots)
+    check changed.anyIt(it.display == "a.nim")
+    check not changed.anyIt(it.display == "b.nim")
 
   test "staged change is also captured (vs HEAD)":
     let repo = uniqueTmpDir("staged")
@@ -121,8 +122,9 @@ suite "crisol D5 — changedFiles":
     writeF(repo, "a.nim", "echo changed\n")
     discard git(repo, "add a.nim")   # stage it
 
-    let changed = changedFiles(repo)
-    check "a.nim" in changed
+    let roots = initTrackedRoots(repo, @[], "")
+    let changed = changedFiles(repo, roots)
+    check changed.anyIt(it.display == "a.nim")
 
   test "clean tree → empty changed set":
     let repo = uniqueTmpDir("clean")
@@ -132,7 +134,8 @@ suite "crisol D5 — changedFiles":
     discard git(repo, "add -A")
     discard git(repo, "commit -q -m initial")
 
-    let changed = changedFiles(repo)
+    let roots = initTrackedRoots(repo, @[], "")
+    let changed = changedFiles(repo, roots)
     check changed.len == 0
 
   test "--base ref: files changed since an earlier commit":
@@ -151,9 +154,10 @@ suite "crisol D5 — changedFiles":
     discard git(repo, "commit -q -m c2")
 
     # Diff working tree vs the FIRST commit → b.nim changed since then.
-    let changed = changedFiles(repo, firstRev)
-    check "b.nim" in changed
-    check "a.nim" notin changed
+    let roots = initTrackedRoots(repo, @[], "")
+    let changed = changedFiles(repo, roots, firstRev)
+    check changed.anyIt(it.display == "b.nim")
+    check not changed.anyIt(it.display == "a.nim")
 
   test "--base includes uncommitted edits (working tree vs ref)":
     let repo = uniqueTmpDir("basewt")
@@ -167,16 +171,18 @@ suite "crisol D5 — changedFiles":
     # Uncommitted edit — must still surface against the committed ref.
     writeF(repo, "a.nim", "echo 1\necho uncommitted\n")
 
-    let changed = changedFiles(repo, firstRev)
-    check "a.nim" in changed
+    let roots = initTrackedRoots(repo, @[], "")
+    let changed = changedFiles(repo, roots, firstRev)
+    check changed.anyIt(it.display == "a.nim")
 
   test "non-repo directory → CrisolError(cekEnvironment)":
     let dir = uniqueTmpDir("norepo")
     defer: removeDir(dir)
     # No `git init` — deliberately not a repository.
+    let roots = initTrackedRoots(dir, @[], "")
     var raised = false
     try:
-      discard changedFiles(dir)
+      discard changedFiles(dir, roots)
     except CrisolError as e:
       raised = true
       check e.kind == cekEnvironment

@@ -15,7 +15,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_shard_pipeline.nim
 
-import std/[os, sets, sequtils, unittest]
+import std/[options, os, sets, sequtils, unittest]
 import crisol/types
 import crisol/pipeline
 import crisol/shard
@@ -134,8 +134,9 @@ suite "buildRunPlan — shard wiring":
     # With an empty dep graph (absent), narrowByDiff conservatively includes ALL
     # eps (srGraphAbsent rule).  So useChanged=true with any non-empty changedSet
     # will return all 4 after narrowing.
-    var changedSet = initHashSet[string]()
-    changedSet.incl "src/crisol/types.nim"   # any file — graph absent triggers inclusion
+    # RFC-0009 A3b-i: buildRunPlan's `changed` param is now HashSet[TrackedPath].
+    var changedSet = initHashSet[TrackedPath]()
+    changedSet.incl fromCanonical("src/crisol/types.nim", cfg.trackedRoots).get   # any file — graph absent triggers inclusion
 
     let pv1 = buildRunPlan(cfg = cfg, selection = sel,
                            useChanged = true, changed = changedSet,

@@ -883,7 +883,9 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   let useChanged = opts.narrowing.kind in {nkChanged, nkFailedOrChanged}
 
   var failedKeys = initHashSet[tuple[path, group: string]]()
-  var changedSet = initHashSet[string]()
+  # RFC-0009 A3b-i: changedFiles reduces every git-emitted name through
+  # cfg.trackedRoots, so this seam now carries a HashSet[TrackedPath].
+  var changedSet = initHashSet[TrackedPath]()
 
   if useFailed:
     let lr = loadLastRun(cfg)
@@ -893,7 +895,7 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     failedKeys = lr.failed
 
   if useChanged:
-    changedSet = changedFiles(cfg.projectRoot, opts.narrowing.baseRef)
+    changedSet = changedFiles(cfg.projectRoot, cfg.trackedRoots, opts.narrowing.baseRef)
 
   # 4. Build the run plan.
   let pv = buildRunPlan(
