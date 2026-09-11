@@ -22,6 +22,7 @@ import std/[os, sets]
 import crisol/types
 import crisol/depgraph
 import crisol/narrow
+import "../support/rfc9_narrow_support"
 
 # Real project-root-relative paths that exist in the workspace.
 # isEntryStale checks fileExists on these; using real files keeps entries fresh.
@@ -47,6 +48,11 @@ proc toSet(paths: varargs[string]): HashSet[string] =
   for p in paths:
     result.incl p
 
+# roots for the TrackedPath-typed `changed` parameter (RFC-0009 A3b-ii). All
+# closure/changed paths in this file are real project-root-relative
+# spellings under the actual checkout, so the real cwd is the right root.
+let roots = mkRoots(getCurrentDir())
+
 # ---------------------------------------------------------------------------
 # Hit: ep closure intersects changed → selected
 # ---------------------------------------------------------------------------
@@ -57,8 +63,8 @@ block test_hit:
   # Use a real existing file as the dep so isEntryStale does not fire.
   let closure = toSet(kNarrow, kTypes)
   g.updateEntry(e.path, flagHash(e.flags), closure)
-  let changed = toSet(kTypes)
-  let result = narrowByDiff(@[e], changed, g, getCurrentDir())
+  let changed = changedTp(roots, kTypes)
+  let result = narrowByDiff(@[e], changed, g, roots, getCurrentDir())
   assert result.len == 1, "expected 1 selected, got " & $result.len
   assert result[0].path == e.path
 
@@ -73,8 +79,8 @@ block test_miss:
   let closure = toSet(kNarrow, kTypes)
   g.updateEntry(e.path, flagHash(e.flags), closure)
   # changed is kDepgraph, which is NOT in the closure → miss.
-  let changed = toSet(kDepgraph)
-  let result = narrowByDiff(@[e], changed, g, getCurrentDir())
+  let changed = changedTp(roots, kDepgraph)
+  let result = narrowByDiff(@[e], changed, g, roots, getCurrentDir())
   assert result.len == 0, "expected 0 selected, got " & $result.len
 
 # ---------------------------------------------------------------------------
@@ -90,8 +96,8 @@ block test_multi_ep:
   g.updateEntry(e1.path, flagHash(e1.flags), toSet(kNarrow))
   g.updateEntry(e2.path, flagHash(e2.flags), toSet(kTypes))
   g.updateEntry(e3.path, flagHash(e3.flags), toSet(kDepgraph))
-  let changed = toSet(kNarrow, kDepgraph)
-  let result = narrowByDiff(@[e1, e2, e3], changed, g, getCurrentDir())
+  let changed = changedTp(roots, kNarrow, kDepgraph)
+  let result = narrowByDiff(@[e1, e2, e3], changed, g, roots, getCurrentDir())
   assert result.len == 2, "expected 2 selected, got " & $result.len
   assert result[0].path == e1.path, "first must be e1 (input order)"
   assert result[1].path == e3.path, "second must be e3 (input order)"
@@ -108,8 +114,8 @@ block test_shared_dep:
   let sharedDep = kDiscover
   g.updateEntry(e1.path, flagHash(e1.flags), toSet(kNarrow, sharedDep))
   g.updateEntry(e2.path, flagHash(e2.flags), toSet(kTypes,  sharedDep))
-  let changed = toSet(sharedDep)
-  let result = narrowByDiff(@[e1, e2], changed, g, getCurrentDir())
+  let changed = changedTp(roots, sharedDep)
+  let result = narrowByDiff(@[e1, e2], changed, g, roots, getCurrentDir())
   assert result.len == 2, "expected both eps selected via shared dep, got " & $result.len
 
 # ---------------------------------------------------------------------------
@@ -123,8 +129,8 @@ block test_own_file_changed:
   # The closure can be entirely synthetic (non-existent) — own-file wins first.
   g.updateEntry(e.path, flagHash(e.flags),
                 toSet("tests/unit/test_self.nim", "src/crisol/self_nonexistent.nim"))
-  let changed = toSet("tests/unit/test_self.nim")
-  let result = narrowByDiff(@[e], changed, g, getCurrentDir())
+  let changed = changedTp(roots, "tests/unit/test_self.nim")
+  let result = narrowByDiff(@[e], changed, g, roots, getCurrentDir())
   assert result.len == 1, "own-file-changed should be selected, got " & $result.len
 
 # ---------------------------------------------------------------------------
@@ -135,8 +141,8 @@ block test_unknown_key_conservative_include:
   var g = mkGraph()
   let e = ep("tests/unit/test_unknown.nim")
   # No entry added to graph for this ep
-  let changed = initHashSet[string]()  # even empty changed set
-  let result = narrowByDiff(@[e], changed, g, getCurrentDir())
+  let changed = changedTp(roots)  # even empty changed set
+  let result = narrowByDiff(@[e], changed, g, roots, getCurrentDir())
   assert result.len == 1,
     "unknown-key ep must be conservatively included even when changed is empty, got " &
     $result.len
@@ -145,8 +151,8 @@ block test_unknown_key_with_nonempty_changed:
   var g = mkGraph()
   let e = ep("tests/unit/test_unknown2.nim")
   # No entry added to graph for this ep
-  let changed = toSet("src/crisol/something.nim")
-  let result = narrowByDiff(@[e], changed, g, getCurrentDir())
+  let changed = changedTp(roots, "src/crisol/something.nim")
+  let result = narrowByDiff(@[e], changed, g, roots, getCurrentDir())
   assert result.len == 1,
     "unknown-key ep must be conservatively included regardless of changed set"
 
@@ -163,8 +169,8 @@ block test_flaghash_keying:
   # The closure must include kRender (the changed file) and kNarrow.
   g.updateEntry(eA.path, flagHash(eA.flags), toSet(kNarrow, kRender))
   # eB has NO graph entry → unknown-key → conservatively included.
-  let changed = toSet(kRender)
-  let result = narrowByDiff(@[eA, eB], changed, g, getCurrentDir())
+  let changed = changedTp(roots, kRender)
+  let result = narrowByDiff(@[eA, eB], changed, g, roots, getCurrentDir())
   assert result.len == 2,
     "eA selected by intersection, eB selected by unknown-key rule; expected 2, got " &
     $result.len
@@ -184,8 +190,8 @@ block test_empty_changed_known_only:
   # Real existing files so entries are fresh (not stale).
   g.updateEntry(e1.path, flagHash(e1.flags), toSet(kNarrow))
   g.updateEntry(e2.path, flagHash(e2.flags), toSet(kTypes))
-  let changed = initHashSet[string]()
-  let result = narrowByDiff(@[e1, e2], changed, g, getCurrentDir())
+  let changed = changedTp(roots)
+  let result = narrowByDiff(@[e1, e2], changed, g, roots, getCurrentDir())
   assert result.len == 0,
     "empty changed + all-known closures → nothing selected, got " & $result.len
 
@@ -196,8 +202,8 @@ block test_empty_changed_with_unknown_key:
   # eKnown uses a real existing file so it is fresh.
   g.updateEntry(eKnown.path, flagHash(eKnown.flags), toSet(kRunner))
   # eUnknown has no graph entry → conservatively included.
-  let changed = initHashSet[string]()
-  let result = narrowByDiff(@[eKnown, eUnknown], changed, g, getCurrentDir())
+  let changed = changedTp(roots)
+  let result = narrowByDiff(@[eKnown, eUnknown], changed, g, roots, getCurrentDir())
   assert result.len == 1,
     "only unknown-key ep selected when changed is empty, got " & $result.len
   assert result[0].path == eUnknown.path

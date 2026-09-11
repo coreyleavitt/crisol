@@ -634,6 +634,17 @@ var probeMemo: Table[string, FoldPolicy]
 
 proc memoizedProbe(rootAbs, stateDir: string;
                     probe: proc (rootAbs, stateDir: string): FoldPolicy): FoldPolicy =
+  ## The memo is a production hot-path optimization for the DEFAULT probe
+  ## ONLY. An explicitly-injected non-default probe (the §3 Linux-testability
+  ## seam) BYPASSES the memo entirely — both read and write — so an injected
+  ## probe always reflects exactly what the caller asked for, never a value
+  ## another call cached for this root under a different probe. Without this,
+  ## a facade call using the real probe (e.g. a prior `runTests`) would poison
+  ## the entry and silently defeat a later forced-policy injection against the
+  ## same root — the memo ignoring probe identity is otherwise a footgun the
+  ## advertised injectable seam cannot survive.
+  if probe != probeFoldPolicy:
+    return probe(rootAbs, stateDir)
   if probeMemo.hasKey(rootAbs):
     return probeMemo[rootAbs]
   result = probe(rootAbs, stateDir)

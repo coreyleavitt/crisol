@@ -22,6 +22,7 @@
 import std/[os, sets, tables, times, unittest, json, strutils]
 import std/posix as posix_mod
 import crisol/[types, runner, depgraph, narrow, planner]
+import "../support/rfc9_narrow_support"
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_searchpath_" & tag & "_" &
@@ -84,8 +85,9 @@ switch("path", thisDir())
 
     # (2) load-bearing consequence: a change to the search-path dep must
     # select the entrypoint via selectByDiff.
-    let changed = toHashSet(["tests/support/helper.nim"])
-    let selection = selectByDiff(@[ep], changed, loaded, root)
+    let roots = mkRoots(root)
+    let changed = changedTp(roots, "tests/support/helper.nim")
+    let selection = selectByDiff(@[ep], changed, loaded, roots, root)
     check selection.len == 1
     if selection.len == 1:
       check selection[0].ep.path == ep.path

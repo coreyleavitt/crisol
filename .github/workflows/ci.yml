@@ -78,6 +78,24 @@ jobs:
             -e CRISOL_TEST_DIRS=tests/conformance \
             ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh
 
+      # RFC-0009 A3b-ii (round-3, R3-18.2): CRISOL_FOLD_POLICY is REQUIRED
+      # for this slice -- the load-bearing E2E body (a real git repo, a
+      # committed case-only rename of a transitively-imported dependency,
+      # `--changed` selection through the real `buildRunPlan` shared plan
+      # phase) must run green on this genuinely case-sensitive ext4 runner,
+      # forced onto fpAsciiLower, BEFORE the windows/macos legs (mode 2,
+      # the real probe) are trusted to carry the rest of the claim. Single
+      # file, not a `CRISOL_TEST_DIRS` sweep -- this is the one test this
+      # gate exists for.
+      - name: rfc-0009 A3b-ii — fold-membership selection (forced fpAsciiLower)
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            -e CRISOL_FOLD_POLICY=fpAsciiLower \
+            ghcr.io/coreyleavitt/nim:2.2.10 \
+            nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a3bii_fold_selection.nim
+
       # RFC-0005 review fix (L1): before this step, NOTHING in CI ever built
       # the actual produced binary — the steps above only compile individual
       # test files, never src/crisol.nim as a whole program — so a regression
@@ -374,6 +392,21 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_fold_probe.nim
 
+      # RFC-0009 A3b-ii (round-3, R3-18.4): the load-bearing E2E test, real
+      # probe (no injection) -- hard-asserts the NTFS volume answers
+      # fpAsciiLower (both directly and via this run's own RunReport
+      # evidence) before proving selection: a real git repo, a committed
+      # case-only rename of a transitively-imported dependency, `--changed`
+      # selection through the real `buildRunPlan` shared plan phase. This is
+      # the windows leg's producer for the NTFS half of the load-bearing
+      # property -- a pinned per-file step, not a conformance sweep, so
+      # without it the property has no producer here until B4b.
+      - name: rfc-0009 A3b-ii — fold-membership selection (real NTFS probe)
+        if: always()
+        env:
+          CRISOL_EXPECT_FOLD: fpAsciiLower
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a3bii_fold_selection.nim
+
   macos:
     runs-on: macos-latest
     steps:
@@ -418,6 +451,13 @@ jobs:
         env:
           CRISOL_TIER: macos
           CRISOL_TEST_DIRS: tests/unit:tests/conformance
+          # RFC-0009 A3b-ii (round-3, R3-18.4): hard-asserts the real probe
+          # on this leg's APFS volume before proving fold-membership
+          # selection live (test_rfc9_a3bii_fold_selection.nim, swept in via
+          # CRISOL_TEST_DIRS above) -- a leg mis-pinned to the wrong policy
+          # fails loudly instead of silently halving the "proven on two
+          # case-insensitive legs" claim.
+          CRISOL_EXPECT_FOLD: fpAsciiLower
         run: bash ci/run-tests.sh
 
       # rfc-0007 C1b: tests/conformance's TIMING-SENSITIVE cases (self-gated

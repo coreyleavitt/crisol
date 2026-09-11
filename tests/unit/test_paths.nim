@@ -15,9 +15,11 @@
 ## real filesystem (`expandFilename`) at `initTrackedRoots` time.
 ##
 ## `initTrackedRoots`'s probe memo is keyed by canonical root abs path and
-## is per-PROCESS (never reset between tests in this file) — every fake
-## root below therefore uses a path unique to its own test, so two tests
-## injecting two different policies never collide on one memoized answer.
+## is per-PROCESS (never reset between tests in this file). Since A3b-ii the
+## memo is BYPASSED for any explicitly-injected non-default probe (see the
+## "injected probe bypasses the memo" test below), so two tests injecting
+## two different policies for one root can no longer collide; the fake roots
+## below nonetheless stay unique per test, which is clearer regardless.
 
 import std/[unittest, options, os, strutils, json]
 import crisol/paths
@@ -409,3 +411,23 @@ suite "toJson / fromJson — round trip":
     let roots = rootsWith("/fake/proj-json4", fpNone)
     check fromJson(%*{"path": "a.nim"}, roots).isNone
     check fromJson(%*"not-an-object", roots).isNone
+
+# ===========================================================================
+# Probe-memo bypass for injected probes (A3b-ii) — the injectable §3 seam
+# must survive a prior default/other-probe call against the SAME root.
+# ===========================================================================
+
+suite "initTrackedRoots — injected probe bypasses the per-process memo":
+
+  test "a second injection with a different policy is honored for the same root":
+    # Same root abs path, two DIFFERENT injected policies in sequence. Before
+    # the A3b-ii memo-bypass, the second call would return the first's
+    # memoized answer (a footgun that silently defeated forced-policy
+    # injection after any prior probe of the same root — e.g. runTests'
+    # internal default probe). With the bypass, each injected probe answers
+    # exactly what it was asked.
+    let root = "/fake/proj-memo-bypass"
+    let first  = rootsWith(root, fpNone)
+    check first.project.foldPolicy == fpNone
+    let second = rootsWith(root, fpAsciiLower)
+    check second.project.foldPolicy == fpAsciiLower

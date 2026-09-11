@@ -74,9 +74,9 @@ proc buildRunPlan*(
   ##   useFailed    — when true, keep only entrypoints in failedKeys.
   ##   useChanged   — when true, keep only entrypoints whose closure ∩ changed ≠ ∅.
   ##   changed      — set of changed files, as TrackedPath (RFC-0009 A3b-i);
-  ##                  required when useChanged. Converted to the
-  ##                  string-keyed shape narrowByDiff still expects via a
-  ##                  temporary adapter, below, at the call site.
+  ##                  required when useChanged. Passed straight through to
+  ##                  narrowByDiff (RFC-0009 A3b-ii retyped narrow's own
+  ##                  membership test to compare TrackedPath directly).
   ##   nimVersion   — Nim compiler fingerprint for freshness checks; the api
   ##                  boundary threads the RUNTIME probe
   ##                  (nimprobe.cachedNimFingerprint()), not the compile-time
@@ -147,14 +147,10 @@ proc buildRunPlan*(
         newSeq[Entrypoint]()
     let changedNarrowed =
       if useChanged:
-        # TEMPORARY adapter (RFC-0009 A3b-i): narrowByDiff/selectByDiff still
-        # take the string-keyed HashSet[string] shape -- narrow.nim itself is
-        # not retyped until A3b-ii, which retypes narrow's own membership
-        # test to compare TrackedPath directly (the fold-soundness axis this
-        # RFC exists for) and deletes this adapter.
-        var changedDisplay = initHashSet[string]()
-        for tp in changed: changedDisplay.incl tp.display
-        narrowByDiff(gated.run, changedDisplay, graph, cfg.projectRoot)
+        # RFC-0009 A3b-ii: narrow.nim compares TrackedPath directly (folded
+        # membership, the selection-soundness axis) -- `changed` is handed
+        # straight through, no adapter.
+        narrowByDiff(gated.run, changed, graph, cfg.trackedRoots, cfg.projectRoot)
       else:
         newSeq[Entrypoint]()
 

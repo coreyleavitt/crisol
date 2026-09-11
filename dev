@@ -112,6 +112,21 @@ case "${cmd}" in
         podman_run nimble build
         ;;
     run)
+        # RFC-0009 A3b-ii: forward CRISOL_FOLD_POLICY / CRISOL_EXPECT_FOLD from
+        # the host shell into the container when set -- podman does not
+        # forward host env vars on its own (see podman_run's doc comment
+        # above), and these two are how a single conformance test is driven
+        # in its forced-policy (Linux CI gate, R3-18.2) and real-probe
+        # (windows/macos legs, R3-18.4) modes from a host-side invocation.
+        # Conditional, unlike `test`'s always-on EXTRA_ENV: `./dev run` is
+        # used for many unrelated invocations and must not inject these
+        # unless the caller actually set them.
+        if [ -n "${CRISOL_FOLD_POLICY:-}" ]; then
+            EXTRA_ENV+=(--env "CRISOL_FOLD_POLICY=${CRISOL_FOLD_POLICY}")
+        fi
+        if [ -n "${CRISOL_EXPECT_FOLD:-}" ]; then
+            EXTRA_ENV+=(--env "CRISOL_EXPECT_FOLD=${CRISOL_EXPECT_FOLD}")
+        fi
         podman_run "$@"
         ;;
     shell)

@@ -341,14 +341,16 @@ suite "crisol D5 — --failed --changed union":
                       ["tests/unit/test_b.nim"].toHashSet)
 
     # Only test_b changed on disk.
-    let changed = ["tests/unit/test_b.nim"].toHashSet
+    let roots = initTrackedRoots(repo, @[], "")
+    var changed = initHashSet[TrackedPath]()
+    changed.incl fromCanonical("tests/unit/test_b.nim", roots).get
     # Only test_a failed previously.
     let failedKeys = [(path: "tests/unit/test_a.nim", group: "unit")].toHashSet
 
     # --- replicate buildPlanView's union narrowing exactly ---
     let failedNarrowed = eps.filterIt(
       (path: it.path, group: it.group) in failedKeys)
-    let changedNarrowed = narrowByDiff(eps, changed, graph, "")
+    let changedNarrowed = narrowByDiff(eps, changed, graph, roots, "")
 
     check failedNarrowed.mapIt(it.path) == @["tests/unit/test_a.nim"]
     check changedNarrowed.mapIt(it.path) == @["tests/unit/test_b.nim"]
