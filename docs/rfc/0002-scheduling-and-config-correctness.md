@@ -1,3 +1,18 @@
++++
+type    = "rfc"
+id      = "0002"
+title   = "RFC-0002 \u2014 Scheduling & config correctness"
+state   = "living"
+stage   = "review"
+review  = "floor"
+profile = "rfc-flow@3"
+
+[[item]]
+id    = "i1"
+title = "These 4 are in the RFC's \"Open questions\" \u00a7, all with a lean (so likely architect-resolvable, not true forks): C cross-group exclusion (l..."
+state = "open"
++++
+
 # RFC-0002 — Scheduling & config correctness
 
 **Status:** Implemented — full rfc-flow complete; committed 5c4de13 and pushed 2026-06-13

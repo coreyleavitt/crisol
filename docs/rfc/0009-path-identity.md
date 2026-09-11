@@ -1,3 +1,88 @@
++++
+type    = "rfc"
+id      = "0009"
+title   = "RFC-0009 \u2014 Path identity: `TrackedPath` and the Windows suite"
+state   = "draft"
+stage   = "rfc"
+profile = "rfc-flow@3"
+blocked_by = ["0001", "0004", "0005", "0007"]
+
+[[item]]
+id    = "i1"
+title = "\u00a71 type: private fields + display*() accessor; add < (over ident); toNative(pp,root) (mirror); keyBytes (was identBytes); add fromCanonic..."
+state = "open"
+
+[[item]]
+id    = "i2"
+title = "\u00a73 probe: OS query first (Win FileCaseSensitiveInformation, mac pathconf _PC_CASE_SENSITIVE); create-and-stat fallback per-process-unique..."
+state = "open"
+
+[[item]]
+id    = "i3"
+title = "Native-canonicalizer slice: steps 1-2 (abs/norm/drive-letter/separator + fold) applied to ALL native paths entering SourceIndex/underAnyR..."
+state = "open"
+
+[[item]]
+id    = "i4"
+title = "New slice A0 golden-pin (run in every Stage-A slice; vectors include an absolute depRoot member + max-depth entrypoint)."
+state = "open"
+
+[[item]]
+id    = "i5"
+title = "A3b: real git repo; mixed-case via commit\u2192warm-run\u2192disk-rename-without-git-mv\u2192edit\u2192git diff -z --name-only; \u22652 entrypoints, diff names a ..."
+state = "open"
+
+[[item]]
+id    = "i6"
+title = "A5: observation via --json --cache-stats (l1Hits==1/misses==0) + exactly-one-stored-entry + negative control."
+state = "open"
+
+[[item]]
+id    = "i7"
+title = "FoldPolicy evidence: emit in A2 (jsonout schema-rev note), assert in A3b twins."
+state = "open"
+
+[[item]]
+id    = "i8"
+title = "Persist foldPolicy in depgraph header; mismatch \u21d2 discard-as-absent. A3c byte-level assert real-case display persisted (windows leg)."
+state = "open"
+
+[[item]]
+id    = "i9"
+title = "Unowned surfaces get owners: jsonout.loadLastRun, order.nim, depparse (\u2192A4b), cacheregistry.rootInsideStateDir, quarantine membership (co..."
+state = "open"
+
+[[item]]
+id    = "i10"
+title = "B4 split \u2192 B4a (native ci/run-tests.sh over tests/unit) / B4b (widen conformance[+integration per scope] + RFC-0007 line-555 tick); name ..."
+state = "open"
+
+[[item]]
+id    = "i11"
+title = "B3c bucket (24 import-clean posix-assuming tests). Pin auditable bucket inventory (meta-test bucket\u222a == grep). Extend import-purity meta-..."
+state = "open"
+
+[[item]]
+id    = "i12"
+title = "macOS: gate identity conformance tests on fold-policy (self-skip fpNone) not windows; name macOS-latest in Stage A acceptance."
+state = "open"
+
+[[item]]
+id    = "i13"
+title = "\u00a71/\u00a72/\u00a75: total boundary returning classification (inProject | inDepRoot | outside), throw only where attribution required (fixes refuse-..."
+state = "open"
+
+[[item]]
+id    = "i14"
+title = "\\\\?\\ : A1 conformance includes a deliberate >260-char nativeOf round-trip (scheduled RED decides prefix)."
+state = "open"
+
+[[item]]
+id    = "i15"
+title = "Empty/root path invariant (display non-empty, no lead/trail /); explicit toJson emitting display only (never persist ident)."
+state = "open"
++++
+
 # RFC-0009 — Path identity: `TrackedPath` and the Windows suite
 
 **Status:** DRAFT — round-3 review done (5 fable lenses, 2026-09-11); ~29 clear-best fixes applied + two calls made (compiler-spelling spike added as slice A0-spike; dep-root naming = optional name/basename default). Ready for `/tdd` from A0-spike (pending Corey's go), or round-4.

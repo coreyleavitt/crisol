@@ -1,3 +1,14 @@
++++
+type    = "rfc"
+id      = "0005"
+title   = "RFC-0005 \u2014 Distributed result cache, cryptographic trust & cache observability"
+state   = "living"
+stage   = "review"
+review  = "floor"
+profile = "rfc-flow@3"
+blocked_by = ["0004", "0006", "0007"]
++++
+
 # RFC-0005 — Distributed result cache, cryptographic trust & cache observability
 
 **Status:** BUILD COMPLETE 2026-09-05 (all 27 slices, CI-green on all four legs); **stage-4 review to floor (3 rounds, 466bc7e + doc pass, 2026-09-06)** — ledger in the handoff doc. Previously: Ready (stage 2 — architect rounds 1, 2 & **3** applied 2026-08-21; FORK-1 (crypto deps) resolved — see §Dependency decision; **FORK-2 (cold-host consult) RESOLVED (a) 2026-09-03 — the post-compile consult ships as stage A2c; see §FORK-2**). **A7-gate re-baseline APPLIED 2026-09-03:** RFC-0007 Stage A (A0–A7) landed in full on main, and this doc is re-baselined on the landed shape — `StoredEntry` freezes on the real `ProcessResult` observation (§The port), the publish gate is recomputed-`outcome` + `evidenceSatisfies` + attempt-1 (§Hard constraints), `--verify-cache` compares observations, never verdicts (§Stage B), and the wire is `crisol/run/v2` (revs 19/20/21 — §Contract impacts). The build is unblocked — FORK-2 resolved (a): the consult lives wherever the key becomes fully known, and key-completion is staged (closure hash is a compile byproduct), so the post-compile consult is the general mechanism and lookupAtPlan its memoized fast path; A2c supplies the missing general case. Source line anchors dated round 3 pre-date the 0007 rewrite; anchors in re-baselined sections are refreshed at HEAD (2026-09-03), the rest are historical — re-grep at slice time.

@@ -1,3 +1,29 @@
++++
+type    = "rfc"
+id      = "0007"
+title   = "RFC-0007 \u2014 Execution substrate: process contract, honest results, platform backends"
+state   = "implemented"
+stage   = "implement"
+review  = "pending"
+profile = "rfc-flow@3"
+blocked_by = ["0001", "0002", "0004"]
+
+[[item]]
+id    = "i1"
+title = "Interrupt never persists lastrun.json (stdout run/v2 with interrupted:true only). Invariant: a never-observed entrypoint must not silentl..."
+state = "open"
+
+[[item]]
+id    = "i2"
+title = "lsUnsupported \u21d2 cacheable-with-label; lsFailed \u21d2 uncacheable (\u00a76). Extends the locked toUnobservable posture to limits; without it, any W..."
+state = "open"
+
+[[item]]
+id    = "i3"
+title = "Round-1's interrupt partial-results amendment stands (unchanged from round 1, still veto-able as documented there; now fully specified \u2014 ..."
+state = "open"
++++
+
 # RFC-0007 — Execution substrate: process contract, honest results, platform backends
 
 **Status:** Build complete — Stages A–C done; Stage D production complete (D1a/D1b kill-domain + forensics; D2a Windows production de-POSIXing — `crisol run` compiles+runs on windows, CI-green all five legs, 2026-09-10). Sole remainder: **D2b** (test-suite de-POSIX + full-suite windows green) is RFC-0009-gated. Tracked follow-up: cbLimit attribution on windows (see D1b).

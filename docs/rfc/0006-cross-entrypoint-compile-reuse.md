@@ -1,3 +1,63 @@
++++
+type    = "rfc"
+id      = "0006"
+title   = "RFC-0006 \u2014 Cross-entrypoint compile reuse: measure first, recover the redundant substrate"
+state   = "parked"
+reason  = "parked per the v0 tracker state at conversion"
+profile = "rfc-flow@3"
+blocked_by = ["0004"]
+
+[[item]]
+id    = "i1"
+title = "FORK-R (Stage R mechanism) \u2014 native objcache.nim vs external ccache vs sccache. Rounds 1\u20132 sharpened the tension in both directions, so t..."
+state = "open"
+
+[[item]]
+id    = "i2"
+title = "*Native* \u2014 dependency-free (crisol's demonstrated discipline), composes directly with <stateDir>/GC/telemetry/ledger, and requires zero c..."
+state = "open"
+
+[[item]]
+id    = "i3"
+title = "*ccache* \u2014 battle-tested; its direct mode already solves both the #include-closure soundness problem and the collision problem the native..."
+state = "open"
+
+[[item]]
+id    = "i4"
+title = "*sccache* \u2014 same content-addressed niche, plus native S3/redis backends that map directly onto RFC-0005's distributed-object door \u2014 the b..."
+state = "open"
+
+[[item]]
+id    = "i5"
+title = "No fork blocks Stage M (unconditional; M-driver is mechanism-agnostic and needed on every branch)."
+state = "open"
+
+[[item]]
+id    = "i6"
+title = "FORK-R (Stage R mechanism) \u2014 genuine, informed fork, tension both ways (rounds 1\u20132):"
+state = "open"
+
+[[item]]
+id    = "i7"
+title = "native objcache.nim: dep-free, composes with stateDir/GC/telemetry, ZERO consumer-side change \u2014 BUT new correctness-critical surface + mu..."
+state = "open"
+
+[[item]]
+id    = "i8"
+title = "ccache: battle-tested, direct mode ALREADY solves #include-closure AND collision problems, wraps cc so works with MONOLITHIC nim c (no wo..."
+state = "open"
+
+[[item]]
+id    = "i9"
+title = "sccache: same + native S3/redis \u2192 RFC-0005 distributed-object door + mature content-addressing; same consumer-image cost."
+state = "open"
+
+[[item]]
+id    = "i10"
+title = "Reached ONLY if Stage M greenlights R. Resolve at R0. NOT blocking."
+state = "open"
++++
+
 # RFC-0006 — Cross-entrypoint compile reuse: measure first, recover the redundant substrate
 
 > **⛔ OUTCOME (2026-07-30): Stage R (object cache) BUILT, MEASURED, and REMOVED — negative result.** A real end-to-end A/B on amoxtli showed no warm benefit (+1.4%) and a ~38% cold-run regression: the compile is Nim-**codegen**-bound (~55%), Stage R only accelerates the **cc** half (~44%) which overlaps behind codegen (off the critical path), and the result cache already owns the dev loop. Stage R code was stripped; **Stage M (measurement) was retained** as the codegen diagnostic. Do NOT re-implement `.o`/substrate reuse — the ceiling is ORC whole-program DCE making codegen program-specific. See `0006-…handoff.md` and memory `rfc-0006-objcache-benchmark-negative`.

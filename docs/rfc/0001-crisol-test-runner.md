@@ -1,3 +1,33 @@
++++
+type    = "rfc"
+id      = "0001"
+title   = "RFC-0001 \u2014 crisol test runner"
+state   = "living"
+stage   = "review"
+review  = "floor"
+profile = "rfc-flow@3"
+
+[[item]]
+id    = "i1"
+title = "Compile-only mode (--check): nim check sweep without running."
+state = "open"
+
+[[item]]
+id    = "i2"
+title = "--tap output format (sink protocol unaffected)."
+state = "open"
+
+[[item]]
+id    = "i3"
+title = "Compound/extended gates (file, cmd, all/any) \u2014 the typed gate object is forward-compatible."
+state = "open"
+
+[[item]]
+id    = "i4"
+title = "Sibling-consumer migrations (lib/cel, lib/kdl, proptest, fresco) \u2014 after amoxtli proves the model; their patterns inform C1 *now* (see St..."
+state = "open"
++++
+
 # RFC-0001 — crisol test runner
 
 **Status:** Implemented — all four rfc-flow stages complete (review floor reached: 0 critical/high/medium open); runner shipped and dogfooded

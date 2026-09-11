@@ -1,3 +1,28 @@
++++
+type    = "rfc"
+id      = "0003"
+title   = "RFC-0003 \u2014 Library facade + onboarding + CLI papercuts"
+state   = "living"
+stage   = "review"
+review  = "floor"
+profile = "rfc-flow@3"
+
+[[item]]
+id    = "i1"
+title = "--base without --changed: error vs keep-warn (lean: error \u2014 clearer; small behavior change)."
+state = "open"
+
+[[item]]
+id    = "i2"
+title = "Does runTests acquire the advisory lock + install signal handlers by default? (lean: yes, with opt-out flags \u2014 safe defaults matching CLI)."
+state = "open"
+
+[[item]]
+id    = "i3"
+title = "Docs slices aren't TDD-able as prose; plan is verify-by-review + fold testable bits into init/--version."
+state = "open"
++++
+
 # RFC-0003 — Library facade + onboarding + CLI papercuts
 
 **Status:** Implemented — all four rfc-flow stages complete (all review findings closed); facade shipped, amoxtli onboarded

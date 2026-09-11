@@ -1,3 +1,39 @@
++++
+type    = "rfc"
+id      = "0004"
+title   = "RFC-0004 \u2014 Incremental, hermetic, observable execution"
+state   = "living"
+stage   = "review"
+review  = "floor"
+profile = "rfc-flow@3"
+blocked_by = ["0001", "0002", "0003"]
+
+[[item]]
+id    = "i1"
+title = "tests/integration/test_max_jobs_overlap.nim \"uncapped: two probes DO overlap with jobs=2\" is FLAKY: 2/3 pass, 1/3 fail in isolation. Same..."
+state = "open"
+
+[[item]]
+id    = "i2"
+title = "Plausible CAUSAL link to C5: the test leaves memAware unset (none=AUTO). Before C5, procGroupRssBytes returned some(0) (the NSpgid bug), ..."
+state = "open"
+
+[[item]]
+id    = "i3"
+title = "Recommended fix (my read): concurrency-cap tests (test_max_jobs_overlap) should set memAware: some(false) to ISOLATE the max-jobs-cap beh..."
+state = "open"
+
+[[item]]
+id    = "i4"
+title = "Recorded in memory [[dev-test-verification-gotchas]]."
+state = "open"
+
+[[item]]
+id    = "i5"
+title = "1. Thread SandboxSpec into the LIVE run path. Today execute()/the runner still spawn real test runs via the LEGACY forkExec/forkExecEnv \u2014..."
+state = "open"
++++
+
 # RFC-0004 — Incremental, hermetic, observable execution
 
 **Status:** Implemented — closed: 27-slice build, review to floor (3 rounds, 0 critical/high), merged to main; follow-ons reconciled
