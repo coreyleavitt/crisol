@@ -56,7 +56,12 @@ proc matchSegment(pat, s: string): bool =
   while pi < pat.len and pat[pi] == '*': inc pi
   result = pi == pat.len and si == s.len
 
-proc matchGlob*(glob: string; relPath: string): bool =
+proc applyFold(s: string; fold: FoldPolicy): string =
+  case fold
+  of fpNone: s
+  of fpAsciiLower: s.toLowerAscii()
+
+proc matchGlob*(glob: string; relPath: string; fold: FoldPolicy = fpNone): bool =
   ## Match a project-root-relative path against a glob pattern.
   ##
   ## Segment separator: '/'.  Special tokens:
@@ -64,13 +69,28 @@ proc matchGlob*(glob: string; relPath: string): bool =
   ##   `?`   within a segment — exactly one char.
   ##   `**`  as a whole segment — matches zero or more whole path segments.
   ##
+  ## `fold` (RFC-0009 A3a-i, R3-23): the tracked root's OWN probed fold
+  ## policy. `fpNone` (the default) is today's byte-exact behavior, so every
+  ## existing call site and test keeps compiling and passing unchanged.
+  ## Under `fpAsciiLower`, BOTH the glob and the candidate path are
+  ## ASCII-lowered before matching — a config author's glob and the on-disk
+  ## spelling it selects may differ in case on a case-insensitive volume,
+  ## exactly as any other identity comparison on that volume must.
+  ##
+  ## Separator awareness: a backslash in the GLOB is normalized to '/'
+  ## before splitting into segments — a config author on Windows may write
+  ## `tests\unit\*.nim` in KDL. `relPath` itself is always already
+  ## '/'-separated (discover's own producer, `paths.nim`'s canonical form),
+  ## so this is a no-op on the path side; only the glob ever needs it.
+  ##
   ## Examples:
   ##   tests/unit/test_*.nim  ↔  tests/unit/test_parser.nim     → true
   ##   tests/**/test_*.nim    ↔  tests/test_a.nim               → true  (** = 0)
   ##   tests/**/test_*.nim    ↔  tests/unit/deep/test_b.nim     → true  (** = 2)
   ##   tests/*/x.nim          ↔  tests/a/b/x.nim                → false
-  let gParts = glob.split('/')
-  let pParts = relPath.split('/')
+  let normGlob = glob.replace('\\', '/')
+  let gParts = applyFold(normGlob, fold).split('/')
+  let pParts = applyFold(relPath, fold).split('/')
 
   proc match(gi, pi: int): bool =
     if gi == gParts.len and pi == pParts.len: return true
@@ -207,18 +227,24 @@ proc unsafeToSeq*(ds: DiscoveredSet): seq[Entrypoint] =
 # resolveFilesGroups — gskFiles path→group attribution (issue #3, RFC-0001:409)
 # ---------------------------------------------------------------------------
 
-proc normalizeRootRelative(p, root: string): string =
-  ## Make an absolute path root-relative; leave a relative path as-is.
-  ## Falls back to the original string if relativePath ever raises.
-  if isAbsolute(p):
-    try: relativePath(p, root)
-    except: p
-  else: p
+proc normalizeRootRelative(p: string; config: Config): string =
+  ## Make an absolute selector path root-relative; leave a relative path
+  ## as-is. RFC-0009 A3a-i (R3-23): routes through the TOTAL `classify`
+  ## boundary rather than `os.relativePath` — a path under a TRACKED root
+  ## (project or a configured dep root, not just `config.projectRoot`
+  ## verbatim) reduces to its canonical, real-case `tp.display` spelling;
+  ## anything `pcOutside` degrades to the raw string, unchanged, matching
+  ## today's `except: p` fallback but now total and exception-free by
+  ## construction rather than relying on `relativePath` never raising.
+  if not isAbsolute(p): return p
+  let pc = classify(p, config.trackedRoots)
+  case pc.kind
+  of pcTracked: pc.tp.display
+  of pcOutside: p
 
 proc resolveFilesGroups(
   config:    Config;
   selection: GroupSelection;
-  root:      string;
   allRel:    seq[string];
 ): tuple[active: seq[Group]; adHocPaths: seq[string]] =
   ## PURE: resolve each gskFiles selector (a path or a glob) to the concrete
@@ -246,7 +272,7 @@ proc resolveFilesGroups(
     candidates = config.groups
 
   for p in selection.paths:
-    let np = normalizeRootRelative(p, root)
+    let np = normalizeRootRelative(p, config)
 
     # Expand the selector to the concrete files it denotes, so attribution is
     # always file -> owner (a glob selector must not be matched as a literal
@@ -255,7 +281,7 @@ proc resolveFilesGroups(
     # attributed as itself, so the downstream no-match diagnosis is unchanged.
     var files: seq[string]
     for rel in allRel:
-      if rel == np or matchGlob(np, rel):
+      if rel == np or matchGlob(np, rel, config.trackedRoots.project.foldPolicy):
         files.add rel
     if files.len == 0:
       files = @[np]
@@ -270,7 +296,7 @@ proc resolveFilesGroups(
     for f in files:
       var matched = false
       for owner in candidates:
-        if owner.globs.anyIt(matchGlob(it, f)):
+        if owner.globs.anyIt(matchGlob(it, f, config.trackedRoots.project.foldPolicy)):
           matched = true
           result.active.add Group(name: owner.name, globs: @[f], flags: owner.flags,
                                    optIn: false, timeoutSecs: owner.timeoutSecs)
@@ -308,6 +334,43 @@ proc effectiveProjectRoot(config: Config): string =
   case pc.kind
   of pcOutside: pc.native.path
   of pcTracked: config.projectRoot
+
+# ---------------------------------------------------------------------------
+# entrypointTp — RFC-0009 A3a-i: Entrypoint.tp producer
+# ---------------------------------------------------------------------------
+
+proc entrypointTp(relPath, root: string; roots: TrackedRoots): TrackedPath =
+  ## `relPath` is already canonical, project-root-relative, '/'-separated
+  ## text at this call site (walkNimFiles + the leading-separator strip
+  ## above), so `fromCanonical` always succeeds and preserves it verbatim --
+  ## the `tp.display == path` invariant holds BY CONSTRUCTION, never by
+  ## coincidence. The debug assert makes that loud rather than silently
+  ## trusted; it is deliberately not `doAssert` (release builds keep
+  ## running rather than trading a diagnostic panic for an outage over an
+  ## identity field nothing downstream yet consumes, A3a-i's own "additive,
+  ## no consumers" framing).
+  ##
+  ## Release-mode fallback: a discovered path is always shape-valid in
+  ## practice, but the producer itself must never be the thing that crashes.
+  ## `classify` is TOTAL (never raises, never refuses) against the same
+  ## native absolute path, so it is the correct degrade target rather than
+  ## re-deriving `fromCanonical`'s own shape check by hand. Its remaining
+  ## `pcOutside` arm cannot occur here (the candidate is `root / relPath`,
+  ## always under `root`) but is closed out with a zero-value `TrackedPath`
+  ## rather than left unreachable-and-unhandled, matching `classify`'s own
+  ## totality contract.
+  let opt = fromCanonical(relPath, roots)
+  when not defined(release):
+    assert opt.isSome,
+      "discover: relPath failed fromCanonical shape validation: " & relPath
+    assert opt.get.display == relPath,
+      "discover: tp.display diverged from relPath: " & relPath
+  if opt.isSome:
+    return opt.get
+  let pc = classify(root / relPath, roots)
+  case pc.kind
+  of pcTracked: pc.tp
+  of pcOutside: TrackedPath()
 
 # ---------------------------------------------------------------------------
 # discover — main entry point
@@ -382,7 +445,7 @@ proc discover*(
   of gskAll:
     active = config.groups
   of gskFiles:
-    let resolved = resolveFilesGroups(config, selection, root, allRel)
+    let resolved = resolveFilesGroups(config, selection, allRel)
     active     = resolved.active
     adHocPaths = resolved.adHocPaths
 
@@ -398,7 +461,7 @@ proc discover*(
       # Match against any glob in the group (union semantics).
       var matched = false
       for glob in group.globs:
-        if matchGlob(glob, relPath):
+        if matchGlob(glob, relPath, config.trackedRoots.project.foldPolicy):
           matched = true
           break
 
@@ -406,6 +469,7 @@ proc discover*(
         seen.incl (relPath, group.name)
         entries.add Entrypoint(
           path:           relPath,
+          tp:             entrypointTp(relPath, root, config.trackedRoots),
           group:          group.name,
           flags:          group.flags,
           runTimeoutSecs: group.timeoutSecs,  # 0 = inherit global (RFC-0002 Feature A)

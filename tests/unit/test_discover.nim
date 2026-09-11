@@ -94,6 +94,18 @@ suite "matchGlob":
   test "trailing ** matches any depth":
     check matchGlob("tests/**", "tests/unit/test_a.nim")
 
+  test "fold defaults to fpNone: case-mismatched glob does not match":
+    check not matchGlob("tests/Unit/*.nim", "tests/unit/x.nim")
+
+  test "fpAsciiLower folds both glob and path before matching":
+    check matchGlob("tests/Unit/*.nim", "tests/unit/x.nim", fpAsciiLower)
+
+  test "fpNone passed explicitly stays byte-exact":
+    check not matchGlob("tests/Unit/*.nim", "tests/unit/x.nim", fpNone)
+
+  test "a backslash in the glob is normalized to '/' before matching":
+    check matchGlob("tests\\unit\\*.nim", "tests/unit/x.nim")
+
 # ---------------------------------------------------------------------------
 # Suite 3 — union+dedup within a group
 # ---------------------------------------------------------------------------
@@ -474,3 +486,91 @@ suite "discover – RFC-0009 A2: trackedRoots.project over projectRoot verbatim"
     let ds = discover(cfg)
     check ds.entries.len == 1
     check ds.entries[0].path == "test_a.nim"
+
+# ---------------------------------------------------------------------------
+# Suite — RFC-0009 A3a-i: Entrypoint.tp (additive)
+# ---------------------------------------------------------------------------
+
+suite "discover – RFC-0009 A3a-i: Entrypoint.tp":
+
+  test "a discovered entrypoint's tp agrees with its path and is project-tagged":
+    let root = makeTempRoot("rfc9_a3a_tp")
+    defer: cleanupDir(root)
+    writeFixture(root, "tests/unit/test_a.nim")
+
+    var cfg = Config(
+      projectRoot: root,
+      groups: @[Group(name: "unit", globs: @["tests/unit/test_*.nim"])],
+    )
+    cfg.trackedRoots = initTrackedRoots(root, @[], "")
+
+    let ds = discover(cfg)
+    check ds.entries.len == 1
+    check ds.entries[0].tp.display == ds.entries[0].path
+    check ds.entries[0].tp.isProject
+
+  test "an unpopulated (zero-value) trackedRoots still produces an agreeing tp":
+    # Mirrors the degraded-trackedRoots fixture pattern above: discover()'s
+    # `tp` producer must not crash or diverge just because the Config was
+    # hand-built rather than routed through loadConfig.
+    let root = makeTempRoot("rfc9_a3a_tp_untracked")
+    defer: cleanupDir(root)
+    writeFixture(root, "test_a.nim")
+
+    let cfg = makeConfig(root, @[Group(name: "unit", globs: @["test_*.nim"])])
+    let ds = discover(cfg)
+    check ds.entries.len == 1
+    check ds.entries[0].tp.display == ds.entries[0].path
+    check ds.entries[0].tp.isProject
+
+# ---------------------------------------------------------------------------
+# Suite — RFC-0009 A3a-i: normalizeRootRelative routes through classify
+# ---------------------------------------------------------------------------
+
+suite "discover – gskFiles absolute selector normalizes via classify":
+
+  test "an absolute path under the project root resolves to its project-relative form":
+    let root = makeTempRoot("rfc9_a3a_normroot")
+    defer: cleanupDir(root)
+    writeFixture(root, "tests/unit/test_a.nim")
+
+    var cfg = Config(
+      projectRoot: root,
+      groups: @[Group(name: "unit", globs: @["tests/unit/test_*.nim"])],
+    )
+    cfg.trackedRoots = initTrackedRoots(root, @[], "")
+
+    # The selector is built from the SAME `root` string the config's
+    # trackedRoots was built from, so this is a lexical, volume-independent
+    # comparison (no lexical-vs-realpath mismatch to guard against here —
+    # see the macOS caution this slice's brief calls out).
+    let absSelector = root / "tests" / "unit" / "test_a.nim"
+    let sel = GroupSelection(kind: gskFiles, paths: @[absSelector])
+
+    let ds = discover(cfg, sel)
+    check ds.entries.len == 1
+    check ds.entries[0].path == "tests/unit/test_a.nim"
+    check ds.entries[0].group == "unit"
+
+  test "an absolute path unrelated to any tracked root falls back to the raw string":
+    let root = makeTempRoot("rfc9_a3a_normroot_outside")
+    defer: cleanupDir(root)
+    writeFixture(root, "tests/unit/test_a.nim")
+
+    var cfg = Config(
+      projectRoot: root,
+      groups: @[Group(name: "unit", globs: @["tests/unit/test_*.nim"])],
+    )
+    cfg.trackedRoots = initTrackedRoots(root, @[], "")
+
+    const outside = "/crisol-rfc9-a3a-definitely-outside/foo.nim"
+    let sel = GroupSelection(kind: gskFiles, paths: @[outside])
+
+    let ds = discover(cfg, sel)
+    # No on-disk file denotes `outside` under `root`, so no Entrypoint is
+    # produced (discover() only ever emits entries for files it actually
+    # walked) — but the RAW, UNCHANGED string must still surface via
+    # adHocPaths, proving normalizeRootRelative's `pcOutside` fallback ran
+    # rather than silently mangling or dropping an unrelated absolute path.
+    check ds.entries.len == 0
+    check ds.adHocPaths == @[outside]

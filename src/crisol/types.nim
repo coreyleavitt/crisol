@@ -22,6 +22,23 @@ export ptypes.Outcome, ptypes.HermeticLevel
 # needed here just to name the field's type; paths.nim imports nothing from
 # this module (or anywhere else in the package), so this cannot cycle.
 import crisol/paths
+# RFC-0009 A3a-i: `Entrypoint` (below) now carries a `tp: TrackedPath`
+# field. A bare `import crisol/paths` (above) only makes its symbols
+# resolvable INSIDE this file -- it does not propagate to a module that
+# merely `import crisol/types`. Without this `export`, any such module
+# performing ordinary derived equality/hashing over an `Entrypoint` (a
+# `seq[Entrypoint].find`/`contains`, a `HashSet[Entrypoint]`, a plain `==`)
+# silently falls through to the compiler's generic per-field `==`/`hash`,
+# which then needs `TrackedPath`'s own `==`/`hash` (and, one level deeper,
+# `RootTag`'s borrowed `==`/`hash`) VISIBLE AT THAT CALL SITE -- and fails to
+# compile without it (caught live by tests/unit/test_shard.nim and
+# test_c3_balanced_shard.nim, neither of which imports crisol/paths
+# directly). Re-exporting the whole module here, rather than hand-picking
+# just the operators, matches the direction this RFC is already taking
+# `types.nim` in (Config.trackedRoots is a `paths.TrackedRoots`) and avoids
+# this exact class of break recurring at every future call site the ladder
+# adds.
+export paths
 
 type
   IdentityKey* = distinct string
@@ -507,6 +524,16 @@ type
     ## Derived paths (nimcache dir, binary path) are computed by helpers —
     ## never stored — so a hand-built Entrypoint cannot carry a corrupt slug.
     path*:  string          # project-root-relative, '/' separated
+    tp*:    TrackedPath     ## RFC-0009 A3a-i: additive identity alongside
+                            ## `path`. Zero-value (tag 0, `rel: ""`) for any
+                            ## Entrypoint not built through `discover` --
+                            ## every hand-built fixture across today's suite
+                            ## constructs `Entrypoint(path: ..., group: ...)`
+                            ## and never sets this field, which is fine: the
+                            ## `tp.display == path` invariant is a producer
+                            ## obligation owned by `discover` alone (below),
+                            ## never a universal invariant over every
+                            ## Entrypoint value in existence.
     group*: string
     flags*: seq[string]     ## The EFFECTIVE compile flags: global then group, merged
                             ## at config-parse time (config.parseGroup).  (path, flags)
