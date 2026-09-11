@@ -236,7 +236,18 @@ suite "classify — root priority":
 suite "classify — symlinked dep root (NativeRoot.realAbs)":
 
   test "a candidate reaching classify via a symlinked root's realpath form classifies under that root's tag":
-    let base = getTempDir() / ("crisol_test_paths_symlink_" & $getCurrentProcessId())
+    let rawBase = getTempDir() / ("crisol_test_paths_symlink_" & $getCurrentProcessId())
+    createDir(rawBase)
+    # Resolve the base up front so the fixture's own paths are internally
+    # consistent. On macOS getTempDir() lives under /var/folders, itself a
+    # symlink to /private/var/folders; without this, the candidate below
+    # would be built in the /var (lexical) spelling while the dep root's
+    # realAbs (expandFilename'd) is the /private/var spelling, and the two
+    # would never prefix-match. Production never hands classify such a hybrid
+    # (a real-path candidate comes from closure's expandFilename'd
+    # IndexedFile.real, fully resolved) — this keeps the fixture faithful to
+    # that contract. No-op on Linux, where getTempDir() has no symlink.
+    let base = expandFilename(rawBase)
     let realDir = base / "real-dep-target"
     let linkDir = base / "dep-link"
     createDir(realDir)
