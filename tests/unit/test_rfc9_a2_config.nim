@@ -32,22 +32,33 @@ proc makeTmpDir(): string =
 
 suite "config — RFC-0009 A2: TrackedRoots wiring":
 
-  test "loadConfig populates cfg.trackedRoots.project from a real probe":
+  test "loadConfig populates + wires cfg.trackedRoots.project (functional, volume-independent)":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let cfgPath = writeFile(tmp, "crisol.kdl",
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    # Every file under `tmp` (a plain tmpfs/ext4 dir on Linux CI) is
-    # case-sensitive -- fpNone -- a real, deterministic probed value.
-    check cfg.trackedRoots.project.foldPolicy == fpNone
+    # A file under the project root classifies tag 0 through the WIRED
+    # trackedRoots -- a zero-value TrackedRoots would not. This proves
+    # population + functionality without pinning the fold-policy VALUE, which
+    # is a probed per-volume fact (fpNone on ext4, fpAsciiLower on APFS) tested
+    # in test_paths/test_fold_probe, never hardcoded here (that hardcoding was
+    # the round-3 macOS-leg flake: the real APFS probe correctly returns
+    # fpAsciiLower).
+    let pc = classify(cfg.projectRoot / "sub" / "x.nim", cfg.trackedRoots)
+    require pc.kind == pcTracked
+    check pc.tp.isProject
+    check pc.tp.display == "sub/x.nim"
     check cfg.trackedRoots.deps.len == 0
 
   test "convention-fallback config (no crisol.kdl) also populates trackedRoots":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let (cfg, _) = loadConfig(startDir = tmp)
-    check cfg.trackedRoots.project.foldPolicy == fpNone
+    let pc = classify(cfg.projectRoot / "sub" / "y.nim", cfg.trackedRoots)
+    require pc.kind == pcTracked
+    check pc.tp.isProject
+    check pc.tp.display == "sub/y.nim"
 
 # ---------------------------------------------------------------------------
 # Dep-root naming (R3-8)
