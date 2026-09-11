@@ -7,6 +7,8 @@ stage   = "rfc"
 profile = "rfc-flow@3"
 blocked_by = ["0001", "0004", "0005", "0007"]
 
+value = "high"
+size = "l"
 [[item]]
 id    = "i1"
 title = "\u00a71 type: private fields + accessor, add <, toNative mirror, rename to keyBytes, add fromCanonical constructor."
