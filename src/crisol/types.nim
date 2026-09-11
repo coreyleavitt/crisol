@@ -18,6 +18,10 @@ import std/[algorithm, hashes, options, random, sets]
 # `ptypes.`-qualified below and is NOT re-exported.
 import crisol/process/types as ptypes
 export ptypes.Outcome, ptypes.HermeticLevel
+# RFC-0009 A2: `Config.trackedRoots` (below) is a `paths.TrackedRoots` --
+# needed here just to name the field's type; paths.nim imports nothing from
+# this module (or anywhere else in the package), so this cannot cycle.
+import crisol/paths
 
 type
   IdentityKey* = distinct string
@@ -314,6 +318,17 @@ type
     depRoots*:           seq[string]  # optional additional source roots beyond the project root
                                      # (e.g. a sibling library under co-development); stdlib and
                                      # nimble-package paths are always excluded regardless
+    trackedRoots*:       TrackedRoots ## RFC-0009 A2: `projectRoot` + every configured dep root,
+                                     ## each root-tagged and its case-fold policy probed EAGERLY --
+                                     ## computed ONCE by config.loadConfig (all three projectRoot
+                                     ## origins: explicit KDL, git-root, cwd) via
+                                     ## paths.initTrackedRoots, then threaded down. Consumers trust
+                                     ## THIS value; they never re-derive a root's native path or
+                                     ## probe fold policy themselves. Zero-value (default, unset)
+                                     ## for a hand-built Config in a test/fixture that never touches
+                                     ## path identity -- matches every other Config field's
+                                     ## "omitted = zero value" convention (see e.g. TrustConfig
+                                     ## above).
     ## Memory-aware scheduling seeds (Feature B, RFC-0002 §Config keys).
     ## All are optional; none = unset (built-in defaults apply at wiring time).
     ## Option[int] (not int with 0-sentinel) matches Group.maxJobs / memAware encoding.

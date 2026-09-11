@@ -86,9 +86,10 @@
 ## - **Errors**: parse/validation failures raise `CrisolError(cekConfig)`.
 ##   A missing config (no `--config`, no file found) is NOT an error.
 
-import std/[os, options, sets, strutils]
+import std/[os, options, sets, strutils, tables]
 import nkdl
 import crisol/types
+import crisol/paths
 
 # ---------------------------------------------------------------------------
 # stateDirOf — single authoritative resolver for crisol's on-disk state dir
@@ -100,13 +101,18 @@ proc stateDirOf*(cfg: Config): string =
   ## `state-dir` — this is how a sandboxed container redirects crisol's build
   ## cache onto a mounted volume (e.g. /cache/crisol) that lives outside the
   ## project tree. Resolution order:
-  ##   1. CRISOL_STATE_DIR set (non-empty) -> absolutePath(env)
+  ##   1. CRISOL_STATE_DIR set (non-empty) -> nativeCanonicalize(env, cfg.projectRoot)
   ##   2. cfg.stateDir empty -> "" (caller signalled "no state dir"; e.g. some
   ##      runEntrypoint callers leave it unset and want the ledger disabled)
   ##   3. cfg.stateDir absolute -> use as-is
   ##   4. otherwise -> absolutePath(cfg.projectRoot / cfg.stateDir)
+  ##
+  ## RFC-0009 A2 (R3-25): step 1 used to be a bare `absolutePath(getEnv(...))`,
+  ## which joins a RELATIVE env value against the process cwd. `cfg.projectRoot`
+  ## is now the explicit base instead (never cwd); an already-absolute env
+  ## value is still normalized (dot-segments, redundant separators).
   let env = getEnv("CRISOL_STATE_DIR")
-  if env.len > 0: return absolutePath(env)
+  if env.len > 0: return nativeCanonicalize(env, cfg.projectRoot).path
   if cfg.stateDir.len == 0: return ""
   if cfg.stateDir.isAbsolute: return cfg.stateDir
   absolutePath(cfg.projectRoot / cfg.stateDir)
@@ -132,7 +138,7 @@ let DefaultGroups*: seq[Group] = @[
 # ---------------------------------------------------------------------------
 
 proc conventionConfig(root: string): Config =
-  Config(
+  result = Config(
     groups:             DefaultGroups,
     jobs:               0,
     timeoutSecs:        DefaultTimeoutSecs,
@@ -145,6 +151,11 @@ proc conventionConfig(root: string): Config =
     verifyCachePct:     DefaultVerifyCachePct,
     workerBinary:       "",
   )
+  # RFC-0009 A2: computed ONCE here too -- the convention-fallback origin
+  # (no crisol.kdl found) is one of projectRoot's three origins (§2); no
+  # dep roots are ever configured on this path.
+  result.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](),
+                                          stateDirOf(result))
 
 # ---------------------------------------------------------------------------
 # Walk-up: search for crisol.kdl from startDir upward → "" if not found
@@ -181,6 +192,15 @@ proc findGitRoot(startDir: string): string =
 
 proc cfgErr(msg: string) {.noReturn.} =
   raise newCrisolError(cekConfig, msg)
+
+proc safeRealAbs(p: string): string =
+  ## RFC-0009 A2: best-effort realpath, mirroring paths.nim's own private
+  ## `safeExpandFilename` fallback (degrade to `p` unchanged on any OSError/
+  ## ValueError -- e.g. a not-yet-existing dep-root path). Used ONLY for the
+  ## config-time dep-root alias check below; `paths.initTrackedRoots`
+  ## independently computes each `NativeRoot`'s own `realAbs` the same way.
+  try: expandFilename(p)
+  except OSError, ValueError: p
 
 proc validateStateDir(dir: string) =
   ## Reject any state-dir that is absolute or contains ".." components.
@@ -694,6 +714,12 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     stateDir           = DefaultStateDir
     globalFlags: seq[string]
     depRoots:   seq[string]
+    # RFC-0009 A2 (R3-8): raw (explicit-name-if-any, configured-path) pairs,
+    # one per `dep-roots` positional path argument, in encounter order.
+    # `depRoots` (above) stays exactly what it always was -- the flattened
+    # path list -- resolved/validated into `depRootSpecs` (below the parse
+    # loop) once every `dep-roots` node has been seen.
+    depRootRaw: seq[tuple[explicitName: Option[string], path: string]]
     # Memory-aware scheduling seeds (Feature B, RFC-0002 §Config keys).
     # All default to none; initAdmission resolves built-in fallbacks.
     memBudgetMb: Option[int]  = none(int)
@@ -761,7 +787,21 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       stateDir = requireStrArg(n, 0, "state-dir")
       validateStateDir(stateDir)
     of "flags":              globalFlags.add      collectStrArgs(n, "flags")
-    of "dep-roots":          depRoots.add         collectStrArgs(n, "dep-roots")
+    of "dep-roots":
+      # RFC-0009 A2 (R3-8): `dep-roots "path" [name="explicit"]` -- an
+      # OPTIONAL `name=` KDL property. Repeatable node (as before); a
+      # single node may still carry several positional paths (all default-
+      # named from their own basename) UNLESS `name=` is present, in which
+      # case exactly one path is required (a shared explicit name across
+      # several paths would be a silent, un-resolvable ambiguity).
+      let paths = collectStrArgs(n, "dep-roots")
+      let nameOpt = n.propStr("name")
+      if nameOpt.isSome and paths.len != 1:
+        cfgErr("config: 'dep-roots' name= requires exactly one path " &
+               "argument in the same node, got " & $paths.len)
+      for p in paths:
+        depRoots.add p
+        depRootRaw.add (explicitName: nameOpt, path: p)
     of "mem-budget-mb":
       let v = requireIntArg(n, "mem-budget-mb")
       if v < 0:
@@ -866,6 +906,39 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     else:
       warns.add makeConfigWarning(source, "top-level", n.name)
 
+  # RFC-0009 A2 (R3-8): resolve + validate dep-root NAMEs now that every
+  # `dep-roots` node has been seen. `depRootSpecs` is what
+  # `paths.initTrackedRoots` is built from below; `depRoots` (the plain path
+  # list) is untouched, unchanged behavior.
+  let projectRootAbs = nativeCanonicalize(projectRoot, projectRoot).path
+  var depRootSpecs: seq[tuple[name, native: string]]
+  var seenNamesFolded: Table[string, string]   # folded name -> original name
+  var seenReal:        Table[string, string]   # realAbs -> as-configured path
+  for entry in depRootRaw:
+    # Relative-dep-root base is projectRoot, NEVER cwd (§2's nativeCanonicalize
+    # never reads cwd itself) -- closes the closure.nim:357/depgraph.nim:927
+    # cwd-join bug on the root definitions themselves.
+    let depAbs = nativeCanonicalize(entry.path, projectRootAbs).path
+    let depReal = safeRealAbs(depAbs)
+    let effectiveName =
+      if entry.explicitName.isSome: entry.explicitName.get
+      else: depAbs.extractFilename()
+    if '/' in effectiveName or ':' in effectiveName:
+      cfgErr("config: dep-root name '" & effectiveName & "' must not " &
+             "contain '/' or ':' (path '" & entry.path & "')")
+    let folded = effectiveName.toLowerAscii()
+    if seenNamesFolded.hasKey(folded):
+      cfgErr("config: dep-root name '" & effectiveName & "' collides " &
+             "(case-insensitively) with '" & seenNamesFolded[folded] &
+             "' -- supply an explicit name= on one of them to disambiguate")
+    seenNamesFolded[folded] = effectiveName
+    if seenReal.hasKey(depReal):
+      cfgErr("config: dep-roots '" & seenReal[depReal] & "' and '" &
+             entry.path & "' both resolve to the same physical directory ('" &
+             depReal & "')")
+    seenReal[depReal] = entry.path
+    depRootSpecs.add (name: effectiveName, native: entry.path)
+
   # Second pass: parse groups, the perf-check block, and the reuse-check block
   # (globalFlags now complete for merge; both blocks have children so need
   # their own pass).
@@ -914,6 +987,10 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).
   )
+  # RFC-0009 A2: computed ONCE here -- the explicit/discovered-KDL-file
+  # origin (§2) -- from THIS SAME projectRoot and the validated depRootSpecs
+  # above (never re-derived downstream).
+  result.trackedRoots = initTrackedRoots(projectRoot, depRootSpecs, stateDirOf(result))
   validate(result, source, warns)
 
 # ---------------------------------------------------------------------------

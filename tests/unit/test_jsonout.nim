@@ -18,6 +18,7 @@ import std/[json, monotimes, options, os, sequtils, sets, strutils, times, unitt
 import std/posix as posix_mod
 import crisol/types
 import crisol/jsonout
+import crisol/paths
 import crisol/render
 import crisol/process/types as ptypes
 import crisol/runner  # for summarize
@@ -1686,8 +1687,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 23 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors; rev 23: rfc-0005 code-review R2-T8b cacheStats.trustRejects/corruptReads)":
-    check RunSchemaRevision == 24
+  test "RunSchemaRevision is 25 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors; rev 23: rfc-0005 code-review R2-T8b cacheStats.trustRejects/corruptReads; rev 24: rfc-0007 B1 top-level lateOrphansReaped; rev 25: RFC-0009 A2 top-level trackedRoots array)":
+    check RunSchemaRevision == 25
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default
@@ -1796,3 +1797,48 @@ suite "jsonout — closureToJson (crisol/closure/v1)":
                               recorded: false, closure: @[], closureHash: "")],
     )
     check parseJson(closureToJsonString(report)) == closureToJson(report)
+
+# ---------------------------------------------------------------------------
+# RFC-0009 A2 -- top-level trackedRoots evidence (RunSchemaRevision 25)
+# ---------------------------------------------------------------------------
+
+suite "jsonout - RFC-0009 A2: top-level trackedRoots evidence":
+
+  test "default (never populated) trackedRoots -> a single project entry, name empty":
+    let node = toJson(syntheticResults(), syntheticSummary())
+    require node.hasKey("trackedRoots")
+    let arr = node["trackedRoots"]
+    check arr.kind == JArray
+    check arr.len == 1
+    check arr[0]["name"].getStr == ""
+    check arr[0]["foldPolicy"].getStr == "none"
+
+  test "a real TrackedRoots with configured deps renders project + each dep, name+foldPolicy":
+    # Injected probe (paths.nim §3): fixes a deterministic FoldPolicy per
+    # root with no real filesystem/Windows round-trip needed.
+    proc fixedPolicy(rootAbs, stateDir: string): FoldPolicy =
+      if rootAbs.endsWith("dep-insensitive"): fpAsciiLower else: fpNone
+
+    let roots = initTrackedRoots(
+      "/tmp/rfc9-a2-jsonout-project",
+      @[(name: "sensitive-dep", native: "/tmp/dep-sensitive"),
+        (name: "insensitive-dep", native: "/tmp/dep-insensitive")],
+      "", fixedPolicy)
+
+    let node = toJson(syntheticResults(), syntheticSummary(), trackedRoots = roots)
+    require node.hasKey("trackedRoots")
+    let arr = node["trackedRoots"]
+    check arr.len == 3
+    check arr[0]["name"].getStr == ""
+    check arr[0]["foldPolicy"].getStr == "none"
+    check arr[1]["name"].getStr == "sensitive-dep"
+    check arr[1]["foldPolicy"].getStr == "none"
+    check arr[2]["name"].getStr == "insensitive-dep"
+    check arr[2]["foldPolicy"].getStr == "asciiLower"
+
+  test "toJsonString threads trackedRoots through identically to toJson":
+    let roots = initTrackedRoots("/tmp/rfc9-a2-jsonout-project2", @[], "",
+      proc (rootAbs, stateDir: string): FoldPolicy = fpAsciiLower)
+    let s = toJsonString(syntheticResults(), syntheticSummary(), trackedRoots = roots)
+    let node = parseJson(s)
+    check node["trackedRoots"][0]["foldPolicy"].getStr == "asciiLower"

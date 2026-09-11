@@ -5,6 +5,10 @@
 ##      (overriding cfg.stateDir).
 ##   2. env unset → stateDirOf == absolutePath(cfg.projectRoot / cfg.stateDir)
 ##   3. env unset + cfg.stateDir == "" → returns ""
+##   4. RFC-0009 A2 (R3-25): CRISOL_STATE_DIR set to a RELATIVE/odd value is
+##      routed through paths.nativeCanonicalize against cfg.projectRoot as the
+##      explicit base -- NEVER against the process cwd (config.nim:108's old
+##      bare `absolutePath(getEnv(...))` joined against cwd).
 ##
 ## Run with:
 ##   ./dev test tests/unit/test_statedirof.nim
@@ -59,3 +63,31 @@ suite "stateDirOf — CRISOL_STATE_DIR env override":
     )
     delEnv("CRISOL_STATE_DIR")
     check stateDirOf(cfg) == ""
+
+  test "RFC-0009 A2: relative CRISOL_STATE_DIR resolves against cfg.projectRoot, never cwd":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let cfg = loadKdl(tmp, "state-dir \".crisol\"\n")
+    # A cwd that is DELIBERATELY not cfg.projectRoot -- proves the base is
+    # projectRoot, not whatever the process happens to be running from.
+    let otherCwd = makeTmpDir()
+    defer: removeDir(otherCwd)
+    let origCwd = getCurrentDir()
+    setCurrentDir(otherCwd)
+    putEnv("CRISOL_STATE_DIR", "relative_state/../relative_state/sub")
+    try:
+      check stateDirOf(cfg) == cfg.projectRoot / "relative_state" / "sub"
+      check stateDirOf(cfg) != otherCwd / "relative_state" / "sub"
+    finally:
+      delEnv("CRISOL_STATE_DIR")
+      setCurrentDir(origCwd)
+
+  test "RFC-0009 A2: CRISOL_STATE_DIR with redundant separators normalizes":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let cfg = loadKdl(tmp, "state-dir \".crisol\"\n")
+    putEnv("CRISOL_STATE_DIR", tmp & "//nested///dir")
+    try:
+      check stateDirOf(cfg) == tmp / "nested" / "dir"
+    finally:
+      delEnv("CRISOL_STATE_DIR")

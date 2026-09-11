@@ -55,6 +55,10 @@ import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runn
                sandbox, cachedispatch, cacheregistry, cachetier, cacheport, cachetelemetry,
                resultcache, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
+# RFC-0009 A2: `RunReport.trackedRoots`'s type (below) is a `paths.TrackedRoots`
+# -- types.nim imports paths.nim itself but does not export it, so this
+# module needs its own import to name the type in RunReport's field.
+import crisol/paths
 # rfc-0007 A2b: `crisol/signals` (the process-global gotSignal flag) is no
 # longer needed to drive `interrupted` — `runner.execute`'s OWN Supervisor
 # now owns SIGINT/SIGTERM installation for the duration of the call
@@ -464,6 +468,18 @@ type
                                   ## installed, so there is nothing real to report; the CLI
                                   ## reads `rr.plan.settings.cacheStats` (not this field's
                                   ## "is it all zero?") to decide whether to show it at all.
+    trackedRoots*: TrackedRoots   ## RFC-0009 A2: the run's real `cfg.trackedRoots` (project
+                                  ## root + every configured dep root, each root-tagged and
+                                  ## fold-probed by config.loadConfig — see types.Config).
+                                  ## Threaded straight through from the plan-phase Config,
+                                  ## unchanged; the CLI passes this into jsonout.toJsonString's
+                                  ## `trackedRoots` param (rev 25) so the emitted evidence
+                                  ## reflects the ACTUAL run's roots, not jsonout's zero-value
+                                  ## default. A structural-early-exit RunReport
+                                  ## (structuralResult/structuralResultWithPlan below) leaves
+                                  ## this at its zero value — no Config was ever built on
+                                  ## that path — same "always-present, zero-value-is-honest"
+                                  ## convention as `cacheStats` above.
 
   VerifyDivergence* = object
     ## RFC-0005 B3b: one --verify-cache mismatch between the observation the
@@ -1662,6 +1678,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     verifyDivergences: verifyDivergences,
     verifyCouldNotReexec: verifyCouldNotReexec,  # RFC-0005 code-review SO4
     cacheStats:        cacheStats,  # RFC-0005 B2b
+    trackedRoots:      cfg.trackedRoots,  # RFC-0009 A2
   )
 
 # ---------------------------------------------------------------------------

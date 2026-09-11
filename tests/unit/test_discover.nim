@@ -9,6 +9,8 @@
 import std/[os, options, sequtils, strutils, sugar, unittest]
 import crisol/types
 import crisol/discover
+import crisol/paths
+import crisol/config
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -421,3 +423,54 @@ suite "toDiscoveredSet – test constructor":
     check gatedOut.len == 0
     check run[0].path == "tests/unit/test_a.nim"
     check run[1].path == "tests/unit/test_b.nim"
+
+# ---------------------------------------------------------------------------
+# RFC-0009 A2 — discover() trusts config.trackedRoots.project, not
+# config.projectRoot verbatim
+# ---------------------------------------------------------------------------
+
+suite "discover – RFC-0009 A2: trackedRoots.project over projectRoot verbatim":
+
+  test "a populated trackedRoots correctly resolves the walk root via classify":
+    let root = makeTempRoot("rfc9_a2_tracked")
+    defer: cleanupDir(root)
+    writeFixture(root, "test_a.nim")
+
+    var cfg = Config(
+      projectRoot: root,
+      groups: @[Group(name: "unit", globs: @["test_*.nim"])],
+    )
+    # trackedRoots built from the SAME root config.nim would have used --
+    # discover() must resolve its walk root by going THROUGH trackedRoots
+    # (classify lands pcOutside for the root itself, §2) rather than
+    # bypassing it, and land on the identical, correct result.
+    cfg.trackedRoots = initTrackedRoots(root, @[], "")
+
+    let ds = discover(cfg)
+    check ds.entries.len == 1
+    check ds.entries[0].path == "test_a.nim"
+
+  test "end-to-end via loadConfig: trackedRoots flows from config into discover":
+    let root = makeTempRoot("rfc9_a2_e2e")
+    defer: cleanupDir(root)
+    writeFixture(root, "test_a.nim")
+    writeFile(root / "crisol.kdl", "group \"unit\" { globs \"test_*.nim\" }\n")
+
+    let (cfg, _) = loadConfig(configPath = root / "crisol.kdl")
+    let ds = discover(cfg)
+    check ds.entries.len == 1
+    check ds.entries[0].path == "test_a.nim"
+
+  test "an unpopulated (zero-value) trackedRoots degrades to projectRoot verbatim":
+    let root = makeTempRoot("rfc9_a2_untracked")
+    defer: cleanupDir(root)
+    writeFixture(root, "test_a.nim")
+
+    # Config built the old way (no loadConfig/initTrackedRoots call) --
+    # trackedRoots is zero-value. discover() must still work exactly as
+    # before: every hand-built Config fixture across the existing suite
+    # follows this pattern.
+    let cfg = makeConfig(root, @[Group(name: "unit", globs: @["test_*.nim"])])
+    let ds = discover(cfg)
+    check ds.entries.len == 1
+    check ds.entries[0].path == "test_a.nim"

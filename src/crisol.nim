@@ -1246,7 +1246,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                               verifyFails = rr.verifyDivergences.len,
                               explainMiss = explainMissResolved,
                               cacheStats = rr.cacheStats,
-                              showCacheStats = cacheStatsResolved))
+                              showCacheStats = cacheStatsResolved,
+                              trackedRoots = rr.trackedRoots))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,

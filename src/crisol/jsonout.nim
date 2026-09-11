@@ -228,6 +228,7 @@
 
 import std/[json, options, os, sets]
 import crisol/types
+import crisol/paths  # RFC-0009 A2: TrackedRoots evidence (RunSchemaRevision 25)
 import crisol/config  # for stateDirOf
 import crisol/render  # for filterRecordsByTag
 import crisol/planview  # for warningsToJsonArray
@@ -260,7 +261,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 24
+const RunSchemaRevision* = 25
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -612,6 +613,22 @@ const RunSchemaRevision* = 24
   ##                     `run.evidence.escapees` instead (no new field —
   ##                     same field, same semantics as rfc-0007 A6a/B1's
   ##                     owning-slot escapee list).
+  ##   rev 25 (RFC-0009 A2) — top-level `trackedRoots` array: one entry per
+  ##                     tracked root (project first, tag 0, `name` == ""),
+  ##                     followed by each configured dep root in declared/
+  ##                     discovered order -- `{name, foldPolicy}` where
+  ##                     `foldPolicy` is `"none"` or `"asciiLower"` (paths.nim
+  ##                     §3's probed, per-root, injectable capability).
+  ##                     ALWAYS PRESENT (mirrors `substrate`/`lateOrphansReaped`
+  ##                     above) -- a caller that never threads a real
+  ##                     `TrackedRoots` gets the zero-value default's single
+  ##                     project entry (`name` "", `foldPolicy` "none"), never
+  ##                     an absent key. This revision number is also the one
+  ##                     the depRoot-member `ClosureEntry.closure` wire
+  ##                     spelling (`dep:<name>/rel`, RFC-0009 Contract
+  ##                     impacts) is named under -- that PRODUCER lands in a
+  ##                     later slice (A3d-iv); this slice reserves the
+  ##                     revision number and lands the `trackedRoots` array only.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -708,6 +725,30 @@ proc phaseToJson(p: ptypes.Phase): JsonNode =
       result[k] = v
 
 # ---------------------------------------------------------------------------
+# trackedRootsToJson -- RFC-0009 A2 (rev 25): {name, foldPolicy} per root
+# ---------------------------------------------------------------------------
+
+proc foldPolicyToJsonStr(p: FoldPolicy): string =
+  case p
+  of fpNone:       "none"
+  of fpAsciiLower: "asciiLower"
+
+proc rootToJson(r: NativeRoot): JsonNode =
+  result = newJObject()
+  result["name"]       = newJString(r.name)
+  result["foldPolicy"] = newJString(foldPolicyToJsonStr(r.foldPolicy))
+
+proc trackedRootsToJson(roots: TrackedRoots): JsonNode =
+  ## Project root first (tag 0, `name` == ""), then each configured dep root
+  ## in declared/discovered order -- mirrors `TrackedRoots`' own tagging
+  ## (paths.nim §1). Pure; no I/O, no re-probing (`foldPolicy`/`name` were
+  ## already resolved once, at `TrackedRoots` construction time).
+  result = newJArray()
+  result.add rootToJson(roots.project)
+  for d in roots.deps:
+    result.add rootToJson(d)
+
+# ---------------------------------------------------------------------------
 # toJson -- pure serializer
 # ---------------------------------------------------------------------------
 
@@ -724,7 +765,8 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
              verifyFails: int = 0;
              explainMiss: bool = false;
              cacheStats: CacheStats = CacheStats();
-             showCacheStats: bool = false): JsonNode =
+             showCacheStats: bool = false;
+             trackedRoots: TrackedRoots = default(TrackedRoots)): JsonNode =
   ## Pure: serialize to the crisol/run/v2 JsonNode.
   ## No I/O.
   ## cacheStats/showCacheStats: RFC-0005 B2b (rev 21) — when showCacheStats
@@ -770,6 +812,11 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   ## slot's result was already emitted, or that were unattributable at all
   ## (e.g. a setsid escape) -- populated by runner.execute() via its own
   ## ptr out-param.  Defaults to 0 (nothing of the kind occurred).
+  ## trackedRoots: RFC-0009 A2 (rev 25) -- rendered as the top-level
+  ## `trackedRoots` array (see the rev-25 schema-history entry above). A
+  ## caller that never threads a real `TrackedRoots` (default,
+  ## `default(TrackedRoots)`) gets the zero-value's single project entry --
+  ## same "always present, honest default" posture as `substrate`.
   ## compileBlock: M-report pass (a) segmented compile-reuse/cost-split block
   ## (crisol/compilereport.readCompileBlock), or nil when no telemetry exists
   ## (measureCompileReuse off). nil -> the "compileStats" field is OMITTED
@@ -916,6 +963,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   result["entrypoints"]      = entrypointsNode
   result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
   result["lateOrphansReaped"] = newJInt(lateOrphansReaped)  # rev 24 (rfc-0007 B1, §3)
+  result["trackedRoots"] = trackedRootsToJson(trackedRoots)  # rev 25 (RFC-0009 A2)
   result["warnings"]         = warningsToJsonArray(warnings)
   result["regressions"]      = regressionsNode  # C6: empty when perf-check disabled
   if compileBlock != nil:
@@ -963,7 +1011,8 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
                    verifyFails: int = 0;
                    explainMiss: bool = false;
                    cacheStats: CacheStats = CacheStats();
-                   showCacheStats: bool = false): string =
+                   showCacheStats: bool = false;
+                   trackedRoots: TrackedRoots = default(TrackedRoots)): string =
   ## Pure: compact JSON string of the crisol/run/v2 document.
   ## C3: filterTag threads through to toJson.
   ## policy: rfc-0007 A6b — threads through to toJson unchanged (see there).
@@ -973,9 +1022,10 @@ proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
   ## cacheStats/showCacheStats: RFC-0005 B2b (rev 21) — threads through to
   ## toJson unchanged.
   ## lateOrphansReaped: rfc-0007 B1 (rev 24) — threads through to toJson unchanged.
+  ## trackedRoots: RFC-0009 A2 (rev 25) — threads through to toJson unchanged.
   $toJson(results, summary, filterTag, warnings, memThrottledSlots, lateOrphansReaped,
          compileBlock, reuseAlerts, interrupted, policy, substrate, verifyFails,
-         explainMiss, cacheStats, showCacheStats)
+         explainMiss, cacheStats, showCacheStats, trackedRoots)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful

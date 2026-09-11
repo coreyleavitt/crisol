@@ -4,7 +4,10 @@
 ##   matchGlob*(glob, relPath: string): bool         — pure; directly unit-testable
 ##   toDiscoveredSet*(eps: seq[Entrypoint]): DiscoveredSet  — test constructor
 ##   discover*(config, selection): DiscoveredSet     — file-tree walk; derives root
-##                                                      from config.projectRoot
+##                                                      from config.trackedRoots.project
+##                                                      (RFC-0009 A2), degrading to
+##                                                      config.projectRoot verbatim only
+##                                                      when trackedRoots was never built
 ##
 ## Gate seam (separated from discover):
 ##   loadGateState*(config: Config): GateState       — effectful; reads env vars once
@@ -20,6 +23,7 @@
 
 import std/[algorithm, os, options, sequtils, sets, strutils, tables]
 import crisol/types
+import crisol/paths
 
 # ---------------------------------------------------------------------------
 # matchGlob — pure single-segment and multi-segment wildcard matcher
@@ -275,6 +279,37 @@ proc resolveFilesGroups(
         result.adHocPaths.add f
 
 # ---------------------------------------------------------------------------
+# effectiveProjectRoot — RFC-0009 A2: trust trackedRoots, not projectRoot verbatim
+# ---------------------------------------------------------------------------
+
+proc effectiveProjectRoot(config: Config): string =
+  ## Reads `config.trackedRoots.project`'s own native abs path rather than
+  ## `config.projectRoot` verbatim (docs/rfc/0009-path-identity.md §2/A2) --
+  ## the first of the 15+ downstream `projectRoot` re-derivations this RFC
+  ## collapses into "trust the TrackedRoots you were handed".
+  ##
+  ## `NativeRoot` deliberately exports neither `.abs` nor `.realAbs` (only
+  ## `.name`/`.foldPolicy` — paths.nim's own comment: a public raw-path
+  ## getter invites exactly the raw-string comparisons the eventual grep-gate
+  ## exists to flag). `classify` is the sanctioned way to recover it: fed the
+  ## SAME string `trackedRoots` was built from, it always canonicalizes to
+  ## exactly `roots.project`'s own native abs path and lands `pcOutside`
+  ## (classify's own "the root itself is a container, never a trackable
+  ## file" rule, §2) — `.native.path` IS that canonicalized root.
+  ##
+  ## Degrades to `config.projectRoot` verbatim (`pcTracked`, the branch below
+  ## that should never fire for a properly-populated `trackedRoots`) when
+  ## `trackedRoots` was never built at all -- a zero-value `TrackedRoots`
+  ## (a hand-built `Config` that never went through `config.loadConfig`/
+  ## `paths.initTrackedRoots`, the pervasive fixture pattern across today's
+  ## test suite) has an empty native root, so classifying any real absolute
+  ## path against it can never land `pcOutside`.
+  let pc = classify(config.projectRoot, config.trackedRoots)
+  case pc.kind
+  of pcOutside: pc.native.path
+  of pcTracked: config.projectRoot
+
+# ---------------------------------------------------------------------------
 # discover — main entry point
 # ---------------------------------------------------------------------------
 
@@ -306,7 +341,7 @@ proc discover*(
   ## entry.  Cross-group: the same file in two groups yields one entry PER group.
   ## Sort: returned sequence is sorted by (path, group).
 
-  let root = config.projectRoot
+  let root = effectiveProjectRoot(config)
 
   # 1. Collect .nim files under root (one pass; shared by selector expansion
   #    and group matching).  Root-relative, '/' separated.
