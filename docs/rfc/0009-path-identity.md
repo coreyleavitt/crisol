@@ -9,17 +9,17 @@ blocked_by = ["0001", "0004", "0005", "0007"]
 
 [[item]]
 id    = "i1"
-title = "\u00a71 type: private fields + display*() accessor; add < (over ident); toNative(pp,root) (mirror); keyBytes (was identBytes); add fromCanonic..."
+title = "\u00a71 type: private fields + accessor, add <, toNative mirror, rename to keyBytes, add fromCanonical constructor."
 state = "open"
 
 [[item]]
 id    = "i2"
-title = "\u00a73 probe: OS query first (Win FileCaseSensitiveInformation, mac pathconf _PC_CASE_SENSITIVE); create-and-stat fallback per-process-unique..."
+title = "\u00a73 probe: OS-query first, create-and-stat fallback, lazy+cached, injectable; probe failure \u21d2 full-run + no-cache."
 state = "open"
 
 [[item]]
 id    = "i3"
-title = "Native-canonicalizer slice: steps 1-2 (abs/norm/drive-letter/separator + fold) applied to ALL native paths entering SourceIndex/underAnyR..."
+title = "Native canonicalizer: apply abs/norm/drive-letter/fold to native paths in SourceIndex/underAnyRoot; add NativeAbs type."
 state = "open"
 
 [[item]]
@@ -29,7 +29,7 @@ state = "open"
 
 [[item]]
 id    = "i5"
-title = "A3b: real git repo; mixed-case via commit\u2192warm-run\u2192disk-rename-without-git-mv\u2192edit\u2192git diff -z --name-only; \u22652 entrypoints, diff names a ..."
+title = "A3b: git mixed-case rename, \u22652 entrypoints, diff names a transitive dep; assert dependent selected, independent not."
 state = "open"
 
 [[item]]
@@ -49,17 +49,17 @@ state = "open"
 
 [[item]]
 id    = "i9"
-title = "Unowned surfaces get owners: jsonout.loadLastRun, order.nim, depparse (\u2192A4b), cacheregistry.rootInsideStateDir, quarantine membership (co..."
+title = "Unowned surfaces (jsonout, depparse, cacheregistry, quarantine, planner, pipeline, workerplan) get owners; grep-gated."
 state = "open"
 
 [[item]]
 id    = "i10"
-title = "B4 split \u2192 B4a (native ci/run-tests.sh over tests/unit) / B4b (widen conformance[+integration per scope] + RFC-0007 line-555 tick); name ..."
+title = "B4 split \u2192 B4a (native run-tests.sh) / B4b (widen conformance+integration); subset-honesty; D2b tick text defined."
 state = "open"
 
 [[item]]
 id    = "i11"
-title = "B3c bucket (24 import-clean posix-assuming tests). Pin auditable bucket inventory (meta-test bucket\u222a == grep). Extend import-purity meta-..."
+title = "B3c bucket: 24 posix-assuming tests; pin auditable bucket inventory; extend import-purity meta-test to tests/support/."
 state = "open"
 
 [[item]]
@@ -69,7 +69,7 @@ state = "open"
 
 [[item]]
 id    = "i13"
-title = "\u00a71/\u00a72/\u00a75: total boundary returning classification (inProject | inDepRoot | outside), throw only where attribution required (fixes refuse-..."
+title = "\u00a71/\u00a72/\u00a75: total boundary returns classification (inProject|inDepRoot|outside); throw only where attribution required."
 state = "open"
 
 [[item]]
