@@ -2,11 +2,12 @@
 type    = "rfc"
 id      = "0001"
 title   = "RFC-0001 \u2014 crisol test runner"
-state   = "living"
+state   = "complete"
 stage   = "review"
 review  = "floor"
 profile = "rfc-flow@3"
 
+reason = "v1 conversion mapped complete->living to satisfy the done role; relabeled now that complete carries it."
 [[item]]
 id    = "i1"
 title = "Compile-only mode (--check): nim check sweep without running."
@@ -24,7 +25,7 @@ state = "open"
 
 [[item]]
 id    = "i4"
-title = "Sibling-consumer migrations (lib/cel, lib/kdl, proptest, fresco) \u2014 after amoxtli proves the model; their patterns inform C1 *now* (see St..."
+title = "Sibling-consumer migrations (lib/cel, lib/kdl, proptest, fresco) — after amoxtli proves the model; inform C1 now."
 state = "open"
 +++
 

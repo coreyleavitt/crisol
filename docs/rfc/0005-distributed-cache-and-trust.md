@@ -2,11 +2,11 @@
 type    = "rfc"
 id      = "0005"
 title   = "RFC-0005 \u2014 Distributed result cache, cryptographic trust & cache observability"
-state   = "living"
+state   = "complete"
 stage   = "review"
 review  = "floor"
 profile = "rfc-flow@3"
-blocked_by = ["0004", "0006", "0007"]
+reason = "v1 conversion mapped complete->living to satisfy the done role; relabeled now that complete carries it."
 +++
 
 # RFC-0005 — Distributed result cache, cryptographic trust & cache observability

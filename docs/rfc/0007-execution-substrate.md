@@ -8,19 +8,21 @@ review  = "pending"
 profile = "rfc-flow@3"
 blocked_by = ["0001", "0002", "0004"]
 
+value = "critical"
+size = "xl"
 [[item]]
 id    = "i1"
-title = "Interrupt never persists lastrun.json (stdout run/v2 with interrupted:true only). Invariant: a never-observed entrypoint must not silentl..."
+title = "Interrupt never persists lastrun.json (v2 interrupted:true only); never-observed entrypoint must not join --failed."
 state = "open"
 
 [[item]]
 id    = "i2"
-title = "lsUnsupported \u21d2 cacheable-with-label; lsFailed \u21d2 uncacheable (\u00a76). Extends the locked toUnobservable posture to limits; without it, any W..."
+title = "lsUnsupported ⇒ cacheable-with-label; lsFailed ⇒ uncacheable (§6); extends toUnobservable so openFiles keeps caching."
 state = "open"
 
 [[item]]
 id    = "i3"
-title = "Round-1's interrupt partial-results amendment stands (unchanged from round 1, still veto-able as documented there; now fully specified \u2014 ..."
+title = "Round-1's interrupt partial-results amendment stands, still veto-able; now fully specified (emission set, no-persist)."
 state = "open"
 +++
 

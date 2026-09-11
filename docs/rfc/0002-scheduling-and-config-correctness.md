@@ -2,14 +2,15 @@
 type    = "rfc"
 id      = "0002"
 title   = "RFC-0002 \u2014 Scheduling & config correctness"
-state   = "living"
+state   = "complete"
 stage   = "review"
 review  = "floor"
 profile = "rfc-flow@3"
 
+reason = "v1 conversion mapped complete->living to satisfy the done role; relabeled now that complete carries it."
 [[item]]
 id    = "i1"
-title = "These 4 are in the RFC's \"Open questions\" \u00a7, all with a lean (so likely architect-resolvable, not true forks): C cross-group exclusion (l..."
+title = "These 4 are in the RFC's Open Questions, each with a lean (architect-resolvable) — see Resolved (round 1) below."
 state = "open"
 +++
 

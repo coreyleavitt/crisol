@@ -2,25 +2,26 @@
 type    = "rfc"
 id      = "0004"
 title   = "RFC-0004 \u2014 Incremental, hermetic, observable execution"
-state   = "living"
+state   = "complete"
 stage   = "review"
 review  = "floor"
 profile = "rfc-flow@3"
 blocked_by = ["0001", "0002", "0003"]
 
+reason = "v1 conversion mapped complete->living to satisfy the done role; relabeled now that complete carries it."
 [[item]]
 id    = "i1"
-title = "tests/integration/test_max_jobs_overlap.nim \"uncapped: two probes DO overlap with jobs=2\" is FLAKY: 2/3 pass, 1/3 fail in isolation. Same..."
+title = "test_max_jobs_overlap.nim \"overlap with jobs=2\" is FLAKY (2/3 pass, 1/3 fail); same family as test_mem_throttle."
 state = "open"
 
 [[item]]
 id    = "i2"
-title = "Plausible CAUSAL link to C5: the test leaves memAware unset (none=AUTO). Before C5, procGroupRssBytes returned some(0) (the NSpgid bug), ..."
+title = "Plausible CAUSAL link to C5: memAware unset; NSpgid bug made procGroupRssBytes some(0), RSS feedback inert pre-C5."
 state = "open"
 
 [[item]]
 id    = "i3"
-title = "Recommended fix (my read): concurrency-cap tests (test_max_jobs_overlap) should set memAware: some(false) to ISOLATE the max-jobs-cap beh..."
+title = "Recommended fix: test_max_jobs_overlap should set memAware: some(false) to isolate the cap from the memory gate."
 state = "open"
 
 [[item]]
@@ -30,7 +31,7 @@ state = "open"
 
 [[item]]
 id    = "i5"
-title = "1. Thread SandboxSpec into the LIVE run path. Today execute()/the runner still spawn real test runs via the LEGACY forkExec/forkExecEnv \u2014..."
+title = "Thread SandboxSpec into the LIVE run path: runner still uses LEGACY forkExec/forkExecEnv, not forkExecEnvScratch."
 state = "open"
 +++
 

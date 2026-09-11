@@ -9,22 +9,22 @@ blocked_by = ["0004"]
 
 [[item]]
 id    = "i1"
-title = "FORK-R (Stage R mechanism) \u2014 native objcache.nim vs external ccache vs sccache. Rounds 1\u20132 sharpened the tension in both directions, so t..."
+title = "FORK-R (Stage R mechanism): native objcache.nim vs ccache vs sccache; rounds 1–2 sharpened the tension, a genuine fork."
 state = "open"
 
 [[item]]
 id    = "i2"
-title = "*Native* \u2014 dependency-free (crisol's demonstrated discipline), composes directly with <stateDir>/GC/telemetry/ledger, and requires zero c..."
+title = "Native: dependency-free, composes with stateDir/GC/telemetry, zero consumer changes; but new correctness surface."
 state = "open"
 
 [[item]]
 id    = "i3"
-title = "*ccache* \u2014 battle-tested; its direct mode already solves both the #include-closure soundness problem and the collision problem the native..."
+title = "ccache: battle-tested; direct mode solves #include-closure + collision problems, wraps cc for monolithic nim c."
 state = "open"
 
 [[item]]
 id    = "i4"
-title = "*sccache* \u2014 same content-addressed niche, plus native S3/redis backends that map directly onto RFC-0005's distributed-object door \u2014 the b..."
+title = "sccache: same content-addressed niche plus native S3/redis onto RFC-0005 distributed-object door; same cost as ccache."
 state = "open"
 
 [[item]]
@@ -39,12 +39,12 @@ state = "open"
 
 [[item]]
 id    = "i7"
-title = "native objcache.nim: dep-free, composes with stateDir/GC/telemetry, ZERO consumer-side change \u2014 BUT new correctness-critical surface + mu..."
+title = "native objcache.nim: dep-free, composes with stateDir/GC/telemetry, zero consumer change; new correctness surface."
 state = "open"
 
 [[item]]
 id    = "i8"
-title = "ccache: battle-tested, direct mode ALREADY solves #include-closure AND collision problems, wraps cc so works with MONOLITHIC nim c (no wo..."
+title = "ccache: direct mode solves #include-closure + collision problems (no worker) but must ship in every consumer image."
 state = "open"
 
 [[item]]
