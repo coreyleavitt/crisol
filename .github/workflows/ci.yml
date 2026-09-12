@@ -407,6 +407,18 @@ jobs:
           CRISOL_EXPECT_FOLD: fpAsciiLower
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a3bii_fold_selection.nim
 
+      # RFC-0009 A4b (D5): the load-bearing on-disk-case determinism
+      # property, cold vs warm -- a real git-free compile through
+      # runner.plan/execute (two entrypoints, divergent importer case,
+      # one real on-disk dependency). Self-probes this volume's case-
+      # sensitivity (no env injection, same convention as the A0-spike
+      # step above) -- NTFS is case-insensitive, so this is a real
+      # producer here, not a skip. A pinned per-file step, not a
+      # conformance sweep, mirroring the A3b-ii step immediately above.
+      - name: rfc-0009 A4b — closure member on-disk-case determinism (real NTFS probe)
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a4b_determinism.nim
+
   macos:
     runs-on: macos-latest
     steps:
@@ -457,6 +469,13 @@ jobs:
           # CRISOL_TEST_DIRS above) -- a leg mis-pinned to the wrong policy
           # fails loudly instead of silently halving the "proven on two
           # case-insensitive legs" claim.
+          #
+          # RFC-0009 A4b (D5): test_rfc9_a4b_determinism.nim (also under
+          # tests/conformance/) is swept in here the SAME way -- it
+          # self-probes this volume's case-sensitivity (no env needed) and
+          # is a real producer on APFS, mirroring how it gets a dedicated
+          # per-file step on the windows job (which runs conformance files
+          # individually rather than via CRISOL_TEST_DIRS sweep).
           CRISOL_EXPECT_FOLD: fpAsciiLower
         run: bash ci/run-tests.sh
 

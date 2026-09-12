@@ -27,6 +27,15 @@ import crisol/depgraph    # DepGraph, updateEntry, saveDepGraph,
                           # DepGraphFormatVersion, depgraphPath, flagHash
 import crisol/fnv         # chainedContentHash
 
+proc tpOf(p: string; roots: TrackedRoots): TrackedPath =
+  ## RFC-0009 A4b: `CompileInputs.files` is now `HashSet[TrackedPath]`.
+  ## Classify a project-relative or dep-root-absolute spelling (exactly the
+  ## strings `closureMemberSpelling` used to produce pre-A4b) against the
+  ## test's REAL `trackedRoots` — never a hand-computed identity.
+  let pc = classify(p, roots)
+  doAssert pc.kind == pcTracked, "test path failed to classify: " & p
+  pc.tp
+
 proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
   ## RFC-0009 A3c-ii: `DepGraphEntry.closure` is now `HashSet[TrackedPath]`.
   ## Every member here is a plain project-relative string, so a vacuous
@@ -163,9 +172,9 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
     check ext.headersHash == chainedContentHash(ext.headers, p.root)
 
     # files ⊇ headers ∪ source
-    check "native/add.c" in inputs.files
+    check tpOf("native/add.c", cfg.trackedRoots) in inputs.files
     for h in ext.headers:
-      check h in inputs.files
+      check tpOf(h, cfg.trackedRoots) in inputs.files
 
   test "dedup: the same header reported both relative and absolute appears once":
     let p = setupExtProject("dedup")
@@ -216,7 +225,7 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
     let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
     check inputs.externals.len == 1
     check inputs.externals[0].headers == @["native/add.h"]
-    check "native/add.h" in inputs.files
+    check tpOf("native/add.h", cfg.trackedRoots) in inputs.files
 
 suite "extractCompileInputs — cached external (carried-forward headers)":
 

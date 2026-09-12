@@ -68,7 +68,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_rfc9_golden_pin.nim
 
-import std/[json, options, os, sequtils, sets, unittest]
+import std/[json, options, os, sets, unittest]
 import crisol/types
 import crisol/keys
 import crisol/planner
@@ -242,15 +242,25 @@ suite "rfc9_golden_pin — depRoot vector (vendored reference, compute-at-runtim
 
     let closureSet = extractClosure(nimcacheDir, bname, epAbs, cfg)
 
+    # RFC-0009 A4b: closureSet is now HashSet[TrackedPath]. Build the
+    # expected members the same way production spells them — never a
+    # hand-computed absolute string.
     # Sanity: the entrypoint's own (relative) member is present.
-    check "tests/ep_with_dep.nim" in closureSet
-    # The depRoot member is present as an ABSOLUTE path, unchanged — main's
-    # own ingestion path (extractClosure -> toProjectRelative's fallback),
-    # never hand-typed by this test.
-    check depMemberAbs in closureSet
+    let expectedEp = fromCanonical("tests/ep_with_dep.nim", cfg.trackedRoots).get
+    check expectedEp in closureSet
+    # The depRoot member is present, classified via the SAME `classify` gate
+    # production uses — main's own ingestion path (extractClosure), never
+    # hand-typed by this test.
+    let depMemberClass = classify(depMemberAbs, cfg.trackedRoots)
+    check depMemberClass.kind == pcTracked
+    check depMemberClass.tp in closureSet
     check depMemberAbs.isAbsolute
 
-    let filesSeq = closureSet.toSeq
+    # chainedContentHash's inputs are derived identically to
+    # `depgraph.recordClosure`'s own derivation — the canonical
+    # TrackedPath->string spelling for hashing (project member: `display`;
+    # dep-root member: `toNative`).
+    let filesSeq = closureHashInputs(closureSet, cfg.trackedRoots)
 
     # chainedContentHash: cannot be a literal pin (embeds the checkout
     # location via depMemberAbs) — compare production's live output

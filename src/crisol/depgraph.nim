@@ -971,23 +971,19 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
     let carried = if key in graph.entries: graph.entries[key].externals else: @[]
     let inputs = extractCompileInputs(nimcacheDir, binaryName, epAbs, config,
                                       index, carried, ccRun)
-    # RFC-0009 A3c-ii: the string->TrackedPath conversion happens at this
-    # depgraph boundary (closure.nim's `extractCompileInputs` itself is not
-    # retyped this slice) — same classify/pcTracked conversion as load
-    # (`fromJson`, above); a member that classifies as pcOutside is dropped.
-    var tpClosure = initHashSet[TrackedPath]()
-    for member in inputs.files:
-      let pc = classify(member, config.trackedRoots)
-      if pc.kind == pcTracked: tpClosure.incl pc.tp
-    # Content hash is computed over `closureHashInputs(tpClosure, …)` — the
-    # SAME derivation `planner.decideCompile` uses at check time, from the
-    # SAME classify-filtered set. Hashing raw `inputs.files` here instead
-    # would diverge from the warm-load check whenever a member was dropped
-    # as pcOutside or reconstructs differently, making every entry look
-    # stale (the test_skipfresh regression). See `closureHashInputs`.
+    # RFC-0009 A4b: `extractCompileInputs` now returns `files` as
+    # `HashSet[TrackedPath]` directly — already filtered through
+    # `index.tracked`/`classify`'s pcTracked gate inside `closure.nim`
+    # (analyzeManifest only ever `incl`s a member after that check), so no
+    # re-classify round trip is needed at this boundary any more (the
+    # A3c-ii string->TrackedPath conversion this replaces).
+    #
+    # Content hash is computed over `closureHashInputs(inputs.files, …)` —
+    # the SAME derivation `planner.decideCompile` uses at check time, from
+    # the SAME classify-filtered set. See `closureHashInputs`.
     let contentHash = closureContentHash(
-      closureHashInputs(tpClosure, config.trackedRoots), config.projectRoot)
-    graph.updateEntry(ep.path, fHash, tpClosure, contentHash, protocolMajor,
+      closureHashInputs(inputs.files, config.trackedRoots), config.projectRoot)
+    graph.updateEntry(ep.path, fHash, inputs.files, contentHash, protocolMajor,
                       inputs.externals)
     if saveDepGraph(graph, config):
       result = (ok: true, error: "")

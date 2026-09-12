@@ -18,10 +18,15 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_closure_warm.nim
 
-import std/[os, sets, json, strutils, unittest]
+import std/[os, sets, json, strutils, unittest, options]
 import crisol/types
 import crisol/paths
 import crisol/closure
+
+proc projTp(rel: string; roots: TrackedRoots): TrackedPath =
+  ## RFC-0009 A4b test helper: build the expected project (tag-0) closure
+  ## member the SAME way production spells one.
+  fromCanonical(rel, roots).get
 
 proc writeManifest(dir, bname: string;
                    compile: seq[string]; link: seq[string]) =
@@ -70,7 +75,11 @@ suite "extractClosure — warm recompile (issue #5)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "test_ep", ep, cfg)
-    check cl == toHashSet(["tests/test_ep.nim", "tests/dep.nim", "src/proj.nim"])
+    check cl == toHashSet([
+      projTp("tests/test_ep.nim", cfg.trackedRoots),
+      projTp("tests/dep.nim", cfg.trackedRoots),
+      projTp("src/proj.nim", cfg.trackedRoots),
+    ])
 
   test "a {.compile.}d C/C++ external (@m-mangled, .c.o/.cpp.o but not .nim.*.o) is tracked, not misread as a module (D3c, issue #11)":
     ## Real evidence: tests/fixtures/golden_reuse/generated/ep_a/ep_a.json's
@@ -108,8 +117,12 @@ suite "extractClosure — warm recompile (issue #5)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "main", ep, cfg)
-    check cl == toHashSet(["tests/main.nim", "tests/fixture.c", "tests/weird.cpp"])
-    check "tests/fixture" notin cl     # never truncated to a bogus extensionless path
+    check cl == toHashSet([
+      projTp("tests/main.nim", cfg.trackedRoots),
+      projTp("tests/fixture.c", cfg.trackedRoots),
+      projTp("tests/weird.cpp", cfg.trackedRoots),
+    ])
+    check projTp("tests/fixture", cfg.trackedRoots) notin cl     # never truncated to a bogus extensionless path
 
   test "a module compiled to .cpp or .m (sfCompileToCpp/importobjc) is not silently dropped":
     ## Nim 2.2.10 cgen's `getCFile` picks the module's C file extension
@@ -141,7 +154,10 @@ suite "extractClosure — warm recompile (issue #5)":
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "main", ep, cfg)
     check cl == toHashSet([
-      "tests/main.nim", "tests/cppmod.nim", "tests/objcmod.nim", "src/proj.nim",
+      projTp("tests/main.nim", cfg.trackedRoots),
+      projTp("tests/cppmod.nim", cfg.trackedRoots),
+      projTp("tests/objcmod.nim", cfg.trackedRoots),
+      projTp("src/proj.nim", cfg.trackedRoots),
     ])
 
   test "raises cekEnvironment when link is present but empty (R3)":

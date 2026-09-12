@@ -12,7 +12,7 @@
 ##
 ## When @p body resolves under exactly ONE tracked root, behavior is unchanged.
 
-import std/[os, sets, json]
+import std/[os, sets, json, options]
 import crisol/types
 import crisol/paths
 import crisol/closure
@@ -75,7 +75,9 @@ block test_r7_ambiguous_at_p_includes_all_matching_roots:
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
 
   # projRoot/src/shared.nim → "src/shared.nim" must be in closure.
-  assert "src/shared.nim" in closureSet,
+  # RFC-0009 A4b: closureSet is now HashSet[TrackedPath].
+  let expectedProjShared = fromCanonical("src/shared.nim", cfg.trackedRoots).get
+  assert expectedProjShared in closureSet,
     "R7: projRoot/src/shared.nim must be in closure. Got: " & $closureSet
 
   # SOUNDNESS CHECK: depRoot/src/shared.nim must ALSO be in the closure.
@@ -119,7 +121,9 @@ block test_r7_unambiguous_at_p_exact_single_result:
   cfg.trackedRoots = initTrackedRoots(projRoot, @[(name: "dep", native: depRoot)], ".crisol")
 
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
-  assert "src/only.nim" in closureSet,
+  # RFC-0009 A4b: closureSet is now HashSet[TrackedPath].
+  let expectedOnly = fromCanonical("src/only.nim", cfg.trackedRoots).get
+  assert expectedOnly in closureSet,
     "R7: unambiguous @p file under projectRoot/src must be in closure. Got: " & $closureSet
   assert closureSet.len == 1,
     "R7: unambiguous @p should yield exactly 1 closure entry. Got: " & $closureSet

@@ -160,9 +160,8 @@
 ##
 ## ## Return value
 ##
-## A `HashSet[string]` of paths relative to `projectRoot`, using forward
-## slashes, matching the scheme used by `Entrypoint.path` and future
-## dep-graph keys.  The entrypoint's own file is included (its object is in
+## A `HashSet[TrackedPath]` (RFC-0009 A4b).  The entrypoint's own file is
+## included (its object is in
 ## `link`).  A `{.compile.}`d external in single-path (`@m`/`@p`/`@n`) form is
 ## included too (D3c, issue #11) — `moduleMangledNameOf`'s
 ## `.nim.{c,cpp,m}.o` filter correctly identifies it as NOT a module object
@@ -509,30 +508,20 @@ proc addUnique(result: var seq[string]; seen: var HashSet[string];
       result.add cand
 
 proc closureMemberSpelling(tp: TrackedPath; roots: TrackedRoots): string =
-  ## RFC-0009 A4a (D3, D5 — CORRECTED per coordinator): the wire/return
-  ## spelling for one closure member, converting a `TrackedPath` back to the
-  ## `HashSet[string]` `extractClosure`/`extractCompileInputs` still return
-  ## (A4b retypes the return itself). Project (tag-0) members spell as
-  ## their project-relative rel (`display`) — byte-identical to the old
-  ## `toProjectRelative`'s primary-branch output. Dep-root members spell as
-  ## their ABSOLUTE native path (`toNative`) — byte-identical to the old
-  ## `toProjectRelative`'s "shouldn't happen post-filter" fallback (a
-  ## dep-root candidate never matched project's root, lexical or real, so
-  ## it always fell through to `result = norm` there).
-  ##
-  ## This is NOT an arbitrary choice: `depgraph.recordClosure` re-classifies
-  ## every returned string via `classify(member, config.trackedRoots)`
-  ## (depgraph.nim ~980) to recover its `TrackedPath` for hashing/
-  ## persistence. `classify` on a bare RELATIVE string always attributes it
-  ## to the PROJECT root (`nativeCanonicalize` unconditionally joins a
-  ## relative candidate against `roots.project.abs`, and the project check
-  ## runs first and unconditionally succeeds) — a dep root's tag can never
-  ## be recovered from a bare rel string, only from an absolute path
-  ## (`classify`'s dep-root loop prefix-matches `d.abs`/`d.realAbs`). So a
-  ## dep-root member MUST spell as an absolute path for that downstream
-  ## `classify` call to round-trip soundly; a project member is unambiguous
-  ## either way and spells as the shorter, human-facing rel form, matching
-  ## every pre-A4a caller's expectation.
+  ## RFC-0009 A4b: post-retype, `extractClosure`/`extractCompileInputs`
+  ## return `TrackedPath` directly — this helper is no longer used at
+  ## THAT boundary. It survives for the two remaining string-spelling
+  ## needs inside `extractCompileInputs`: `AnalyzedExternal.source` (a
+  ## plain `string` field, unretyped — see its type doc) and
+  ## `ExternalSource.headers: seq[string]` (the persisted/wire header
+  ## list, also unretyped this slice). Project (tag-0) members spell as
+  ## their project-relative rel (`display`); dep-root members spell as
+  ## their ABSOLUTE native path (`toNative`) — see `fromCanonical`/
+  ## `classify`'s doc comments for why a dep-root member must spell
+  ## absolute to round-trip soundly through a later bare-string
+  ## `classify` call (still relevant to any caller that persists one of
+  ## these strings and reclassifies it later, e.g. a carried-forward
+  ## `ExternalSource.headers` entry read back via `index.tracked`).
   if isProject(tp): display(tp)
   else: toNative(tp, roots)
 
@@ -916,8 +905,8 @@ type
     headersHash*: string    ## chainedContentHash(headers, projectRoot)
 
   CompileInputs* = object
-    files*:     HashSet[string]  ## extractClosure result UNION every
-                                  ## external's headers
+    files*:     HashSet[TrackedPath]  ## extractClosure result UNION every
+                                       ## external's headers (RFC-0009 A4b)
     externals*: seq[ExternalSource]
 
   AnalyzedExternal = object
@@ -1090,7 +1079,7 @@ proc analyzeManifest(nimcacheDir: string;
   ##                    per entrypoint; the overload below builds one ad hoc
   ##                    for tests/one-off callers.
   ##
-  ## Returns a `HashSet[string]` of projectRoot-relative, forward-slash paths.
+  ## Returns a `HashSet[TrackedPath]` (RFC-0009 A4b).
   ##
   ## Raises `CrisolError(cekEnvironment)` if the JSON is missing or unparseable.
   ##
@@ -1251,8 +1240,10 @@ proc analyzeManifest(nimcacheDir: string;
         # as an AnalyzedExternal for header derivation. Matched against
         # `objToCcCmd` by the SAME `objPath` this iteration is processing
         # (not `resolved`/`tp` — the match is object-to-object, source
-        # resolution is a separate concern). `source` mirrors the SAME
-        # spelling `files` returns at the boundary (`closureMemberSpelling`).
+        # resolution is a separate concern). `AnalyzedExternal.source` is a
+        # plain `string` field (unretyped this slice), spelled via
+        # `closureMemberSpelling` — the same spelling `extractClosure` used
+        # to return pre-A4b.
         let objKey = objPath.normalizedPath
         let hasCcCmd = objKey in objToCcCmd
         let ccCmd = if hasCcCmd: objToCcCmd[objKey] else: ""
@@ -1285,7 +1276,7 @@ proc extractClosure*(nimcacheDir: string;
                      binaryName: string;
                      entrypoint: string;
                      config: Config;
-                     index: SourceIndex): HashSet[string] =
+                     index: SourceIndex): HashSet[TrackedPath] =
   ## Extract the source-dependency closure for one compiled entrypoint.
   ##
   ## Parameters:
@@ -1301,7 +1292,10 @@ proc extractClosure*(nimcacheDir: string;
   ##                    per entrypoint; the overload below builds one ad hoc
   ##                    for tests/one-off callers.
   ##
-  ## Returns a `HashSet[string]` of projectRoot-relative, forward-slash paths.
+  ## Returns a `HashSet[TrackedPath]` (RFC-0009 A4b — retyped from the
+  ## `HashSet[string]` this proc returned pre-A4b; callers that need the
+  ## wire/display spelling of a member use `closureMemberSpelling` or the
+  ## TrackedPath accessors directly, e.g. `display`/`toNative`).
   ##
   ## Thin wrapper over `analyzeManifest` (issue #16 refactor) — see that
   ## proc's doc comment, and the module doc comment above, for the full
@@ -1310,20 +1304,12 @@ proc extractClosure*(nimcacheDir: string;
   ## `CrisolError(cekEnvironment)` under the same conditions documented
   ## there (missing/unparseable manifest; empty `link`; no `depfiles` key;
   ## a tuple-form `{.compile.}` object; a non-absolute `{.link.}` entry).
-  # RFC-0009 A4a (D5, CORRECTED): convert the internal `HashSet[TrackedPath]`
-  # accumulation back to the `HashSet[string]` this proc still returns (A4b
-  # retypes the return itself) — see `closureMemberSpelling`'s doc comment
-  # for why this spelling (not bare `display`) is what keeps
-  # `depgraph.recordClosure`'s downstream `classify` round-trip sound.
-  let tpFiles = analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index).files
-  result = initHashSet[string]()
-  for tp in tpFiles:
-    result.incl closureMemberSpelling(tp, index.trackedRoots)
+  analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index).files
 
 proc extractClosure*(nimcacheDir: string;
                      binaryName: string;
                      entrypoint: string;
-                     config: Config): HashSet[string] =
+                     config: Config): HashSet[TrackedPath] =
   ## Convenience overload for tests/one-offs: builds a fresh `SourceIndex`
   ## from `config` and delegates.  Production callers (`depgraph.recordClosure`
   ## via `runner.execute`) build the index ONCE per run instead — see the
@@ -1397,10 +1383,11 @@ proc extractCompileInputs*(nimcacheDir: string;
   for c in carried:
     carriedBySource[c.source] = c
 
-  # RFC-0009 A4a (D4): `files` stays the `HashSet[TrackedPath]`
+  # RFC-0009 A4b: `files` stays the `HashSet[TrackedPath]`
   # `analyzeManifest` already accumulated; every header folded in below adds
-  # its own `pc.tp`, converted back to `HashSet[string]` only at the very
-  # end (`closureMemberSpelling`, matching D5's corrected boundary).
+  # its own `pc.tp` directly — `CompileInputs.files` is itself
+  # `HashSet[TrackedPath]` now, so no string round-trip at the return
+  # boundary any more.
   var files = analyzed.files
   var externals: seq[ExternalSource] = @[]
 
@@ -1420,7 +1407,7 @@ proc extractCompileInputs*(nimcacheDir: string;
           "'cc -M' header probe failed for '" & ext.source & "'" &
           " (command: " & inv.cmd & ")")
 
-      var kept: seq[string] = @[]
+      var keptTp: seq[TrackedPath] = @[]
       var seen = initHashSet[TrackedPath]()
         ## RFC-0009 A4a (D4): the header-dedup set, retyped to TrackedPath —
         ## same classify gate as every other soundness check in this module.
@@ -1433,7 +1420,16 @@ proc extractCompileInputs*(nimcacheDir: string;
         let tpH = pcH.tp
         if tpH notin seen:
           seen.incl tpH
-          kept.add closureMemberSpelling(tpH, index.trackedRoots)
+          keptTp.add tpH
+      # RFC-0009 A4b (D1): the keeplist itself stays TrackedPath through
+      # dedup — only converted to the `ExternalSource.headers: seq[string]`
+      # wire spelling here, at the point a string is actually required
+      # (`headersHash`/persistence). Sorting on the spelling (not on the
+      # TrackedPath) keeps this byte-identical to the pre-A4b string-keyed
+      # `kept.sort()`.
+      var kept = newSeq[string](keptTp.len)
+      for i, tp in keptTp:
+        kept[i] = closureMemberSpelling(tp, index.trackedRoots)
       kept.sort()
       headers = kept
     else:
@@ -1460,10 +1456,6 @@ proc extractCompileInputs*(nimcacheDir: string;
       if pcHdr.kind == pcTracked:
         files.incl pcHdr.tp
 
-  # RFC-0009 A4a (D5, CORRECTED): convert the internal `HashSet[TrackedPath]`
-  # back to `CompileInputs.files: HashSet[string]` (unchanged return type —
-  # A4b's concern) via the same spelling `extractClosure` uses.
-  var stringFiles = initHashSet[string]()
-  for tp in files:
-    stringFiles.incl closureMemberSpelling(tp, index.trackedRoots)
-  result = CompileInputs(files: stringFiles, externals: externals)
+  # RFC-0009 A4b: `CompileInputs.files` is `HashSet[TrackedPath]` — return
+  # the accumulated set directly, no string round-trip at the boundary.
+  result = CompileInputs(files: files, externals: externals)

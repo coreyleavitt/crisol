@@ -20,7 +20,7 @@
 ## With R5 fix: dep.nim appears in the closure even when absent on disk →
 ## isEntryStale detects the missing file → entrypoint is included as stale.
 
-import std/[os, sets, json]
+import std/[os, sets, json, options]
 import crisol/types
 import crisol/paths
 import crisol/closure
@@ -83,8 +83,11 @@ block test_r5_deleted_at_m_dep_still_in_closure:
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
 
   # "tests/dep_r5.nim" must appear in the closure even though the file is gone.
-  # (Project-root-relative path from root/tests/dep_r5.nim)
-  assert "tests/dep_r5.nim" in closureSet,
+  # (Project-root-relative path from root/tests/dep_r5.nim) — RFC-0009 A4b:
+  # closureSet is now HashSet[TrackedPath]; build the expected member the
+  # same way the code spells a project-relative member.
+  let expectedDep = fromCanonical("tests/dep_r5.nim", cfg.trackedRoots).get
+  assert expectedDep in closureSet,
     "R5: deleted @m dep must still be recorded in closure. Got: " & $closureSet
 
 block test_r5_existing_at_m_dep_still_in_closure:
@@ -111,7 +114,8 @@ block test_r5_existing_at_m_dep_still_in_closure:
   cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
 
-  assert "tests/dep_existing.nim" in closureSet,
+  let expectedDep = fromCanonical("tests/dep_existing.nim", cfg.trackedRoots).get
+  assert expectedDep in closureSet,
     "R5: existing @m dep must still be in closure. Got: " & $closureSet
 
 block test_r5_at_m_dep_outside_tracked_root_excluded:
@@ -148,7 +152,8 @@ block test_r5_at_m_dep_outside_tracked_root_excluded:
 
   # "tests/some_stdlib_lookalike.nim" resolves to root/tests/some_stdlib_lookalike.nim
   # That IS under root → it SHOULD be in closure (non-existent but under tracked root)
-  assert "tests/some_stdlib_lookalike.nim" in closureSet,
+  let expectedDep = fromCanonical("tests/some_stdlib_lookalike.nim", cfg.trackedRoots).get
+  assert expectedDep in closureSet,
     "R5: @m dep under tracked root must be in closure even when absent. Got: " & $closureSet
 
 echo "PASS test_soundness_r5"

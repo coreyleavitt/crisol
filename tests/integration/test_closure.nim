@@ -18,7 +18,7 @@
 ## All three tests also assert: no stdlib path is returned (every returned path
 ## is projectRoot-relative and resolves to an existing file under projectRoot).
 
-import std/[os, sets, strutils, unittest]
+import std/[os, sets, strutils, unittest, options]
 import crisol/closure
 import crisol/types
 import crisol/paths
@@ -68,6 +68,13 @@ let projectTrackedRoots = initTrackedRoots(projectRoot,
   ## matching this file's fixed `projectRoot` (the checkout itself) — not
   ## the zero-value default, exactly as `config.loadConfig` builds it.
 
+proc projTp(rel: string): TrackedPath =
+  ## RFC-0009 A4b test helper: build the expected project (tag-0) closure
+  ## member the same way production spells one, against this file's fixed
+  ## `projectTrackedRoots` (no depRoots configured here, so every member is
+  ## project-tagged).
+  fromCanonical(rel, projectTrackedRoots).get
+
 # ---------------------------------------------------------------------------
 # Test 1 — relative-import chain (@m), no extraDep
 # ---------------------------------------------------------------------------
@@ -81,9 +88,9 @@ suite "extractClosure — @m relative import chain":
                         trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
-    check "tests/fixtures/deptest_main.nim" in cl
-    check "tests/fixtures/deptest_dep.nim"  in cl
-    check "tests/fixtures/deptest_dep2.nim" in cl
+    check projTp("tests/fixtures/deptest_main.nim") in cl
+    check projTp("tests/fixtures/deptest_dep.nim")  in cl
+    check projTp("tests/fixtures/deptest_dep2.nim") in cl
 
   test "closure does NOT contain deptest_extra without -d:extraDep":
     let src    = fixtureDir / "deptest_main.nim"
@@ -92,7 +99,7 @@ suite "extractClosure — @m relative import chain":
                         trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
-    check "tests/fixtures/deptest_extra.nim" notin cl
+    check projTp("tests/fixtures/deptest_extra.nim") notin cl
 
   test "every returned path is projectRoot-relative and exists under projectRoot":
     let src    = fixtureDir / "deptest_main.nim"
@@ -101,7 +108,8 @@ suite "extractClosure — @m relative import chain":
                         trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
-    for p in cl:
+    for tp in cl:
+      let p = display(tp)
       # Must not be absolute.
       check not p.isAbsolute
       # Must not contain stdlib indicators.
@@ -169,10 +177,10 @@ suite "extractClosure — flag-sensitive closure":
                         trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
-    check "tests/fixtures/deptest_main.nim"  in cl
-    check "tests/fixtures/deptest_dep.nim"   in cl
-    check "tests/fixtures/deptest_dep2.nim"  in cl
-    check "tests/fixtures/deptest_extra.nim" in cl
+    check projTp("tests/fixtures/deptest_main.nim")  in cl
+    check projTp("tests/fixtures/deptest_dep.nim")   in cl
+    check projTp("tests/fixtures/deptest_dep2.nim")  in cl
+    check projTp("tests/fixtures/deptest_extra.nim") in cl
 
 # ---------------------------------------------------------------------------
 # Test 3 — @p soundness case: --path:src project modules are tracked
@@ -189,7 +197,7 @@ suite "extractClosure — @p soundness (--path:src project modules tracked)":
     let cl     = extractClosure(nc, bn, src, config)
 
     # The critical assertion: @p-mangled project source is in the closure.
-    check "src/crisol/depparse.nim" in cl
+    check projTp("src/crisol/depparse.nim") in cl
 
   test "stdlib paths are excluded from @p closure":
     let src    = fixtureDir / "pathimport_main.nim"
@@ -201,7 +209,8 @@ suite "extractClosure — @p soundness (--path:src project modules tracked)":
                         trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
-    for p in cl:
+    for tp in cl:
+      let p = display(tp)
       # system.nim, std/*, etc. must not appear
       check not p.startsWith("lib/")
       check not p.contains("system.nim")
@@ -225,7 +234,7 @@ suite "extractClosure — @p soundness (--path:src project modules tracked)":
 
     # depparse currently does NOT import types.nim — this is expected.
     # If this fails after a refactor, verify depparse's imports and update.
-    check "src/crisol/types.nim" notin cl
+    check projTp("src/crisol/types.nim") notin cl
 
 # ---------------------------------------------------------------------------
 # Test 5 — R1 regression: a real {.compile.}d C external must not become a
@@ -249,11 +258,11 @@ suite "extractClosure — real {.compile.}d external (R1 regression, issue #5 fi
                             trackedRoots: projectTrackedRoots)
     let cl         = extractClosure(nc, bn, src, config)
 
-    check "tests/fixtures/golden_reuse/ep_a.nim" in cl
-    check "tests/fixtures/golden_reuse/fixture_substrate.nim" in cl
+    check projTp("tests/fixtures/golden_reuse/ep_a.nim") in cl
+    check projTp("tests/fixtures/golden_reuse/fixture_substrate.nim") in cl
 
-    for p in cl:
-      check fileExists(projectRoot / p)
+    for tp in cl:
+      check fileExists(projectRoot / display(tp))
 
 # ---------------------------------------------------------------------------
 # Test 6 — missing JSON raises CrisolError(cekEnvironment)

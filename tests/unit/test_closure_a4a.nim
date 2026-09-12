@@ -108,10 +108,10 @@ block test_a4a_symlinked_dep_root_realpath_candidate_classifies_tracked:
   writeManifestWithDepfile(nc, "t", realCandidate)
 
   let closureSet = extractClosure(nc, "t", ep, cfg, index)
-  let expectedSpelling = toNative(pc.tp, cfg.trackedRoots)
-  assert expectedSpelling in closureSet,
+  # RFC-0009 A4b: closureSet is now HashSet[TrackedPath] — assert the
+  # TrackedPath identity directly, no string round-trip needed.
+  assert pc.tp in closureSet,
     "A4a bug #2: the symlinked-dep-root realpath candidate must be RETAINED " &
-    "in the closure (dep-tagged member spells as its absolute native path, " &
-    "RFC-0009 A4a corrected-D5). Got: " & $closureSet
+    "in the closure (dep-tagged member, RFC-0009 A4a/A4b). Got: " & $closureSet
 
 echo "PASS test_closure_a4a"

@@ -11,10 +11,22 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_source_index.nim
 
-import std/[os, sets, json, strutils, unittest]
+import std/[os, sets, json, strutils, unittest, options]
 import crisol/types
 import crisol/paths
 import crisol/closure
+
+proc projTp(rel: string; roots: TrackedRoots): TrackedPath =
+  ## RFC-0009 A4b test helper: build the expected project (tag-0) closure
+  ## member the SAME way production spells one — `fromCanonical` on a
+  ## project-relative rel string.
+  fromCanonical(rel, roots).get
+
+proc depTp(absPath: string; roots: TrackedRoots): TrackedPath =
+  ## RFC-0009 A4b test helper: build the expected dep-root closure member
+  ## by classifying its real absolute path — the same soundness gate
+  ## production uses (`index.tracked`/`classify`).
+  classify(absPath, roots).tp
 
 proc writeManifest(dir, bname: string;
                    compile: seq[string]; link: seq[string]) =
@@ -62,7 +74,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check cl == toHashSet([
-      "tests/t.nim", "lib/foo/src/foo.nim", "lib/bar/src/bar/util.nim",
+      projTp("tests/t.nim", cfg.trackedRoots),
+      projTp("lib/foo/src/foo.nim", cfg.trackedRoots),
+      projTp("lib/bar/src/bar/util.nim", cfg.trackedRoots),
     ])
 
   test "suffix boundary: body util.nim does not match a decoy with a different basename":
@@ -86,9 +100,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "src/util.nim" in cl
-    check "src/myutil.nim" notin cl
-    check cl == toHashSet(["tests/t.nim", "src/util.nim"])
+    check projTp("src/util.nim", cfg.trackedRoots) in cl
+    check projTp("src/myutil.nim", cfg.trackedRoots) notin cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("src/util.nim", cfg.trackedRoots)])
 
   test "@n prefix resolves exactly like @p":
     let root = freshRoot("nprefix")
@@ -106,7 +120,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check cl == toHashSet(["tests/t.nim", "vendor/foo.nim"])
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("vendor/foo.nim", cfg.trackedRoots)])
 
   test "index exclusions: state dir, hidden dir, nimcache dir, and a nested symlinked dir are never candidates":
     let root = freshRoot("excl")
@@ -141,7 +155,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check cl == toHashSet(["tests/t.nim"])
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots)])
 
   test "a dep-root that is itself a symlink is walked, resolving to its lexical path":
     ## config.depRoots = @[root/"_deps"/"lib"] where that path is a symlink
@@ -193,8 +207,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     cfg.trackedRoots = initTrackedRoots(projRoot, @[(name: "dep", native: depRootPath)], ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     let expected = depRootPath / "src" / "dep.nim"
-    check expected in cl
-    check cl == toHashSet(["tests/t.nim", expected])
+    let expectedTp = depTp(expected, cfg.trackedRoots)
+    check expectedTp in cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), expectedTp])
 
   test "trigger A: in-root relative import shorter from a --path root (leading .. body)":
     ## `--path:src` importing `../lib/x.nim` — Nim's mangler emits the
@@ -217,8 +232,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "lib/x.nim" in cl
-    check cl == toHashSet(["tests/unit/deep/t.nim", "lib/x.nim"])
+    check projTp("lib/x.nim", cfg.trackedRoots) in cl
+    check cl == toHashSet([projTp("tests/unit/deep/t.nim", cfg.trackedRoots), projTp("lib/x.nim", cfg.trackedRoots)])
 
   test "decoy sanity: a leading-.. body still enforces the basename boundary":
     ## Stripping leading ".."/"."/""'" components from the body must not
@@ -246,9 +261,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "src/x.nim" in cl
-    check "lib/zx.nim" notin cl
-    check cl == toHashSet(["tests/t.nim", "src/x.nim"])
+    check projTp("src/x.nim", cfg.trackedRoots) in cl
+    check projTp("lib/zx.nim", cfg.trackedRoots) notin cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("src/x.nim", cfg.trackedRoots)])
 
   test "@c (colon) and @h (hash) mangling escapes are decoded in a directory component":
     ## Nim rejects `#`/`:` in a module BASENAME (module names must be plain
@@ -278,8 +293,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "lib#1:2/w.nim" in cl
-    check cl == toHashSet(["tests/t.nim", "lib#1:2/w.nim"])
+    check projTp("lib#1:2/w.nim", cfg.trackedRoots) in cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("lib#1:2/w.nim", cfg.trackedRoots)])
 
   test "ambiguity pin: a body present under two tracked locations resolves to both (R7 over-selection)":
     let root = freshRoot("ambig")
@@ -299,9 +314,13 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "src/shared.nim" in cl
-    check "lib/shared.nim" in cl
-    check cl == toHashSet(["tests/t.nim", "src/shared.nim", "lib/shared.nim"])
+    check projTp("src/shared.nim", cfg.trackedRoots) in cl
+    check projTp("lib/shared.nim", cfg.trackedRoots) in cl
+    check cl == toHashSet([
+      projTp("tests/t.nim", cfg.trackedRoots),
+      projTp("src/shared.nim", cfg.trackedRoots),
+      projTp("lib/shared.nim", cfg.trackedRoots),
+    ])
 
   test "a non-dot state dir (Config.stateDir with no leading dot) is still pruned, by absolute path — not by name convention":
     ## walkForIndex's state-dir skip is an ABSOLUTE-PATH comparison
@@ -327,9 +346,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: "state", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), "state")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "src/shared.nim" in cl
-    check "state/shared.nim" notin cl
-    check cl == toHashSet(["tests/t.nim", "src/shared.nim"])
+    check projTp("src/shared.nim", cfg.trackedRoots) in cl
+    check projTp("state/shared.nim", cfg.trackedRoots) notin cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("src/shared.nim", cfg.trackedRoots)])
 
   test "a nonexistent depRoot in config.depRoots is tolerated — no raise, in-root resolution unaffected":
     let root = freshRoot("deproot_missing")
@@ -349,7 +368,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[missingDepRoot])
     cfg.trackedRoots = initTrackedRoots(root, @[(name: "dep", native: missingDepRoot)], ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check cl == toHashSet(["tests/t.nim", "src/x.nim"])
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("src/x.nim", cfg.trackedRoots)])
 
   test "a .nim SYMLINK FILE inside the project (pcLinkToFile) is indexed under its lexical path; a realpath-relative body resolves to it":
     ## root/lib/dep.nim is a FILE symlink (not a symlinked directory)
@@ -384,8 +403,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "lib/dep.nim" in cl
-    check cl == toHashSet(["tests/t.nim", "lib/dep.nim"])
+    check projTp("lib/dep.nim", cfg.trackedRoots) in cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("lib/dep.nim", cfg.trackedRoots)])
 
   test "an @m body carrying a realpath through a symlinked depRoot is retained via classify's realAbs match (RFC-0009 A4a)":
     ## Reproduces the shape a shallow entrypoint (`tests/t.nim`, one level
@@ -463,13 +482,27 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     #     index as its under-project symlink path and spells project-relative.
     # Both are correct retentions; asserting one absolute spelling is
     # volume-dependent and fails on macOS. Assert retention volume-independently.
-    check "tests/t.nim" in cl
+    #
+    # RFC-0009 A4b: cl is now HashSet[TrackedPath]. Retain the SAME
+    # volume-independent assertion: exactly 2 members (entrypoint + dep),
+    # and the non-entrypoint member's WIRE spelling (project-relative
+    # `display` when recovered project-tagged, absolute `toNative` when
+    # matched dep-tagged — the same branch closure.nim's own
+    # `closureMemberSpelling` takes) ends with "dep/src/dep.nim" either way.
+    let epTp = projTp("tests/t.nim", cfg.trackedRoots)
+    check epTp in cl
     check cl.len == 2
-    var depMember = ""
+    var depMember: TrackedPath
+    var foundDep = false
     for m in cl:
-      if m != "tests/t.nim": depMember = m
-    check depMember.len > 0
-    check depMember.endsWith("dep/src/dep.nim")
+      if m != epTp:
+        depMember = m
+        foundDep = true
+    check foundDep
+    let depSpelling =
+      if isProject(depMember): display(depMember)
+      else: toNative(depMember, cfg.trackedRoots)
+    check depSpelling.endsWith("dep/src/dep.nim")
 
   test "negative pin: an in-root @m body is NOT unioned against the index — a same-basename decoy elsewhere is never selected":
     ## The fallback (index.lookup for an @m body) is gated on the plain
@@ -496,9 +529,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "tests/foo.nim" in cl
-    check "other/foo.nim" notin cl
-    check cl == toHashSet(["tests/t.nim", "tests/foo.nim"])
+    check projTp("tests/foo.nim", cfg.trackedRoots) in cl
+    check projTp("other/foo.nim", cfg.trackedRoots) notin cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("tests/foo.nim", cfg.trackedRoots)])
 
   test "an @m body escaping every tracked root, with no dep-root of its own, is NOT unioned against the whole index (untracked out-of-root import)":
     ## `root/tests/t.nim` imports an UNTRACKED out-of-root module via
@@ -529,8 +562,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "src/other/lib.nim" notin cl
-    check cl == toHashSet(["tests/t.nim"])
+    check projTp("src/other/lib.nim", cfg.trackedRoots) notin cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots)])
 
   test "an @m body computed from a symlinked entrypoint directory's REALPATH resolves via byReal to the lexical in-root path":
     ## `root/a/b/tests` is a SYMLINK to a SHALLOW outside directory `st`
@@ -576,9 +609,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "src/foo.nim" in cl
-    check "a/b/tests/t.nim" in cl
-    check cl == toHashSet(["a/b/tests/t.nim", "src/foo.nim"])
+    check projTp("src/foo.nim", cfg.trackedRoots) in cl
+    check projTp("a/b/tests/t.nim", cfg.trackedRoots) in cl
+    check cl == toHashSet([projTp("a/b/tests/t.nim", cfg.trackedRoots), projTp("src/foo.nim", cfg.trackedRoots)])
 
   test "a symlinked entrypoint FILE's @m body resolves via the file's real directory, not its (non-symlinked) containing directory's":
     ## `root/tests/t.nim` is a SYMLINK to the real file `root/other/t.nim`;
@@ -611,8 +644,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "other/helper.nim" in cl
-    check "tests/helper.nim" notin cl
+    check projTp("other/helper.nim", cfg.trackedRoots) in cl
+    check projTp("tests/helper.nim", cfg.trackedRoots) notin cl
 
   test "case-2 miss (neither realCandidate nor the lexical candidate is indexed/exists) keeps realCandidate, not a bogus lexical sibling":
     ## Same symlinked-entrypoint-DIRECTORY shape as the byReal-recovery test
@@ -650,8 +683,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "a/b/ghost.nim" notin cl
-    check cl == toHashSet(["a/b/tests/t.nim"])
+    check projTp("a/b/ghost.nim", cfg.trackedRoots) notin cl
+    check cl == toHashSet([projTp("a/b/tests/t.nim", cfg.trackedRoots)])
 
 suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned dot-dir":
 
@@ -680,8 +713,8 @@ suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned 
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check ".hidden/cas/dep/src/dep.nim" in cl
-    check cl == toHashSet(["tests/t.nim", ".hidden/cas/dep/src/dep.nim"])
+    check projTp(".hidden/cas/dep/src/dep.nim", cfg.trackedRoots) in cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp(".hidden/cas/dep/src/dep.nim", cfg.trackedRoots)])
 
   test "negative pin: the same pruned-dot-dir @p body resolves to nothing when the file is absent (no fabricated path)":
     ## Same body/shape as above, but `root/.hidden/cas/dep/src/dep.nim` is
@@ -703,8 +736,8 @@ suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned 
     var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check ".hidden/cas/dep/src/dep.nim" notin cl
-    check cl == toHashSet(["tests/t.nim"])
+    check projTp(".hidden/cas/dep/src/dep.nim", cfg.trackedRoots) notin cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots)])
 
   test "dep-root variant: the roots existence-check fallback also tries a configured depRoot, not just projectRoot":
     ## `depRoot/.hidden/extra.nim` lives OUTSIDE projectRoot, under a pruned
@@ -733,5 +766,6 @@ suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned 
     cfg.trackedRoots = initTrackedRoots(root, @[(name: "dep", native: depRoot)], ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     let expected = (depRoot / ".hidden" / "extra.nim").normalizedPath
-    check expected in cl
-    check cl == toHashSet(["tests/t.nim", expected])
+    let expectedTp = depTp(expected, cfg.trackedRoots)
+    check expectedTp in cl
+    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), expectedTp])
