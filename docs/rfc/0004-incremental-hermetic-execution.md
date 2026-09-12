@@ -5,6 +5,7 @@ title   = "RFC-0004 \u2014 Incremental, hermetic, observable execution"
 state   = "complete"
 stage   = "review"
 review  = "floor"
+wiring  = "proven"
 profile = "rfc-flow@3"
 blocked_by = ["0001", "0002", "0003"]
 

@@ -3,6 +3,7 @@ type    = "rfc"
 id      = "0009"
 title   = "RFC-0009 \u2014 Path identity: `TrackedPath` and the Windows suite"
 state   = "draft"
+wiring   = "unproven"
 stage   = "rfc"
 profile = "rfc-flow@3"
 blocked_by = ["0001", "0004", "0005", "0007"]

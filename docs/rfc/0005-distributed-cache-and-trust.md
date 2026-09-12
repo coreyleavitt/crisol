@@ -5,6 +5,7 @@ title   = "RFC-0005 \u2014 Distributed result cache, cryptographic trust & cache
 state   = "complete"
 stage   = "review"
 review  = "floor"
+wiring  = "proven"
 profile = "rfc-flow@3"
 reason = "v1 conversion mapped complete->living to satisfy the done role; relabeled now that complete carries it."
 +++

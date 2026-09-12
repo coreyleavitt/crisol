@@ -3,6 +3,7 @@ type    = "rfc"
 id      = "0006"
 title   = "RFC-0006 \u2014 Cross-entrypoint compile reuse: measure first, recover the redundant substrate"
 state   = "parked"
+wiring   = "unproven"
 reason  = "parked per the v0 tracker state at conversion"
 profile = "rfc-flow@3"
 blocked_by = ["0004"]
