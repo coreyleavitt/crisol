@@ -212,11 +212,16 @@ proc wait4MaxRss(res: EntrypointResult): tuple[bytes: int64; mechanism: string] 
 
 proc appendAttemptRow(led: var Ledger; ep: Entrypoint; attemptNum: int;
                       res: EntrypointResult; inputHash: string;
-                      peakRssBytes: int64 = 0) =
+                      peakRssBytes: int64 = 0;
+                      roots: TrackedRoots = TrackedRoots()) =
   ## Append one LedgerRow for a completed live attempt.
   ## Converts durationMs→durationUs; peakRssBytes is the per-slot running max
   ## sampled across poll ticks while the run phase was live (C5).
-  let iKey = identityKey(ep.path, flagHash(ep.flags))
+  ##
+  ## `roots` (RFC-0009 A5b-ii): additive, defaults to the zero `TrackedRoots`
+  ## — harmless for every entrypoint (always tag-0); the sole caller
+  ## threads `config.trackedRoots`.
+  let iKey = identityKey(ep, roots)
   let (maxRss, mechanism) = wait4MaxRss(res)  # rfc-0007 A5
   let row = LedgerRow(
     identity:   iKey,
@@ -830,17 +835,19 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
   ## (`config.measureCompileReuse`).
   ##
   ## configHash = flagHash(ep.flags), computed PER-ENTRYPOINT — this MUST
-  ## collide with appendAttemptRow's identityKey(ep.path, flagHash(ep.flags))
-  ## (this file, ~line 156) or ArtifactRows silently orphan from the
-  ## RunLedger's IdentityKey (measureworker.nim's own documented contract).
+  ## collide with appendAttemptRow's identityKey(ep, roots) (this file,
+  ## ~line 213) or ArtifactRows silently orphan from the RunLedger's
+  ## IdentityKey (measureworker.nim's own documented contract).
   MeasurePlan(
-    # RFC-0009 A3d-iii: source the entrypoint's identity from its TrackedPath,
-    # serialized to the worker via the display() accessor (a deliberate string
-    # wire — the worker consumes a plain path). For a project (tag-0) member
-    # display() is byte-identical to ep.path, so this preserves the collision
-    # with appendAttemptRow's identityKey(ep.path, …) noted above. Fall back to
-    # ep.path if tp was never populated (a hand-built ep off the discover path),
-    # so the identity is never an empty string.
+    # RFC-0009 A3d-iii/A5b-ii: source the entrypoint's identity from its
+    # TrackedPath, serialized to the worker via the display() accessor (a
+    # deliberate string wire — the worker consumes a plain path and
+    # reconstructs its own TrackedPath, see measureworker.nim). For a project
+    # (tag-0) member display() is byte-identical to ep.path, so this
+    # preserves the collision with appendAttemptRow's identityKey(ep, roots)
+    # noted above. Fall back to ep.path if tp was never populated (a
+    # hand-built ep off the discover path), so the identity is never an
+    # empty string.
     entrypointPath:    (if ep.tp.display().len > 0: ep.tp.display() else: ep.path),
     entrypointAbsPath: epAbs,
     flags:             ep.flags,
@@ -1010,7 +1017,8 @@ proc spawnCompileStable(
     if ep.path.isAbsolute: ep.path
     else: config.projectRoot / ep.path
 
-  let epSlug = slug(ep.path, ep.flags)
+  # RFC-0009 A5b-ii: routed through planner.epSlug (ep.tp when populated).
+  let epSlug = epSlug(ep, config.trackedRoots)
   let cacheDir =
     if epSlug in dupSlugs:
       # Rare: same (path, flags) scheduled twice in this plan — keep the old
@@ -1877,7 +1885,7 @@ proc execute*(
             if ledgerActive and recordLedger:
               appendAttemptRow(led, p.entrypoints[completedIdx].ep, slotAttempt,
                                result[completedIdx], inputHashes[completedIdx],
-                               slots[idx].peakRssBytes)
+                               slots[idx].peakRssBytes, config.trackedRoots)
 
             # B1: retry decision — re-dispatch if the result is a failure AND we
             # have remaining attempts.  Compile failures and spawn errors are NOT

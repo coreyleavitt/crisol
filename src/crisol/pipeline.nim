@@ -170,7 +170,7 @@ proc buildRunPlan*(
   # falls back to C2 path-hash partition on cold start (no ledger rows).
   if shardK > 0:
     let resolvedStateDir = stateDirOf(cfg)
-    runnable = shardWithHistory(runnable, shardK, shardN, resolvedStateDir)
+    runnable = shardWithHistory(runnable, shardK, shardN, resolvedStateDir, cfg.trackedRoots)
 
   # C4: Order step — AFTER shard (shard membership is stable), BEFORE plan.
   # Applied only when order != omNone.  With omNone (default) this block is
@@ -179,7 +179,7 @@ proc buildRunPlan*(
   # is stable regardless of the --order fallback (RFC §F5 line 159).
   if order != omNone:
     let resolvedStateDir = stateDirOf(cfg)
-    runnable = orderByHistory(runnable, order, resolvedStateDir)
+    runnable = orderByHistory(runnable, order, resolvedStateDir, cfg.trackedRoots)
 
   let runPlan = plan(cfg, runnable, graph, nimVersion, forceCompile)
   RunPlanView(

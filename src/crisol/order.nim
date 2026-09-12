@@ -56,7 +56,6 @@ import std/[algorithm, sequtils, tables]
 import crisol/types
 import crisol/ledger         # for scanLedger, LedgerRow, currentRowVersion
 import crisol/keys           # for identityKey
-import crisol/depgraph       # for flagHash
 import crisol/stats          # for median (C6: shared stats module)
 import crisol/outcomestrings # for isFailureOutcomeString, isCompileFailedOutcomeString
 
@@ -169,6 +168,7 @@ proc orderByHistory*(
   eps:      seq[Entrypoint];
   mode:     OrderMode;
   stateDir: string;
+  roots:    TrackedRoots = TrackedRoots();
 ): seq[Entrypoint] =
   ## Ledger-aware ordering wrapper.
   ##
@@ -189,6 +189,11 @@ proc orderByHistory*(
   ## stateDir: resolved absolute path to the state dir (caller must resolve
   ##   cfg.projectRoot / cfg.stateDir before calling; mirrors shardWithHistory).
   ##
+  ## `roots` (RFC-0009 A5b-ii): additive, defaults to the zero `TrackedRoots`
+  ## — harmless for every entrypoint (always tag-0) and every hand-built
+  ## fixture ep (zero `tp` falls back to the plain-path identity). The real
+  ## caller (pipeline.nim) threads `cfg.trackedRoots`.
+  ##
   ## Cold-start (no rows for any ep → tables stay empty) → orderBy applies its
   ## lexicographic fallback for non-None modes.
   if mode == omNone:
@@ -198,7 +203,7 @@ proc orderByHistory*(
   var medianDur = initTable[string, int64]()
 
   for ep in eps:
-    let ik   = identityKey(ep.path, flagHash(ep.flags))
+    let ik   = identityKey(ep, roots)
     let rows = scanLedger(stateDir, ik)
 
     case mode

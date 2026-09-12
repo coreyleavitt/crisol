@@ -1441,6 +1441,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
         spec          = spec,
         parentEnv     = toSeq(envPairs()),
         protocolMajor = CrisolProtocolMajor,
+        roots         = cfg.trackedRoots,  # RFC-0009 A5b-ii
       )
       # RFC-0005 B2b/L2: override BEFORE realSeams closes over `rt` —
       # realSeams' own store closure reads `rt.sink` (its embedded copy),
@@ -1574,8 +1575,9 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       # Skip compile-failed — no run duration to compare.
       if outcome(r) == oCompileFailed:
         continue
-      # Build identity key for this entrypoint.
-      let ikey = identityKey(r.ep.path, flagHash(r.ep.flags))
+      # Build identity key for this entrypoint. RFC-0009 A5b-ii: routed
+      # through the Entrypoint-keyed overload (ep.tp when populated).
+      let ikey = identityKey(r.ep, cfg.trackedRoots)
       # Scan the ledger for PRIOR rows (exclude current run by timestamp).
       let allRows = scanLedger(resolvedStateDir, ikey)
       var historyUs: seq[int64]

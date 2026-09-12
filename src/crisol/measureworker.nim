@@ -64,8 +64,10 @@
 ##    (`recordCompileCostRow`, RFC-0006 M-cost-split): the raw codegen/cc/link
 ##    µs split already computed by `runMeasured` into `spans`, appended to the
 ##    SEPARATE compile-cost stream (`compilecost.nim`) under the SAME
-##    identity (`identityKey(plan.entrypointPath, plan.configHash)`)
-##    `recordArtifactRows` used, so a future M-report can join the two
+##    identity (`measurePlanIdentity(plan)` — RFC-0009 A5b-ii: the
+##    TrackedPath-reconstructed identityKey, byte-identical to the parent's
+##    RunLedger identity) `recordArtifactRows` used, so a future M-report
+##    can join the two
 ##    streams. Wrapped in its own try/except with the identical never-fail-
 ##    the-compile contract as step 4 — independent of whether step 4 itself
 ##    succeeded or failed.
@@ -74,15 +76,55 @@
 ## (regardless of whether recording succeeded), non-zero iff the compile
 ## itself failed.
 
-import std/[os, tables, times]
+import std/[options, os, tables, times]
 import crisol/types
 import crisol/keys
+import crisol/paths   # RFC-0009 A5b-ii: TrackedRoots/fromCanonical/keyBytes
+                       # to reconstruct this re-exec'd worker's entrypoint
+                       # identity from the wire MeasurePlan — see
+                       # `measurePlanIdentity` below.
 import crisol/closure
 import crisol/compiledriver
 import crisol/artifactid
 import crisol/artifactledger
 import crisol/compilecost
 import crisol/workerplan
+
+# ---------------------------------------------------------------------------
+# measurePlanIdentity — RFC-0009 A5b-ii: reconstruct the IdentityKey
+# ---------------------------------------------------------------------------
+
+proc measurePlanIdentity(plan: MeasurePlan): IdentityKey =
+  ## Derive this plan's entrypoint `IdentityKey` via the `TrackedPath`
+  ## overload, so it matches EXACTLY what the PARENT process records in the
+  ## RunLedger for this same entrypoint (`runner.appendAttemptRow`'s
+  ## `identityKey(ep, roots)`). This worker is a RE-EXEC'd separate process
+  ## — `plan.entrypointPath` crosses the wire as a plain STRING, not a live
+  ## `TrackedPath` — so it is reconstructed here.
+  ##
+  ## Entrypoints are ALWAYS tag-0 (rootTag 0, the project root): a tag-0
+  ## `TrackedPath`'s `keyBytes` resolves from `tp.rel` alone
+  ## (`paths.keyBytes`'s tag-0 branch never reads `roots.deps`), so
+  ## `MeasurePlan.projectRoot` — which the wire format already carries — is
+  ## sufficient to reconstruct it; no dep-root specs need to cross the wire
+  ## for this (a dep-root member would need them, but no dep-root path is
+  ## ever an entrypoint). `initTrackedRoots(plan.projectRoot, @[],
+  ## plan.stateDir)` builds a project-only `TrackedRoots` (the probed fold
+  ## policy is irrelevant to `keyBytes`, which never folds); `fromCanonical`
+  ## then validates `plan.entrypointPath`'s shape and tags it rootTag 0.
+  ##
+  ## Falls back to the plain string overload (byte-identical result for a
+  ## well-formed tag-0 path) if `fromCanonical` ever rejects the wire path —
+  ## defense only; `runner.buildCompileWorkerPlan` always emits a canonical
+  ## `tp.display()`/`ep.path`.
+  let roots = initTrackedRoots(plan.projectRoot,
+                                newSeq[tuple[name, native: string]](),
+                                plan.stateDir)
+  let tpOpt = fromCanonical(plan.entrypointPath, roots)
+  if tpOpt.isSome:
+    identityKey(tpOpt.get, roots, plan.configHash)
+  else:
+    identityKey(plan.entrypointPath, plan.configHash)
 
 # ---------------------------------------------------------------------------
 # recordArtifactRows — the measurement-recording step
@@ -105,7 +147,7 @@ proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
   let manifest = parseCompileManifest(manifestPath)
   let entryBasename = entryUnitBasename(plan.entrypointAbsPath)
   let knownStrings = @[plan.nimcacheDir, plan.outputBinPath.parentDir()]
-  let identity = identityKey(plan.entrypointPath, plan.configHash)
+  let identity = measurePlanIdentity(plan)
   let nowUs = int64(epochTime() * 1_000_000)
 
   var led = openArtifactLedger(plan.stateDir)
@@ -160,13 +202,12 @@ proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
 proc recordCompileCostRow(plan: MeasurePlan; spans: CompileSpans) =
   ## Append ONE `CompileCostRow` for this compile, carrying the raw
   ## codegen/cc/link µs split from `spans`. `entrypointIdentity` is derived
-  ## EXACTLY as `recordArtifactRows` derives it (`identityKey(plan.
-  ## entrypointPath, plan.configHash)`) so the two streams share identity and
-  ## a future M-report can join them. May raise (unexpected ledger I/O) — the
-  ## CALLER wraps this in try/except so a measurement-layer failure never
-  ## fails a successful compile (mirrors `recordArtifactRows`'s own contract;
-  ## see module doc).
-  let identity = identityKey(plan.entrypointPath, plan.configHash)
+  ## EXACTLY as `recordArtifactRows` derives it (`measurePlanIdentity(plan)`)
+  ## so the two streams share identity and a future M-report can join them.
+  ## May raise (unexpected ledger I/O) — the CALLER wraps this in try/except
+  ## so a measurement-layer failure never fails a successful compile
+  ## (mirrors `recordArtifactRows`'s own contract; see module doc).
+  let identity = measurePlanIdentity(plan)
   let nowUs = int64(epochTime() * 1_000_000)
 
   var led = openCompileCostLedger(plan.stateDir)

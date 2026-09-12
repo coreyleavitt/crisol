@@ -6,7 +6,7 @@
 ##   1. Load config.
 ##   2. Discover ALL entrypoints across ALL groups (gskAll, opt-in included).
 ##      Gates are IGNORED — a closed gate must NOT delete caches.
-##   3. For each discovered entrypoint compute `slug(ep.path, ep.flags)`.
+##   3. For each discovered entrypoint compute `epSlug(ep, config.trackedRoots)` (planner.nim; keys via `ep.tp` when populated -- RFC-0009 A5b-ii).
 ##      This is the FORWARD-COMPUTED expected slug set.  No slug decoding.
 ##   4. Delete every directory under `<stateDir>/cache/` and `<stateDir>/bin/`
 ##      whose base name is NOT in the expected slug set.
@@ -30,9 +30,9 @@
 import std/[os, sets, strutils, tables, times]
 import crisol/[types, config, discover, planner, runner, depgraph, resultcache, ledger,
                artifactledger, compilecost, shardedledger]
-  # `planner` imported explicitly for `slug` (forward-computed expected-slug set
-  # below) rather than leaning on runner's re-export — keeps the dependency
-  # visible in the import list.
+  # `planner` imported explicitly for `epSlug` (forward-computed expected-slug
+  # set below; RFC-0009 A5b-ii) rather than leaning on runner's re-export —
+  # keeps the dependency visible in the import list.
   # `resultcache` imported for `isResultCacheRootName` and `gcResultCache`.
   # `ledger` imported for `compactLedger`.
   # `artifactledger` imported for `compactArtifactLedger` (RFC-0006 M0) — a
@@ -131,7 +131,7 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   ##
   ## Steps:
   ##   1. Discover ALL entrypoints (gskAll, gates ignored — no applyGates call).
-  ##   2. Build the expected slug set via slug(ep.path, ep.flags); the cache/
+  ##   2. Build the expected slug set via epSlug(ep, config.trackedRoots); the cache/
   ##      variant additionally folds in the current toolchain fingerprint.
   ##   3. Prune <stateDir>/cache/ and <stateDir>/bin/.
   ##   4. GC the depgraph (drop entries not in discovered set).
@@ -172,7 +172,7 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   # persistence) so it always uses the bare slug set.
   var expectedSlugs = initHashSet[string]()
   for ep in eps:
-    expectedSlugs.incl slug(ep.path, ep.flags)
+    expectedSlugs.incl epSlug(ep, config.trackedRoots)
 
   # cache/ additionally folds in the CURRENT toolchain fingerprint (RFC-0006
   # nimcache-persistence GC): a dir for the same entrypoint but an OLD
@@ -182,7 +182,7 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   let toolchainFp = toolchainFingerprint(nimVersion, ccVersion)
   var expectedCacheSlugs = initHashSet[string]()
   for ep in eps:
-    let baseSlug = slug(ep.path, ep.flags)
+    let baseSlug = epSlug(ep, config.trackedRoots)
     if toolchainFp.len > 0:
       expectedCacheSlugs.incl(baseSlug & "-" & toolchainFp)
     else:

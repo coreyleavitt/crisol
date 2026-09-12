@@ -72,15 +72,22 @@ import crisol/outcomestrings # for isCompileFailedOutcomeString
 # Public: shardOf  (C2 — path-hash partition)
 # ---------------------------------------------------------------------------
 
-proc shardOf*(eps: seq[Entrypoint]; k, n: int): seq[Entrypoint] =
+proc shardOf*(eps: seq[Entrypoint]; k, n: int;
+              roots: TrackedRoots = TrackedRoots()): seq[Entrypoint] =
   ## Return the subset of `eps` assigned to shard `k` of `n`.
   ##
   ## Assignment: ep is in shard k iff
-  ##   fnv1a64($identityKey(ep.path, flagHash(ep.flags))) mod n == (k - 1).
+  ##   fnv1a64($identityKey(ep, roots)) mod n == (k - 1).
   ## Keying by composite identity ensures that two entrypoints sharing the same
   ## path but differing in compile flags are treated as DISTINCT identities and
   ## can land in different shards.
   ## Input order is preserved among the surviving entrypoints.
+  ##
+  ## `roots` (RFC-0009 A5b-ii): additive, defaults to the zero `TrackedRoots`
+  ## — harmless for every entrypoint (always tag-0; `keyBytes`'s tag-0 branch
+  ## never reads `roots`), and for a hand-built fixture ep (zero `tp`)
+  ## `identityKey(ep, roots)` falls back to the plain-path string overload
+  ## regardless of `roots`. Real callers thread `config.trackedRoots`.
   ##
   ## Preconditions (caller is responsible for validation):
   ##   n >= 1
@@ -88,7 +95,7 @@ proc shardOf*(eps: seq[Entrypoint]; k, n: int): seq[Entrypoint] =
   result = newSeq[Entrypoint]()
   let target = uint64(k - 1)
   for ep in eps:
-    let h = fnv1a64($identityKey(ep.path, flagHash(ep.flags)))
+    let h = fnv1a64($identityKey(ep, roots))
     if h mod uint64(n) == target:
       result.add ep
 
@@ -99,16 +106,21 @@ proc shardOf*(eps: seq[Entrypoint]; k, n: int): seq[Entrypoint] =
 proc balancedShardOf*(
   eps:        seq[Entrypoint];
   k, n:       int;
-  durationOf: Table[string, int64]
+  durationOf: Table[string, int64];
+  roots:      TrackedRoots = TrackedRoots()
 ): seq[Entrypoint] =
   ## Pure LPT (Longest Processing Time) greedy bin-pack.
   ##
-  ## `durationOf` maps $identityKey(ep.path, flagHash(ep.flags)) → representative
-  ## historical duration (µs).  An ep absent from the table is treated as duration 0.
+  ## `durationOf` maps $identityKey(ep, roots) → representative historical
+  ## duration (µs).  An ep absent from the table is treated as duration 0.
   ##
   ## Keying by composite identity (path + flagHash) ensures that two entrypoints
   ## sharing the same path but differing in compile flags are treated as DISTINCT
   ## identities; the partition is always disjoint and complete over the full set.
+  ##
+  ## `roots` (RFC-0009 A5b-ii): additive, defaults to the zero `TrackedRoots`
+  ## — see `shardOf`'s doc for why the default is harmless for every
+  ## entrypoint and every hand-built fixture ep.
   ##
   ## Algorithm:
   ##   1. Sort eps by duration DESC, tie-break by identity key ASC (fully deterministic).
@@ -125,8 +137,8 @@ proc balancedShardOf*(
   # Step 1: sort eps by duration DESC, then identity key ASC as tie-break.
   var sorted = eps
   sorted.sort(proc(a, b: Entrypoint): int =
-    let ika = $identityKey(a.path, flagHash(a.flags))
-    let ikb = $identityKey(b.path, flagHash(b.flags))
+    let ika = $identityKey(a, roots)
+    let ikb = $identityKey(b, roots)
     let da = durationOf.getOrDefault(ika, 0'i64)
     let db = durationOf.getOrDefault(ikb, 0'i64)
     if db != da:
@@ -146,7 +158,7 @@ proc balancedShardOf*(
         minLoad = binLoads[b]
         minBin  = b
     assignment[i] = minBin
-    let ik = $identityKey(ep.path, flagHash(ep.flags))
+    let ik = $identityKey(ep, roots)
     binLoads[minBin] += durationOf.getOrDefault(ik, 0'i64)
 
   # Build a set of identity keys assigned to bin (k-1) for fast membership tests.
@@ -154,7 +166,7 @@ proc balancedShardOf*(
   var inBin: seq[string] = @[]
   for i, ep in sorted:
     if assignment[i] == target:
-      inBin.add $identityKey(ep.path, flagHash(ep.flags))
+      inBin.add $identityKey(ep, roots)
 
   # Step 3: return eps in ORIGINAL input order (filter, not reorder).
   let inBinSet = block:
@@ -162,7 +174,7 @@ proc balancedShardOf*(
     for p in inBin: t[p] = true
     t
   result = eps.filterIt(inBinSet.getOrDefault(
-    $identityKey(it.path, flagHash(it.flags)), false))
+    $identityKey(it, roots), false))
 
 # ---------------------------------------------------------------------------
 # Public: shardWithHistory  (C3 — ledger-aware wrapper)
@@ -172,10 +184,15 @@ proc shardWithHistory*(
   eps:      seq[Entrypoint];
   k, n:     int;
   stateDir: string;
+  roots:    TrackedRoots = TrackedRoots()
 ): seq[Entrypoint] =
   ## Ledger-aware shard selector.  Reads each ep's ledger history, derives a
   ## representative duration (median of non-compile-fail durationUs rows), then
   ## calls `balancedShardOf` for LPT bin-packing.
+  ##
+  ## `roots` (RFC-0009 A5b-ii): additive, defaults to the zero `TrackedRoots`
+  ## — see `shardOf`'s doc; the real caller (pipeline.nim) threads
+  ## `cfg.trackedRoots`.
   ##
   ## Decision rules:
   ##   Cold start (no ep has any history): fallback to `shardOf` (C2 path-hash),
@@ -196,7 +213,7 @@ proc shardWithHistory*(
   # eps sharing the same path but differing in compile flags are distinct.
   var knownDurations: Table[string, seq[int64]] = initTable[string, seq[int64]]()
   for ep in eps:
-    let ik = identityKey(ep.path, flagHash(ep.flags))
+    let ik = identityKey(ep, roots)
     let rows = scanLedger(stateDir, ik)
     var durs: seq[int64] = @[]
     for r in rows:
@@ -213,7 +230,7 @@ proc shardWithHistory*(
 
   # Cold-start: no ep has any history → fall back to path-hash.
   if knownDurations.len == 0:
-    return shardOf(eps, k, n)
+    return shardOf(eps, k, n, roots)
 
   # Compute per-ep representative duration (median of their rows).
   # Compute a global default for eps with no history.
@@ -226,13 +243,13 @@ proc shardWithHistory*(
 
   var durationOf = initTable[string, int64]()
   for ep in eps:
-    let ik = $identityKey(ep.path, flagHash(ep.flags))
+    let ik = $identityKey(ep, roots)
     if ik in knownDurations:
       durationOf[ik] = median(knownDurations[ik])
     else:
       durationOf[ik] = defaultDuration
 
-  balancedShardOf(eps, k, n, durationOf)
+  balancedShardOf(eps, k, n, durationOf, roots)
 
 # ---------------------------------------------------------------------------
 # Public: parseShardSpec

@@ -148,6 +148,19 @@ proc identityKey*(tp: TrackedPath; roots: TrackedRoots; flagHash: string): Ident
   ## are always tag-0).
   identityKey(string(keyBytes(tp, roots)), flagHash)
 
+proc identityKey*(ep: Entrypoint; roots: TrackedRoots): IdentityKey =
+  ## RFC-0009 A5b-ii: entrypoint-keyed convenience overload — every producer
+  ## call site migrated in this slice (shard/order/runner/api) calls THIS,
+  ## not the raw `(path, flagHash)` string overload, so the zero-`tp`
+  ## fallback lives in exactly one place. Uses `ep.tp` (the `TrackedPath`
+  ## overload above) when populated — production entrypoints always have it
+  ## (`discover` sets it) — falling back to the plain `ep.path` string for a
+  ## hand-built fixture ep whose `tp` is the zero value (A3a-i contract:
+  ## hand-built eps never set `tp`). Byte-identical to the string overload
+  ## for a populated tag-0 `tp` (entrypoints are always tag-0).
+  if ep.tp.display().len > 0: identityKey(ep.tp, roots, flagHash(ep.flags))
+  else:                       identityKey(ep.path, flagHash(ep.flags))
+
 # ---------------------------------------------------------------------------
 # SoundnessKey derivation
 # ---------------------------------------------------------------------------

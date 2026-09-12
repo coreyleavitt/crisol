@@ -716,10 +716,16 @@ type
       ## Feeds the explain-miss sidecar's stored record and `explainMiss`'s
       ## `currEnv` — NEVER a raw value (`keys.envDigest` never retains one).
     protocolMajor*:   int
+    trackedRoots*:    TrackedRoots
+      ## RFC-0009 A5b-ii: additive, defaults to the zero `TrackedRoots` (see
+      ## `keyContext`'s `roots` param doc). Threaded to every entrypoint-keyed
+      ## producer call this module's closures make (`slug`/`identityKey`/
+      ## sidecar key derivation) so they route through the `ep.tp` overloads.
 
 proc keyContext*(nimVersion, ccVersion: string; spec: SandboxSpec;
                  parentEnv: openArray[(string, string)];
-                 protocolMajor: int): KeyContext =
+                 protocolMajor: int;
+                 roots: TrackedRoots = TrackedRoots()): KeyContext =
   ## Build the key-derivation context once per run.
   ##
   ## `parentEnv` is the host environment snapshot to filter against `spec`.
@@ -728,11 +734,17 @@ proc keyContext*(nimVersion, ccVersion: string; spec: SandboxSpec;
   ## synthetic snapshot to exercise the key-derivation logic without live env
   ## reads.  Filtering (allowlist + `spec.envPins`' tail) happens exactly once
   ## here — every `keyOfProc`-built closure reuses the resulting hash.
+  ##
+  ## `roots` (RFC-0009 A5b-ii): additive, defaults to the zero `TrackedRoots`
+  ## — harmless for every entrypoint (always tag-0) and every hand-built
+  ## fixture pep (zero `tp` falls back to the plain-path identity). The real
+  ## caller (api.nim) threads `cfg.trackedRoots`.
   let filtered = filterEnv(parentEnv, spec, @[])
   KeyContext(
     nimVersion:      nimVersion,
     ccVersion:       ccVersion,
     spec:            spec,
+    trackedRoots:    roots,
     hermeticEnvHash: hermeticEnvHash(filtered),
     envDigest:       envDigest(hermeticEnvDigestInput(filtered)),
     protocolMajor:   protocolMajor,
@@ -788,8 +800,11 @@ proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
     # it is uniquely determined by (ep.path, ep.flags) and matches what the
     # execute loop would build, making two entrypoints with the same basename but
     # different paths produce distinct argv components.
-    let epSlug = slug(ep.path, ep.flags)
-    let epArgv = epSlug / binName(ep)
+    # RFC-0009 A5b-ii: routed through planner.epSlug (ep.tp when populated,
+    # falling back to ep.path for a hand-built fixture pep) rather than the
+    # bare `slug(ep.path, ep.flags)` string producer.
+    let epSlugStr = epSlug(ep, ctx.trackedRoots)
+    let epArgv = epSlugStr / binName(ep)
     KeyInputs(
       closureContentHash: entry.closureHash,
       flagHash:           fHash,
@@ -853,7 +868,15 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
              for ev in backfillErrEvents(result):
                rt.sink.emit(ev)
              if result.hit.isNone and rt.localRoot.len > 0:
-               let prior = mostRecentRecord(readSidecar(rt.localRoot, pep.ep.path))
+               # RFC-0009 A5b-ii: routed through the `tp`-keyed overload when
+               # `pep.ep.tp` is populated, falling back to the plain-path
+               # string overload for a hand-built fixture pep (zero `tp`,
+               # A3a-i contract). Byte-identical for entrypoints (tag-0).
+               let prior =
+                 if pep.ep.tp.display().len > 0:
+                   mostRecentRecord(readSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots))
+                 else:
+                   mostRecentRecord(readSidecar(rt.localRoot, pep.ep.path))
                if prior.isSome:
                  result.explain = explainMiss(prior.get.entry.inputs, d.inputs,
                                                prior.get.entry.envDigest, ctx.envDigest)
@@ -879,8 +902,14 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
              if rt.cache.tiers.len > 1:
                rt.pending.add entry
              if result and rt.localRoot.len > 0:
-               writeSidecar(rt.localRoot, pep.ep.path,
-                            SidecarEntry(key: d.key, inputs: d.inputs, envDigest: ctx.envDigest))
+               # RFC-0009 A5b-ii: same tp-or-path routing as the load closure
+               # above.
+               let sidecarEntry = SidecarEntry(key: d.key, inputs: d.inputs,
+                                                envDigest: ctx.envDigest)
+               if pep.ep.tp.display().len > 0:
+                 writeSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots, sidecarEntry)
+               else:
+                 writeSidecar(rt.localRoot, pep.ep.path, sidecarEntry)
     ,
   )
 

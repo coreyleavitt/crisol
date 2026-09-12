@@ -65,7 +65,7 @@ proc slug*(tp: TrackedPath; roots: TrackedRoots; flags: seq[string]): string =
   ## tag-0/project members (entrypoints are always tag-0).
   slug(string(keyBytes(tp, roots)), flags)
 
-proc epSlug(ep: Entrypoint; roots: TrackedRoots): string =
+proc epSlug*(ep: Entrypoint; roots: TrackedRoots): string =
   ## RFC-0009 A5b-i: an entrypoint's slug from its TrackedPath IDENTITY when
   ## populated (production — `discover` always sets `ep.tp`), falling back to
   ## the string `ep.path` for a hand-built ep whose `tp` is the zero value.
@@ -74,6 +74,9 @@ proc epSlug(ep: Entrypoint; roots: TrackedRoots): string =
   ## to a degenerate empty-`rel` slug (which would collide all such eps onto one
   ## bin/cache dir). For a tag-0 entrypoint `keyBytes == rel == path`, so both
   ## branches are byte-identical; the fallback only guards the zero-`tp` case.
+  ## Exported (RFC-0009 A5b-ii): the consumer sweep reuses this exact
+  ## fallback logic from clean.nim/cachedispatch.nim/runner.nim rather than
+  ## re-deriving it at each call site.
   if ep.tp.display().len > 0: slug(ep.tp, roots, ep.flags)
   else:                       slug(ep.path, ep.flags)
 

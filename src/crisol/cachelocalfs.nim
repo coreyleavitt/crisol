@@ -144,6 +144,13 @@ proc readSidecar*(root: string; path: string): Sidecar =
   let parsed = sidecarFromJson(node)
   if parsed.isSome: result = parsed.get
 
+proc readSidecar*(root: string; tp: TrackedPath; roots: TrackedRoots): Sidecar =
+  ## RFC-0009 A5b-ii: `TrackedPath` overload — keys via `keyBytes(tp, roots)`
+  ## (the `CacheKeyPath` `sidecarPath` overload above) rather than a raw path
+  ## string. Byte-identical to the string overload for entrypoints (always
+  ## tag-0): `keyBytes` returns exactly `tp.rel` for a tag-0 `tp`.
+  readSidecar(root, string(keyBytes(tp, roots)))
+
 proc writeSidecar*(root: string; path: string; entry: SidecarEntry;
                    maxRecords = DefaultMaxSidecarRecords) =
   ## Update the path-keyed sidecar's most-recent record for
@@ -158,6 +165,12 @@ proc writeSidecar*(root: string; path: string; entry: SidecarEntry;
   try: createDir(dir)
   except OSError: return
   discard atomicPublish(sidecarPath(root, path), $sidecarToJson(next))
+
+proc writeSidecar*(root: string; tp: TrackedPath; roots: TrackedRoots;
+                   entry: SidecarEntry; maxRecords = DefaultMaxSidecarRecords) =
+  ## RFC-0009 A5b-ii: `TrackedPath` overload — see `readSidecar`'s `tp`
+  ## overload above; byte-identical to the string overload for entrypoints.
+  writeSidecar(root, string(keyBytes(tp, roots)), entry, maxRecords)
 
 proc localFsBackend*(root: string; autoCreate: bool; maxEntries: int): CacheBackend =
   let ser = jsonCacheSerializer()
