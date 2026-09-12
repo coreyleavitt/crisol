@@ -117,7 +117,11 @@ suite "RFC-0009 A5c — cache-portability E2E (depRoot member, relocated tree)":
     except OSError as e:
       echo "SKIP test_rfc9_a5c_cache_portability: symlink creation failed " &
            "in this environment: " & e.msg
-      removeDir(base)
+      # A failed createSymlink can leave a partial reparse-point stub that a
+      # privilege-less Windows runner cannot delete; the skip must not turn a
+      # tidy-up failure into a red leg, so cleanup here is best-effort.
+      try: removeDir(base)
+      except CatchableError: discard
       quit(0)
 
     putEnv("CRISOL_STATE_DIR", sharedStateDir)
