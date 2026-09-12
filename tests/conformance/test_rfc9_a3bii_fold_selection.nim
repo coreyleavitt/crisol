@@ -158,10 +158,14 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   # .crisol/ is untracked run-state (cache/bin/lock/depgraph/ledger) --
   # gitignored so gitdiff's untracked-file scan (R3-24's second git
   # invocation, `git ls-files -z --others --exclude-standard`) never lets it
-  # pollute the changed set. tests/unit/widget.nim is ignored too -- only
-  # populated (as a decoy, see module doc point 1) under useForcedProbe;
-  # harmless to ignore when it's never created.
-  writeF(repo, ".gitignore", "tests/unit/widget.nim\n.crisol/\n")
+  # pollute the changed set. widget.nim is NOT ignored here: it must be
+  # TRACKED so the committed case-rename below can actually rename it (a
+  # `.gitignore` entry would leave it un-added, and `git mv` would fail
+  # "not under version control" -- the exact bug an earlier revision shipped,
+  # masked on case-sensitive Linux by the untracked scan). The forced-mode
+  # decoy is instead kept out of the untracked scan via `.git/info/exclude`,
+  # applied only after the rename un-tracks the old spelling (below).
+  writeF(repo, ".gitignore", ".crisol/\n")
   writeF(repo, "tests/unit/widget.nim", "proc widgetValue*(): int = 42\n")
   writeF(repo, "tests/unit/helper.nim",
          "import widget\nproc helperValue*(): int = widgetValue() + 1\n")
@@ -201,16 +205,28 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   # commit) — never an uncommitted staged rename, which would emit BOTH the
   # delete of the old spelling and the add of the new one in the same diff
   # (the deleted side raw-matches the persisted graph — vacuous).
-  discard git(repo, "mv tests/unit/widget.nim tests/unit/tmp.nim")
-  discard git(repo, "mv tests/unit/tmp.nim tests/unit/Widget.nim")
-  discard git(repo, "commit -q -m rename-widget-to-Widget")
+  # The two-step (via tmp.nim) is the standard case-only-rename dance that
+  # works on both case-sensitive and case-insensitive volumes. Assert each
+  # step succeeded: a silently-failing `git mv` (e.g. the source un-tracked)
+  # would leave the rename un-done and the whole proof vacuous.
+  let mv1 = git(repo, "mv tests/unit/widget.nim tests/unit/tmp.nim")
+  let mv2 = git(repo, "mv tests/unit/tmp.nim tests/unit/Widget.nim")
+  let cmt = git(repo, "commit -q -m rename-widget-to-Widget")
+  check mv1.exitCode == 0
+  check mv2.exitCode == 0
+  check cmt.exitCode == 0
   let renameRev = git(repo, "rev-parse HEAD").output.strip()
 
   if useForcedProbe:
-    # See module doc point 1. Recreate the OLD spelling as an untracked,
-    # gitignored decoy so `depgraph.isEntryStale`'s raw `fileExists` doesn't
-    # force-include the dependent via Rule 4 ahead of Rule 5 (the fold).
-    # Content is irrelevant — isEntryStale only checks existence.
+    # See module doc point 1. Recreate the OLD spelling as a decoy so
+    # `depgraph.isEntryStale`'s raw `fileExists` doesn't force-include the
+    # dependent via Rule 4 ahead of Rule 5 (the fold). The rename above left
+    # `widget.nim` un-tracked, so exclude it via `.git/info/exclude` FIRST
+    # (never `.gitignore`, which would also un-track the original before the
+    # rename) — otherwise R3-24's untracked scan would pull the OLD spelling
+    # into the changed set and break the negative control. Content is
+    # irrelevant — isEntryStale only checks existence.
+    writeF(repo, ".git/info/exclude", "tests/unit/widget.nim\n")
     writeF(repo, "tests/unit/widget.nim",
            "-- decoy: kept present only so isEntryStale's raw fileExists\n" &
            "-- doesn't force-include ahead of narrow's closure-membership fold.\n")
