@@ -1009,12 +1009,16 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
     let key   = (ep.path, fHash)
     if impl.pv.graph.entries.hasKey(key):
       let ge = impl.pv.graph.entries[key]
-      # RFC-0009 A3c-ii: `ge.closure` is `HashSet[TrackedPath]`; sort by the
-      # sole ordering (`cmpKeyBytes`) and emit each member's `display` —
-      # this reproduces today's sorted project-relative-string output shape.
+      # RFC-0009 A3c-ii/A3d-iv: `ge.closure` is `HashSet[TrackedPath]`; sort by
+      # the sole ordering (`cmpKeyBytes`) and emit each member in its portable
+      # `keyBytes` spelling (crisol/closure/v1 rev 3). For a project (tag-0)
+      # member keyBytes is byte-identical to `display` (project-root-relative),
+      # so the wire is unchanged there; a dep-root member is spelled
+      # `dep:<name>/rel` (the §4 escape) instead of a machine-local absolute
+      # path — the closure wire carries no absolute host paths.
       var closureTp = toSeq(ge.closure)
       closureTp.sort(proc(a, b: TrackedPath): int = cmpKeyBytes(a, b, impl.cfg.trackedRoots))
-      let closureSeq = closureTp.mapIt(display(it))
+      let closureSeq = closureTp.mapIt(string(keyBytes(it, impl.cfg.trackedRoots)))
       entries.add ClosureEntry(
         path:        ep.path,
         group:       ep.group,

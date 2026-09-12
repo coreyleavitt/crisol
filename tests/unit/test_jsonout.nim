@@ -1774,7 +1774,7 @@ suite "jsonout — closureToJson (crisol/closure/v1)":
 
   test "schema constants are the documented literals":
     check ClosureV1Schema == "crisol/closure/v1"
-    check ClosureV1Revision == 2
+    check ClosureV1Revision == 3
 
   test "closureToJson: schema/schemaRevision, a recorded entry's full field set, an unrecorded entry, and warnings":
     let report = ClosureReport(

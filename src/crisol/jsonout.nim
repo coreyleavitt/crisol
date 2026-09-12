@@ -1182,7 +1182,7 @@ proc loadLastRun*(config: Config):
 const ClosureV1Schema* = "crisol/closure/v1"
   ## Stable schema identifier embedded in every crisol/closure/v1 JSON document.
 
-const ClosureV1Revision* = 2
+const ClosureV1Revision* = 3
   ## Integer minor revision of the crisol/closure/v1 schema (A8 convention).
   ##   rev 1 (implicit) — entries[]/warnings, as issue #9 slice A shipped it.
   ##   rev 2           — top-level `gatedOut` array (path, group, reason):
@@ -1190,15 +1190,28 @@ const ClosureV1Revision* = 2
   ##                     that a positional path whose only match is gated
   ##                     out is distinguishable from "no entrypoints matched"
   ##                     (see api.closureReport / ClosureReport.gatedOut).
+  ##   rev 3 (RFC-0009 A3d-iv) — each `entries[].closure` member is spelled in
+  ##                     its portable `keyBytes` form: a project-root member is
+  ##                     unchanged (project-root-relative, forward-slash), and a
+  ##                     dep-root member is now `dep:<name>/rel` (the §4 `dep:*`
+  ##                     escape) rather than a machine-local absolute path — so
+  ##                     the closure wire carries no absolute host paths and is
+  ##                     portable across machines. Consumers that resolved a
+  ##                     member as an absolute path (e.g. amoxtli's
+  ##                     tier_gate.normalizeClosureEntries) migrate keyed on this
+  ##                     rev-3 marker (RFC-0009 Contract-impacts).
 
 proc closureToJson*(r: ClosureReport): JsonNode =
   ## Pure: serialize a ClosureReport to the crisol/closure/v1 JsonNode.  No I/O.
   ## Deterministic ordering: entries in plan order (as received); each
   ## entry's `closure` array is already sorted by api.closureReport().
   ##
-  ## Each entry's `closure` array holds paths exactly as recorded in the
-  ## depgraph: project-root-relative with forward slashes for files inside
-  ## the project root, ABSOLUTE for files under a configured dep-root (see
+  ## Each entry's `closure` array holds every member in its portable
+  ## `keyBytes` spelling (RFC-0009 A3d-iv, rev 3): project-root-relative with
+  ## forward slashes for a file inside the project root, and `dep:<name>/rel`
+  ## (the §4 `dep:*` escape) for a file under a configured dep-root — never a
+  ## machine-local absolute path. `api.closureReport` produces these strings
+  ## via `keyBytes`; this serializer only emits them (see
   ## types.ClosureEntry.closure).
   ##
   ## `ClosureReport.adHocPaths` is deliberately NOT
