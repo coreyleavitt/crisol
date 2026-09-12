@@ -1061,7 +1061,18 @@ suite "jsonout - loadLastRun (B7)":
       timeoutSecs:        30,
       compileTimeoutSecs: 60,
       maxOutputBytes:     65536,
+      # RFC-0009 A3d-i: loadLastRun reduces each persisted path to a
+      # TrackedPath via config.trackedRoots, so give the fixture a REAL
+      # TrackedRoots matching projectRoot (as loadConfig does) — a default
+      # (empty) one would fold the failed keys under a policy that need not
+      # match what the assertions below build from the SAME cfg.trackedRoots.
+      trackedRoots:       initTrackedRoots(projectRoot, @[], stateDir),
     )
+
+  proc fk(cfg: Config; path, group: string): tuple[tp: TrackedPath, group: string] =
+    ## The A3d-i failed-set key: the persisted path reduced to its TrackedPath
+    ## identity against the SAME roots loadLastRun used, paired with the group.
+    (tp: fromCanonical(path, cfg.trackedRoots).get, group: group)
 
   test "absent lastrun.json → found=false":
     let tmpDir = uniqueTmpDir("absent")
@@ -1094,11 +1105,11 @@ suite "jsonout - loadLastRun (B7)":
     check lr.found == true
     # Only the (test_shared.nim, "unit") pair is a failure.
     check lr.failed.len == 1
-    check (path: "tests/unit/test_shared.nim", group: "unit") in lr.failed
+    check fk(cfg, "tests/unit/test_shared.nim", "unit") in lr.failed
     # The passed-group variant must NOT be in the failed set.
-    check (path: "tests/unit/test_shared.nim", group: "integration") notin lr.failed
+    check fk(cfg, "tests/unit/test_shared.nim", "integration") notin lr.failed
     # The other passed entrypoint must NOT be in the failed set.
-    check (path: "tests/unit/test_other.nim", group: "unit") notin lr.failed
+    check fk(cfg, "tests/unit/test_other.nim", "unit") notin lr.failed
 
   test "loadLastRun: all failure outcome strings are recognised":
     ## One entrypoint per failure outcome string; all must appear in failed set.
@@ -1116,11 +1127,11 @@ suite "jsonout - loadLastRun (B7)":
 
     check lr.found == true
     check lr.failed.len == 5
-    check (path: "a.nim", group: "g") in lr.failed
-    check (path: "b.nim", group: "g") in lr.failed
-    check (path: "c.nim", group: "g") in lr.failed
-    check (path: "d.nim", group: "g") in lr.failed
-    check (path: "e.nim", group: "g") in lr.failed
+    check fk(cfg, "a.nim", "g") in lr.failed
+    check fk(cfg, "b.nim", "g") in lr.failed
+    check fk(cfg, "c.nim", "g") in lr.failed
+    check fk(cfg, "d.nim", "g") in lr.failed
+    check fk(cfg, "e.nim", "g") in lr.failed
 
   test "loadLastRun: 'passed' outcome is NOT in failed set":
     let tmpDir   = uniqueTmpDir("passed")
@@ -1307,9 +1318,10 @@ suite "jsonout - loadLastRun (B7)":
     # An old v2 document: no schemaRevision, entrypoint has no cached/inputHash.
     let doc = """{"schema":"crisol/run/v2","summary":{"total":1,"counts":{"passed":0,"exitNonZero":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnError":0,"killed":0,"crashed":0},"noTestsRan":false},"entrypoints":[{"path":"a.nim","group":"g","outcome":"exitNonZero","records":[]}]}"""
     writeFile(tmpDir / stateDir / "lastrun.json", doc)
-    let lr = loadLastRun(makeCfg(tmpDir, stateDir))
+    let cfg = makeCfg(tmpDir, stateDir)
+    let lr = loadLastRun(cfg)
     check lr.found == true
-    check (path: "a.nim", group: "g") in lr.failed
+    check fk(cfg, "a.nim", "g") in lr.failed
 
   test "loadLastRun tolerates a new doc carrying cached/inputHash/cacheDecision":
     let tmpDir   = uniqueTmpDir("a8new")
@@ -1360,8 +1372,39 @@ suite "jsonout - loadLastRun (B7)":
 
     check lr.found == true
     check lr.failed.len == 1
-    check (path: "tests/unit/test_alpha.nim", group: "unit") in lr.failed
-    check (path: "tests/unit/test_beta.nim",  group: "unit") notin lr.failed
+    check fk(cfg, "tests/unit/test_alpha.nim", "unit") in lr.failed
+    check fk(cfg, "tests/unit/test_beta.nim", "unit") notin lr.failed
+
+  test "loadLastRun: --failed membership FOLDS under a case-insensitive policy (RFC-0009 A3d-i)":
+    ## The load-bearing A3d-i property: on a case-insensitive volume a
+    ## persisted `Foo.nim` failure must match a live `foo.nim`. Proven here by
+    ## forcing fpAsciiLower through the §3 probe seam (volume-independent on
+    ## this case-sensitive ext4 container). Under the default fpNone probe the
+    ## two spellings are distinct identities — folding is exactly what makes
+    ## `--failed` sound across a case-only rename. A raw-string membership
+    ## test (the pre-A3d-i behaviour) would MISS this match.
+    let tmpDir   = uniqueTmpDir("foldfailed")
+    let stateDir = ".crisol_test"
+    createDir(tmpDir)
+    createDir(tmpDir / stateDir)
+    defer: removeDir(tmpDir)
+
+    # Persist a failure under the UPPER-case spelling.
+    let jsonDoc = """{"schema":"crisol/run/v2","summary":{"total":1,"counts":{"passed":0,"exitNonZero":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnError":0,"killed":0,"crashed":0},"flaky":0,"quarantined":0,"notStarted":0,"noTestsRan":false},"entrypoints":[{"path":"tests/unit/Foo.nim","group":"unit","outcome":"exitNonZero","records":[]}]}"""
+    writeFile(tmpDir / stateDir / "lastrun.json", jsonDoc)
+
+    proc forcedLower(rootAbs, sd: string): FoldPolicy = fpAsciiLower
+    var cfg = makeCfg(tmpDir, stateDir)
+    cfg.trackedRoots = initTrackedRoots(tmpDir, @[], stateDir, forcedLower)
+
+    let lr = loadLastRun(cfg)
+    check lr.found == true
+    check lr.failed.len == 1
+    # The LOWER-case live spelling matches the UPPER-case persisted failure —
+    # only because == folds under fpAsciiLower.
+    check fk(cfg, "tests/unit/foo.nim", "unit") in lr.failed
+    # And a genuinely different file does NOT match (fold is not "match all").
+    check fk(cfg, "tests/unit/bar.nim", "unit") notin lr.failed
 
 # ---------------------------------------------------------------------------
 # P3 — symlink write-through protection for temp file

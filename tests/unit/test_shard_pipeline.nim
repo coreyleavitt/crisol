@@ -47,6 +47,10 @@ proc makeConfig(root: string; globs: seq[string]): Config =
     jobs:    1,
     timeoutSecs: 60,
     compiletimeoutSecs: 120,
+    # RFC-0009 A3d-i/A3a-i: discover builds each ep.tp from config.trackedRoots,
+    # and buildRunPlan's --failed membership compares those tp's against the
+    # failedKeys below — give the fixture REAL roots so both derive identically.
+    trackedRoots: initTrackedRoots(root, @[], ".crisol"),
   )
 
 proc pathsOf(pv: RunPlanView): seq[string] =
@@ -171,9 +175,12 @@ suite "buildRunPlan — shard wiring":
     let sel = GroupSelection(kind: gskDefault)
 
     # Mark test_a and test_b as failed.
-    var failedKeys = initHashSet[tuple[path, group: string]]()
-    failedKeys.incl (path: "tests/unit/test_a.nim", group: "unit")
-    failedKeys.incl (path: "tests/unit/test_b.nim", group: "unit")
+    # RFC-0009 A3d-i: failedKeys is TrackedPath-keyed; build each key from
+    # the SAME cfg.trackedRoots discover uses, so the fold-aware membership
+    # in buildRunPlan matches the discovered entrypoints' tp.
+    var failedKeys = initHashSet[tuple[tp: TrackedPath, group: string]]()
+    failedKeys.incl (tp: fromCanonical("tests/unit/test_a.nim", cfg.trackedRoots).get, group: "unit")
+    failedKeys.incl (tp: fromCanonical("tests/unit/test_b.nim", cfg.trackedRoots).get, group: "unit")
 
     let pv1 = buildRunPlan(cfg = cfg, selection = sel,
                            useFailed = true, failedKeys = failedKeys,

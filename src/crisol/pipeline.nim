@@ -54,7 +54,7 @@ type
 proc buildRunPlan*(
   cfg:          Config;
   selection:    GroupSelection;
-  failedKeys:   HashSet[tuple[path, group: string]] = initHashSet[tuple[path, group: string]]();
+  failedKeys:   HashSet[tuple[tp: TrackedPath, group: string]] = initHashSet[tuple[tp: TrackedPath, group: string]]();
   useFailed:    bool = false;
   useChanged:   bool = false;
   changed:      HashSet[TrackedPath] = initHashSet[TrackedPath]();
@@ -142,7 +142,7 @@ proc buildRunPlan*(
   if useFailed or useChanged:
     let failedNarrowed =
       if useFailed:
-        gated.run.filterIt((path: it.path, group: it.group) in failedKeys)
+        gated.run.filterIt((tp: it.tp, group: it.group) in failedKeys)  # RFC-0009 A3d-i: fold-aware failed-key membership (TrackedPath)
       else:
         newSeq[Entrypoint]()
     let changedNarrowed =

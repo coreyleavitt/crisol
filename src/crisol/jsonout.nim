@@ -1091,7 +1091,7 @@ const FailureOutcomeStrings* = failureOutcomeStrings
   ## Re-exported from crisol/outcomestrings for backward compatibility.
 
 proc loadLastRun*(config: Config):
-    tuple[found: bool; failed: HashSet[tuple[path, group: string]]] =
+    tuple[found: bool; failed: HashSet[tuple[tp: TrackedPath, group: string]]] =
   ## Read <projectRoot>/<stateDir>/lastrun.json.
   ##
   ## Returns:
@@ -1107,7 +1107,7 @@ proc loadLastRun*(config: Config):
   let path = stateDirOf(config) / "lastrun.json"
 
   if not fileExists(path):
-    return (found: false, failed: initHashSet[tuple[path, group: string]]())
+    return (found: false, failed: initHashSet[tuple[tp: TrackedPath, group: string]]())
 
   var raw: string
   try:
@@ -1133,7 +1133,7 @@ proc loadLastRun*(config: Config):
     # rfc-0007 A1d-i: a schema CHANGE is not something a byte-compatible
     # reader can partially trust -- the honest posture is "no data", exactly
     # like a missing file.  No error, no partial parse of v1's shape.
-    return (found: false, failed: initHashSet[tuple[path, group: string]]())
+    return (found: false, failed: initHashSet[tuple[tp: TrackedPath, group: string]]())
   if schemaVal != RunSchema:
     raise newCrisolError(cekEnvironment,
       "stale lastrun.json (schema '" & schemaVal &
@@ -1148,21 +1148,30 @@ proc loadLastRun*(config: Config):
     stderr.write("crisol: warning: lastrun.json schemaRevision " & $rev &
                  " is newer than this crisol understands (max " &
                  $RunSchemaRevision & "); ignoring it as cold-start\n")
-    return (found: false, failed: initHashSet[tuple[path, group: string]]())
+    return (found: false, failed: initHashSet[tuple[tp: TrackedPath, group: string]]())
 
   # Parse entrypoints array.
   if not node.hasKey("entrypoints") or node["entrypoints"].kind != JArray:
     raise newCrisolError(cekEnvironment,
       "lastrun.json is missing 'entrypoints' array — run `crisol run` first")
 
-  var failedSet = initHashSet[tuple[path, group: string]]()
+  # RFC-0009 A3d-i: the failed set is keyed by TrackedPath, not a raw string,
+  # so the `--failed` membership test in pipeline.buildRunPlan folds under the
+  # project root's policy (a persisted `Foo.nim` matches a live `foo.nim` on a
+  # case-insensitive volume). Each persisted `path` is jsonout's OWN output —
+  # a canonical, project-relative, forward-slash spelling — so `fromCanonical`
+  # (tag-0 shorthand) reduces it directly; a member that fails that shape
+  # validation cannot match any live tracked entrypoint anyway and is skipped.
+  var failedSet = initHashSet[tuple[tp: TrackedPath, group: string]]()
   for ep in node["entrypoints"]:
     if ep.kind != JObject: continue
     let epPath    = ep.getOrDefault("path").getStr("")
     let epGroup   = ep.getOrDefault("group").getStr("")
     let epOutcome = ep.getOrDefault("outcome").getStr("")
     if epOutcome in FailureOutcomeStrings:
-      failedSet.incl((path: epPath, group: epGroup))
+      let tp = fromCanonical(epPath, config.trackedRoots)
+      if tp.isSome:
+        failedSet.incl((tp: tp.get, group: epGroup))
 
   result = (found: true, failed: failedSet)
 

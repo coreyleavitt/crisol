@@ -328,14 +328,16 @@ suite "crisol D5 — --failed --changed union":
     setCurrentDir(repo)
     defer: setCurrentDir(oldCwd)
 
-    let eps = @[
-      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]),
-      Entrypoint(path: "tests/unit/test_b.nim", group: "unit", flags: @[]),
-    ]
-    # RFC-0009 A3c-ii: `DepGraphEntry.closure` is `HashSet[TrackedPath]` --
-    # build `roots` first so both the closure and `changed` (below) reduce
-    # under the SAME roots `narrowByDiff` is called with.
+    # RFC-0009 A3c-ii/A3d-i: build `roots` first so the closure, `changed`,
+    # the entrypoints' own `tp`, and the failed-key membership all reduce
+    # under the SAME roots.
     let roots = initTrackedRoots(repo, @[], "")
+    let eps = @[
+      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[],
+                 tp: fromCanonical("tests/unit/test_a.nim", roots).get),
+      Entrypoint(path: "tests/unit/test_b.nim", group: "unit", flags: @[],
+                 tp: fromCanonical("tests/unit/test_b.nim", roots).get),
+    ]
 
     # Precise graph: each closure is just the entrypoint's own file.
     var graph = initDepGraph("2.2.10")
@@ -348,12 +350,14 @@ suite "crisol D5 — --failed --changed union":
     # Only test_b changed on disk.
     var changed = initHashSet[TrackedPath]()
     changed.incl fromCanonical("tests/unit/test_b.nim", roots).get
-    # Only test_a failed previously.
-    let failedKeys = [(path: "tests/unit/test_a.nim", group: "unit")].toHashSet
+    # Only test_a failed previously. RFC-0009 A3d-i: the failed set is
+    # TrackedPath-keyed and the membership folds via ep.tp.
+    let failedKeys = [(tp: fromCanonical("tests/unit/test_a.nim", roots).get,
+                       group: "unit")].toHashSet
 
     # --- replicate buildPlanView's union narrowing exactly ---
     let failedNarrowed = eps.filterIt(
-      (path: it.path, group: it.group) in failedKeys)
+      (tp: it.tp, group: it.group) in failedKeys)
     let changedNarrowed = narrowByDiff(eps, changed, graph, roots, "")
 
     check failedNarrowed.mapIt(it.path) == @["tests/unit/test_a.nim"]

@@ -896,7 +896,7 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   let useFailed  = opts.narrowing.kind in {nkFailed, nkFailedOrChanged}
   let useChanged = opts.narrowing.kind in {nkChanged, nkFailedOrChanged}
 
-  var failedKeys = initHashSet[tuple[path, group: string]]()
+  var failedKeys = initHashSet[tuple[tp: TrackedPath, group: string]]()
   # RFC-0009 A3b-i: changedFiles reduces every git-emitted name through
   # cfg.trackedRoots, so this seam now carries a HashSet[TrackedPath].
   var changedSet = initHashSet[TrackedPath]()
