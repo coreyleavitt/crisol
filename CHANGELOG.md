@@ -439,6 +439,26 @@ Nim's compile cache (`~/.cache/nim`, redirected to `.ci-nimcache/` via
 `XDG_CACHE_HOME`) is cached across CI runs with `actions/cache@v4`, keyed on
 `milpa.lock` + `crisol.nimble`.
 
+### BREAKING CHANGE — dependency graph format 6: the header records each tracked root's name and fold policy; one-time full recompile (RFC-0009 A3c-i)
+
+**Prior behaviour:** the persisted dependency graph header carried only the
+Nim version and the format number. Entry paths were stored as plain
+project-relative strings with no record of which root layout or
+case-sensitivity policy produced them. A graph persisted under one set of
+tracked roots — or on one filesystem's fold behaviour — could be reloaded
+under a different layout or policy and its entries silently misattributed.
+
+**New behaviour:** the header now carries a `roots` descriptor: this file's
+own local tag->name table (so an entry's root is resolved by NAME, never by a
+bare persisted ordinal that a config reorder could point at the wrong root)
+plus each named root's probed `foldPolicy`. At load, every persisted root
+name is resolved against the CURRENT tracked roots — a name that no longer
+resolves (a renamed or removed dependency root), or a name that resolves but
+whose persisted fold policy disagrees with the current probe, discards the
+whole graph as absent rather than comparing entries across policies. This is
+depgraph-header validity only; it is not cache/ledger version material. A
+format-5 (or older) graph predates the descriptor and is discarded once,
+triggering a single full recompile.
 ### BREAKING CHANGE — dependency graph format 5: the headers a `{.compile.}`d source `#include`s are tracked compile inputs; one-time full recompile (issue #16)
 
 **Prior behaviour:** a `{.compile.}`d C/C++ source was in the closure

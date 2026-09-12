@@ -345,16 +345,18 @@ echo "PASS test_depgraph"
 # ---------------------------------------------------------------------------
 
 block test_format_version_pin:
-  ## DepGraphFormatVersion is 5 as of issue #16: a {.compile.}d external's
-  ## #include'd headers are now tracked compile inputs, joining `closure`
-  ## itself and recorded per-external in the new `externals` field. A v4
-  ## closure is missing whatever headers its externals (if any) #include —
-  ## under-selecting exactly like a v3 entry was missing {.compile.}d
-  ## sources themselves (issue #11) — so the graph must be discarded once.
+  ## DepGraphFormatVersion is 6 as of RFC-0009 A3c-i: the header gains a
+  ## `roots` descriptor (this file's own local tag->name table plus each
+  ## named root's probed `foldPolicy`), so a graph persisted under one root
+  ## layout / fold policy is never silently reused under another — an
+  ## unknown root name or a fold-policy disagreement discards it as absent.
+  ## A v5 (or older) graph predates that descriptor and is discarded once.
+  ## (v5, issue #16: a {.compile.}d external's #include'd headers became
+  ## tracked compile inputs recorded per-external in `externals`.)
   ## Bump this pin only together with a History entry in depgraph.nim and a
   ## CHANGELOG "BREAKING CHANGE — dependency graph format N" section.
-  assert DepGraphFormatVersion == 5,
-    "DepGraphFormatVersion pin: expected 5 (issue #16), got " & $DepGraphFormatVersion
+  assert DepGraphFormatVersion == 6,
+    "DepGraphFormatVersion pin: expected 6 (RFC-0009 A3c-i), got " & $DepGraphFormatVersion
 
   # A v4 graph on disk is treated as absent (discarded, not migrated).
   let root = getTempDir() / ("crisol_depgraph_v4pin_" & $getpid())
@@ -370,3 +372,22 @@ block test_format_version_pin:
   let loaded = loadDepGraph(makeTmpConfig(root), "")
   assert loaded.entries.len == 0,
     "a format-4 depgraph must be discarded on load (got " & $loaded.entries.len & " entries)"
+
+  # A v5 graph — the format immediately prior to the RFC-0009 A3c-i root
+  # descriptor — predates the header `roots` table and is likewise discarded
+  # once on load (the CHANGELOG format-6 migration promise). It carries the
+  # v5 `externals` shape (issue #16) to prove the discard is driven purely by
+  # the formatVersion mismatch, not by a shape parse failure.
+  let root5 = getTempDir() / ("crisol_depgraph_v5pin_" & $getpid())
+  removeDir(root5)
+  ensureStateDirExists(root5)
+  defer: removeDir(root5)
+  let v5 = %*{
+    "header": {"nimVersion": "", "formatVersion": 5},
+    "entries": [{"path": "tests/unit/test_x.nim", "flagHash": "cbf29ce484222325",
+                 "closure": ["tests/unit/test_x.nim"], "closureHash": "00",
+                 "externals": [], "protocolMajor": 1}]}
+  writeFile(root5 / ".crisol" / "depgraph", $v5)
+  let loaded5 = loadDepGraph(makeTmpConfig(root5), "")
+  assert loaded5.entries.len == 0,
+    "a format-5 depgraph must be discarded on load (got " & $loaded5.entries.len & " entries)"
