@@ -111,12 +111,32 @@ proc name*(r: NativeRoot): string = r.name
 proc project*(r: TrackedRoots): lent NativeRoot = r.fproject
 proc deps*(r: TrackedRoots): lent seq[NativeRoot] = r.fdeps
 
+proc populated*(r: TrackedRoots): bool = r.fproject.abs.len > 0
+  ## RFC-0009 A5c: a `TrackedRoots` built by `initTrackedRoots` always has a
+  ## non-empty project `abs` (`nativeCanonicalize` never returns an empty
+  ## string). Only a bare `TrackedRoots()` object-construction literal —
+  ## never produced by this module's own constructor — is zero-valued this
+  ## way, i.e. a caller that skipped `initTrackedRoots`/`config.loadConfig`
+  ## entirely (a hand-built/malformed `Config`). `cacheregistry.configuredCache`
+  ## is the one consumer: it has no fold POLICY to safely consult for such a
+  ## caller, so it treats every `file://` remote as unverifiable and fails
+  ## closed, rather than falling back to `fpNone` and risking an
+  ## under-fold on whatever volume it actually lands on. Exposed as a named
+  ## boolean query (not a raw `abs` getter) to keep the "no public raw-path
+  ## accessor" invariant above intact.
+
 # ---------------------------------------------------------------------------
-# fold — private helper. Identity under fpNone, ASCII-lowercase under
-# fpAsciiLower. NOT part of the public interface.
+# fold — identity under fpNone, ASCII-lowercase under fpAsciiLower.
 # ---------------------------------------------------------------------------
 
-proc fold(s: string; policy: FoldPolicy): string =
+proc fold*(s: string; policy: FoldPolicy): string =
+  ## Exported (RFC-0009 A5c) for exactly one outside consumer:
+  ## `cacheregistry.rootInsideStateDir`, which must fold a configured
+  ## `file://` remote's directory and `stateDir` under the SAME policy
+  ## `TrackedPath`'s own `==`/`hash` (above) use — not a second,
+  ## independently-drifting fold implementation. Still governed by the
+  ## same "no implicit string conversion" spirit: callers fold explicit,
+  ## already-absolute strings, never a `TrackedPath`'s private `rel`.
   case policy
   of fpNone: s
   of fpAsciiLower: s.toLowerAscii()

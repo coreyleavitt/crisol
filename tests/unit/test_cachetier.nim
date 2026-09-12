@@ -1286,6 +1286,89 @@ block test_configured_cache_rejects_root_equal_to_state_dir:
     caught = true
   assert caught, "a remote rooted exactly AT stateDir must also be rejected"
 
+# ---------------------------------------------------------------------------
+# RFC-0009 A5c: rootInsideStateDir fold-routing (fail-OPEN -> fail-CLOSED).
+# An INJECTED FoldPolicy (never the real per-volume probe) makes these
+# volume-independent -- they must pass identically on ext4 (this container)
+# and on a real case-insensitive volume (per [[rfc0009-macos-test-gotchas]]).
+# ---------------------------------------------------------------------------
+
+proc forcedFpAsciiLowerProbe(rootAbs, stateDir: string): FoldPolicy = fpAsciiLower
+
+block test_configured_cache_rejects_case_variant_root_inside_state_dir_under_folding_policy:
+  # Pre-A5c this was the fail-OPEN bug: a raw byte `startsWith` never
+  # matches a case-flipped stateDir spelling, so this exact remote was
+  # wrongly ALLOWED even though it resolves to the SAME on-disk directory
+  # on a case-insensitive/folding volume (recursing the l1 cache).
+  let sd = freshStateDir14("rootinside_casevariant")
+  let flippedSd = sd.toUpperAscii()
+  let nested = flippedSd / "cache" / "nested"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)])
+  let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpAsciiLowerProbe)
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = trackedRoots)
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a case-variant remote spelling of a path inside stateDir must be " &
+                 "rejected under a folding policy (was wrongly ALLOWED pre-A5c)"
+
+block test_configured_cache_rejects_ordinary_root_inside_state_dir_under_folding_policy:
+  # Same-case nesting must still be caught under fpAsciiLower (the fold
+  # never masks an already-matching comparison).
+  let sd = freshStateDir14("rootinside_folding")
+  let nested = sd / "cache" / "nested"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)])
+  let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpAsciiLowerProbe)
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = trackedRoots)
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "an ordinary (same-case) root inside stateDir must stay rejected under a folding policy"
+
+block test_configured_cache_allows_outside_root_under_folding_policy:
+  # A genuinely-outside remote must still be ALLOWED under fpAsciiLower --
+  # folding both sides never turns a distinct directory into a match.
+  let sd = freshStateDir14("outside_folding")
+  let remoteRoot = freshLocalFsRoot("configuredcache_outside_folding")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)])
+  let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpAsciiLowerProbe)
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                           trackedRoots = trackedRoots)
+  assert rt.cache.tiers.len == 2
+  assert rt.cache.tiers[1].name == "mirror"
+
+block test_configured_cache_degraded_trackedroots_rejects_even_an_outside_root:
+  # RFC-0009 A5c degraded/fail-closed: an UNPOPULATED `trackedRoots` (the
+  # default -- no `config.loadConfig`-probed policy to consult, e.g. a
+  # hand-built/malformed Config) has no safe policy to fold under, so
+  # EVERY `file://` remote is rejected outright -- even one that is
+  # genuinely OUTSIDE stateDir and would be ALLOWED given a real policy
+  # (proven by the previous test using the SAME remoteRoot shape). This is
+  # the "no policy to consult" fail-closed direction (RFC-0009 SS3/SS4),
+  # never a silent fpNone-and-hope fallback.
+  let sd = freshStateDir14("degraded_outside")
+  let remoteRoot = freshLocalFsRoot("configuredcache_degraded_outside")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)])
+  var caught = false
+  try:
+    # `trackedRoots` omitted -- defaults to the zero value (unpopulated).
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "an unpopulated trackedRoots (degraded config) must fail closed and " &
+                 "reject every file:// remote, even a genuinely-outside one"
+
 block test_configured_cache_rejects_unresolvable_scheme:
   # RFC-0005 C3b registers "http"/"https"/"s3" too -- this now needs a
   # scheme genuinely unregistered by ANY registry (not merely "not yet
@@ -1307,7 +1390,8 @@ block test_configured_cache_builds_a_real_second_tier:
   let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot,
                                               backfillOnHit: true)])
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
-                           secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+                           secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                           trackedRoots = initTrackedRoots(sd, @[], sd))
   assert rt.cache.tiers.len == 2
   assert rt.cache.tiers[0].name == "l1"
   assert rt.cache.tiers[1].name == "mirror"
@@ -1332,7 +1416,8 @@ block test_configured_cache_honors_explicit_verify_trust_true_under_a_real_polic
   )
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                            secrets = CacheSecrets(hmacKey: some("s3cr3t")),
-                           sink = NilSink[TelemetryEvent]())
+                           sink = NilSink[TelemetryEvent](),
+                           trackedRoots = initTrackedRoots(sd, @[], sd))
   assert rt.cache.tiers[1].verifyTrust == true
 
 # ---------------------------------------------------------------------------
@@ -1441,7 +1526,8 @@ block test_configured_cache_wires_ed25519_policy_end_to_end:
   )
   var rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                            secrets = CacheSecrets(signSeedB64: base64.encode(seedBytes)),
-                           sink = NilSink[TelemetryEvent]())
+                           sink = NilSink[TelemetryEvent](),
+                           trackedRoots = initTrackedRoots(sd, @[], sd))
   assert rt.cache.tiers[1].verifyTrust == true, "no explicit verify-trust -- default is policy != none"
   let key = SoundnessKey("e5e5e5e5e5e5e5e5")
   let putVerdicts = rt.cache.put(sampleEntry(key, exitCode = 5))
@@ -1452,7 +1538,8 @@ block test_configured_cache_wires_ed25519_policy_end_to_end:
   # above published -- proves configuredCache's "no-seed verify-only mode"
   # wiring, not just the policy in isolation.
   var rtVerifyOnly = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
-                                     secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+                                     secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                                     trackedRoots = initTrackedRoots(sd, @[], sd))
   let l = rtVerifyOnly.cache.lookup(key)
   assert l.hit.isSome
   assert l.hit.get.verified == true
@@ -1469,7 +1556,8 @@ block test_configured_cache_wires_hmac_policy_end_to_end:
   )
   var rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                            secrets = CacheSecrets(hmacKey: some("s3cr3t")),
-                           sink = NilSink[TelemetryEvent]())
+                           sink = NilSink[TelemetryEvent](),
+                           trackedRoots = initTrackedRoots(sd, @[], sd))
   assert rt.cache.tiers[1].verifyTrust == true, "no explicit verify-trust -- default is policy != none"
   let key = SoundnessKey("d0d0d0d0d0d0d0d0")
   let putVerdicts = rt.cache.put(sampleEntry(key, exitCode = 3))
@@ -1480,7 +1568,8 @@ block test_configured_cache_wires_hmac_policy_end_to_end:
   # captured by identity from the first call.
   var rt2 = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                             secrets = CacheSecrets(hmacKey: some("s3cr3t")),
-                            sink = NilSink[TelemetryEvent]())
+                            sink = NilSink[TelemetryEvent](),
+                            trackedRoots = initTrackedRoots(sd, @[], sd))
   let l = rt2.cache.lookup(key)
   assert l.hit.isSome
   assert l.hit.get.verified == true

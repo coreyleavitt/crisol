@@ -833,8 +833,10 @@ proc offlineTierDeps(): CacheDeps =
   # needs real secrets, so it is accepted and discarded like the other
   # three unused params.
   CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
-                              resolvedSecrets: CacheSecrets): CacheRuntime =
+                              resolvedSecrets: CacheSecrets;
+                              trackedRoots: TrackedRoots): CacheRuntime =
     discard cfg; discard stateDir; discard maxEntries; discard resolvedSecrets
+    discard trackedRoots
     CacheRuntime(
       cache: TieredCache(
         tiers: @[Tier(name: "l1", backend: alwaysOfflineBackend(), backfillOnHit: false, verifyTrust: false)],
@@ -1050,7 +1052,7 @@ suite "runTestsWith / CacheDeps — production parity":
     defer: delEnv("CRISOL_CACHE_TOKEN")
     let deps = productionCacheDeps()
     discard deps.buildRuntime(CacheConfig(), getTempDir() / "crisol_d5_scrub_state", 0,
-                              CacheSecrets())
+                              CacheSecrets(), TrackedRoots())
     check getEnv("CRISOL_CACHE_TOKEN") == "must-survive-buildRuntime-called-alone"
 
 # ---------------------------------------------------------------------------
@@ -1159,8 +1161,10 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
       let l1 = memory()
       let l2 = memory()
       let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
-                                              resolvedSecrets: CacheSecrets): CacheRuntime =
+                                              resolvedSecrets: CacheSecrets;
+                                              trackedRoots: TrackedRoots): CacheRuntime =
         discard cfg; discard stateDir; discard maxEntries; discard resolvedSecrets
+        discard trackedRoots
         CacheRuntime(
           cache: TieredCache(
             tiers: @[
@@ -2222,10 +2226,11 @@ proc e2e3Deps(fs: E2E3Server; secrets = CacheSecrets()): CacheDeps =
   # fixture wants ITS OWN fixed test secrets, never whatever runTestsWith
   # resolved from the (in this suite, unset) real environment.
   CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
-                              resolvedSecrets: CacheSecrets): CacheRuntime =
+                              resolvedSecrets: CacheSecrets;
+                              trackedRoots: TrackedRoots): CacheRuntime =
     discard resolvedSecrets
     configuredCache(cfg, stateDir, maxEntries, testRegistry(fs.e2e3Fetcher),
-                    secrets, NilSink[TelemetryEvent]()))
+                    secrets, NilSink[TelemetryEvent](), trackedRoots))
 
 const E2E3SingleTestKdl = """
 group "unit" {
@@ -2364,10 +2369,11 @@ proc e2e3StoreDeps(st: E2E3Store; secrets: CacheSecrets): CacheDeps =
   # RFC-0005 code-review R2-D5a: see e2e3Deps's own comment, above, for why
   # `resolvedSecrets` is named distinctly and discarded here.
   CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
-                              resolvedSecrets: CacheSecrets): CacheRuntime =
+                              resolvedSecrets: CacheSecrets;
+                              trackedRoots: TrackedRoots): CacheRuntime =
     discard resolvedSecrets
     configuredCache(cfg, stateDir, maxEntries, testRegistry(st.e2e3StoreFetcher),
-                    secrets, NilSink[TelemetryEvent]()))
+                    secrets, NilSink[TelemetryEvent](), trackedRoots))
 
 suite "RFC-0005 C3b -- E2E-3: s3 remote wired live through runTestsWith(testRegistry(fake))":
 
@@ -2475,10 +2481,11 @@ proc e2e3AuthDeps(fs: E2E3AuthServer; token: string): CacheDeps =
   # RFC-0005 code-review R2-D5a: see e2e3Deps's own comment, above, for why
   # `resolvedSecrets` is named distinctly and discarded here.
   CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
-                              resolvedSecrets: CacheSecrets): CacheRuntime =
+                              resolvedSecrets: CacheSecrets;
+                              trackedRoots: TrackedRoots): CacheRuntime =
     discard resolvedSecrets
     configuredCache(cfg, stateDir, maxEntries, testRegistry(fs.e2e3AuthFetcher),
-                    secrets, NilSink[TelemetryEvent]()))
+                    secrets, NilSink[TelemetryEvent](), trackedRoots))
 
 suite "RFC-0005 C6 -- secure-by-default credential scopes end to end (auth-validating fake server)":
 

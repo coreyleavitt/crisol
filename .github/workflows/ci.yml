@@ -419,6 +419,18 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a4b_determinism.nim
 
+      # RFC-0009 A5c: the cache-portability E2E — a depRoot closure member's
+      # cache key must be host-portable (relocating the project tree between
+      # two runs still HITS the local cache). Fold-INDEPENDENT (no
+      # CRISOL_EXPECT_FOLD, no volume-skip guard) — this is a producer here
+      # regardless of NTFS case policy, mirroring the A3b-ii/A4b per-file
+      # steps immediately above. Self-skips only on an environment that
+      # cannot create symlinks at all (same convention as
+      # test_closure_a4a.nim), never on case (in)sensitivity.
+      - name: rfc-0009 A5c — cache-portability E2E (depRoot member, relocated tree)
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a5c_cache_portability.nim
+
   macos:
     runs-on: macos-latest
     steps:

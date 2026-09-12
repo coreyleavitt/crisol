@@ -111,8 +111,10 @@ suite "RFC-0005 code-review SO2 — end-of-run drain skipped on an interrupted r
       # fixed two-tier CacheRuntime and never needs real secrets, so it is
       # accepted and discarded like the other three unused params.
       let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; sd: string; maxEntries: int;
-                                              resolvedSecrets: CacheSecrets): CacheRuntime =
+                                              resolvedSecrets: CacheSecrets;
+                                              trackedRoots: TrackedRoots): CacheRuntime =
         discard cfg; discard sd; discard maxEntries; discard resolvedSecrets
+        discard trackedRoots
         CacheRuntime(
           cache: TieredCache(
             tiers: @[

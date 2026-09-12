@@ -82,6 +82,9 @@ import crisol/caches3
 import crisol/httpraw
 import crisol/cachetelemetry
 import crisol/cachetrust
+import crisol/paths
+# RFC-0009 A5c: `rootInsideStateDir`'s fold-routing fix. `paths` imports only
+# `std/*` (no `crisol/*`), so this cannot introduce an import cycle.
 
 export cachetelemetry
 # RFC-0005 C5a: re-exports `cachetrust`'s public surface -- notably its
@@ -382,20 +385,31 @@ proc localOnlyCache*(stateDir: string; maxEntries: int): CacheRuntime =
     localRoot: root,
   )
 
-proc rootInsideStateDir(root, stateDir: string): bool =
+proc rootInsideStateDir(root, stateDir: string; foldPolicy: FoldPolicy): bool =
   ## `root` (a configured `file://` remote's directory) resolves equal to,
   ## or nested under, `stateDir` — RFC-0005 "Local-fs root": such a tier
   ## would recurse the L1 cache (`clean.nim`'s `pruneDir` walks the whole
   ## `stateDir`, not just `stateDir/cache`, so ANY location inside it is
   ## fair game for pruning). Absolute + normalized on both sides so a
   ## relative config value and trailing separators cannot dodge the check.
-  let a = normalizedPath(absolutePath(root))
-  let b = normalizedPath(absolutePath(stateDir))
+  ##
+  ## RFC-0009 A5c: BOTH sides are folded under `foldPolicy` (`paths.fold` —
+  ## the SAME helper `TrackedPath`'s own `==`/`hash` use) before comparing —
+  ## fixing a fail-*OPEN* bug in the previous raw-byte comparison: on a
+  ## case-insensitive/folding volume, a remote spelled with a different
+  ## case than `stateDir` (e.g. `STATEDIR/x` vs. configured `statedir`)
+  ## would not `startsWith` under a byte comparison, so the check passed
+  ## and a cache-recursing remote was wrongly ALLOWED. Under `fpNone`
+  ## (case-sensitive volume — the default), `fold(s, fpNone) == s`, so this
+  ## is byte-identical to the pre-fix behavior.
+  let a = fold(normalizedPath(absolutePath(root)), foldPolicy)
+  let b = fold(normalizedPath(absolutePath(stateDir)), foldPolicy)
   a == b or a.startsWith(b & DirSep)
 
 proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
                       reg: BackendRegistry; secrets: CacheSecrets;
-                      sink: TelemetrySink[TelemetryEvent]): CacheRuntime =
+                      sink: TelemetrySink[TelemetryEvent];
+                      trackedRoots: TrackedRoots = TrackedRoots()): CacheRuntime =
   ## RFC-0005 A3c-ii/C4: build the run's `TieredCache` from parsed KDL
   ## (`CacheConfig.remotes` — `types.RemoteTier` — and, since C4,
   ## `CacheConfig.trust` — `types.TrustConfig`), via `reg` (scheme ->
@@ -419,6 +433,25 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
   ##   - a remote named `"l1"` — reserved for the pinned local tier.
   ##   - a `file://` root that resolves inside `stateDir` (`clean` would
   ##     prune it out from under a live remote — see `rootInsideStateDir`).
+  ##     **RFC-0009 A5c:** the comparison is folded under
+  ##     `trackedRoots.project.foldPolicy` — the SAME per-volume policy
+  ##     `TrackedPath`'s own identity uses — so a case-variant remote path
+  ##     inside `stateDir` on a folding volume is caught too (pre-A5c this
+  ##     was a raw byte comparison: fail-*open* on such a volume). `config.
+  ##     loadConfig` always populates `trackedRoots` (RFC-0009 A2) for a
+  ##     real run; `trackedRoots` defaults to the zero value here ONLY for
+  ##     a caller that builds a `CacheConfig` by hand and skips that (a
+  ##     malformed/degraded config, e.g. most of this module's own unit
+  ##     tests). **Degraded/fail-closed (§3/§4):** when `trackedRoots` is
+  ##     unpopulated (`paths.populated` false — no probed fold policy to
+  ##     consult), EVERY `file://` remote is rejected outright, exactly as
+  ##     if it resolved inside `stateDir` — there is no policy under which
+  ##     it is safe to say otherwise, and the two axes here (membership
+  ##     vs. this cache-recursion guard) have opposite safe poles, so
+  ##     falling back to `fpNone` and hoping is not an option (RFC-0009 §3:
+  ##     "no single silent default serves both"). A caller that wants a
+  ##     `file://` remote actually accepted must thread a real
+  ##     `trackedRoots` through.
   ##   - a url whose scheme `reg` cannot resolve (`buildBackend` -> `none`):
   ##     an unregistered/typo'd/not-yet-shipped scheme (http/s3 arrive in
   ##     Stage C; `memory://` is registered ONLY by `testRegistry`) is a
@@ -537,7 +570,14 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
 
     if remote.url.startsWith("file://"):
       let fsRoot = remote.url["file://".len .. ^1]
-      if rootInsideStateDir(fsRoot, stateDir):
+      # RFC-0009 A5c: fail CLOSED when there is no probed fold policy to
+      # consult (`trackedRoots` unpopulated -- see this proc's own doc
+      # comment) -- reject unconditionally rather than risk an under-fold
+      # by guessing `fpNone`.
+      let insideStateDir =
+        if not populated(trackedRoots): true
+        else: rootInsideStateDir(fsRoot, stateDir, trackedRoots.project.foldPolicy)
+      if insideStateDir:
         raise newCrisolError(cekConfig,
           "config: remote-cache '" & remote.name & "': url '" & remote.url &
           "' resolves inside the state dir '" & stateDir & "' -- this would " &

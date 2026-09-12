@@ -1116,8 +1116,18 @@ type
     ## E2E suites) names this parameter `resolvedSecrets` too but never
     ## reads it — it closes over its own `secrets` local instead, exactly
     ## as before this reshape.
+    ##
+    ## **RFC-0009 A5c:** gained a fifth argument, `trackedRoots:
+    ## TrackedRoots`, threaded down from `runTestsWith`'s own `cfg.
+    ## trackedRoots` (RFC-0009 A2 — populated once by `config.loadConfig`)
+    ## at its `deps.buildRuntime` call site, below. `productionCacheDeps`
+    ## passes it straight into `configuredCache`'s fold-routed
+    ## `rootInsideStateDir` guard; a test double that builds its own
+    ## `CacheRuntime` directly (never calling `configuredCache`) accepts
+    ## and discards it, same as the other unused params.
     buildRuntime*: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
-                        resolvedSecrets: CacheSecrets): CacheRuntime {.closure.}
+                        resolvedSecrets: CacheSecrets;
+                        trackedRoots: TrackedRoots): CacheRuntime {.closure.}
 
 const CrisolCacheSecretPrefix = "CRISOL_CACHE_"
   ## RFC-0005 C4 "Secrets come from the environment... are then removed
@@ -1211,8 +1221,10 @@ proc productionCacheDeps*(): CacheDeps =
   ## `CacheSecrets` value is threaded down through `buildRuntime`'s new
   ## `resolvedSecrets` parameter instead of being re-derived here.
   CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
-                              resolvedSecrets: CacheSecrets): CacheRuntime =
-    configuredCache(cfg, stateDir, maxEntries, productionRegistry(), resolvedSecrets, NilSink[TelemetryEvent]()))
+                              resolvedSecrets: CacheSecrets;
+                              trackedRoots: TrackedRoots): CacheRuntime =
+    configuredCache(cfg, stateDir, maxEntries, productionRegistry(), resolvedSecrets,
+                    NilSink[TelemetryEvent](), trackedRoots))
 
 # ---------------------------------------------------------------------------
 # runTestsWith — full run facade; catches-and-encodes structural failures.
@@ -1317,7 +1329,8 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     try:
       # R2-D5a: `secrets` was already resolved (+ scrubbed) above, before
       # `planImpl` — this is a plain pass-through, not a new resolution.
-      rt = deps.buildRuntime(effectiveCacheCfg, pr.settings.stateDir, maxCacheEntries, secrets)
+      rt = deps.buildRuntime(effectiveCacheCfg, pr.settings.stateDir, maxCacheEntries, secrets,
+                             cfg.trackedRoots)
     except CrisolError as e:
       let code = if e.kind == cekInternal: 2 else: 3
       return structuralResultWithPlan(e.msg, code, pr)

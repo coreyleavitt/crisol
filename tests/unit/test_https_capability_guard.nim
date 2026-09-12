@@ -67,7 +67,8 @@ suite "cacheregistry.configuredCache — https-capability guard (non-ssl build)"
       RemoteTier(name: "mirror", url: "file://" & remoteRoot)
     ])
     let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
-                             secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+                             secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                             trackedRoots = initTrackedRoots(sd, @[], sd))
     check rt.cache.tiers.len == 2
     check rt.cache.tiers[1].name == "mirror"
 
