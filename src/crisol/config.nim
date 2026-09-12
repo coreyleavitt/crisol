@@ -137,7 +137,7 @@ let DefaultGroups*: seq[Group] = @[
 # Convention-fallback config (no crisol.kdl found)
 # ---------------------------------------------------------------------------
 
-proc conventionConfig(root: string): Config =
+proc conventionConfig(root: string; probe: FoldProbe = probeFoldPolicy): Config =
   result = Config(
     groups:             DefaultGroups,
     jobs:               0,
@@ -155,7 +155,7 @@ proc conventionConfig(root: string): Config =
   # (no crisol.kdl found) is one of projectRoot's three origins (§2); no
   # dep roots are ever configured on this path.
   result.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](),
-                                          stateDirOf(result))
+                                          stateDirOf(result), probe)
 
 # ---------------------------------------------------------------------------
 # Walk-up: search for crisol.kdl from startDir upward → "" if not found
@@ -705,7 +705,8 @@ proc validate(cfg: Config; source: string; warns: var seq[ConfigWarning]) =
 # ---------------------------------------------------------------------------
 
 proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
-                 warns: var seq[ConfigWarning]): Config =
+                 warns: var seq[ConfigWarning];
+                 probe: FoldProbe = probeFoldPolicy): Config =
   var
     jobs               = 0
     timeoutSecs        = DefaultTimeoutSecs
@@ -990,14 +991,14 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
   # RFC-0009 A2: computed ONCE here -- the explicit/discovered-KDL-file
   # origin (§2) -- from THIS SAME projectRoot and the validated depRootSpecs
   # above (never re-derived downstream).
-  result.trackedRoots = initTrackedRoots(projectRoot, depRootSpecs, stateDirOf(result))
+  result.trackedRoots = initTrackedRoots(projectRoot, depRootSpecs, stateDirOf(result), probe)
   validate(result, source, warns)
 
 # ---------------------------------------------------------------------------
 # parseConfigFile — read + parse a crisol.kdl path → Config
 # ---------------------------------------------------------------------------
 
-proc parseConfigFile(path: string): (Config, seq[ConfigWarning]) =
+proc parseConfigFile(path: string; probe: FoldProbe = probeFoldPolicy): (Config, seq[ConfigWarning]) =
   let src =
     try: readFile(path)
     except IOError, OSError:
@@ -1011,14 +1012,15 @@ proc parseConfigFile(path: string): (Config, seq[ConfigWarning]) =
       r.getErr.formatError(src, path))
 
   var warns: seq[ConfigWarning]
-  let cfg = docToConfig(r.get, parentDir(absolutePath(path)), path, warns)
+  let cfg = docToConfig(r.get, parentDir(absolutePath(path)), path, warns, probe)
   (cfg, warns)
 
 # ---------------------------------------------------------------------------
 # loadConfig — the stable public seam
 # ---------------------------------------------------------------------------
 
-proc loadConfig*(configPath: string = ""; startDir: string = ""):
+proc loadConfig*(configPath: string = ""; startDir: string = "";
+                 probe: FoldProbe = probeFoldPolicy):
                 (Config, seq[ConfigWarning]) =
   ## Resolve and load the crisol configuration.
   ##
@@ -1035,13 +1037,13 @@ proc loadConfig*(configPath: string = ""; startDir: string = ""):
     if not fileExists(configPath):
       raise newCrisolError(cekEnvironment,
         "config: --config path does not exist: '" & configPath & "'")
-    return parseConfigFile(configPath)
+    return parseConfigFile(configPath, probe)
 
   let origin = if startDir.len > 0: startDir else: getCurrentDir()
   let found  = findConfigFile(origin)
   if found.len > 0:
-    return parseConfigFile(found)
+    return parseConfigFile(found, probe)
 
   # Convention fallback — not an error; no warnings (no file to have unknown keys)
   let gitRoot = findGitRoot(origin)
-  (conventionConfig(if gitRoot.len > 0: gitRoot else: origin), @[])
+  (conventionConfig(if gitRoot.len > 0: gitRoot else: origin, probe), @[])

@@ -176,16 +176,22 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
 
   proc forcedProbe(rootAbs, stateDir: string): FoldPolicy = forcedPolicy
 
-  # No memo pre-warm needed: paths.memoizedProbe bypasses its per-process memo
-  # for any explicitly-injected non-default probe, so RUN 2's forced-probe
-  # override below is honored even though RUN 1's `runTests` facade probes this
-  # same root first with the real (default) probe.
+  # The forced probe (mode 1) must govern the ENTIRE run — RUN 1's PERSIST as
+  # well as RUN 2's LOAD — because A3c-i now records each root's fold policy in
+  # the dep graph header and discards the graph on a load-time mismatch
+  # (dgdFoldMismatch). RUN 1's public `runTests` facade builds its own config
+  # internally, so the policy is injected through `RunOptions.foldProbe`
+  # (RFC-0009 §3 seam, threaded api.planTests → config.loadConfig →
+  # initTrackedRoots); RUN 2 rebuilds its config with the SAME probe below. In
+  # real-probe modes (2/3) `foldProbe` is nil → the real `probeFoldPolicy`
+  # governs both runs identically, so the header always matches on reload.
 
   # RUN 1: a real run (compile + execute) — the public `runTests` facade,
   # not a hand-rolled compile — with NO `--changed`, so the dep graph is
   # built and PERSISTED to disk via a genuine `recordClosure`/`saveDepGraph`
   # (depgraph.nim ~791).
-  let r1 = runTests(RunOptions(startDir: repo, jobs: 1))
+  let r1 = runTests(RunOptions(startDir: repo, jobs: 1,
+                               foldProbe: (if useForcedProbe: forcedProbe else: nil)))
   check r1.status == rsOk
   check r1.summary.total == 2
   check r1.summary.failed == 0
@@ -234,13 +240,14 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   # Edit Widget.nim's CONTENT — uncommitted working-tree edit.
   writeF(repo, "tests/unit/Widget.nim", "proc widgetValue*(): int = 4242\n")
 
-  # RUN 2's cfg: fresh load, then the documented injection —
-  # `cfg.trackedRoots` overridden via `initTrackedRoots(..., probe = forced)`
-  # — which (thanks to the pre-warm above) agrees with what RUN 1 already
-  # saw, under useForcedProbe. A plain re-load under real-probe modes.
-  var (cfg, _) = loadConfig(startDir = repo)
-  if useForcedProbe:
-    cfg.trackedRoots = initTrackedRoots(cfg.projectRoot, @[], cfg.stateDir, forcedProbe)
+  # RUN 2's cfg: a fresh load built with the SAME probe RUN 1 persisted under,
+  # threaded through `loadConfig` (RFC-0009 §3 seam) so the whole config —
+  # trackedRoots AND the fold policy `loadDepGraph` validates the header
+  # against — is consistent with RUN 1. Under real-probe modes the probe is
+  # the default `probeFoldPolicy`, identical to RUN 1's.
+  var (cfg, _) =
+    if useForcedProbe: loadConfig(startDir = repo, probe = forcedProbe)
+    else:              loadConfig(startDir = repo)
 
   let nimVersion = cachedNimFingerprint()
 

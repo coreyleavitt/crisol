@@ -627,6 +627,17 @@ proc probeFoldPolicy*(rootAbs: string; stateDir: string): FoldPolicy =
 # initTrackedRoots — eager root construction, per-process memoized probe.
 # ---------------------------------------------------------------------------
 
+type FoldProbe* = proc (rootAbs, stateDir: string): FoldPolicy
+  ## The §3 injectable fold-policy probe. Defaults everywhere to
+  ## `probeFoldPolicy` (the real per-volume probe); an explicitly-injected
+  ## non-default probe is the Linux-testability seam that lets a test force a
+  ## policy a real case-sensitive volume would never answer. Threaded from
+  ## `config.loadConfig` (and `RunOptions.foldProbe`, via `api.planTests`)
+  ## down to `initTrackedRoots` so a forced policy governs an ENTIRE run —
+  ## both the graph a real `runTests` PERSISTS and any later `loadDepGraph`
+  ## validation of that graph's header (RFC-0009 A3c-i) — not just a single
+  ## hand-built `initTrackedRoots` call.
+
 var probeMemo: Table[string, FoldPolicy]
   ## Per-process memo keyed by canonical root abs path — Config is built
   ## hundreds of times across the test suite, so the probe is a per-process,

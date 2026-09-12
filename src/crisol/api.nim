@@ -233,6 +233,16 @@ type
     ## Tier 1 — everyday selection
     configPath*:   string = ""
     startDir*:     string = ""   ## walk-up origin when configPath==""; "" → cwd
+    foldProbe*:    FoldProbe = nil
+                                 ## RFC-0009 §3 test-injection seam: overrides the
+                                 ## fold-policy probe `loadConfig` uses to build this
+                                 ## run's `trackedRoots`. `nil` (production/CLI default)
+                                 ## → the real `probeFoldPolicy`. A forced probe here
+                                 ## governs the WHOLE run — including the fold policy
+                                 ## stamped into any dep graph this run persists — so a
+                                 ## later `--changed` load validates that graph's header
+                                 ## against the SAME policy (A3c-i) instead of tripping a
+                                 ## spurious `dgdFoldMismatch`. Not settable from KDL/CLI.
     selection*:    GroupSelection ## default-constructed = gskDefault
     narrowing*:    RunNarrowing   ## default-constructed = noNarrowing()
     forceCompile*: bool = false
@@ -849,9 +859,13 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   ## Internal plan phase shared by planTests and runTests.
   ## Raises CrisolError on any structural problem.
 
-  # 1. Load config.
+  # 1. Load config. A test-injected fold probe (RFC-0009 §3 seam) governs the
+  #    whole run's trackedRoots — including the fold policy persisted into the
+  #    dep graph header — so `nil` falls back to the real `probeFoldPolicy`.
+  let effProbe = if opts.foldProbe != nil: opts.foldProbe else: probeFoldPolicy
   var (cfg, cfgWarnings) = loadConfig(configPath = opts.configPath,
-                                      startDir   = opts.startDir)
+                                      startDir   = opts.startDir,
+                                      probe      = effProbe)
 
   # 2. Apply jobs / timeout / retries overrides.
   if opts.jobs > 0:        cfg.jobs        = opts.jobs
