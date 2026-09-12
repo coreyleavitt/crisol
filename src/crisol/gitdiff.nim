@@ -53,17 +53,30 @@ import crisol/types
 # Internal helper: run git without a shell
 # ---------------------------------------------------------------------------
 
-proc runGit(args: seq[string]; workingDir: string): tuple[output: string; exitCode: int] =
+proc runGit(args: seq[string]; workingDir: string):
+    tuple[output, errOutput: string; exitCode: int] =
   ## Invoke `git <args>` in `workingDir` without a shell intermediary.
-  ## Uses `poUsePath` so `git` is found via PATH; `poStdErrToStdOut` merges
-  ## stderr into the captured output so diagnostics are visible.
-  ## Returns (output, exitCode); raises OSError if git cannot be exec'd at all.
+  ## Uses `poUsePath` so `git` is found via PATH. stderr is captured
+  ## SEPARATELY from stdout and NEVER merged: git writes diagnostics to
+  ## stderr (e.g. on Windows with `core.autocrlf`, a per-file
+  ## "LF will be replaced by CRLF" warning), and merging that into stdout
+  ## would let a warning line be parsed as a changed-file NAME — a real
+  ## correctness bug that corrupted the changed set on the windows leg.
+  ## stdout carries the machine-readable, NUL-separated names ONLY; stderr
+  ## is surfaced only in error messages. Returns (stdout, stderr, exitCode);
+  ## raises OSError if git cannot be exec'd at all.
+  ##
+  ## stdout is drained fully first (streaming, so an arbitrarily large diff
+  ## never blocks); git's stderr here is bounded to a few short warning lines
+  ## that comfortably fit the OS pipe buffer, so reading it after stdout EOF
+  ## cannot deadlock in practice.
   let p = startProcess("git", workingDir = workingDir, args = args,
-                        options = {poUsePath, poStdErrToStdOut})
+                        options = {poUsePath})
   defer: close(p)
   let output = p.outputStream.readAll()
   let code   = waitForExit(p)
-  result = (output: output, exitCode: code)
+  let errOut = p.errorStream.readAll()
+  result = (output: output, errOutput: errOut, exitCode: code)
 
 proc splitNul(output: string): seq[string] =
   ## Splits `-z` git output on NUL, dropping empty fragments (a trailing NUL
@@ -144,7 +157,7 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
   var probeOut: string
   var probeCode: int
   try:
-    (probeOut, probeCode) = runGit(
+    (probeOut, _, probeCode) = runGit(
       @["rev-parse", "--is-inside-work-tree"],
       workingDir = projectRoot)
   except OSError as e:
@@ -174,10 +187,10 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
     else:
       @["diff", "-z", "--no-renames", "--relative", "--name-only", baseRef]
 
-  var diffOut: string
+  var diffOut, diffErr: string
   var diffCode: int
   try:
-    (diffOut, diffCode) = runGit(diffArgs, workingDir = projectRoot)
+    (diffOut, diffErr, diffCode) = runGit(diffArgs, workingDir = projectRoot)
   except OSError as e:
     raise newCrisolError(cekEnvironment,
       "git diff failed to execute: " & e.msg)
@@ -187,7 +200,7 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
 
   if diffCode != 0:
     raise newCrisolError(cekEnvironment,
-      "git diff exited with code " & $diffCode & ": " & diffOut.strip())
+      "git diff exited with code " & $diffCode & ": " & diffErr.strip())
 
   for name in splitNul(diffOut):
     let tp = reduceChangedName(name, roots)
@@ -208,7 +221,7 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
   var untrackedOut: string
   var untrackedCode: int
   try:
-    (untrackedOut, untrackedCode) = runGit(
+    (untrackedOut, _, untrackedCode) = runGit(
       @["ls-files", "-z", "--others", "--exclude-standard"],
       workingDir = projectRoot)
   except:
