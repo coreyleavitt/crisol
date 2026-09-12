@@ -834,7 +834,14 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
   ## (this file, ~line 156) or ArtifactRows silently orphan from the
   ## RunLedger's IdentityKey (measureworker.nim's own documented contract).
   MeasurePlan(
-    entrypointPath:    ep.path,
+    # RFC-0009 A3d-iii: source the entrypoint's identity from its TrackedPath,
+    # serialized to the worker via the display() accessor (a deliberate string
+    # wire — the worker consumes a plain path). For a project (tag-0) member
+    # display() is byte-identical to ep.path, so this preserves the collision
+    # with appendAttemptRow's identityKey(ep.path, …) noted above. Fall back to
+    # ep.path if tp was never populated (a hand-built ep off the discover path),
+    # so the identity is never an empty string.
+    entrypointPath:    (if ep.tp.display().len > 0: ep.tp.display() else: ep.path),
     entrypointAbsPath: epAbs,
     flags:             ep.flags,
     nimcacheDir:       cacheDir,

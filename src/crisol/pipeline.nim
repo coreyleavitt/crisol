@@ -155,10 +155,13 @@ proc buildRunPlan*(
         newSeq[Entrypoint]()
 
     # Union over the two narrowed sets, preserving gated.run input order.
-    var keep = initHashSet[tuple[path, group: string]]()
-    for ep in failedNarrowed:  keep.incl (path: ep.path, group: ep.group)
-    for ep in changedNarrowed: keep.incl (path: ep.path, group: ep.group)
-    runnable = gated.run.filterIt((path: it.path, group: it.group) in keep)
+    # RFC-0009 A3d-iii: the keep-set is keyed by TrackedPath identity (ep.tp),
+    # not a raw path string — the last string-keyed selection surface in the
+    # pipeline joins to the live identity like every other narrowing step.
+    var keep = initHashSet[tuple[tp: TrackedPath, group: string]]()
+    for ep in failedNarrowed:  keep.incl (tp: ep.tp, group: ep.group)
+    for ep in changedNarrowed: keep.incl (tp: ep.tp, group: ep.group)
+    runnable = gated.run.filterIt((tp: it.tp, group: it.group) in keep)
 
   # C3: Shard step — LAST step of selection, AFTER narrowing and BEFORE plan.
   # Applied only when shardK > 0 (i.e. --shard was passed).
