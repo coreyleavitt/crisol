@@ -13,7 +13,8 @@ size = "l"
 [[item]]
 id    = "i1"
 title = "\u00a71 type: private fields + accessor, add <, toNative mirror, rename to keyBytes, add fromCanonical constructor."
-state = "open"
+state = "resolved"
+reason = "paths.nim TrackedPath (private rootTag/fold/rel + accessors, keyBytes, fromCanonical, toNative); public < superseded by cmpKeyBytes (R3-3); tests/unit/test_paths.nim"
 
 [[item]]
 id    = "i2"
@@ -23,32 +24,38 @@ state = "open"
 [[item]]
 id    = "i3"
 title = "Native canonicalizer: apply abs/norm/drive-letter/fold to native paths in SourceIndex/underAnyRoot; add NativeAbs type."
-state = "open"
+state = "resolved"
+reason = "closure.nim underAnyRoot via nativeCanonicalize + paths.nim NativeAbs; tests/unit/test_closure_a4a.nim, test_source_index.nim"
 
 [[item]]
 id    = "i4"
 title = "New slice A0 golden-pin (run in every Stage-A slice; vectors include an absolute depRoot member + max-depth entrypoint)."
-state = "open"
+state = "resolved"
+reason = "A0 golden-pin tests/unit/test_rfc9_golden_pin.nim + fixtures {simple,maxdepth,deproot}"
 
 [[item]]
 id    = "i5"
 title = "A3b: git mixed-case rename, \u22652 entrypoints, diff names a transitive dep; assert dependent selected, independent not."
-state = "open"
+state = "resolved"
+reason = "tests/conformance/test_rfc9_a3bii_fold_selection.nim (git-mv rename, negative control, transitive-dep select); ci.yml windows+macos legs"
 
 [[item]]
 id    = "i6"
 title = "A5: observation via --json --cache-stats (l1Hits==1/misses==0) + exactly-one-stored-entry + negative control."
-state = "open"
+state = "resolved"
+reason = "A5c: cacheregistry.rootInsideStateDir fold-routed fail-closed + tests/conformance/test_rfc9_a5c_cache_portability.nim (symlinked depRoot, relocated tree, l1Hits==1/misses==0, negative controls); CI 34721929202 green all 5 legs"
 
 [[item]]
 id    = "i7"
 title = "FoldPolicy evidence: emit in A2 (jsonout schema-rev note), assert in A3b twins."
-state = "open"
+state = "resolved"
+reason = "jsonout RunSchemaRevision 25 foldPolicy emission; asserted test_rfc9_a2_config.nim + test_rfc9_a3bii_fold_selection.nim"
 
 [[item]]
 id    = "i8"
 title = "Persist foldPolicy in depgraph header; mismatch \u21d2 discard-as-absent. A3c byte-level assert real-case display persisted (windows leg)."
-state = "open"
+state = "resolved"
+reason = "depgraph header foldPolicy persist + dgdFoldMismatch/dgdRootUnknown discard-as-absent; test_depgraph_guard.nim + byte-identical cold/warm test_rfc9_a4b_determinism.nim, ci.yml windows"
 
 [[item]]
 id    = "i9"
@@ -68,22 +75,26 @@ state = "open"
 [[item]]
 id    = "i12"
 title = "macOS: gate identity conformance tests on fold-policy (self-skip fpNone) not windows; name macOS-latest in Stage A acceptance."
-state = "open"
+state = "resolved"
+reason = "ci.yml macos-latest CRISOL_EXPECT_FOLD; test_rfc9_a3bii self-skips on probed policy not OS name"
 
 [[item]]
 id    = "i13"
 title = "\u00a71/\u00a72/\u00a75: total boundary returns classification (inProject|inDepRoot|outside); throw only where attribution required."
-state = "open"
+state = "resolved"
+reason = "paths.nim classify total (pcTracked/pcOutside, R2 simplification of inProject|inDepRoot|outside); test_paths.nim totality suite"
 
 [[item]]
 id    = "i14"
 title = "\\\\?\\ : A1 conformance includes a deliberate >260-char nativeOf round-trip (scheduled RED decides prefix)."
-state = "open"
+state = "resolved"
+reason = "paths.nim stripLongPathPrefix/applyWinLongPathPrefix; test_paths.nim >260-char rel round-trip through toNative"
 
 [[item]]
 id    = "i15"
 title = "Empty/root path invariant (display non-empty, no lead/trail /); explicit toJson emitting display only (never persist ident)."
-state = "open"
+state = "resolved"
+reason = "paths.nim toJson emits {root,path} display-only (never persists ident); test_paths.nim empty/root invariant + round-trip"
 +++
 
 # RFC-0009 — Path identity: `TrackedPath` and the Windows suite
@@ -550,7 +561,7 @@ Dependency-correct order: **A0-spike (empirical gate) → A (identity) → B (su
 - [x] **A5a — fnv pair-rework (the real semantic change).** `fnv.chainedContentHash` reworks to take pairs — `keyBytes` (a `CacheKeyPath`, §1) feeds the chain, sorted by `cmpKeyBytes` NEVER a folded order (§4's ordering invariant), the paired native path (`toNative(tp, roots)`) is what actually gets opened; its callers `closure.nim:1395` (`headersHash`), `depgraph.nim:482`, `depgraph.nim:790` (the record path, previously unnamed — Breadth review), and `planner.nim:211` (the staleness re-hash, also previously unnamed) update to the pair shape (round-3, R3-16, corrected caller list). `planner.nim:199-200`'s `sortedClosure.sort()` — a raw string sort — moves to `cmpKeyBytes` order in this SAME slice: if planner's staleness hash isn't reworked to the `keyBytes`-sorted pair shape here, the stored `closureHash` and the recheck hash diverge for any depRoot member, producing a permanent `cdStale` (cache never warms) or a false-fresh the moment a project has a depRoot. `A0`'s golden harness re-runs against this slice — the vendored frozen-reference computation (`A0`) recomputes the depRoot vectors at runtime rather than checking a literal byte-pin, since a literal pin would embed the checkout's own absolute path (this is the last slice the vendored reference is used; see `A0`'s R3-29 note — the depRoot vectors flip to literal byte-pins and the vendored reference is deleted in THIS slice, now that `keyBytes` for a depRoot member is genuinely host-invariant). *(fnv + its four callers + A0 re-run + A0 vendored-reference deletion.)*
 - [x] **A5b-i — producers.** `keys.identityKey`/`soundnessKey`, `planner.slug` (deriving its WHOLE slug — human-readable prefix as well as hash — from `keyBytes`, so the same hash can never disagree with its own directory name), `cachelocalfs.sidecarPath` gain `CacheKeyPath` overloads and migrate their own in-module uses. *(3 modules.)*
 - [x] **A5b-ii — consumer sweep.** (Round-3, R3-15 — split from round-2's single A5b.) Mechanical `ep.path` → `ep.tp` at the ~30 caller sites across `shard`/`clean`/`cachedispatch`/`api`/`order`/`runner` — including `shard.nim:91`, `clean.nim:175`/`:185`/`:202`, `cachedispatch.nim:782`/`:791`/`:856`/`:882`, `api.nim:1538` (previously unowned surfaces, Breadth review) — compiler-guided, byte-identical for every project without a `depRoot`. Undercounted in round 2: `runner.nim:207`/`:994`, `order.nim:201`, and `measureworker.nim:108`/`:169` — the re-exec'd worker process, whose `plan.entrypointPath` is a wire STRING, not a live `TrackedPath` — is this slice's one NON-mechanical site: it must reconstruct a `TrackedPath` via `fromCanonical` plus a `TrackedRoots` threaded into the worker's own process, a design decision stated here explicitly rather than left implicit. Entrypoints are always `rootTag 0`, so this migration is a behavioral no-op for every project without a `depRoot`; only a `depRoot` member's key material actually changes shape (to the `dep:<name>/rel` form), and only via `A5a`'s `chainedContentHash`. The string-typed overloads of `slug`/`identityKey`/`sidecarPath` are NOT deleted in this slice — that moves to `A-final-ii`, below (Feasibility-F7/R3-15): `A-final`'s grep-gate is already the closing guard, and deleting the overloads here before the consumer sweep is complete would break compilation mid-ladder. *(shard + clean + cachedispatch + api + order + runner + measureworker.)*
-- [ ] **A5c — cacheregistry fold-routing + cache portability E2E.** `rootInsideStateDir` (`cacheregistry.nim:392`) routes through folded `TrackedPath` identity rather than a raw `startsWith`, fixing a fail-*open* on the RFC-0005 fail-closed check, and fails CLOSED (§3/§4) when a run is in degraded mode with no policy to consult. Cache PORTABILITY E2E (the reframed cache half of the load-bearing property, Fork C): the fixture MUST include a configured `depRoot` member in the closure (a single-root project's keys are already relative and host-stable on `main` today — `l1Hits==1`/one stored entry would pass on `main` unchanged and prove nothing) AND relocate the tree (or otherwise vary the dep-root's native spelling) between run 1 and run 2, observed via `crisol run --json --cache-stats` asserting `l1Hits==1`/`misses==0` and EXACTLY ONE stored entry — RED on `main` today via `fnv.nim:68`'s absolute-path fall-through, GREEN only once `keyBytes` for the depRoot member is genuinely `dep:name/rel`. Keep a secondary NEGATIVE CONTROL asserting the two runs' raw native spellings differ (so the test cannot pass by filesystem coincidence). The mandatory `depRoot` fixture is additionally SYMLINKED (round-3, R3-14: real directory elsewhere, symlink configured as the root — the CAS-style layout `NativeRoot.realAbs` exists to handle) with a negative control asserting the candidate's realpath form differs from the root's lexical prefix — `NativeRoot.realAbs`'s under-selection fix is otherwise unit-live only, which this RFC's own liveness rule forbids for a soundness field. OS-independent (Linux/macOS legs prove it; no Windows privilege needed). Explicit windows-job `ci.yml` step for the original portability test. *(cacheregistry + conformance tests + ci.yml windows step.)*
+- [x] **A5c — cacheregistry fold-routing + cache portability E2E.** `rootInsideStateDir` (`cacheregistry.nim:392`) routes through folded `TrackedPath` identity rather than a raw `startsWith`, fixing a fail-*open* on the RFC-0005 fail-closed check, and fails CLOSED (§3/§4) when a run is in degraded mode with no policy to consult. Cache PORTABILITY E2E (the reframed cache half of the load-bearing property, Fork C): the fixture MUST include a configured `depRoot` member in the closure (a single-root project's keys are already relative and host-stable on `main` today — `l1Hits==1`/one stored entry would pass on `main` unchanged and prove nothing) AND relocate the tree (or otherwise vary the dep-root's native spelling) between run 1 and run 2, observed via `crisol run --json --cache-stats` asserting `l1Hits==1`/`misses==0` and EXACTLY ONE stored entry — RED on `main` today via `fnv.nim:68`'s absolute-path fall-through, GREEN only once `keyBytes` for the depRoot member is genuinely `dep:name/rel`. Keep a secondary NEGATIVE CONTROL asserting the two runs' raw native spellings differ (so the test cannot pass by filesystem coincidence). The mandatory `depRoot` fixture is additionally SYMLINKED (round-3, R3-14: real directory elsewhere, symlink configured as the root — the CAS-style layout `NativeRoot.realAbs` exists to handle) with a negative control asserting the candidate's realpath form differs from the root's lexical prefix — `NativeRoot.realAbs`'s under-selection fix is otherwise unit-live only, which this RFC's own liveness rule forbids for a soundness field. OS-independent (Linux/macOS legs prove it; no Windows privilege needed). Explicit windows-job `ci.yml` step for the original portability test. *(cacheregistry + conformance tests + ci.yml windows step.)*
 - [ ] **A-degraded — degraded-mode enumeration + conformance test.** (Round-3, R3-10 — new slice.) Degraded mode (§3) is described run-level in prose but was triggered only per-root and forced only `--changed` narrowing; this slice makes it total and gives it a home. (a) Degrade forces a FULL run for ALL narrowing kinds — `nkFailed`, `nkChanged`, `nkFailedOrChanged` (`api.nim:192-194`) — not `--changed` alone: `nkFailed`/`nkFailedOrChanged` are fed by `loadLastRun`'s persisted `(path, group)` keys (`api.nim:872-877`), and joining those under `fpNone` during a degraded run would silently drop a last-run-failed entrypoint whose persisted spelling case-differs post-rename — an unsound miss in the mode meant to fail safe. The blanket "never reaches a selection decision" sentence (§3) is replaced by an ENUMERATION of degraded-run comparison consumers and each one's safe-pole argument: narrowing → forced full (all kinds); quarantine → `fpNone` is the safe pole (loud under-match, never masking — `runner.nim:118-165`); order → pessimization only, never unsound; result cache → bypassed entirely. (b) A single root's double-probe failure degrades the WHOLE run, not just that root's comparisons. (c) Conformance test, injecting a double-failing probe (§3's injectable probe makes this Linux-constructible): asserts, in one run, full selection despite BOTH `--changed` AND `--failed`, zero cache stores and reads, no depgraph persisted, the degraded reason present in `--json` evidence, and `rootInsideStateDir` refusing closed. (d) A degraded run's closure (built under `fpNone`) can still carry fold-DUPLICATE members onto the `ClosureEntry.closure` wire RFC-0008 inherits (no fold means no merge either); the degraded marker documents this as a known gap in the closure-array dedup guarantee for that one run, not a silent one. *(new conformance test + degraded-mode doc + api.nim narrowing-mode audit.)*
 - [ ] **A-final-i — testEp sweep while `path` still lives.** (Round-3, split from round-2's single A-final — Feasibility-F7/R3-15.) The compiler enumerates every remaining `Entrypoint.path` site; a SANCTIONED SCRIPTED sweep migrates the 221 test-site `Entrypoint(path: ...)` constructions across 74 files (the RFC-0007 A1e-i precedent — a scripted pass plus the compiler loop, not hand-editing) to a new, pinned `tests/support/testEp(path, ...)` helper, backed by a module-level `TrackedRoots` fixture whose fold policy is derived the same way production derives it on the running host (round-3, R3-21 — never a bare `fpNone` constant, which would compare unequal against a production `fpAsciiLower` path on `windows-latest`, the exact leg this RFC exists to make green — the fixture's fold policy either tracks the host or is scoped to roots that never compare against a production path). Because `path:` is always the first field but the surrounding construction spans 25+ distinct shapes (48 of them multiline) — not uniformly whole-construction-scriptable — the sweep head-token-rewrites each site to call the helper rather than hand-constructing `tp` inline at 221 call sites. `path: string` itself is NOT removed yet — this slice is purely additive-consumer, so it can land and be verified independently of the removal below. *(scripted test sweep + `tests/support/testEp` helper.)*
 - [ ] **A-final-ii — remove `path: string` + grep-gate.** `path: string` is deleted from `Entrypoint` now that `A-final-i`'s sweep is the only remaining consumer. A completion grep-gate allowlists `absolutePath`/`normalizedPath`/`expandFilename` to `paths.nim` alone, plus the Non-goals exemptions (`compilereport`/`ccprobe`'s Linux-shaped measurement code, `artifactid.eraseKnownString`, `artifactid.includeClosureContentHash`, `report.nim`'s `CRISOL_SINK` — round-3, R3-25); it also flags any remaining `relativePath` call, any `isAbsolute`-based root check, any raw `startsWith(root...)`, and any sort/`sorted`/`<` over `TrackedPath` (round-3, R3-3 — no such operator exists, so this is belt-and-suspenders against a reintroduced local `<`). The string-typed overloads of `slug`/`identityKey`/`sidecarPath` — deliberately left in place through `A5b-ii` (R3-15) — are DELETED in this slice, and the grep-gate confirms none remain: leaving them would let the compiler stay silent about a stray call site still on the old string path mid-ladder, and `crisol clean` computing its expected-slug set from a divergent (string) code path than the rest of the binary would delete live cache directories out from under a warm run. A production-code (not test) note on the `display`-vs-`toNative` rule is pinned here too: production code never reads `tp.display()` to open or spawn a file, only `toNative(tp, roots)` — the grep-gate flags a production-code `.display()` call feeding anything other than a log/error string. *(whole program + grep-gate + overload deletion.)*
