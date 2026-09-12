@@ -22,17 +22,30 @@ import crisol/types
 import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
 import crisol/depgraph
 
+proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
+  ## RFC-0009 A3c-ii: build a `HashSet[TrackedPath]` via `classify` under a
+  ## vacuous (zero-value) `TrackedRoots`. Every closure member built here is
+  ## a plain project-relative string (rootTag 0), so the vacuous root is
+  ## safe regardless of whatever REAL `TrackedRoots` a given test's `cfg`
+  ## separately carries (see tests/unit/test_depgraph.nim's `tpSet` for the
+  ## full reasoning).
+  result = initHashSet[TrackedPath]()
+  for p in paths:
+    let pc = classify(p, default(TrackedRoots))
+    doAssert pc.kind == pcTracked, "test path failed to classify: " & p
+    result.incl pc.tp
+
 suite "depgraph writer guards (issue #5)":
 
   test "updateEntry refuses an empty closure and keeps the existing entry":
     var g  = initDepGraph("")
     let fh = flagHash(@[])
-    let prior = toHashSet(["tests/t.nim", "src/a.nim"])
+    let prior = tpSet("tests/t.nim", "src/a.nim")
     g.updateEntry("tests/t.nim", fh, prior, "hash-prior", 1)
 
     var raised = false
     try:
-      g.updateEntry("tests/t.nim", fh, initHashSet[string](), "hash-empty", 1)
+      g.updateEntry("tests/t.nim", fh, initHashSet[TrackedPath](), "hash-empty", 1)
     except CrisolError as e:
       raised = true
       check e.kind == cekInternal
@@ -44,13 +57,13 @@ suite "depgraph writer guards (issue #5)":
     var g  = initDepGraph("")
     let fh = flagHash(@[])
     expect CrisolError:
-      g.updateEntry("tests/new.nim", fh, initHashSet[string](), "h", 1)
+      g.updateEntry("tests/new.nim", fh, initHashSet[TrackedPath](), "h", 1)
     check ("tests/new.nim", fh) notin g.entries
 
   test "invalidateEntry drops the entry; absent key is a no-op":
     var g  = initDepGraph("")
     let fh = flagHash(@[])
-    g.updateEntry("tests/t.nim", fh, toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", fh, tpSet("tests/t.nim"), "h", 1)
     g.invalidateEntry("tests/t.nim", fh)
     check ("tests/t.nim", fh) notin g.entries
     g.invalidateEntry("tests/t.nim", fh)          # idempotent
@@ -183,7 +196,7 @@ suite "recordClosure — recovery policy (R5)":
     let fh = flagHash(@[])
     # Pre-seed a fresh-looking prior entry — exactly what a naive writer
     # would leave behind on failure.
-    graph.updateEntry("tests/rec_fail.nim", fh, toHashSet(["tests/rec_fail.nim"]),
+    graph.updateEntry("tests/rec_fail.nim", fh, tpSet("tests/rec_fail.nim"),
                       "priorhash", 1)
     doAssert saveDepGraph(graph, cfg)
 
@@ -239,7 +252,7 @@ suite "saveDepGraph — return value (issue #13.3)":
     createDir(depgraphPath(cfg))
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     check not saveDepGraph(g, cfg)
     check not fileExists(depgraphPath(cfg))
 
@@ -249,7 +262,7 @@ suite "saveDepGraph — return value (issue #13.3)":
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     check saveDepGraph(g, cfg)
     check fileExists(depgraphPath(cfg))
 
@@ -266,7 +279,7 @@ suite "depgraph load provenance: discarded persisted graph":
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     doAssert saveDepGraph(g, cfg)
 
     var d: DepGraphDiscard
@@ -302,7 +315,7 @@ suite "depgraph load provenance: discarded persisted graph":
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     doAssert saveDepGraph(g, cfg)
 
     var d: DepGraphDiscard
@@ -328,7 +341,7 @@ suite "depgraph load provenance: discarded persisted graph":
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     doAssert saveDepGraph(g, cfg)
 
     check loadDepGraph(cfg, "2.2.10").entries.len == 1
@@ -499,7 +512,7 @@ suite "depgraph load provenance: discarded persisted graph":
     check cfg.trackedRoots.deps[0].foldPolicy == fpAsciiLower
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     doAssert saveDepGraph(g, cfg)
 
     var d: DepGraphDiscard
@@ -516,7 +529,7 @@ suite "depgraph load provenance: discarded persisted graph":
     cfgWrite.trackedRoots = initTrackedRoots(root, @[("gonedep", root / "gonedep")], ".crisol",
                                              fixedProbe(fpNone))
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     doAssert saveDepGraph(g, cfgWrite)
 
     var cfgRead = Config(projectRoot: root, stateDir: ".crisol")
@@ -536,7 +549,7 @@ suite "depgraph load provenance: discarded persisted graph":
     var cfgWrite = Config(projectRoot: root, stateDir: ".crisol")
     cfgWrite.trackedRoots = initTrackedRoots(root, @[], ".crisol", fixedProbe(fpNone))
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     doAssert saveDepGraph(g, cfgWrite)
 
     # Same root NAME ("" — the project root), a DIFFERENT injected policy —

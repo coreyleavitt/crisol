@@ -27,7 +27,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_nimcache_persistence_real.nim
 
-import std/[os, sets, strutils, tables, times, unittest]
+import std/[options, os, sets, strutils, tables, times, unittest]
 import std/posix as posix_mod
 import crisol/[types, runner, depgraph, closure]
 
@@ -48,7 +48,7 @@ proc makeTempRoot(tag: string): string =
   tmp
 
 proc makeCfg(root: string): Config =
-  Config(
+  result = Config(
     projectRoot:        root,
     stateDir:           ".crisol",
     jobs:               1,
@@ -56,6 +56,10 @@ proc makeCfg(root: string): Config =
     compileTimeoutSecs: 120,
     maxOutputBytes:     65_536,
   )
+  # RFC-0009 A3c-ii: real (not vacuous) trackedRoots, matching `root` -- this
+  # file drives closure recording through the real `execute()`/`recordClosure`
+  # path, which converts each member via `classify(member, config.trackedRoots)`.
+  result.trackedRoots = initTrackedRoots(root, @[], "")
 
 proc stageEp(root: string; fixtureName = "pass_always.nim"; group = "default";
              flags: seq[string] = @[]): Entrypoint =
@@ -121,7 +125,7 @@ suite "nimcache-persistence — REUSE (real compile)":
     check key in graphAfter1.entries
     let cl1 = graphAfter1.entries[key].closure
     check cl1.len >= 1
-    check "tests/pass_always.nim" in cl1
+    check fromCanonical("tests/pass_always.nim", cfg.trackedRoots).get in cl1
     # Cold compile: Nim's per-invocation C work list is populated.
     let manifest1 = parseCompileManifest(expectedCacheDir / binName(ep) & ".json")
     check manifest1.compile.len > 0

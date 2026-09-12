@@ -26,6 +26,21 @@ proc makeTmpConfig(root: string): Config =
 proc ensureStateDirExists(root: string) =
   createDir(root / ".crisol")
 
+proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
+  ## RFC-0009 A3c-ii: build a `HashSet[TrackedPath]` via `classify` under a
+  ## vacuous (zero-value) `TrackedRoots` -- matches `makeTmpConfig`'s
+  ## `Config`, which leaves `trackedRoots` at ITS zero value too, so a
+  ## closure built here round-trips identically through save/load in the
+  ## SAME test (both sides classify under the same vacuous root). Every
+  ## absolute OR project-relative spelling classifies `pcTracked` under
+  ## this root by construction (see `classify`/`underRoot` with an empty
+  ## `roots.project.abs`).
+  result = initHashSet[TrackedPath]()
+  for p in paths:
+    let pc = classify(p, default(TrackedRoots))
+    doAssert pc.kind == pcTracked, "test path failed to classify: " & p
+    result.incl pc.tp
+
 # ---------------------------------------------------------------------------
 # Test: flagHash is stable and varies by flag set
 # ---------------------------------------------------------------------------
@@ -64,9 +79,7 @@ block test_round_trip:
   var g = initDepGraph("2.2.10")
 
   let fh1 = flagHash(@["-d:foo"])
-  var closure1 = initHashSet[string]()
-  closure1.incl "tests/unit/test_foo.nim"
-  closure1.incl "src/crisol/foo.nim"
+  let closure1 = tpSet("tests/unit/test_foo.nim", "src/crisol/foo.nim")
 
   updateEntry(g, "tests/unit/test_foo.nim", fh1, closure1)
 
@@ -97,7 +110,7 @@ block test_atomic_valid_json:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
   doAssert saveDepGraph(g, cfg)
 
   let depgraphPath = root / ".crisol" / "depgraph"
@@ -125,8 +138,8 @@ block test_two_flaghashes_same_path:
   assert fh1 != fh2
 
   let path = "tests/unit/test_x.nim"
-  let cl1 = toHashSet(["tests/unit/test_x.nim", "src/a.nim"])
-  let cl2 = toHashSet(["tests/unit/test_x.nim", "src/b.nim"])
+  let cl1 = tpSet("tests/unit/test_x.nim", "src/a.nim")
+  let cl2 = tpSet("tests/unit/test_x.nim", "src/b.nim")
   updateEntry(g, path, fh1, cl1)
   updateEntry(g, path, fh2, cl2)
 
@@ -151,7 +164,7 @@ block test_nim_version_mismatch_empty:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
   doAssert saveDepGraph(g, cfg)
 
   # Load with a DIFFERENT nim version → should get empty graph
@@ -168,7 +181,7 @@ block test_nim_version_match_entries_present:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
   doAssert saveDepGraph(g, cfg)
 
   let g2 = loadDepGraph(cfg, "2.2.10")
@@ -188,10 +201,10 @@ block test_isEntryStale_missing_file:
   let fh = flagHash(@[])
   # Closure includes a path that definitely does not exist
   let nonExistent = root / "this_does_not_exist.nim"
-  updateEntry(g, path, fh, toHashSet([nonExistent]))
+  updateEntry(g, path, fh, tpSet(nonExistent))
 
   let key = (path, fh)
-  assert isEntryStale(g, key, root),
+  assert isEntryStale(g, key, root, default(TrackedRoots)),
     "isEntryStale must be true when closure contains a non-existent file"
 
 block test_isEntryStale_all_files_exist:
@@ -206,10 +219,10 @@ block test_isEntryStale_all_files_exist:
   var g = initDepGraph("2.2.10")
   let path = "tests/unit/test_real.nim"
   let fh = flagHash(@[])
-  updateEntry(g, path, fh, toHashSet([realFile]))
+  updateEntry(g, path, fh, tpSet(realFile))
 
   let key = (path, fh)
-  assert not isEntryStale(g, key, root),
+  assert not isEntryStale(g, key, root, default(TrackedRoots)),
     "isEntryStale must be false when all closure files exist"
 
 block test_isEntryStale_absent_entry:
@@ -220,7 +233,7 @@ block test_isEntryStale_absent_entry:
   var g = initDepGraph("2.2.10")
   let key = ("tests/nonexistent.nim", flagHash(@[]))
   # Key is not in the graph at all — should be treated as stale
-  assert isEntryStale(g, key, root),
+  assert isEntryStale(g, key, root, default(TrackedRoots)),
     "isEntryStale must be true when entry is absent from graph"
 
 # ---------------------------------------------------------------------------
@@ -235,8 +248,8 @@ block test_gcDeletedEntrypoints:
   let keyA = ("tests/unit/test_a.nim", fhA)
   let keyB = ("tests/unit/test_b.nim", fhB)
 
-  updateEntry(g, keyA[0], keyA[1], toHashSet(["tests/unit/test_a.nim"]), "", 0)
-  updateEntry(g, keyB[0], keyB[1], toHashSet(["tests/unit/test_b.nim"]), "", 0)
+  updateEntry(g, keyA[0], keyA[1], tpSet("tests/unit/test_a.nim"), "", 0)
+  updateEntry(g, keyB[0], keyB[1], tpSet("tests/unit/test_b.nim"), "", 0)
 
   assert g.entries.len == 2
 
@@ -271,11 +284,11 @@ block test_updateEntry_upsert:
   let path = "tests/unit/test_u.nim"
   let fh = flagHash(@[])
 
-  let cl1 = toHashSet(["tests/unit/test_u.nim", "src/a.nim"])
+  let cl1 = tpSet("tests/unit/test_u.nim", "src/a.nim")
   updateEntry(g, path, fh, cl1)
   assert g.entries[(path, fh)].closure == cl1
 
-  let cl2 = toHashSet(["tests/unit/test_u.nim", "src/b.nim"])
+  let cl2 = tpSet("tests/unit/test_u.nim", "src/b.nim")
   updateEntry(g, path, fh, cl2)
   assert g.entries[(path, fh)].closure == cl2, "upsert should overwrite old closure"
 
@@ -308,7 +321,7 @@ block test_saveDepGraph_symlink_write_through_protection:
 
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, toHashSet(["tests/t.nim"]))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
 
   # Must not crash; sentinel must remain untouched.
   doAssert saveDepGraph(g, cfg)
@@ -327,8 +340,7 @@ block test_saveDepGraph_normal_roundtrip_after_p5:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@["-d:test"])
-  var cl = initHashSet[string]()
-  cl.incl "tests/unit/test_p5.nim"
+  let cl = tpSet("tests/unit/test_p5.nim")
   updateEntry(g, "tests/unit/test_p5.nim", fh, cl)
 
   doAssert saveDepGraph(g, cfg)

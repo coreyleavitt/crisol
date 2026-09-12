@@ -43,15 +43,17 @@ proc ep(path: string; flags: seq[string] = @[]): Entrypoint =
 proc mkGraph(nimVer = "2.2.10"): DepGraph =
   initDepGraph(nimVer)
 
-proc toSet(paths: varargs[string]): HashSet[string] =
-  result = initHashSet[string]()
-  for p in paths:
-    result.incl p
-
-# roots for the TrackedPath-typed `changed` parameter (RFC-0009 A3b-ii). All
-# closure/changed paths in this file are real project-root-relative
-# spellings under the actual checkout, so the real cwd is the right root.
+# roots for the TrackedPath-typed `changed`/`closure` parameters (RFC-0009
+# A3b-ii/A3c-ii). All closure/changed paths in this file are real
+# project-root-relative spellings under the actual checkout, so the real
+# cwd is the right root.
 let roots = mkRoots(getCurrentDir())
+
+proc toSet(paths: varargs[string]): HashSet[TrackedPath] =
+  ## RFC-0009 A3c-ii: `DepGraphEntry.closure` is now `HashSet[TrackedPath]`
+  ## -- this builds one via the shared `closureTp` helper, under `roots`
+  ## (above).
+  closureTp(roots, paths)
 
 # ---------------------------------------------------------------------------
 # Hit: ep closure intersects changed → selected

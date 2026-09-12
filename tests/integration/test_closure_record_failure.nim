@@ -62,7 +62,12 @@ suite "closure recording failure after a successful compile (issue #5)":
     # hash, current protocol major. Under the old writer this entry survived
     # the failed recording and made run 2 cdSkipFresh.
     var graph = initDepGraph("")
-    let seededClosure = toHashSet([ep.path])
+    # RFC-0009 A3c-ii: `DepGraphEntry.closure` is `HashSet[TrackedPath]` --
+    # this closure is pure bait (a fresh-looking prior entry the retry must
+    # discard), never read back for content, so classifying `ep.path` under
+    # `cfg.trackedRoots` (unset/vacuous here) just needs to produce SOME
+    # non-empty TrackedPath.
+    let seededClosure = [classify(ep.path, cfg.trackedRoots).tp].toHashSet
     graph.updateEntry(ep.path, fHash, seededClosure,
                       closureContentHash(@[ep.path], root), CrisolProtocolMajor)
     createDir(root / ".crisol")

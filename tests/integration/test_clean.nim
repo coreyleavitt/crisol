@@ -290,8 +290,14 @@ suite "crisol clean — depgraph GC":
 
     # A closure is never empty (updateEntry refuses one — issue #5); the
     # minimal real closure is the entrypoint itself.
-    graph.updateEntry(keptPath,  fHash, toHashSet([keptPath]),  "", 1)
-    graph.updateEntry(stalePath, fHash, toHashSet([stalePath]), "", 1)
+    # RFC-0009 A3c-ii: `DepGraphEntry.closure` is `HashSet[TrackedPath]`.
+    # Both members are plain project-relative strings, so a vacuous
+    # (zero-value) `TrackedRoots` round-trips them exactly -- this test
+    # never touches closure content beyond non-emptiness.
+    graph.updateEntry(keptPath,  fHash,
+                      [fromCanonical(keptPath,  default(TrackedRoots)).get].toHashSet, "", 1)
+    graph.updateEntry(stalePath, fHash,
+                      [fromCanonical(stalePath, default(TrackedRoots)).get].toHashSet, "", 1)
     doAssert saveDepGraph(graph, cfg)
 
     discard cleanOrphans(cfg)

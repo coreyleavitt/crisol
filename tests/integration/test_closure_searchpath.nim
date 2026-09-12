@@ -31,8 +31,29 @@ proc makeTempRoot(tag: string): string =
   createDir(result)
 
 proc makeCfg(root: string): Config =
-  Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
-         timeoutSecs: 60, compileTimeoutSecs: 120, maxOutputBytes: 65_536)
+  ## RFC-0009 A3c-ii: `trackedRoots` must be REAL (matching `root`), not the
+  ## zero-value/vacuous root -- `recordClosure` (depgraph.nim) now converts
+  ## each closure member to `TrackedPath` via `classify(member,
+  ## config.trackedRoots)`, and several tests below separately build a
+  ## `TrackedRoots` (e.g. for `selectByDiff`) that must fold-agree with this
+  ## one (`TrackedPath.==` asserts on a same-rootTag/different-fold
+  ## comparison) -- a vacuous root here would only accidentally not crash
+  ## because this container's real probe also happens to answer fpNone.
+  result = Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
+                  timeoutSecs: 60, compileTimeoutSecs: 120, maxOutputBytes: 65_536)
+  result.trackedRoots = initTrackedRoots(root, @[], "")
+
+proc tp1(s: string; cfg: Config): TrackedPath =
+  ## RFC-0009 A3c-ii: reduce a project-relative string to the TrackedPath
+  ## identity `recordClosure`/`loadDepGraph` would have stored it as, for a
+  ## closure-membership assertion. None of this file's fixtures need a
+  ## configured dep root to classify correctly: `classify`'s PROJECT-FIRST
+  ## rule means a path lexically under `projectRoot` (even one that also
+  ## nests under a symlinked `_deps/...` dep root) is always tag-0 --
+  ## exactly every closure member this file asserts on.
+  let pc = classify(s, cfg.trackedRoots)
+  doAssert pc.kind == pcTracked, "test path failed to classify: " & s
+  pc.tp
 
 suite "closure records search-path (@p, non-tracked-root) deps (issue #8)":
 
@@ -80,12 +101,12 @@ switch("path", thisDir())
     let closure = loaded.entries[key].closure
 
     # (1) the search-path-resolved dep must be in the closure.
-    check "tests/support/helper.nim" in closure
-    check "tests/sub/test_uses_helper.nim" in closure
+    check tp1("tests/support/helper.nim", cfg) in closure
+    check tp1("tests/sub/test_uses_helper.nim", cfg) in closure
 
     # (2) load-bearing consequence: a change to the search-path dep must
     # select the entrypoint via selectByDiff.
-    let roots = mkRoots(root)
+    let roots = cfg.trackedRoots
     let changed = changedTp(roots, "tests/support/helper.nim")
     let selection = selectByDiff(@[ep], changed, loaded, roots, root)
     check selection.len == 1
@@ -133,8 +154,8 @@ doAssert xValue() == 5
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check "lib/x.nim" in closure
-    check "tests/unit/deep/t.nim" in closure
+    check tp1("lib/x.nim", cfg) in closure
+    check tp1("tests/unit/deep/t.nim", cfg) in closure
 
   test "trigger B: a symlinked dep-root's realpath-relative @p body is recorded at its lexical path":
     ## <temp>/cas/dep/src/dep.nim lives OUTSIDE the project root; root/_deps/dep
@@ -195,8 +216,8 @@ doAssert depValue() == 7
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check "_deps/dep/src/dep.nim" in closure
-    check epPath in closure
+    check tp1("_deps/dep/src/dep.nim", cfg) in closure
+    check tp1(epPath, cfg) in closure
 
   test "trigger C: a symlinked dep-root's realpath-relative @m body (shallow entrypoint) is recorded at its lexical path":
     ## Same physical layout as trigger B (a depRoot reached through a
@@ -274,8 +295,8 @@ doAssert depValue() == 7
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check "_deps/dep/src/dep.nim" in closure
-    check epPath in closure
+    check tp1("_deps/dep/src/dep.nim", cfg) in closure
+    check tp1(epPath, cfg) in closure
 
 suite "closure does not over-select an unrelated decoy for an untracked out-of-root @m import":
 
@@ -331,8 +352,8 @@ doAssert libValue() == 9
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check "src/other/lib.nim" notin closure
-    check "tests/t.nim" in closure
+    check tp1("src/other/lib.nim", cfg) notin closure
+    check tp1("tests/t.nim", cfg) in closure
 
 suite "closure resolves @m bodies through a symlinked entrypoint FILE by the file's real directory":
 
@@ -388,8 +409,8 @@ doAssert helperValue() == 11
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check "other/helper.nim" in closure
-    check "tests/helper.nim" notin closure
+    check tp1("other/helper.nim", cfg) in closure
+    check tp1("tests/helper.nim", cfg) notin closure
 
     # A stable, un-invalidated entry must not force a recompile next run.
     let p2 = plan(cfg, @[ep], graph, nimVersion = "")
@@ -439,7 +460,7 @@ doAssert fooValue() == 42
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check "src/foo.nim" in closure
+    check tp1("src/foo.nim", cfg) in closure
 
 suite "closure resolves through a projectRoot that is itself a symlinked directory":
 
@@ -491,7 +512,7 @@ doAssert sibValue() == 7
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check closure == toHashSet(["tests/t.nim", "tests/sib.nim", "src/foo.nim"])
+    check closure == toHashSet([tp1("tests/t.nim", cfg), tp1("tests/sib.nim", cfg), tp1("src/foo.nim", cfg)])
 
     # A stable, un-invalidated entry must not force a recompile next run.
     let p2 = plan(cfg, @[ep], graph, nimVersion = "")
@@ -571,8 +592,8 @@ doAssert depValue() == 7
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check ".hidden/cas/dep/src/dep.nim" in closure
-    check epPath in closure
+    check tp1(".hidden/cas/dep/src/dep.nim", cfg) in closure
+    check tp1(epPath, cfg) in closure
 
   test "shallow entrypoint (@m shape): dep.nim under the same dot-dir layout is already recorded (pre-existing byReal fallback)":
     ## Same physical layout as above, but the entrypoint is SHALLOW
@@ -628,5 +649,5 @@ doAssert depValue() == 7
     check key in loaded.entries
     let closure = loaded.entries[key].closure
 
-    check ".hidden/cas/dep/src/dep.nim" in closure
-    check epPath in closure
+    check tp1(".hidden/cas/dep/src/dep.nim", cfg) in closure
+    check tp1(epPath, cfg) in closure

@@ -122,15 +122,7 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
     # loadDepGraph, so the seeded graph is read back as a precise (non-stale) match.
     let epPath = "tests/unit/test_a.nim"
     let fHash  = flagHash(@[])
-    let closureSet = [epPath].toHashSet
-    let cHash  = closureContentHash(@[epPath], repo)
-    var graph  = initDepGraph(cachedNimFingerprint())
-    graph.updateEntry(
-      epPath, fHash, closureSet,
-      closureHash   = cHash,
-      protocolMajor = CrisolProtocolMajor,
-    )
-    let cfg = Config(
+    var cfg = Config(
       projectRoot:        repo,
       stateDir:           ".crisol",
       groups:             @[],
@@ -138,6 +130,21 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
       timeoutSecs:        30,
       compileTimeoutSecs: 60,
       maxOutputBytes:     65536,
+    )
+    # RFC-0009 A3c-ii: real (not vacuous) trackedRoots, matching `repo` --
+    # the actual `crisol run --changed` invocation below loads its own
+    # config via `loadConfig(startDir = repo)` (real trackedRoots); this
+    # seed graph's on-disk header (`saveDepGraph`'s `rootsDescriptor`) must
+    # fold-agree with that, or loadDepGraph would discard it as
+    # dgdFoldMismatch.
+    cfg.trackedRoots = initTrackedRoots(repo, @[], "")
+    let closureSet = [fromCanonical(epPath, cfg.trackedRoots).get].toHashSet
+    let cHash  = closureContentHash(@[epPath], repo)
+    var graph  = initDepGraph(cachedNimFingerprint())
+    graph.updateEntry(
+      epPath, fHash, closureSet,
+      closureHash   = cHash,
+      protocolMajor = CrisolProtocolMajor,
     )
     doAssert saveDepGraph(graph, cfg)
 

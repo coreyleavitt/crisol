@@ -195,20 +195,26 @@ proc decideCompile*(ep: Entrypoint;
     return (cdStale, "nim version changed")
 
   # Check that all closure files exist and compute content hash.
-  var sortedClosure: seq[string] = toSeq(entry.closure)
-  sortedClosure.sort()
+  #
+  # RFC-0009 A3c-ii: `entry.closure` is `HashSet[TrackedPath]`. Existence is
+  # checked via `toNative(tp, roots)` uniformly (project OR dep-root member
+  # alike -- mirrors `depgraph.isEntryStale`'s identical fix, D4). The
+  # content-hash INPUT is derived by the SHARED `depgraph.closureHashInputs`
+  # helper -- the SAME derivation, over the SAME classify-filtered set,
+  # `recordClosure` used at record time. Using any other derivation here
+  # would fail the `entry.closureHash` comparison on every warm load and
+  # spuriously recompile everything (the test_skipfresh regression).
+  let roots = config.trackedRoots
 
-  for f in sortedClosure:
-    let absPath =
-      if f.isAbsolute: f
-      else: config.projectRoot / f
-    if not fileExists(absPath):
-      return (cdStale, "closure file missing: " & f)
+  for tp in entry.closure:
+    if not fileExists(toNative(tp, roots)):
+      return (cdStale, "closure file missing: " & display(tp))
 
   # Compute current content hash.
   var computedHash: string
   try:
-    computedHash = closureContentHash(sortedClosure, config.projectRoot)
+    computedHash = closureContentHash(
+      closureHashInputs(entry.closure, roots), config.projectRoot)
   except CatchableError:
     return (cdStale, "could not read closure files for content hash")
 

@@ -36,7 +36,18 @@ proc stageEp(tmpRoot: string; group = "test"; flags: seq[string] = @[]): Entrypo
 
 proc makeIsolatedConfig(root: string): Config =
   ## Build a Config that uses an isolated stateDir under `root`.
-  Config(
+  ##
+  ## RFC-0009 A3c-ii: `trackedRoots` must be REAL (matching `root`), not the
+  ## zero-value/vacuous root -- `decideCompile` (planner.nim) reconstructs
+  ## each closure member's native path via `toNative(tp, config.trackedRoots)`
+  ## for its existence check. A vacuous root (`project.abs == ""`) would
+  ## reconstruct a RELATIVE closure member (e.g. "tests/pass_always.nim",
+  ## the normal case for an in-project file) as "/tests/pass_always.nim"
+  ## (anchored at the filesystem root) instead of "<root>/tests/
+  ## pass_always.nim" -- fileExists then always fails, and decideCompile
+  ## never sees cdSkipFresh (exactly the bug this comment prevents from
+  ## regressing).
+  result = Config(
     projectRoot:        root,
     stateDir:           ".crisol_skipfresh_test",
     timeoutSecs:        60,
@@ -44,6 +55,7 @@ proc makeIsolatedConfig(root: string): Config =
     maxOutputBytes:     65_536,
     jobs:               1,
   )
+  result.trackedRoots = initTrackedRoots(root, @[], "")
 
 # ---------------------------------------------------------------------------
 # Suite

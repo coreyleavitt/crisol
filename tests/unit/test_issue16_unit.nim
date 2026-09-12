@@ -26,6 +26,19 @@ import crisol/depgraph    # DepGraph, updateEntry, saveDepGraph,
                           # DepGraphFormatVersion, depgraphPath, flagHash
 import crisol/fnv         # chainedContentHash
 
+proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
+  ## RFC-0009 A3c-ii: `DepGraphEntry.closure` is now `HashSet[TrackedPath]`.
+  ## Every member here is a plain project-relative string, so a vacuous
+  ## (zero-value) `TrackedRoots` round-trips it exactly (see
+  ## tests/unit/test_depgraph.nim's identically-named helper for the full
+  ## reasoning) -- these tests never assert on `.closure` content or feed it
+  ## through `decideCompile`, only `.externals`.
+  result = initHashSet[TrackedPath]()
+  for p in paths:
+    let pc = classify(p, default(TrackedRoots))
+    doAssert pc.kind == pcTracked, "test path failed to classify: " & p
+    result.incl pc.tp
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -279,8 +292,8 @@ suite "depgraph — externals round-trip (issue #16)":
     var g = initDepGraph("2.2.10")
     let path = "tests/t.nim"
     let fh = flagHash(@[])
-    let closure = toHashSet(["tests/t.nim", "native/add.c", "native/add.h",
-                             "native/b.c", "native/a.h", "native/z.h"])
+    let closure = tpSet("tests/t.nim", "native/add.c", "native/add.h",
+                        "native/b.c", "native/a.h", "native/z.h")
     # Deliberately unsorted input order (b before add) and unsorted headers
     # (z before a) — production sorts both on write (depgraph.toJson).
     let externals = @[
@@ -376,7 +389,7 @@ suite "staleExternalObjects (issue #16 slice 1b)":
       ExternalSource(source: "native/other.c", obj: "objOther.o",
                      headers: @["native/other.h"], headersHash: hashOther),
     ]
-    updateEntry(g, path, fh, toHashSet(["tests/t.nim"]), "ch", 1, externals)
+    updateEntry(g, path, fh, tpSet("tests/t.nim"), "ch", 1, externals)
 
     check staleExternalObjects(g, path, @[], root).len == 0
 
@@ -407,7 +420,7 @@ suite "staleExternalObjects (issue #16 slice 1b)":
       ExternalSource(source: "native/other.c", obj: "objOther.o",
                      headers: @["native/other.h"], headersHash: hashOther),
     ]
-    updateEntry(g, path, fh, toHashSet(["tests/t.nim"]), "ch", 1, externals)
+    updateEntry(g, path, fh, tpSet("tests/t.nim"), "ch", 1, externals)
 
     let stale = staleExternalObjects(g, path, @[], root)
     check "objAdd.o" in stale

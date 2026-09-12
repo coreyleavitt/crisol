@@ -27,3 +27,10 @@ proc changedTp*(roots: TrackedRoots; paths: varargs[string]): HashSet[TrackedPat
   result = initHashSet[TrackedPath]()
   for p in paths:
     result.incl fromCanonical(p, roots).get
+
+proc closureTp*(roots: TrackedRoots; paths: varargs[string]): HashSet[TrackedPath] =
+  ## RFC-0009 A3c-ii: sibling of `changedTp`, named for the call sites that
+  ## build a `DepGraphEntry.closure` (now `HashSet[TrackedPath]`) rather than
+  ## a `--changed` set -- identical body/contract (project-root-relative,
+  ## canonical spellings only).
+  changedTp(roots, paths)

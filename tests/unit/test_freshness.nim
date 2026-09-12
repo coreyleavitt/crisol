@@ -29,7 +29,14 @@ import crisol/runner
 # ---------------------------------------------------------------------------
 
 proc makeTmpConfig(root: string): Config =
-  Config(projectRoot: root, stateDir: ".crisol")
+  ## RFC-0009 A3c-ii: `trackedRoots` must be REAL (matching `root`), not the
+  ## zero-value/vacuous root -- `decideCompile` (planner.nim) reconstructs
+  ## each closure member's content-hash string via `display`/`toNative`
+  ## against `config.trackedRoots`, and this file's `recordEntry` helper
+  ## must reconstruct the IDENTICAL string at record time for the hash
+  ## comparison to ever match (see `recordEntry`, below).
+  result = Config(projectRoot: root, stateDir: ".crisol")
+  result.trackedRoots = initTrackedRoots(root, @[], "")
 
 proc makeEp(path: string; flags: seq[string] = @[]): Entrypoint =
   Entrypoint(path: path, group: "unit", flags: flags)
@@ -44,11 +51,23 @@ proc makeBin(config: Config; ep: Entrypoint): string =
 
 proc recordEntry(graph: var DepGraph; ep: Entrypoint; config: Config;
                  closureFiles: seq[string]; protocolMajor: int) =
-  ## Build a depgraph entry for ep using the given closure files.
-  var closureSet = initHashSet[string]()
+  ## Build a depgraph entry for ep using the given closure files (absolute
+  ## paths on disk).
+  ##
+  ## RFC-0009 A3c-ii: `closureFiles` is converted to `HashSet[TrackedPath]`
+  ## for STORAGE via `classify`. The content hash must be computed over the
+  ## SAME per-member strings `decideCompile` reconstructs at compare time
+  ## (`display` for a tag-0/project member, `toNative` for a tag>0/dep-root
+  ## member -- see planner.nim's `decideCompile`) -- NOT the raw absolute
+  ## `closureFiles` strings -- or the hash could never match again.
+  var closureSet = initHashSet[TrackedPath]()
+  var hashFiles: seq[string] = @[]
   for f in closureFiles:
-    closureSet.incl f
-  let contentHash = closureContentHash(closureFiles, config.projectRoot)
+    let pc = classify(f, config.trackedRoots)
+    doAssert pc.kind == pcTracked, "test closure file failed to classify: " & f
+    closureSet.incl pc.tp
+    hashFiles.add(if isProject(pc.tp): display(pc.tp) else: toNative(pc.tp, config.trackedRoots))
+  let contentHash = closureContentHash(hashFiles, config.projectRoot)
   let fHash = flagHash(ep.flags)
   graph.updateEntry(ep.path, fHash, closureSet, contentHash, protocolMajor)
 
@@ -198,9 +217,11 @@ suite "decideCompile — binary freshness logic":
 
     let missingFile = root / "does_not_exist.nim"  # never created
     var g = initDepGraph("2.2.10")
-    var closureSet = initHashSet[string]()
-    closureSet.incl f
-    closureSet.incl missingFile
+    var closureSet = initHashSet[TrackedPath]()
+    for p in [f, missingFile]:
+      let pc = classify(p, cfg.trackedRoots)
+      doAssert pc.kind == pcTracked, "test closure file failed to classify: " & p
+      closureSet.incl pc.tp
     let fHash = flagHash(ep.flags)
     g.updateEntry(ep.path, fHash, closureSet, "aaaaaaaaaaaaaaaa", CrisolProtocolMajor)
 

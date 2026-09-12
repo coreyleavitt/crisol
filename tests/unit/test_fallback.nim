@@ -36,10 +36,17 @@ proc ep(path: string; flags: seq[string] = @[]): Entrypoint =
 proc emptyGraph(nimVer = "2.2.10"): DepGraph =
   initDepGraph(nimVer)
 
-proc toSet(paths: varargs[string]): HashSet[string] =
-  result = initHashSet[string]()
+proc toSet(roots: TrackedRoots; paths: varargs[string]): HashSet[TrackedPath] =
+  ## RFC-0009 A3c-ii: `DepGraphEntry.closure` is now `HashSet[TrackedPath]`.
+  ## Uses `classify` (not `fromCanonical`/`closureTp`) because this file's
+  ## closures mix relative bare filenames (real `tmpRoots`/`tmpDir` blocks)
+  ## and absolute synthetic paths (vacuous-`roots` blocks) -- `classify`
+  ## handles both uniformly; `fromCanonical` would reject the absolute ones.
+  result = initHashSet[TrackedPath]()
   for p in paths:
-    result.incl p
+    let pc = classify(p, roots)
+    doAssert pc.kind == pcTracked, "test path failed to classify: " & p
+    result.incl pc.tp
 
 proc reasonsOf(results: seq[SelectionResult]): seq[SelectionReason] =
   for r in results: result.add r.reason
@@ -92,7 +99,7 @@ block test_own_file_beats_miss:
   # Closure has a non-existent file; would be stale if we got that far.
   let tmpDir = getTempDir()
   let nonExistent = tmpDir / "crisol_d4_self_unrel_" & $getCurrentProcessId() & ".nim"
-  g.updateEntry(e.path, flagHash(e.flags), toSet(nonExistent))
+  g.updateEntry(e.path, flagHash(e.flags), toSet(roots, nonExistent))
   # changed only contains ep.path — the own-file rule fires (priority 2).
   let changed = changedTp(roots, "tests/unit/test_self.nim")
   let result = selectByDiff(@[e], changed, g, roots, "")
@@ -114,7 +121,7 @@ block test_own_file_beats_stale:
   var g = emptyGraph()
   let e = ep("tests/unit/test_priority.nim")
   # Closure includes a file that does not exist → isEntryStale would return true.
-  g.updateEntry(e.path, flagHash(e.flags), toSet(missingFile))
+  g.updateEntry(e.path, flagHash(e.flags), toSet(roots, missingFile))
   # ep.path is also in changed → own-file rule fires first.
   let changed = changedTp(roots, "tests/unit/test_priority.nim")
   let result = selectByDiff(@[e], changed, g, roots, "")
@@ -130,7 +137,7 @@ block test_unknown_closure:
   # Graph has entries for OTHER eps but NOT for this ep's key.
   var g = emptyGraph()
   let eOther = ep("tests/unit/test_other.nim")
-  g.updateEntry(eOther.path, flagHash(eOther.flags), toSet("src/crisol/other.nim"))
+  g.updateEntry(eOther.path, flagHash(eOther.flags), toSet(roots, "src/crisol/other.nim"))
   let e = ep("tests/unit/test_unknown.nim")
   let changed = changedTp(roots)
   let result = selectByDiff(@[e], changed, g, roots, "")
@@ -142,7 +149,7 @@ block test_unknown_closure:
 block test_unknown_closure_nonempty_changed:
   var g = emptyGraph()
   let eOther2 = ep("tests/unit/test_other2.nim")
-  g.updateEntry(eOther2.path, flagHash(eOther2.flags), toSet("src/crisol/x.nim"))
+  g.updateEntry(eOther2.path, flagHash(eOther2.flags), toSet(roots, "src/crisol/x.nim"))
   let e = ep("tests/unit/test_unknown2.nim")
   let changed = changedTp(roots, "src/crisol/something_else.nim")
   let result = selectByDiff(@[e], changed, g, roots, "")
@@ -163,7 +170,7 @@ block test_stale_entry:
   var g = emptyGraph()
   let e = ep("tests/unit/test_stale.nim")
   # Closure references the temp file (which exists right now).
-  g.updateEntry(e.path, flagHash(e.flags), toSet(tmpFile))
+  g.updateEntry(e.path, flagHash(e.flags), toSet(roots, tmpFile))
 
   # Now delete the file to simulate a missing closure dependency.
   removeFile(tmpFile)
@@ -200,7 +207,7 @@ block test_known_hit:
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_hit.nim")
-  g.updateEntry(e.path, flagHash(e.flags), toSet(tmpAName, tmpBName))
+  g.updateEntry(e.path, flagHash(e.flags), toSet(tmpRoots, tmpAName, tmpBName))
   # changed contains one of the closure files → hit.
   let changed = changedTp(tmpRoots, tmpBName)
   let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
@@ -229,7 +236,7 @@ block test_known_miss_excluded:
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_miss.nim")
-  g.updateEntry(e.path, flagHash(e.flags), toSet(tmpCName, tmpDName))
+  g.updateEntry(e.path, flagHash(e.flags), toSet(tmpRoots, tmpCName, tmpDName))
   # changed does NOT contain any closure file → miss → excluded.
   let changed = changedTp(tmpRoots, "crisol_d4_unrelated.nim")
   let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
@@ -248,7 +255,7 @@ block test_priority_own_file_vs_stale:
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_prio.nim")
-  g.updateEntry(e.path, flagHash(e.flags), toSet(missingFile2))
+  g.updateEntry(e.path, flagHash(e.flags), toSet(roots, missingFile2))
   # Both conditions: own-file in changed AND entry is stale.
   let changed = changedTp(roots, "tests/unit/test_prio.nim")
   let result = selectByDiff(@[e], changed, g, roots, "")
@@ -295,10 +302,10 @@ block test_summary_mixed:
   let eStale   = ep("tests/unit/test_mstale.nim")
 
   # eHit: known fresh closure (existing file) that intersects changed.
-  g.updateEntry(eHit.path, flagHash(eHit.flags), toSet(hitDepName))
+  g.updateEntry(eHit.path, flagHash(eHit.flags), toSet(tmpRoots, hitDepName))
   # eUnknown: no entry → unknown closure.
   # eStale: entry with a missing file → stale.
-  g.updateEntry(eStale.path, flagHash(eStale.flags), toSet(missingFile3Name))
+  g.updateEntry(eStale.path, flagHash(eStale.flags), toSet(tmpRoots, missingFile3Name))
 
   let changed = changedTp(tmpRoots, hitDepName)
   let detailed = selectByDiff(@[eHit, eUnknown, eStale], changed, g, tmpRoots, tmpDir)
@@ -341,9 +348,9 @@ block test_order_preserved:
   let e2 = ep("tests/unit/test_ord2.nim")
   let e3 = ep("tests/unit/test_ord3.nim")
   # e1: hit, e2: miss (excluded), e3: hit
-  g.updateEntry(e1.path, flagHash(e1.flags), toSet(dep1Name))
-  g.updateEntry(e2.path, flagHash(e2.flags), toSet(dep2Name))
-  g.updateEntry(e3.path, flagHash(e3.flags), toSet(dep3Name))
+  g.updateEntry(e1.path, flagHash(e1.flags), toSet(tmpRoots, dep1Name))
+  g.updateEntry(e2.path, flagHash(e2.flags), toSet(tmpRoots, dep2Name))
+  g.updateEntry(e3.path, flagHash(e3.flags), toSet(tmpRoots, dep3Name))
   let changed = changedTp(tmpRoots, dep1Name, dep3Name)
   let result = selectByDiff(@[e1, e2, e3], changed, g, tmpRoots, tmpDir)
   assert result.len == 2, "expected 2 hits (e1, e3), got " & $result.len
@@ -373,8 +380,8 @@ block test_narrowByDiff_delegates:
   let eHit  = ep("tests/unit/test_nd_hit.nim")
   let eMiss = ep("tests/unit/test_nd_miss.nim")
   let eUnk  = ep("tests/unit/test_nd_unk.nim")
-  g.updateEntry(eHit.path,  flagHash(eHit.flags),  toSet(ndDepName))
-  g.updateEntry(eMiss.path, flagHash(eMiss.flags), toSet(ndOtherName))
+  g.updateEntry(eHit.path,  flagHash(eHit.flags),  toSet(tmpRoots, ndDepName))
+  g.updateEntry(eMiss.path, flagHash(eMiss.flags), toSet(tmpRoots, ndOtherName))
   # eUnk has no entry.
   let changed = changedTp(tmpRoots, ndDepName)
   let result = narrowByDiff(@[eHit, eMiss, eUnk], changed, g, tmpRoots, tmpDir)

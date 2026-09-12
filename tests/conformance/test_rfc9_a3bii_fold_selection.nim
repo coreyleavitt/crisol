@@ -10,11 +10,16 @@
 ## ## Dispatch (three modes)
 ##
 ##   1. `CRISOL_FOLD_POLICY` set (R3-18.2, the ubuntu `test` job's Linux
-##      gate) — parsed and INJECTED via `initTrackedRoots`'s `probe`
-##      parameter, forcing this genuinely case-sensitive ext4 volume to
-##      behave as the given policy for selection. Production itself stays
-##      completely env-free: the injection happens only at this test's own
-##      boundary, never inside `crisol/*`.
+##      gate) — parsed and INJECTED through the RFC-0009 §3 fold-probe seam,
+##      forcing this genuinely case-sensitive ext4 volume to behave as the
+##      given policy for the WHOLE run: RUN 1's real `runTests` facade takes
+##      it via `RunOptions.foldProbe` (threaded api.planTests →
+##      config.loadConfig → initTrackedRoots), and RUN 2 rebuilds its config
+##      with the same probe via `loadConfig(probe = …)`, so the policy the
+##      graph is PERSISTED under matches the one its header is later
+##      VALIDATED against (A3c-i). Production itself stays completely
+##      env-free: the injection happens only at this test's own boundary,
+##      never inside `crisol/*`.
 ##   2. `CRISOL_EXPECT_FOLD` set (R3-18.4, the windows/macos legs) — NO
 ##      injection. The REAL probe is hard-asserted to answer the given
 ##      policy (both directly, via `probeFoldPolicy`, and via the run's own
@@ -263,7 +268,11 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   let depKey = ("tests/unit/test_dependent.nim", flagHash(@[]))
   check depKey in graph.entries
   let persistedClosure = graph.entries[depKey].closure
-  check "tests/unit/widget.nim" in persistedClosure
+  # RFC-0009 A3c-ii: `persistedClosure` is `HashSet[TrackedPath]` now --
+  # reduce the raw persisted spelling to its TrackedPath identity the same
+  # way `depgraph.fromJson` did at load (`classify`/`fromCanonical` against
+  # `cfg.trackedRoots`) before checking membership.
+  check fromCanonical("tests/unit/widget.nim", cfg.trackedRoots).get in persistedClosure
 
   var changedDisplays = initHashSet[string]()
   for c in changed: changedDisplays.incl c.display
@@ -275,7 +284,7 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   echo "RFC9-A3BII NEGATIVE CONTROL: full changed set = ", $changedDisplays
   check "tests/unit/Widget.nim" in changedDisplays        # the new spelling IS the diff
   check "tests/unit/widget.nim" notin changedDisplays     # the OLD (persisted) spelling is NOT
-  check not isEntryStale(graph, depKey, cfg.projectRoot)  # confirms Rule 4 cannot be why it's selected
+  check not isEntryStale(graph, depKey, cfg.projectRoot, cfg.trackedRoots)  # confirms Rule 4 cannot be why it's selected
 
   # --- Selection, via the REAL shared plan phase (buildRunPlan) ---
   let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault),

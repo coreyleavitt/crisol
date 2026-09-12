@@ -12,21 +12,30 @@ import std/[os, sets]
 import crisol/types
 import crisol/depgraph
 
+proc tp1(p: string; roots: TrackedRoots): TrackedPath =
+  ## RFC-0009 A3c-ii: single-member closure builder -- `roots` must be REAL
+  ## (matching the test's own `root`), since this file's whole point is
+  ## proving `isEntryStale` resolves against `projectRoot` via `toNative`.
+  let pc = classify(p, roots)
+  doAssert pc.kind == pcTracked, "test path failed to classify: " & p
+  pc.tp
+
 block test_r4_relative_missing_under_projectRoot:
   ## A closure containing a relative path that does NOT exist under projectRoot → stale.
   let root = getTempDir() / "crisol_r4_a"
   createDir(root)
   defer: removeDir(root)
 
+  let roots = initTrackedRoots(root, @[], "")
   var g = initDepGraph("2.2.10")
   let path = "tests/unit/test_ep.nim"
   let fh = flagHash(@[])
   # Store a project-root-relative path that does NOT exist under root.
   let relPath = "src/util_r4_does_not_exist.nim"
-  updateEntry(g, path, fh, toHashSet([relPath]))
+  updateEntry(g, path, fh, toHashSet([tp1(relPath, roots)]))
 
   let key = (path, fh)
-  assert isEntryStale(g, key, root),
+  assert isEntryStale(g, key, root, roots),
     "R4: relative closure path missing under projectRoot must → stale"
 
 block test_r4_relative_exists_under_projectRoot:
@@ -37,14 +46,15 @@ block test_r4_relative_exists_under_projectRoot:
   createDir(root / "src")
   writeFile(root / "src" / "util_r4_real.nim", "# real file")
 
+  let roots = initTrackedRoots(root, @[], "")
   var g = initDepGraph("2.2.10")
   let path = "tests/unit/test_ep.nim"
   let fh = flagHash(@[])
   let relPath = "src/util_r4_real.nim"
-  updateEntry(g, path, fh, toHashSet([relPath]))
+  updateEntry(g, path, fh, toHashSet([tp1(relPath, roots)]))
 
   let key = (path, fh)
-  assert not isEntryStale(g, key, root),
+  assert not isEntryStale(g, key, root, roots),
     "R4: relative closure path that exists under projectRoot must → not stale"
 
 block test_r4_cwd_vs_projectRoot_distinction:
@@ -63,6 +73,7 @@ block test_r4_cwd_vs_projectRoot_distinction:
   writeFile(tmpFile, "# shadow")
   defer: removeFile(tmpFile)
 
+  let roots = initTrackedRoots(root, @[], "")
   var g = initDepGraph("2.2.10")
   let path = "tests/unit/test_ep.nim"
   let fh = flagHash(@[])
@@ -70,11 +81,11 @@ block test_r4_cwd_vs_projectRoot_distinction:
   # The file does not exist under root/r4_shadow_check.nim.
   # It only "exists" if CWD = /tmp and we do fileExists("r4_shadow_check.nim").
   let relPath = "r4_shadow_check.nim"
-  updateEntry(g, path, fh, toHashSet([relPath]))
+  updateEntry(g, path, fh, toHashSet([tp1(relPath, roots)]))
 
   let key = (path, fh)
   # Must be stale because root/"r4_shadow_check.nim" doesn't exist.
-  assert isEntryStale(g, key, root),
+  assert isEntryStale(g, key, root, roots),
     "R4: relative path must be resolved against projectRoot, not CWD. " &
     "File exists in tmp dir but not under projectRoot → must be stale"
 

@@ -108,6 +108,10 @@ import crisol/closure  # for extractClosure/extractCompileInputs/SourceIndex/
                         # import comment for why: this module importing
                         # crisol/artifactid would have closed that cycle,
                         # issue #16).
+import crisol/paths     # RFC-0009 A3c-ii: TrackedPath/TrackedRoots/classify/
+                        # fromCanonical/cmpKeyBytes/display/toNative/
+                        # PathClass/pcTracked/pcOutside for DepGraphEntry.
+                        # closure's TrackedPath retype.
 import crisol/ccprobe   # for RunProc/realRun (recordClosure's ccRun param)
 import crisol/ioutils  # sanitizeControlBytes (the shared control/ANSI-byte
                         # sanitization primitive — bottom of the dep graph, no
@@ -206,7 +210,7 @@ type
       ## compared cross-policy.
 
   DepGraphEntry* = object
-    closure*:       HashSet[string]
+    closure*:       HashSet[TrackedPath]
       ## project-root-relative closure paths.
       ##
       ## Invariant NONEMPTY-CLOSURE: a compiled entrypoint's closure always
@@ -437,6 +441,27 @@ proc closureContentHash*(files: seq[string]; projectRoot: string): string =
   ## directly for the same result.
   chainedContentHash(files, projectRoot)
 
+proc closureHashInputs*(closure: HashSet[TrackedPath];
+                        roots: TrackedRoots): seq[string] =
+  ## RFC-0009 A3c-ii: the canonical seq[string] fed to `closureContentHash`
+  ## for a `TrackedPath` closure. It MUST be derived identically at record
+  ## time (`recordClosure`) and at check time (`planner.decideCompile`),
+  ## from the SAME (classify-filtered) `TrackedPath` set — otherwise the
+  ## warm-load content hash never reproduces the recorded one and every
+  ## entry looks stale (the `test_skipfresh` regression this centralization
+  ## fixes).
+  ##
+  ## Per member: a project (tag-0) member yields `display` (its
+  ## project-relative `rel` — byte-identical to the string
+  ## `extractCompileInputs`/`toProjectRelative` produced pre-retype, which
+  ## `chainedContentHash` resolves against `projectRoot`); a dep-root member
+  ## yields `toNative` (the ABSOLUTE native path — NEVER `display`, whose
+  ## dep-relative `rel` would resolve against `projectRoot` to the wrong
+  ## file, RFC R3-17c). `chainedContentHash` sorts internally.
+  result = newSeqOfCap[string](closure.len)
+  for tp in closure:
+    result.add(if isProject(tp): display(tp) else: toNative(tp, roots))
+
 # ---------------------------------------------------------------------------
 # Public: constructors
 # ---------------------------------------------------------------------------
@@ -456,7 +481,7 @@ proc initDepGraph*(nimVersion: string): DepGraph =
 proc updateEntry*(graph: var DepGraph;
                   path:          string;
                   fHash:         string;
-                  closure:       HashSet[string];
+                  closure:       HashSet[TrackedPath];
                   closureHash:   string = "";
                   protocolMajor: int = 0;
                   externals:     seq[ExternalSource] = @[]) =
@@ -494,23 +519,22 @@ proc invalidateEntry*(graph: var DepGraph; path: string; fHash: string) =
 
 proc isEntryStale*(graph: DepGraph;
                    key:   (string, string);
-                   projectRoot: string): bool =
+                   projectRoot: string;
+                   roots: TrackedRoots): bool =
   ## Returns true iff the entry should be re-scanned:
   ##   - key is absent from the graph, OR
   ##   - any file in the closure does not exist on disk.
   ##
-  ## Closure paths may be absolute or project-root-relative.  Relative paths
-  ## are resolved against `projectRoot` before the existence check, so the
-  ## result is independent of the caller's CWD.  This prevents a file that
-  ## happens to exist in CWD (but not under projectRoot) from falsely
-  ## suppressing staleness (R4 soundness fix).
+  ## RFC-0009 A3c-ii: `entry.closure` is `HashSet[TrackedPath]` — each
+  ## member's native absolute path is derived via `toNative(tp, roots)`
+  ## (root-tag-aware; no longer a bare `projectRoot / f` join), so the
+  ## result stays independent of the caller's CWD across every tracked
+  ## root, not just the project root.
   if key notin graph.entries:
     return true
   let entry = graph.entries[key]
-  for f in entry.closure:
-    let absPath =
-      if f.isAbsolute: f
-      else: projectRoot / f
+  for tp in entry.closure:
+    let absPath = toNative(tp, roots)
     if not fileExists(absPath):
       return true
   return false
@@ -575,8 +599,15 @@ proc gcDeletedEntrypoints*(graph:               var DepGraph;
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
-proc toJson(graph: DepGraph): JsonNode =
+proc toJson(graph: DepGraph; roots: TrackedRoots): JsonNode =
   ## Serialize a DepGraph to a JsonNode.
+  ##
+  ## RFC-0009 A3c-ii: `entry.closure` is `HashSet[TrackedPath]` — each
+  ## member is sorted by `cmpKeyBytes(_, _, roots)` (the SOLE ordering over
+  ## `TrackedPath`; there is deliberately no `<`) and serialized via
+  ## `display`, which for a tag-0 (project) member is byte-identical to the
+  ## project-relative string this file stored before the retype — the
+  ## on-disk closure format is unchanged.
   let headerNode = newJObject()
   headerNode["nimVersion"]    = newJString(graph.header.nimVersion)
   headerNode["formatVersion"] = newJInt(graph.header.formatVersion)
@@ -594,11 +625,12 @@ proc toJson(graph: DepGraph): JsonNode =
   for (key, entry) in graph.entries.pairs:
     let (path, fHash) = key
     let closureArr = newJArray()
-    # Sort for deterministic output
+    # Sort for deterministic output. No `<` exists on TrackedPath (R3-3) —
+    # `cmpKeyBytes` is the sole ordering; serialize each member's `display`.
     var sortedClosure = toSeq(entry.closure)
-    sortedClosure.sort()
-    for f in sortedClosure:
-      closureArr.add newJString(f)
+    sortedClosure.sort(proc(a, b: TrackedPath): int = cmpKeyBytes(a, b, roots))
+    for tp in sortedClosure:
+      closureArr.add newJString(display(tp))
     let externalsArr = newJArray()
     var sortedExternals = entry.externals
     sortedExternals.sort(proc(a, b: ExternalSource): int = cmp(a.source, b.source))
@@ -628,7 +660,7 @@ proc toJson(graph: DepGraph): JsonNode =
   result["header"]  = headerNode
   result["entries"] = entriesArr
 
-proc fromJson(node: JsonNode; discarded: var DepGraphDiscard): DepGraph =
+proc fromJson(node: JsonNode; roots: TrackedRoots; discarded: var DepGraphDiscard): DepGraph =
   ## Deserialize a DepGraph from a JsonNode, preserving the STORED header
   ## verbatim (nimVersion + formatVersion) — this proc has no notion of
   ## "the current Nim version" and performs no nimVersion comparison; that
@@ -750,10 +782,18 @@ proc fromJson(node: JsonNode; discarded: var DepGraphDiscard): DepGraph =
     let fHash   = flagHashNode.getStr("")
     if path == "" or fHash == "": continue
 
-    var closure = initHashSet[string]()
+    # RFC-0009 A3c-ii: classify-at-load both converts each stored
+    # project-root-relative string to its TrackedPath identity AND drops
+    # any member that does not resolve under a tracked root — this
+    # SUBSUMES the separate post-load underRootNorm filter that used to run
+    # over the string closure (M10; see loadStoredDepGraph, below).
+    var closure = initHashSet[TrackedPath]()
     for item in closureNode:
       let s = item.getStr("")
-      if s != "": closure.incl s
+      if s.len == 0: continue
+      let pc = classify(s, roots)
+      if pc.kind == pcTracked: closure.incl pc.tp
+      # pcOutside members are dropped — exactly what M10's underRootNorm did.
 
     let closureHash   = if closureHashNode != nil: closureHashNode.getStr("") else: ""
     let protocolMajor = if protocolMajNode != nil: protocolMajNode.getInt(0)  else: 0
@@ -851,7 +891,7 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
 
   var toWrite = graph
   toWrite.header.roots = rootsDescriptor(config.trackedRoots)
-  let jsonStr = $toJson(toWrite)
+  let jsonStr = $toJson(toWrite, config.trackedRoots)
   let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
     stderr.write("crisol: warning: could not write depgraph: " & err & "\n")
@@ -931,10 +971,23 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
     let carried = if key in graph.entries: graph.entries[key].externals else: @[]
     let inputs = extractCompileInputs(nimcacheDir, binaryName, epAbs, config,
                                       index, carried, ccRun)
-    var closureSeq = toSeq(inputs.files)
-    closureSeq.sort()
-    let contentHash = closureContentHash(closureSeq, config.projectRoot)
-    graph.updateEntry(ep.path, fHash, inputs.files, contentHash, protocolMajor,
+    # RFC-0009 A3c-ii: the string->TrackedPath conversion happens at this
+    # depgraph boundary (closure.nim's `extractCompileInputs` itself is not
+    # retyped this slice) — same classify/pcTracked conversion as load
+    # (`fromJson`, above); a member that classifies as pcOutside is dropped.
+    var tpClosure = initHashSet[TrackedPath]()
+    for member in inputs.files:
+      let pc = classify(member, config.trackedRoots)
+      if pc.kind == pcTracked: tpClosure.incl pc.tp
+    # Content hash is computed over `closureHashInputs(tpClosure, …)` — the
+    # SAME derivation `planner.decideCompile` uses at check time, from the
+    # SAME classify-filtered set. Hashing raw `inputs.files` here instead
+    # would diverge from the warm-load check whenever a member was dropped
+    # as pcOutside or reconstructs differently, making every entry look
+    # stale (the test_skipfresh regression). See `closureHashInputs`.
+    let contentHash = closureContentHash(
+      closureHashInputs(tpClosure, config.trackedRoots), config.projectRoot)
+    graph.updateEntry(ep.path, fHash, tpClosure, contentHash, protocolMajor,
                       inputs.externals)
     if saveDepGraph(graph, config):
       result = (ok: true, error: "")
@@ -1024,7 +1077,7 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
     discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
     return initDepGraph("")
 
-  result = fromJson(node, discarded)
+  result = fromJson(node, config.trackedRoots, discarded)
 
   # M10 soundness: re-validate closure paths from the on-disk graph.
   #
@@ -1098,11 +1151,12 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
 
   for key in toSeq(result.entries.keys):
     var entry = result.entries[key]
-    var filtered = initHashSet[string]()
-    for p in entry.closure:
-      if underRootNorm(p):
-        filtered.incl p   # kept VERBATIM — exactly as read from disk
-      # else: drop the escaping path silently (absolute or relative alike)
+    # RFC-0009 A3c-ii: the closure-path M10 filter that used to run HERE
+    # (drop any string member not under a tracked root) is now SUBSUMED by
+    # the classify-at-parse conversion in `fromJson`, above — every member
+    # already surviving into `entry.closure` is a `TrackedPath` built via
+    # `classify`'s `pcTracked` arm; a `pcOutside` member was already dropped
+    # there. `entry.closure` needs no further filtering here.
 
     # M10, extended (issue #16): `entry.externals[].source` must resolve
     # under a tracked root (same rule/gate as a closure path — an
@@ -1125,11 +1179,11 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
 
     # Defense in depth — see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE:
     # the writer refuses to record an empty closure, but if one reaches disk
-    # anyway, treat it as absent so decideCompile/narrow re-derive it.
-    if filtered.len == 0:
+    # anyway (or every member was dropped as pcOutside at classify-time,
+    # above), treat it as absent so decideCompile/narrow re-derive it.
+    if entry.closure.len == 0:
       result.entries.del(key)
       continue
-    entry.closure = filtered
     entry.externals = filteredExternals
     result.entries[key] = entry
 

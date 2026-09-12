@@ -1009,8 +1009,12 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
     let key   = (ep.path, fHash)
     if impl.pv.graph.entries.hasKey(key):
       let ge = impl.pv.graph.entries[key]
-      var closureSeq = toSeq(ge.closure)
-      closureSeq.sort()
+      # RFC-0009 A3c-ii: `ge.closure` is `HashSet[TrackedPath]`; sort by the
+      # sole ordering (`cmpKeyBytes`) and emit each member's `display` —
+      # this reproduces today's sorted project-relative-string output shape.
+      var closureTp = toSeq(ge.closure)
+      closureTp.sort(proc(a, b: TrackedPath): int = cmpKeyBytes(a, b, impl.cfg.trackedRoots))
+      let closureSeq = closureTp.mapIt(display(it))
       entries.add ClosureEntry(
         path:        ep.path,
         group:       ep.group,

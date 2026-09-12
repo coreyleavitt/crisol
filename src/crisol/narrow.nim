@@ -34,35 +34,6 @@ import crisol/paths
 # Public: detailed selector (D4)
 # ---------------------------------------------------------------------------
 
-proc reduceClosure(closure: HashSet[string]; roots: TrackedRoots): Option[HashSet[TrackedPath]] =
-  ## Reduces a persisted `DepGraphEntry.closure` (still `HashSet[string]` —
-  ## it does not retype until A3c-ii) to `HashSet[TrackedPath]` so Rule 5 can
-  ## compare it against `changed` under fold.
-  ##
-  ## Every member is expected to be project-root-relative (the normal case:
-  ## `fromCanonical` reduces it directly). An OLD persisted graph can also
-  ## hold an ABSOLUTE native depRoot member (the `fnv.nim:68` fall-through,
-  ## R3-17b) — `fromCanonical` REJECTS absolute input by construction, so a
-  ## bare call on such a member is undefined (crash or silent drop, unsound).
-  ## Such a member is instead routed through `classify`: `pcTracked` still
-  ## yields a usable identity; `pcOutside` means the member cannot be
-  ## reduced at all.
-  ##
-  ## Returns `none` the instant ANY member is unclassifiable — signalling
-  ## the caller must treat the whole entry conservatively (it cannot prove a
-  ## miss without a sound identity for every member).
-  var acc = initHashSet[TrackedPath]()
-  for member in closure:
-    let viaCanonical = fromCanonical(member, roots)
-    if viaCanonical.isSome:
-      acc.incl viaCanonical.get
-      continue
-    let pc = classify(member, roots)
-    case pc.kind
-    of pcTracked: acc.incl pc.tp
-    of pcOutside: return none(HashSet[TrackedPath])
-  some(acc)
-
 proc selectByDiff*(eps: seq[Entrypoint];
                    changed: HashSet[TrackedPath];
                    graph: DepGraph;
@@ -76,11 +47,11 @@ proc selectByDiff*(eps: seq[Entrypoint];
   ##   1. **srGraphAbsent**    — graph.entries is empty (graph absent/empty).
   ##   2. **srOwnFileChanged** — ep.path (reduced via `fromCanonical`) ∈ changed.
   ##   3. **srUnknownClosure** — no entry in graph for (ep.path, flagHash(ep.flags)).
-  ##   4. **srStaleEntry**     — isEntryStale returns true (a closure file vanished),
-  ##                             OR the persisted closure holds an unclassifiable
-  ##                             member (R3-17b; conservative — cannot prove a miss).
-  ##   5. **srClosureHit**     — known fresh closure ∩ changed ≠ ∅ (folded via
-  ##                             `TrackedPath`) → include.
+  ##   4. **srStaleEntry**     — isEntryStale returns true (a closure file vanished).
+  ##   5. **srClosureHit**     — known fresh closure ∩ changed ≠ ∅ (both already
+  ##                             `HashSet[TrackedPath]` — RFC-0009 A3c-ii;
+  ##                             `entry.closure` is compared directly, no
+  ##                             string->TrackedPath reduction needed) → include.
   ##   (excluded)              — known fresh closure ∩ changed = ∅  → skip.
   ##
   ## Input order of `eps` is preserved.  The only side effect is the
@@ -112,19 +83,15 @@ proc selectByDiff*(eps: seq[Entrypoint];
       continue
 
     # Rule 4: entry exists but a closure file has been deleted → stale.
-    if isEntryStale(graph, key, projectRoot):
+    if isEntryStale(graph, key, projectRoot, roots):
       result.add (ep: ep, reason: srStaleEntry)
       continue
 
     # Rule 5: known fresh closure — include iff it intersects `changed`.
-    # R3-17b: reduce the persisted (still string) closure to TrackedPath;
-    # an unclassifiable member forces the conservative srStaleEntry path
-    # rather than a bare/undefined comparison.
-    let closureTp = reduceClosure(graph.entries[key].closure, roots)
-    if closureTp.isNone:
-      result.add (ep: ep, reason: srStaleEntry)
-      continue
-    if not disjoint(closureTp.get, changed):
+    # RFC-0009 A3c-ii: `graph.entries[key].closure` is already
+    # `HashSet[TrackedPath]` (classified at load, `depgraph.fromJson`) —
+    # compared directly against `changed`, no reduction step.
+    if not disjoint(graph.entries[key].closure, changed):
       result.add (ep: ep, reason: srClosureHit)
     # else: closure miss → excluded (the only exclusion path)
 

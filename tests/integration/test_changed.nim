@@ -332,16 +332,20 @@ suite "crisol D5 — --failed --changed union":
       Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]),
       Entrypoint(path: "tests/unit/test_b.nim", group: "unit", flags: @[]),
     ]
+    # RFC-0009 A3c-ii: `DepGraphEntry.closure` is `HashSet[TrackedPath]` --
+    # build `roots` first so both the closure and `changed` (below) reduce
+    # under the SAME roots `narrowByDiff` is called with.
+    let roots = initTrackedRoots(repo, @[], "")
+
     # Precise graph: each closure is just the entrypoint's own file.
     var graph = initDepGraph("2.2.10")
     let fh = flagHash(@[])
     graph.updateEntry("tests/unit/test_a.nim", fh,
-                      ["tests/unit/test_a.nim"].toHashSet)
+                      [fromCanonical("tests/unit/test_a.nim", roots).get].toHashSet)
     graph.updateEntry("tests/unit/test_b.nim", fh,
-                      ["tests/unit/test_b.nim"].toHashSet)
+                      [fromCanonical("tests/unit/test_b.nim", roots).get].toHashSet)
 
     # Only test_b changed on disk.
-    let roots = initTrackedRoots(repo, @[], "")
     var changed = initHashSet[TrackedPath]()
     changed.incl fromCanonical("tests/unit/test_b.nim", roots).get
     # Only test_a failed previously.
