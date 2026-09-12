@@ -95,6 +95,16 @@ proc widgetSpelling(closure: HashSet[TrackedPath]; roots: TrackedRoots): string 
       return display(tp)
   ""
 
+proc closureForPath(g: DepGraph; path: string): HashSet[TrackedPath] =
+  ## Locate a graph entry by its PATH component, ignoring the flag-hash half
+  ## of the (path, flagHash) key: the run records each entry under the flags
+  ## the compile actually used (path/define flags from the config), NOT
+  ## flagHash(@[]), so a fixed-flag-hash key lookup misses. One flag set is
+  ## used here, so exactly one entry per path.
+  for k, entry in g.entries.pairs:
+    if k[0] == path: return entry.closure
+  raise newException(ValueError, "no dep-graph entry for path: " & path)
+
 proc runDeterminismBody(root: string) =
   createDir(root / "src")
   createDir(root / "tests")
@@ -124,14 +134,8 @@ proc runDeterminismBody(root: string) =
   for r in results:
     check r.outcome == oPassed
 
-  let fh        = flagHash(@[])
-  let keyLower  = ("tests/test_lower.nim", fh)
-  let keyUpper  = ("tests/test_upper.nim", fh)
-  check keyLower in graph.entries
-  check keyUpper in graph.entries
-
-  let coldLowerSpelling = widgetSpelling(graph.entries[keyLower].closure, cfg.trackedRoots)
-  let coldUpperSpelling = widgetSpelling(graph.entries[keyUpper].closure, cfg.trackedRoots)
+  let coldLowerSpelling = widgetSpelling(closureForPath(graph, "tests/test_lower.nim"), cfg.trackedRoots)
+  let coldUpperSpelling = widgetSpelling(closureForPath(graph, "tests/test_upper.nim"), cfg.trackedRoots)
 
   echo "RFC9-A4B COLD: test_lower.nim's recorded widget member spelling = '", coldLowerSpelling, "'"
   echo "RFC9-A4B COLD: test_upper.nim's recorded widget member spelling = '", coldUpperSpelling, "'"
@@ -144,11 +148,8 @@ proc runDeterminismBody(root: string) =
 
   # --- WARM: reload the PERSISTED graph, no recompile at all ---
   let warmGraph = loadDepGraph(cfg, "")
-  check keyLower in warmGraph.entries
-  check keyUpper in warmGraph.entries
-
-  let warmLowerSpelling = widgetSpelling(warmGraph.entries[keyLower].closure, cfg.trackedRoots)
-  let warmUpperSpelling = widgetSpelling(warmGraph.entries[keyUpper].closure, cfg.trackedRoots)
+  let warmLowerSpelling = widgetSpelling(closureForPath(warmGraph, "tests/test_lower.nim"), cfg.trackedRoots)
+  let warmUpperSpelling = widgetSpelling(closureForPath(warmGraph, "tests/test_upper.nim"), cfg.trackedRoots)
 
   echo "RFC9-A4B WARM: test_lower.nim's recorded widget member spelling = '", warmLowerSpelling, "'"
   echo "RFC9-A4B WARM: test_upper.nim's recorded widget member spelling = '", warmUpperSpelling, "'"
