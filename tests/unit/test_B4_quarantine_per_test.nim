@@ -19,13 +19,29 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_B4_quarantine_per_test.nim
 
-import std/[options, sets, unittest]
+import std/[options, os, sets, unittest]
 import crisol/types
 import crisol/runner  # for isQuarantined
 from crisol/process/types as ptypes import nil
 
+# RFC-0009 A3d-ii: quarantine's B3 path rule now folds via TrackedPath.
+# Build a single roots for the whole file so every ep.tp and every quarantine
+# path share the same fold policy (exact matches here; the fold itself is
+# proven in the dedicated case-insensitive test below).
+let qroots = initTrackedRoots(getCurrentDir(), @[], "")
+
 proc makeEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit")
+  Entrypoint(path: path, group: "unit", tp: fromCanonical(path, qroots).get)
+
+proc qPathsOf(q: HashSet[string]): HashSet[TrackedPath] =
+  ## Mirror config.docToConfig: reduce every raw user entry to its TrackedPath
+  ## identity via classify (the B3 path view). A name entry classifies to some
+  ## TrackedPath that never matches a real ep.tp — harmless, exactly as in
+  ## production, where the same entry also lives in the raw B4 name set.
+  result = initHashSet[TrackedPath]()
+  for entry in q:
+    let pc = classify(entry, qroots)
+    if pc.kind == pcTracked: result.incl pc.tp
 
 proc failRec(name: string): TestRecord =
   TestRecord(name: name, status: rsFail, durationUs: 1)
@@ -67,19 +83,19 @@ suite "B4 isQuarantined — B3 path-match rule":
     let ep  = makeEp("tests/integration/test_x.nim")
     let res = failResult(ep, @[])
     let q   = toHashSet(["tests/integration/test_x.nim"])
-    check isQuarantined(ep, res, q) == true
+    check isQuarantined(ep, res, q, qPathsOf(q)) == true
 
   test "ep.path NOT in quarantine set, no failing records → not quarantined":
     let ep  = makeEp("tests/integration/test_x.nim")
     let res = failResult(ep, @[])
     let q   = toHashSet(["tests/integration/test_y.nim"])
-    check isQuarantined(ep, res, q) == false
+    check isQuarantined(ep, res, q, qPathsOf(q)) == false
 
   test "empty quarantine set → not quarantined":
     let ep  = makeEp("tests/integration/test_x.nim")
     let res = failResult(ep, @[failRec("some test")])
     let q   = initHashSet[string]()
-    check isQuarantined(ep, res, q) == false
+    check isQuarantined(ep, res, q, qPathsOf(q)) == false
 
   test "B3 path-match: passed result with path in set → still quarantined":
     ## A cached pass for a now-path-quarantined binary is marked quarantined
@@ -87,7 +103,27 @@ suite "B4 isQuarantined — B3 path-match rule":
     let ep  = makeEp("tests/integration/test_x.nim")
     let res = passResult(ep, @[])
     let q   = toHashSet(["tests/integration/test_x.nim"])
-    check isQuarantined(ep, res, q) == true
+    check isQuarantined(ep, res, q, qPathsOf(q)) == true
+
+  test "B3 path rule FOLDS under a case-insensitive policy (RFC-0009 A3d-ii)":
+    ## The live soundness bug A3d-ii closes: on a case-insensitive volume a
+    ## `quarantine "Foo.nim"` entry must downgrade a failing `foo.nim`. Proven
+    ## by forcing fpAsciiLower through the §3 probe seam (volume-independent on
+    ## this case-sensitive ext4 container). A raw case-sensitive string match
+    ## (the pre-A3d-ii behaviour) would MISS this and report a real failure.
+    proc forcedLower(rootAbs, sd: string): FoldPolicy = fpAsciiLower
+    let froots = initTrackedRoots(getCurrentDir(), @[], "", forcedLower)
+    # Live entrypoint spelled lower-case; quarantine entry spelled upper-case.
+    let ep  = Entrypoint(path: "tests/integration/foo.nim", group: "unit",
+                         tp: fromCanonical("tests/integration/foo.nim", froots).get)
+    let res = failResult(ep, @[])
+    var qPaths = initHashSet[TrackedPath]()
+    qPaths.incl classify("tests/integration/Foo.nim", froots).tp   # UPPER-case
+    check isQuarantined(ep, res, initHashSet[string](), qPaths) == true
+    # A genuinely different file is not swept in by the fold.
+    var qOther = initHashSet[TrackedPath]()
+    qOther.incl classify("tests/integration/bar.nim", froots).tp
+    check isQuarantined(ep, res, initHashSet[string](), qOther) == false
 
 # ---------------------------------------------------------------------------
 # Suite 2: B4 per-test rule
@@ -99,19 +135,19 @@ suite "B4 isQuarantined — per-test name-match rule":
     let ep  = makeEp("tests/integration/test_z.nim")
     let res = failResult(ep, @[failRec("bad test A"), failRec("bad test B")])
     let q   = toHashSet(["bad test A", "bad test B"])
-    check isQuarantined(ep, res, q) == true
+    check isQuarantined(ep, res, q, qPathsOf(q)) == true
 
   test "some failing record NOT quarantined → NOT quarantined":
     let ep  = makeEp("tests/integration/test_z.nim")
     let res = failResult(ep, @[failRec("bad test A"), failRec("real failure")])
     let q   = toHashSet(["bad test A"])
-    check isQuarantined(ep, res, q) == false
+    check isQuarantined(ep, res, q, qPathsOf(q)) == false
 
   test "single failing record, quarantined → quarantined":
     let ep  = makeEp("tests/unit/test_w.nim")
     let res = failResult(ep, @[failRec("known flaky test")])
     let q   = toHashSet(["known flaky test"])
-    check isQuarantined(ep, res, q) == true
+    check isQuarantined(ep, res, q, qPathsOf(q)) == true
 
   test "failed with NO failing records (opaque binary) → per-test rule N/A, not quarantined":
     ## When an entrypoint failed (exit nonzero) but emitted no failing records
@@ -121,33 +157,33 @@ suite "B4 isQuarantined — per-test name-match rule":
     # Records contain only pass/skip, but outcome is oFailed (e.g., exit nonzero)
     let res = failResult(ep, @[passRec("something"), skipRec("something else")])
     let q   = toHashSet(["something", "something else"])
-    check isQuarantined(ep, res, q) == false
+    check isQuarantined(ep, res, q, qPathsOf(q)) == false
 
   test "failed with zero records (completely opaque) → not quarantined by per-test rule":
     let ep  = makeEp("tests/integration/test_opaque2.nim")
     let res = failResult(ep, @[])
     let q   = toHashSet(["any name"])
-    check isQuarantined(ep, res, q) == false
+    check isQuarantined(ep, res, q, qPathsOf(q)) == false
 
   test "passed result with all-named records → per-test rule N/A (nothing to downgrade)":
     ## A passed entrypoint is never downgraded by per-test rule.
     let ep  = makeEp("tests/integration/test_pass.nim")
     let res = passResult(ep, @[passRec("test foo"), passRec("test bar")])
     let q   = toHashSet(["test foo", "test bar"])
-    check isQuarantined(ep, res, q) == false
+    check isQuarantined(ep, res, q, qPathsOf(q)) == false
 
   test "mix of fail+pass records: all fail records quarantined → quarantined":
     ## Non-fail records are irrelevant. Only rsFail records must all be in q.
     let ep  = makeEp("tests/integration/test_mixed.nim")
     let res = failResult(ep, @[failRec("bad test"), passRec("good test")])
     let q   = toHashSet(["bad test"])
-    check isQuarantined(ep, res, q) == true
+    check isQuarantined(ep, res, q, qPathsOf(q)) == true
 
   test "mix of fail+skip records: all fail records quarantined → quarantined":
     let ep  = makeEp("tests/integration/test_mixed2.nim")
     let res = failResult(ep, @[failRec("bad test"), skipRec("skipped test")])
     let q   = toHashSet(["bad test"])
-    check isQuarantined(ep, res, q) == true
+    check isQuarantined(ep, res, q, qPathsOf(q)) == true
 
   test "B4 and B3 overlap: test name equals ep path → still quarantined":
     ## One flat set matched against both paths and names. An entry matching
@@ -155,7 +191,7 @@ suite "B4 isQuarantined — per-test name-match rule":
     let ep  = makeEp("tests/integration/test_x.nim")
     let res = failResult(ep, @[failRec("tests/integration/test_x.nim")])
     let q   = toHashSet(["tests/integration/test_x.nim"])
-    check isQuarantined(ep, res, q) == true
+    check isQuarantined(ep, res, q, qPathsOf(q)) == true
 
 when isMainModule:
   echo "B4 isQuarantined unit tests done."

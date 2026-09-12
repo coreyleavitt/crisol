@@ -119,32 +119,44 @@ proc readCapped(path: string; maxBytes: int): string =
 # ---------------------------------------------------------------------------
 
 proc isQuarantined*(ep: Entrypoint; res: EntrypointResult;
-                    q: HashSet[string]): bool =
+                    qNames: HashSet[string];
+                    qPaths: HashSet[TrackedPath]): bool =
   ## Pure: returns true iff this entrypoint's failure contribution should be
-  ## downgraded (excluded from exit-1) under the quarantine set `q`.
+  ## downgraded (excluded from exit-1) under the quarantine configuration.
   ##
-  ## Two rules are applied in order; either is sufficient:
+  ## Two rules are applied in order; either is sufficient. RFC-0009 A3d-ii
+  ## splits the single legacy string set into two views of the SAME user
+  ## entries, because the two rules match fundamentally different things:
   ##
-  ##   B3 (path rule):
-  ##     ep.path ∈ q  → quarantined.  Matches entire binaries by path, regardless
-  ##     of outcome or protocol records.  A cached pass for a path-quarantined
+  ##   B3 (path rule) — FOLDED:
+  ##     ep.tp ∈ qPaths  → quarantined.  Matches entire binaries by path
+  ##     identity, regardless of outcome or protocol records. `qPaths` is the
+  ##     user entries reduced to TrackedPath (config.quarantineTp), so the
+  ##     match folds under the project root's policy — `quarantine "Foo.nim"`
+  ##     downgrades a failing `foo.nim` on a case-insensitive volume (the live
+  ##     soundness bug this closes). A cached pass for a path-quarantined
   ##     binary is also marked (harmless — summarize only suppresses failures).
   ##
-  ##   B4 (per-test name rule):
+  ##   B4 (per-test name rule) — EXACT:
   ##     outcome(res) is a failure AND res.records contains ≥ 1 rsFail record AND
-  ##     every rsFail record's name ∈ q  → quarantined.
-  ##     If ANY failing record's name is NOT in q, the rule does NOT fire.
-  ##     If the entrypoint failed with NO rsFail records (opaque binary, exit
-  ##     nonzero without protocol, killed, crashed, etc.) this rule does NOT
-  ##     apply — only the B3 path rule can downgrade such results.
+  ##     every rsFail record's name ∈ qNames  → quarantined.
+  ##     `qNames` is the raw user entries (config.quarantine): a test-record
+  ##     name is NOT a filesystem path and must NOT fold — it is matched by
+  ##     exact string equality. If ANY failing record's name is not in qNames,
+  ##     the rule does NOT fire. If the entrypoint failed with NO rsFail
+  ##     records (opaque binary, exit nonzero without protocol, killed,
+  ##     crashed, etc.) this rule does NOT apply — only B3 can downgrade such
+  ##     results.
   ##
-  ## One flat set:
-  ##   The same `q` is matched against both entrypoint paths (B3) and test-record
-  ##   names (B4). An entry is whichever it happens to match; there is no ambiguity
-  ##   because paths and test names occupy different positions in the decision tree.
+  ## Two views, one source:
+  ##   Both derive from the same `quarantine { … }` KDL block. A user entry is
+  ##   whichever it happens to match — a path (B3, via qPaths) or a test name
+  ##   (B4, via qNames). A name entry also lands in qPaths as some TrackedPath
+  ##   that never matches a real ep.tp (harmless); a path entry also stays in
+  ##   qNames verbatim, preserving the legacy "one flat set" match semantics.
 
   # B3: whole-binary path-match (always checked first; applies to any outcome).
-  if ep.path in q:
+  if ep.tp in qPaths:
     return true
 
   # B4: per-test name-match.
@@ -158,10 +170,10 @@ proc isQuarantined*(ep: Entrypoint; res: EntrypointResult;
   for rec in res.records:
     if rec.status == rsFail:
       inc failCount
-      if rec.name notin q:
+      if rec.name notin qNames:
         return false  # at least one failing record is NOT quarantined → real failure
 
-  # failCount > 0 AND every failing record was in q.
+  # failCount > 0 AND every failing record was in qNames.
   result = failCount > 0
 
 # ---------------------------------------------------------------------------
@@ -1694,7 +1706,7 @@ proc execute*(
       # concern, not part of the soundness/cache key.  Cached results are
       # always passes (only passing results are stored), so the B4 per-test
       # rule naturally no-ops here; the B3 path rule still applies.
-      synth.quarantined = isQuarantined(p.entrypoints[i].ep, synth, config.quarantine)
+      synth.quarantined = isQuarantined(p.entrypoints[i].ep, synth, config.quarantine, config.quarantineTp)
       result[i] = synth
       finalized[i] = true    # B1: mark finalized — edCached never retried
       inc done
@@ -1821,7 +1833,7 @@ proc execute*(
           ac.onSlotFinish(slotToken, finishRss)
           var res = fo.res
           res.quarantined = isQuarantined(p.entrypoints[completedIdx].ep, res,
-                                          config.quarantine)
+                                          config.quarantine, config.quarantineTp)
           result[completedIdx] = res
           finalized[completedIdx] = true
           inc done
@@ -1891,7 +1903,7 @@ proc execute*(
               result[completedIdx].quarantined =
                 isQuarantined(p.entrypoints[completedIdx].ep,
                               result[completedIdx],
-                              config.quarantine)
+                              config.quarantine, config.quarantineTp)
 
               # Track whether any failure has been recorded (for failFast).
               if failFast and completedOutcome.isFailure:

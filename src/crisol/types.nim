@@ -378,11 +378,21 @@ type
                                 ## compaction.  0 = disabled (keep all rows).
                                 ## Consistent with cacheMaxAgeDays: opt-in, 0=disabled.
     quarantine*:   HashSet[string]
-                                ## B3: set of entrypoint paths whose failures are EXCLUDED from
-                                ## the exit-1 decision.  Paths are project-root-relative, '/'
-                                ## separated, matched by raw string equality against ep.path.
-                                ## Populated from the top-level `quarantine { "path" … }` KDL
-                                ## block.  Empty set = no quarantine (default).
+                                ## The raw user-origin quarantine entries from the top-level
+                                ## `quarantine { "path" … }` KDL block. Used for the B4 per-test
+                                ## NAME rule (`isQuarantined`): a test-record name is matched by
+                                ## exact string equality — a test name is not a filesystem path
+                                ## and must NOT fold. Empty set = no quarantine (default).
+    quarantineTp*: HashSet[TrackedPath]
+                                ## RFC-0009 A3d-i(i)/A3d-ii: the same user entries reduced to
+                                ## TrackedPath identities (via `classify` against the project
+                                ## root — a user-origin reduction, never `fromCanonical` on raw
+                                ## KDL text), for the B3 whole-binary PATH rule. Matched FOLDED
+                                ## against `ep.tp`, so `quarantine "Foo.nim"` downgrades a
+                                ## failing `foo.nim` on a case-insensitive volume (the live
+                                ## soundness bug this closes). An entry that is a test name, not
+                                ## a path, still classifies to SOME TrackedPath but simply never
+                                ## matches a real `ep.tp` — harmless. Built once at config load.
     perfCheck*:    PerfCheckConfig
                                 ## C6: perf-regression detection policy.  Default = disabled
                                 ## (PerfCheckConfig zero-value has enabled=false).

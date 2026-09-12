@@ -992,6 +992,18 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
   # origin (§2) -- from THIS SAME projectRoot and the validated depRootSpecs
   # above (never re-derived downstream).
   result.trackedRoots = initTrackedRoots(projectRoot, depRootSpecs, stateDirOf(result), probe)
+  # RFC-0009 A3d-ii: reduce the raw user quarantine entries to TrackedPath
+  # identities for the B3 (whole-binary path) rule, so quarantine matching
+  # folds under the project root's policy. This runs HERE, after trackedRoots
+  # is built (the entries are parsed earlier, before it exists). classify is
+  # the user-origin reduction (it lexically resolves `.`/`..` and tolerates a
+  # non-canonical spelling) — never fromCanonical, which rejects unvalidated
+  # user text. A pcOutside entry (or a test-name entry that happens to escape
+  # the root) is dropped from the path set; it can still match as a B4 name.
+  result.quarantineTp = initHashSet[TrackedPath]()
+  for entry in result.quarantine:
+    let pc = classify(entry, result.trackedRoots)
+    if pc.kind == pcTracked: result.quarantineTp.incl pc.tp
   validate(result, source, warns)
 
 # ---------------------------------------------------------------------------

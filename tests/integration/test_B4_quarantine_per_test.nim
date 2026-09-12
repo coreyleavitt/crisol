@@ -31,18 +31,28 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc makeCfg(q: HashSet[string] = initHashSet[string]()): Config =
-  Config(
+  # RFC-0009 A3d-ii: mirror config.docToConfig — real trackedRoots, and the
+  # B3 path view (quarantineTp) reduced from the raw entries via classify.
+  result = Config(
     compileTimeoutSecs: 60,
     timeoutSecs:        30,
     maxOutputBytes:     65_536,
     projectRoot:        getCurrentDir(),
     quarantine:         q,
+    trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
   )
+  result.quarantineTp = initHashSet[TrackedPath]()
+  for entry in q:
+    let pc = classify(entry, result.trackedRoots)
+    if pc.kind == pcTracked: result.quarantineTp.incl pc.tp
 
 proc runFixture(fixturePath: string;
                 q: HashSet[string] = initHashSet[string]()): seq[EntrypointResult] =
-  let ep  = Entrypoint(path: fixturePath, group: "test", flags: @[])
   let cfg = makeCfg(q)
+  # RFC-0009 A3d-ii: ep.tp is what the B3 path rule folds against — build it
+  # from the SAME roots (classify handles the absolute fixture path).
+  let ep  = Entrypoint(path: fixturePath, group: "test", flags: @[],
+                       tp: classify(fixturePath, cfg.trackedRoots).tp)
   let p   = plan(cfg, @[ep], emptyDepGraph())
   var g   = emptyDepGraph()
   execute(p, config = cfg, graph = g)
