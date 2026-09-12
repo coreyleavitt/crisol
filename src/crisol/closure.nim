@@ -1442,7 +1442,15 @@ proc extractCompileInputs*(nimcacheDir: string;
           "header record exists for it from a previous run")
       headers = carriedBySource[ext.source].headers
 
-    let hHash = chainedContentHash(headers, config.projectRoot)
+    # RFC-0009 A5a: headers are not `TrackedPath` (they stay hashed by their
+    # own string, per module doc) — build (key, nativePath) pairs preserving
+    # the pre-A5a behavior: the chained key is the header's own string
+    # (byte-identical header hash), content read from the resolved absolute
+    # path.
+    var headerPairs = newSeq[tuple[key: string; nativePath: string]](headers.len)
+    for i, h in headers:
+      headerPairs[i] = (key: h, nativePath: (if h.isAbsolute: h else: config.projectRoot / h))
+    let hHash = chainedContentHash(headerPairs)
     externals.add ExternalSource(source: ext.source, obj: ext.obj,
                                  headers: headers, headersHash: hHash)
     # RFC-0009 A4a (D4): fold each header into the SAME `HashSet[TrackedPath]`

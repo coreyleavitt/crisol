@@ -42,8 +42,17 @@ proc makeTempRoot(tag: string): string =
   createDir(result)
 
 proc makeCfg(root: string): Config =
-  Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
+  result = Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
          timeoutSecs: 60, compileTimeoutSecs: 120, maxOutputBytes: 65_536)
+  # RFC-0009 A5a: `trackedRoots` MUST match `projectRoot` (real production
+  # configs always build both from the same root) — a vacuous/default
+  # TrackedRoots (project.abs == "") makes `classify` treat EVERY absolute
+  # path on the filesystem as "under project" (the empty-prefix match), so
+  # `ep.path` (genuinely outside `root`) would wrongly classify as pcTracked
+  # instead of the pcOutside this test's fault-injection depends on ("the
+  # entrypoint lives OUTSIDE every tracked root, so its extracted closure is
+  # empty").
+  result.trackedRoots = initTrackedRoots(root, @[], "")
 
 suite "closure recording failure after a successful compile (issue #5)":
 
@@ -64,12 +73,14 @@ suite "closure recording failure after a successful compile (issue #5)":
     var graph = initDepGraph("")
     # RFC-0009 A3c-ii: `DepGraphEntry.closure` is `HashSet[TrackedPath]` --
     # this closure is pure bait (a fresh-looking prior entry the retry must
-    # discard), never read back for content, so classifying `ep.path` under
-    # `cfg.trackedRoots` (unset/vacuous here) just needs to produce SOME
-    # non-empty TrackedPath.
-    let seededClosure = [classify(ep.path, cfg.trackedRoots).tp].toHashSet
+    # discard), never read back for content, so it just needs to be SOME
+    # non-empty TrackedPath. RFC-0009 A5a: `cfg.trackedRoots` now genuinely
+    # matches `root` (see `makeCfg`), so `ep.path` (outside `root`) classifies
+    # pcOutside -- a project-relative placeholder name is used instead,
+    # never the entrypoint's own (now-outside) path.
+    let seededClosure = [fromCanonical("bait.nim", cfg.trackedRoots).get].toHashSet
     graph.updateEntry(ep.path, fHash, seededClosure,
-                      closureContentHash(@[ep.path], root), CrisolProtocolMajor)
+                      closureContentHash(@[(key: ep.path, nativePath: ep.path)]), CrisolProtocolMajor)
     createDir(root / ".crisol")
     doAssert saveDepGraph(graph, cfg)
 

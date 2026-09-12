@@ -289,7 +289,7 @@ block test_m10_symlinked_source_inside_root_retained:
 
   # A warm run stays fresh: closureContentHash must succeed (hash through
   # the link) rather than raise because the guard silently dropped it.
-  let h = closureContentHash(@["src/linked.nim"], root)
+  let h = closureContentHash(@[(key: "src/linked.nim", nativePath: root / "src/linked.nim")])
   assert h.len == 16, "closureContentHash must succeed through the symlink. Got: " & h
 
 block test_m10_depRoot_via_symlink_absolute_path_retained:

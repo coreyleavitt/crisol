@@ -27,6 +27,13 @@ import crisol/depgraph    # DepGraph, updateEntry, saveDepGraph,
                           # DepGraphFormatVersion, depgraphPath, flagHash
 import crisol/fnv         # chainedContentHash
 
+proc headerPairs(headers: seq[string]; root: string): seq[tuple[key: string; nativePath: string]] =
+  ## RFC-0009 A5a: `chainedContentHash` now takes (key, nativePath) pairs.
+  ## Headers are project-relative strings (not `TrackedPath`) — mirrors
+  ## `closure.nim`'s own headersHash pair derivation exactly.
+  for h in headers:
+    result.add((key: h, nativePath: (if h.isAbsolute: h else: root / h)))
+
 proc tpOf(p: string; roots: TrackedRoots): TrackedPath =
   ## RFC-0009 A4b: `CompileInputs.files` is now `HashSet[TrackedPath]`.
   ## Classify a project-relative or dep-root-absolute spelling (exactly the
@@ -169,7 +176,7 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
     check ext.headers == expectedHeaders
     check "/usr/include/stdint.h" notin ext.headers   # system header excluded
 
-    check ext.headersHash == chainedContentHash(ext.headers, p.root)
+    check ext.headersHash == chainedContentHash(headerPairs(ext.headers, p.root))
 
     # files ⊇ headers ∪ source
     check tpOf("native/add.c", cfg.trackedRoots) in inputs.files
@@ -250,7 +257,7 @@ suite "extractCompileInputs — cached external (carried-forward headers)":
     check inputs.externals[0].headers == @["native/add.h"]
     # headersHash is always FRESHLY computed from the carried headers'
     # current content, never the carried record's own (possibly stale) hash.
-    check inputs.externals[0].headersHash == chainedContentHash(@["native/add.h"], p.root)
+    check inputs.externals[0].headersHash == chainedContentHash(headerPairs(@["native/add.h"], p.root))
 
   test "no matching compile entry, no carried record: raises CrisolError cekEnvironment naming the source":
     let p = setupExtProject("nocarry")
@@ -392,8 +399,8 @@ suite "staleExternalObjects (issue #16 slice 1b)":
     var g = initDepGraph("2.2.10")
     let path = "tests/t.nim"
     let fh = flagHash(@[])
-    let hashAdd = chainedContentHash(@["native/add.h"], root)
-    let hashOther = chainedContentHash(@["native/other.h"], root)
+    let hashAdd = chainedContentHash(headerPairs(@["native/add.h"], root))
+    let hashOther = chainedContentHash(headerPairs(@["native/other.h"], root))
     let externals = @[
       ExternalSource(source: "native/add.c", obj: "objAdd.o",
                      headers: @["native/add.h"], headersHash: hashAdd),
@@ -424,7 +431,7 @@ suite "staleExternalObjects (issue #16 slice 1b)":
     var g = initDepGraph("2.2.10")
     let path = "tests/t.nim"
     let fh = flagHash(@[])
-    let hashOther = chainedContentHash(@["native/other.h"], root)
+    let hashOther = chainedContentHash(headerPairs(@["native/other.h"], root))
     let externals = @[
       ExternalSource(source: "native/add.c", obj: "objAdd.o",
                      headers: @["native/add.h"], headersHash: ""),

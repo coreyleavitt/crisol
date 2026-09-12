@@ -139,7 +139,7 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
     # dgdFoldMismatch.
     cfg.trackedRoots = initTrackedRoots(repo, @[], "")
     let closureSet = [fromCanonical(epPath, cfg.trackedRoots).get].toHashSet
-    let cHash  = closureContentHash(@[epPath], repo)
+    let cHash  = closureContentHash(@[(key: epPath, nativePath: repo / epPath)])
     var graph  = initDepGraph(cachedNimFingerprint())
     graph.updateEntry(
       epPath, fHash, closureSet,

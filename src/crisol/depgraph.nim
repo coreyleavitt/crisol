@@ -412,55 +412,42 @@ proc flagHash*(flags: seq[string]): string =
 # Public: closureContentHash
 # ---------------------------------------------------------------------------
 
-proc closureContentHash*(files: seq[string]; projectRoot: string): string =
-  ## Compute a stable 64-bit FNV-1a hash over the CONTENTS of all closure files.
+proc closureContentHash*(pairs: seq[tuple[key: string; nativePath: string]]): string =
+  ## Compute a stable 64-bit FNV-1a hash over the CONTENTS of all closure
+  ## files.
   ##
-  ## Algorithm: iterate over sorted(files); for each file, chain the running hash
-  ## through both the relative path AND the file content using FNV-1a:
-  ##   running = fnv1a64(toHex16(running) & "\x00" & relPath & "\x00" & content)
-  ##
-  ## Properties:
-  ##   - Order-independent for the same set (files are sorted before hashing).
-  ##   - Position-sensitive AND path-sensitive: swapping file contents between two
-  ##     paths changes the hash (R6 fix vs the old XOR scheme which is commutative
-  ##     and self-cancelling).
-  ##   - Non-self-cancelling: two files with identical content are distinguished by
-  ##     their paths.
-  ##
-  ## Parameters:
-  ##   `files`       — seq of project-root-relative file paths (sorted internally)
-  ##   `projectRoot` — absolute path to project root for resolving relative paths
-  ##
-  ## Returns 16 lower-case hex chars (or all-zeros string if files is empty).
-  ##
-  ## Raises OSError if any file cannot be read.
+  ## RFC-0009 A5a: `pairs` is `closureHashInputs`' output — the PORTABLE
+  ## `keyBytes` spelling chained into the hash, content read from the
+  ## paired ABSOLUTE native path. A project-only closure hashes
+  ## byte-identical to before this change; a dep-root member's hash becomes
+  ## host-portable. See `crisol/fnv.chainedContentHash` for the algorithm.
   ##
   ## Delegates to `crisol/fnv.chainedContentHash` — the depgraph-facing name
   ## for the identical fold; `crisol/closure` (which cannot import this
   ## module — see closure.nim's import comment) calls `chainedContentHash`
   ## directly for the same result.
-  chainedContentHash(files, projectRoot)
+  chainedContentHash(pairs)
 
 proc closureHashInputs*(closure: HashSet[TrackedPath];
-                        roots: TrackedRoots): seq[string] =
-  ## RFC-0009 A3c-ii: the canonical seq[string] fed to `closureContentHash`
-  ## for a `TrackedPath` closure. It MUST be derived identically at record
-  ## time (`recordClosure`) and at check time (`planner.decideCompile`),
-  ## from the SAME (classify-filtered) `TrackedPath` set — otherwise the
-  ## warm-load content hash never reproduces the recorded one and every
-  ## entry looks stale (the `test_skipfresh` regression this centralization
-  ## fixes).
+    roots: TrackedRoots): seq[tuple[key: string; nativePath: string]] =
+  ## RFC-0009 A3c-ii/A5a: the canonical (key, nativePath) pairs fed to
+  ## `closureContentHash` for a `TrackedPath` closure. It MUST be derived
+  ## identically at record time (`recordClosure`) and at check time
+  ## (`planner.decideCompile`), from the SAME (classify-filtered)
+  ## `TrackedPath` set — otherwise the warm-load content hash never
+  ## reproduces the recorded one and every entry looks stale (the
+  ## `test_skipfresh` regression this centralization fixes).
   ##
-  ## Per member: a project (tag-0) member yields `display` (its
-  ## project-relative `rel` — byte-identical to the string
-  ## `extractCompileInputs`/`toProjectRelative` produced pre-retype, which
-  ## `chainedContentHash` resolves against `projectRoot`); a dep-root member
-  ## yields `toNative` (the ABSOLUTE native path — NEVER `display`, whose
-  ## dep-relative `rel` would resolve against `projectRoot` to the wrong
-  ## file, RFC R3-17c). `chainedContentHash` sorts internally.
-  result = newSeqOfCap[string](closure.len)
+  ## Per member: `key` is `keyBytes(tp, roots)` — a project (tag-0) member's
+  ## `keyBytes` is byte-identical to its `display` (project-relative `rel`,
+  ## the pre-A5a spelling); a dep-root member's `keyBytes` is the portable
+  ## `"dep:name/rel"` form (never a machine-local absolute path).
+  ## `nativePath` is always `toNative(tp, roots)` — the ABSOLUTE native path
+  ## to read content from, for either kind of member. `chainedContentHash`
+  ## sorts by `key` internally.
+  result = newSeqOfCap[tuple[key: string; nativePath: string]](closure.len)
   for tp in closure:
-    result.add(if isProject(tp): display(tp) else: toNative(tp, roots))
+    result.add((key: string(keyBytes(tp, roots)), nativePath: toNative(tp, roots)))
 
 # ---------------------------------------------------------------------------
 # Public: constructors
@@ -578,7 +565,9 @@ proc staleExternalObjects*(graph: DepGraph; path: string; flags: seq[string];
     var stale = ext.headersHash == ""
     if not stale:
       try:
-        stale = chainedContentHash(ext.headers, projectRoot) != ext.headersHash
+        stale = chainedContentHash(ext.headers.mapIt(
+          (key: it, nativePath: (if it.isAbsolute: it else: projectRoot / it)))
+        ) != ext.headersHash
       except CatchableError:
         stale = true
     if stale:
@@ -982,7 +971,7 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
     # the SAME derivation `planner.decideCompile` uses at check time, from
     # the SAME classify-filtered set. See `closureHashInputs`.
     let contentHash = closureContentHash(
-      closureHashInputs(inputs.files, config.trackedRoots), config.projectRoot)
+      closureHashInputs(inputs.files, config.trackedRoots))
     graph.updateEntry(ep.path, fHash, inputs.files, contentHash, protocolMajor,
                       inputs.externals)
     if saveDepGraph(graph, config):

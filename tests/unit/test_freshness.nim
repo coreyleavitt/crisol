@@ -28,6 +28,12 @@ import crisol/runner
 # Helpers
 # ---------------------------------------------------------------------------
 
+proc pairsOf(paths: seq[string]): seq[tuple[key: string; nativePath: string]] =
+  ## RFC-0009 A5a: closureContentHash now takes (key, nativePath) pairs.
+  ## Every path in the suite below is already absolute, so key == nativePath
+  ## — this preserves the pre-A5a behavior of chaining the given path itself.
+  for p in paths: result.add((key: p, nativePath: p))
+
 proc makeTmpConfig(root: string): Config =
   ## RFC-0009 A3c-ii: `trackedRoots` must be REAL (matching `root`), not the
   ## zero-value/vacuous root -- `decideCompile` (planner.nim) reconstructs
@@ -61,13 +67,14 @@ proc recordEntry(graph: var DepGraph; ep: Entrypoint; config: Config;
   ## member -- see planner.nim's `decideCompile`) -- NOT the raw absolute
   ## `closureFiles` strings -- or the hash could never match again.
   var closureSet = initHashSet[TrackedPath]()
-  var hashFiles: seq[string] = @[]
   for f in closureFiles:
     let pc = classify(f, config.trackedRoots)
     doAssert pc.kind == pcTracked, "test closure file failed to classify: " & f
     closureSet.incl pc.tp
-    hashFiles.add(if isProject(pc.tp): display(pc.tp) else: toNative(pc.tp, config.trackedRoots))
-  let contentHash = closureContentHash(hashFiles, config.projectRoot)
+  # RFC-0009 A5a: use the SAME `depgraph.closureHashInputs` derivation
+  # production's `recordClosure` uses — the record==recheck proof this
+  # suite exists to pin.
+  let contentHash = closureContentHash(closureHashInputs(closureSet, config.trackedRoots))
   let fHash = flagHash(ep.flags)
   graph.updateEntry(ep.path, fHash, closureSet, contentHash, protocolMajor)
 
@@ -85,8 +92,8 @@ suite "closureContentHash — stable and content-sensitive":
     let f2 = root / "b.nim"
     writeFile(f1, "# file a")
     writeFile(f2, "# file b")
-    let h1 = closureContentHash(@[f1, f2], root)
-    let h2 = closureContentHash(@[f1, f2], root)
+    let h1 = closureContentHash(pairsOf(@[f1, f2]))
+    let h2 = closureContentHash(pairsOf(@[f1, f2]))
     check h1 == h2
 
   test "order of files does not matter (sorted internally)":
@@ -97,8 +104,8 @@ suite "closureContentHash — stable and content-sensitive":
     let f2 = root / "b.nim"
     writeFile(f1, "# aaa")
     writeFile(f2, "# bbb")
-    let h1 = closureContentHash(@[f1, f2], root)
-    let h2 = closureContentHash(@[f2, f1], root)
+    let h1 = closureContentHash(pairsOf(@[f1, f2]))
+    let h2 = closureContentHash(pairsOf(@[f2, f1]))
     check h1 == h2
 
   test "changing file content → different hash":
@@ -107,9 +114,9 @@ suite "closureContentHash — stable and content-sensitive":
     defer: removeDir(root)
     let f1 = root / "a.nim"
     writeFile(f1, "# original")
-    let hBefore = closureContentHash(@[f1], root)
+    let hBefore = closureContentHash(pairsOf(@[f1]))
     writeFile(f1, "# CHANGED")
-    let hAfter = closureContentHash(@[f1], root)
+    let hAfter = closureContentHash(pairsOf(@[f1]))
     check hBefore != hAfter
 
   test "empty file list → all-zeros or at least consistent":
@@ -117,8 +124,8 @@ suite "closureContentHash — stable and content-sensitive":
     let root = getTempDir() / "crisol_freshness_hash4"
     createDir(root)
     defer: removeDir(root)
-    let h = closureContentHash(@[], root)
-    check h == closureContentHash(@[], root)
+    let h = closureContentHash(pairsOf(@[]))
+    check h == closureContentHash(pairsOf(@[]))
     check h.len == 16
 
   test "16 hex chars output":
@@ -127,7 +134,7 @@ suite "closureContentHash — stable and content-sensitive":
     defer: removeDir(root)
     let f = root / "x.nim"
     writeFile(f, "hello")
-    let h = closureContentHash(@[f], root)
+    let h = closureContentHash(pairsOf(@[f]))
     check h.len == 16
     for c in h:
       check c in {'0'..'9', 'a'..'f'}

@@ -214,7 +214,7 @@ proc decideCompile*(ep: Entrypoint;
   var computedHash: string
   try:
     computedHash = closureContentHash(
-      closureHashInputs(entry.closure, roots), config.projectRoot)
+      closureHashInputs(entry.closure, roots))
   except CatchableError:
     return (cdStale, "could not read closure files for content hash")
 

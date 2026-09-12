@@ -25,6 +25,12 @@
 import std/[os, sets]
 import crisol/depgraph
 
+proc pairsOf(paths: seq[string]): seq[tuple[key: string; nativePath: string]] =
+  ## RFC-0009 A5a: closureContentHash now takes (key, nativePath) pairs.
+  ## Every path in this file is already absolute, so key == nativePath —
+  ## this preserves the pre-A5a behavior of chaining the given path itself.
+  for p in paths: result.add((key: p, nativePath: p))
+
 block test_r6_identical_content_files_detected:
   ## Two files with identical content: old XOR scheme gives 0 XOR 0 = 0.
   ## If both change to another identical content, old hash is same (0 again).
@@ -38,12 +44,12 @@ block test_r6_identical_content_files_detected:
   writeFile(fa, "# same content")
   writeFile(fb, "# same content")
 
-  let h1 = closureContentHash(@[fa, fb], root)
+  let h1 = closureContentHash(pairsOf(@[fa, fb]))
   # Both files have identical content. The hash must still distinguish this
   # set from a set with different paths (by being path-sensitive).
   # At minimum, the hash must be 16 hex chars and deterministic.
   assert h1.len == 16, "hash must be 16 chars"
-  let h2 = closureContentHash(@[fa, fb], root)
+  let h2 = closureContentHash(pairsOf(@[fa, fb]))
   assert h1 == h2, "hash must be deterministic"
 
 block test_r6_content_swap_detected:
@@ -59,13 +65,13 @@ block test_r6_content_swap_detected:
   writeFile(fa, "# content X")
   writeFile(fb, "# content Y")
 
-  let hBefore = closureContentHash(@[fa, fb], root)
+  let hBefore = closureContentHash(pairsOf(@[fa, fb]))
 
   # Swap contents
   writeFile(fa, "# content Y")
   writeFile(fb, "# content X")
 
-  let hAfter = closureContentHash(@[fa, fb], root)
+  let hAfter = closureContentHash(pairsOf(@[fa, fb]))
 
   assert hBefore != hAfter,
     "R6: swapping file contents between two files must change the hash " &
@@ -87,8 +93,8 @@ block test_r6_identical_content_no_cancellation:
   writeFile(fb, "# same")
   writeFile(fc, "# same")
 
-  let h2 = closureContentHash(@[fa, fb], root)
-  let h3 = closureContentHash(@[fa, fb, fc], root)
+  let h2 = closureContentHash(pairsOf(@[fa, fb]))
+  let h3 = closureContentHash(pairsOf(@[fa, fb, fc]))
 
   assert h2 != h3,
     "R6: adding a third file with identical content must change the hash"
@@ -105,8 +111,8 @@ block test_r6_order_still_deterministic:
   writeFile(fa, "# aaa")
   writeFile(fb, "# bbb")
 
-  let h1 = closureContentHash(@[fa, fb], root)
-  let h2 = closureContentHash(@[fb, fa], root)  # reversed order
+  let h1 = closureContentHash(pairsOf(@[fa, fb]))
+  let h2 = closureContentHash(pairsOf(@[fb, fa]))  # reversed order
   assert h1 == h2,
     "R6: same set of files in different order must give same hash (sort-invariant)"
 
@@ -121,9 +127,9 @@ block test_r6_changing_one_file_detected:
   writeFile(fa, "# original A")
   writeFile(fb, "# original B")
 
-  let hBefore = closureContentHash(@[fa, fb], root)
+  let hBefore = closureContentHash(pairsOf(@[fa, fb]))
   writeFile(fa, "# CHANGED A")
-  let hAfter = closureContentHash(@[fa, fb], root)
+  let hAfter = closureContentHash(pairsOf(@[fa, fb]))
 
   assert hBefore != hAfter,
     "R6: changing one file's content must change the combined hash"

@@ -27,27 +27,29 @@
 ##                path, never hand-typed independently (R3-29's "don't let
 ##                shared plumbing cancel out" rule).
 ##
-## LITERAL byte-pins vs. VENDORED-reference compute-at-runtime (RFC-0009
-## A0 bullet, round-3 R3-29):
+## LITERAL byte-pins (RFC-0009 A0 bullet, round-3 R3-29; flipped fully to
+## literal pins at A5a):
 ##
 ##   - `simple`/`maxdepth` vectors are path-RELATIVE: `identityKey`,
 ##     `planner.slug`, `cachelocalfs.sidecarPath`, and
-##     `fnv.chainedContentHash` are genuinely host-invariant today, so
-##     they are LITERAL byte-pins below.
-##   - the `deproot` vector's `chainedContentHash` chains the depRoot
-##     member's ABSOLUTE native path (`fnv.nim:68`'s fall-through case),
-##     which embeds the checkout location — NOT host-invariant. Its
-##     golden check is instead "production's live output equals a FROZEN,
-##     vendored reference implementation's output on the SAME raw inputs"
-##     (`tests/support/rfc9_vendored_reference.nim`) — a preservation
-##     oracle, not a literal pin. `identityKey`/`planner.slug`/`flagHash`
-##     for the SAME depRoot-vector entrypoint are also routed through the
-##     vendored reference (not literal-pinned), per the RFC bullet's exact
-##     wording, even though these three do not themselves touch the
-##     depRoot member's absolute path (only `chainedContentHash` does) —
-##     keeping every vector for this one fixture on the same "compute
-##     against the frozen reference" footing avoids a mixed convention
-##     that would obscure which half of a fixture is host-invariant.
+##     `fnv.chainedContentHash` are genuinely host-invariant, so they are
+##     LITERAL byte-pins below.
+##   - the `deproot` vector's `chainedContentHash` USED TO chain the
+##     depRoot member's ABSOLUTE native path directly (pre-A5a), which
+##     embedded the checkout location — NOT host-invariant, so its golden
+##     check was "production's live output equals a FROZEN, vendored
+##     reference implementation's output on the SAME raw inputs"
+##     (`tests/support/rfc9_vendored_reference.nim`), a preservation oracle
+##     rather than a literal pin. RFC-0009 A5a reworked the hash to chain
+##     the PORTABLE `keyBytes` spelling instead (a dep-root member's key is
+##     now `"dep:name/rel"`, never the absolute path) while still reading
+##     file content from the absolute native path — so the resulting hash
+##     is host-invariant too. The `deproot` vector (and its
+##     `identityKey`/`planner.slug`/`flagHash` siblings, which never
+##     touched the depRoot member's absolute path even pre-A5a) are now
+##     LITERAL byte-pins like every other vector here, and
+##     `rfc9_vendored_reference.nim` — whose own doc comment scoped it to
+##     "A1 through A4b ONLY" — has been deleted.
 ##
 ## `soundnessKey` (RFC-0009 A0 bullet): embeds `nimVersion`/`ccVersion`,
 ## so a REAL run's key is valid only inside the pinned container leg
@@ -80,7 +82,6 @@ import crisol/depgraph
 import crisol/config
 import crisol/runner
 import crisol/process/types as ptypes
-import "../support/rfc9_vendored_reference"
 
 # ---------------------------------------------------------------------------
 # Fixture locations
@@ -151,11 +152,11 @@ suite "rfc9_golden_pin — cachelocalfs.sidecarPath literal byte-pins":
 suite "rfc9_golden_pin — fnv.chainedContentHash literal byte-pins":
 
   test "simple: single relative file, real committed content":
-    check fnv.chainedContentHash(@[simplePath], simpleFixtureRoot) ==
+    check fnv.chainedContentHash(@[(key: simplePath, nativePath: simpleFixtureRoot / simplePath)]) ==
       "e8db44ccb4e1f06f"
 
   test "maxdepth: single relative file ten dirs deep, real committed content":
-    check fnv.chainedContentHash(@[deepPath], maxdepthFixtureRoot) ==
+    check fnv.chainedContentHash(@[(key: deepPath, nativePath: maxdepthFixtureRoot / deepPath)]) ==
       "406ac69776627725"
 
 # ===========================================================================
@@ -182,8 +183,9 @@ suite "rfc9_golden_pin — soundnessKey literal byte-pin (synthetic inputs)":
     check $soundnessKey(inp) == "1d5ba6892b56015d"
 
 # ===========================================================================
-# 6. depRoot vector — vendored-reference compute-at-runtime, NOT a literal
-#    pin (RFC-0009 A0 bullet, round-3 R3-29).
+# 6. depRoot vector — literal byte-pins (RFC-0009 A5a flipped this from the
+#    pre-A5a vendored-reference compute-at-runtime oracle; see module doc
+#    comment).
 #
 # Drives PRODUCTION `closure.extractClosure` over a hand-written nimcache
 # manifest (test_soundness_r7.nim's convention) whose `depfiles` array
@@ -221,7 +223,7 @@ proc writeDeprootManifest(nimcacheDir, bname, epAbs, depMemberAbs: string) =
   createDir(nimcacheDir)
   writeFile(nimcacheDir / bname & ".json", $node)
 
-suite "rfc9_golden_pin — depRoot vector (vendored reference, compute-at-runtime)":
+suite "rfc9_golden_pin — depRoot vector (literal byte-pins, RFC-0009 A5a)":
 
   test "closure member outside projectRoot is carried as an absolute native path (fnv.nim:68 fall-through)":
     let epAbs = deprootProjectRoot / "tests" / "ep_with_dep.nim"
@@ -256,37 +258,37 @@ suite "rfc9_golden_pin — depRoot vector (vendored reference, compute-at-runtim
     check depMemberClass.tp in closureSet
     check depMemberAbs.isAbsolute
 
-    # chainedContentHash's inputs are derived identically to
-    # `depgraph.recordClosure`'s own derivation — the canonical
-    # TrackedPath->string spelling for hashing (project member: `display`;
-    # dep-root member: `toNative`).
+    # RFC-0009 A5a: chainedContentHash's inputs are `closureHashInputs`'
+    # (key, nativePath) pairs — `key` is `keyBytes(tp, roots)` (project
+    # member: byte-identical to the pre-A5a `display`; dep-root member: the
+    # portable "dep:name/rel" spelling, chained into the hash instead of
+    # `toNative`'s absolute path), `nativePath` is always `toNative(tp,
+    # roots)` (content is still read from the absolute path).
     let filesSeq = closureHashInputs(closureSet, cfg.trackedRoots)
 
-    # chainedContentHash: cannot be a literal pin (embeds the checkout
-    # location via depMemberAbs) — compare production's live output
-    # against the frozen vendored reference's output on the SAME raw
-    # `filesSeq`/`projectRoot` inputs instead.
-    let prodHash = fnv.chainedContentHash(filesSeq, cfg.projectRoot)
-    let vendHash = rfc9_vendored_reference.chainedContentHash(filesSeq, cfg.projectRoot)
-    check prodHash == vendHash
+    # chainedContentHash: NOW a literal pin. Pre-A5a this could only be
+    # checked against a frozen vendored reference (the chained key was
+    # `depMemberAbs`, which embeds the checkout location). Post-A5a the
+    # chained key is the portable "dep:dep/member.nim" spelling — the hash
+    # no longer depends on where this checkout lives, so it is
+    # host-invariant and can be pinned like the simple/maxdepth vectors.
+    let prodHash = fnv.chainedContentHash(filesSeq)
+    check prodHash == "b1d7296eb81f3100"
     check prodHash.len == 16  # sanity: a real 16-hex-char digest, not "" / a crash value
 
-    # identityKey/slug/flagHash for this SAME entrypoint, also routed
-    # through the vendored reference rather than literal-pinned (RFC-0009
-    # A0 bullet's exact wording — see module doc comment for why, even
-    # though these three don't themselves touch the depRoot member).
+    # identityKey/slug/flagHash for this SAME entrypoint. These never
+    # touched the depRoot member's absolute path even pre-A5a (see module
+    # doc comment) — now that the vendored reference is retired (A5a),
+    # they are literal-pinned directly like every other vector here.
     let flags = @["--define:rfc9dep"]
     let prodFH = depgraph.flagHash(flags)
-    let vendFH = rfc9_vendored_reference.flagHash(flags)
-    check prodFH == vendFH
+    check prodFH == "1a176d1243dc2823"
 
     let prodIK = keys.identityKey("tests/ep_with_dep.nim", prodFH)
-    let vendIK = rfc9_vendored_reference.identityKey("tests/ep_with_dep.nim", vendFH)
-    check $prodIK == vendIK
+    check $prodIK == "20b5e9ee2fd4be01"
 
     let prodSlug = planner.slug("tests/ep_with_dep.nim", flags)
-    let vendSlug = rfc9_vendored_reference.slug("tests/ep_with_dep.nim", flags)
-    check prodSlug == vendSlug
+    check prodSlug == "tests__ep_with_dep__nim-3ec54c3652c17ed3"
 
 # ===========================================================================
 # 7. One fixture run's actual on-disk cache slugs — a REAL `execute()` over

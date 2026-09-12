@@ -15,7 +15,7 @@
 ## `crisol/depgraph` (which itself imports `crisol/closure` — a cycle); it
 ## imports this module instead.
 
-import std/[algorithm, os]
+import std/algorithm
 
 const fnvOffset64* = 0xcbf29ce484222325'u64
   ## FNV-1a 64-bit offset basis.
@@ -38,37 +38,50 @@ proc toHex16*(v: uint64): string =
     result[i] = hexChars[x and 0xf]
     x = x shr 4
 
-proc chainedContentHash*(files: seq[string]; projectRoot: string): string =
-  ## Compute a stable 64-bit FNV-1a hash over the CONTENTS of all `files`.
+proc chainedContentHash*(pairs: seq[tuple[key: string; nativePath: string]]): string =
+  ## Compute a stable 64-bit FNV-1a hash over the CONTENTS of all `pairs`.
   ##
-  ## Algorithm: iterate over sorted(files); for each file, chain the running hash
-  ## through both the relative path AND the file content using FNV-1a:
-  ##   running = fnv1a64(toHex16(running) & "\x00" & relPath & "\x00" & content)
+  ## RFC-0009 A5a: the CHAINED path component is now the PORTABLE `key`
+  ## (a project member's project-root-relative spelling, or a dep-root
+  ## member's `dep:name/rel` spelling — see `crisol/paths.keyBytes`), never
+  ## the machine-local absolute path. Content is still read from
+  ## `nativePath` — the absolute, already-resolved path — so a project-only
+  ## closure hashes BYTE-IDENTICAL to before this change (its `key` is the
+  ## same relative spelling the old `relPath` was), while a dep-root
+  ## member's hash becomes host-portable (its `key` no longer embeds the
+  ## checkout location).
+  ##
+  ## Algorithm: iterate over `pairs` sorted by `key`; for each pair, chain
+  ## the running hash through both `key` AND the file content (read from
+  ## `nativePath`) using FNV-1a:
+  ##   running = fnv1a64(toHex16(running) & "\x00" & key & "\x00" & content)
   ##
   ## Properties:
-  ##   - Order-independent for the same set (files are sorted before hashing).
-  ##   - Position-sensitive AND path-sensitive: swapping file contents between two
-  ##     paths changes the hash (R6 fix vs the old XOR scheme which is commutative
-  ##     and self-cancelling).
-  ##   - Non-self-cancelling: two files with identical content are distinguished by
-  ##     their paths.
+  ##   - Order-independent for the same set (pairs are sorted by `key`
+  ##     before hashing — never by `nativePath`, which is not portable).
+  ##   - Position-sensitive AND key-sensitive: swapping file contents
+  ##     between two keys changes the hash (R6 fix vs the old XOR scheme
+  ##     which is commutative and self-cancelling).
+  ##   - Non-self-cancelling: two files with identical content are
+  ##     distinguished by their keys.
   ##
   ## Parameters:
-  ##   `files`       — seq of project-root-relative file paths (sorted internally)
-  ##   `projectRoot` — absolute path to project root for resolving relative paths
+  ##   `pairs` — seq of (key, nativePath): `key` is the portable spelling to
+  ##             chain into the hash; `nativePath` is the ABSOLUTE native
+  ##             path content is read from (no projectRoot resolution
+  ##             happens here — the caller hands over an already-resolved
+  ##             absolute path).
   ##
-  ## Returns 16 lower-case hex chars (or all-zeros string if files is empty).
+  ## Returns 16 lower-case hex chars (or all-zeros string if pairs is empty).
   ##
   ## Raises OSError/IOError if any file cannot be read.
-  var sorted = files
-  sorted.sort()
+  var sorted = pairs
+  sorted.sort(proc(a, b: tuple[key: string; nativePath: string]): int =
+    cmp(a.key, b.key))
   var running: uint64 = fnvOffset64  # start from FNV offset (not 0) for non-trivial empty case
-  for relPath in sorted:
-    let absPath =
-      if relPath.isAbsolute: relPath
-      else: projectRoot / relPath
-    let content = readFile(absPath)
-    # Chain: mix running hash value, path, and content together.
+  for pair in sorted:
+    let content = readFile(pair.nativePath)
+    # Chain: mix running hash value, portable key, and content together.
     # This makes the result sensitive to both WHICH file changed AND WHAT its content is.
-    running = fnv1a64(toHex16(running) & "\x00" & relPath & "\x00" & content)
+    running = fnv1a64(toHex16(running) & "\x00" & pair.key & "\x00" & content)
   result = toHex16(running)
