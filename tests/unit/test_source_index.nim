@@ -450,9 +450,26 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
                      depRoots: @[depRootPath])
     cfg.trackedRoots = initTrackedRoots(root, @[(name: "dep", native: depRootPath)], ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    let expectedDepMember = depRootPath.absolutePath.normalizedPath / "src" / "dep.nim"
-    check expectedDepMember in cl
-    check cl == toHashSet(["tests/t.nim", expectedDepMember])
+    # RFC-0009 A4a: the symlinked-depRoot member is RETAINED — that retention
+    # is the soundness property this test proves (a realpath through a
+    # symlinked dep root is kept, not dropped by the under-root filter). Its
+    # exact SPELLING is platform-dependent and deliberately NOT pinned:
+    #   - where the realpath-relative @m candidate keeps the volume's real
+    #     prefix, it matches the dep root's realAbs directly and spells
+    #     dep-absolute (via toNative) — e.g. the Linux temp volume.
+    #   - where the volume expands a symlinked temp prefix (macOS
+    #     /var → /private/var, [[rfc0009-macos-test-gotchas]]), the lexical
+    #     candidate misses realAbs, so the member is recovered through the
+    #     index as its under-project symlink path and spells project-relative.
+    # Both are correct retentions; asserting one absolute spelling is
+    # volume-dependent and fails on macOS. Assert retention volume-independently.
+    check "tests/t.nim" in cl
+    check cl.len == 2
+    var depMember = ""
+    for m in cl:
+      if m != "tests/t.nim": depMember = m
+    check depMember.len > 0
+    check depMember.endsWith("dep/src/dep.nim")
 
   test "negative pin: an in-root @m body is NOT unioned against the index — a same-basename decoy elsewhere is never selected":
     ## The fallback (index.lookup for an @m body) is gated on the plain
