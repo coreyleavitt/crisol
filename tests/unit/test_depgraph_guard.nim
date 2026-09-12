@@ -66,6 +66,22 @@ proc graphRoot(tag: string): string =
   removeDir(result)
   createDir(result / ".crisol")
 
+proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): FoldPolicy =
+  ## RFC-0009 A3c-i: inject a FIXED policy for every root, bypassing the
+  ## real OS probe entirely (see MEMORY: never hardcode `foldPolicy ==
+  ## fpNone` against the real probe — this dev container is case-sensitive
+  ## ext4, so a real probe never returns fpAsciiLower locally). Mirrors
+  ## tests/unit/test_paths.nim's own `fixedProbe`.
+  result = proc (rootAbs, stateDir: string): FoldPolicy = policy
+
+proc probeByHint(hint: string; hintPolicy, otherPolicy: FoldPolicy): proc (rootAbs, stateDir: string): FoldPolicy =
+  ## Inject DIFFERING policies per root, discriminated by a substring of the
+  ## root's native path (`hint`) — lets one test prove the project root and
+  ## a dep root each keep their OWN persisted policy, without depending on
+  ## call order.
+  result = proc (rootAbs, stateDir: string): FoldPolicy =
+    if hint in rootAbs: hintPolicy else: otherPolicy
+
 suite "depgraph load guards (issue #5 migration)":
 
   test "a formatVersion-2 graph (written by the compile-array extractor) loads as empty":
@@ -469,3 +485,70 @@ suite "depgraph load provenance: discarded persisted graph":
       stored: "unreadable: cannot open: /tmp/a|b/depgraph")
     check "a|b" in d.message
     check "unreadable: cannot open: /tmp/a|b/depgraph" in d.message
+
+  test "RFC-0009 A3c-i: root descriptor (project + one named dep, each with its own injected foldPolicy) round-trips byte-for-byte through save/loadStoredDepGraph":
+    let root = graphRoot("roots_roundtrip")
+    defer: removeDir(root)
+    let depNative = root / "depdir"
+    createDir(depNative)
+
+    var cfg = Config(projectRoot: root, stateDir: ".crisol")
+    cfg.trackedRoots = initTrackedRoots(root, @[("mydep", depNative)], ".crisol",
+                                        probeByHint("depdir", fpAsciiLower, fpNone))
+    check cfg.trackedRoots.project.foldPolicy == fpNone
+    check cfg.trackedRoots.deps[0].foldPolicy == fpAsciiLower
+
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    doAssert saveDepGraph(g, cfg)
+
+    var d: DepGraphDiscard
+    let loaded = loadStoredDepGraph(cfg, d)
+    check d.kind == dgdNone
+    check loaded.header.roots.len == 2
+    check loaded.header.roots[0] == (tag: 0, name: "", foldPolicy: fpNone)
+    check loaded.header.roots[1] == (tag: 1, name: "mydep", foldPolicy: fpAsciiLower)
+
+  test "RFC-0009 A3c-i: loadDepGraph discards as absent when a persisted root NAME is unknown to the current roots (dgdRootUnknown)":
+    let root = graphRoot("root_unknown")
+    defer: removeDir(root)
+    var cfgWrite = Config(projectRoot: root, stateDir: ".crisol")
+    cfgWrite.trackedRoots = initTrackedRoots(root, @[("gonedep", root / "gonedep")], ".crisol",
+                                             fixedProbe(fpNone))
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    doAssert saveDepGraph(g, cfgWrite)
+
+    var cfgRead = Config(projectRoot: root, stateDir: ".crisol")
+    cfgRead.trackedRoots = initTrackedRoots(root, @[], ".crisol", fixedProbe(fpNone))
+
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfgRead, "2.2.10", d)
+    check loaded.entries.len == 0
+    check d.kind == dgdRootUnknown
+    check d.key == "rootUnknown"
+    check d.stored == "gonedep"
+    check "gonedep" in d.message
+
+  test "RFC-0009 A3c-i: loadDepGraph discards as absent on a foldPolicy mismatch for a name that still resolves (dgdFoldMismatch), never compared cross-policy":
+    let root = graphRoot("fold_mismatch")
+    defer: removeDir(root)
+    var cfgWrite = Config(projectRoot: root, stateDir: ".crisol")
+    cfgWrite.trackedRoots = initTrackedRoots(root, @[], ".crisol", fixedProbe(fpNone))
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), toHashSet(["tests/t.nim"]), "h", 1)
+    doAssert saveDepGraph(g, cfgWrite)
+
+    # Same root NAME ("" — the project root), a DIFFERENT injected policy —
+    # never a live fold-class collision, just the injected values disagreeing.
+    var cfgRead = Config(projectRoot: root, stateDir: ".crisol")
+    cfgRead.trackedRoots = initTrackedRoots(root, @[], ".crisol", fixedProbe(fpAsciiLower))
+
+    var d: DepGraphDiscard
+    let loaded = loadDepGraph(cfgRead, "2.2.10", d)
+    check loaded.entries.len == 0
+    check d.kind == dgdFoldMismatch
+    check d.key == "foldMismatch"
+    check d.stored == "fpNone"
+    check d.current == "fpAsciiLower"
+    check "depgraph discarded" in d.message

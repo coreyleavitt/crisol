@@ -268,7 +268,7 @@ suite "extractCompileInputs — cc -M probe failure":
 # 6-7: depgraph externals — round-trip + M10 load guard
 # ---------------------------------------------------------------------------
 
-suite "depgraph — externals round-trip (issue #16, format 5)":
+suite "depgraph — externals round-trip (issue #16)":
 
   test "updateEntry with two unsorted externals (unsorted headers) round-trips sorted through save/loadStoredDepGraph":
     let root = freshRoot("dg_roundtrip")
@@ -294,12 +294,12 @@ suite "depgraph — externals round-trip (issue #16, format 5)":
 
     let raw = readFile(depgraphPath(cfg))
     let node = parseJson(raw)
-    check node["header"]["formatVersion"].getInt() == 5
+    check node["header"]["formatVersion"].getInt() == DepGraphFormatVersion
 
     var discarded: DepGraphDiscard
     let loaded = loadStoredDepGraph(cfg, discarded)
     check discarded.kind == dgdNone
-    check loaded.header.formatVersion == 5
+    check loaded.header.formatVersion == DepGraphFormatVersion
 
     let entry = loaded.entries[(path, fh)]
     check entry.externals.len == 2

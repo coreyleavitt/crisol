@@ -11,7 +11,15 @@
 ## {
 ##   "header": {
 ##     "nimVersion":     "<string>",   -- e.g. "2.2.10"
-##     "formatVersion":  <int>         -- DepGraphFormatVersion
+##     "formatVersion":  <int>,        -- DepGraphFormatVersion
+##     "roots": [                      -- RFC-0009 A3c-i: this file's OWN local
+##       {                             -- tag->name assignment, never a bare
+##         "tag":        <int>,        -- ordinal (a config dep-order edit could
+##         "name":       "<string>",   -- otherwise silently rebind an old tag to
+##         "foldPolicy": "<string>"    -- the wrong root). "" name = project root
+##       },                            -- (tag 0); "fpNone"/"fpAsciiLower" =
+##       ...                          -- that root's PROBED FoldPolicy at the
+##     ]                              -- time this file was last saved.
 ##   },
 ##   "entries": [
 ##     {
@@ -41,6 +49,15 @@
 ## - **Absent entry**: `isEntryStale` returns true.
 ## - **Deleted-entrypoint GC**: `gcDeletedEntrypoints` drops keys absent from the
 ##   provided current-entrypoint set.
+## - **Unknown root name** (header, RFC-0009 A3c-i): a persisted `roots` entry
+##   whose `name` does not resolve against the CURRENT `config.trackedRoots`
+##   (a renamed/removed dep root) → whole graph → empty (treat as absent).
+##   `loadDepGraph`-only, exactly like the nimVersion mismatch above — this is
+##   depgraph-HEADER validity, never a cache/ledger version concern (§4).
+## - **FoldPolicy mismatch for a name that still resolves** (header,
+##   RFC-0009 A3c-i): the persisted `foldPolicy` for a root name differs from
+##   that root's CURRENT probed policy → whole graph → empty (treat as
+##   absent), never compared cross-policy. `loadDepGraph`-only.
 ##
 ## ## Two loaders — stored vs. freshness view (issue #12)
 ##
@@ -107,11 +124,21 @@ export fnv
 # Constants
 # ---------------------------------------------------------------------------
 
-const DepGraphFormatVersion* = 5
+const DepGraphFormatVersion* = 6
   ## Increment this when the JSON schema changes in an incompatible way.
   ## A loaded file with a different formatVersion is treated as absent.
   ##
   ## History:
+  ##   6 — RFC-0009 A3c-i: the header gains `roots` — this file's own local
+  ##       tag->name table, and each named root's probed `foldPolicy` at save
+  ##       time (`DepGraphHeader.roots`; never a bare ordinal — see the type
+  ##       doc). A v5 file has no such table; upgrading it in place would
+  ##       leave every one of its entries permanently exempt from the new
+  ##       root-name/foldPolicy validity check `loadDepGraph` now performs
+  ##       (see "Invalidation rules", above) — indistinguishable from a
+  ##       config that genuinely has no dep roots. The bump discards the
+  ##       graph once (a one-time full recompile) rather than serve or
+  ##       migrate it, exactly like every prior bump below.
   ##   5 — issue #16: a `{.compile.}`d external's `#include`d headers are
   ##       tracked compile inputs. `DepGraphEntry` gains `externals` (one
   ##       `closure.ExternalSource` per single-path external: its source
@@ -151,6 +178,32 @@ type
   DepGraphHeader* = object
     nimVersion*:    string  ## Nim version string (e.g. "2.2.10")
     formatVersion*: int     ## DepGraphFormatVersion
+    roots*: seq[tuple[tag: int; name: string; foldPolicy: FoldPolicy]]
+      ## RFC-0009 A3c-i: this FILE's own local tag->name assignment, one
+      ## record per root tracked when the graph was last saved — project
+      ## root first (`tag: 0`, `name: ""`), then each configured dep root in
+      ## `TrackedRoots` order (`tag: 1..N`). Never a bare ordinal without its
+      ## name: a config dep-order edit would otherwise silently rebind an
+      ## old tag to the wrong root on the next load. `foldPolicy` is that
+      ## root's own PROBED policy at save time (never re-derived from the
+      ## in-memory value later — see `saveDepGraph`, the sole producer).
+      ##
+      ## Populated at SAVE time from `config.trackedRoots` (`saveDepGraph`),
+      ## not at construction (`initDepGraph` has no `Config` to source it
+      ## from) — every real on-disk file therefore always carries the roots
+      ## as of its last write; an in-memory graph between load and save may
+      ## carry a stale or empty `roots` inherited from disk, which is
+      ## harmless (nothing reads this field except the save path that is
+      ## about to overwrite it, and the load-time validation below, which
+      ## only ever runs against the just-loaded, on-disk value).
+      ##
+      ## Consumed at load time by `loadDepGraph` (never `loadStoredDepGraph`
+      ## — this is depgraph-header validity, not a cache/ledger version
+      ## concern, §4): each entry's `name` is looked up against the CURRENT
+      ## `config.trackedRoots`; an unresolvable name (`dgdRootUnknown`) or a
+      ## `foldPolicy` that resolves but disagrees with the current probe
+      ## (`dgdFoldMismatch`) discards the whole graph as absent, never
+      ## compared cross-policy.
 
   DepGraphEntry* = object
     closure*:       HashSet[string]
@@ -185,12 +238,23 @@ type
     dgdNimVersion     ## header.nimVersion != current compiler fingerprint
     dgdFormatVersion  ## header.formatVersion != DepGraphFormatVersion
     dgdMalformed      ## file present but unreadable, unparseable, or an unexpected shape
+    dgdRootUnknown    ## RFC-0009 A3c-i: a persisted header root NAME does not
+                      ## resolve against the CURRENT config.trackedRoots (a
+                      ## renamed/removed dep root) — `loadDepGraph` only,
+                      ## never `loadStoredDepGraph` (depgraph-header
+                      ## validity, not a cache/ledger version concern, §4).
+    dgdFoldMismatch   ## RFC-0009 A3c-i: a persisted header root NAME still
+                      ## resolves, but its persisted `foldPolicy` disagrees
+                      ## with that root's CURRENT probed policy — never
+                      ## compared cross-policy. `loadDepGraph` only.
 
   DepGraphDiscard* = object
     ## Load-time provenance of a discard decision: WHY a persisted graph was
     ## discarded (kind == dgdNone when nothing was discarded), and the two
-    ## header values that disagreed (dgdNimVersion/dgdFormatVersion) or a
-    ## short reason (dgdMalformed, in `stored`; `current` unused). Deliberately
+    ## header values that disagreed (dgdNimVersion/dgdFormatVersion/
+    ## dgdFoldMismatch) or a short reason (dgdMalformed / dgdRootUnknown's
+    ## offending root name, both in `stored`; `current` unused for those
+    ## two). Deliberately
     ## NOT a field on `DepGraph` — `DepGraph` is otherwise the exact
     ## persistence mirror of the on-disk JSON, so stapling a load-time-only
     ## fact onto it would leave that fact's validity window (one
@@ -284,13 +348,15 @@ proc sanitizeHeaderField(s: string; pipeAware: bool = false): string =
 
 proc key*(d: DepGraphDiscard): string =
   ## ConfigWarning `key` for a discard: "nimVersion" / "formatVersion" /
-  ## "malformed" / "" (dgdNone). The single formatting authority for this
-  ## fact.
+  ## "malformed" / "rootUnknown" / "foldMismatch" / "" (dgdNone). The single
+  ## formatting authority for this fact.
   case d.kind
   of dgdNone:          ""
   of dgdNimVersion:    "nimVersion"
   of dgdFormatVersion: "formatVersion"
   of dgdMalformed:     "malformed"
+  of dgdRootUnknown:   "rootUnknown"
+  of dgdFoldMismatch:  "foldMismatch"
 
 proc message*(d: DepGraphDiscard): string =
   ## Human-readable diagnostic for a discard, or "" for dgdNone. The single
@@ -315,6 +381,15 @@ proc message*(d: DepGraphDiscard): string =
     "depgraph discarded: unreadable or malformed (" &
     sanitizeHeaderField(d.stored) &
     ") -- the recorded graph is treated as empty"
+  of dgdRootUnknown:
+    "depgraph discarded: recorded root '" & sanitizeHeaderField(d.stored) &
+    "' is unknown to the current tracked roots -- the recorded graph is " &
+    "treated as empty (run recompiles and force-selects every entrypoint)"
+  of dgdFoldMismatch:
+    "depgraph discarded: recorded fold policy " & sanitizeHeaderField(d.stored) &
+    ", current probe is " & sanitizeHeaderField(d.current) &
+    " -- the recorded graph is treated as empty (run recompiles and " &
+    "force-selects every entrypoint)"
 
 # ---------------------------------------------------------------------------
 # Public: flagHash
@@ -506,6 +581,15 @@ proc toJson(graph: DepGraph): JsonNode =
   headerNode["nimVersion"]    = newJString(graph.header.nimVersion)
   headerNode["formatVersion"] = newJInt(graph.header.formatVersion)
 
+  let rootsArr = newJArray()
+  for r in graph.header.roots:
+    let rNode = newJObject()
+    rNode["tag"]        = newJInt(r.tag)
+    rNode["name"]       = newJString(r.name)
+    rNode["foldPolicy"] = newJString($r.foldPolicy)  ## "fpNone"/"fpAsciiLower"
+    rootsArr.add rNode
+  headerNode["roots"] = rootsArr
+
   let entriesArr = newJArray()
   for (key, entry) in graph.entries.pairs:
     let (path, fHash) = key
@@ -601,6 +685,48 @@ proc fromJson(node: JsonNode; discarded: var DepGraphDiscard): DepGraph =
   result.header.nimVersion    = storedNimVerStr
   result.header.formatVersion = DepGraphFormatVersion
 
+  # Parse header.roots (RFC-0009 A3c-i). OPTIONAL at this shape-validation
+  # layer -- absent (e.g. a hand-built fixture predating this field, or one
+  # that never touches the roots mechanism) parses as `@[]`, mirroring how
+  # `closureHash`/`protocolMajor`/`externals` are tolerated as absent on an
+  # entry, below. Every REAL file (`saveDepGraph`, the sole producer) always
+  # writes it non-empty (at minimum the project root, tag 0) -- an absent
+  # array here can only mean a hand-built document, never a genuinely
+  # persisted graph, so leniency costs nothing in production. If PRESENT,
+  # it must be well-formed: a malformed element is a fact about the stored
+  # bytes (dgdMalformed), not something a `loadDepGraph`-layer freshness
+  # judgment should paper over.
+  let rootsNode = headerNode{"roots"}
+  if rootsNode != nil:
+    if rootsNode.kind != JArray:
+      discarded = DepGraphDiscard(kind: dgdMalformed, stored: "header roots not an array")
+      return
+    var roots: seq[tuple[tag: int; name: string; foldPolicy: FoldPolicy]] = @[]
+    for rNode in rootsNode:
+      if rNode.kind != JObject:
+        discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root entry not an object")
+        return
+      let tagNode  = rNode{"tag"}
+      let nameNode = rNode{"name"}
+      let fpNode   = rNode{"foldPolicy"}
+      if tagNode == nil or tagNode.kind != JInt:
+        discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root missing/invalid tag")
+        return
+      if nameNode == nil or nameNode.kind != JString:
+        discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root missing/invalid name")
+        return
+      if fpNode == nil or fpNode.kind != JString:
+        discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root missing/invalid foldPolicy")
+        return
+      var fp: FoldPolicy
+      try:
+        fp = parseEnum[FoldPolicy](fpNode.getStr(""))
+      except ValueError:
+        discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root has unrecognized foldPolicy")
+        return
+      roots.add (tag: tagNode.getInt(0), name: nameNode.getStr(""), foldPolicy: fp)
+    result.header.roots = roots
+
   # Parse entries
   let entriesArr = node{"entries"}
   if entriesArr == nil:
@@ -669,9 +795,27 @@ proc depgraphPath*(config: Config): string =
   ## Absolute path to the depgraph file.
   stateDirOf(config) / "depgraph"
 
+proc rootsDescriptor(roots: TrackedRoots): seq[tuple[tag: int; name: string; foldPolicy: FoldPolicy]] =
+  ## RFC-0009 A3c-i: this file's own local tag->name table (`DepGraphHeader.
+  ## roots`) — project root first (`tag: 0`, `name: ""`), then each
+  ## configured dep root in `TrackedRoots` order (`tag: 1..N`), mirroring
+  ## `TrackedRoots`' own tagging (paths.nim §1) exactly.
+  result.add (tag: 0, name: roots.project.name, foldPolicy: roots.project.foldPolicy)
+  for i, d in roots.deps:
+    result.add (tag: i + 1, name: d.name, foldPolicy: d.foldPolicy)
+
 proc saveDepGraph*(graph: DepGraph; config: Config): bool =
   ## Write the graph to `<projectRoot>/<stateDir>/depgraph` atomically.
   ## Creates the state directory if absent.
+  ##
+  ## Stamps `header.roots` (RFC-0009 A3c-i) from `config.trackedRoots` — THIS
+  ## is the sourcing site for the root descriptor (not `initDepGraph`, which
+  ## has no `Config` to draw one from, and not `updateEntry`, which never
+  ## touches the header): every real save reflects the roots the entries
+  ## being written were computed against, exactly once, here. The `graph`
+  ## parameter (and whatever `header.roots` it happened to carry in memory,
+  ## e.g. inherited from a prior load) is left untouched; only the on-disk
+  ## bytes gain the freshly-derived descriptor.
   ##
   ## Returns `true` iff the graph was actually persisted (the final
   ## `moveFile` completed), `false` on ANY failure. Deliberately NOT
@@ -705,7 +849,9 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
                  "': " & e.msg & "\n")
     return false
 
-  let jsonStr = $toJson(graph)
+  var toWrite = graph
+  toWrite.header.roots = rootsDescriptor(config.trackedRoots)
+  let jsonStr = $toJson(toWrite)
   let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
     stderr.write("crisol: warning: could not write depgraph: " & err & "\n")
@@ -1036,6 +1182,31 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
                                 stored: stored.header.nimVersion,
                                 current: nimVersion)
     return initDepGraph(nimVersion)
+
+  # RFC-0009 A3c-i: depgraph-header validity for the root descriptor —
+  # NEVER a cache/ledger version concern (§4), so this lives only in the
+  # freshness loader, exactly like the nimVersion check above.  Each
+  # persisted root's NAME is resolved against the CURRENT
+  # `config.trackedRoots`: unresolvable (a renamed/removed dep root) →
+  # dgdRootUnknown; resolvable but a `foldPolicy` disagreement →
+  # dgdFoldMismatch (never compared cross-policy — see DepGraphHeader.roots).
+  proc currentFoldPolicy(name: string; ok: var bool): FoldPolicy =
+    ok = true
+    if name == "": return config.trackedRoots.project.foldPolicy
+    for d in config.trackedRoots.deps:
+      if d.name == name: return d.foldPolicy
+    ok = false
+
+  for r in stored.header.roots:
+    var resolved: bool
+    let cur = currentFoldPolicy(r.name, resolved)
+    if not resolved:
+      discarded = DepGraphDiscard(kind: dgdRootUnknown, stored: r.name)
+      return initDepGraph(nimVersion)
+    if cur != r.foldPolicy:
+      discarded = DepGraphDiscard(kind: dgdFoldMismatch,
+                                  stored: $r.foldPolicy, current: $cur)
+      return initDepGraph(nimVersion)
 
   stored.header.nimVersion = nimVersion
   result = stored
