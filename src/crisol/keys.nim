@@ -20,6 +20,10 @@ import std/tables
 import std/algorithm
 import crisol/types
 import crisol/depgraph   # re-uses fnv1a64, toHex16, fnvOffset64; never reimplement
+# RFC-0009 A5b-i: TrackedPath/TrackedRoots/keyBytes for the
+# identityKey(tp, roots, flagHash) overload below. No cycle: paths.nim
+# imports only std libs.
+import crisol/paths
 from crisol/process/types as ptypes import nil  ## qualified access to the
   ## §1 Limits/LimitKind shape (rfc-0007 A2a-iii) — house convention (see
   ## runner.nim/jsonout.nim/api.nim); NOT re-exported from crisol/types.
@@ -134,6 +138,15 @@ proc identityKey*(path: string; flagHash: string): IdentityKey =
   ## primary key across env/toolchain upgrades.
   var h = fnv1a64("\x00" & path & "\x00" & flagHash)
   result = IdentityKey(toHex16(h))
+
+proc identityKey*(tp: TrackedPath; roots: TrackedRoots; flagHash: string): IdentityKey =
+  ## RFC-0009 A5b-i: TrackedPath overload. Derives the path bytes via
+  ## `keyBytes` (project/tag-0 members get their bare `rel`; dep-root members
+  ## get `dep:<name>/rel`) rather than a raw native/display string. For a
+  ## tag-0 (project) `tp`, `keyBytes` returns exactly `tp.rel` — so this is
+  ## BYTE-IDENTICAL to the string overload for every entrypoint (entrypoints
+  ## are always tag-0).
+  identityKey(string(keyBytes(tp, roots)), flagHash)
 
 # ---------------------------------------------------------------------------
 # SoundnessKey derivation

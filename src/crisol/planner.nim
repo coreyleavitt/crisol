@@ -56,13 +56,34 @@ proc slug*(path: string; flags: seq[string]): string =
   let hash16 = toHex16(fnv1a64(hashInput))
   result = readablePrefix & "-" & hash16
 
+proc slug*(tp: TrackedPath; roots: TrackedRoots; flags: seq[string]): string =
+  ## RFC-0009 A5b-i: TrackedPath overload. Derives the WHOLE slug (readable
+  ## prefix AND hash) from `keyBytes(tp, roots)` rather than a raw native
+  ## path string, so the readable prefix and the hash can never disagree
+  ## about which root the entrypoint belongs to. Delegating to the string
+  ## overload with `keyBytes` as the path is byte-identical to it for
+  ## tag-0/project members (entrypoints are always tag-0).
+  slug(string(keyBytes(tp, roots)), flags)
+
+proc epSlug(ep: Entrypoint; roots: TrackedRoots): string =
+  ## RFC-0009 A5b-i: an entrypoint's slug from its TrackedPath IDENTITY when
+  ## populated (production — `discover` always sets `ep.tp`), falling back to
+  ## the string `ep.path` for a hand-built ep whose `tp` is the zero value.
+  ## This honors A3a-i's contract (hand-built fixtures do NOT set `tp` — the
+  ## producer obligation is `discover`'s alone), so a fixture ep never collapses
+  ## to a degenerate empty-`rel` slug (which would collide all such eps onto one
+  ## bin/cache dir). For a tag-0 entrypoint `keyBytes == rel == path`, so both
+  ## branches are byte-identical; the fallback only guards the zero-`tp` case.
+  if ep.tp.display().len > 0: slug(ep.tp, roots, ep.flags)
+  else:                       slug(ep.path, ep.flags)
+
 proc binName*(ep: Entrypoint): string =
   ## Basename of the compiled binary (no extension).
   ep.path.extractFilename().changeFileExt("")
 
 proc binPath*(ep: Entrypoint; config: Config): string =
   ## Absolute path to the directory containing the stable compiled binary.
-  stateDirOf(config) / "bin" / slug(ep.path, ep.flags)
+  stateDirOf(config) / "bin" / epSlug(ep, config.trackedRoots)
 
 proc toolchainFingerprint*(nimVersion: string; ccVersion: string): string =
   ## Short, stable fingerprint of the compiler toolchain (RFC-0006 nimcache-
@@ -103,9 +124,9 @@ proc cachePath*(ep: Entrypoint; config: Config; toolchainFp: string = ""): strin
   ## path shape (used by callers with no toolchain probe, e.g. `crisol clean`
   ## invoked without real nimVersion/ccVersion, and existing tests).
   let suffix = if toolchainFp.len > 0: "-" & toolchainFp else: ""
-  stateDirOf(config) / "cache" / (slug(ep.path, ep.flags) & suffix)
+  stateDirOf(config) / "cache" / (epSlug(ep, config.trackedRoots) & suffix)
 
-proc duplicateSlugs*(p: RunPlan): HashSet[string] =
+proc duplicateSlugs*(p: RunPlan; roots: TrackedRoots): HashSet[string] =
   ## Return the set of slugs that appear MORE THAN ONCE across `p`'s
   ## entrypoints — i.e. the same (path, flags) pair scheduled at ≥ 2 distinct
   ## plan positions in a single run.
@@ -119,7 +140,7 @@ proc duplicateSlugs*(p: RunPlan): HashSet[string] =
   ## concurrency-safe behavior ONLY where it's still needed).
   var seen = initHashSet[string]()
   for pep in p.entrypoints:
-    let s = slug(pep.ep.path, pep.ep.flags)
+    let s = epSlug(pep.ep, roots)
     if s in seen:
       result.incl s
     else:

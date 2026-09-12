@@ -127,34 +127,38 @@ suite "cachePath — stable per-entrypoint, toolchain-keyed":
 suite "duplicateSlugs — rare concurrent-duplicate detection":
 
   test "empty plan ⇒ empty set":
+    let cfg = mkCfg()
     let p = RunPlan(jobs: 1, entrypoints: @[])
-    check duplicateSlugs(p).len == 0
+    check duplicateSlugs(p, cfg.trackedRoots).len == 0
 
   test "all-unique plan ⇒ empty set (the common case)":
+    let cfg = mkCfg()
     let p = RunPlan(jobs: 2, entrypoints: @[
       mkPep(mkEp("tests/unit/test_a.nim")),
       mkPep(mkEp("tests/unit/test_b.nim")),
       mkPep(mkEp("tests/unit/test_c.nim")),
     ])
-    check duplicateSlugs(p).len == 0
+    check duplicateSlugs(p, cfg.trackedRoots).len == 0
 
   test "same (path, flags) appearing twice ⇒ its slug is reported":
+    let cfg = mkCfg()
     let epA = mkEp("tests/unit/test_a.nim")
     let p = RunPlan(jobs: 2, entrypoints: @[
       mkPep(epA),
       mkPep(mkEp("tests/unit/test_b.nim")),
       mkPep(epA),  # duplicate: same path+flags as the first entry
     ])
-    let dups = duplicateSlugs(p)
+    let dups = duplicateSlugs(p, cfg.trackedRoots)
     check slug(epA.path, epA.flags) in dups
     check dups.len == 1
 
   test "same path but DIFFERENT flags ⇒ NOT a duplicate (different slug)":
+    let cfg = mkCfg()
     let p = RunPlan(jobs: 2, entrypoints: @[
       mkPep(mkEp("tests/unit/test_a.nim", @["-d:release"])),
       mkPep(mkEp("tests/unit/test_a.nim", @["-d:debug"])),
     ])
-    check duplicateSlugs(p).len == 0
+    check duplicateSlugs(p, cfg.trackedRoots).len == 0
 
 when isMainModule:
   echo "nimcache-persistence pure invariants done."

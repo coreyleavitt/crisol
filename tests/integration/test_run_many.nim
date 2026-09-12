@@ -15,7 +15,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_run_many.nim
 
-import std/[options, os, unittest]
+import std/[options, os, unittest, tempfiles]
 import crisol/types
 import crisol/runner
 from crisol/process/types as ptypes import nil
@@ -31,6 +31,20 @@ proc fixtureDir(): string =
 
 proc mkEp(path: string): Entrypoint =
   Entrypoint(path: path, group: "test", flags: @[])
+
+proc isolatedStateDir(tag: string): string =
+  ## RFC-0009 A5b-i test hygiene: `plan()`'s `decideCompile` calls
+  ## `fileExists(binPath(ep, config) / binName(ep))`. A `Config` with no
+  ## `stateDir` resolves (via `stateDirOf`) to an empty string, so
+  ## `binPath`/`cachePath` collapse to a CWD-RELATIVE "bin"/"cache" — i.e.
+  ## the repo root when this suite runs under `./dev test`. An earlier test
+  ## file in the same `./dev test` invocation may have already compiled a
+  ## fixture into that same canonical (A5b-i TrackedPath-derived) slug's
+  ## `./bin/<slug>`, which makes THIS suite observe `edStale` instead of the
+  ## `edNeverBuilt` it asserts against an empty graph. Give every `Config`
+  ## its own fresh, isolated, ABSOLUTE stateDir so binPath/cachePath can
+  ## never collide with repo-root pollution from any other test.
+  createTempDir("crisol_runmany_ann_" & tag & "_", "")
 
 ## rfc-0007 A1e-i: EntrypointResult.outcome is gone — outcome(r) derives from
 ## compile/run Phase. These helpers build a hand-fixture Phase pair for the
@@ -64,7 +78,9 @@ proc crashedResult(ep: Entrypoint): EntrypointResult =
 suite "plan — pure annotation of compile decisions":
 
   test "all entrypoints annotated cdNeverBuilt with empty graph":
-    let cfg = Config(jobs: 0)   # jobs=0 → resolved to max(1, cpu-2) by plan() (A4)
+    let sd = isolatedStateDir("a")
+    defer: removeDir(sd)
+    let cfg = Config(jobs: 0, stateDir: sd)   # jobs=0 → resolved to max(1, cpu-2) by plan() (A4)
     let eps = @[
       Entrypoint(path: "tests/fixtures/pass_always.nim",  group: "g", flags: @[]),
       Entrypoint(path: "tests/fixtures/fail_always.nim",  group: "g", flags: @[]),
@@ -79,7 +95,9 @@ suite "plan — pure annotation of compile decisions":
     ## Build a plan over a non-existent path; if plan tried to compile or stat
     ## the binary it would fail or produce oCompileFailed.  The fact that plan()
     ## returns successfully (without raising) proves no I/O happened.
-    let cfg = Config(jobs: 2)
+    let sd = isolatedStateDir("b")
+    defer: removeDir(sd)
+    let cfg = Config(jobs: 2, stateDir: sd)
     let eps = @[
       Entrypoint(path: "does_not_exist_at_all.nim", group: "g", flags: @[]),
     ]
@@ -89,7 +107,9 @@ suite "plan — pure annotation of compile decisions":
     check p.jobs == 2
 
   test "jobs resolved: config.jobs > 0 is preserved":
-    let cfg = Config(jobs: 4)
+    let sd = isolatedStateDir("c")
+    defer: removeDir(sd)
+    let cfg = Config(jobs: 4, stateDir: sd)
     let p = plan(cfg, @[], emptyDepGraph())
     check p.jobs == 4
 

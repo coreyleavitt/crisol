@@ -1569,7 +1569,7 @@ proc execute*(
   #     fall back to the old volatile pepIdx-suffixed dir in spawnCompileStable
   #     to avoid two concurrent slots racing on one nimcache write.
   let toolchainFp = toolchainFingerprint(nimVersion, ccVersion)
-  let dupSlugs    = duplicateSlugs(p)
+  let dupSlugs    = duplicateSlugs(p, config.trackedRoots)
 
   # Pre-allocate result slots so we can fill them by index (plan order).
   result = newSeq[EntrypointResult](n)

@@ -72,6 +72,7 @@ import crisol/cachewire
 import crisol/resultcache
 import crisol/ioutils
 import crisol/fnv
+import crisol/paths      # RFC-0009 A5b-i: CacheKeyPath overload of sidecarPath
 
 proc entryPath(root: string; key: SoundnessKey): string {.inline.} =
   cacheVersionDirAt(root) / ($key & ".json")
@@ -118,6 +119,13 @@ proc sidecarPath*(root: string; path: string): string =
   ## sidecar and explains as `kcFlags` rather than "no prior inputs"
   ## (RFC-0005 "Miss-explanation").
   inputsDirAt(root) / (toHex16(fnv1a64(path)) & ".json")
+
+proc sidecarPath*(root: string; key: CacheKeyPath): string =
+  ## RFC-0009 A5b-i: `CacheKeyPath` overload — additive only. In-module
+  ## callers (`readSidecar`/`writeSidecar`, below) still take a bare `path:
+  ## string` from EXTERNAL callers with no `TrackedPath` in hand; threading a
+  ## `tp` through those is A5b-ii's job, once callers have one to thread.
+  sidecarPath(root, string(key))
 
 proc readSidecar*(root: string; path: string): Sidecar =
   ## Read the path-keyed explain sidecar. Absent, unreadable, or
