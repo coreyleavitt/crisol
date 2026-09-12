@@ -13,6 +13,7 @@
 
 import std/[os, sets, json, strutils, unittest]
 import crisol/types
+import crisol/paths
 import crisol/closure
 
 proc writeManifest(dir, bname: string;
@@ -57,7 +58,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@pfoo.nim.c.o",
       nc / "@pbar@sutil.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check cl == toHashSet([
       "tests/t.nim", "lib/foo/src/foo.nim", "lib/bar/src/bar/util.nim",
@@ -81,7 +83,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@putil.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "src/util.nim" in cl
     check "src/myutil.nim" notin cl
@@ -100,7 +103,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@nfoo.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check cl == toHashSet(["tests/t.nim", "vendor/foo.nim"])
 
@@ -134,7 +138,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@pplanted_c.nim.c.o",
       nc / "@px.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check cl == toHashSet(["tests/t.nim"])
 
@@ -183,8 +188,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / ("@p" & mangledBody & ".c.o"),
     ])
-    let cfg = Config(projectRoot: projRoot, stateDir: ".crisol",
+    var cfg = Config(projectRoot: projRoot, stateDir: ".crisol",
                      depRoots: @[depRootPath])
+    cfg.trackedRoots = initTrackedRoots(projRoot, @[(name: "dep", native: depRootPath)], ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     let expected = depRootPath / "src" / "dep.nim"
     check expected in cl
@@ -208,7 +214,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@p..@slib@sx.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "lib/x.nim" in cl
     check cl == toHashSet(["tests/unit/deep/t.nim", "lib/x.nim"])
@@ -236,7 +243,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@p..@sx.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "src/x.nim" in cl
     check "lib/zx.nim" notin cl
@@ -267,7 +275,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@plib@h1@c2@sw.nim.c.o",
       nc / "@m..@slib@h1@c2@sw.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "lib#1:2/w.nim" in cl
     check cl == toHashSet(["tests/t.nim", "lib#1:2/w.nim"])
@@ -287,7 +296,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@pshared.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "src/shared.nim" in cl
     check "lib/shared.nim" in cl
@@ -314,7 +324,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@pshared.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: "state", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: "state", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), "state")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "src/shared.nim" in cl
     check "state/shared.nim" notin cl
@@ -335,7 +346,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ])
     let missingDepRoot = root / "_deps" / "does_not_exist"
     check not dirExists(missingDepRoot)
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[missingDepRoot])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[missingDepRoot])
+    cfg.trackedRoots = initTrackedRoots(root, @[(name: "dep", native: missingDepRoot)], ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check cl == toHashSet(["tests/t.nim", "src/x.nim"])
 
@@ -369,12 +381,13 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / ("@p" & mangledBody & ".c.o"),
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "lib/dep.nim" in cl
     check cl == toHashSet(["tests/t.nim", "lib/dep.nim"])
 
-  test "an @m body carrying a realpath through a symlinked depRoot resolves to the lexical depRoot path (via byReal)":
+  test "an @m body carrying a realpath through a symlinked depRoot is retained via classify's realAbs match (RFC-0009 A4a)":
     ## Reproduces the shape a shallow entrypoint (`tests/t.nim`, one level
     ## below root) produces for a module reached through a symlinked
     ## depRoot: Nim's mangler prefers `@m` (entrypointDir-relative) whenever
@@ -387,11 +400,26 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## here is computed with `relativePath` exactly as Nim's mangler does
     ## (shortest relative path from the entrypoint's directory, which
     ## carries no symlink of its own, to the dep's REAL path), so
-    ## `(epDir / body).normalizedPath` lands EXACTLY on the dep's real path
-    ## — outside every tracked root — and `resolveMangledAll` must recover
-    ## it via an EXACT `index.lookupByReal` match at its LEXICAL depRoot
-    ## path, "_deps/dep/src/dep.nim" — exactly like the `@p` case already
-    ## covered above, but reached via the `@m` branch instead.
+    ## `(epDir / body).normalizedPath` lands EXACTLY on the dep's real path.
+    ##
+    ## RFC-0009 A4a: this is exactly under-selection bug #2 the slice fixes.
+    ## Pre-A4a, `underAnyRoot`'s manual lexical-only string match did NOT
+    ## consider a dep root's realAbs, so this realpath candidate looked
+    ## "outside every tracked root" and had to be recovered via an exact
+    ## `index.lookupByReal` match at the dep root's LEXICAL spelling
+    ## ("_deps/dep/src/dep.nim", since depRootPath happens to be nested
+    ## inside the project here). Post-A4a, `index.tracked`/`classify`
+    ## matches the dep root's `realAbs` DIRECTLY (the `d.realAbs` prefix
+    ## check in `classify`'s dep loop) — the candidate is recognized as
+    ## tracked (and dep-tagged) on the FIRST pass, so the old `byReal`
+    ## recovery path is never reached for this case. The member is still
+    ## retained (no under-selection: the soundness property this test
+    ## guards is unchanged) — only its SPELLING changes, from the old
+    ## project-relative-looking recovered string to the dep-tagged member's
+    ## corrected-D5 spelling, its ABSOLUTE native path (`toNative`) — see
+    ## `closureMemberSpelling`'s doc comment in closure.nim for why a
+    ## dep-root member must spell as absolute for `depgraph.recordClosure`'s
+    ## downstream `classify` round-trip to stay sound.
     let root = freshRoot("s3_m_symlink")
     defer: removeDir(root)
     let outside = freshRoot("s3_m_symlink_outside")
@@ -418,11 +446,13 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / ("@m" & mangledBody & ".c.o"),
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol",
+    var cfg = Config(projectRoot: root, stateDir: ".crisol",
                      depRoots: @[depRootPath])
+    cfg.trackedRoots = initTrackedRoots(root, @[(name: "dep", native: depRootPath)], ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
-    check "_deps/dep/src/dep.nim" in cl
-    check cl == toHashSet(["tests/t.nim", "_deps/dep/src/dep.nim"])
+    let expectedDepMember = depRootPath.absolutePath.normalizedPath / "src" / "dep.nim"
+    check expectedDepMember in cl
+    check cl == toHashSet(["tests/t.nim", expectedDepMember])
 
   test "negative pin: an in-root @m body is NOT unioned against the index — a same-basename decoy elsewhere is never selected":
     ## The fallback (index.lookup for an @m body) is gated on the plain
@@ -446,7 +476,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@mfoo.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "tests/foo.nim" in cl
     check "other/foo.nim" notin cl
@@ -478,7 +509,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@m..@s..@sother@slib.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "src/other/lib.nim" notin cl
     check cl == toHashSet(["tests/t.nim"])
@@ -524,7 +556,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / ("@m" & mangledBody & ".c.o"),
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "src/foo.nim" in cl
     check "a/b/tests/t.nim" in cl
@@ -558,7 +591,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@mhelper.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "other/helper.nim" in cl
     check "tests/helper.nim" notin cl
@@ -596,7 +630,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
       nc / "@mt.nim.c.o",
       nc / "@m..@sghost.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check "a/b/ghost.nim" notin cl
     check cl == toHashSet(["a/b/tests/t.nim"])
@@ -625,7 +660,8 @@ suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned 
       nc / "@mt.nim.c.o",
       nc / "@p..@s..@s.hidden@scas@sdep@ssrc@sdep.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check ".hidden/cas/dep/src/dep.nim" in cl
     check cl == toHashSet(["tests/t.nim", ".hidden/cas/dep/src/dep.nim"])
@@ -647,7 +683,8 @@ suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned 
       nc / "@mt.nim.c.o",
       nc / "@p..@s..@s.hidden@scas@sdep@ssrc@sdep.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     check ".hidden/cas/dep/src/dep.nim" notin cl
     check cl == toHashSet(["tests/t.nim"])
@@ -675,7 +712,8 @@ suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned 
       nc / "@mt.nim.c.o",
       nc / "@p..@s.hidden@sextra.nim.c.o",
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[depRoot])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[depRoot])
+    cfg.trackedRoots = initTrackedRoots(root, @[(name: "dep", native: depRoot)], ".crisol")
     let cl = extractClosure(nc, "t", ep, cfg)
     let expected = (depRoot / ".hidden" / "extra.nim").normalizedPath
     check expected in cl

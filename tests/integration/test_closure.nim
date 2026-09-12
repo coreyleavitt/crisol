@@ -21,6 +21,7 @@
 import std/[os, sets, strutils, unittest]
 import crisol/closure
 import crisol/types
+import crisol/paths
 
 # ---------------------------------------------------------------------------
 # Helper: compile a fixture, return the nimcache dir + binary name used.
@@ -60,6 +61,13 @@ let projectRoot = currentSourcePath().parentDir.parentDir.parentDir
 
 let fixtureDir  = projectRoot / "tests" / "fixtures"
 
+let projectTrackedRoots = initTrackedRoots(projectRoot,
+  newSeq[tuple[name, native: string]](), "")
+  ## RFC-0009 A4a (Issue A fix): every `Config` literal below reaches
+  ## `extractClosure`/`buildSourceIndex`, so it needs REAL `trackedRoots` —
+  ## matching this file's fixed `projectRoot` (the checkout itself) — not
+  ## the zero-value default, exactly as `config.loadConfig` builds it.
+
 # ---------------------------------------------------------------------------
 # Test 1 — relative-import chain (@m), no extraDep
 # ---------------------------------------------------------------------------
@@ -69,7 +77,8 @@ suite "extractClosure — @m relative import chain":
   test "closure contains main, dep, dep2 — no extra":
     let src    = fixtureDir / "deptest_main.nim"
     let (nc, bn) = compileFixture(src)
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
     check "tests/fixtures/deptest_main.nim" in cl
@@ -79,7 +88,8 @@ suite "extractClosure — @m relative import chain":
   test "closure does NOT contain deptest_extra without -d:extraDep":
     let src    = fixtureDir / "deptest_main.nim"
     let (nc, bn) = compileFixture(src)
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
     check "tests/fixtures/deptest_extra.nim" notin cl
@@ -87,7 +97,8 @@ suite "extractClosure — @m relative import chain":
   test "every returned path is projectRoot-relative and exists under projectRoot":
     let src    = fixtureDir / "deptest_main.nim"
     let (nc, bn) = compileFixture(src)
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
     for p in cl:
@@ -107,7 +118,8 @@ suite "extractClosure — warm recompile yields the same closure as cold (issue 
 
   test "cold == warm, and the warm manifest really had an empty compile array":
     let src    = fixtureDir / "deptest_main.nim"
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let parent = getTempDir() / "crisol_closure_coldwarm_" & $getCurrentProcessId()
     removeDir(parent)
     createDir(parent)
@@ -153,7 +165,8 @@ suite "extractClosure — flag-sensitive closure":
     let tmpDir = getTempDir() / "crisol_extradep"
     createDir(tmpDir)
     let (nc, bn) = compileFixture(src, @["-d:extraDep"], tmpDir)
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
     check "tests/fixtures/deptest_main.nim"  in cl
@@ -171,7 +184,8 @@ suite "extractClosure — @p soundness (--path:src project modules tracked)":
     let src    = fixtureDir / "pathimport_main.nim"
     let srcDir = projectRoot / "src"
     let (nc, bn) = compileFixture(src, @["--path:" & srcDir])
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
     # The critical assertion: @p-mangled project source is in the closure.
@@ -183,7 +197,8 @@ suite "extractClosure — @p soundness (--path:src project modules tracked)":
     let tmpDir = getTempDir() / "crisol_pathp"
     createDir(tmpDir)
     let (nc, bn) = compileFixture(src, @["--path:" & srcDir], tmpDir)
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
     for p in cl:
@@ -204,7 +219,8 @@ suite "extractClosure — @p soundness (--path:src project modules tracked)":
     let tmpDir = getTempDir() / "crisol_types_check"
     createDir(tmpDir)
     let (nc, bn) = compileFixture(src, @["--path:" & srcDir], tmpDir)
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let cl     = extractClosure(nc, bn, src, config)
 
     # depparse currently does NOT import types.nim — this is expected.
@@ -229,7 +245,8 @@ suite "extractClosure — real {.compile.}d external (R1 regression, issue #5 fi
     let src        = fixtureDir / "golden_reuse" / "ep_a.nim"
     let includeDir = fixtureDir / "golden_reuse" / "include"
     let (nc, bn)   = compileFixture(src, @["--passC:-I" & includeDir])
-    let config     = Config(projectRoot: projectRoot, depRoots: @[])
+    let config     = Config(projectRoot: projectRoot, depRoots: @[],
+                            trackedRoots: projectTrackedRoots)
     let cl         = extractClosure(nc, bn, src, config)
 
     check "tests/fixtures/golden_reuse/ep_a.nim" in cl
@@ -245,7 +262,8 @@ suite "extractClosure — real {.compile.}d external (R1 regression, issue #5 fi
 suite "extractClosure — error handling":
 
   test "missing nimcache JSON raises CrisolError cekEnvironment":
-    let config = Config(projectRoot: projectRoot, depRoots: @[])
+    let config = Config(projectRoot: projectRoot, depRoots: @[],
+                        trackedRoots: projectTrackedRoots)
     let bogus  = getTempDir() / "crisol_missing_" & $getCurrentProcessId()
     createDir(bogus)
     try:

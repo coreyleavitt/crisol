@@ -19,6 +19,7 @@
 
 import std/[json, os, sets, strutils, tables, unittest]
 import crisol/types
+import crisol/paths
 import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
 import crisol/depgraph
 
@@ -166,7 +167,8 @@ suite "recordClosure — recovery policy (R5)":
     writeFile(ep, "# ep\n")
     let nc = root / "nimcache"
     writeManifest(nc, "rec_ep", link = @[nc / "@mrec_ep.nim.c.o"])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+    var cfg = Config(projectRoot: root, stateDir: ".crisol")
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
 
     var graph = initDepGraph("")
     let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_ep.nim", group: "t"),
@@ -224,7 +226,8 @@ suite "recordClosure — recovery policy (R5)":
     writeFile(ep, "# ep\n")
     let nc = root / "nimcache"
     writeManifest(nc, "rec_persistfail", link = @[nc / "@mrec_persistfail.nim.c.o"])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol")
+    var cfg = Config(projectRoot: root, stateDir: ".crisol")
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
 
     createDir(depgraphPath(cfg))
 

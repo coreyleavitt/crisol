@@ -960,7 +960,8 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     writeFile(epPath, "quit(0)\n")
 
     let cfg = Config(projectRoot: dir, stateDir: ".crisol",
-                     compileTimeoutSecs: 120, timeoutSecs: 60)
+                     compileTimeoutSecs: 120, timeoutSecs: 60,
+                     trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol"))
     let spec = sandbox.resolveSandbox(ptypes.hlIsolated)
     var g = emptyDepGraph()
     let rt = localOnlyCache(dir / ".crisol", maxEntries = 0)

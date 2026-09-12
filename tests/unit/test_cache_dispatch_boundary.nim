@@ -19,7 +19,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_cache_dispatch_boundary.nim
 
 import std/[options, os, tables, unittest]
-import crisol/[types, runner, planner, depgraph, sandbox, cachedispatch, resultcache]
+import crisol/[types, runner, planner, depgraph, sandbox, cachedispatch, resultcache, paths]
 import crisol/process/types as ptypes
 import "../support/helpers"  # legacySeams
 
@@ -104,7 +104,8 @@ suite "execute — cache HIT served at plan time":
     let cb = proc(r: EntrypointResult) {.closure.} = fired.add r
 
     let results = execute(
-      p, config = Config(projectRoot: getTempDir()), graph = g,
+      p, config = Config(projectRoot: getTempDir(),
+        trackedRoots: initTrackedRoots(getTempDir(), newSeq[tuple[name, native: string]](), "")), graph = g,
       onResult = cb, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)))
 
@@ -146,7 +147,8 @@ suite "execute — cached entry bypasses admission":
     var g = emptyDepGraph()
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)))
 
@@ -179,7 +181,8 @@ suite "execute — cache MISS stores on attempt-1 pass":
     var g = emptyDepGraph()
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)))
 
@@ -216,7 +219,8 @@ suite "execute — no-cache full bypass":
     var g = emptyDepGraph()
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheDisabled(isoSpec))
 
@@ -249,7 +253,8 @@ suite "execute — degraded hermeticity blocks the store":
     let netSpec = resolveSandbox(hlNetwork)
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheEnabled(netSpec, defaultCachePolicy(), mockSeams(ms)))
 
@@ -295,7 +300,8 @@ suite "R2-1 — no-cache cacheDecision discrimination":
     var g = emptyDepGraph()
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheDisabled(isoSpec))
 
@@ -324,8 +330,9 @@ suite "R2-1 — no-cache cacheDecision discrimination":
     writeFile(fixt, "quit(0)\n")
 
     ## Step 1: compile+run via edNeverBuilt so the stable binary is in place.
-    let cfg = Config(projectRoot: dir, stateDir: ".crisol",
+    var cfg = Config(projectRoot: dir, stateDir: ".crisol",
                      compileTimeoutSecs: 120, timeoutSecs: 60)
+    cfg.trackedRoots = initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")
     let pep0 = PlannedEntrypoint(
       ep: Entrypoint(path: fixt, group: "unit", flags: @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
@@ -380,7 +387,8 @@ suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set
     let p = RunPlan(entrypoints: peps, jobs: 1)
     var g = emptyDepGraph()
     let results = execute(
-      p, config = Config(projectRoot: getTempDir()), graph = g, showProgress = false,
+      p, config = Config(projectRoot: getTempDir(),
+        trackedRoots: initTrackedRoots(getTempDir(), newSeq[tuple[name, native: string]](), "")), graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms), prefetch = spy))
 
     check results.len == 3
@@ -404,7 +412,8 @@ suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set
     let p = RunPlan(entrypoints: peps, jobs: 1)
     var g = emptyDepGraph()
     discard execute(
-      p, config = Config(projectRoot: getTempDir()), graph = g, showProgress = false,
+      p, config = Config(projectRoot: getTempDir(),
+        trackedRoots: initTrackedRoots(getTempDir(), newSeq[tuple[name, native: string]](), "")), graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms), prefetch = spy))
 
     check prefetchedKeyCount == 1   # only the non-opted-out entry made it into the candidate set
@@ -427,7 +436,8 @@ suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set
     var ctx = cacheDisabled(isoSpec)
     ctx.prefetch = spy
     discard execute(p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                                       compileTimeoutSecs: 120, timeoutSecs: 60),
+                                       compileTimeoutSecs: 120, timeoutSecs: 60,
+                                       trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
                     graph = g, showProgress = false, cache = ctx)
     check prefetchCalls == 0
 
@@ -463,7 +473,8 @@ suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real r
     var g = emptyDepGraph()
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)))
 
@@ -492,7 +503,8 @@ suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real r
     let strictPolicy = ptypes.OutcomePolicy(strictHygiene: true)
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms),
                            outcomePolicy = strictPolicy))
@@ -513,7 +525,8 @@ suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real r
     var g = emptyDepGraph()
     let strictPolicy = ptypes.OutcomePolicy(strictHygiene: true)
     let results = execute(
-      p, config = Config(projectRoot: getTempDir()), graph = g, showProgress = false,
+      p, config = Config(projectRoot: getTempDir(),
+        trackedRoots: initTrackedRoots(getTempDir(), newSeq[tuple[name, native: string]](), "")), graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms),
                            outcomePolicy = strictPolicy))
 
@@ -576,7 +589,8 @@ suite "execute — RFC-0005 SO3: post-compile consult attempt-gating":
     var g = emptyDepGraph()
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), raceSeams(rs, cachedPass(1))))
 
@@ -608,7 +622,8 @@ suite "execute — RFC-0005 SO3: post-compile consult attempt-gating":
     ms.store["mk-" & fixt] = cachedPass(111)
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                         compileTimeoutSecs: 120, timeoutSecs: 60),
+                         compileTimeoutSecs: 120, timeoutSecs: 60,
+                         trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)))
 

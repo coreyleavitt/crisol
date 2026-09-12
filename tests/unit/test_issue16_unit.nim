@@ -18,6 +18,7 @@
 
 import std/[algorithm, json, os, sets, strutils, tables, unittest]
 import crisol/types
+import crisol/paths
 import crisol/closure    # ExternalSource, CompileInputs, extractCompileInputs,
                           # isModuleObjectName, buildSourceIndex; re-exports
                           # ccprobe.RunProc/realRun.
@@ -100,7 +101,8 @@ proc setupExtProject(tag: string): ExtProject =
   writeFile(result.vendorH, "// vendor.h v1\n")
 
 proc extCfg(p: ExtProject): Config =
-  Config(projectRoot: p.root, stateDir: ".crisol", depRoots: @[p.depRoot])
+  result = Config(projectRoot: p.root, stateDir: ".crisol", depRoots: @[p.depRoot])
+  result.trackedRoots = initTrackedRoots(p.root, @[(name: "dep", native: p.depRoot)], ".crisol")
 
 proc coldCcCmd(p: ExtProject): string =
   ## The manifest `compile` entry's ccCmd for the cold-external case:

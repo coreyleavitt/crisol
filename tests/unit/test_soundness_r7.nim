@@ -14,6 +14,7 @@
 
 import std/[os, sets, json]
 import crisol/types
+import crisol/paths
 import crisol/closure
 
 proc writeNimcacheJson(dir: string; bname: string; pairs: seq[(string, string)]) =
@@ -64,11 +65,12 @@ block test_r7_ambiguous_at_p_includes_all_matching_roots:
     (nimcacheDir / cFileName, "gcc"),
   ])
 
-  let cfg = Config(
+  var cfg = Config(
     projectRoot: projRoot,
     stateDir: ".crisol",
     depRoots: @[depRoot],
   )
+  cfg.trackedRoots = initTrackedRoots(projRoot, @[(name: "dep", native: depRoot)], ".crisol")
 
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
 
@@ -109,11 +111,12 @@ block test_r7_unambiguous_at_p_exact_single_result:
     (nimcacheDir / cFileName, "gcc"),
   ])
 
-  let cfg = Config(
+  var cfg = Config(
     projectRoot: projRoot,
     stateDir: ".crisol",
     depRoots: @[depRoot],
   )
+  cfg.trackedRoots = initTrackedRoots(projRoot, @[(name: "dep", native: depRoot)], ".crisol")
 
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
   assert "src/only.nim" in closureSet,

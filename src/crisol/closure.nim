@@ -183,6 +183,8 @@
 
 import std/[algorithm, json, os, sets, strutils, tables]
 import crisol/types
+import crisol/paths    # RFC-0009 A4a: classify/TrackedPath/PathClass/display/toNative
+                        # — the index/relativize identity layer, below.
 import crisol/config   # for stateDirOf — the source-index walk prunes it
 import crisol/ccprobe  # for RunProc/realRun/deriveCcMInvocation/ccIncludeHeaders
                         # (issue #16) — a true leaf module (std-only), so this
@@ -233,10 +235,31 @@ type
       ## a deleted dep must still be reported as "tracked" so its last-known
       ## closure entry is retained rather than silently dropped by the
       ## under-tracked-root filter).  Only roots that DO exist are actually
-      ## walked (`buildSourceIndex`).  This is the single source of truth
-      ## for "is this path tracked" — both `underAnyRoot` (the `@m` escape
-      ## check, below) and `extractClosure`'s under-tracked-root filter use
-      ## it; there is no separate, duplicate root list.
+      ## walked (`buildSourceIndex`).  Still used by `resolveMangledAll`'s
+      ## pruned-directory existence-check fallback (join a stripped suffix
+      ## onto each entry and test for existence) — a plain string list is
+      ## exactly what that fallback needs.  RFC-0009 A4a: `trackedRoots`
+      ## (below), not this field, is now the single source of truth for "is
+      ## this path tracked" (`tracked`/`underAnyRoot`/`extractClosure`'s
+      ## under-tracked-root filter all route through `classify`).
+    trackedRoots: TrackedRoots
+      ## RFC-0009 A4a: `config.trackedRoots`, copied once at
+      ## `buildSourceIndex` time — the run's real project+dep-root identity,
+      ## as built by `config.loadConfig`/`initTrackedRoots`.  Every
+      ## tracked-check and relativize decision in this module goes through
+      ## `tracked` (below), which classifies against THIS field — never a
+      ## separately-derived root list — closing the two under-selection
+      ## bugs the old manual lexical-only string matching missed (a
+      ## manifest/walk separator skew before `nativeCanonicalize` ran; a
+      ## dep root reached via a symlink whose realpath-expanded candidate
+      ## matched no root's LEXICAL form).
+
+proc tracked*(index: SourceIndex; native: string): PathClass =
+  ## Classify a native candidate against the run's tracked roots — the
+  ## single identity entry point for closure resolution (`nativeCanonicalize`
+  ## + project + dep + realAbs matching all happen inside `classify`). Hot
+  ## call sites thread only the index, not index-and-roots both.
+  classify(native, index.trackedRoots)
 
 proc addToIndex(index: var SourceIndex; lexical: string; real: string) =
   let base = lexical.extractFilename
@@ -256,7 +279,7 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
   ## this matters for depRoots
   ## (`buildSourceIndex` passes `recordRoot == dir` at the top so recorded
   ## paths are lexically `<depRootAbs>/<rel>`, matching what the
-  ## under-tracked-root filter and `toProjectRelative` expect) — AND each
+  ## under-tracked-root filter and `classify` expect) — AND each
   ## file's REALPATH (symlinks resolved), used by `lookup` to match `@p`
   ## bodies the compiler mangled from a realpath-canonicalized source (e.g.
   ## a depRoot reached through a symlink into milpa's CAS).  `dir`'s real
@@ -341,7 +364,16 @@ proc buildSourceIndex*(config: Config): SourceIndex =
   ## tracked"), losing the lexical depRoot path the closure is supposed to
   ## record instead.
   result = SourceIndex(byBasename: initTable[string, seq[IndexedFile]](),
-                        byReal: initTable[string, seq[string]]())
+                        byReal: initTable[string, seq[string]](),
+                        trackedRoots: config.trackedRoots)
+    # RFC-0009 A4a (D1): copied verbatim from `config.trackedRoots` — the
+    # run's real identity, built once by `config.loadConfig`/
+    # `initTrackedRoots`.  NOT re-derived from `config.projectRoot`/
+    # `config.depRoots` here: production always populates
+    # `config.trackedRoots` via `loadConfig`, which stays the single source
+    # of truth (a test that builds a bare `Config` literal must populate
+    # `trackedRoots` itself, the same way `loadConfig` does, not rely on a
+    # dormant fallback here).
   let stateDirAbs = stateDirOf(config)
 
   let prAbs = config.projectRoot.absolutePath.normalizedPath
@@ -449,20 +481,17 @@ proc lookupByReal(index: SourceIndex; realAbs: string): seq[string] =
   index.byReal.getOrDefault(realAbs, @[])
 
 proc underAnyRoot(index: SourceIndex; absPath: string): bool =
-  ## True iff `absPath` (normalized absolute) lives under one of `index`'s
-  ## recorded lexical roots (projectRoot or a depRoot) — path equals the
-  ## root, or starts with `root & DirSep`.  The single source of truth for
-  ## "is this path tracked": used both by `resolveMangledAll`'s `@m` branch
-  ## (to detect a candidate that escaped every tracked root, e.g. the
-  ## realpath-through-a-symlinked-depRoot case, so it can fall back to the
-  ## index instead of silently dropping the module) and by `extractClosure`'s
-  ## under-tracked-root filter (the SOUNDNESS gate over every resolved
-  ## candidate, `@m` and `@p`/`@n` alike) — there is no separate,
-  ## independently-computed root list.
-  for root in index.roots:
-    if absPath == root or absPath.startsWith(root & $DirSep):
-      return true
-  false
+  ## RFC-0009 A4a (D2): thin wrapper over `tracked`/`classify` — the
+  ## SOUNDNESS gate "is this candidate under a tracked root", used by
+  ## `resolveMangledAll`'s `@m` branch (to detect a candidate that escaped
+  ## every tracked root, e.g. the realpath-through-a-symlinked-depRoot case,
+  ## so it can fall back to the index instead of silently dropping the
+  ## module). Strictly MORE correct than the old manual lexical-only string
+  ## match this replaced: `classify` also matches a root's `realAbs` (a
+  ## symlinked dep root) and runs every candidate through
+  ## `nativeCanonicalize` first, closing both under-selection bugs the old
+  ## check missed.
+  index.tracked(absPath).kind == pcTracked
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -479,31 +508,33 @@ proc addUnique(result: var seq[string]; seen: var HashSet[string];
       seen.incl cand
       result.add cand
 
-proc toProjectRelative(absPath: string; projectRoot: string): string =
-  ## Convert an absolute path to a projectRoot-relative forward-slash path.
-  let root = projectRoot.absolutePath.normalizedPath
-  let norm  = absPath.normalizedPath
-  if norm.startsWith(root & $DirSep):
-    result = norm[root.len + 1 .. ^1]
-  elif norm == root:
-    result = ""
-  else:
-    # rfc-0007 C1a: `absPath` may be the REALPATH form `underAnyRoot`
-    # accepted via the root's own realpath-expanded entry
-    # (`buildSourceIndex`'s `addRootWithRealForm`) rather than its lexical
-    # one — mirror that same real-vs-lexical duality here so it strips
-    # correctly instead of falling through to the raw-path fallback below.
-    let realRoot =
-      try: root.expandFilename.normalizedPath
-      except OSError: root
-    if realRoot != root and norm.startsWith(realRoot & $DirSep):
-      result = norm[realRoot.len + 1 .. ^1]
-    elif realRoot != root and norm == realRoot:
-      result = ""
-    else:
-      result = norm          # fallback: return as-is (shouldn't happen post-filter)
-  # Normalise to forward slashes on all platforms.
-  result = result.replace($DirSep, "/")
+proc closureMemberSpelling(tp: TrackedPath; roots: TrackedRoots): string =
+  ## RFC-0009 A4a (D3, D5 — CORRECTED per coordinator): the wire/return
+  ## spelling for one closure member, converting a `TrackedPath` back to the
+  ## `HashSet[string]` `extractClosure`/`extractCompileInputs` still return
+  ## (A4b retypes the return itself). Project (tag-0) members spell as
+  ## their project-relative rel (`display`) — byte-identical to the old
+  ## `toProjectRelative`'s primary-branch output. Dep-root members spell as
+  ## their ABSOLUTE native path (`toNative`) — byte-identical to the old
+  ## `toProjectRelative`'s "shouldn't happen post-filter" fallback (a
+  ## dep-root candidate never matched project's root, lexical or real, so
+  ## it always fell through to `result = norm` there).
+  ##
+  ## This is NOT an arbitrary choice: `depgraph.recordClosure` re-classifies
+  ## every returned string via `classify(member, config.trackedRoots)`
+  ## (depgraph.nim ~980) to recover its `TrackedPath` for hashing/
+  ## persistence. `classify` on a bare RELATIVE string always attributes it
+  ## to the PROJECT root (`nativeCanonicalize` unconditionally joins a
+  ## relative candidate against `roots.project.abs`, and the project check
+  ## runs first and unconditionally succeeds) — a dep root's tag can never
+  ## be recovered from a bare rel string, only from an absolute path
+  ## (`classify`'s dep-root loop prefix-matches `d.abs`/`d.realAbs`). So a
+  ## dep-root member MUST spell as an absolute path for that downstream
+  ## `classify` call to round-trip soundly; a project member is unambiguous
+  ## either way and spells as the shorter, human-facing rel form, matching
+  ## every pre-A4a caller's expectation.
+  if isProject(tp): display(tp)
+  else: toNative(tp, roots)
 
 proc decodeBody(raw: string): string =
   ## Decode Nim's mangling escapes in the post-prefix mangled body string:
@@ -1018,7 +1049,7 @@ proc analyzeManifest(nimcacheDir: string;
                      entrypoint: string;
                      config: Config;
                      index: SourceIndex):
-    tuple[files: HashSet[string]; externals: seq[AnalyzedExternal]] =
+    tuple[files: HashSet[TrackedPath]; externals: seq[AnalyzedExternal]] =
   ## Extract the source-dependency closure for one compiled entrypoint, AND
   ## (issue #16) classify every `link` entry that is a single-path
   ## `{.compile.}`d external (D3c) into an `AnalyzedExternal` — its
@@ -1126,9 +1157,13 @@ proc analyzeManifest(nimcacheDir: string;
       " cannot derive the source closure soundly")
 
   let epAbs = entrypoint.absolutePath.normalizedPath
-  let prAbs = config.projectRoot.absolutePath.normalizedPath
 
-  var files = initHashSet[string]()
+  var files = initHashSet[TrackedPath]()
+    ## RFC-0009 A4a (D4): the FINAL membership accumulation, retyped to
+    ## `HashSet[TrackedPath]` — every member added below is a `pc.tp` from
+    ## `index.tracked`, guarded on `pc.kind == pcTracked` (the SAME
+    ## under-tracked-root soundness filter as before, just expressed as a
+    ## classify gate instead of a manual string-prefix scan).
   var externals: seq[AnalyzedExternal] = @[]
 
   # Map each `compile` entry's OUTPUT OBJECT (extracted from its own ccCmd,
@@ -1181,8 +1216,9 @@ proc analyzeManifest(nimcacheDir: string;
           # library) — same under-tracked-root gate applied below to every
           # resolved candidate.
           let absObj = objPath.absolutePath.normalizedPath
-          if index.underAnyRoot(absObj):
-            files.incl toProjectRelative(absObj, prAbs)
+          let pcObj = index.tracked(absObj)
+          if pcObj.kind == pcTracked:
+            files.incl pcObj.tp
           continue
         of flkPrebuiltRel:
           # D9: a `{.link.}` entry with a non-absolute path — cannot be
@@ -1199,27 +1235,28 @@ proc analyzeManifest(nimcacheDir: string;
     for resolved in candidates:
       if resolved == "": continue            # (shouldn't occur, but be defensive)
 
-      # Under-tracked-root filter: the SOUNDNESS gate. Keeps only what lives
-      # under projectRoot or a depRoot — `index.roots`/`underAnyRoot` is the
-      # single source of truth for "tracked", shared with `resolveMangledAll`'s
-      # `@m` escape check (no separate, independently-computed root list).
-      # Stdlib/nimble paths are excluded here. Existence is NOT checked (R5):
-      # deleted deps remain in the closure.
-      if not index.underAnyRoot(resolved): continue
-
-      # Convert to projectRoot-relative, forward slashes.
-      let rel = toProjectRelative(resolved, prAbs)
-      files.incl rel
+      # Under-tracked-root filter: the SOUNDNESS gate — RFC-0009 A4a (D2):
+      # `index.tracked`/`classify` is the single source of truth for
+      # "tracked", shared with `resolveMangledAll`'s `@m` escape check (no
+      # separate, independently-computed root list). Stdlib/nimble paths are
+      # excluded here. Existence is NOT checked (R5): deleted deps remain in
+      # the closure.
+      let pc = index.tracked(resolved)
+      if pc.kind != pcTracked: continue
+      let tp = pc.tp
+      files.incl tp
 
       if isExternal:
         # D3c (issue #11) single-path external — issue #16: also record it
         # as an AnalyzedExternal for header derivation. Matched against
         # `objToCcCmd` by the SAME `objPath` this iteration is processing
-        # (not `resolved`/`rel` — the match is object-to-object, source
-        # resolution is a separate concern).
+        # (not `resolved`/`tp` — the match is object-to-object, source
+        # resolution is a separate concern). `source` mirrors the SAME
+        # spelling `files` returns at the boundary (`closureMemberSpelling`).
         let objKey = objPath.normalizedPath
         let hasCcCmd = objKey in objToCcCmd
         let ccCmd = if hasCcCmd: objToCcCmd[objKey] else: ""
+        let rel = closureMemberSpelling(tp, index.trackedRoots)
         externals.add AnalyzedExternal(source: rel, obj: objPath.extractFilename,
                                        ccCmd: ccCmd, hasCcCmd: hasCcCmd)
 
@@ -1227,8 +1264,9 @@ proc analyzeManifest(nimcacheDir: string;
     # depfiles entries are already absolute paths (no @m/@p/@n mangling) —
     # normalize only. Existence is NOT checked (R5 policy, same as `link`).
     let abs = df.path.absolutePath.normalizedPath
-    if index.underAnyRoot(abs):
-      files.incl toProjectRelative(abs, prAbs)
+    let pcDf = index.tracked(abs)
+    if pcDf.kind == pcTracked:
+      files.incl pcDf.tp
     else:
       # Fallback for a depfiles path recorded relative to something other
       # than the tracked lexical root (e.g. reached through a symlink into
@@ -1237,8 +1275,9 @@ proc analyzeManifest(nimcacheDir: string;
       # lexical candidate that is itself under-tracked-root.
       for cand in index.lookupByReal(abs):
         let candAbs = cand.absolutePath.normalizedPath
-        if index.underAnyRoot(candAbs):
-          files.incl toProjectRelative(candAbs, prAbs)
+        let pcCand = index.tracked(candAbs)
+        if pcCand.kind == pcTracked:
+          files.incl pcCand.tp
 
   result = (files: files, externals: externals)
 
@@ -1271,7 +1310,15 @@ proc extractClosure*(nimcacheDir: string;
   ## `CrisolError(cekEnvironment)` under the same conditions documented
   ## there (missing/unparseable manifest; empty `link`; no `depfiles` key;
   ## a tuple-form `{.compile.}` object; a non-absolute `{.link.}` entry).
-  analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index).files
+  # RFC-0009 A4a (D5, CORRECTED): convert the internal `HashSet[TrackedPath]`
+  # accumulation back to the `HashSet[string]` this proc still returns (A4b
+  # retypes the return itself) — see `closureMemberSpelling`'s doc comment
+  # for why this spelling (not bare `display`) is what keeps
+  # `depgraph.recordClosure`'s downstream `classify` round-trip sound.
+  let tpFiles = analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index).files
+  result = initHashSet[string]()
+  for tp in tpFiles:
+    result.incl closureMemberSpelling(tp, index.trackedRoots)
 
 proc extractClosure*(nimcacheDir: string;
                      binaryName: string;
@@ -1337,8 +1384,8 @@ proc extractCompileInputs*(nimcacheDir: string;
   ## ChildSpec.cwd, also projectRoot) — so a relative header path means the
   ## same thing on both sides of the replay. Once resolved, a header is
   ## kept iff it resolves under a tracked root
-  ## (`index.underAnyRoot`/`toProjectRelative` — the identical soundness
-  ## gate `analyzeManifest`'s closure paths pass through), else dropped
+  ## (`index.tracked`/`classify` — the identical soundness gate
+  ## `analyzeManifest`'s closure paths pass through), else dropped
   ## silently (a system header, e.g. `/usr/include/stdint.h`, is never
   ## tracked). The kept set is sorted and deduplicated.
   ##
@@ -1350,6 +1397,10 @@ proc extractCompileInputs*(nimcacheDir: string;
   for c in carried:
     carriedBySource[c.source] = c
 
+  # RFC-0009 A4a (D4): `files` stays the `HashSet[TrackedPath]`
+  # `analyzeManifest` already accumulated; every header folded in below adds
+  # its own `pc.tp`, converted back to `HashSet[string]` only at the very
+  # end (`closureMemberSpelling`, matching D5's corrected boundary).
   var files = analyzed.files
   var externals: seq[ExternalSource] = @[]
 
@@ -1370,16 +1421,19 @@ proc extractCompileInputs*(nimcacheDir: string;
           " (command: " & inv.cmd & ")")
 
       var kept: seq[string] = @[]
-      var seen = initHashSet[string]()
+      var seen = initHashSet[TrackedPath]()
+        ## RFC-0009 A4a (D4): the header-dedup set, retyped to TrackedPath —
+        ## same classify gate as every other soundness check in this module.
       for h in ccIncludeHeaders(output, inv.sourceFile):
         let habs =
           if h.isAbsolute: h.normalizedPath
           else: (prAbs / h).normalizedPath
-        if not index.underAnyRoot(habs): continue    # system header, etc. — excluded
-        let rel = toProjectRelative(habs, prAbs)
-        if rel notin seen:
-          seen.incl rel
-          kept.add rel
+        let pcH = index.tracked(habs)
+        if pcH.kind != pcTracked: continue    # system header, etc. — excluded
+        let tpH = pcH.tp
+        if tpH notin seen:
+          seen.incl tpH
+          kept.add closureMemberSpelling(tpH, index.trackedRoots)
       kept.sort()
       headers = kept
     else:
@@ -1395,7 +1449,21 @@ proc extractCompileInputs*(nimcacheDir: string;
     let hHash = chainedContentHash(headers, config.projectRoot)
     externals.add ExternalSource(source: ext.source, obj: ext.obj,
                                  headers: headers, headersHash: hHash)
+    # RFC-0009 A4a (D4): fold each header into the SAME `HashSet[TrackedPath]`
+    # membership accumulation `analyzeManifest` started — classify uniformly,
+    # whether `headers` was just derived (fresh `cc -M` probe, above) or
+    # carried forward from a previous run's persisted `ExternalSource`
+    # (already in `closureMemberSpelling` form either way, so `index.tracked`
+    # round-trips both).
     for h in headers:
-      files.incl h
+      let pcHdr = index.tracked(h)
+      if pcHdr.kind == pcTracked:
+        files.incl pcHdr.tp
 
-  result = CompileInputs(files: files, externals: externals)
+  # RFC-0009 A4a (D5, CORRECTED): convert the internal `HashSet[TrackedPath]`
+  # back to `CompileInputs.files: HashSet[string]` (unchanged return type —
+  # A4b's concern) via the same spelling `extractClosure` uses.
+  var stringFiles = initHashSet[string]()
+  for tp in files:
+    stringFiles.incl closureMemberSpelling(tp, index.trackedRoots)
+  result = CompileInputs(files: stringFiles, externals: externals)

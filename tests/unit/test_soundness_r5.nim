@@ -22,6 +22,7 @@
 
 import std/[os, sets, json]
 import crisol/types
+import crisol/paths
 import crisol/closure
 
 proc writeNimcacheJson(dir: string; bname: string; pairs: seq[(string, string)]) =
@@ -77,7 +78,8 @@ block test_r5_deleted_at_m_dep_still_in_closure:
   # The file would resolve to: epDir / "dep_r5.nim" = root/tests/dep_r5.nim
   # That path is under projectRoot → tracked
 
-  let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+  var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+  cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
 
   # "tests/dep_r5.nim" must appear in the closure even though the file is gone.
@@ -105,7 +107,8 @@ block test_r5_existing_at_m_dep_still_in_closure:
     (nimcacheDir / cFileName, "gcc"),
   ])
 
-  let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+  var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+  cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
 
   assert "tests/dep_existing.nim" in closureSet,
@@ -139,7 +142,8 @@ block test_r5_at_m_dep_outside_tracked_root_excluded:
     (nimcacheDir / cFileName, "gcc"),
   ])
 
-  let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+  var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+  cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
   let closureSet = extractClosure(nimcacheDir, bname, epFile, cfg)
 
   # "tests/some_stdlib_lookalike.nim" resolves to root/tests/some_stdlib_lookalike.nim

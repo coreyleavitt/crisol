@@ -74,6 +74,7 @@ import crisol/keys
 import crisol/planner
 import crisol/cachelocalfs
 import crisol/fnv
+import crisol/paths
 import crisol/closure
 import crisol/depgraph
 import crisol/config
@@ -231,11 +232,13 @@ suite "rfc9_golden_pin — depRoot vector (vendored reference, compute-at-runtim
     let bname = "ep_with_dep"
     writeDeprootManifest(nimcacheDir, bname, epAbs, depMemberAbs)
 
-    let cfg = Config(
+    var cfg = Config(
       projectRoot: deprootProjectRoot,
       stateDir:    ".crisol",
       depRoots:    @[deprootDepDir],
     )
+    cfg.trackedRoots = initTrackedRoots(deprootProjectRoot,
+      @[(name: "dep", native: deprootDepDir)], ".crisol")
 
     let closureSet = extractClosure(nimcacheDir, bname, epAbs, cfg)
 
@@ -290,9 +293,10 @@ suite "rfc9_golden_pin — one fixture run's actual on-disk cache slugs":
     copyDir(simpleFixtureRoot, scratchRoot)
     defer: removeDir(scratchRoot)
 
-    let cfg = Config(projectRoot: scratchRoot, stateDir: ".crisol", jobs: 1,
+    var cfg = Config(projectRoot: scratchRoot, stateDir: ".crisol", jobs: 1,
                       timeoutSecs: 60, compileTimeoutSecs: 120,
                       maxOutputBytes: 65_536)
+    cfg.trackedRoots = initTrackedRoots(scratchRoot, newSeq[tuple[name, native: string]](), ".crisol")
     let ep = Entrypoint(path: simplePath, group: "default", flags: @[])
 
     var graph = initDepGraph("")

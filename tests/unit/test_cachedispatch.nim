@@ -15,7 +15,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_cachedispatch.nim
 
 import std/[options, os, sequtils, strutils, unittest]
-import crisol/[types, sandbox, cachedispatch, resultcache, planner, depgraph]
+import crisol/[types, sandbox, cachedispatch, resultcache, planner, depgraph, paths]
 import crisol/process/types  # pkCached/pkSkipped (rfc-0007 A1c coherence test)
 import crisol/keys           # KeyDiff, KeyComponent (kcFlags/kcHermeticEnv)
 import crisol/cacheregistry  # localOnlyCache -- a real CacheRuntime + local root
@@ -1252,8 +1252,9 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
     let epPath = dir / "test_flip.nim"
     writeFile(epPath, B2aFlipFixture)
 
-    let cfg = Config(projectRoot: dir, stateDir: ".crisol",
+    var cfg = Config(projectRoot: dir, stateDir: ".crisol",
                      compileTimeoutSecs: 120, timeoutSecs: 60)
+    cfg.trackedRoots = initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")
     let spec = resolveSandbox(hlIsolated)
     var g = emptyDepGraph()
     let rt = localOnlyCache(dir / ".crisol", maxEntries = 0)

@@ -20,6 +20,7 @@
 
 import std/[os, sets, json, strutils, unittest]
 import crisol/types
+import crisol/paths
 import crisol/closure
 
 proc writeManifest(dir, bname: string;
@@ -66,7 +67,8 @@ suite "extractClosure — warm recompile (issue #5)":
       nc / "@psystem.nim.c.o",          # stdlib: not under a tracked root
       "/opt/vendor/libfoo.o",           # externalToLink: no @m/@p prefix
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "test_ep", ep, cfg)
     check cl == toHashSet(["tests/test_ep.nim", "tests/dep.nim", "src/proj.nim"])
 
@@ -103,7 +105,8 @@ suite "extractClosure — warm recompile (issue #5)":
       "/usr/lib/libfoo.a",         # foreign archive, absolute — excluded
       "/opt/x.o",                  # foreign object, absolute — excluded
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "main", ep, cfg)
     check cl == toHashSet(["tests/main.nim", "tests/fixture.c", "tests/weird.cpp"])
     check "tests/fixture" notin cl     # never truncated to a bogus extensionless path
@@ -134,7 +137,8 @@ suite "extractClosure — warm recompile (issue #5)":
       nc / "@mobjcmod.nim.m.o",      # importobjc module
       nc / "@pproj.nim.cpp.o",       # @p-mangled cpp module (--path:src)
     ])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     let cl = extractClosure(nc, "main", ep, cfg)
     check cl == toHashSet([
       "tests/main.nim", "tests/cppmod.nim", "tests/objcmod.nim", "src/proj.nim",
@@ -148,7 +152,8 @@ suite "extractClosure — warm recompile (issue #5)":
     writeFile(ep, "# ep\n")
     let nc = root / "nimcache"
     writeManifest(nc, "test_ep", compile = @["some.c"], link = @[])
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     var raised = false
     try:
       discard extractClosure(nc, "test_ep", ep, cfg)
@@ -174,7 +179,8 @@ suite "extractClosure — warm recompile (issue #5)":
     node["compile"] = compileArr
     # Deliberately no "link" key at all.
     writeFile(nc / "test_ep.json", $node)
-    let cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
     var raised = false
     try:
       discard extractClosure(nc, "test_ep", ep, cfg)
