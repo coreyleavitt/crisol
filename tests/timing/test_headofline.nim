@@ -102,6 +102,14 @@ proc makeConfig(jobs: int): Config =
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    # RFC-0009 A3c-ii: the dep-graph closure is HashSet[TrackedPath], and
+    # recordClosure/decideCompile classify+resolve every member against
+    # config.trackedRoots. A default (empty) TrackedRoots would classify the
+    # fixture's closure members as pcOutside (dropped) — the entry then looks
+    # stale on the Phase-2 warm run and every entrypoint RECOMPILES, blowing
+    # the head-of-line timing budget (~2.3s vs the 380ms threshold). Give it
+    # a REAL TrackedRoots matching projectRoot, exactly as loadConfig does.
+    trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
   )
 
 # ---------------------------------------------------------------------------
