@@ -17,9 +17,10 @@ import crisol/types
 import crisol/render
 import crisol/runner  # for summarize
 import crisol/process/types as ptypes  # rfc-0007 A1c: coherent Phase fixtures
+import "../support/testep"
 
 proc makeEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit")
+  testEp(path, group = "unit")
 
 proc noColorOpts(): RenderOpts = RenderOpts(color: false, slowestN: 5)
 proc withColorOpts(): RenderOpts = RenderOpts(color: true, slowestN: 5)

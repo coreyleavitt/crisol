@@ -14,6 +14,7 @@ import std/[os, sets, tables, unittest]
 import crisol/types
 import crisol/depgraph
 import crisol/runner
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -32,7 +33,7 @@ proc stageEp(tmpRoot: string; group = "test"; flags: seq[string] = @[]): Entrypo
   ## and an unrecorded entrypoint is never cdSkipFresh.
   createDir(tmpRoot / "tests")
   copyFile(fixtureDir() / "pass_always.nim", tmpRoot / "tests" / "pass_always.nim")
-  Entrypoint(path: "tests/pass_always.nim", group: group, flags: flags)
+  testEp("tests/pass_always.nim", group = group, flags = flags)
 
 proc makeIsolatedConfig(root: string): Config =
   ## Build a Config that uses an isolated stateDir under `root`.

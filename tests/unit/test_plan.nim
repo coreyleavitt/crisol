@@ -14,13 +14,14 @@
 import std/unittest
 import crisol/types
 import crisol/runner
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 proc mkEp(path: string; group = "unit"; flags: seq[string] = @[]): Entrypoint =
-  Entrypoint(path: path, group: group, flags: flags)
+  testEp(path, group = group, flags = flags)
 
 # ---------------------------------------------------------------------------
 # Suite

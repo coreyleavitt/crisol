@@ -24,13 +24,14 @@ import crisol/process/types as ptypes
 import crisol/runner  # for summarize
 import crisol/cachetelemetry  # RFC-0005 code-review T16: CacheStats field construction
 import crisol
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers -- build synthetic EntrypointResults
 # ---------------------------------------------------------------------------
 
 proc makeEp(path: string; group: string = "unit"): Entrypoint =
-  Entrypoint(path: path, group: group, flags: @[])
+  testEp(path, group = group, flags = @[])
 
 proc makeRecord(name: string; status: RecordStatus;
                 msg: string = ""; tags: seq[string] = @[]): TestRecord =
@@ -668,11 +669,9 @@ suite "jsonout A8 — cache reporting fields":
     ## result row must identify its leg without the config, so it carries the
     ## effective (global-then-group) flag list exactly as compiled.
     var legA = liveResult()
-    legA.ep = Entrypoint(path: "tests/unit/test_probe.nim", group: "unit-a",
-                         flags: @["-d:common", "-d:legA"])
+    legA.ep = testEp("tests/unit/test_probe.nim", group = "unit-a", flags = @["-d:common", "-d:legA"])
     var legB = liveResult()
-    legB.ep = Entrypoint(path: "tests/unit/test_probe.nim", group: "unit-b",
-                         flags: @["-d:common", "-d:legB"])
+    legB.ep = testEp("tests/unit/test_probe.nim", group = "unit-b", flags = @["-d:common", "-d:legB"])
     let node = toJson(@[legA, legB], Summary(total: 2, passed: 2))
     check node["schemaRevision"].getInt >= 14
     check node["entrypoints"][0]["flags"] == %*["-d:common", "-d:legA"]
@@ -1357,10 +1356,10 @@ suite "jsonout - loadLastRun (B7)":
 
     # One failed, one passed.
     let results = @[
-      EntrypointResult(ep: Entrypoint(path: "tests/unit/test_alpha.nim", group: "unit", flags: @[]),
+      EntrypointResult(ep: testEp("tests/unit/test_alpha.nim", group = "unit", flags = @[]),
                        compile: okPhase(), run: okPhase(1),
                        durationMs: 100, records: @[]),
-      EntrypointResult(ep: Entrypoint(path: "tests/unit/test_beta.nim", group: "unit", flags: @[]),
+      EntrypointResult(ep: testEp("tests/unit/test_beta.nim", group = "unit", flags = @[]),
                        compile: okPhase(), run: okPhase(),
                        durationMs: 50, records: @[]),
     ]

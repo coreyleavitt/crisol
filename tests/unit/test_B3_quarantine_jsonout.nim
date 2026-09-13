@@ -16,9 +16,10 @@ import std/[json, options, unittest]
 import crisol/types
 import crisol/jsonout
 import crisol/process/types as ptypes
+import "../support/testep"
 
 proc makeEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit", flags: @[])
+  testEp(path, group = "unit", flags = @[])
 
 proc okPhase(code: int = 0): ptypes.Phase =
   ## rfc-0007 A1e-i: `flaky` is the DERIVED value (outcome(r)==oPassed and

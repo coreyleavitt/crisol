@@ -53,6 +53,7 @@ import std/[os, osproc, strutils, times, unittest]
 import std/posix as posix_mod
 import crisol
 import crisol/[config, depgraph, planner, types]
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers (shapes copied from tests/integration/test_issue11_closure_inputs.nim
@@ -162,8 +163,8 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
 
     let (cfg, cfgErrs) = loadConfig(root / "crisol.kdl")
     doAssert cfgErrs.len == 0, "loadConfig failed: " & $cfgErrs
-    let stableBin = binPath(Entrypoint(path: "tests/unit/t_marker.nim", group: "unit"), cfg) /
-                    binName(Entrypoint(path: "tests/unit/t_marker.nim", group: "unit"))
+    let stableBin = binPath(testEp("tests/unit/t_marker.nim", group = "unit"), cfg) /
+                    binName(testEp("tests/unit/t_marker.nim", group = "unit"))
     check fileExists(stableBin)
 
     # Step 2: edit source to write "2"; plant the persist-failure fault;

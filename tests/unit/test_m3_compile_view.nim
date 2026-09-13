@@ -20,6 +20,7 @@ import std/[json, options, unittest]
 import crisol/types
 import crisol/runner     # plan, emptyDepGraph
 import crisol/planview   # decisionStringEd, planToJson
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # (b) compileView accessor agreement with edecision
@@ -29,7 +30,7 @@ suite "M3 (b) — compileView agrees with edecision for all variants":
 
   proc mkPep(ed: EntrypointDecision): PlannedEntrypoint =
     PlannedEntrypoint(
-      ep: Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[]),
+      ep: testEp("tests/unit/test_x.nim", group = "unit", flags = @[]),
       edecision: ed,
     )
 
@@ -67,7 +68,7 @@ suite "M3 (b) — compileView agrees with edecision for all variants":
 suite "M3 (c) — plan() edecision is authoritative (no shadow decision field)":
 
   test "plan with empty graph → edNeverBuilt, compileView → cdNeverBuilt":
-    let ep = Entrypoint(path: "tests/unit/test_foo.nim", group: "unit", flags: @[])
+    let ep = testEp("tests/unit/test_foo.nim", group = "unit", flags = @[])
     let p = plan(Config(), @[ep], emptyDepGraph())
     check p.entrypoints.len == 1
     let pep = p.entrypoints[0]
@@ -77,7 +78,7 @@ suite "M3 (c) — plan() edecision is authoritative (no shadow decision field)":
   test "compileView of a plan()'d pep matches what decideCompile returns":
     ## plan() derives edecision from (CompileDecision → toEntrypointDecision).
     ## compileView reverses this derivation.  They must be consistent.
-    let ep = Entrypoint(path: "tests/unit/test_foo.nim", group: "unit", flags: @[])
+    let ep = testEp("tests/unit/test_foo.nim", group = "unit", flags = @[])
     let p = plan(Config(), @[ep], emptyDepGraph())
     let pep = p.entrypoints[0]
     # With empty graph/no binary, decideCompile returns cdNeverBuilt.
@@ -101,16 +102,16 @@ suite "M3 (d) — planview reporting uses edecision exclusively":
       jobs: 1,
       entrypoints: @[
         PlannedEntrypoint(
-          ep: Entrypoint(path: "tests/unit/a.nim", group: "unit", flags: @[]),
+          ep: testEp("tests/unit/a.nim", group = "unit", flags = @[]),
           edecision: edNeverBuilt, reason: "test"),
         PlannedEntrypoint(
-          ep: Entrypoint(path: "tests/unit/b.nim", group: "unit", flags: @[]),
+          ep: testEp("tests/unit/b.nim", group = "unit", flags = @[]),
           edecision: edStale, reason: "test"),
         PlannedEntrypoint(
-          ep: Entrypoint(path: "tests/unit/c.nim", group: "unit", flags: @[]),
+          ep: testEp("tests/unit/c.nim", group = "unit", flags = @[]),
           edecision: edRunFresh, reason: "test"),
         PlannedEntrypoint(
-          ep: Entrypoint(path: "tests/unit/d.nim", group: "unit", flags: @[]),
+          ep: testEp("tests/unit/d.nim", group = "unit", flags = @[]),
           edecision: edCached, reason: "test"),
       ])
     let j = planToJson(plan, @[])

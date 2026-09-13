@@ -27,6 +27,7 @@ import crisol/cachetelemetry # RFC-0005 B2a: TelemetryEvent/InMemorySink
 import crisol/runner          # execute() -- drives a real run directly (no planner)
 import crisol/api             # verifyCachePass/VerifyCache/verifySample/VerifyDivergence
 import "../support/helpers"  # legacySeams
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,7 +35,7 @@ import "../support/helpers"  # legacySeams
 
 proc freshPep(dec: EntrypointDecision; path = "tests/unit/test_x.nim"): PlannedEntrypoint =
   PlannedEntrypoint(
-    ep:        Entrypoint(path: path, group: "unit", flags: @[]),
+    ep:        testEp(path, group = "unit", flags = @[]),
     edecision: dec,
   )
 
@@ -635,14 +636,14 @@ suite "shouldStore — cache-write gate":
     ## rfc-0007 A6a: outcome is derived, not stored — a passing Phase pair
     ## makes outcome(r) == oPassed. `evidence` is now carried ON the result
     ## itself; shouldStore reads it via `runEvidence` (no separate parameter).
-    result = EntrypointResult(ep: Entrypoint(path: "p"))
+    result = EntrypointResult(ep: testEp("p"))
     result.compile = Phase(kind: pkSkipped)
     result.run = Phase(kind: pkRan, res: ProcessResult(
       exit: Exit(kind: ekExited, code: 0), cause: Cause(by: cbProcess),
       evidence: evidence, rusage: none(Rusage), durationUs: 0))
 
   proc failResult(): EntrypointResult =
-    result = EntrypointResult(ep: Entrypoint(path: "p"))
+    result = EntrypointResult(ep: testEp("p"))
     result.compile = Phase(kind: pkSkipped)
     result.run = Phase(kind: pkRan, res: ProcessResult(
       exit: Exit(kind: ekExited, code: 1), cause: Cause(by: cbProcess),
@@ -721,7 +722,7 @@ suite "realSeams — env values enter soundness key (RFC-0004 §Keys)":
     ]
 
     let pep = PlannedEntrypoint(
-      ep: Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[]),
+      ep: testEp("tests/unit/test_x.nim", group = "unit", flags = @[]),
       edecision: edRunFresh)
 
     # RFC-0005 A2b: keyOfProc(ctx, graph) is what the key-derivation tests
@@ -750,7 +751,7 @@ suite "realSeams — env values enter soundness key (RFC-0004 §Keys)":
     ]
 
     let pep = PlannedEntrypoint(
-      ep: Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[]),
+      ep: testEp("tests/unit/test_x.nim", group = "unit", flags = @[]),
       edecision: edRunFresh)
 
     let ctx1 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
@@ -790,7 +791,7 @@ proc samplePassResult(exitCode = 0): CachedResult =
     records: @[], cachedAt: 1_700_000_000'i64)
 
 proc pepAt(path: string; flags: seq[string] = @[]): PlannedEntrypoint =
-  PlannedEntrypoint(ep: Entrypoint(path: path, group: "unit", flags: flags),
+  PlannedEntrypoint(ep: testEp(path, group = "unit", flags = flags),
                     edecision: edRunFresh)
 
 suite "realSeams — explain-miss sidecar (RFC-0005 B1b)":
@@ -1263,7 +1264,7 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
 
     # Run 1: edNeverBuilt -- compiles + runs live (n=1 -> exit 0) + stores
     # via the real cache; also records epPath's closureHash into `g`.
-    let pep1 = PlannedEntrypoint(ep: Entrypoint(path: epPath, group: "unit", flags: @[]),
+    let pep1 = PlannedEntrypoint(ep: testEp(epPath, group = "unit", flags = @[]),
                                  edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
@@ -1274,7 +1275,7 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
 
     # Run 2: edRunFresh -- `g` now has epPath's closureHash, so lookupAtPlan
     # derives the SAME key -> cdmHit (no fresh execution for this run).
-    let pep2 = PlannedEntrypoint(ep: Entrypoint(path: epPath, group: "unit", flags: @[]),
+    let pep2 = PlannedEntrypoint(ep: testEp(epPath, group = "unit", flags = @[]),
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,

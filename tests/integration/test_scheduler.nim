@@ -16,6 +16,7 @@
 import std/[math, os, times, unittest]
 import crisol/types
 import crisol/runner
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,7 +28,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "test", flags: @[])
+  testEp(path, group = "test", flags = @[])
 
 proc outcomes(results: seq[EntrypointResult]): seq[Outcome] =
   ## Extract outcomes in result order (== plan order).

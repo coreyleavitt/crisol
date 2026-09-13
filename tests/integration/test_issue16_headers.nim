@@ -25,6 +25,7 @@ import std/[json, os, osproc, strutils, times, unittest]
 import std/posix as posix_mod
 import crisol
 import crisol/[types, planner, nimprobe, ccprobe, closure]
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers (shapes copied from tests/integration/test_issue11_externals.nim —
@@ -270,8 +271,7 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     # stale), never wholesale, when nothing actually changed.
     var flags: seq[string]
     for f in epNode["flags"]: flags.add f.getStr
-    let ep = Entrypoint(path: epNode["path"].getStr, group: epNode["group"].getStr,
-                        flags: flags)
+    let ep = testEp(epNode["path"].getStr, group = epNode["group"].getStr, flags = flags)
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
     let toolchainFp = toolchainFingerprint(cachedNimFingerprint(), cachedCcVersion())
     let cacheDir = cachePath(ep, cfg, toolchainFp)

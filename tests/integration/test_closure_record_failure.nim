@@ -31,6 +31,7 @@ import std/[options, os, sets, tables, times, unittest]
 import std/posix as posix_mod
 import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache]
 import "../support/helpers"  # legacySeams
+import "../support/testep"
 
 proc fixtureDir(): string =
   currentSourcePath().parentDir.parentDir / "fixtures"
@@ -62,8 +63,7 @@ suite "closure recording failure after a successful compile (issue #5)":
     let cfg = makeCfg(root)
     # Entrypoint OUTSIDE projectRoot (and no depRoots): its closure filters
     # to the empty set, which updateEntry refuses.
-    let ep    = Entrypoint(path: fixtureDir() / "pass_always.nim",
-                           group: "default", flags: @[])
+    let ep    = testEp(fixtureDir() / "pass_always.nim", group = "default", flags = @[])
     let fHash = flagHash(ep.flags)
     let key   = (ep.path, fHash)
 
@@ -132,8 +132,7 @@ suite "closure recording failure blocks the result-cache store (issue #5, R9)":
     defer: removeDir(root)
     let cfg = makeCfg(root)
     # Same out-of-root scenario as above: closure recording fails.
-    let ep = Entrypoint(path: fixtureDir() / "pass_always.nim",
-                        group: "default", flags: @[])
+    let ep = testEp(fixtureDir() / "pass_always.nim", group = "default", flags = @[])
     var graph = initDepGraph("")
     createDir(root / ".crisol")
     doAssert saveDepGraph(graph, cfg)

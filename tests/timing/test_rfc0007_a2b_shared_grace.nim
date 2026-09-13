@@ -33,6 +33,7 @@ import crisol/types
 import crisol/runner
 import crisol/depgraph
 import crisol/process/types as ptypes
+import "../support/testep"
 
 if getEnv("CRISOL_TIMING_TESTS") == "":
   quit(0)
@@ -41,7 +42,7 @@ proc fixtureDir(): string =
   currentSourcePath().parentDir().parentDir() / "fixtures"
 
 proc mkEp(path: string; flags: seq[string]): Entrypoint =
-  Entrypoint(path: path, group: "timing", flags: flags)
+  testEp(path, group = "timing", flags = flags)
 
 const
   N               = 3

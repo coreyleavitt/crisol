@@ -33,10 +33,11 @@
 
 import crisol/types
 import crisol/runner
+import "../support/testep"
 
 proc pep(path: string; edecision: EntrypointDecision): PlannedEntrypoint =
   PlannedEntrypoint(
-    ep: Entrypoint(path: path, group: "unit", flags: @[]),
+    ep: testEp(path, group = "unit", flags = @[]),
     edecision: edecision,
     reason: "cached",
     retries: 2,

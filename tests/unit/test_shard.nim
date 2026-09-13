@@ -30,13 +30,14 @@ import crisol/types
 import crisol/shard
 import crisol/keys
 import crisol/depgraph
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 proc ep(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit", flags: @[])
+  testEp(path, group = "unit", flags = @[])
 
 proc epPaths(eps: seq[Entrypoint]): seq[string] =
   eps.mapIt(it.path)
@@ -358,7 +359,7 @@ suite "shard — composite identity: same path, different flags":
   ## rendered as a string — the same key the ledger uses — to uniquify eps.
 
   proc epWithFlags(path: string; flags: seq[string]): Entrypoint =
-    Entrypoint(path: path, group: "unit", flags: flags)
+    testEp(path, group = "unit", flags = flags)
 
   proc identKey(ep: Entrypoint): string =
     ## The composite key string used by the fixed shard implementation.

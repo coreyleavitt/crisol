@@ -15,6 +15,7 @@
 
 import std/[os, strutils, unittest]
 import crisol/[types, sandbox, cachedispatch, depgraph, keys]
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # 1a — filterEnv injects a pin, overriding the host's own value.
@@ -121,7 +122,7 @@ suite "A0 — key-portability invariance (keyOf, through keyContext/keyOfProc)":
     var g = initDepGraph("2.2.10")
     let pinnedSpec = resolveSandbox(hlIsolated, envPins = @[("USER", "ci-pinned-user")])
     let pep = PlannedEntrypoint(
-      ep: Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[]),
+      ep: testEp("tests/unit/test_x.nim", group = "unit", flags = @[]),
       edecision: edRunFresh)
 
     let envA: seq[(string, string)] = @[

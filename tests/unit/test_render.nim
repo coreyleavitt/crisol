@@ -26,6 +26,7 @@ import crisol/terminal  # for shouldEnableColor
 import crisol/runner  # for summarize
 import crisol/process/types as ptypes  # rfc-0007 A1c: coherent Phase fixtures
 import crisol/cachetelemetry  # RFC-0005 B2b: CacheStats — renderCacheStats
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers — build synthetic results
@@ -37,7 +38,7 @@ import crisol/cachetelemetry  # RFC-0005 B2b: CacheStats — renderCacheStats
 # ---------------------------------------------------------------------------
 
 proc makeEp(path: string; group = "unit"): Entrypoint =
-  Entrypoint(path: path, group: group)
+  testEp(path, group = group)
 
 proc ranPhase(cause: ptypes.Cause; exit: ptypes.Exit): ptypes.Phase =
   ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(

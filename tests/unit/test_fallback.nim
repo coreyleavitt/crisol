@@ -25,13 +25,14 @@ import crisol/types
 import crisol/depgraph
 import crisol/narrow
 import "../support/rfc9_narrow_support"
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 proc ep(path: string; flags: seq[string] = @[]): Entrypoint =
-  Entrypoint(path: path, group: "default", flags: flags)
+  testEp(path, group = "default", flags = flags)
 
 proc emptyGraph(nimVer = "2.2.10"): DepGraph =
   initDepGraph(nimVer)

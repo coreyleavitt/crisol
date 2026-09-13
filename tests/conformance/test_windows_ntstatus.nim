@@ -30,6 +30,7 @@ when defined(windows):
   import ./helpers
   import crisol/types
   import crisol/process/types as ptypes
+  import "../support/testep"
 
   let avBin = compileFixture("access_violation")
 
@@ -56,7 +57,7 @@ when defined(windows):
       # Drive the REAL production outcome() derivation (crisol/types) over a
       # minimal, honestly-populated EntrypointResult, exactly the shape the
       # runner itself builds — not a hand-rolled equivalent.
-      let ep = Entrypoint(path: "tests/fixtures/access_violation.nim", group: "test", flags: @[])
+      let ep = testEp("tests/fixtures/access_violation.nim", group = "test", flags = @[])
       let evidence = Evidence(
         killDomain: report.killDomain,
         tree: treeObservationFor(report.killDomain),

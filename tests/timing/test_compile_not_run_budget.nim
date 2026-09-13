@@ -45,6 +45,7 @@
 import std/[os, times, unittest]
 import crisol/types
 import crisol/runner
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,12 +59,7 @@ proc fixtureDir(): string =
 proc mkEpWithTimeout(path: string; runTimeoutSecs: int): Entrypoint =
   ## Build an Entrypoint carrying a per-entrypoint run timeout, mimicking
   ## what discover() copies from group.timeoutSecs into ep.runTimeoutSecs.
-  Entrypoint(
-    path:           path,
-    group:          "default",
-    flags:          @[],
-    runTimeoutSecs: runTimeoutSecs,
-  )
+  testEp(path, group = "default", flags = @[], runTimeoutSecs = runTimeoutSecs)
 
 proc runWithTimeouts(ep: Entrypoint;
                      compileTimeoutSecs: int): EntrypointResult =

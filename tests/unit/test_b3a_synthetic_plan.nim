@@ -11,6 +11,7 @@
 
 import crisol/types
 import crisol/runner
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -18,7 +19,7 @@ import crisol/runner
 
 proc pep(path: string; retries: int): PlannedEntrypoint =
   PlannedEntrypoint(
-    ep: Entrypoint(path: path, group: "unit", flags: @[]),
+    ep: testEp(path, group = "unit", flags = @[]),
     edecision: edRunFresh,
     reason: "cached",
     retries: retries,

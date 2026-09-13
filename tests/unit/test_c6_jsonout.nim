@@ -16,9 +16,10 @@ import std/[json, strutils, unittest]
 import crisol/types
 import crisol/jsonout
 import crisol/render
+import "../support/testep"
 
 proc makeEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit", flags: @[])
+  testEp(path, group = "unit", flags = @[])
 
 suite "C6 — run/v1 regressions + render":
 

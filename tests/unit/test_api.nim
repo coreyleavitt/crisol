@@ -100,6 +100,7 @@ proc okPhase(code: int = 0): ptypes.Phase =
 
 # Helper: import the test support module (path relative to project root)
 import "../support/helpers"
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Selection constructors
@@ -279,9 +280,9 @@ suite "planTests — failedOnly() narrowing":
       # Seed: test_a failed, test_b passed.
       let results = @[
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"), compile: okPhase(), run: okPhase(1)),
+          ep:      testEp("tests/unit/test_a.nim", group = "unit"), compile: okPhase(), run: okPhase(1)),
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit"), compile: okPhase(), run: okPhase()),
+          ep:      testEp("tests/unit/test_b.nim", group = "unit"), compile: okPhase(), run: okPhase()),
       ]
       let summary = Summary(total: 2, passed: 1, failed: 1)
       seedLastRun(projectRoot, results, summary)
@@ -300,7 +301,7 @@ suite "planTests — failedOnly() narrowing":
       # Seed: everything passed.
       let results = @[
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"), compile: okPhase(), run: okPhase()),
+          ep:      testEp("tests/unit/test_a.nim", group = "unit"), compile: okPhase(), run: okPhase()),
       ]
       let summary = Summary(total: 1, passed: 1)
       seedLastRun(projectRoot, results, summary)
@@ -400,9 +401,9 @@ suite "planTests — changedOnly / failedOrChanged narrowing":
       # Seed: only test_b failed; test_a passed.
       let results = @[
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit"), compile: okPhase(), run: okPhase()),
+          ep:      testEp("tests/unit/test_a.nim", group = "unit"), compile: okPhase(), run: okPhase()),
         EntrypointResult(
-          ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit"), compile: okPhase(), run: okPhase(1)),
+          ep:      testEp("tests/unit/test_b.nim", group = "unit"), compile: okPhase(), run: okPhase(1)),
       ]
       seedLastRun(gitRoot, results, Summary(total: 2, passed: 1, failed: 1))
       # failedOnly → test_b only (1 entrypoint).
@@ -556,7 +557,7 @@ suite "api type surface":
 
 suite "rfc-0007 A1c — runResult / failureLine over a captured run phase":
   test "runResult(r): some(ProcessResult) for a live run (pkRan)":
-    var r = EntrypointResult(ep: Entrypoint(path: "t.nim", group: "unit"))
+    var r = EntrypointResult(ep: testEp("t.nim", group = "unit"))
     r.compile = Phase(kind: pkSkipped)
     r.run = Phase(kind: pkRan, res: ProcessResult(
       exit: Exit(kind: ekSignaled, sig: 11, coreDumped: false),
@@ -571,7 +572,7 @@ suite "rfc-0007 A1c — runResult / failureLine over a captured run phase":
     check failureLine(r) == "crashed: SIGSEGV"
 
   test "failureLine 'killed: ...' for a runner-authored kill (cause.by == cbRunner)":
-    var r = EntrypointResult(ep: Entrypoint(path: "t.nim", group: "unit"))
+    var r = EntrypointResult(ep: testEp("t.nim", group = "unit"))
     r.compile = Phase(kind: pkSkipped)
     r.run = Phase(kind: pkRan, res: ProcessResult(
       exit: Exit(kind: ekSignaled, sig: 15, coreDumped: false),
@@ -584,7 +585,7 @@ suite "rfc-0007 A1c — runResult / failureLine over a captured run phase":
     check failureLine(r) == "killed: runner timeout"
 
   test "failureLine(r) == \"\" for a passing result":
-    var r = EntrypointResult(ep: Entrypoint(path: "t.nim", group: "unit"))
+    var r = EntrypointResult(ep: testEp("t.nim", group = "unit"))
     r.compile = Phase(kind: pkSkipped)
     r.run = Phase(kind: pkRan, res: ProcessResult(
       exit: Exit(kind: ekExited, code: 0),
@@ -972,7 +973,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
 
     # Run 1: edNeverBuilt -- compiles + runs live, stores via the real cache
     # (also promotes the stable binary + records its closure into `g`).
-    let pep1 = PlannedEntrypoint(ep: Entrypoint(path: epPath, group: "unit", flags: @[]),
+    let pep1 = PlannedEntrypoint(ep: testEp(epPath, group = "unit", flags = @[]),
                                  edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
@@ -983,7 +984,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     # Run 2: edRunFresh -- `g` now has epPath's closureHash, so lookupAtPlan
     # derives the SAME key -> cdmHit (a plan-time hit; no fresh execution,
     # no touching of the stable binary either way).
-    let pep2 = PlannedEntrypoint(ep: Entrypoint(path: epPath, group: "unit", flags: @[]),
+    let pep2 = PlannedEntrypoint(ep: testEp(epPath, group = "unit", flags = @[]),
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,

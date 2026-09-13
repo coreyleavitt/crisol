@@ -31,13 +31,14 @@ import crisol/shard
 import crisol/ledger
 import crisol/keys
 import crisol/depgraph  # for flagHash
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers shared across all suites
 # ---------------------------------------------------------------------------
 
 proc ep(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit", flags: @[])
+  testEp(path, group = "unit", flags = @[])
 
 proc epPaths(eps: seq[Entrypoint]): seq[string] =
   eps.mapIt(it.path)

@@ -28,6 +28,7 @@ import std/[options, os, tempfiles, unittest]
 import crisol/[types, config, cachedispatch, resultcache, sandbox, planner, depgraph]
 import crisol/process/types as ptypes
 import "../support/helpers"  # legacySeams
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,7 +44,7 @@ proc freshPep(dec: EntrypointDecision;
               cs:  CacheableState = csDefault;
               path = "tests/unit/test_x.nim"): PlannedEntrypoint =
   PlannedEntrypoint(
-    ep:        Entrypoint(path: path, group: "unit", flags: @[]),
+    ep:        testEp(path, group = "unit", flags = @[]),
     edecision: dec,
     cacheable: cs,
   )
@@ -250,7 +251,7 @@ suite "A9 shouldStore — csFalse blocks write":
     ## (compile skipped, run exited 0) makes outcome(r) == oPassed. `evidence`
     ## is now carried ON the result itself; shouldStore reads it via
     ## `runEvidence` (no separate parameter — see the call sites below).
-    result = EntrypointResult(ep: Entrypoint(path: "p"))
+    result = EntrypointResult(ep: testEp("p"))
     result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     result.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
       exit: ptypes.Exit(kind: ptypes.ekExited, code: 0),
@@ -393,7 +394,7 @@ suite "A9 plan — cacheable threaded to PlannedEntrypoint":
   test "Group.cacheable csFalse → PlannedEntrypoint.cacheable csFalse":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
-    let ep  = Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[])
+    let ep  = testEp("tests/unit/test_x.nim", group = "unit", flags = @[])
     let cfg = buildCfg(csFalse, tmp)
     let rp  = plan(cfg, @[ep], emptyDepGraph())
     check rp.entrypoints.len == 1
@@ -402,7 +403,7 @@ suite "A9 plan — cacheable threaded to PlannedEntrypoint":
   test "Group.cacheable csTrue → PlannedEntrypoint.cacheable csTrue":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
-    let ep  = Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[])
+    let ep  = testEp("tests/unit/test_x.nim", group = "unit", flags = @[])
     let cfg = buildCfg(csTrue, tmp)
     let rp  = plan(cfg, @[ep], emptyDepGraph())
     check rp.entrypoints[0].cacheable == csTrue
@@ -410,7 +411,7 @@ suite "A9 plan — cacheable threaded to PlannedEntrypoint":
   test "Group.cacheable csDefault → PlannedEntrypoint.cacheable csDefault":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
-    let ep  = Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[])
+    let ep  = testEp("tests/unit/test_x.nim", group = "unit", flags = @[])
     let cfg = buildCfg(csDefault, tmp)
     let rp  = plan(cfg, @[ep], emptyDepGraph())
     check rp.entrypoints[0].cacheable == csDefault
@@ -420,7 +421,7 @@ suite "A9 plan — cacheable threaded to PlannedEntrypoint":
     ## lookup falls through to the default and the cacheable is csDefault.
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
-    let ep  = Entrypoint(path: "tests/unit/test_x.nim", group: "orphan", flags: @[])
+    let ep  = testEp("tests/unit/test_x.nim", group = "orphan", flags = @[])
     let cfg = buildCfg(csFalse, tmp)  # "unit" group is csFalse, but ep is in "orphan"
     let rp  = plan(cfg, @[ep], emptyDepGraph())
     check rp.entrypoints[0].cacheable == csDefault
@@ -444,7 +445,7 @@ suite "A9 --force-compile × --no-cache orthogonality":
     var c: Calls
     # Simulate what plan() produces for a forceCompile entry: edStale.
     let pep  = PlannedEntrypoint(
-      ep:        Entrypoint(path: "t.nim", group: "unit", flags: @[]),
+      ep:        testEp("t.nim", group = "unit", flags = @[]),
       edecision: edStale,
       cacheable: csDefault,
     )
@@ -458,7 +459,7 @@ suite "A9 --force-compile × --no-cache orthogonality":
     ## After forceCompile, a live pass DOES get stored (if hermeticity achieved).
     let isoSpec     = resolveSandbox(hlIsolated)
     let fullAchieved = allApplied()
-    var r = EntrypointResult(ep: Entrypoint(path: "t.nim"))
+    var r = EntrypointResult(ep: testEp("t.nim"))
     r.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     r.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
       exit: ptypes.Exit(kind: ptypes.ekExited, code: 0),
@@ -481,7 +482,7 @@ suite "A9 --force-compile × --no-cache orthogonality":
     ## CachePolicy construction AFTER planning.
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
-    let ep  = Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[])
+    let ep  = testEp("tests/unit/test_x.nim", group = "unit", flags = @[])
     let cfg = Config(
       groups: @[Group(name: "unit", globs: @["tests/unit/test_x.nim"])],
       jobs: 1, timeoutSecs: 300, compileTimeoutSecs: 600,
@@ -505,7 +506,7 @@ suite "A9 --force-compile × --no-cache orthogonality":
   test "(c) both: edStale is cdmNotEligible AND shouldStore blocked by noCache":
     var c: Calls
     let pep  = PlannedEntrypoint(
-      ep:        Entrypoint(path: "t.nim", group: "unit", flags: @[]),
+      ep:        testEp("t.nim", group = "unit", flags = @[]),
       edecision: edStale,
       cacheable: csDefault,
     )
@@ -516,7 +517,7 @@ suite "A9 --force-compile × --no-cache orthogonality":
 
     # Store-time: noCache blocks write
     let isoSpec     = resolveSandbox(hlIsolated)
-    var r = EntrypointResult(ep: Entrypoint(path: "t.nim"))
+    var r = EntrypointResult(ep: testEp("t.nim"))
     r.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     r.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
       exit: ptypes.Exit(kind: ptypes.ekExited, code: 0),

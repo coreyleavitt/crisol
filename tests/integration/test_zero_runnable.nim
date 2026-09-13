@@ -20,6 +20,7 @@ import crisol/nimprobe  # for cachedNimFingerprint (the fingerprint runMain seed
 import crisol/planner  # for CrisolProtocolMajor
 
 import crisol/process/types as ptypes
+import "../support/testep"
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -197,7 +198,7 @@ suite "crisol zero-runnable — branch 2: --failed no prior failures":
     # Seed lastrun.json: test_a passed (no failures).
     let results = @[
       EntrypointResult(
-        ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]), durationMs: 10, records: @[],
+        ep:      testEp("tests/unit/test_a.nim", group = "unit", flags = @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase()),
     ]
     persistLastRun(results, Summary(total: 1, passed: 1), cfg)

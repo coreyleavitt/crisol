@@ -19,6 +19,7 @@ import std/[os, posix, strutils, unittest]
 import crisol/[types, runner, planner, depgraph, sandbox, cachedispatch]
 import crisol/process
 import crisol/process/types as ptypes
+import "../support/testep"
 
 proc escapeeMechanismsAvailable(): bool =
   ## rfc-0007 C1a: escapee discovery (`discoverAndReapEscapees`) and the
@@ -69,7 +70,7 @@ proc runSingle(fixtureName, markerName: string; scratchTag: string;
   writeFile(fixt, readFile(fixtureDir() / fixtureName))
 
   let pep = PlannedEntrypoint(
-    ep: Entrypoint(path: fixt, group: "unit", flags: @[]),
+    ep: testEp(fixt, group = "unit", flags = @[]),
     edecision: edNeverBuilt, runTimeoutMs: runTimeoutMs)
   let p = RunPlan(entrypoints: @[pep], jobs: 1)
   var g = emptyDepGraph()

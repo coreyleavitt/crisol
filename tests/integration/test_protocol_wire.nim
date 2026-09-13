@@ -19,6 +19,7 @@ import std/[os, unittest]
 import crisol/types
 import crisol/runner
 import crisol/depgraph
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,7 +31,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "test", flags: @[])
+  testEp(path, group = "test", flags = @[])
 
 proc makeCfg(): Config =
   Config(

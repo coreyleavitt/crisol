@@ -17,6 +17,7 @@ import std/[options, strutils, unittest]
 import crisol/types
 import crisol/discover
 import crisol/render
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,8 +70,8 @@ suite "gateSkipMessages — pure helper":
 suite "C2 selection — gskDefault excludes opt-in":
 
   test "gskDefault: opt-in group entrypoints do NOT appear in run set":
-    let epOptIn    = Entrypoint(path: "tests/smoke/test_s.nim", group: "smoke",       flags: @[])
-    let epDefault  = Entrypoint(path: "tests/unit/test_u.nim",  group: "unit",        flags: @[])
+    let epOptIn    = testEp("tests/smoke/test_s.nim", group = "smoke", flags = @[])
+    let epDefault  = testEp("tests/unit/test_u.nim", group = "unit", flags = @[])
     let ds = toDiscoveredSet(@[epDefault])  # gskDefault discover excludes opt-in
 
     let cfg = makeConfig(@[
@@ -88,7 +89,7 @@ suite "C2 selection — gskNamed":
   test "gskNamed: only the named group is active, opt-in or not":
     # We build the DiscoveredSet manually to reflect what discover() would return
     # for gskNamed(["smoke"]) — i.e. only the smoke entrypoint.
-    let epSmoke = Entrypoint(path: "tests/smoke/test_s.nim", group: "smoke", flags: @[])
+    let epSmoke = testEp("tests/smoke/test_s.nim", group = "smoke", flags = @[])
     let ds = toDiscoveredSet(@[epSmoke])
 
     let cfg = makeConfig(@[
@@ -119,8 +120,8 @@ suite "C2 selection — gskNamed":
     check kind == cekConfig
 
   test "gskNamed with multiple names: both groups active":
-    let epA = Entrypoint(path: "tests/unit/test_a.nim",  group: "unit",        flags: @[])
-    let epB = Entrypoint(path: "tests/smoke/test_b.nim", group: "smoke",       flags: @[])
+    let epA = testEp("tests/unit/test_a.nim", group = "unit", flags = @[])
+    let epB = testEp("tests/smoke/test_b.nim", group = "smoke", flags = @[])
     let ds = toDiscoveredSet(@[epA, epB])
 
     let cfg = makeConfig(@[
@@ -134,8 +135,8 @@ suite "C2 selection — gskNamed":
 suite "C2 selection — gskAll":
 
   test "gskAll includes opt-in group entries":
-    let epUnit  = Entrypoint(path: "tests/unit/test_u.nim",  group: "unit",  flags: @[])
-    let epSmoke = Entrypoint(path: "tests/smoke/test_s.nim", group: "smoke", flags: @[])
+    let epUnit  = testEp("tests/unit/test_u.nim", group = "unit", flags = @[])
+    let epSmoke = testEp("tests/smoke/test_s.nim", group = "smoke", flags = @[])
     # gskAll discover would include both; simulate with toDiscoveredSet.
     let ds = toDiscoveredSet(@[epUnit, epSmoke])
 
@@ -155,8 +156,8 @@ suite "C2 selection — gskAll":
 suite "C2 gate skip — applyGates gatedOut":
 
   test "gated group (env unset) → in gatedOut, not in run":
-    let epGated = Entrypoint(path: "tests/smoke/test_s.nim", group: "smoke", flags: @[])
-    let epRun   = Entrypoint(path: "tests/unit/test_u.nim",  group: "unit",  flags: @[])
+    let epGated = testEp("tests/smoke/test_s.nim", group = "smoke", flags = @[])
+    let epRun   = testEp("tests/unit/test_u.nim", group = "unit", flags = @[])
     let ds = toDiscoveredSet(@[epRun, epGated])
 
     let cfg = makeConfig(@[
@@ -174,7 +175,7 @@ suite "C2 gate skip — applyGates gatedOut":
     check "SMOKE_API_KEY" in gatedOut[0].reason
 
   test "gate open (env set to non-empty) → group runs, gatedOut empty":
-    let epGated = Entrypoint(path: "tests/smoke/test_s.nim", group: "smoke", flags: @[])
+    let epGated = testEp("tests/smoke/test_s.nim", group = "smoke", flags = @[])
     let ds = toDiscoveredSet(@[epGated])
 
     let cfg = makeConfig(@[

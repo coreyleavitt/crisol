@@ -28,6 +28,7 @@ import std/[options, os, sequtils, unittest]
 import crisol/types
 import crisol/runner
 import crisol/config
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -39,7 +40,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEpInGroup(path, groupName: string): Entrypoint =
-  Entrypoint(path: path, group: groupName, flags: @[])
+  testEp(path, group = groupName, flags = @[])
 
 # ---------------------------------------------------------------------------
 # Suite

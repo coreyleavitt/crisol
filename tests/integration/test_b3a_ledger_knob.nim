@@ -21,6 +21,7 @@ import crisol/depgraph
 import crisol/runner
 import crisol/ledger
 import crisol/keys
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,7 +35,7 @@ proc fixtureDir(): string =
 proc stageEp(tmpRoot: string): Entrypoint =
   createDir(tmpRoot / "tests")
   copyFile(fixtureDir() / "pass_always.nim", tmpRoot / "tests" / "pass_always.nim")
-  Entrypoint(path: "tests/pass_always.nim", group: "test", flags: @[])
+  testEp("tests/pass_always.nim", group = "test", flags = @[])
 
 proc makeIsolatedConfig(root: string): Config =
   Config(

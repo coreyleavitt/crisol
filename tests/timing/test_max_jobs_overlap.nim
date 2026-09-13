@@ -23,6 +23,7 @@ import crisol/sandbox
 let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
 
 import crisol/config
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,7 +35,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEpInGroup(path: string; groupName: string): Entrypoint =
-  Entrypoint(path: path, group: groupName, flags: @[])
+  testEp(path, group = groupName, flags = @[])
 
 type Interval = object
   pid:   int

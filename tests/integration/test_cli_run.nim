@@ -30,6 +30,7 @@ import crisol         # imports runMain
 import crisol/types
 import crisol/jsonout
 import crisol/process/types as ptypes
+import "../support/testep"
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -315,10 +316,10 @@ suite "crisol CLI — B7 --failed":
     # Seed: fail_always failed, pass_always passed.
     let results = @[
       EntrypointResult(
-        ep:       Entrypoint(path: failRelPath, group: "paths", flags: @[]), durationMs: 100, records: @[],
+        ep:       testEp(failRelPath, group = "paths", flags = @[]), durationMs: 100, records: @[],
         compile: okPhase(), run: okPhase(1)),
       EntrypointResult(
-        ep:       Entrypoint(path: passRelPath, group: "paths", flags: @[]), durationMs: 50, records: @[],
+        ep:       testEp(passRelPath, group = "paths", flags = @[]), durationMs: 50, records: @[],
         compile: okPhase(), run: okPhase()),
     ]
     let summary = Summary(total: 2, passed: 1, failed: 1)
@@ -376,8 +377,7 @@ suite "crisol CLI — B7 --failed":
     # Seed: a non-existent entrypoint as failed.
     let results = @[
       EntrypointResult(
-        ep:      Entrypoint(path: "tests/fixtures/nonexistent_xyzzy.nim",
-                            group: "paths", flags: @[]), durationMs: 10, records: @[],
+        ep:      testEp("tests/fixtures/nonexistent_xyzzy.nim", group = "paths", flags = @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase(1)),
     ]
     let summary = Summary(total: 1, passed: 0, failed: 1)

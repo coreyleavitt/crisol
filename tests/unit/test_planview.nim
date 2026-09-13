@@ -8,6 +8,7 @@ import std/[json, monotimes, options, os, strutils, unittest]
 import crisol/types
 import crisol/render
 import crisol/planview
+import "../support/testep"
 # Note: Config import not needed — planToJson no longer takes Config
 
 # ---------------------------------------------------------------------------
@@ -18,7 +19,7 @@ proc mkPep(path: string; group: string; d: CompileDecision;
            reason = "r"; runTimeoutMs = 0; maxJobs = none(int)): PlannedEntrypoint =
   ## M3: `decision` field removed; derive edecision from d.
   PlannedEntrypoint(
-    ep: Entrypoint(path: path, group: group, flags: @[]),
+    ep: testEp(path, group = group, flags = @[]),
     reason: reason,
     edecision: (case d
                 of cdNeverBuilt: edNeverBuilt
@@ -31,7 +32,7 @@ proc mkPepEd(path: string; group: string; ed: EntrypointDecision;
   ## Build a PlannedEntrypoint by EntrypointDecision directly (A8 — for edCached
   ## which has no CompileDecision counterpart).  M3: `decision` field removed.
   PlannedEntrypoint(
-    ep: Entrypoint(path: path, group: group, flags: @[]),
+    ep: testEp(path, group = group, flags = @[]),
     edecision: ed, reason: reason)
 
 proc samplePlan(): RunPlan =

@@ -34,6 +34,7 @@ import crisol/types
 import crisol/runner
 import crisol/config
 import crisol/sandbox
+import "../support/testep"
 
 # A6: the live run path is now hermetic by default (env scrub).  These tests
 # spawn overlap_probe, which reads CRISOL_TEST_OVERLAP_FILE from its env — so we
@@ -86,7 +87,7 @@ proc anyOverlap(intervals: seq[Interval]): bool =
   false
 
 proc mkEpInGroup(path, groupName: string; runTimeoutSecs: int = 0): Entrypoint =
-  Entrypoint(path: path, group: groupName, flags: @[], runTimeoutSecs: runTimeoutSecs)
+  testEp(path, group = groupName, flags = @[], runTimeoutSecs = runTimeoutSecs)
 
 # ---------------------------------------------------------------------------
 # Proc 1 — A+C composition: per-group cap + memory gate

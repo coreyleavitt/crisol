@@ -16,6 +16,7 @@ import std/[os, times, unittest]
 import crisol/types   # Outcome, EntrypointResult
 import crisol/runner  # runEntrypoint
 from crisol/process/types as ptypes import nil  # ekExited (Exit.kind)
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -29,7 +30,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc ep(path: string): Entrypoint =
-  Entrypoint(path: path, group: "test", flags: @[])
+  testEp(path, group = "test", flags = @[])
 
 # ---------------------------------------------------------------------------
 # Suite

@@ -33,6 +33,7 @@ import std/[os, times, unittest]
 import std/posix as posix_mod
 import crisol            # imports runMain
 import crisol/[types, runner, depgraph, planner]
+import "../support/testep"
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_a2c_" & tag & "_" &
@@ -66,8 +67,7 @@ suite "rfc-0007 A2c — compile child cwd is projectRoot regardless of the invok
     writeFixtureProject(root)
 
     let cfg = makeCfg(root)
-    let ep = Entrypoint(path: "tests/unit/test_uses_helper.nim", group: "default",
-                        flags: @["--path:src"])
+    let ep = testEp("tests/unit/test_uses_helper.nim", group = "default", flags = @["--path:src"])
 
     let savedCwd = getCurrentDir()
     setCurrentDir(elsewhere)

@@ -82,6 +82,7 @@ import crisol/depgraph
 import crisol/config
 import crisol/runner
 import crisol/process/types as ptypes
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Fixture locations
@@ -309,7 +310,7 @@ suite "rfc9_golden_pin — one fixture run's actual on-disk cache slugs":
                       timeoutSecs: 60, compileTimeoutSecs: 120,
                       maxOutputBytes: 65_536)
     cfg.trackedRoots = initTrackedRoots(scratchRoot, newSeq[tuple[name, native: string]](), ".crisol")
-    let ep = Entrypoint(path: simplePath, group: "default", flags: @[])
+    let ep = testEp(simplePath, group = "default", flags = @[])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")

@@ -16,13 +16,14 @@
 import std/[options, sets, unittest]
 import crisol/types
 import crisol/planner
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 proc mkEp(path: string; flags: seq[string] = @[]): Entrypoint =
-  Entrypoint(path: path, group: "default", flags: flags)
+  testEp(path, group = "default", flags = flags)
 
 proc mkCfg(): Config =
   Config(projectRoot: "/proj", stateDir: ".crisol")

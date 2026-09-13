@@ -12,14 +12,14 @@
 import std/unittest
 import crisol/types
 import crisol/scheduler
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 proc makeEp(runTimeoutSecs: int = 0): Entrypoint =
-  Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[],
-             runTimeoutSecs: runTimeoutSecs)
+  testEp("tests/unit/test_a.nim", group = "unit", flags = @[], runTimeoutSecs = runTimeoutSecs)
 
 proc makeCfg(timeoutSecs: int = 0): Config =
   Config(groups: @[], jobs: 1, timeoutSecs: timeoutSecs,

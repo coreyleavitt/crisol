@@ -30,6 +30,7 @@
 import std/[options, os, sets, strutils, tables, times, unittest]
 import std/posix as posix_mod
 import crisol/[types, runner, depgraph, closure]
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -71,7 +72,7 @@ proc stageEp(root: string; fixtureName = "pass_always.nim"; group = "default";
   ## `stageEp` for the same pattern).
   createDir(root / "tests")
   copyFile(fixtureDir() / fixtureName, root / "tests" / fixtureName)
-  Entrypoint(path: "tests" / fixtureName, group: group, flags: flags)
+  testEp("tests" / fixtureName, group = group, flags = flags)
 
 proc countCFiles(dir: string): int =
   if not dirExists(dir): return 0

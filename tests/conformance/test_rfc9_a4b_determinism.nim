@@ -52,6 +52,7 @@ import crisol/types
 import crisol/paths
 import crisol/depgraph
 import crisol/runner
+import "../support/testep"
 
 proc uniqueTmpDir(tag: string): string =
   result = getTempDir() / ("crisol_a4b_determinism_" & tag & "_" & $getCurrentProcessId())
@@ -118,8 +119,8 @@ proc runDeterminismBody(root: string) =
 
   let cfg      = makeIsolatedConfig(root)
   let pathFlag = "--path:" & (root / "src")
-  let epLower  = Entrypoint(path: "tests/test_lower.nim", group: "default", flags: @[pathFlag])
-  let epUpper  = Entrypoint(path: "tests/test_upper.nim", group: "default", flags: @[pathFlag])
+  let epLower  = testEp("tests/test_lower.nim", group = "default", flags = @[pathFlag])
+  let epUpper  = testEp("tests/test_upper.nim", group = "default", flags = @[pathFlag])
 
   # --- COLD: fresh graph, both entrypoints never built; a REAL compile ---
   var graph = initDepGraph("")

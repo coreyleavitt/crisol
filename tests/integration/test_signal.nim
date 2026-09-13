@@ -20,6 +20,7 @@ import crisol/types
 import crisol/runner
 import crisol/depgraph
 import crisol/sandbox
+import "../support/testep"
 
 # A6: live run path is hermetic by default; allowlist HANG_PID_FILE so the
 # hang_with_pid fixture can announce its grandchild PID to the parent.
@@ -61,7 +62,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "test", flags: @[])
+  testEp(path, group = "test", flags = @[])
 
 # ---------------------------------------------------------------------------
 # Suite 1: SIGINT interrupts execute() and kills all children

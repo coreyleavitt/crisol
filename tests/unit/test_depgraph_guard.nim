@@ -22,6 +22,7 @@ import crisol/types
 import crisol/paths
 import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
 import crisol/depgraph
+import "../support/testep"
 
 proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
   ## RFC-0009 A3c-ii: build a `HashSet[TrackedPath]` via `classify` under a
@@ -171,7 +172,7 @@ suite "recordClosure — recovery policy (R5)":
     cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
 
     var graph = initDepGraph("")
-    let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_ep.nim", group: "t"),
+    let r = recordClosure(graph, cfg, testEp("tests/rec_ep.nim", group = "t"),
                           nc, "rec_ep",
                           protocolMajor = 1, index = buildSourceIndex(cfg))
     check r.ok
@@ -202,7 +203,7 @@ suite "recordClosure — recovery policy (R5)":
                       "priorhash", 1)
     doAssert saveDepGraph(graph, cfg)
 
-    let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_fail.nim", group: "t"),
+    let r = recordClosure(graph, cfg, testEp("tests/rec_fail.nim", group = "t"),
                           nc, "rec_fail",
                           protocolMajor = 1, index = buildSourceIndex(cfg))
     check not r.ok
@@ -232,7 +233,7 @@ suite "recordClosure — recovery policy (R5)":
     createDir(depgraphPath(cfg))
 
     var graph = initDepGraph("")
-    let r = recordClosure(graph, cfg, Entrypoint(path: "tests/rec_persistfail.nim", group: "t"),
+    let r = recordClosure(graph, cfg, testEp("tests/rec_persistfail.nim", group = "t"),
                           nc, "rec_persistfail",
                           protocolMajor = 1, index = buildSourceIndex(cfg))
     check not r.ok

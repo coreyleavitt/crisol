@@ -14,13 +14,14 @@ import std/[options, streams, strutils, unittest, xmlparser, xmltree]
 import crisol/types
 import crisol/junit
 import crisol/process/types as ptypes  # rfc-0007 A1c: coherent Phase fixtures
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
 
 proc makeEp(path: string; group: string = "unit"): Entrypoint =
-  Entrypoint(path: path, group: group, flags: @[])
+  testEp(path, group = group, flags = @[])
 
 proc makeRecord(name: string; status: RecordStatus;
                 msg: string = "";

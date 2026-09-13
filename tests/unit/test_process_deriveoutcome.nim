@@ -12,12 +12,13 @@
 import std/[options, unittest]
 import crisol/types as ctypes
 import crisol/process/types as ptypes
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Fixture builders
 # ---------------------------------------------------------------------------
 
-let anEp = Entrypoint(path: "tests/fixtures/dummy.nim", group: "default", flags: @[])
+let anEp = testEp("tests/fixtures/dummy.nim", group = "default", flags = @[])
 
 proc procResult(exit: Exit; cause: Cause; escapees: seq[ProcSnapshot] = @[]): ProcessResult =
   ProcessResult(

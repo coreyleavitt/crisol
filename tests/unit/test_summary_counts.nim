@@ -15,9 +15,10 @@ import std/[options, unittest]
 import crisol/types
 import crisol/runner  # for summarize
 import crisol/process/types as ptypes
+import "../support/testep"
 
 proc makeEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit")
+  testEp(path, group = "unit")
 
 proc ranPhase(cause: ptypes.Cause; exit: ptypes.Exit): ptypes.Phase =
   ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(

@@ -23,6 +23,7 @@ import std/[os, sets, strutils, unittest]
 import crisol/types
 import crisol/depgraph
 import crisol/runner
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,7 +46,7 @@ proc makeTmpConfig(root: string): Config =
   result.trackedRoots = initTrackedRoots(root, @[], "")
 
 proc makeEp(path: string; flags: seq[string] = @[]): Entrypoint =
-  Entrypoint(path: path, group: "unit", flags: flags)
+  testEp(path, group = "unit", flags = flags)
 
 proc makeBin(config: Config; ep: Entrypoint): string =
   ## Create a real (empty) binary file at the stable bin path; return the full path.

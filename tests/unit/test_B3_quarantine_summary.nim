@@ -20,9 +20,10 @@ import std/[options, unittest]
 import crisol/types
 import crisol/runner  # for summarize
 from crisol/process/types as ptypes import nil
+import "../support/testep"
 
 proc makeEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit")
+  testEp(path, group = "unit")
 
 ## rfc-0007 A1e-i: outcome is derived from compile/run Phase, not stored —
 ## each helper below builds the Phase pair that derives the outcome its name

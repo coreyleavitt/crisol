@@ -56,6 +56,7 @@ import crisol/artifactledger
 import crisol/keys
 import crisol/jsonout  # RunSchemaRevision
 import crisol/ledger
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers — library-call path (behavior 1, OFF; never spawns a worker)
@@ -69,7 +70,7 @@ proc projectRoot(): string =
 const epRelPath = "tests" / "fixtures" / "pass_always.nim"
 
 proc mkEp(): Entrypoint =
-  Entrypoint(path: epRelPath, group: "test", flags: @[])
+  testEp(epRelPath, group = "test", flags = @[])
 
 proc freshStateDir(tag: string): string =
   result = getTempDir() / "crisol_test_measure_gate_" & tag & "_" & $getCurrentProcessId()

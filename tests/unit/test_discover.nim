@@ -11,6 +11,7 @@ import crisol/types
 import crisol/discover
 import crisol/paths
 import crisol/config
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -422,8 +423,8 @@ suite "discover – runTimeoutSecs propagation":
 suite "toDiscoveredSet – test constructor":
   test "toDiscoveredSet builds a DiscoveredSet without file-tree walk":
     let eps = @[
-      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]),
-      Entrypoint(path: "tests/unit/test_b.nim", group: "unit", flags: @[]),
+      testEp("tests/unit/test_a.nim", group = "unit", flags = @[]),
+      testEp("tests/unit/test_b.nim", group = "unit", flags = @[]),
     ]
     let ds = toDiscoveredSet(eps)
 

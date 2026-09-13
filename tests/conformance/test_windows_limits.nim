@@ -48,6 +48,7 @@ when defined(windows):
   import ./helpers
   import crisol/types
   import crisol/process/types as ptypes
+  import "../support/testep"
 
   let cpuSpinBin = compileFixture("cpu_spin")
   let passFastBin = compileFixture("pass_fast")
@@ -84,7 +85,7 @@ when defined(windows):
       # exit code is CI-unknown) — assert enforcement + lsApplied, not a
       # specific code.
       let cause = classifyCause(report.exit, report.stop, Limits(), report.limits)
-      let ep = Entrypoint(path: "tests/fixtures/cpu_spin.nim", group: "test", flags: @[])
+      let ep = testEp("tests/fixtures/cpu_spin.nim", group = "test", flags = @[])
       let evidence = Evidence(
         killDomain: report.killDomain,
         tree: treeObservationFor(report.killDomain),

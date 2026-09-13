@@ -26,6 +26,7 @@ import crisol/depgraph
 import crisol/narrow
 
 import crisol/process/types as ptypes
+import "../support/testep"
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -286,10 +287,10 @@ suite "crisol D5 — --failed --changed union":
     createDir(repo / ".crisol")
     let results = @[
       EntrypointResult(
-        ep:      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[]), durationMs: 10, records: @[],
+        ep:      testEp("tests/unit/test_a.nim", group = "unit", flags = @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase(1)),
       EntrypointResult(
-        ep:      Entrypoint(path: "tests/unit/test_b.nim", group: "unit", flags: @[]), durationMs: 10, records: @[],
+        ep:      testEp("tests/unit/test_b.nim", group = "unit", flags = @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase()),
     ]
     let summary = Summary(total: 2, passed: 1, failed: 1)

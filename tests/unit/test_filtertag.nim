@@ -27,13 +27,14 @@ import crisol/render
 import crisol/jsonout
 import crisol/runner  # for summarize
 import crisol/process/types as ptypes
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 proc makeEp(path: string; group = "unit"): Entrypoint =
-  Entrypoint(path: path, group: group)
+  testEp(path, group = group)
 
 proc taggedRecord(name: string; tags: seq[string];
                   status: RecordStatus = rsPass;

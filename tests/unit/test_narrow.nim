@@ -23,6 +23,7 @@ import crisol/types
 import crisol/depgraph
 import crisol/narrow
 import "../support/rfc9_narrow_support"
+import "../support/testep"
 
 # Real project-root-relative paths that exist in the workspace.
 # isEntryStale checks fileExists on these; using real files keeps entries fresh.
@@ -38,7 +39,7 @@ const kRunner   = "src/crisol/runner.nim"
 # ---------------------------------------------------------------------------
 
 proc ep(path: string; flags: seq[string] = @[]): Entrypoint =
-  Entrypoint(path: path, group: "default", flags: flags)
+  testEp(path, group = "default", flags = flags)
 
 proc mkGraph(nimVer = "2.2.10"): DepGraph =
   initDepGraph(nimVer)

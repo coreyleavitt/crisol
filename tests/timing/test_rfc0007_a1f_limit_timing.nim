@@ -30,6 +30,7 @@ import crisol/runner
 import crisol/depgraph
 import crisol/sandbox
 import crisol/process/types as ptypes
+import "../support/testep"
 
 if getEnv("CRISOL_TIMING_TESTS") == "":
   quit(0)
@@ -44,7 +45,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "test", flags: @[])
+  testEp(path, group = "test", flags = @[])
 
 # ---------------------------------------------------------------------------
 # Suite 1 — SIGXCPU requested+achieved (real CPU burn)

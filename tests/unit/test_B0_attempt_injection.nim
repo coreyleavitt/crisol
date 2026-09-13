@@ -18,6 +18,7 @@
 
 import std/[os, options, osproc, strutils, unittest, tempfiles]
 import crisol/[types, runner, depgraph, sandbox, cachedispatch]
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,12 +45,8 @@ suite "B0 — CRISOL_ATTEMPT injection":
     let stateDir = makeTempStateDir()
     defer: removeDir(stateDir)
 
-    let ep = Entrypoint(
-      path:           probeSrc,  # source file; execute() will compile it
-      group:          "unit",
-      flags:          @[],
-      runTimeoutSecs: 0,
-    )
+    let ep = testEp(probeSrc, # source file; execute() will compile it
+      group = "unit", flags = @[], runTimeoutSecs = 0)
 
     # Build a minimal PlannedEntrypoint with decision=edNeverBuilt (compile+run).
     let pep = PlannedEntrypoint(
@@ -105,7 +102,7 @@ suite "B0 — CRISOL_ATTEMPT injection":
     let probeSrc   = fixtureDir / "attempt_probe.nim"
 
     let res = runEntrypoint(
-      Entrypoint(path: probeSrc, group: "unit", flags: @[], runTimeoutSecs: 0),
+      testEp(probeSrc, group = "unit", flags = @[], runTimeoutSecs = 0),
       compileTimeoutMs = 120_000,
       runTimeoutMs     = 30_000,
       maxOutputBytes   = 65_536,

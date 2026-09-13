@@ -31,6 +31,7 @@ import crisol/depgraph
 import crisol/sandbox
 import crisol/process/types as ptypes
 import crisol         # imports runMain
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,7 +43,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "test", flags: @[])
+  testEp(path, group = "test", flags = @[])
 
 proc expectCoreDumped(): bool =
   ## rfc-0007 A1f: "assert the observation, don't fabricate" — coreDumped

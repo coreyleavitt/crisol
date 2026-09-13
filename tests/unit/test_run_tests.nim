@@ -66,6 +66,7 @@ proc okPhase(code: int = 0): ptypes.Phase =
 
 # Helper: import the test support module
 import "../support/helpers"
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -283,7 +284,7 @@ suite "runTests — S2c structural + zero-runnable":
       writePassFixture(projectRoot / "tests" / "unit", "test_pass.nim")
       # Seed: everything passed.
       let results = @[EntrypointResult(
-        ep:      Entrypoint(path: "tests/unit/test_pass.nim", group: "unit"), compile: okPhase(), run: okPhase())]
+        ep:      testEp("tests/unit/test_pass.nim", group = "unit"), compile: okPhase(), run: okPhase())]
       seedLastRun(projectRoot, results, Summary(total: 1, passed: 1))
       let opts = RunOptions(
         configPath: projectRoot / "crisol.kdl",

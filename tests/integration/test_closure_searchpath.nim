@@ -23,6 +23,7 @@ import std/[os, sets, tables, times, unittest, json, strutils]
 import std/posix as posix_mod
 import crisol/[types, runner, depgraph, narrow, planner]
 import "../support/rfc9_narrow_support"
+import "../support/testep"
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_searchpath_" & tag & "_" &
@@ -84,8 +85,7 @@ switch("path", thisDir())
 """)
 
     let cfg = makeCfg(root)
-    let ep = Entrypoint(path: "tests/sub/test_uses_helper.nim",
-                        group: "default", flags: @[])
+    let ep = testEp("tests/sub/test_uses_helper.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -138,8 +138,7 @@ doAssert xValue() == 5
 """)
 
     var cfg = makeCfg(root)
-    let ep = Entrypoint(path: "tests/unit/deep/t.nim", group: "default",
-                        flags: @["--path:" & (root / "src")])
+    let ep = testEp("tests/unit/deep/t.nim", group = "default", flags = @["--path:" & (root / "src")])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -198,8 +197,7 @@ doAssert depValue() == 7
     var cfg = makeCfg(root)
     cfg.depRoots = @[root / "_deps" / "dep"]
     let epPath = "tests/a/b/c/d/e/f/g/h/test_uses_dep.nim"
-    let ep = Entrypoint(path: epPath, group: "default",
-                        flags: @["--path:" & (root / "_deps" / "dep" / "src")])
+    let ep = testEp(epPath, group = "default", flags = @["--path:" & (root / "_deps" / "dep" / "src")])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -259,8 +257,7 @@ doAssert depValue() == 7
     var cfg = makeCfg(root)
     cfg.depRoots = @[root / "_deps" / "dep"]
     let epPath = "tests/t.nim"
-    let ep = Entrypoint(path: epPath, group: "default",
-                        flags: @["--path:" & (root / "_deps" / "dep" / "src")])
+    let ep = testEp(epPath, group = "default", flags = @["--path:" & (root / "_deps" / "dep" / "src")])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -335,7 +332,7 @@ doAssert libValue() == 9
 """)
 
     let cfg = makeCfg(root)
-    let ep = Entrypoint(path: "tests/t.nim", group: "default", flags: @[])
+    let ep = testEp("tests/t.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -389,7 +386,7 @@ doAssert helperValue() == 11
     createSymlink(root / "other" / "t.nim", root / "tests" / "t.nim")
 
     let cfg = makeCfg(root)
-    let ep = Entrypoint(path: "tests/t.nim", group: "default", flags: @[])
+    let ep = testEp("tests/t.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -443,7 +440,7 @@ doAssert fooValue() == 42
     createSymlink(root / "real_tests", root / "a" / "b" / "tests")
 
     let cfg = makeCfg(root)
-    let ep = Entrypoint(path: "a/b/tests/t.nim", group: "default", flags: @[])
+    let ep = testEp("a/b/tests/t.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -495,7 +492,7 @@ doAssert sibValue() == 7
     createSymlink(realProj, linkProj)
 
     let cfg = makeCfg(linkProj)
-    let ep = Entrypoint(path: "tests/t.nim", group: "default", flags: @[])
+    let ep = testEp("tests/t.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -561,8 +558,7 @@ doAssert depValue() == 7
     # recovered purely via the roots existence-check fallback against
     # projectRoot, not via a depRoot walk.
     let epPath = "tests/a/b/c/d/e/f/g/h/test_uses_dep.nim"
-    let ep = Entrypoint(path: epPath, group: "default",
-                        flags: @["--path:" & (root / "_deps" / "dep" / "src")])
+    let ep = testEp(epPath, group = "default", flags = @["--path:" & (root / "_deps" / "dep" / "src")])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
@@ -619,8 +615,7 @@ doAssert depValue() == 7
 
     var cfg = makeCfg(root)
     let epPath = "tests/t.nim"
-    let ep = Entrypoint(path: epPath, group: "default",
-                        flags: @["--path:" & (root / "_deps" / "dep" / "src")])
+    let ep = testEp(epPath, group = "default", flags = @["--path:" & (root / "_deps" / "dep" / "src")])
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")

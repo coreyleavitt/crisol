@@ -15,6 +15,7 @@ import std/[options, unittest]
 import crisol/[types, sandbox, cachedispatch, resultcache, planner, depgraph]
 import crisol/process/types as ptypes
 import "../support/helpers"  # legacySeams
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -23,7 +24,7 @@ import "../support/helpers"  # legacySeams
 proc freshPep(dec: EntrypointDecision = edRunFresh;
               cs: CacheableState = csDefault): PlannedEntrypoint =
   PlannedEntrypoint(
-    ep: Entrypoint(path: "tests/unit/test_x.nim", group: "unit", flags: @[]),
+    ep: testEp("tests/unit/test_x.nim", group = "unit", flags = @[]),
     edecision: dec,
     cacheable: cs,
   )
@@ -97,7 +98,7 @@ suite "M8 (a) — miss-stored vs miss-unstored via shouldStore":
     ## rfc-0007 A6a: outcome is derived from the Phase pair; `evidence` is
     ## now carried ON the result itself (shouldStore reads it via
     ## `runEvidence` — no separate parameter).
-    result = EntrypointResult(ep: Entrypoint(path: "p"))
+    result = EntrypointResult(ep: testEp("p"))
     result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     result.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
       exit: ptypes.Exit(kind: ptypes.ekExited, code: 0),
@@ -106,7 +107,7 @@ suite "M8 (a) — miss-stored vs miss-unstored via shouldStore":
       durationUs: 0))
 
   proc failRes(): EntrypointResult =
-    result = EntrypointResult(ep: Entrypoint(path: "p"))
+    result = EntrypointResult(ep: testEp("p"))
     result.compile = ptypes.Phase(kind: ptypes.pkSkipped)
     result.run = ptypes.Phase(kind: ptypes.pkRan, res: ptypes.ProcessResult(
       exit: ptypes.Exit(kind: ptypes.ekExited, code: 1),
@@ -193,13 +194,13 @@ suite "M8 (b) — cdmPolicyDisabled vs cdmGroupOptOut distinction":
     ## resolveCacheable's writeOk gate is checked BEFORE outcome/achieved are
     ## ever consulted, so a default-constructed (pkSkipped/pkSkipped) result
     ## is fine here -- shouldStore returns before reaching either check.
-    let r = EntrypointResult(ep: Entrypoint(path: "p"))
+    let r = EntrypointResult(ep: testEp("p"))
     let v = shouldStore(r, isoSpec, 1, globalOn, csFalse)
     check not v.store
     check v.decision == cdmGroupOptOut
 
   test "--no-cache → cdmPolicyDisabled from shouldStore":
-    let r = EntrypointResult(ep: Entrypoint(path: "p"))
+    let r = EntrypointResult(ep: testEp("p"))
     let v = shouldStore(r, isoSpec, 1, globalOff, csDefault)
     check not v.store
     check v.decision == cdmPolicyDisabled

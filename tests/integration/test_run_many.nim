@@ -19,6 +19,7 @@ import std/[options, os, unittest, tempfiles]
 import crisol/types
 import crisol/runner
 from crisol/process/types as ptypes import nil
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,7 +31,7 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "test", flags: @[])
+  testEp(path, group = "test", flags = @[])
 
 proc isolatedStateDir(tag: string): string =
   ## RFC-0009 A5b-i test hygiene: `plan()`'s `decideCompile` calls
@@ -82,8 +83,8 @@ suite "plan — pure annotation of compile decisions":
     defer: removeDir(sd)
     let cfg = Config(jobs: 0, stateDir: sd)   # jobs=0 → resolved to max(1, cpu-2) by plan() (A4)
     let eps = @[
-      Entrypoint(path: "tests/fixtures/pass_always.nim",  group: "g", flags: @[]),
-      Entrypoint(path: "tests/fixtures/fail_always.nim",  group: "g", flags: @[]),
+      testEp("tests/fixtures/pass_always.nim", group = "g", flags = @[]),
+      testEp("tests/fixtures/fail_always.nim", group = "g", flags = @[]),
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     check p.entrypoints.len == 2
@@ -99,7 +100,7 @@ suite "plan — pure annotation of compile decisions":
     defer: removeDir(sd)
     let cfg = Config(jobs: 2, stateDir: sd)
     let eps = @[
-      Entrypoint(path: "does_not_exist_at_all.nim", group: "g", flags: @[]),
+      testEp("does_not_exist_at_all.nim", group = "g", flags = @[]),
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     check p.entrypoints.len == 1
@@ -205,7 +206,7 @@ suite "summarize — pure aggregate counts":
     check s.noTestsRan == false
 
   test "all passed → exitCode 0":
-    let ep0 = Entrypoint(path: "x.nim", group: "g", flags: @[])
+    let ep0 = testEp("x.nim", group = "g", flags = @[])
     let results = @[
       passedResult(ep0),
       passedResult(ep0),
@@ -216,7 +217,7 @@ suite "summarize — pure aggregate counts":
     check exitCode(s) == 0
 
   test "one killed → exitCode 1":
-    let ep0 = Entrypoint(path: "x.nim", group: "g", flags: @[])
+    let ep0 = testEp("x.nim", group = "g", flags = @[])
     let results = @[
       passedResult(ep0),
       killedResult(ep0),
@@ -226,7 +227,7 @@ suite "summarize — pure aggregate counts":
     check exitCode(s) == 1
 
   test "one crashed → exitCode 1":
-    let ep0 = Entrypoint(path: "x.nim", group: "g", flags: @[])
+    let ep0 = testEp("x.nim", group = "g", flags = @[])
     let results = @[
       crashedResult(ep0),
     ]

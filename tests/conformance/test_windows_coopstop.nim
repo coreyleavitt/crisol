@@ -42,6 +42,7 @@ when defined(windows):
   import ./helpers
   import crisol/types
   import crisol/process/types as ptypes
+  import "../support/testep"
 
   let ctrlBreakBin = compileFixture("ctrl_break_handler")
   let detachBin    = compileFixture("detach_console")
@@ -68,7 +69,7 @@ when defined(windows):
     ## minimal, honestly-populated EntrypointResult — exactly the shape the
     ## runner itself builds — not a hand-rolled equivalent (mirrors
     ## test_windows_ntstatus.nim).
-    let ep = Entrypoint(path: epPath, group: "test", flags: @[])
+    let ep = testEp(epPath, group = "test", flags = @[])
     let cause = classifyCause(report.exit, report.stop, Limits(), report.limits)
     let evidence = Evidence(
       killDomain: report.killDomain,

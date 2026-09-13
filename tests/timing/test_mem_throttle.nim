@@ -32,6 +32,7 @@ let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
 
 import crisol/config
 import crisol/jsonout
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Helpers (shared with test_max_jobs_overlap)
@@ -77,7 +78,7 @@ proc anyOverlap(intervals: seq[Interval]): bool =
   false
 
 proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "default", flags: @[])
+  testEp(path, group = "default", flags = @[])
 
 proc runWithMemConfig(eps: seq[Entrypoint];
                       memBudgetMb: Option[int];

@@ -41,6 +41,7 @@
 import std/[os, strutils, unittest]
 import std/posix
 import crisol/[types, runner, depgraph, sandbox]
+import "../support/testep"
 
 # ---------------------------------------------------------------------------
 # Fixture path helper
@@ -50,7 +51,7 @@ proc fixtureDir(): string =
   currentSourcePath().parentDir().parentDir() / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit", flags: @[])
+  testEp(path, group = "unit", flags = @[])
 
 proc isProcessDead(pid: int; timeoutMs: int = 2000): bool =
   ## Poll /proc/<pid>/stat for up to timeoutMs ms; return true iff the process
