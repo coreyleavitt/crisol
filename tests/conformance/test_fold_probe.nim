@@ -17,7 +17,7 @@
 ## std/unittest — no other `crisol/*` surface, matching this directory's
 ## D2a-6 pattern.
 
-import std/[os, unittest]
+import std/[options, os, unittest]
 import crisol/paths
 
 proc isCaseInsensitiveVolume(dir: string): bool =
@@ -46,7 +46,7 @@ suite "RFC-0009 A1 — probeFoldPolicy real-volume runtime evidence":
       let stateDir = root / ".crisol-state"
       let policy = probeFoldPolicy(root, stateDir)
       echo "FOLD-PROBE OBSERVATION: probeFoldPolicy(", root, ") = ", $policy
-      check policy == fpAsciiLower
+      check policy == some(fpAsciiLower)
 
 when isMainModule:
   echo "test_fold_probe done"

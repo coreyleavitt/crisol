@@ -85,7 +85,7 @@ group "unit" {
     let r = captureStdout(@["run", "--config", cfgPath, "--jobs", "1", "--json"])
     check r.code == 0
     let doc = parseJson(r.stdout)
-    check doc["schemaRevision"].getInt == 25
+    check doc["schemaRevision"].getInt == 26
 
     # RED before wiring: `doc["trackedRoots"]` renders the jsonout
     # zero-value default (project only, dep root silently dropped) because

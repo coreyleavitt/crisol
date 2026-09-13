@@ -261,7 +261,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 25
+const RunSchemaRevision* = 26
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -629,6 +629,18 @@ const RunSchemaRevision* = 25
   ##                     impacts) is named under -- that PRODUCER lands in a
   ##                     later slice (A3d-iv); this slice reserves the
   ##                     revision number and lands the `trackedRoots` array only.
+  ##   rev 26 (RFC-0009 A-degraded D6) -- top-level `degraded` object:
+  ##                     `{"reason": <string>}`, PRESENT ONLY when
+  ##                     `trackedRoots.degraded` is true (the fold-policy
+  ##                     probe genuinely failed for some tracked root, §3)
+  ##                     -- OMITTED entirely otherwise, not emitted as a
+  ##                     `null`/empty placeholder, so a healthy run's
+  ##                     document is byte-identical to a pre-rev-26 one
+  ##                     except for the revision number itself (same
+  ##                     presence-gating posture as `cacheStats`/`keyDiff`
+  ##                     above). `reason` is `trackedRoots.degradedReason`
+  ##                     verbatim (D2's semicolon-joined, root-naming
+  ##                     message) -- never empty when the key is present.
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -964,6 +976,13 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   result["memThrottledSlots"] = newJInt(memThrottledSlots)  # S2a schema field; S6b populates
   result["lateOrphansReaped"] = newJInt(lateOrphansReaped)  # rev 24 (rfc-0007 B1, §3)
   result["trackedRoots"] = trackedRootsToJson(trackedRoots)  # rev 25 (RFC-0009 A2)
+  # rev 26 (RFC-0009 A-degraded D6): degraded evidence, PRESENT ONLY when
+  # this run's trackedRoots is degraded -- OMITTED (not null/empty) on a
+  # healthy run, so healthy-run JSON stays byte-stable except the revision.
+  if trackedRoots.degraded:
+    let degradedNode = newJObject()
+    degradedNode["reason"] = newJString(trackedRoots.degradedReason)
+    result["degraded"] = degradedNode
   result["warnings"]         = warningsToJsonArray(warnings)
   result["regressions"]      = regressionsNode  # C6: empty when perf-check disabled
   if compileBlock != nil:

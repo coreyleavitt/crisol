@@ -108,7 +108,7 @@ suite "B1c CLI — --explain-miss over --json: kcFlags on a flag change":
 
     # stdout stays parseable JSON even with the flag on.
     let doc = parseJson(r.stdout)
-    check doc["schemaRevision"].getInt == 25
+    check doc["schemaRevision"].getInt == 26
     let eps = doc["entrypoints"]
     check eps.len == 1
     check eps[0].hasKey("keyDiff")

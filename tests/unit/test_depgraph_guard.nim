@@ -17,7 +17,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_depgraph_guard.nim
 
-import std/[json, os, sets, strutils, tables, unittest]
+import std/[json, options, os, sets, strutils, tables, unittest]
 import crisol/types
 import crisol/paths
 import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
@@ -80,21 +80,21 @@ proc graphRoot(tag: string): string =
   removeDir(result)
   createDir(result / ".crisol")
 
-proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): FoldPolicy =
+proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): Option[FoldPolicy] =
   ## RFC-0009 A3c-i: inject a FIXED policy for every root, bypassing the
   ## real OS probe entirely (see MEMORY: never hardcode `foldPolicy ==
   ## fpNone` against the real probe — this dev container is case-sensitive
   ## ext4, so a real probe never returns fpAsciiLower locally). Mirrors
   ## tests/unit/test_paths.nim's own `fixedProbe`.
-  result = proc (rootAbs, stateDir: string): FoldPolicy = policy
+  result = proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(policy)
 
-proc probeByHint(hint: string; hintPolicy, otherPolicy: FoldPolicy): proc (rootAbs, stateDir: string): FoldPolicy =
+proc probeByHint(hint: string; hintPolicy, otherPolicy: FoldPolicy): proc (rootAbs, stateDir: string): Option[FoldPolicy] =
   ## Inject DIFFERING policies per root, discriminated by a substring of the
   ## root's native path (`hint`) — lets one test prove the project root and
   ## a dep root each keep their OWN persisted policy, without depending on
   ## call order.
-  result = proc (rootAbs, stateDir: string): FoldPolicy =
-    if hint in rootAbs: hintPolicy else: otherPolicy
+  result = proc (rootAbs, stateDir: string): Option[FoldPolicy] =
+    some(if hint in rootAbs: hintPolicy else: otherPolicy)
 
 suite "depgraph load guards (issue #5 migration)":
 
@@ -268,6 +268,19 @@ suite "saveDepGraph — return value (issue #13.3)":
     g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
     check saveDepGraph(g, cfg)
     check fileExists(depgraphPath(cfg))
+
+  test "RFC-0009 A-degraded (D5): returns false and writes nothing at all when config.trackedRoots.degraded, even with no obstruction present":
+    let root = graphRoot("savefail_degraded")
+    defer: removeDir(root)
+    var roots = default(TrackedRoots)
+    roots.degraded = true
+    roots.degradedReason = "fold-policy probe failed for root '' (" & root & ")"
+    let cfg = Config(projectRoot: root, stateDir: ".crisol", trackedRoots: roots)
+
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    check not saveDepGraph(g, cfg)
+    check not fileExists(depgraphPath(cfg))
 
 # ---------------------------------------------------------------------------
 # depgraph load provenance — a discarded depgraph must be a visible,

@@ -47,8 +47,9 @@ suite "C6 — run/v1 regressions + render":
     ## rfc-0005 code-review R2-T8b bumped 22->23 (`cacheStats.trustRejects`/
     ## `cacheStats.corruptReads`); rfc-0007 B1 bumped 23->24 (top-level
     ## `lateOrphansReaped`); RFC-0009 A2 bumped 24->25 (top-level
-    ## `trackedRoots` array).
-    check RunSchemaRevision == 25
+    ## `trackedRoots` array); RFC-0009 A-degraded D6 bumped 25->26 (top-level
+    ## `degraded` object, present only when `trackedRoots.degraded`).
+    check RunSchemaRevision == 26
 
   test "regressions array present and empty when no regressions":
     let results = @[

@@ -1393,7 +1393,7 @@ suite "jsonout - loadLastRun (B7)":
     let jsonDoc = """{"schema":"crisol/run/v2","summary":{"total":1,"counts":{"passed":0,"exitNonZero":1,"compileFailed":0,"timedOut":0,"signaled":0,"spawnError":0,"killed":0,"crashed":0},"flaky":0,"quarantined":0,"notStarted":0,"noTestsRan":false},"entrypoints":[{"path":"tests/unit/Foo.nim","group":"unit","outcome":"exitNonZero","records":[]}]}"""
     writeFile(tmpDir / stateDir / "lastrun.json", jsonDoc)
 
-    proc forcedLower(rootAbs, sd: string): FoldPolicy = fpAsciiLower
+    proc forcedLower(rootAbs, sd: string): Option[FoldPolicy] = some(fpAsciiLower)
     var cfg = makeCfg(tmpDir, stateDir)
     cfg.trackedRoots = initTrackedRoots(tmpDir, @[], stateDir, forcedLower)
 
@@ -1730,8 +1730,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 25 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors; rev 23: rfc-0005 code-review R2-T8b cacheStats.trustRejects/corruptReads; rev 24: rfc-0007 B1 top-level lateOrphansReaped; rev 25: RFC-0009 A2 top-level trackedRoots array)":
-    check RunSchemaRevision == 25
+  test "RunSchemaRevision is 26 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors; rev 23: rfc-0005 code-review R2-T8b cacheStats.trustRejects/corruptReads; rev 24: rfc-0007 B1 top-level lateOrphansReaped; rev 25: RFC-0009 A2 top-level trackedRoots array; rev 26: RFC-0009 A-degraded D6 top-level degraded object)":
+    check RunSchemaRevision == 26
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default
@@ -1859,8 +1859,8 @@ suite "jsonout - RFC-0009 A2: top-level trackedRoots evidence":
   test "a real TrackedRoots with configured deps renders project + each dep, name+foldPolicy":
     # Injected probe (paths.nim §3): fixes a deterministic FoldPolicy per
     # root with no real filesystem/Windows round-trip needed.
-    proc fixedPolicy(rootAbs, stateDir: string): FoldPolicy =
-      if rootAbs.endsWith("dep-insensitive"): fpAsciiLower else: fpNone
+    proc fixedPolicy(rootAbs, stateDir: string): Option[FoldPolicy] =
+      some(if rootAbs.endsWith("dep-insensitive"): fpAsciiLower else: fpNone)
 
     let roots = initTrackedRoots(
       "/tmp/rfc9-a2-jsonout-project",
@@ -1881,7 +1881,33 @@ suite "jsonout - RFC-0009 A2: top-level trackedRoots evidence":
 
   test "toJsonString threads trackedRoots through identically to toJson":
     let roots = initTrackedRoots("/tmp/rfc9-a2-jsonout-project2", @[], "",
-      proc (rootAbs, stateDir: string): FoldPolicy = fpAsciiLower)
+      proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(fpAsciiLower))
     let s = toJsonString(syntheticResults(), syntheticSummary(), trackedRoots = roots)
     let node = parseJson(s)
     check node["trackedRoots"][0]["foldPolicy"].getStr == "asciiLower"
+
+# ---------------------------------------------------------------------------
+# RFC-0009 A-degraded D6 -- top-level `degraded` object (RunSchemaRevision 26)
+# ---------------------------------------------------------------------------
+
+suite "jsonout - RFC-0009 A-degraded D6: top-level degraded evidence":
+
+  test "a healthy (non-degraded) trackedRoots omits the degraded key entirely":
+    let node = toJson(syntheticResults(), syntheticSummary())
+    check not node.hasKey("degraded")
+
+  test "a degraded trackedRoots emits {\"degraded\": {\"reason\": ...}}":
+    var roots = default(TrackedRoots)
+    roots.degraded = true
+    roots.degradedReason = "fold-policy probe failed for root '' (/tmp/rfc9-degraded-jsonout)"
+    let node = toJson(syntheticResults(), syntheticSummary(), trackedRoots = roots)
+    require node.hasKey("degraded")
+    check node["degraded"]["reason"].getStr == roots.degradedReason
+
+  test "toJsonString threads the degraded object through identically to toJson":
+    var roots = default(TrackedRoots)
+    roots.degraded = true
+    roots.degradedReason = "fold-policy probe failed for root 'dep' (/tmp/dep)"
+    let s = toJsonString(syntheticResults(), syntheticSummary(), trackedRoots = roots)
+    let node = parseJson(s)
+    check node["degraded"]["reason"].getStr == roots.degradedReason

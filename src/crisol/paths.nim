@@ -89,6 +89,19 @@ type
     ## construction only via `initTrackedRoots`.
     fproject: NativeRoot    ## rootTag 0.
     fdeps: seq[NativeRoot]  ## rootTag 1..deps.len, by configured name/order.
+    degraded*: bool         ## RFC-0009 A-degraded (D2): true iff ANY root's
+                            ## fold-policy probe genuinely failed (`none`) at
+                            ## construction time. One root's failure degrades
+                            ## the WHOLE run — every degraded-run-aware
+                            ## consumer (narrowing, cache, dep-graph persist)
+                            ## reads this single flag. Orthogonal to
+                            ## `populated()` (that means "roots resolved at
+                            ## all"; this means "resolved, but at least one
+                            ## probe answer is unknown").
+    degradedReason*: string ## human-readable, semicolon-joined reason(s)
+                            ## naming every root whose probe failed — "" iff
+                            ## not degraded. Surfaced in `--json` evidence
+                            ## (a later slice) and safe to log as-is.
 
   CacheKeyPath* = distinct string
     ## keyBytes' return type: canonical, UNFOLDED cache-key bytes. A distinct
@@ -601,7 +614,7 @@ proc sameVolume(a, b: string): bool =
   let db = deviceIdOf(b)
   da.isSome and db.isSome and da.get == db.get
 
-proc createAndStatFallback(rootAbs, stateDir: string): FoldPolicy =
+proc createAndStatFallback(rootAbs, stateDir: string): Option[FoldPolicy] =
   ## LAST RESORT, only if the OS query is unsupported and the read-only
   ## fallback found no entry to test against (an empty root): a probe-file
   ## pair whose name carries a per-PROCESS-unique suffix — never a fixed
@@ -609,19 +622,27 @@ proc createAndStatFallback(rootAbs, stateDir: string): FoldPolicy =
   ## false case-sensitive read. Housed in `stateDir` IFF stateDir is on the
   ## same volume as `rootAbs`; otherwise an ignored dot-name file directly
   ## in `rootAbs`, removed after.
+  ##
+  ## RFC-0009 A-degraded (D1): `none` means the probe GENUINELY failed (the
+  ## `writeFile` itself raised) — distinct from a definitive `some(fpNone)`
+  ## answer (the write succeeded and the case-flipped spelling was simply
+  ## absent, a legitimate case-sensitive-volume verdict). Conflating the two
+  ## under a bare `fpNone` return (the pre-D1 shape) hid a genuine probe
+  ## failure behind the same value a real case-sensitive volume produces —
+  ## the bug this Option-typed return exists to fix.
   let unique = "crisol_fold_probe_" & $getCurrentProcessId()
   let useStateDir = stateDir.len > 0 and sameVolume(rootAbs, stateDir)
   let dir = if useStateDir: stateDir else: rootAbs
   let baseName = if useStateDir: unique & ".tmp" else: "." & unique & ".tmp"
   let lowerPath = dir / baseName
   let upperPath = dir / flipAsciiCase(baseName)
-  result = fpNone
+  result = none(FoldPolicy)
   try:
     createDir(dir)
     writeFile(lowerPath, "")
-    result = if fileExists(upperPath): fpAsciiLower else: fpNone
+    result = some(if fileExists(upperPath): fpAsciiLower else: fpNone)
   except OSError:
-    result = fpNone
+    result = none(FoldPolicy)
   finally:
     try: removeFile(lowerPath)
     except OSError: discard
@@ -629,7 +650,7 @@ proc createAndStatFallback(rootAbs, stateDir: string): FoldPolicy =
       if fileExists(upperPath): removeFile(upperPath)
     except OSError: discard
 
-proc probeFoldPolicy*(rootAbs: string; stateDir: string): FoldPolicy =
+proc probeFoldPolicy*(rootAbs: string; stateDir: string): Option[FoldPolicy] =
   ## 1. OS QUERY FIRST (authoritative; rarely fails; NEVER touches disk).
   ## 2. READ-ONLY FALLBACK on query failure.
   ## 3. CREATE-AND-STAT, only if (1) is unsupported and (2) found no entry
@@ -637,17 +658,21 @@ proc probeFoldPolicy*(rootAbs: string; stateDir: string): FoldPolicy =
   ## Injectable past this proc entirely: `initTrackedRoots`'s `probe`
   ## parameter lets a test fix a FoldPolicy directly, so fold semantics are
   ## unit-testable on Linux CI without a Windows round-trip.
+  ##
+  ## RFC-0009 A-degraded (D1): `none` means every stage genuinely failed —
+  ## the run is DEGRADED (see `initTrackedRoots`). `some(fpNone)` /
+  ## `some(fpAsciiLower)` are both definitive, non-degraded answers.
   let osAnswer = osQueryFoldPolicy(rootAbs)
-  if osAnswer.isSome: return osAnswer.get
+  if osAnswer.isSome: return osAnswer
   let roAnswer = readOnlyFallback(rootAbs)
-  if roAnswer.isSome: return roAnswer.get
+  if roAnswer.isSome: return roAnswer
   createAndStatFallback(rootAbs, stateDir)
 
 # ---------------------------------------------------------------------------
 # initTrackedRoots — eager root construction, per-process memoized probe.
 # ---------------------------------------------------------------------------
 
-type FoldProbe* = proc (rootAbs, stateDir: string): FoldPolicy
+type FoldProbe* = proc (rootAbs, stateDir: string): Option[FoldPolicy]
   ## The §3 injectable fold-policy probe. Defaults everywhere to
   ## `probeFoldPolicy` (the real per-volume probe); an explicitly-injected
   ## non-default probe is the Linux-testability seam that lets a test force a
@@ -657,14 +682,22 @@ type FoldProbe* = proc (rootAbs, stateDir: string): FoldPolicy
   ## both the graph a real `runTests` PERSISTS and any later `loadDepGraph`
   ## validation of that graph's header (RFC-0009 A3c-i) — not just a single
   ## hand-built `initTrackedRoots` call.
+  ##
+  ## RFC-0009 A-degraded (D1): `none` is a GENUINE probe failure — the run is
+  ## degraded (`TrackedRoots.degraded`); `some(policy)` is a definitive
+  ## answer, whichever policy it names.
 
-var probeMemo: Table[string, FoldPolicy]
+var probeMemo: Table[string, Option[FoldPolicy]]
   ## Per-process memo keyed by canonical root abs path — Config is built
   ## hundreds of times across the test suite, so the probe is a per-process,
-  ## per-root cost paid once, never once per Config construction.
+  ## per-root cost paid once, never once per Config construction. Memoizes
+  ## BOTH a definitive `some` answer and a genuine `none` failure (D1) — a
+  ## degraded root stays degraded for the rest of this process, never
+  ## silently re-probed into a lucky-second-try `some`.
 
 proc memoizedProbe(rootAbs, stateDir: string;
-                    probe: proc (rootAbs, stateDir: string): FoldPolicy): FoldPolicy =
+                    probe: proc (rootAbs, stateDir: string): Option[FoldPolicy]):
+                    Option[FoldPolicy] =
   ## The memo is a production hot-path optimization for the DEFAULT probe
   ## ONLY. An explicitly-injected non-default probe (the §3 Linux-testability
   ## seam) BYPASSES the memo entirely — both read and write — so an injected
@@ -689,7 +722,7 @@ proc safeExpandFilename(p: string): string =
 proc initTrackedRoots*(projectNative: string;
                         deps: seq[tuple[name, native: string]];
                         stateDir: string;
-                        probe: proc (rootAbs, stateDir: string): FoldPolicy =
+                        probe: proc (rootAbs, stateDir: string): Option[FoldPolicy] =
                           probeFoldPolicy): TrackedRoots =
   ## Builds project + each dep NativeRoot, probing EAGERLY here — not lazily
   ## on first comparison — backed by a per-process memo keyed by canonical
@@ -697,9 +730,25 @@ proc initTrackedRoots*(projectNative: string;
   ## legitimate cwd read for `projectRoot` resolution is config.nim's job,
   ## captured once before this is ever called); `nativeCanonicalize` still
   ## lexically normalizes it. Each dep's relative-path base is `projectAbs`.
+  ##
+  ## RFC-0009 A-degraded (D2): a `none` probe answer for ANY root (project or
+  ## dep) sets that root's `foldPolicy = fpNone` (folding still uses the safe
+  ## no-fold pole for the rest of THIS degraded run — it never aliases
+  ## distinct files) and marks the WHOLE `TrackedRoots.degraded = true`, with
+  ## `degradedReason` naming every such root (semicolon-joined if more than
+  ## one).
   let projectAbs = nativeCanonicalize(projectNative, projectNative).abs
   let projectReal = safeExpandFilename(projectAbs)
-  let projectPolicy = memoizedProbe(projectAbs, stateDir, probe)
+  let projectAnswer = memoizedProbe(projectAbs, stateDir, probe)
+  var degraded = false
+  var reasons: seq[string] = @[]
+  let projectPolicy =
+    if projectAnswer.isSome:
+      projectAnswer.get
+    else:
+      degraded = true
+      reasons.add "fold-policy probe failed for root 'project' (" & projectAbs & ")"
+      fpNone
   let projectRoot = NativeRoot(abs: projectAbs, realAbs: projectReal,
                                 foldPolicy: projectPolicy, name: "")
 
@@ -707,8 +756,16 @@ proc initTrackedRoots*(projectNative: string;
   for (depName, depNative) in deps:
     let depAbs = nativeCanonicalize(depNative, projectAbs).abs
     let depReal = safeExpandFilename(depAbs)
-    let depPolicy = memoizedProbe(depAbs, stateDir, probe)
+    let depAnswer = memoizedProbe(depAbs, stateDir, probe)
+    let depPolicy =
+      if depAnswer.isSome:
+        depAnswer.get
+      else:
+        degraded = true
+        reasons.add "fold-policy probe failed for root '" & depName & "' (" & depAbs & ")"
+        fpNone
     depRoots.add NativeRoot(abs: depAbs, realAbs: depReal,
                              foldPolicy: depPolicy, name: depName)
 
-  TrackedRoots(fproject: projectRoot, fdeps: depRoots)
+  TrackedRoots(fproject: projectRoot, fdeps: depRoots,
+               degraded: degraded, degradedReason: reasons.join("; "))

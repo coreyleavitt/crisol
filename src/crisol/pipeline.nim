@@ -138,8 +138,16 @@ proc buildRunPlan*(
   #   both       → UNION: an entrypoint runs if EITHER criterion includes it
   #                (conservative — intersection could miss a newly broken
   #                 entrypoint absent from the prior run).
+  # RFC-0009 A-degraded (D3): a degraded run (some root's fold-policy probe
+  # genuinely failed) forces the FULL set, skipping narrowing entirely —
+  # overriding useFailed/useChanged/both alike. `--failed`'s keys are
+  # (TrackedPath, group) pairs from a PRIOR run; joining them under a
+  # safe-pole fpNone this run could silently DROP a last-run-failed
+  # entrypoint whose persisted spelling case-differs post-rename (an unsound
+  # miss). Full run = sound over-selection, the same posture an absent dep
+  # graph already takes. Shard/order still run after (pessimize only).
   var runnable = gated.run
-  if useFailed or useChanged:
+  if (useFailed or useChanged) and not cfg.trackedRoots.degraded:
     let failedNarrowed =
       if useFailed:
         gated.run.filterIt((tp: it.tp, group: it.group) in failedKeys)  # RFC-0009 A3d-i: fold-aware failed-key membership (TrackedPath)

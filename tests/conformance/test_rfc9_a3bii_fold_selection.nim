@@ -179,7 +179,7 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   discard git(repo, "add -A")
   discard git(repo, "commit -q -m initial")
 
-  proc forcedProbe(rootAbs, stateDir: string): FoldPolicy = forcedPolicy
+  proc forcedProbe(rootAbs, stateDir: string): Option[FoldPolicy] = some(forcedPolicy)
 
   # The forced probe (mode 1) must govern the ENTIRE run — RUN 1's PERSIST as
   # well as RUN 2's LOAD — because A3c-i now records each root's fold policy in
@@ -209,7 +209,7 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
     # case-insensitive legs" claim.
     let stateDirAbs = repo / ".crisol"
     let realAnswer = probeFoldPolicy(repo, stateDirAbs)
-    check realAnswer == expectedPolicy
+    check realAnswer == some(expectedPolicy)
     check r1.trackedRoots.project.foldPolicy == expectedPolicy
 
   # Case-divergence: a COMMITTED rename (git mv X tmp && git mv tmp Y, one

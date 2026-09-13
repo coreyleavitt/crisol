@@ -24,8 +24,8 @@
 import std/[unittest, options, os, strutils, json]
 import crisol/paths
 
-proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): FoldPolicy =
-  result = proc (rootAbs, stateDir: string): FoldPolicy = policy
+proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): Option[FoldPolicy] =
+  result = proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(policy)
 
 proc rootsWith(projectAbs: string; policy: FoldPolicy;
                deps: seq[tuple[name, native: string]] = @[]): TrackedRoots =

@@ -1293,7 +1293,7 @@ block test_configured_cache_rejects_root_equal_to_state_dir:
 # and on a real case-insensitive volume (per [[rfc0009-macos-test-gotchas]]).
 # ---------------------------------------------------------------------------
 
-proc forcedFpAsciiLowerProbe(rootAbs, stateDir: string): FoldPolicy = fpAsciiLower
+proc forcedFpAsciiLowerProbe(rootAbs, stateDir: string): Option[FoldPolicy] = some(fpAsciiLower)
 
 block test_configured_cache_rejects_case_variant_root_inside_state_dir_under_folding_policy:
   # Pre-A5c this was the fail-OPEN bug: a raw byte `startsWith` never

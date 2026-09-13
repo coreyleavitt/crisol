@@ -1316,7 +1316,15 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # DefaultMaxCacheEntries) so the live store path's soft cap and `clean`'s
   # GC target agree — one knob, one resolution rule, both readers of it.
   var rt: CacheRuntime
-  if not opts.noCache:
+  # RFC-0009 D4: a degraded run (cfg.trackedRoots.degraded — the fold-policy
+  # probe genuinely failed for some root, A-degraded D2) bypasses the cache
+  # pipeline ENTIRELY: no CacheRuntime is constructed, so nothing below can
+  # store to or read from it. Cold but never wrong (§3) — mirrors the
+  # `not opts.noCache` pole exactly; both gates below (cacheCtx's
+  # enabled/disabled choice, and the end-of-run drainPending flush) must
+  # stay in lockstep with this one, since `rt` is only safe to dereference
+  # when this same condition constructed it.
+  if not opts.noCache and not cfg.trackedRoots.degraded:
     let maxCacheEntries =
       if cfg.maxCacheEntries > 0: cfg.maxCacheEntries
       else: DefaultMaxCacheEntries
@@ -1436,7 +1444,11 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # off" contract.
   let warnSink = if statsSink != nil: statsSink else: newInMemorySink()
   let cacheCtx =
-    if opts.noCache:
+    # RFC-0009 D4: mirrors the `rt` construction gate above verbatim — a
+    # degraded run must land in the SAME cacheDisabled() branch as
+    # `noCache: true`, never the `else` branch below (which dereferences
+    # `rt`, nil/zero-value on a degraded run since it was never built).
+    if opts.noCache or cfg.trackedRoots.degraded:
       var ctx = cacheDisabled(spec)   # fully off; spec still governs sandbox hermeticity
       ctx.sink = warnSink.sink()
       ctx
@@ -1535,7 +1547,10 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # the SAME process-global, level-triggered query the plan-time
   # prefetch/consult loops already use for exactly this "abandon more I/O
   # on a pending shutdown" purpose (cachetier.nim's own doc comment).
-  if not opts.noCache and not interrupted and rt.pending.len > 0:
+  # RFC-0009 D4: same construction gate as `rt` above — a degraded run never
+  # built `rt`, so this must stay in lockstep or `rt.pending` dereferences a
+  # nil ref.
+  if not opts.noCache and not cfg.trackedRoots.degraded and not interrupted and rt.pending.len > 0:
     let flushVerdicts = rt.cache.drainPending(rt.pending, DefaultDeferredPutBudget,
       abandoned = proc(): bool = signals.shutdownRequested().isSome)
     for v in flushVerdicts:

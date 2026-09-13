@@ -847,7 +847,9 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
   ## bytes gain the freshly-derived descriptor.
   ##
   ## Returns `true` iff the graph was actually persisted (the final
-  ## `moveFile` completed), `false` on ANY failure. Deliberately NOT
+  ## `moveFile` completed), `false` on ANY failure OR on a degraded run
+  ## (RFC-0009 A-degraded D5, `config.trackedRoots.degraded` — see below).
+  ## Deliberately NOT
   ## `{.discardable.}` — every caller (issue #13.3) must decide what a
   ## failed persist means for what it just did in memory: `recordClosure`
   ## turns it into a recovery-policy failure so the runner discards the
@@ -868,6 +870,15 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
   ## directory — `rename(2)` reliably fails with EISDIR in that case,
   ## without needing filesystem permissions the container's root user would
   ## bypass anyway.
+  # RFC-0009 A-degraded (D5): a degraded run (the fold-policy probe genuinely
+  # failed for some root, §3) never persists its dep graph — a graph built
+  # under an unresolved policy must never be silently trusted by a later,
+  # healthy run. Checked FIRST, before any write (not even createDir): the
+  # simplest safe posture is "as if this run never touched the graph at
+  # all", not a header.degraded marker on a written-then-discarded file.
+  if config.trackedRoots.degraded:
+    return false
+
   let stateDir  = stateDirOf(config)
   let finalPath = depgraphPath(config)
 

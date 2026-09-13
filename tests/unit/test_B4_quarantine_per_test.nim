@@ -111,7 +111,7 @@ suite "B4 isQuarantined — B3 path-match rule":
     ## by forcing fpAsciiLower through the §3 probe seam (volume-independent on
     ## this case-sensitive ext4 container). A raw case-sensitive string match
     ## (the pre-A3d-ii behaviour) would MISS this and report a real failure.
-    proc forcedLower(rootAbs, sd: string): FoldPolicy = fpAsciiLower
+    proc forcedLower(rootAbs, sd: string): Option[FoldPolicy] = some(fpAsciiLower)
     let froots = initTrackedRoots(getCurrentDir(), @[], "", forcedLower)
     # Live entrypoint spelled lower-case; quarantine entry spelled upper-case.
     let ep  = Entrypoint(path: "tests/integration/foo.nim", group: "unit",

@@ -573,9 +573,16 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
       # RFC-0009 A5c: fail CLOSED when there is no probed fold policy to
       # consult (`trackedRoots` unpopulated -- see this proc's own doc
       # comment) -- reject unconditionally rather than risk an under-fold
-      # by guessing `fpNone`.
+      # by guessing `fpNone`. RFC-0009 A-degraded D4: same pole extends to a
+      # DEGRADED run (`trackedRoots.degraded` -- some root's fold-policy
+      # probe genuinely failed, D1/D2) -- even though `trackedRoots` IS
+      # populated (each root got SOME foldPolicy, `fpNone` per D2's
+      # fallback), that `fpNone` is a placeholder chosen to avoid aliasing,
+      # not a probed answer for THIS root -- trusting it here to admit a
+      # `file://` remote would risk the exact under-fold this reject exists
+      # to prevent, so a degraded run rejects unconditionally too.
       let insideStateDir =
-        if not populated(trackedRoots): true
+        if not populated(trackedRoots) or trackedRoots.degraded: true
         else: rootInsideStateDir(fsRoot, stateDir, trackedRoots.project.foldPolicy)
       if insideStateDir:
         raise newCrisolError(cekConfig,

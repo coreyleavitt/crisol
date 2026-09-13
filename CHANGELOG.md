@@ -6,6 +6,38 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### Added — degraded-run evidence in `--json` output, and its dep graph is no longer persisted (RFC-0009 A-degraded D5/D6)
+
+A run is "degraded" when the fold-policy probe (RFC-0009 §3) genuinely
+fails for some tracked root — distinct from a legitimate `fpNone` (a real
+case-sensitive volume) — and already forces a full run and bypasses the
+result cache entirely (D3/D4). Two more axes now fail safe under the same
+condition:
+
+- **D5 — `depgraph.saveDepGraph` no longer persists a degraded run's dep
+  graph.** `config.trackedRoots.degraded` is checked first, before any
+  write (not even `createDir`), and the proc returns `false` immediately —
+  the simplest safe posture ("as if this run never touched the graph"),
+  not a written-then-discarded file with a header marker. A later,
+  healthy run therefore never inherits a graph built under an unresolved
+  fold policy.
+- **D6 — `run/v2` gains a top-level `degraded` object** (`schemaRevision`
+  25 → 26): `{"reason": <string>}`, PRESENT ONLY when
+  `trackedRoots.degraded` is true — OMITTED entirely otherwise, so a
+  healthy run's document stays byte-identical to a pre-rev-26 one except
+  for the revision number itself (same presence-gating convention as
+  `cacheStats`/`keyDiff`). `reason` is `trackedRoots.degradedReason`
+  verbatim — the semicolon-joined, root-naming message D2 already builds.
+
+`docs/rfc/0009-path-identity.md` §3 replaces its previous blanket "never
+reaches a selection decision" claim with an enumeration of every
+degraded-run comparison consumer and its own safe pole (narrowing forced
+full; quarantine takes `fpNone` as its safe pole; ordering only
+pessimizes; the result cache is bypassed entirely) and documents one
+known, non-silent gap: a degraded run's source closure, built under
+`fpNone`, can still carry fold-duplicate members onto the
+`ClosureEntry.closure` wire for that one run.
+
 ### Fixed — a present-but-empty Content-Length is malformed framing, never an absent header (RFC-0005 review R2-SEC-A)
 
 `httpraw.readResponse` keyed `Content-Length` "presence" on the header's
