@@ -59,7 +59,7 @@ suite "rfc-0007 A1f — SIGXCPU requested+achieved via execute() (timing)":
     ## host, well inside that budget.
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "rlimit_cpu.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10)
+    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
     let p    = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let spec = resolveSandbox(level = hlIsolated,
@@ -91,7 +91,7 @@ suite "rfc-0007 A1f — compile-interrupt attributes correctly (timing)":
 
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "compile_interrupt.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60)
+    let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
     let p    = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
 

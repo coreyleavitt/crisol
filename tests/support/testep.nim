@@ -22,9 +22,18 @@ proc testEp*(path: string; group = "unit"; flags: seq[string] = @[];
              runTimeoutSecs = 0): Entrypoint =
   ## Test-only Entrypoint constructor: derives a real tag-0 tp from `path`
   ## via the fixture roots, mirroring discover's producer obligation so
-  ## tests exercise the same tp identity production does. Falls back to a
-  ## zero tp only for a path that is not a valid canonical rel (rare).
-  let tp = fromCanonical(path, testRoots)
+  ## tests exercise the same tp identity production does.
+  ##
+  ## Routes through `tracked` (== `classify`), NOT `fromCanonical`, so BOTH a
+  ## relative path ("tests/fixtures/x.nim") and an absolute path under the
+  ## root (fixtureDir()/"x.nim") yield the same valid tag-0 tp — matching how
+  ## production's discover classifies. `fromCanonical` accepts only a relative
+  ## spelling and silently returned a zero tp for an absolute fixture path,
+  ## which after the A-final-ii removal made `toNative(ep.tp, roots)` resolve
+  ## to garbage and the runner oSpawnError (it bit tests/integration and then
+  ## tests/timing). Falls back to a zero tp only for a path genuinely OUTSIDE
+  ## every root (rare, and never a real fixture).
+  let tp = tracked(path, testRoots)
   Entrypoint(
     tp: (if tp.isSome: tp.get else: default(TrackedPath)),
     group: group, flags: flags, runTimeoutSecs: runTimeoutSecs)

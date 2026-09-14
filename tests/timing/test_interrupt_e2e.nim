@@ -36,11 +36,12 @@
 ## Run with:
 ##   ./dev timing
 
-import std/[json, os, osproc, streams, strtabs, strutils, times, unittest]
+import std/[json, options, os, osproc, streams, strtabs, strutils, times, unittest]
 import std/posix
 import crisol/depgraph  # flagHash
 import crisol/keys      # identityKey
 import crisol/ledger    # scanLedger
+import crisol/paths     # initTrackedRoots/tracked/TrackedRoots (identity match)
 
 # ---------------------------------------------------------------------------
 # GATE: quit 0 immediately when env var is unset or empty.
@@ -191,7 +192,13 @@ template runInterruptCase(c: InterruptCase) =
     check doc["summary"]["counts"]["passed"].getInt >= 1
 
     # PLUS: no ledger row for the killed entry.
-    let hangIdentity = identityKey(HangForeverRel, flagHash(@[]))
+    # Match the identity the subprocess runner persisted: it ran with
+    # workingDir = repoRoot(), so its TrackedRoots probe the real repo root
+    # and HangForeverRel classifies tag-0 there. Reconstruct the same key.
+    let hangRoots = initTrackedRoots(repoRoot(), @[], "")
+    let hangTp = tracked(HangForeverRel, hangRoots)
+    doAssert hangTp.isSome, "HangForeverRel must classify tag-0 under repoRoot"
+    let hangIdentity = identityKey(hangTp.get, hangRoots, flagHash(@[]))
     let hangRows = scanLedger(stateDir, hangIdentity)
     check hangRows.len == 0
 

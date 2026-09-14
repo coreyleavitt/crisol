@@ -71,6 +71,7 @@ proc runWithTimeouts(ep: Entrypoint;
     compileTimeoutSecs: compileTimeoutSecs,
     maxOutputBytes:     65_536,
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), @[], "")
   )
   let p = plan(cfg, @[ep], emptyDepGraph())
   var g = emptyDepGraph()

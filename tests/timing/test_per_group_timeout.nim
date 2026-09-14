@@ -42,6 +42,7 @@ proc runWith(eps: seq[Entrypoint]; jobs: int;
     compileTimeoutSecs: 60,          # generous compile budget
     timeoutSecs:        globalRunSecs,
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), @[], "")
   )
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()

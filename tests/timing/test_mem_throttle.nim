@@ -99,6 +99,7 @@ proc runWithMemConfig(eps: seq[Entrypoint];
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
     memBudgetMb:        memBudgetMb,
     memAware:           memAware,
   )
@@ -127,6 +128,7 @@ proc runWithMemConfigThrottled(eps: seq[Entrypoint];
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
     memBudgetMb:        memBudgetMb,
     memAware:           memAware,
   )

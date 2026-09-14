@@ -102,6 +102,7 @@ proc runWithCap(eps: seq[Entrypoint]; groupName: string;
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
     # This suite verifies the per-group max-jobs CAP, not the memory-admission
     # gate.  Since C5 (NSpgid fix) the gate's RSS feedback is real and AUTO mode
     # could intermittently throttle a 2nd slot, suppressing the overlap the

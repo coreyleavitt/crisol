@@ -64,7 +64,7 @@ suite "rfc-0007 A2b — interrupt teardown of N hung slots shares ONE grace wind
     var eps: seq[Entrypoint]
     for i in 0 ..< N:
       eps.add mkEp(fd / "term_ignores.nim", @["-d:CRISOL_A2B_GRACE_" & $i])
-    let cfg = Config(jobs: N, compileTimeoutSecs: 60, timeoutSecs: 60)
+    let cfg = Config(jobs: N, compileTimeoutSecs: 60, timeoutSecs: 60, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
     let p   = plan(cfg, eps, emptyDepGraph())
     var g   = emptyDepGraph()
 
