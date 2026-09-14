@@ -65,11 +65,11 @@ block test_hit:
   let e = ep("tests/unit/test_foo.nim")
   # Use a real existing file as the dep so isEntryStale does not fire.
   let closure = toSet(kNarrow, kTypes)
-  g.updateEntry(e.path, flagHash(e.flags), closure)
+  g.updateEntry(e.tp.display(), flagHash(e.flags), closure)
   let changed = changedTp(roots, kTypes)
   let result = narrowByDiff(@[e], changed, g, roots, getCurrentDir())
   assert result.len == 1, "expected 1 selected, got " & $result.len
-  assert result[0].path == e.path
+  assert result[0].tp.display() == e.tp.display()
 
 # ---------------------------------------------------------------------------
 # Miss: ep closure does NOT intersect changed → excluded
@@ -80,7 +80,7 @@ block test_miss:
   let e = ep("tests/unit/test_bar.nim")
   # Use real existing files; closure does NOT include the changed file.
   let closure = toSet(kNarrow, kTypes)
-  g.updateEntry(e.path, flagHash(e.flags), closure)
+  g.updateEntry(e.tp.display(), flagHash(e.flags), closure)
   # changed is kDepgraph, which is NOT in the closure → miss.
   let changed = changedTp(roots, kDepgraph)
   let result = narrowByDiff(@[e], changed, g, roots, getCurrentDir())
@@ -96,14 +96,14 @@ block test_multi_ep:
   let e2 = ep("tests/unit/test_b.nim")
   let e3 = ep("tests/unit/test_c.nim")
   # Each closure uses real existing files; changed only hits e1 and e3.
-  g.updateEntry(e1.path, flagHash(e1.flags), toSet(kNarrow))
-  g.updateEntry(e2.path, flagHash(e2.flags), toSet(kTypes))
-  g.updateEntry(e3.path, flagHash(e3.flags), toSet(kDepgraph))
+  g.updateEntry(e1.tp.display(), flagHash(e1.flags), toSet(kNarrow))
+  g.updateEntry(e2.tp.display(), flagHash(e2.flags), toSet(kTypes))
+  g.updateEntry(e3.tp.display(), flagHash(e3.flags), toSet(kDepgraph))
   let changed = changedTp(roots, kNarrow, kDepgraph)
   let result = narrowByDiff(@[e1, e2, e3], changed, g, roots, getCurrentDir())
   assert result.len == 2, "expected 2 selected, got " & $result.len
-  assert result[0].path == e1.path, "first must be e1 (input order)"
-  assert result[1].path == e3.path, "second must be e3 (input order)"
+  assert result[0].tp.display() == e1.tp.display(), "first must be e1 (input order)"
+  assert result[1].tp.display() == e3.tp.display(), "second must be e3 (input order)"
 
 # ---------------------------------------------------------------------------
 # Shared dependency: two eps depending on same file → both selected
@@ -115,8 +115,8 @@ block test_shared_dep:
   let e2 = ep("tests/unit/test_y.nim")
   # sharedDep must be a real existing file so entries are not stale.
   let sharedDep = kDiscover
-  g.updateEntry(e1.path, flagHash(e1.flags), toSet(kNarrow, sharedDep))
-  g.updateEntry(e2.path, flagHash(e2.flags), toSet(kTypes,  sharedDep))
+  g.updateEntry(e1.tp.display(), flagHash(e1.flags), toSet(kNarrow, sharedDep))
+  g.updateEntry(e2.tp.display(), flagHash(e2.flags), toSet(kTypes,  sharedDep))
   let changed = changedTp(roots, sharedDep)
   let result = narrowByDiff(@[e1, e2], changed, g, roots, getCurrentDir())
   assert result.len == 2, "expected both eps selected via shared dep, got " & $result.len
@@ -130,7 +130,7 @@ block test_own_file_changed:
   let e = ep("tests/unit/test_self.nim")
   # D4: own-file rule (priority 2) fires before staleness check (priority 4).
   # The closure can be entirely synthetic (non-existent) — own-file wins first.
-  g.updateEntry(e.path, flagHash(e.flags),
+  g.updateEntry(e.tp.display(), flagHash(e.flags),
                 toSet("tests/unit/test_self.nim", "src/crisol/self_nonexistent.nim"))
   let changed = changedTp(roots, "tests/unit/test_self.nim")
   let result = narrowByDiff(@[e], changed, g, roots, getCurrentDir())
@@ -170,16 +170,16 @@ block test_flaghash_keying:
   let eB = ep(path, @["-d:debug"])
   # eA has a graph entry with real existing files in its closure.
   # The closure must include kRender (the changed file) and kNarrow.
-  g.updateEntry(eA.path, flagHash(eA.flags), toSet(kNarrow, kRender))
+  g.updateEntry(eA.tp.display(), flagHash(eA.flags), toSet(kNarrow, kRender))
   # eB has NO graph entry → unknown-key → conservatively included.
   let changed = changedTp(roots, kRender)
   let result = narrowByDiff(@[eA, eB], changed, g, roots, getCurrentDir())
   assert result.len == 2,
     "eA selected by intersection, eB selected by unknown-key rule; expected 2, got " &
     $result.len
-  assert result[0].path == eA.path
+  assert result[0].tp.display() == eA.tp.display()
   assert result[0].flags == eA.flags
-  assert result[1].path == eB.path
+  assert result[1].tp.display() == eB.tp.display()
   assert result[1].flags == eB.flags
 
 # ---------------------------------------------------------------------------
@@ -191,8 +191,8 @@ block test_empty_changed_known_only:
   let e1 = ep("tests/unit/test_p.nim")
   let e2 = ep("tests/unit/test_q.nim")
   # Real existing files so entries are fresh (not stale).
-  g.updateEntry(e1.path, flagHash(e1.flags), toSet(kNarrow))
-  g.updateEntry(e2.path, flagHash(e2.flags), toSet(kTypes))
+  g.updateEntry(e1.tp.display(), flagHash(e1.flags), toSet(kNarrow))
+  g.updateEntry(e2.tp.display(), flagHash(e2.flags), toSet(kTypes))
   let changed = changedTp(roots)
   let result = narrowByDiff(@[e1, e2], changed, g, roots, getCurrentDir())
   assert result.len == 0,
@@ -203,12 +203,12 @@ block test_empty_changed_with_unknown_key:
   let eKnown   = ep("tests/unit/test_known.nim")
   let eUnknown = ep("tests/unit/test_nograph.nim")
   # eKnown uses a real existing file so it is fresh.
-  g.updateEntry(eKnown.path, flagHash(eKnown.flags), toSet(kRunner))
+  g.updateEntry(eKnown.tp.display(), flagHash(eKnown.flags), toSet(kRunner))
   # eUnknown has no graph entry → conservatively included.
   let changed = changedTp(roots)
   let result = narrowByDiff(@[eKnown, eUnknown], changed, g, roots, getCurrentDir())
   assert result.len == 1,
     "only unknown-key ep selected when changed is empty, got " & $result.len
-  assert result[0].path == eUnknown.path
+  assert result[0].tp.display() == eUnknown.tp.display()
 
 echo "PASS test_narrow"

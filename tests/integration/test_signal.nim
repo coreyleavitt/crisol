@@ -62,7 +62,10 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  testEp(path, group = "test", flags = @[])
+  ## `path` is always an absolute fixtureDir()-rooted path; relativize to
+  ## repo root so testEp derives a real tag-0 tp (matches this suite's
+  ## Config.trackedRoots below).
+  testEp(path.relativePath(getCurrentDir()), group = "test", flags = @[])
 
 # ---------------------------------------------------------------------------
 # Suite 1: SIGINT interrupts execute() and kills all children
@@ -106,7 +109,9 @@ suite "signal handling — SIGINT kills pool and exits 130":
 
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "hang_with_pid.nim")]
-      let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60)
+      let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60,
+                        projectRoot: getCurrentDir(),
+                        trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p    = plan(cfg, eps, emptyDepGraph())
 
       try:
@@ -197,7 +202,9 @@ suite "signal handling — normal run with handlers installed":
 
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "pass_always.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30)
+    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30,
+                      projectRoot: getCurrentDir(),
+                      trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let p    = plan(cfg, eps, emptyDepGraph())
 
     var g = emptyDepGraph()
@@ -213,7 +220,9 @@ suite "signal handling — normal run with handlers installed":
 
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "fail_always.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30)
+    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30,
+                      projectRoot: getCurrentDir(),
+                      trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let p    = plan(cfg, eps, emptyDepGraph())
 
     var g = emptyDepGraph()

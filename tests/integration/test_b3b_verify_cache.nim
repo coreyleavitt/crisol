@@ -28,6 +28,7 @@
 import std/[json, os, strutils, unittest]
 import std/posix as posix_mod
 import crisol/api
+import crisol/types
 
 import "../support/helpers"
 
@@ -131,7 +132,7 @@ suite "B3b — verify-cache divergence (nondeterministic fixture)":
       # The divergence surfaces ONLY in verifyDivergences, never in .results.
       check rr2.verifyDivergences.len == 1
       let dv = rr2.verifyDivergences[0]
-      check dv.ep.path == epPath
+      check dv.ep.tp.display() == epPath
       check dv.exitDiverged
       check not dv.recordsDiverged   # neither run emits protocol records
 

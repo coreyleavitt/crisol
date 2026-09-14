@@ -175,7 +175,7 @@ proc applyGates*(
   var gatedOut: seq[GatedEntry]
   for ep in eps.entries:
     if ep.group in gatedReason:
-      gatedOut.add (path: ep.path, group: ep.group, reason: gatedReason[ep.group])
+      gatedOut.add (path: ep.tp.display(), group: ep.group, reason: gatedReason[ep.group])
     else:
       run.add ep
 
@@ -468,7 +468,6 @@ proc discover*(
       if matched and (relPath, group.name) notin seen:
         seen.incl (relPath, group.name)
         entries.add Entrypoint(
-          path:           relPath,
           tp:             entrypointTp(relPath, root, config.trackedRoots),
           group:          group.name,
           flags:          group.flags,
@@ -477,7 +476,7 @@ proc discover*(
 
   # 4. Sort by (path, group) — stable ordering for deterministic output.
   entries.sort(proc(a, b: Entrypoint): int =
-    let cmp1 = cmp(a.path, b.path)
+    let cmp1 = cmp(a.tp.display(), b.tp.display())
     if cmp1 != 0: cmp1 else: cmp(a.group, b.group)
   )
 

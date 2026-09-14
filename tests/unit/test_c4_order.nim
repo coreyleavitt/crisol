@@ -30,7 +30,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_c4_order.nim
 
-import std/[algorithm, os, sequtils, sets, tables, unittest]
+import std/[algorithm, options, os, sequtils, sets, tables, unittest]
 import crisol/types
 import crisol/order
 import crisol/ledger
@@ -46,12 +46,12 @@ proc ep(path: string): Entrypoint =
   testEp(path, group = "unit", flags = @[])
 
 proc epPaths(eps: seq[Entrypoint]): seq[string] =
-  eps.mapIt(it.path)
+  eps.mapIt(it.tp.display())
 
 proc pathSet(eps: seq[Entrypoint]): HashSet[string] =
   result = initHashSet[string]()
   for e in eps:
-    result.incl e.path
+    result.incl e.tp.display()
 
 proc freshStateDir(name: string): string =
   result = getTempDir() / ("crisol_c4_" & name)
@@ -64,7 +64,7 @@ proc seedLedger(sd: string; rows: openArray[(string, int64, int64, string)]) =
   var led = openLedger(sd)
   let fh = flagHash(@[])
   for (path, ts, dur, outcome) in rows:
-    let ik = identityKey(path, fh)
+    let ik = identityKey(fromCanonical(path, TrackedRoots()).get, TrackedRoots(), fh)
     let row = LedgerRow(
       identity:   ik,
       timestamp:  ts,
@@ -185,9 +185,9 @@ suite "orderBy — omRecentFail":
     let lastFail = failTable([("has_fail.nim", 5000i64)])
     let got = orderBy(eps, omRecentFail, lastFail, initTable[string, int64]())
     # has_fail first; then no_fail and also_no in lex order
-    check got[0].path == "has_fail.nim"
-    check got[1].path == "also_no.nim"
-    check got[2].path == "no_fail.nim"
+    check got[0].tp.display() == "has_fail.nim"
+    check got[1].tp.display() == "also_no.nim"
+    check got[2].tp.display() == "no_fail.nim"
 
   test "tie-break by lexicographic path within same failure tier":
     # Two eps with same fail timestamp → sorted lexicographically
@@ -220,12 +220,12 @@ suite "orderBy — omRecentFail":
     ])
     let got = orderBy(eps, omRecentFail, lastFail, initTable[string, int64]())
     # Fails descending by time: new_fail(3000) > mid_fail(2000) > old_fail(1000)
-    check got[0].path == "new_fail.nim"
-    check got[1].path == "mid_fail.nim"
-    check got[2].path == "old_fail.nim"
+    check got[0].tp.display() == "new_fail.nim"
+    check got[1].tp.display() == "mid_fail.nim"
+    check got[2].tp.display() == "old_fail.nim"
     # Never-failed in lex order: no1 < no2
-    check got[3].path == "no1.nim"
-    check got[4].path == "no2.nim"
+    check got[3].tp.display() == "no1.nim"
+    check got[4].tp.display() == "no2.nim"
 
 # ---------------------------------------------------------------------------
 # Suite: orderBy — omDuration
@@ -259,8 +259,8 @@ suite "orderBy — omDuration":
     let medDur = durTable([("has_hist.nim", 100i64)])
     # no_hist has no entry → treated as 0 → comes after has_hist
     let got = orderBy(eps, omDuration, initTable[string, int64](), medDur)
-    check got[0].path == "has_hist.nim"
-    check got[1].path == "no_hist.nim"
+    check got[0].tp.display() == "has_hist.nim"
+    check got[1].tp.display() == "no_hist.nim"
 
   test "no-history eps tie-broken lexicographically":
     let eps = @[ep("z_no.nim"), ep("a_no.nim"), ep("m_no.nim")]
@@ -286,10 +286,10 @@ suite "orderBy — omDuration":
     let medDur = durTable([("slow.nim", 5000i64), ("fast.nim", 100i64)])
     let got = orderBy(eps, omDuration, initTable[string, int64](), medDur)
     # slow first, fast second (desc duration), then no_a < no_b (lex, no history → 0)
-    check got[0].path == "slow.nim"
-    check got[1].path == "fast.nim"
-    check got[2].path == "no_a.nim"
-    check got[3].path == "no_b.nim"
+    check got[0].tp.display() == "slow.nim"
+    check got[1].tp.display() == "fast.nim"
+    check got[2].tp.display() == "no_a.nim"
+    check got[3].tp.display() == "no_b.nim"
 
 # ---------------------------------------------------------------------------
 # Suite: orderByHistory (I/O wrapper)
@@ -332,9 +332,9 @@ suite "orderByHistory — I/O wrapper":
       ("ep_c.nim", 2000i64, 500i64, "exitNonZero"),
     ])
     let got = orderByHistory(eps, omRecentFail, sd)
-    check got[0].path == "ep_b.nim"
-    check got[1].path == "ep_c.nim"
-    check got[2].path == "ep_a.nim"
+    check got[0].tp.display() == "ep_b.nim"
+    check got[1].tp.display() == "ep_c.nim"
+    check got[2].tp.display() == "ep_a.nim"
 
   test "omRecentFail: 'passed' outcome NOT counted as failure":
     let sd = freshStateDir("io_rf_pass_excluded")
@@ -348,8 +348,8 @@ suite "orderByHistory — I/O wrapper":
     ])
     let got = orderByHistory(eps, omRecentFail, sd)
     # ep_b has a failure, ep_a does not → ep_b first
-    check got[0].path == "ep_b.nim"
-    check got[1].path == "ep_a.nim"
+    check got[0].tp.display() == "ep_b.nim"
+    check got[1].tp.display() == "ep_a.nim"
 
   test "omRecentFail: all failure outcomes recognized":
     ## exitNonZero, compileFailed, timedOut, signaled, spawnError all count as failures
@@ -366,11 +366,11 @@ suite "orderByHistory — I/O wrapper":
     ])
     let got = orderByHistory(eps, omRecentFail, sd)
     # All have failures; ordered by timestamp desc: e > d > c > b > a
-    check got[0].path == "e.nim"
-    check got[1].path == "d.nim"
-    check got[2].path == "c.nim"
-    check got[3].path == "b.nim"
-    check got[4].path == "a.nim"
+    check got[0].tp.display() == "e.nim"
+    check got[1].tp.display() == "d.nim"
+    check got[2].tp.display() == "c.nim"
+    check got[3].tp.display() == "b.nim"
+    check got[4].tp.display() == "a.nim"
 
   test "omDuration: ep with largest median duration comes first":
     let sd = freshStateDir("io_dur_largest")
@@ -382,9 +382,9 @@ suite "orderByHistory — I/O wrapper":
       ("mid.nim",  1000i64, 500i64,  "passed"),
     ])
     let got = orderByHistory(eps, omDuration, sd)
-    check got[0].path == "slow.nim"
-    check got[1].path == "mid.nim"
-    check got[2].path == "fast.nim"
+    check got[0].tp.display() == "slow.nim"
+    check got[1].tp.display() == "mid.nim"
+    check got[2].tp.display() == "fast.nim"
 
   test "omDuration: compileFailed rows excluded from duration median":
     ## An ep has 1 compileFailed row (dur=50) and 2 passed rows (dur=1000, 2000).
@@ -394,8 +394,8 @@ suite "orderByHistory — I/O wrapper":
     let eps = @[ep("filtered.nim"), ep("baseline.nim")]
     var led = openLedger(sd)
     let fh = flagHash(@[])
-    let filtIk = identityKey("filtered.nim", fh)
-    let baseIk  = identityKey("baseline.nim", fh)
+    let filtIk = identityKey(fromCanonical("filtered.nim", TrackedRoots()).get, TrackedRoots(), fh)
+    let baseIk  = identityKey(fromCanonical("baseline.nim", TrackedRoots()).get, TrackedRoots(), fh)
     # compileFailed row (should be excluded from median)
     append(led, LedgerRow(identity: filtIk, timestamp: 1000i64, inputHash: "x",
                           outcome: "compileFailed", attempt: 1,
@@ -415,8 +415,8 @@ suite "orderByHistory — I/O wrapper":
     # After excluding compileFailed: filtered median = median([1000, 2000]) = 2000
     # baseline median = 500 → filtered > baseline → filtered first
     let got = orderByHistory(eps, omDuration, sd)
-    check got[0].path == "filtered.nim"
-    check got[1].path == "baseline.nim"
+    check got[0].tp.display() == "filtered.nim"
+    check got[1].tp.display() == "baseline.nim"
 
   test "permutation invariant for all modes":
     let sd = freshStateDir("io_perm")

@@ -40,12 +40,12 @@ proc ep(path: string): Entrypoint =
   testEp(path, group = "unit", flags = @[])
 
 proc epPaths(eps: seq[Entrypoint]): seq[string] =
-  eps.mapIt(it.path)
+  eps.mapIt(it.tp.display())
 
 proc pathSet(eps: seq[Entrypoint]): HashSet[string] =
   result = initHashSet[string]()
   for e in eps:
-    result.incl e.path
+    result.incl e.tp.display()
 
 proc unionAllShards(eps: seq[Entrypoint]; n: int): seq[Entrypoint] =
   ## Collect all eps across all shards k=1..n (without deduplication).
@@ -129,9 +129,9 @@ suite "shardOf — completeness and disjointness":
     var counts = initCountTable[string]()
     for k in 1..n:
       for e in shardOf(eps, k, n):
-        counts.inc(e.path)
+        counts.inc(e.tp.display())
     for e in eps:
-      check counts[e.path] == 1
+      check counts[e.tp.display()] == 1
 
 # ---------------------------------------------------------------------------
 # Suite: shardOf — stability
@@ -363,7 +363,7 @@ suite "shard — composite identity: same path, different flags":
 
   proc identKey(ep: Entrypoint): string =
     ## The composite key string used by the fixed shard implementation.
-    $identityKey(ep.path, flagHash(ep.flags))
+    $identityKey(ep.tp, testRoots, flagHash(ep.flags))
 
   proc identSet(eps: seq[Entrypoint]): HashSet[string] =
     result = initHashSet[string]()
@@ -402,8 +402,8 @@ suite "shard — composite identity: same path, different flags":
     # Assign different durations so LPT assigns them to different bins.
     # Use identity-keyed duration table (as the fixed implementation expects).
     var dOf = initTable[string, int64]()
-    dOf[$identityKey(epA.path, flagHash(epA.flags))] = 1000i64
-    dOf[$identityKey(epB.path, flagHash(epB.flags))] = 500i64
+    dOf[$identityKey(epA.tp, testRoots, flagHash(epA.flags))] = 1000i64
+    dOf[$identityKey(epB.tp, testRoots, flagHash(epB.flags))] = 500i64
     let n = 2
     # Disjoint: each identity appears in exactly one shard.
     var identCounts = initCountTable[string]()
@@ -419,9 +419,9 @@ suite "shard — composite identity: same path, different flags":
     let epC = epWithFlags("tests/other.nim", @[])
     let eps = @[epA, epB, epC]
     var dOf = initTable[string, int64]()
-    dOf[$identityKey(epA.path, flagHash(epA.flags))] = 300i64
-    dOf[$identityKey(epB.path, flagHash(epB.flags))] = 200i64
-    dOf[$identityKey(epC.path, flagHash(epC.flags))] = 100i64
+    dOf[$identityKey(epA.tp, testRoots, flagHash(epA.flags))] = 300i64
+    dOf[$identityKey(epB.tp, testRoots, flagHash(epB.flags))] = 200i64
+    dOf[$identityKey(epC.tp, testRoots, flagHash(epC.flags))] = 100i64
     let n = 2
     var identCounts = initCountTable[string]()
     for k in 1..n:

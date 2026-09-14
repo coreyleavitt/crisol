@@ -49,8 +49,8 @@
 ## `lastFail[ep.path]`  = max timestamp among failure rows for that ep.
 ## `medianDur[ep.path]` = median durationUs of non-compileFailed rows for that ep.
 ##
-## Both tables are keyed by ep.path (project-root-relative string), matching
-## how Entrypoint.path is stored and how shard.nim keys its duration table.
+## Both tables are keyed by ep.tp.display() (project-root-relative string),
+## matching how shard.nim keys its duration table.
 
 import std/[algorithm, sequtils, tables]
 import crisol/types
@@ -121,22 +121,22 @@ proc orderBy*(
     ## tier, so the result is just lex-sorted eps.
     if lastFail.len == 0:
       var sorted = eps
-      sorted.sort(proc(a, b: Entrypoint): int = cmp(a.path, b.path))
+      sorted.sort(proc(a, b: Entrypoint): int = cmp(a.tp.display(), b.tp.display()))
       return sorted
 
     ## Two-tier sort:
     ##   Tier 0 (has a recorded failure): descending lastFail timestamp; lex tie-break.
     ##   Tier 1 (never failed):           ascending ep.path.
-    var withFail    = eps.filterIt(it.path in lastFail)
-    var withoutFail = eps.filterIt(it.path notin lastFail)
+    var withFail    = eps.filterIt(it.tp.display() in lastFail)
+    var withoutFail = eps.filterIt(it.tp.display() notin lastFail)
 
     withFail.sort(proc(a, b: Entrypoint): int =
-      let ta = lastFail[a.path]
-      let tb = lastFail[b.path]
+      let ta = lastFail[a.tp.display()]
+      let tb = lastFail[b.tp.display()]
       if ta != tb: return cmp(tb, ta)   # DESC timestamp (more recent = smaller cmp result)
-      cmp(a.path, b.path)               # ASC path tie-break
+      cmp(a.tp.display(), b.tp.display())               # ASC path tie-break
     )
-    withoutFail.sort(proc(a, b: Entrypoint): int = cmp(a.path, b.path))
+    withoutFail.sort(proc(a, b: Entrypoint): int = cmp(a.tp.display(), b.tp.display()))
 
     return withFail & withoutFail
 
@@ -145,7 +145,7 @@ proc orderBy*(
     ## → just lex-sort.
     if medianDur.len == 0:
       var sorted = eps
-      sorted.sort(proc(a, b: Entrypoint): int = cmp(a.path, b.path))
+      sorted.sort(proc(a, b: Entrypoint): int = cmp(a.tp.display(), b.tp.display()))
       return sorted
 
     ## Single-tier sort: descending medianDur; absent ep → 0; lex tie-break.
@@ -153,10 +153,10 @@ proc orderBy*(
     ## and any tie at 0 is broken by lex path).
     var sorted = eps
     sorted.sort(proc(a, b: Entrypoint): int =
-      let da = medianDur.getOrDefault(a.path, 0'i64)
-      let db = medianDur.getOrDefault(b.path, 0'i64)
+      let da = medianDur.getOrDefault(a.tp.display(), 0'i64)
+      let db = medianDur.getOrDefault(b.tp.display(), 0'i64)
       if da != db: return cmp(db, da)   # DESC duration
-      cmp(a.path, b.path)               # ASC path tie-break
+      cmp(a.tp.display(), b.tp.display())               # ASC path tie-break
     )
     return sorted
 
@@ -217,7 +217,7 @@ proc orderByHistory*(
           if r.timestamp > maxTs:
             maxTs = r.timestamp
       if maxTs >= 0:
-        lastFail[ep.path] = maxTs
+        lastFail[ep.tp.display()] = maxTs
 
     of omDuration:
       # Build medianDur: median of non-compileFailed durationUs rows.
@@ -227,6 +227,6 @@ proc orderByHistory*(
         if not isCompileFailedOutcomeString(r.outcome):
           durs.add r.durationUs
       if durs.len > 0:
-        medianDur[ep.path] = median(durs)
+        medianDur[ep.tp.display()] = median(durs)
 
   orderBy(eps, mode, lastFail, medianDur)

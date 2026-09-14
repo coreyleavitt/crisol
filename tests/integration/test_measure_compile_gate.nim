@@ -80,6 +80,7 @@ proc freshStateDir(tag: string): string =
 proc makeConfig(stateDir: string; measureCompileReuse: bool; workerBinary: string = ""): Config =
   Config(
     projectRoot:         projectRoot(),
+    trackedRoots:        initTrackedRoots(projectRoot(), newSeq[tuple[name, native: string]](), stateDir),
     stateDir:            stateDir,
     timeoutSecs:         60,
     compileTimeoutSecs:  300,
@@ -208,7 +209,7 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     check results.len == 1
     check results[0].outcome == oPassed
 
-    let expectedIdentity = identityKey(ep.path, flagHash(ep.flags))
+    let expectedIdentity = identityKey(ep.tp, cfg.trackedRoots, flagHash(ep.flags))
     let rows = scanArtifactLedger(stateDir)
     check rows.len > 0
     for r in rows:
@@ -227,7 +228,7 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     if exitCode != 0: echo "crisol run output:\n", output
 
     let ep = mkEp()
-    let expectedIdentity = identityKey(ep.path, flagHash(ep.flags))
+    let expectedIdentity = identityKey(ep.tp, initTrackedRoots(projectRoot(), newSeq[tuple[name, native: string]](), stateDir), flagHash(ep.flags))
     let rows = scanArtifactLedger(stateDir)
     check rows.len > 0
 
@@ -268,7 +269,7 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     # attempt normally — proves the failure was isolated to the measurement
     # layer, not a wholesale stateDir breakage.
     let ep = mkEp()
-    let identity = identityKey(ep.path, flagHash(ep.flags))
+    let identity = identityKey(ep.tp, initTrackedRoots(projectRoot(), newSeq[tuple[name, native: string]](), stateDir), flagHash(ep.flags))
     let runRows = ledger.scanLedger(stateDir, identity)
     check runRows.len > 0
 

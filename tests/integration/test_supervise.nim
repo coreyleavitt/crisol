@@ -30,7 +30,10 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc ep(path: string): Entrypoint =
-  testEp(path, group = "test", flags = @[])
+  ## `path` is always an absolute fixtureDir()-rooted path; relativize to
+  ## repo root so testEp derives a real tag-0 tp -- runEntrypoint's own
+  ## Config resolves projectRoot to getCurrentDir() (runner.nim).
+  testEp(path.relativePath(getCurrentDir()), group = "test", flags = @[])
 
 # ---------------------------------------------------------------------------
 # Suite

@@ -17,6 +17,7 @@
 
 import std/[options, os, sets, sequtils, unittest]
 import crisol/types
+import crisol/paths
 import crisol/pipeline
 import crisol/shard
 import crisol/ledger
@@ -55,7 +56,7 @@ proc makeConfig(root: string; globs: seq[string]): Config =
 
 proc pathsOf(pv: RunPlanView): seq[string] =
   ## Extract entrypoint paths from the plan view.
-  pv.plan.entrypoints.mapIt(it.ep.path)
+  pv.plan.entrypoints.mapIt(it.ep.tp.display())
 
 proc pathSetOf(pv: RunPlanView): HashSet[string] =
   result = initHashSet[string]()
@@ -211,8 +212,11 @@ proc seedLedgerForPipeline(stateDir: string;
                             rows: openArray[(string, int64, string)]) =
   var led = openLedger(stateDir)
   let fh = flagHash(@[])
+  # Same roots buildRunPlan derives for this fixture's discover (RFC-0009):
+  # stateDir is `root / ".crisol"`, matching makeConfig's initTrackedRoots.
+  let roots = initTrackedRoots(stateDir.parentDir, @[], ".crisol")
   for (path, dur, outcome) in rows:
-    let ik = identityKey(path, fh)
+    let ik = identityKey(fromCanonical(path, roots).get, roots, fh)
     append(led, LedgerRow(
       identity:   ik,
       timestamp:  1000i64,

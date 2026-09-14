@@ -293,7 +293,7 @@ suite "planTests — failedOnly() narrowing":
       let pr = planTests(opts)
       # Only test_a (the failed one) should be planned.
       check pr.entrypoints.len == 1
-      check pr.entrypoints[0].ep.path == "tests/unit/test_a.nim"
+      check pr.entrypoints[0].ep.tp.display() == "tests/unit/test_a.nim"
 
   test "failedOnly with prior run but nothing failed → empty plan (not structural)":
     withTempProject:
@@ -378,7 +378,7 @@ suite "planTests — changedOnly / failedOrChanged narrowing":
       )
       let pr = planTests(opts)
       check pr.entrypoints.len == 1
-      check "test_a.nim" in pr.entrypoints[0].ep.path
+      check "test_a.nim" in pr.entrypoints[0].ep.tp.display()
 
   test "noNarrowing plans all entrypoints (regression)":
     withTempProject:
@@ -959,7 +959,12 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     removeDir(dir)
     createDir(dir)
     defer: removeDir(dir)
-    let epPath = dir / "test_pass.nim"
+    # RFC-0009 A-final-ii-a (R3c): `dir` IS the tracked project root
+    # (below), so a path RELATIVE to it gives testEp a real tag-0 tp --
+    # never an absolute path (fromCanonical always rejects it, landing the
+    # defensive zero-tp production entrypoints never actually hit).
+    const epRelPath = "test_pass.nim"
+    let epPath = dir / epRelPath
     writeFile(epPath, "quit(0)\n")
 
     let cfg = Config(projectRoot: dir, stateDir: ".crisol",
@@ -973,8 +978,9 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
 
     # Run 1: edNeverBuilt -- compiles + runs live, stores via the real cache
     # (also promotes the stable binary + records its closure into `g`).
-    let pep1 = PlannedEntrypoint(ep: testEp(epPath, group = "unit", flags = @[]),
+    let pep1 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
                                  edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    check pep1.ep.tp.display().len > 0   # sanity: a real tag-0 tp
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
       cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
@@ -984,7 +990,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     # Run 2: edRunFresh -- `g` now has epPath's closureHash, so lookupAtPlan
     # derives the SAME key -> cdmHit (a plan-time hit; no fresh execution,
     # no touching of the stable binary either way).
-    let pep2 = PlannedEntrypoint(ep: testEp(epPath, group = "unit", flags = @[]),
+    let pep2 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
@@ -1014,7 +1020,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
         "2.2.10", "gcc 13.2.0", spec).divergences)
 
     check divergences.len == 0   # SO4: never misfiled as a divergence
-    check epPath in errText
+    check epRelPath in errText
     check "could not re-execute" in errText.toLowerAscii
     # Never ALSO reported via the divergence wording ("--verify-cache
     # divergence for ... diverged from the cached result") -- distinct

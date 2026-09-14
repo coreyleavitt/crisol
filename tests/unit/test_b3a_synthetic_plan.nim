@@ -42,8 +42,8 @@ block test_shape:
 
   assert vp.jobs == 1, "synthetic plan must run jobs=1 for determinism"
   assert vp.entrypoints.len == 2, "synthetic plan must contain exactly the sampled subset"
-  assert vp.entrypoints[0].ep.path == "tests/unit/test_a.nim"
-  assert vp.entrypoints[1].ep.path == "tests/unit/test_c.nim"
+  assert vp.entrypoints[0].ep.tp.display() == "tests/unit/test_a.nim"
+  assert vp.entrypoints[1].ep.tp.display() == "tests/unit/test_c.nim"
   for e in vp.entrypoints:
     assert e.retries == 0, "verify pass must set pep.retries = 0 (single attempt, no masking of flakiness)"
 
@@ -67,7 +67,7 @@ block test_fields_preserved:
   let vp = buildVerifyPlan(@[p], @[0])
   assert vp.entrypoints[0].edecision == edRunFresh
   assert vp.entrypoints[0].cacheable == csTrue
-  assert vp.entrypoints[0].ep.path == "tests/unit/test_a.nim"
+  assert vp.entrypoints[0].ep.tp.display() == "tests/unit/test_a.nim"
 
 # ---------------------------------------------------------------------------
 # 4. empty sample -> empty synthetic plan (still jobs = 1)

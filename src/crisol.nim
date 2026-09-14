@@ -39,7 +39,7 @@ import std/[options, os, strutils]
 import std/terminal as stdterm  # isatty(File) — cross-platform TTY check, no
                                 # std/posix needed (RFC-0007 A3); distinct
                                 # from crisol/terminal (color rendering) below
-import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe, render, ioutils]
+import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe, render, ioutils, paths]
 import crisol/process  # rfc-0007 A7: capabilities() -- the real substrate node for run/v2 + plan/v1
 
 # `_exit(2)`: skips Nim's exitprocs/GC-finalize cleanup on the int8-overflow
@@ -1232,7 +1232,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         if isCacheMissDecision(r.cacheDecision):
           for blk in explainMissLines(r.keyDiff, explainMissVerboseFlag):
             for physLine in blk.splitLines():
-              stderr.write("crisol: " & r.ep.path & ": explain: " & physLine & "\n")
+              stderr.write("crisol: " & r.ep.tp.display() & ": explain: " & physLine & "\n")
     # RFC-0005 B2b: same routing rule -- the cache-stats summary line is
     # exactly such a human line; the structured data lives in the
     # `cacheStats` field below instead.

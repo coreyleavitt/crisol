@@ -113,10 +113,11 @@ proc measurePlanIdentity(plan: MeasurePlan): IdentityKey =
   ## policy is irrelevant to `keyBytes`, which never folds); `fromCanonical`
   ## then validates `plan.entrypointPath`'s shape and tags it rootTag 0.
   ##
-  ## Falls back to the plain string overload (byte-identical result for a
-  ## well-formed tag-0 path) if `fromCanonical` ever rejects the wire path —
-  ## defense only; `runner.buildCompileWorkerPlan` always emits a canonical
-  ## `tp.display()`/`ep.path`.
+  ## `fromCanonical` rejecting the wire path is a malformed-wire invariant
+  ## violation — never a case to paper over: `runner.buildCompileWorkerPlan`
+  ## always emits a canonical `tp.display()`, so a valid parent-produced
+  ## tag-0 wire path ALWAYS succeeds here. Fail loud, mirroring
+  ## `parseMeasurePlan`'s malformed-plan `CrisolError(cekEnvironment)` idiom.
   let roots = initTrackedRoots(plan.projectRoot,
                                 newSeq[tuple[name, native: string]](),
                                 plan.stateDir)
@@ -124,7 +125,8 @@ proc measurePlanIdentity(plan: MeasurePlan): IdentityKey =
   if tpOpt.isSome:
     identityKey(tpOpt.get, roots, plan.configHash)
   else:
-    identityKey(plan.entrypointPath, plan.configHash)
+    raise newCrisolError(cekEnvironment,
+      "measure-compile plan has a malformed entrypointPath: " & plan.entrypointPath)
 
 # ---------------------------------------------------------------------------
 # recordArtifactRows — the measurement-recording step

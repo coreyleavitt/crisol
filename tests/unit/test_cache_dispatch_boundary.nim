@@ -36,7 +36,7 @@ type MockState = ref object
 proc mockSeams(ms: MockState): CacheSeams =
   legacySeams(
     keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
-             SoundnessKey("mk-" & pep.ep.path),
+             SoundnessKey("mk-" & pep.ep.tp.display()),
     load = proc(key: SoundnessKey): Option[CachedResult] =
              inc ms.loadCalls
              if ($key) in ms.store: some(ms.store[$key])
@@ -141,7 +141,7 @@ suite "execute — cached entry bypasses admission":
     let cachedPep = plannedFresh("cached_entry.nim")
     # The live entry is edNeverBuilt so it compiles+runs the real fixture.
     let livePep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
 
     let p = RunPlan(entrypoints: @[cachedPep, livePep], jobs: 1)
@@ -176,7 +176,7 @@ suite "execute — cache MISS stores on attempt-1 pass":
     # edNeverBuilt so the binary is actually built+run; we mock the seam so the
     # store gate fires.  (edRunFresh would need a pre-built binary.)
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
@@ -214,7 +214,7 @@ suite "execute — no-cache full bypass":
     writeFile(fixt, "quit(0)\n")
 
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
@@ -245,7 +245,7 @@ suite "execute — degraded hermeticity blocks the store":
 
     let ms = MockState(store: initTable[string, CachedResult]())
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
@@ -295,7 +295,7 @@ suite "R2-1 — no-cache cacheDecision discrimination":
     writeFile(fixt, "quit(0)\n")
 
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
@@ -335,7 +335,7 @@ suite "R2-1 — no-cache cacheDecision discrimination":
                      compileTimeoutSecs: 120, timeoutSecs: 60)
     cfg.trackedRoots = initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")
     let pep0 = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let p0 = RunPlan(entrypoints: @[pep0], jobs: 1)
     var g0 = emptyDepGraph()
@@ -346,7 +346,7 @@ suite "R2-1 — no-cache cacheDecision discrimination":
     ## and emit edRunFresh (or edSkipFresh).  We manually force edRunFresh to be
     ## explicit about the decision under test, using the stable binPath.
     let pep1 = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edRunFresh, runTimeoutMs: 60_000)
     let p1 = RunPlan(entrypoints: @[pep1], jobs: 1)
     var g1 = emptyDepGraph()
@@ -430,7 +430,7 @@ suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set
     let fixt = dir / "test_pass.nim"
     writeFile(fixt, "quit(0)\n")
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
@@ -465,10 +465,10 @@ suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real r
     writeFile(fixt, "quit(0)\n")
 
     let ms = MockState(store: initTable[string, CachedResult]())
-    ms.store["mk-" & fixt] = cachedPassWithEscapees(9999)
+    ms.store["mk-" & extractFilename(fixt)] = cachedPassWithEscapees(9999)
 
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
@@ -494,10 +494,10 @@ suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real r
     writeFile(fixt, "quit(0)\n")
 
     let ms = MockState(store: initTable[string, CachedResult]())
-    ms.store["mk-" & fixt] = cachedPassWithEscapees(9999)
+    ms.store["mk-" & extractFilename(fixt)] = cachedPassWithEscapees(9999)
 
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
@@ -559,7 +559,7 @@ type RaceState = ref object
 proc raceSeams(rs: RaceState; passResult: CachedResult): CacheSeams =
   legacySeams(
     keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
-             SoundnessKey("mk-" & pep.ep.path),
+             SoundnessKey("mk-" & pep.ep.tp.display()),
     load = proc(key: SoundnessKey): Option[CachedResult] =
              inc rs.loadCalls
              if rs.planted:
@@ -584,7 +584,7 @@ suite "execute — RFC-0005 SO3: post-compile consult attempt-gating":
 
     let rs = RaceState()
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000, retries: 1)  # maxAttempts = 2
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
@@ -614,13 +614,13 @@ suite "execute — RFC-0005 SO3: post-compile consult attempt-gating":
     writeFile(fixt, "quit(0)\n")
 
     let pep = PlannedEntrypoint(
-      ep: testEp(fixt, group = "unit", flags = @[]),
+      ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
       edecision: edNeverBuilt, runTimeoutMs: 60_000)   # retries: 0 (default) -- single attempt
     let p = RunPlan(entrypoints: @[pep], jobs: 1)
     var g = emptyDepGraph()
     # Seed the mock cache under the REAL key this fixture derives (mockSeams'
-    # legacyKey is "mk-" & pep.ep.path -- see the module-level mockSeams proc).
-    ms.store["mk-" & fixt] = cachedPass(111)
+    # legacyKey is "mk-" & pep.ep.tp.display() -- see the module-level mockSeams proc).
+    ms.store["mk-" & extractFilename(fixt)] = cachedPass(111)
     let results = execute(
       p, config = Config(projectRoot: dir, stateDir: ".crisol",
                          compileTimeoutSecs: 120, timeoutSecs: 60,

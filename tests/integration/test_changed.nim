@@ -334,9 +334,9 @@ suite "crisol D5 — --failed --changed union":
     # under the SAME roots.
     let roots = initTrackedRoots(repo, @[], "")
     let eps = @[
-      Entrypoint(path: "tests/unit/test_a.nim", group: "unit", flags: @[],
+      Entrypoint(group: "unit", flags: @[],
                  tp: fromCanonical("tests/unit/test_a.nim", roots).get),
-      Entrypoint(path: "tests/unit/test_b.nim", group: "unit", flags: @[],
+      Entrypoint(group: "unit", flags: @[],
                  tp: fromCanonical("tests/unit/test_b.nim", roots).get),
     ]
 
@@ -361,14 +361,14 @@ suite "crisol D5 — --failed --changed union":
       (tp: it.tp, group: it.group) in failedKeys)
     let changedNarrowed = narrowByDiff(eps, changed, graph, roots, "")
 
-    check failedNarrowed.mapIt(it.path) == @["tests/unit/test_a.nim"]
-    check changedNarrowed.mapIt(it.path) == @["tests/unit/test_b.nim"]
+    check failedNarrowed.mapIt(it.tp.display()) == @["tests/unit/test_a.nim"]
+    check changedNarrowed.mapIt(it.tp.display()) == @["tests/unit/test_b.nim"]
 
     var keep = initHashSet[tuple[path, group: string]]()
-    for ep in failedNarrowed:  keep.incl (path: ep.path, group: ep.group)
-    for ep in changedNarrowed: keep.incl (path: ep.path, group: ep.group)
-    let union = eps.filterIt((path: it.path, group: it.group) in keep)
+    for ep in failedNarrowed:  keep.incl (path: ep.tp.display(), group: ep.group)
+    for ep in changedNarrowed: keep.incl (path: ep.tp.display(), group: ep.group)
+    let union = eps.filterIt((path: it.tp.display(), group: it.group) in keep)
 
     # Union, not intersection: BOTH selected; input order preserved.
-    check union.mapIt(it.path) ==
+    check union.mapIt(it.tp.display()) ==
       @["tests/unit/test_a.nim", "tests/unit/test_b.nim"]

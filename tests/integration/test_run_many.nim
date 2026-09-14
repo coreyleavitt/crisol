@@ -120,10 +120,11 @@ suite "execute — continue-on-failure aggregation":
   test "all pass → every result is oPassed, summary all-passed":
     let fdir = fixtureDir()
     let cfg = Config(compileTimeoutSecs: 30, timeoutSecs: 10,
-                     projectRoot: getCurrentDir())
+                     projectRoot: getCurrentDir(),
+                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let eps = @[
-      mkEp(fdir / "pass_always.nim"),
-      mkEp(fdir / "pass_always.nim"),   # run twice; both should pass
+      mkEp("tests/fixtures/pass_always.nim"),
+      mkEp("tests/fixtures/pass_always.nim"),   # run twice; both should pass
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
@@ -140,11 +141,12 @@ suite "execute — continue-on-failure aggregation":
   test "mix of pass and fail → ALL run, correct outcomes, non-zero exit":
     let fdir = fixtureDir()
     let cfg = Config(compileTimeoutSecs: 30, timeoutSecs: 10,
-                     projectRoot: getCurrentDir())
+                     projectRoot: getCurrentDir(),
+                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let eps = @[
-      mkEp(fdir / "pass_always.nim"),
-      mkEp(fdir / "fail_always.nim"),
-      mkEp(fdir / "fail_compile.nim"),
+      mkEp("tests/fixtures/pass_always.nim"),
+      mkEp("tests/fixtures/fail_always.nim"),
+      mkEp("tests/fixtures/fail_compile.nim"),
     ]
     let p = plan(cfg, eps, emptyDepGraph())
 
@@ -179,10 +181,11 @@ suite "execute — continue-on-failure aggregation":
   test "all fail → summary correctly tallied, exitCode non-zero":
     let fdir = fixtureDir()
     let cfg = Config(compileTimeoutSecs: 30, timeoutSecs: 10,
-                     projectRoot: getCurrentDir())
+                     projectRoot: getCurrentDir(),
+                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let eps = @[
-      mkEp(fdir / "fail_always.nim"),
-      mkEp(fdir / "fail_always.nim"),
+      mkEp("tests/fixtures/fail_always.nim"),
+      mkEp("tests/fixtures/fail_always.nim"),
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()

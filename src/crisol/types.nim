@@ -533,20 +533,14 @@ type
     ## A single .nim file to be compiled and run as a test binary.
     ## Derived paths (nimcache dir, binary path) are computed by helpers —
     ## never stored — so a hand-built Entrypoint cannot carry a corrupt slug.
-    path*:  string          # project-root-relative, '/' separated
-    tp*:    TrackedPath     ## RFC-0009 A3a-i: additive identity alongside
-                            ## `path`. Zero-value (tag 0, `rel: ""`) for any
-                            ## Entrypoint not built through `discover` --
-                            ## every hand-built fixture across today's suite
-                            ## constructs `Entrypoint(path: ..., group: ...)`
-                            ## and never sets this field, which is fine: the
-                            ## `tp.display == path` invariant is a producer
-                            ## obligation owned by `discover` alone (below),
-                            ## never a universal invariant over every
-                            ## Entrypoint value in existence.
+    tp*:    TrackedPath     ## RFC-0009: the entrypoint's tracked identity.
+                            ## For an Entrypoint built through `discover`, this
+                            ## is always a tag-0 (project-relative) path, so
+                            ## `tp.display()` equals the historical project-
+                            ## root-relative, '/'-separated `path` string.
     group*: string
     flags*: seq[string]     ## The EFFECTIVE compile flags: global then group, merged
-                            ## at config-parse time (config.parseGroup).  (path, flags)
+                            ## at config-parse time (config.parseGroup).  (tp, flags)
                             ## is the entrypoint's identity — slug, nimcache, result
                             ## cache and depgraph all key on it — so the same path
                             ## under two groups with different flags is two legs.

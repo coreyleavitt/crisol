@@ -45,7 +45,8 @@ suite "B0 — CRISOL_ATTEMPT injection":
     let stateDir = makeTempStateDir()
     defer: removeDir(stateDir)
 
-    let ep = testEp(probeSrc, # source file; execute() will compile it
+    let ep = testEp("attempt_probe.nim", # source file, relative to
+      # cfg.projectRoot (fixtureDir, below) -- execute() will compile it
       group = "unit", flags = @[], runTimeoutSecs = 0)
 
     # Build a minimal PlannedEntrypoint with decision=edNeverBuilt (compile+run).
@@ -62,6 +63,7 @@ suite "B0 — CRISOL_ATTEMPT injection":
 
     var cfg = Config(
       projectRoot:        fixtureDir,  # resolve relative path from fixtures/
+      trackedRoots:       initTrackedRoots(fixtureDir, newSeq[tuple[name, native: string]](), ""),
       stateDir:           stateDir,    # temp state dir
       timeoutSecs:        30,
       compileTimeoutSecs: 120,
@@ -102,7 +104,9 @@ suite "B0 — CRISOL_ATTEMPT injection":
     let probeSrc   = fixtureDir / "attempt_probe.nim"
 
     let res = runEntrypoint(
-      testEp(probeSrc, group = "unit", flags = @[], runTimeoutSecs = 0),
+      # runEntrypoint resolves its own Config.projectRoot to getCurrentDir()
+      # (runner.nim), so the entrypoint must be relative to the repo root.
+      testEp(probeSrc.relativePath(getCurrentDir()), group = "unit", flags = @[], runTimeoutSecs = 0),
       compileTimeoutMs = 120_000,
       runTimeoutMs     = 30_000,
       maxOutputBytes   = 65_536,

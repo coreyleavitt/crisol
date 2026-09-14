@@ -31,7 +31,10 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  testEp(path, group = "test", flags = @[])
+  ## `path` is always an absolute fixtureDir()-rooted path; relativize to
+  ## repo root so testEp derives a real tag-0 tp (matches makeCfg's
+  ## Config.projectRoot: getCurrentDir(), below).
+  testEp(path.relativePath(getCurrentDir()), group = "test", flags = @[])
 
 proc makeCfg(): Config =
   Config(
@@ -39,6 +42,7 @@ proc makeCfg(): Config =
     timeoutSecs:        30,
     maxOutputBytes:     65_536,
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
   )
 
 # ---------------------------------------------------------------------------

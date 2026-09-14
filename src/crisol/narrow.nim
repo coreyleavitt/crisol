@@ -45,8 +45,8 @@ proc selectByDiff*(eps: seq[Entrypoint];
   ##
   ## Rule precedence for each `ep` (evaluated in order; first match wins):
   ##   1. **srGraphAbsent**    — graph.entries is empty (graph absent/empty).
-  ##   2. **srOwnFileChanged** — ep.path (reduced via `fromCanonical`) ∈ changed.
-  ##   3. **srUnknownClosure** — no entry in graph for (ep.path, flagHash(ep.flags)).
+  ##   2. **srOwnFileChanged** — ep.tp ∈ changed.
+  ##   3. **srUnknownClosure** — no entry in graph for (ep.tp.display(), flagHash(ep.flags)).
   ##   4. **srStaleEntry**     — isEntryStale returns true (a closure file vanished).
   ##   5. **srClosureHit**     — known fresh closure ∩ changed ≠ ∅ (both already
   ##                             `HashSet[TrackedPath]` — RFC-0009 A3c-ii;
@@ -65,17 +65,13 @@ proc selectByDiff*(eps: seq[Entrypoint];
       continue
 
     # Rule 2: entrypoint's own source file was edited → always run.
-    # Reduced via `fromCanonical(ep.path, roots)` (NOT `ep.tp`) -- yields the
-    # identical TrackedPath (display == path, same fold) without depending on
-    # hand-built test entrypoints having populated `tp`. A `none` result
-    # (should not happen for a discovered project-relative path) falls
-    # through to the later, still-conservative rules.
-    let epTp = fromCanonical(ep.path, roots)
-    if epTp.isSome and epTp.get in changed:
+    # `ep.tp` already IS the entrypoint's TrackedPath identity — no
+    # re-derivation via `fromCanonical` needed.
+    if ep.tp in changed:
       result.add (ep: ep, reason: srOwnFileChanged)
       continue
 
-    let key = (ep.path, flagHash(ep.flags))
+    let key = (ep.tp.display(), flagHash(ep.flags))
 
     # Rule 3: no entry in graph for this key → unknown closure.
     if key notin graph.entries:

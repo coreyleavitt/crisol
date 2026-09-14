@@ -241,7 +241,7 @@ suite "gskFiles – path owned by several groups":
     let ds  = discover(cfg, sel)
     let eps = applyGates(ds, cfg, initGateState([])).run
 
-    check eps.mapIt((it.path, it.group, it.flags)) == @[
+    check eps.mapIt((it.tp.display(), it.group, it.flags)) == @[
       ("tests/other/test_z.nim", "paths", cfg.flags),
       ("tests/unit/test_a.nim",  "unit",  @["-d:unitDefine"]),
       ("tests/unit/test_b.nim",  "unit",  @["-d:unitDefine"]),
@@ -265,7 +265,7 @@ suite "gskFiles – path owned by several groups":
                              paths: @["tests/unit/test_a.nim", "tests/unit/*.nim"])
     let eps = applyGates(discover(cfg, sel), cfg, initGateState([])).run
 
-    check eps.mapIt((it.path, it.group)) == @[
+    check eps.mapIt((it.tp.display(), it.group)) == @[
       ("tests/unit/test_a.nim", "all-tests"),
       ("tests/unit/test_a.nim", "unit"),
     ]

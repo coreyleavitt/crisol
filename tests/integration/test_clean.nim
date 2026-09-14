@@ -16,7 +16,7 @@
 import std/[options, os, sets, strutils, tables, times, unittest]
 import std/posix
 import crisol
-import crisol/[types, runner, depgraph, lock, clean]
+import crisol/[types, paths, runner, depgraph, lock, clean]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,9 +56,10 @@ proc makeConfig(root: string): Config =
     ],
   )
 
-proc slugFor(relPath: string; flags: seq[string] = @[]): string =
-  ## Compute the slug for a path+flags pair (wraps the library proc).
-  slug(relPath, flags)
+proc slugFor(relPath: string; roots: TrackedRoots; flags: seq[string] = @[]): string =
+  ## Compute the slug for a path+flags pair (wraps the library proc), deriving
+  ## the tag-0 tp the same way discover would for this fixture root.
+  slug(fromCanonical(relPath, roots).get, roots, flags)
 
 # ---------------------------------------------------------------------------
 # Suite 1 — clean prunes orphans / keeps current slugs
@@ -84,7 +85,7 @@ suite "crisol clean — orphan pruning":
 
     # Compute the expected slug for the discovered entrypoint.
     let relPath      = "tests/unit/test_foo.nim"
-    let expectedSlug = slugFor(relPath, @[])
+    let expectedSlug = slugFor(relPath, cfg.trackedRoots, @[])
 
     # Create the expected (current) dirs.
     createDir(cacheDir / expectedSlug)
@@ -122,7 +123,7 @@ suite "crisol clean — orphan pruning":
     createDir(cacheDir)
 
     let relPath      = "tests/unit/test_bar.nim"
-    let expectedSlug = slugFor(relPath, @[])
+    let expectedSlug = slugFor(relPath, cfg.trackedRoots, @[])
 
     # Per-slot dir for the current entrypoint → should be retained.
     createDir(cacheDir / (expectedSlug & "_0"))
@@ -155,7 +156,7 @@ suite "crisol clean — nimcache-persistence toolchain-fingerprint GC":
     createDir(cacheDir)
 
     let relPath   = "tests/unit/test_tc.nim"
-    let baseSlug  = slugFor(relPath, @[])
+    let baseSlug  = slugFor(relPath, cfg.trackedRoots, @[])
     let currentFp = toolchainFingerprint("2.2.10", "gcc-current|ldd-current")
     let staleFp   = toolchainFingerprint("2.2.10", "gcc-OLD|ldd-OLD")
     check currentFp != staleFp  ## precondition
@@ -193,7 +194,7 @@ suite "crisol clean — nimcache-persistence toolchain-fingerprint GC":
     createDir(cacheDir)
 
     let relPath  = "tests/unit/test_bare.nim"
-    let baseSlug = slugFor(relPath, @[])
+    let baseSlug = slugFor(relPath, cfg.trackedRoots, @[])
     createDir(cacheDir / baseSlug)  ## bare, no toolchain suffix
 
     let r = cleanOrphans(cfg)  ## no nimVersion/ccVersion — the "" default
@@ -224,7 +225,7 @@ suite "crisol clean — gates ignored":
     # The gate env var CRISOL_TEST_GATE_NOTSET_XYZ is NOT set,
     # so applyGates would exclude this group.  clean must NOT call applyGates.
     let relPath   = "tests/integration/test_gated.nim"
-    let gatedSlug = slugFor(relPath, @[])
+    let gatedSlug = slugFor(relPath, cfg.trackedRoots, @[])
 
     createDir(cacheDir / gatedSlug)
 

@@ -352,6 +352,28 @@ proc underRoot(candidate, rootAbs: string): Option[string] =
   else:
     none(string)
 
+proc isUnderRoot*(candidate, rootAbs: string): bool =
+  ## The ONE sanctioned root-membership primitive. True iff `candidate` is
+  ## `rootAbs` itself or lives strictly under it, matched at a path-component
+  ## boundary — never a bare string prefix that would wrongly match a sibling
+  ## sharing the root's name (`/proj-old` under `/proj`). Separators are
+  ## normalized to `/` so a native-normalized candidate (backslashes on
+  ## Windows) compares correctly against a `/`-form root and vice versa.
+  ##
+  ## Operates on already-normalized NATIVE paths; it does NOT fold case or
+  ## resolve symlinks. Two distinct callers need it: the depgraph M10
+  ## traversal-bounds predicate (deliberately non-folding — a filesystem
+  ## security check must not fold), and cacheregistry's rootInsideStateDir
+  ## (which folds BOTH operands first, then asks membership here). This is why
+  ## it stays separate from `classify`, which folds for SELECTION identity;
+  ## conflating the two would either weaken the traversal defense or corrupt
+  ## selection. The path-identity gate (tests/conformance/
+  ## test_rfc9_path_identity_gate.nim) forbids raw `startsWith(root & …)`
+  ## everywhere else so this remains the single implementation.
+  let c = candidate.replace('\\', '/')
+  let r = rootAbs.replace('\\', '/')
+  c == r or underRoot(c, r).isSome
+
 proc classify*(native: string; roots: TrackedRoots): PathClass =
   ## TOTAL: every native spelling classifies. Nothing is refused here.
   let na = nativeCanonicalize(native, roots.project.abs)
@@ -483,6 +505,13 @@ proc toNative*(tp: TrackedPath; roots: TrackedRoots): string =
   ## The inverse for I/O: the tagged root's native abs path, joined with
   ## `tp.rel` in OS-native separators — mirrors `classify`'s argument order
   ## (subject first, roots second).
+  ##
+  ## PRODUCTION INVARIANT (RFC-0009 A-final-ii): this is the ONLY way to
+  ## turn a TrackedPath back into a filesystem path to open, compile, or
+  ## spawn. `display(tp)` (== `tp.rel`) is for HUMANS and logs/JSON only —
+  ## it is root-relative and never fed to an OS file operation. The
+  ## path-identity gate does not (cannot cheaply) enforce this textually, so
+  ## it is stated here as the contract every I/O caller honors.
   let rootAbs =
     if tp.rootTag == RootTag(0): roots.fproject.abs
     else: roots.fdeps[int(uint16(tp.rootTag)) - 1].abs

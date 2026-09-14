@@ -46,7 +46,7 @@
 ##     completion; bounded by maxOutputBytes.
 
 import std/[envvars, json, monotimes, options, os, sequtils, sets, strutils, tables, tempfiles, times]
-import crisol/[types, config, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver]
+import crisol/[types, config, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver, ccprobe]
 # rfc-0007 A2b: the runner is supervised entirely through `crisol/process`'s
 # Supervisor contract now — `std/posix` and `crisol/spawn` (forkExec/
 # forkExecEnvScratch/GracePeriodMs) are GONE from this file; every compile
@@ -526,6 +526,18 @@ proc classifyRunResult(
   ## opaque-fallback EntrypointResult construction for a normal run end
   ## with no protocol records.
 
+type
+  RecordClosureProc* = proc(graph: var DepGraph; config: Config; ep: Entrypoint;
+                            nimcacheDir, binaryName: string;
+                            protocolMajor: int; index: SourceIndex;
+                            ccRun: RunProc): tuple[ok: bool, error: string]
+    ## R3a (RFC-0009 A-final-ii-a): injectable seam matching `depgraph.
+    ## recordClosure`'s signature, so a test can substitute a synthetic
+    ## failure without constructing a genuinely-outside-every-root
+    ## Entrypoint (production entrypoints are ALWAYS tag-0 — see
+    ## `discover`). `execute*`'s `recordClosureFn` param defaults to the
+    ## real `recordClosure` — zero production behavior change.
+
 proc finalizeSlot(
   sv:               var Supervisor;
   slots:            var seq[Slot];
@@ -540,6 +552,7 @@ proc finalizeSlot(
   sourceIndexBuilt: var bool;
   cache:            CacheContext;
   pendingEscapees:  var Table[int32, seq[ptypes.ProcSnapshot]];
+  recordClosureFn:  RecordClosureProc;
 ): FinalizeOutcome =
   ## Called once `next` has reported weChildExited for `slots[idx].id`.
   ## Reaps it (the only place a ChildId is consumed, §1) and either
@@ -646,8 +659,9 @@ proc finalizeSlot(
       if not sourceIndexBuilt:
         sourceIndex = buildSourceIndex(config)
         sourceIndexBuilt = true
-      let rec = recordClosure(graph, config, pep.ep, slots[idx].cacheDir,
-                              binName(pep.ep), CrisolProtocolMajor, sourceIndex)
+      let rec = recordClosureFn(graph, config, pep.ep, slots[idx].cacheDir,
+                              binName(pep.ep), CrisolProtocolMajor, sourceIndex,
+                              realRunIn(config.projectRoot.absolutePath.normalizedPath))  # canon-ok: real compile subprocess cwd
       slots[idx].closureRecorded = rec.ok
       slots[idx].closureError    = rec.error
 
@@ -839,16 +853,12 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
   ## ~line 213) or ArtifactRows silently orphan from the RunLedger's
   ## IdentityKey (measureworker.nim's own documented contract).
   MeasurePlan(
-    # RFC-0009 A3d-iii/A5b-ii: source the entrypoint's identity from its
-    # TrackedPath, serialized to the worker via the display() accessor (a
-    # deliberate string wire — the worker consumes a plain path and
-    # reconstructs its own TrackedPath, see measureworker.nim). For a project
-    # (tag-0) member display() is byte-identical to ep.path, so this
-    # preserves the collision with appendAttemptRow's identityKey(ep, roots)
-    # noted above. Fall back to ep.path if tp was never populated (a
-    # hand-built ep off the discover path), so the identity is never an
-    # empty string.
-    entrypointPath:    (if ep.tp.display().len > 0: ep.tp.display() else: ep.path),
+    # Source the entrypoint's identity from its TrackedPath, serialized to
+    # the worker via the display() accessor (a deliberate string wire — the
+    # worker consumes a plain path and reconstructs its own TrackedPath, see
+    # measureworker.nim). This preserves the collision with
+    # appendAttemptRow's identityKey(ep, roots) noted above.
+    entrypointPath:    ep.tp.display(),
     entrypointAbsPath: epAbs,
     flags:             ep.flags,
     nimcacheDir:       cacheDir,
@@ -856,7 +866,7 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
     groupId:           ep.group,
     configHash:        flagHash(ep.flags),
     stateDir:          stateDirOf(config),
-    projectRoot:       config.projectRoot.absolutePath.normalizedPath,
+    projectRoot:       config.projectRoot.absolutePath.normalizedPath, # canon-ok: real spawn projectRoot
   )
 
 proc dirHasEntries(dir: string): bool =
@@ -888,7 +898,7 @@ proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
   ##
   ## Two rules:
   ##
-  ## 1. A depgraph entry exists for `(ep.path, flagHash(ep.flags))`: delete
+  ## 1. A depgraph entry exists for `(ep.tp.display(), flagHash(ep.flags))`: delete
   ##    exactly the objects `depgraph.staleExternalObjects` flags, using the
   ##    entry's recorded per-external header hashes — precise, per-external.
   ##
@@ -912,9 +922,9 @@ proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
   ## that cannot be evicted must never be linked into a binary crisol then
   ## reports on. `removeFile` on an already-absent object is a no-op, so
   ## only a genuinely broken state directory reaches this path.
-  let key = (ep.path, flagHash(ep.flags))
+  let key = (ep.tp.display(), flagHash(ep.flags))
   if key in graph.entries:
-    for obj in staleExternalObjects(graph, ep.path, ep.flags, config.projectRoot):
+    for obj in staleExternalObjects(graph, ep.tp.display(), ep.flags, config.projectRoot):
       removeFile(cacheDir / obj)
   elif hadPriorContent:
     for kind, path in walkDir(cacheDir):
@@ -954,7 +964,7 @@ proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string):
     # way; discard it so the next run starts from cdNeverBuilt instead of
     # trusting it. Not exercisable under test as root (chmod-based faults
     # do not fail for root); this is untested hardening.
-    stderr.write("crisol: warning: " & ep.path &
+    stderr.write("crisol: warning: " & ep.tp.display() &
                  ": could not promote its compiled binary (" &
                  e.msg & "); the previous binary was discarded\n")
     try: stderr.flushFile() except CatchableError: discard
@@ -978,7 +988,7 @@ proc spawnCompileStable(
   ## nimcache (RFC-0006 nimcache-persistence): the COMMON case (this
   ## entrypoint's slug appears exactly once in the plan) uses the STABLE,
   ## toolchain-fingerprinted `cachePath(ep, config, toolchainFp)` — a pure
-  ## function of (ep.path, ep.flags, toolchainFp), never of plan position —
+  ## function of (ep.tp, ep.flags, toolchainFp), never of plan position —
   ## so Nim's own incremental compile can reuse it run-to-run (this is the
   ## fix: previously every cacheDir was suffixed with `_<pepIdx>`, the
   ## entrypoint's POSITION in the plan, which shifts on `--changed`/subset
@@ -1013,11 +1023,8 @@ proc spawnCompileStable(
 
   let ep = pep.ep
   # R3: resolve entrypoint to absolute path before passing to nim c.
-  let epAbs =
-    if ep.path.isAbsolute: ep.path
-    else: config.projectRoot / ep.path
+  let epAbs = toNative(ep.tp, config.trackedRoots)
 
-  # RFC-0009 A5b-ii: routed through planner.epSlug (ep.tp when populated).
   let epSlug = epSlug(ep, config.trackedRoots)
   let cacheDir =
     if epSlug in dupSlugs:
@@ -1148,7 +1155,7 @@ proc spawnCompileStable(
   # crisol itself was invoked from.
   let childSpec = ChildSpec(
     argv:   compArgs,
-    cwd:    config.projectRoot.absolutePath.normalizedPath,
+    cwd:    config.projectRoot.absolutePath.normalizedPath, # canon-ok: real child spawn cwd
     env:    filterEnv(toSeq(envPairs()), SandboxSpec(envScrub: false), @[]),
     sinks:  combinedSink(compOut),
     limits: ptypes.Limits(),  # compile is unsandboxed — no limits requested
@@ -1274,7 +1281,7 @@ proc spawnRunDirect(
   var childSpec: ChildSpec
   try:
     childSpec = buildRunChildSpec(binFull, runOut, sinkFile, spec, attempt,
-                                  config.projectRoot.absolutePath.normalizedPath, scratchDir)
+                                  config.projectRoot.absolutePath.normalizedPath, scratchDir)  # canon-ok: real run child spawn cwd
   except:
     try: removeDir(tmpDir) except: discard
     return false
@@ -1508,6 +1515,15 @@ proc execute*(
                                   ## unconditional, same as B1b's sidecar
                                   ## write -- there is simply nothing to
                                   ## stamp when the seam was never consulted.
+  recordClosureFn:  RecordClosureProc = recordClosure;  ## R3a (RFC-0009
+                                  ## A-final-ii-a): injectable recordClosure
+                                  ## seam. Defaults to the real `recordClosure`
+                                  ## -- ZERO production behavior change. Tests
+                                  ## inject a synthetic failure to exercise
+                                  ## issue #13.3 D5's binary-discard invariant
+                                  ## without a genuinely-outside-every-root
+                                  ## Entrypoint (production entrypoints are
+                                  ## ALWAYS tag-0).
 ): seq[EntrypointResult] =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
   ## scheduler honouring p.jobs (A4).  At most p.jobs child processes alive at
@@ -1817,12 +1833,13 @@ proc execute*(
 
         let fo = finalizeSlot(sv, slots, idx, p, maxOutputBytes,
                               allowTransition = not shuttingDown,
-                              projectRoot = config.projectRoot.absolutePath.normalizedPath,
+                              projectRoot = config.projectRoot.absolutePath.normalizedPath, # canon-ok: real finalize spawn projectRoot
                               graph = graph, config = config,
                               sourceIndex = sourceIndex,
                               sourceIndexBuilt = sourceIndexBuilt,
                               cache = cache,
-                              pendingEscapees = pendingEscapees)
+                              pendingEscapees = pendingEscapees,
+                              recordClosureFn = recordClosureFn)
 
         case fo.kind
         of fkTransitioned:
@@ -1975,7 +1992,7 @@ proc execute*(
                     # whose decideCompile can no longer be trusted to agree
                     # with it (issue #13.3).
                     try: removeFile(stableBin) except CatchableError: discard
-                    stderr.write("crisol: warning: " & ep.path & ": could not record its " &
+                    stderr.write("crisol: warning: " & ep.tp.display() & ": could not record its " &
                                  "source closure (" & slotClosureError & "); dependency record " &
                                  "invalidated and its binary was discarded — it will be " &
                                  "recompiled and force-selected next run\n")
@@ -2263,7 +2280,7 @@ proc execute*(
               for s in slots:
                 if s.state == ssLive:
                   let elapsed = int64((nowProgress - s.t0) * 1000)
-                  inFlight.add (p.entrypoints[s.pepIdx].ep.path, elapsed)
+                  inFlight.add (p.entrypoints[s.pepIdx].ep.tp.display(), elapsed)
               # M4: compute whether the mem-throttle signal should appear.
               let showThrottle = memThrottleActive(throttledSince, getMonoTime(),
                                                    MemThrottleSignalMs)
@@ -2417,8 +2434,11 @@ proc runEntrypoint*(
     compileTimeoutSecs: compileTimeoutMs div 1000,
     timeoutSecs:        runTimeoutMs div 1000,
     maxOutputBytes:     maxOutputBytes,
-    # Use current dir as projectRoot so ep.path can be absolute or CWD-relative.
+    # Use current dir as projectRoot so a tag-0 ep.tp resolves via toNative.
+    # trackedRoots must be populated too -- toNative resolves through it,
+    # never through projectRoot directly (RFC-0009 A-final-ii).
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
   )
   # Ensure non-zero fields so M1 derivation uses them (not defaults).
   if cfg.compileTimeoutSecs == 0: cfg.compileTimeoutSecs = 30

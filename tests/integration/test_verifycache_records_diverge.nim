@@ -34,6 +34,7 @@
 import std/[options, os, strutils, unittest]
 import std/posix as posix_mod
 import crisol/api
+import crisol/types
 
 import "../support/helpers"
 
@@ -146,7 +147,7 @@ suite "T12 — recordsDiverge true positive: constant exit, diverging record con
 
       check rr2.verifyDivergences.len == 1
       let dv = rr2.verifyDivergences[0]
-      check dv.ep.path == epPath
+      check dv.ep.tp.display() == epPath
       check dv.recordsDiverged == true
       check dv.exitDiverged == false   # exit stayed 0 both times -- ONLY records diverged
 

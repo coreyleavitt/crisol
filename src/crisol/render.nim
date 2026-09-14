@@ -533,7 +533,7 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     # sink must pass crisol's own ANSI color codes through).  The raw
     # captured `output` tail is deliberately NOT sanitized: it is the
     # binary's own output and may legitimately be colored.
-    let epPath    = sanitizeControlBytes(r.ep.path)
+    let epPath    = sanitizeControlBytes(r.ep.tp.display())
 
     # C3: apply filter to the records used for display and counts.
     # The filter only affects what is SHOWN — the outcome label is unchanged.
@@ -703,7 +703,7 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     for r in results:
       for rec in r.records:
         allTests.add (sanitizeControlBytes(rec.name), rec.durationUs,
-                      sanitizeControlBytes(r.ep.path))
+                      sanitizeControlBytes(r.ep.tp.display()))
 
     if allTests.len > 0:
       # Sort descending by durationUs
@@ -724,7 +724,7 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     # Entrypoint-level slowest-N (fallback for opaque binaries).
     var allEps: seq[(string, int64)]  # (path, durationMs)
     for r in results:
-      allEps.add (sanitizeControlBytes(r.ep.path), r.durationMs)
+      allEps.add (sanitizeControlBytes(r.ep.tp.display()), r.durationMs)
     if allEps.len > 0:
       allEps.sort(proc(a, b: (string, int64)): int = cmp(b[1], a[1]))
       let topN = allEps[0 ..< min(n, allEps.len)]

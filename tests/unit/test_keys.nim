@@ -26,6 +26,7 @@
 import std/[options, strutils]
 import crisol/keys
 import crisol/types
+import crisol/paths
 import crisol/process/types  ## unqualified Limits/LimitKind (rfc-0007 A2a-iii)
 
 # ---------------------------------------------------------------------------
@@ -50,18 +51,18 @@ proc baseInputs(): KeyInputs =
 # ---------------------------------------------------------------------------
 
 block test_identity_key_stable:
-  let k1 = identityKey("tests/unit/test_foo.nim", "aabbccdd11223344")
-  let k2 = identityKey("tests/unit/test_foo.nim", "aabbccdd11223344")
+  let k1 = identityKey(fromCanonical("tests/unit/test_foo.nim", TrackedRoots()).get, TrackedRoots(), "aabbccdd11223344")
+  let k2 = identityKey(fromCanonical("tests/unit/test_foo.nim", TrackedRoots()).get, TrackedRoots(), "aabbccdd11223344")
   assert k1 == k2, "IdentityKey must be deterministic"
 
 block test_identity_key_differs_by_path:
-  let k1 = identityKey("tests/unit/test_foo.nim", "aabbccdd11223344")
-  let k2 = identityKey("tests/unit/test_bar.nim", "aabbccdd11223344")
+  let k1 = identityKey(fromCanonical("tests/unit/test_foo.nim", TrackedRoots()).get, TrackedRoots(), "aabbccdd11223344")
+  let k2 = identityKey(fromCanonical("tests/unit/test_bar.nim", TrackedRoots()).get, TrackedRoots(), "aabbccdd11223344")
   assert k1 != k2, "IdentityKey must differ when path differs"
 
 block test_identity_key_differs_by_flaghash:
-  let k1 = identityKey("tests/unit/test_foo.nim", "aabbccdd11223344")
-  let k2 = identityKey("tests/unit/test_foo.nim", "ffffffffffffffff")
+  let k1 = identityKey(fromCanonical("tests/unit/test_foo.nim", TrackedRoots()).get, TrackedRoots(), "aabbccdd11223344")
+  let k2 = identityKey(fromCanonical("tests/unit/test_foo.nim", TrackedRoots()).get, TrackedRoots(), "ffffffffffffffff")
   assert k1 != k2, "IdentityKey must differ when flagHash differs"
 
 # ---------------------------------------------------------------------------

@@ -40,7 +40,10 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEpInGroup(path, groupName: string): Entrypoint =
-  testEp(path, group = groupName, flags = @[])
+  ## `path` is always an absolute fixtureDir()-rooted path; relativize to
+  ## repo root so testEp derives a real tag-0 tp (matches this suite's
+  ## Config.trackedRoots below).
+  testEp(path.relativePath(getCurrentDir()), group = groupName, flags = @[])
 
 # ---------------------------------------------------------------------------
 # Suite
@@ -96,6 +99,7 @@ suite "H1/fail-fast — no phantom entry under non-contiguous dispatch":
       maxOutputBytes:     10 * 1024 * 1024,
       stateDir:           ".crisol",
       projectRoot:        getCurrentDir(),
+      trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
       memAware:           some(false),          # disable mem gate for determinism
     )
 
@@ -118,7 +122,7 @@ suite "H1/fail-fast — no phantom entry under non-contiguous dispatch":
     # Every returned result must correspond to an entry that actually ran.
     # A phantom entry has an empty ep.path (default-zero EntrypointResult).
     for r in results:
-      check r.ep.path.len > 0
+      check r.ep.tp.display().len > 0
 
     # Exactly 2 entries were dispatched (idx 0 and idx 2); idx 1 was never dispatched.
     # BUG: this was 3 (included the phantom at idx 1).

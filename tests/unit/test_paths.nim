@@ -431,3 +431,28 @@ suite "initTrackedRoots — injected probe bypasses the per-process memo":
     check first.project.foldPolicy == fpNone
     let second = rootsWith(root, fpAsciiLower)
     check second.project.foldPolicy == fpAsciiLower
+
+suite "isUnderRoot — the sanctioned root-membership primitive":
+
+  test "the root itself is a member (container == root)":
+    check isUnderRoot("/proj", "/proj")
+    check isUnderRoot("/proj/", "/proj/")
+
+  test "a path strictly under the root is a member":
+    check isUnderRoot("/proj/a/b.nim", "/proj")
+    check isUnderRoot("/proj/a/b.nim", "/proj/")
+
+  test "a sibling sharing the root's name as a prefix is NOT a member":
+    # The whole reason a raw startsWith is forbidden: `/proj-old` shares the
+    # textual prefix `/proj` but is a different tree.
+    check not isUnderRoot("/proj-old/x.nim", "/proj")
+    check not isUnderRoot("/project/x.nim", "/proj")
+
+  test "an unrelated path is not a member":
+    check not isUnderRoot("/etc/passwd", "/proj")
+    check not isUnderRoot("../../etc/passwd", "/proj")
+
+  test "separators are normalized so mixed forms compare correctly":
+    check isUnderRoot("C:\\proj\\a\\b.nim", "C:/proj")
+    check isUnderRoot("C:/proj/a/b.nim", "C:\\proj")
+    check not isUnderRoot("C:\\proj-old\\a", "C:/proj")

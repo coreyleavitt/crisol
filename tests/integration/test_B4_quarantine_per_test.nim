@@ -51,7 +51,7 @@ proc runFixture(fixturePath: string;
   let cfg = makeCfg(q)
   # RFC-0009 A3d-ii: ep.tp is what the B3 path rule folds against — build it
   # from the SAME roots (classify handles the absolute fixture path).
-  let ep  = Entrypoint(path: fixturePath, group: "test", flags: @[],
+  let ep  = Entrypoint(group: "test", flags: @[],
                        tp: classify(fixturePath, cfg.trackedRoots).tp)
   let p   = plan(cfg, @[ep], emptyDepGraph())
   var g   = emptyDepGraph()

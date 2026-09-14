@@ -87,7 +87,10 @@ proc anyOverlap(intervals: seq[Interval]): bool =
   false
 
 proc mkEpInGroup(path, groupName: string; runTimeoutSecs: int = 0): Entrypoint =
-  testEp(path, group = groupName, flags = @[], runTimeoutSecs = runTimeoutSecs)
+  ## `path` is always an absolute fixtureDir()-rooted path; relativize to
+  ## repo root so testEp derives a real tag-0 tp (matches this file's
+  ## Config.projectRoot: getCurrentDir(), below).
+  testEp(path.relativePath(getCurrentDir()), group = groupName, flags = @[], runTimeoutSecs = runTimeoutSecs)
 
 # ---------------------------------------------------------------------------
 # Proc 1 — A+C composition: per-group cap + memory gate
@@ -145,6 +148,7 @@ proc testCapAndMemoryCompose() =
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
     memBudgetMb:        none(int),  # no mem constraint for this sub-test
   )
   let epsSerial = @[
@@ -178,6 +182,7 @@ proc testCapAndMemoryCompose() =
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
     memBudgetMb:        some(256),  # < 512 MiB seed → gate serializes
     memAware:           none(bool),
   )
@@ -249,6 +254,7 @@ proc testFailFastDrains() =
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
     memBudgetMb:        some(256),   # memory gate active
     memAware:           none(bool),
   )
@@ -327,6 +333,7 @@ proc testPerGroupTimeoutInComposedRun() =
     maxOutputBytes:     10 * 1024 * 1024,
     stateDir:           ".crisol",
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
   )
 
   let eps = @[

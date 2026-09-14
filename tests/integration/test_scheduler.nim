@@ -28,7 +28,10 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  testEp(path, group = "test", flags = @[])
+  ## `path` is always an absolute fixtureDir()-rooted path; testEp needs a
+  ## project-root-relative rel (its testRoots is repo-root, matching this
+  ## suite's Config.trackedRoots below) to derive a real tag-0 tp.
+  testEp(path.relativePath(getCurrentDir()), group = "test", flags = @[])
 
 proc outcomes(results: seq[EntrypointResult]): seq[Outcome] =
   ## Extract outcomes in result order (== plan order).
@@ -44,6 +47,7 @@ proc runPlan(eps: seq[Entrypoint]; jobs: int;
     compileTimeoutSecs: max(1, int(ceil(compMs / 1000))),
     timeoutSecs:        max(1, int(ceil(runMs / 1000))),
     projectRoot:        getCurrentDir(),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
   )
   let p   = plan(cfg, eps, emptyDepGraph())
   var g   = emptyDepGraph()

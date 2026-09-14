@@ -43,7 +43,10 @@ proc fixtureDir(): string =
   testsDir / "fixtures"
 
 proc mkEp(path: string): Entrypoint =
-  testEp(path, group = "test", flags = @[])
+  ## `path` is always an absolute fixtureDir()-rooted path; relativize to
+  ## repo root so testEp derives a real tag-0 tp (matches this suite's
+  ## Config.trackedRoots below).
+  testEp(path.relativePath(getCurrentDir()), group = "test", flags = @[])
 
 proc expectCoreDumped(): bool =
   ## rfc-0007 A1f: "assert the observation, don't fabricate" — coreDumped
@@ -106,7 +109,9 @@ suite "rfc-0007 A1f — authorship breadth via execute()":
   test "crash_segv: oCrashed / cbProcess / SIGSEGV / coreDumped matches the observed core_pattern":
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "crash_segv.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10)
+    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10,
+                  projectRoot: getCurrentDir(),
+                  trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let p    = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     # Default cache/spec: hlIsolated, RLIMIT_CORE=0 — the "default path" the
@@ -126,7 +131,9 @@ suite "rfc-0007 A1f — authorship breadth via execute()":
   test "self_sigkill: oCrashed / cbExternal (the runner never sent this SIGKILL)":
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "self_sigkill.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10)
+    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10,
+                  projectRoot: getCurrentDir(),
+                  trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let p    = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let results = execute(p, config = cfg, graph = g)
@@ -146,7 +153,9 @@ suite "rfc-0007 A1f — authorship breadth via execute()":
     ## is recorded).
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "term_cooperative.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 1)  # short: force the kill
+    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 1,
+                  projectRoot: getCurrentDir(),
+                  trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))  # short: force the kill
     let p    = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let results = execute(p, config = cfg, graph = g)
@@ -167,7 +176,9 @@ suite "rfc-0007 A1f — authorship breadth via execute()":
     ## comment lists as the OTHER possibility.
     let fdir = fixtureDir()
     let eps  = @[mkEp(fdir / "rlimit_fsize.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10)
+    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10,
+                  projectRoot: getCurrentDir(),
+                  trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let p    = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let spec = resolveSandbox(level = hlIsolated,
@@ -209,7 +220,9 @@ suite "rfc-0007 A1f — authorship breadth via execute()":
       exitnow(0)
 
     let eps = @[mkEp(fdir / "hang_with_pid.nim")]
-    let cfg = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 20)
+    let cfg = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 20,
+                  projectRoot: getCurrentDir(),
+                  trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let p   = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec))
@@ -248,7 +261,9 @@ suite "rfc-0007 A1f — authorship breadth via execute()":
       exitnow(0)
 
     let eps = @[mkEp(fdir / "hang_with_pid.nim")]
-    let cfg = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 20)
+    let cfg = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 20,
+                  projectRoot: getCurrentDir(),
+                  trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let p   = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec))

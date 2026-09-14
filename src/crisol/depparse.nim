@@ -79,4 +79,4 @@ proc decodeMangledPath*(cFilePath: string; entrypointPath: string): string =
     .replace("\x00", "@")               # restore literal @
   # Resolve relative to the entrypoint's source directory.
   let epDir  = entrypointPath.parentDir
-  result = (epDir / decoded).normalizedPath
+  result = (epDir / decoded).normalizedPath  # canon-ok: resolve closure member relative to entrypoint source dir (lexical, closure §5)

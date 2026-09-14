@@ -20,8 +20,8 @@
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_c6_regression.nim
 
-import std/[os, strutils, times, unittest]
-import crisol/[types, ledger, keys, depgraph, stats]
+import std/[options, os, strutils, times, unittest]
+import crisol/[types, paths, ledger, keys, depgraph, stats]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,7 +33,7 @@ proc freshStateDir(name: string): string =
   createDir(result)
 
 proc makeIdentity(path: string): IdentityKey =
-  identityKey(path, flagHash(@[]))
+  identityKey(fromCanonical(path, TrackedRoots()).get, TrackedRoots(), flagHash(@[]))
 
 proc seedRow(stateDir: string; identity: IdentityKey; durationUs: int64;
              timestamp: int64; outcome: string = "passed") =

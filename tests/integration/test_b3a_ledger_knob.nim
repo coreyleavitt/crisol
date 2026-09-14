@@ -40,6 +40,7 @@ proc stageEp(tmpRoot: string): Entrypoint =
 proc makeIsolatedConfig(root: string): Config =
   Config(
     projectRoot:        root,
+    trackedRoots:       initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol_b3a_ledger_test"),
     stateDir:           ".crisol_b3a_ledger_test",
     timeoutSecs:        60,
     compileTimeoutSecs: 120,
@@ -68,7 +69,7 @@ suite "B3a — execute(recordLedger) ledger knob":
     discard execute(p, config = cfg, graph = graph, nimVersion = "",
                     showProgress = false)
 
-    let ident = identityKey(ep.path, flagHash(ep.flags))
+    let ident = identityKey(ep.tp, cfg.trackedRoots, flagHash(ep.flags))
     let rows = scanLedger(sd, ident)
     check rows.len == 1
 
@@ -89,7 +90,7 @@ suite "B3a — execute(recordLedger) ledger knob":
     check results.len == 1
     check results[0].outcome == oPassed  # the run itself is unaffected
 
-    let ident = identityKey(ep.path, flagHash(ep.flags))
+    let ident = identityKey(ep.tp, cfg.trackedRoots, flagHash(ep.flags))
     let rows = scanLedger(sd, ident)
     check rows.len == 0
 
@@ -104,7 +105,7 @@ suite "B3a — execute(recordLedger) ledger knob":
     let ep  = stageEp(tmpRoot)
     let cfg = makeIsolatedConfig(tmpRoot)
     let sd  = stateDirOf(cfg)
-    let ident = identityKey(ep.path, flagHash(ep.flags))
+    let ident = identityKey(ep.tp, cfg.trackedRoots, flagHash(ep.flags))
 
     var graph = initDepGraph("")
     let p1 = plan(cfg, @[ep], graph, "", false)

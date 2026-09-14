@@ -94,7 +94,7 @@ suite "nimcache-persistence — REUSE (real compile)":
 
     let toolchainFp = toolchainFingerprint("nim-test-v1", "cc-test-v1")
     let expectedCacheDir = cachePath(ep, cfg, toolchainFp)
-    let key = (ep.path, flagHash(ep.flags))
+    let key = (ep.tp.display(), flagHash(ep.flags))
 
     # initDepGraph (not emptyDepGraph, which stamps header.nimVersion = "")
     # so the graph's header matches the nimVersion given to plan()/execute()
@@ -259,7 +259,7 @@ suite "nimcache-persistence — STABLE ACROSS PLAN POSITION (the --changed fix)"
     # recompile so spawnCompileStable actually runs again for `ep`.
     let planB = plan(cfg, @[decoy, ep], graph, nimVersion = "nim-v1",
                      forceCompile = true)
-    check planB.entrypoints[1].ep.path == ep.path
+    check planB.entrypoints[1].ep.tp.display() == ep.tp.display()
     let resultsB = execute(planB, config = cfg, graph = graph,
                            nimVersion = "nim-v1", ccVersion = "cc-v1",
                            showProgress = false)

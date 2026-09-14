@@ -57,7 +57,7 @@ suite "C5 — rss_hog: ledger row rssBytes > 1 MiB":
       # rfc-0007 A1e-i: EntrypointResult no longer carries peakRssBytes — the
       # ledger row below is the only surviving carrier of this quantity.
       let ep   = rr.results[0].ep
-      let iKey = identityKey(ep.path, flagHash(ep.flags))
+      let iKey = identityKey(ep.tp, rr.trackedRoots, flagHash(ep.flags))
       let rows = scanLedger(projectRoot / ".crisol", iKey)
       require rows.len == 1
       check rows[0].rssBytes > OneMiB
@@ -80,7 +80,7 @@ suite "C5 — edCached: no new ledger row; served result is cached":
       check rr1.exitCode == 0
 
       let ep   = rr1.results[0].ep
-      let iKey = identityKey(ep.path, flagHash(ep.flags))
+      let iKey = identityKey(ep.tp, rr1.trackedRoots, flagHash(ep.flags))
       let stateDir = projectRoot / ".crisol"
       let rows1 = scanLedger(stateDir, iKey)
       let count1 = rows1.len  # should be 1
@@ -121,7 +121,7 @@ suite "C5 — per-attempt: each retry attempt gets its own rssBytes row":
       check rr.exitCode == 0
 
       let ep   = rr.results[0].ep
-      let iKey = identityKey(ep.path, flagHash(ep.flags))
+      let iKey = identityKey(ep.tp, rr.trackedRoots, flagHash(ep.flags))
       let rows = scanLedger(projectRoot / ".crisol", iKey)
       # rss_hog passes on first attempt → 1 row.
       check rows.len == 1

@@ -176,7 +176,7 @@ suite "RFC-0009 A-degraded — D3 forces full selection, D4 bypasses the cache, 
                                         cacheStats: true))
     check rControl.status == rsOk
     check not rControl.trackedRoots.degraded
-    let controlPaths = rControl.plan.entrypoints.mapIt(it.ep.path)
+    let controlPaths = rControl.plan.entrypoints.mapIt(it.ep.tp.display())
     echo "A-DEGRADED CONTROL selected: ", $controlPaths
     check "tests/unit/test_a.nim" in controlPaths   # via --failed
     check "tests/unit/test_b.nim" in controlPaths   # via --changed (srOwnFileChanged)
@@ -194,7 +194,7 @@ suite "RFC-0009 A-degraded — D3 forces full selection, D4 bypasses the cache, 
     check rDegraded.trackedRoots.degraded
     check rDegraded.trackedRoots.degradedReason.len > 0
     echo "A-DEGRADED degradedReason: ", rDegraded.trackedRoots.degradedReason
-    let degradedPaths = rDegraded.plan.entrypoints.mapIt(it.ep.path)
+    let degradedPaths = rDegraded.plan.entrypoints.mapIt(it.ep.tp.display())
     echo "A-DEGRADED DEGRADED selected: ", $degradedPaths
     # D3: FULL selection despite BOTH --changed and --failed being requested.
     check "tests/unit/test_a.nim" in degradedPaths

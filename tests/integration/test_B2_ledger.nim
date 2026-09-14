@@ -55,7 +55,7 @@ suite "B2 — flaky_once: 2 ledger rows, isFlaky=true":
 
       # Derive the identity for this entrypoint.
       let ep = rr.results[0].ep
-      let iKey = identityKey(ep.path, flagHash(ep.flags))
+      let iKey = identityKey(ep.tp, rr.trackedRoots, flagHash(ep.flags))
       let stateDir = projectRoot / ".crisol"
 
       let rows = scanLedger(stateDir, iKey)
@@ -99,7 +99,7 @@ suite "B2 — pass_always: 1 ledger row, isFlaky=false":
       check rr.results[0].attempts == 1
 
       let ep = rr.results[0].ep
-      let iKey = identityKey(ep.path, flagHash(ep.flags))
+      let iKey = identityKey(ep.tp, rr.trackedRoots, flagHash(ep.flags))
       let stateDir = projectRoot / ".crisol"
 
       let rows = scanLedger(stateDir, iKey)
@@ -130,7 +130,7 @@ suite "B2 — fail_always with retries=2: 3 rows, all fail, isFlaky=false":
       check rr.results[0].attempts == 3
 
       let ep = rr.results[0].ep
-      let iKey = identityKey(ep.path, flagHash(ep.flags))
+      let iKey = identityKey(ep.tp, rr.trackedRoots, flagHash(ep.flags))
       let stateDir = projectRoot / ".crisol"
 
       let rows = scanLedger(stateDir, iKey)
@@ -161,7 +161,7 @@ suite "B2 — edCached: no ledger rows written for cached hits":
       check rr1.exitCode == 0
 
       let ep = rr1.results[0].ep
-      let iKey = identityKey(ep.path, flagHash(ep.flags))
+      let iKey = identityKey(ep.tp, rr1.trackedRoots, flagHash(ep.flags))
       let stateDir = projectRoot / ".crisol"
 
       let rows1 = scanLedger(stateDir, iKey)

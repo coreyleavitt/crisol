@@ -17,11 +17,17 @@
 ## `edNeverBuilt` (no binary at all), not merely `edStale` (binary present,
 ## entry missing).
 ##
-## Real-compile drive through execute(). The recording failure is induced the
-## one way it can arise without a mock: the entrypoint lives OUTSIDE every
-## tracked root, so its extracted closure is empty and updateEntry refuses it
-## (cekInternal). The graph is pre-seeded with a fresh-looking entry for the
-## same key — exactly what the old `except: discard` would have preserved.
+## RFC-0009 A-final-ii-a (R3b): the recording failure is injected via
+## `execute()`'s `recordClosureFn` seam (`runner.RecordClosureProc`) rather
+## than by building an Entrypoint OUTSIDE every tracked root. Production
+## entrypoints are ALWAYS tag-0 (`discover` never emits one outside the
+## project root — an outside path surfaces only via `adHocPaths`, never as
+## a real `Entrypoint`; the `pcOutside` arm downstream is defensive/
+## unreachable), so the outside-root shape this test used to build to force
+## an empty extracted closure was never a real production shape. A VALID
+## tag-0 entrypoint drives the fault at its true boundary — recordClosure's
+## returned `(ok: false, ...)` — portable across every leg, no outside-root
+## Entrypoint required.
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
@@ -29,12 +35,9 @@
 
 import std/[options, os, sets, tables, times, unittest]
 import std/posix as posix_mod
-import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache]
+import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache, closure, ccprobe]
 import "../support/helpers"  # legacySeams
 import "../support/testep"
-
-proc fixtureDir(): string =
-  currentSourcePath().parentDir.parentDir / "fixtures"
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_record_" & tag & "_" &
@@ -45,15 +48,33 @@ proc makeTempRoot(tag: string): string =
 proc makeCfg(root: string): Config =
   result = Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
          timeoutSecs: 60, compileTimeoutSecs: 120, maxOutputBytes: 65_536)
-  # RFC-0009 A5a: `trackedRoots` MUST match `projectRoot` (real production
-  # configs always build both from the same root) — a vacuous/default
-  # TrackedRoots (project.abs == "") makes `classify` treat EVERY absolute
-  # path on the filesystem as "under project" (the empty-prefix match), so
-  # `ep.path` (genuinely outside `root`) would wrongly classify as pcTracked
-  # instead of the pcOutside this test's fault-injection depends on ("the
-  # entrypoint lives OUTSIDE every tracked root, so its extracted closure is
-  # empty").
+  # trackedRoots MUST match projectRoot (real production configs always
+  # build both from the same root).
   result.trackedRoots = initTrackedRoots(root, @[], "")
+
+proc failingRecordClosure(graph: var DepGraph; config: Config; ep: Entrypoint;
+                          nimcacheDir, binaryName: string;
+                          protocolMajor: int; index: SourceIndex;
+                          ccRun: RunProc): tuple[ok: bool, error: string] =
+  ## R3a/R3b seam injection: the compile always succeeds (it's a real
+  ## `pass_always.nim` compile+run under the tracked project root); this
+  ## proc is substituted for the real `depgraph.recordClosure` via
+  ## `execute()`'s `recordClosureFn` param so the POST-compile recording
+  ## step fails deterministically, exercising issue #5/#13.3's recovery
+  ## policy without any outside-root Entrypoint.
+  ##
+  ## Mirrors the real `recordClosure`'s `except CatchableError` branch
+  ## (invalidate + persist the graph on a recording failure) — that
+  ## invalidation is `recordClosure`'s OWN responsibility, not the
+  ## runner's (the runner only reads `closureRecorded`/`closureError`
+  ## back off the slot to decide the stable-binary discard, issue #13.3
+  ## D5), so a substitute seam must replicate it to keep the "either the
+  ## on-disk entry matches the stable binary, or there is no stable
+  ## binary" invariant this test exercises.
+  let fHash = flagHash(ep.flags)
+  graph.invalidateEntry(ep.tp.display(), fHash)
+  discard saveDepGraph(graph, config)
+  (false, "injected recording failure")
 
 suite "closure recording failure after a successful compile (issue #5)":
 
@@ -61,11 +82,15 @@ suite "closure recording failure after a successful compile (issue #5)":
     let root = makeTempRoot("invalidate")
     defer: removeDir(root)
     let cfg = makeCfg(root)
-    # Entrypoint OUTSIDE projectRoot (and no depRoots): its closure filters
-    # to the empty set, which updateEntry refuses.
-    let ep    = testEp(fixtureDir() / "pass_always.nim", group = "default", flags = @[])
+    let epNative = root / "pass_always.nim"
+    writeFile(epNative, "quit(0)\n")
+    # A VALID tag-0 entrypoint under the tracked project root (R3b) — the
+    # injected `recordClosureFn` seam (below) drives the fault, not an
+    # outside-root Entrypoint (unreachable in production; see module doc).
+    let ep    = testEp("pass_always.nim", group = "default", flags = @[])
+    check ep.tp.display().len > 0   # sanity: a real tag-0 tp, not the defensive zero value
     let fHash = flagHash(ep.flags)
-    let key   = (ep.path, fHash)
+    let key   = (ep.tp.display(), fHash)
 
     # Seed a FRESH-looking prior entry: an existing file, its current content
     # hash, current protocol major. Under the old writer this entry survived
@@ -74,20 +99,19 @@ suite "closure recording failure after a successful compile (issue #5)":
     # RFC-0009 A3c-ii: `DepGraphEntry.closure` is `HashSet[TrackedPath]` --
     # this closure is pure bait (a fresh-looking prior entry the retry must
     # discard), never read back for content, so it just needs to be SOME
-    # non-empty TrackedPath. RFC-0009 A5a: `cfg.trackedRoots` now genuinely
-    # matches `root` (see `makeCfg`), so `ep.path` (outside `root`) classifies
-    # pcOutside -- a project-relative placeholder name is used instead,
-    # never the entrypoint's own (now-outside) path.
+    # non-empty TrackedPath under the tracked project root.
     let seededClosure = [fromCanonical("bait.nim", cfg.trackedRoots).get].toHashSet
-    graph.updateEntry(ep.path, fHash, seededClosure,
-                      closureContentHash(@[(key: ep.path, nativePath: ep.path)]), CrisolProtocolMajor)
+    graph.updateEntry(ep.tp.display(), fHash, seededClosure,
+                      closureContentHash(@[(key: ep.tp.display(), nativePath: epNative)]),
+                      CrisolProtocolMajor)
     createDir(root / ".crisol")
     doAssert saveDepGraph(graph, cfg)
 
     let plan1 = plan(cfg, @[ep], graph, nimVersion = "")
     check plan1.entrypoints[0].edecision == edNeverBuilt
     let r1 = execute(plan1, config = cfg, graph = graph,
-                     nimVersion = "", showProgress = false)
+                     nimVersion = "", showProgress = false,
+                     recordClosureFn = failingRecordClosure)
     check r1.len == 1
     check r1[0].outcome == oPassed            # compile + run succeeded
 
@@ -119,7 +143,7 @@ proc mockStoreOnlySeams(ms: MockCacheState): CacheSeams =
   ## is not plan-time cache-eligible); store is the seam under test.
   legacySeams(
     keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
-             SoundnessKey("mk-" & pep.ep.path),
+             SoundnessKey("mk-" & pep.ep.tp.display()),
     load = proc(key: SoundnessKey): Option[CachedResult] = none(CachedResult),
     store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc ms.storeCalls; true,
@@ -131,8 +155,11 @@ suite "closure recording failure blocks the result-cache store (issue #5, R9)":
     let root = makeTempRoot("nostorewithcache")
     defer: removeDir(root)
     let cfg = makeCfg(root)
-    # Same out-of-root scenario as above: closure recording fails.
-    let ep = testEp(fixtureDir() / "pass_always.nim", group = "default", flags = @[])
+    writeFile(root / "pass_always.nim", "quit(0)\n")
+    # Same VALID tag-0 entrypoint shape as above: closure recording fails
+    # via the injected `recordClosureFn` seam, not an outside-root path.
+    let ep = testEp("pass_always.nim", group = "default", flags = @[])
+    check ep.tp.display().len > 0
     var graph = initDepGraph("")
     createDir(root / ".crisol")
     doAssert saveDepGraph(graph, cfg)
@@ -144,7 +171,8 @@ suite "closure recording failure blocks the result-cache store (issue #5, R9)":
     let cache = cacheEnabled(resolveSandbox(hlIsolated), defaultCachePolicy(),
                              mockStoreOnlySeams(ms))
     let r1 = execute(plan1, config = cfg, graph = graph,
-                     nimVersion = "", showProgress = false, cache = cache)
+                     nimVersion = "", showProgress = false, cache = cache,
+                     recordClosureFn = failingRecordClosure)
 
     check r1.len == 1
     check r1[0].outcome == oPassed          # compile + run still succeeded

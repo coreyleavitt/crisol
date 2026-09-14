@@ -54,7 +54,8 @@ doAssert helperValue() == 42
 
 proc makeCfg(root: string): Config =
   Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
-         timeoutSecs: 60, compileTimeoutSecs: 120, maxOutputBytes: 65_536)
+         timeoutSecs: 60, compileTimeoutSecs: 120, maxOutputBytes: 65_536,
+         trackedRoots: initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol"))
 
 suite "rfc-0007 A2c — compile child cwd is projectRoot regardless of the invoking process's cwd":
 

@@ -109,12 +109,14 @@ suite "rfc9_golden_pin — identityKey literal byte-pins":
   test "simple (trivial single-file project, no flags)":
     let fh = depgraph.flagHash(@[])
     check fh == "cbf29ce484222325"
-    check $keys.identityKey(simplePath, fh) == "26750bd0d11426e3"
+    let simpleTp = fromCanonical(simplePath, testRoots).get
+    check $keys.identityKey(simpleTp, testRoots, fh) == "26750bd0d11426e3"
 
   test "maxdepth (ten dirs deep, non-trivial flags)":
     let fh = depgraph.flagHash(deepFlags)
     check fh == "8bbbbdc2240c935b"
-    check $keys.identityKey(deepPath, fh) == "afb4ab06919d3527"
+    let deepTp = fromCanonical(deepPath, testRoots).get
+    check $keys.identityKey(deepTp, testRoots, fh) == "afb4ab06919d3527"
 
 # ===========================================================================
 # 2. planner.slug — literal byte-pins (path-relative, host-invariant)
@@ -123,10 +125,11 @@ suite "rfc9_golden_pin — identityKey literal byte-pins":
 suite "rfc9_golden_pin — planner.slug literal byte-pins":
 
   test "simple":
-    check planner.slug(simplePath, @[]) == "tests__simple_ep__nim-3c8259c27679bbbb"
+    check planner.slug(fromCanonical(simplePath, testRoots).get, testRoots, @[]) ==
+      "tests__simple_ep__nim-3c8259c27679bbbb"
 
   test "maxdepth":
-    check planner.slug(deepPath, deepFlags) ==
+    check planner.slug(fromCanonical(deepPath, testRoots).get, testRoots, deepFlags) ==
       "tests__a__b__c__d__e__f__g__h__i__j__deep_ep__nim-745b86e3ced9efb7"
 
 # ===========================================================================
@@ -285,10 +288,10 @@ suite "rfc9_golden_pin — depRoot vector (literal byte-pins, RFC-0009 A5a)":
     let prodFH = depgraph.flagHash(flags)
     check prodFH == "1a176d1243dc2823"
 
-    let prodIK = keys.identityKey("tests/ep_with_dep.nim", prodFH)
+    let prodIK = keys.identityKey(expectedEp, cfg.trackedRoots, prodFH)
     check $prodIK == "20b5e9ee2fd4be01"
 
-    let prodSlug = planner.slug("tests/ep_with_dep.nim", flags)
+    let prodSlug = planner.slug(expectedEp, cfg.trackedRoots, flags)
     check prodSlug == "tests__ep_with_dep__nim-3ec54c3652c17ed3"
 
 # ===========================================================================
@@ -322,7 +325,7 @@ suite "rfc9_golden_pin — one fixture run's actual on-disk cache slugs":
       echo "rfc9 golden-pin fixture run output:\n", results[0].output
     check results[0].outcome == oPassed
 
-    let expectedSlug = planner.slug(ep.path, ep.flags)
+    let expectedSlug = planner.slug(ep.tp, testRoots, ep.flags)
     check expectedSlug == "tests__simple_ep__nim-3c8259c27679bbbb"
 
     check dirExists(stateDirOf(cfg) / "cache" / expectedSlug)

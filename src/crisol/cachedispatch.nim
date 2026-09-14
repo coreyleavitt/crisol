@@ -791,18 +791,15 @@ proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
     let ep    = pep.ep
     let fHash = flagHash(ep.flags)
     let entry =
-      if (ep.path, fHash) in graph[].entries: graph[].entries[(ep.path, fHash)]
+      if (ep.tp.display(), fHash) in graph[].entries: graph[].entries[(ep.tp.display(), fHash)]
       else: DepGraphEntry()
     # L4: argv component reflects the actual binary path used at run time.
     # spawnRunDirect/spawnRun invoke `<stateDir>/bin/<slug>/<binName>` — a full
     # absolute path that varies per machine/stateDir and cannot be in a stable
     # key.  The stable, machine-independent surrogate is `<slug>/<binName>`:
-    # it is uniquely determined by (ep.path, ep.flags) and matches what the
+    # it is uniquely determined by (ep.tp, ep.flags) and matches what the
     # execute loop would build, making two entrypoints with the same basename but
     # different paths produce distinct argv components.
-    # RFC-0009 A5b-ii: routed through planner.epSlug (ep.tp when populated,
-    # falling back to ep.path for a hand-built fixture pep) rather than the
-    # bare `slug(ep.path, ep.flags)` string producer.
     let epSlugStr = epSlug(ep, ctx.trackedRoots)
     let epArgv = epSlugStr / binName(ep)
     KeyInputs(
@@ -868,15 +865,8 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
              for ev in backfillErrEvents(result):
                rt.sink.emit(ev)
              if result.hit.isNone and rt.localRoot.len > 0:
-               # RFC-0009 A5b-ii: routed through the `tp`-keyed overload when
-               # `pep.ep.tp` is populated, falling back to the plain-path
-               # string overload for a hand-built fixture pep (zero `tp`,
-               # A3a-i contract). Byte-identical for entrypoints (tag-0).
                let prior =
-                 if pep.ep.tp.display().len > 0:
-                   mostRecentRecord(readSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots))
-                 else:
-                   mostRecentRecord(readSidecar(rt.localRoot, pep.ep.path))
+                 mostRecentRecord(readSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots))
                if prior.isSome:
                  result.explain = explainMiss(prior.get.entry.inputs, d.inputs,
                                                prior.get.entry.envDigest, ctx.envDigest)
@@ -902,14 +892,9 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
              if rt.cache.tiers.len > 1:
                rt.pending.add entry
              if result and rt.localRoot.len > 0:
-               # RFC-0009 A5b-ii: same tp-or-path routing as the load closure
-               # above.
                let sidecarEntry = SidecarEntry(key: d.key, inputs: d.inputs,
                                                 envDigest: ctx.envDigest)
-               if pep.ep.tp.display().len > 0:
-                 writeSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots, sidecarEntry)
-               else:
-                 writeSidecar(rt.localRoot, pep.ep.path, sidecarEntry)
+               writeSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots, sidecarEntry)
     ,
   )
 

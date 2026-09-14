@@ -767,7 +767,7 @@ proc verifyCachePass*(results: seq[EntrypointResult];
     if freshExit.isNone:
       result.couldNotReexec.add stored.ep
       stderr.write("crisol: warning: --verify-cache could not re-execute " &
-                   stored.ep.path & " (verify sub-run phase: " &
+                   stored.ep.tp.display() & " (verify sub-run phase: " &
                    $fresh.run.kind & "); not counted as a divergence\n")
       try: stderr.flushFile() except CatchableError: discard
       continue
@@ -786,13 +786,13 @@ proc verifyCachePass*(results: seq[EntrypointResult];
       freshRecords:    fresh.records,
     )
     # RFC-0005 B2a: the landed B3c divergence path's telemetry event.
-    sink.emit(TelemetryEvent(kind: tekVerifyFail, path: stored.ep.path))
+    sink.emit(TelemetryEvent(kind: tekVerifyFail, path: stored.ep.tp.display()))
 
     var what: seq[string]
     if exitDiverged: what.add "exit"
     if recDiverged:  what.add "records"
     stderr.write("crisol: warning: --verify-cache divergence for " &
-                 stored.ep.path & " (" & what.join(", ") &
+                 stored.ep.tp.display() & " (" & what.join(", ") &
                  " diverged from the cached result)\n")
     try: stderr.flushFile() except CatchableError: discard
 
@@ -1006,7 +1006,7 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
   for pep in impl.pr.entrypoints:
     let ep    = pep.ep
     let fHash = flagHash(ep.flags)
-    let key   = (ep.path, fHash)
+    let key   = (ep.tp.display(), fHash)
     if impl.pv.graph.entries.hasKey(key):
       let ge = impl.pv.graph.entries[key]
       # RFC-0009 A3c-ii/A3d-iv: `ge.closure` is `HashSet[TrackedPath]`; sort by
@@ -1020,7 +1020,7 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
       closureTp.sort(proc(a, b: TrackedPath): int = cmpKeyBytes(a, b, impl.cfg.trackedRoots))
       let closureSeq = closureTp.mapIt(string(keyBytes(it, impl.cfg.trackedRoots)))
       entries.add ClosureEntry(
-        path:        ep.path,
+        path:        ep.tp.display(),
         group:       ep.group,
         flagHash:    fHash,
         recorded:    true,
@@ -1029,7 +1029,7 @@ proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
       )
     else:
       entries.add ClosureEntry(
-        path:        ep.path,
+        path:        ep.tp.display(),
         group:       ep.group,
         flagHash:    fHash,
         recorded:    false,

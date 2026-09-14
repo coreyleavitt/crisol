@@ -56,7 +56,7 @@ suite "discover – tracer":
     let ds  = discover(cfg)
     let eps = applyGates(ds, cfg, initGateState([])).run
     check eps.len == 1
-    check eps[0].path  == "tests/unit/test_a.nim"
+    check eps[0].tp.display()  == "tests/unit/test_a.nim"
     check eps[0].group == "unit"
     check eps[0].flags == @["-d:testing"]
 
@@ -128,7 +128,7 @@ suite "discover – dedup within group":
     let ds  = discover(cfg)
     let eps = applyGates(ds, cfg, initGateState([])).run
     check eps.len == 1
-    check eps[0].path == "tests/unit/test_a.nim"
+    check eps[0].tp.display() == "tests/unit/test_a.nim"
 
 # ---------------------------------------------------------------------------
 # Suite 4 — sorted output
@@ -152,7 +152,7 @@ suite "discover – sorted output":
     let ds  = discover(cfg)
     let eps = applyGates(ds, cfg, initGateState([])).run
     check eps.len == 3
-    let paths = eps.mapIt(it.path)
+    let paths = eps.mapIt(it.tp.display())
     check paths == @[
       "tests/unit/test_a.nim",
       "tests/unit/test_b.nim",
@@ -434,8 +434,8 @@ suite "toDiscoveredSet – test constructor":
     let (run, gatedOut) = applyGates(ds, cfg, state)
     check run.len == 2
     check gatedOut.len == 0
-    check run[0].path == "tests/unit/test_a.nim"
-    check run[1].path == "tests/unit/test_b.nim"
+    check run[0].tp.display() == "tests/unit/test_a.nim"
+    check run[1].tp.display() == "tests/unit/test_b.nim"
 
 # ---------------------------------------------------------------------------
 # RFC-0009 A2 — discover() trusts config.trackedRoots.project, not
@@ -461,7 +461,7 @@ suite "discover – RFC-0009 A2: trackedRoots.project over projectRoot verbatim"
 
     let ds = discover(cfg)
     check ds.entries.len == 1
-    check ds.entries[0].path == "test_a.nim"
+    check ds.entries[0].tp.display() == "test_a.nim"
 
   test "end-to-end via loadConfig: trackedRoots flows from config into discover":
     let root = makeTempRoot("rfc9_a2_e2e")
@@ -472,7 +472,7 @@ suite "discover – RFC-0009 A2: trackedRoots.project over projectRoot verbatim"
     let (cfg, _) = loadConfig(configPath = root / "crisol.kdl")
     let ds = discover(cfg)
     check ds.entries.len == 1
-    check ds.entries[0].path == "test_a.nim"
+    check ds.entries[0].tp.display() == "test_a.nim"
 
   test "an unpopulated (zero-value) trackedRoots degrades to projectRoot verbatim":
     let root = makeTempRoot("rfc9_a2_untracked")
@@ -486,7 +486,7 @@ suite "discover – RFC-0009 A2: trackedRoots.project over projectRoot verbatim"
     let cfg = makeConfig(root, @[Group(name: "unit", globs: @["test_*.nim"])])
     let ds = discover(cfg)
     check ds.entries.len == 1
-    check ds.entries[0].path == "test_a.nim"
+    check ds.entries[0].tp.display() == "test_a.nim"
 
 # ---------------------------------------------------------------------------
 # Suite — RFC-0009 A3a-i: Entrypoint.tp (additive)
@@ -507,7 +507,7 @@ suite "discover – RFC-0009 A3a-i: Entrypoint.tp":
 
     let ds = discover(cfg)
     check ds.entries.len == 1
-    check ds.entries[0].tp.display == ds.entries[0].path
+    check ds.entries[0].tp.display == "tests/unit/test_a.nim"
     check ds.entries[0].tp.isProject
 
   test "an unpopulated (zero-value) trackedRoots still produces an agreeing tp":
@@ -521,7 +521,7 @@ suite "discover – RFC-0009 A3a-i: Entrypoint.tp":
     let cfg = makeConfig(root, @[Group(name: "unit", globs: @["test_*.nim"])])
     let ds = discover(cfg)
     check ds.entries.len == 1
-    check ds.entries[0].tp.display == ds.entries[0].path
+    check ds.entries[0].tp.display == "test_a.nim"
     check ds.entries[0].tp.isProject
 
 # ---------------------------------------------------------------------------
@@ -550,7 +550,7 @@ suite "discover – gskFiles absolute selector normalizes via classify":
 
     let ds = discover(cfg, sel)
     check ds.entries.len == 1
-    check ds.entries[0].path == "tests/unit/test_a.nim"
+    check ds.entries[0].tp.display() == "tests/unit/test_a.nim"
     check ds.entries[0].group == "unit"
 
   test "an absolute path unrelated to any tracked root falls back to the raw string":

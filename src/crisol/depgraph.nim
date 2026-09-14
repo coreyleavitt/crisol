@@ -905,7 +905,7 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
 proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
                     nimcacheDir, binaryName: string;
                     protocolMajor: int; index: SourceIndex;
-                    ccRun: RunProc = realRunIn(config.projectRoot.absolutePath.normalizedPath)):
+                    ccRun: RunProc = realRunIn(config.projectRoot.absolutePath.normalizedPath)):  # canon-ok: real compile subprocess cwd
                     tuple[ok: bool, error: string] =
   ## Extract, hash, and persist one entrypoint's source closure after a
   ## successful compile — the single place issue #5's recovery policy lives.
@@ -965,9 +965,9 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## The caller only needs to warn on `not ok` and discard the stable
   ## binary; no further recovery step is needed on either path.
   let fHash = flagHash(ep.flags)
-  let epAbs = if ep.path.isAbsolute: ep.path else: config.projectRoot / ep.path
+  let epAbs = toNative(ep.tp, config.trackedRoots)
   try:
-    let key = (ep.path, fHash)
+    let key = (ep.tp.display(), fHash)
     let carried = if key in graph.entries: graph.entries[key].externals else: @[]
     let inputs = extractCompileInputs(nimcacheDir, binaryName, epAbs, config,
                                       index, carried, ccRun)
@@ -983,14 +983,14 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
     # the SAME classify-filtered set. See `closureHashInputs`.
     let contentHash = closureContentHash(
       closureHashInputs(inputs.files, config.trackedRoots))
-    graph.updateEntry(ep.path, fHash, inputs.files, contentHash, protocolMajor,
+    graph.updateEntry(ep.tp.display(), fHash, inputs.files, contentHash, protocolMajor,
                       inputs.externals)
     if saveDepGraph(graph, config):
       result = (ok: true, error: "")
     else:
       result = (ok: false, error: "dependency graph could not be persisted")
   except CatchableError as e:
-    graph.invalidateEntry(ep.path, fHash)
+    graph.invalidateEntry(ep.tp.display(), fHash)
     if saveDepGraph(graph, config):
       result = (ok: false, error: e.msg)
     else:
@@ -1116,19 +1116,19 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
   # is no channel here that reveals file contents. See
   # tests/unit/test_soundness_m10.nim's symlink-retention blocks (issue
   # #13.2) for the pin proving this stays lexical.
-  let prNorm = config.projectRoot.absolutePath.normalizedPath
+  let prNorm = config.projectRoot.absolutePath.normalizedPath  # canon-ok: M10 traversal-bounds root canonicalization (non-folding, filesystem-real)
   var rootsNorm = @[prNorm]
   for dr in config.depRoots:
-    rootsNorm.add dr.absolutePath.normalizedPath
+    rootsNorm.add dr.absolutePath.normalizedPath  # canon-ok: M10 traversal-bounds dep-root canonicalization
 
   proc underRootNorm(p: string): bool =
     ## Shared M10 predicate: normalize `p` (relative -> projectRoot-relative)
     ## and test it against `rootsNorm` — the identical rule applied to
     ## `entry.closure` paths, below, and now (issue #16) to
     ## `entry.externals[].source`/`.headers[]` paths too.
-    let cand = (if p.isAbsolute: p else: prNorm / p).normalizedPath
+    let cand = (if p.isAbsolute: p else: prNorm / p).normalizedPath  # canon-ok: M10 traversal-bounds candidate canonicalization (non-folding, filesystem-real)
     for root in rootsNorm:
-      if cand == root or cand.startsWith(root & $DirSep):
+      if isUnderRoot(cand, root):
         return true
     false
 

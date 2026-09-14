@@ -69,7 +69,7 @@ type Calls = object
   keyCalls:   int
   storeCalls: int
 
-proc legacyKey(pep: PlannedEntrypoint): SoundnessKey = SoundnessKey("k-" & pep.ep.path)
+proc legacyKey(pep: PlannedEntrypoint): SoundnessKey = SoundnessKey("k-" & pep.ep.tp.display())
 
 proc seamsHit(c: var Calls; cr: CachedResult): CacheSeams =
   let cp = addr c
@@ -102,7 +102,7 @@ proc seamsMissWithExplain(c: var Calls; explain: seq[KeyDiff]): CacheSeams =
   CacheSeams(
     keyOf: proc(pep: PlannedEntrypoint): KeyInputs =
              inc cp[].keyCalls
-             KeyInputs(argv: @[pep.ep.path]),
+             KeyInputs(argv: @[pep.ep.tp.display()]),
     load: proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
              inc cp[].loadCalls
              CacheLookup(hit: none(TierHit), verdicts: @[], explain: explain),
@@ -118,7 +118,7 @@ proc seamsMissWithVerdicts(c: var Calls; verdicts: seq[TierVerdict]): CacheSeams
   CacheSeams(
     keyOf: proc(pep: PlannedEntrypoint): KeyInputs =
              inc cp[].keyCalls
-             KeyInputs(argv: @[pep.ep.path]),
+             KeyInputs(argv: @[pep.ep.tp.display()]),
     load: proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
              inc cp[].loadCalls
              CacheLookup(hit: none(TierHit), verdicts: verdicts),
@@ -864,7 +864,7 @@ suite "realSeams — explain-miss sidecar (RFC-0005 B1b)":
     let seams = realSeams(ctx, addr g, rt)
     let pep = pepAt("tests/unit/test_corruptsc.nim")
 
-    let scPath = sidecarPath(rt.localRoot, pep.ep.path)
+    let scPath = sidecarPath(rt.localRoot, pep.ep.tp.display())
     createDir(parentDir(scPath))
     writeFile(scPath, "{ broken")
 
@@ -901,7 +901,7 @@ suite "realSeams — explain-miss sidecar (RFC-0005 B1b)":
     let d = derive(seams, pep)
     check seams.store(pep, d, samplePassResult())
 
-    let scPath = sidecarPath(rt.localRoot, pep.ep.path)
+    let scPath = sidecarPath(rt.localRoot, pep.ep.tp.display())
     check fileExists(scPath)
     let raw = readFile(scPath)
     check sentinel notin raw
@@ -1250,7 +1250,12 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
     let dir = getTempDir() / "crisol_b2a_verifyfail"
     removeDir(dir); createDir(dir)
     defer: removeDir(dir)
-    let epPath = dir / "test_flip.nim"
+    # RFC-0009 A-final-ii-a (R3c): `dir` IS the tracked project root (below),
+    # so a path RELATIVE to it gives testEp a real tag-0 tp -- never an
+    # absolute path (which fromCanonical always rejects, landing the
+    # defensive zero-tp production entrypoints never actually hit).
+    const epRelPath = "test_flip.nim"
+    let epPath = dir / epRelPath
     writeFile(epPath, B2aFlipFixture)
 
     var cfg = Config(projectRoot: dir, stateDir: ".crisol",
@@ -1264,8 +1269,9 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
 
     # Run 1: edNeverBuilt -- compiles + runs live (n=1 -> exit 0) + stores
     # via the real cache; also records epPath's closureHash into `g`.
-    let pep1 = PlannedEntrypoint(ep: testEp(epPath, group = "unit", flags = @[]),
+    let pep1 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
                                  edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    check pep1.ep.tp.display().len > 0   # sanity: a real tag-0 tp
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
       cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
@@ -1273,9 +1279,9 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
     check results1[0].cacheDecision == cdmStored
     check readFile(dir / "verify_counter.txt").strip() == "1"
 
-    # Run 2: edRunFresh -- `g` now has epPath's closureHash, so lookupAtPlan
+    # Run 2: edRunFresh -- `g` now has epRelPath's closureHash, so lookupAtPlan
     # derives the SAME key -> cdmHit (no fresh execution for this run).
-    let pep2 = PlannedEntrypoint(ep: testEp(epPath, group = "unit", flags = @[]),
+    let pep2 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
@@ -1297,11 +1303,11 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
 
     check readFile(dir / "verify_counter.txt").strip() == "2"   # proves a real re-execution
     check divergences.len == 1
-    check divergences[0].ep.path == epPath
+    check divergences[0].ep.tp.display() == epRelPath
     check divergences[0].exitDiverged
 
     check mem.events.len == 1
     check mem.events[0].kind == tekVerifyFail
-    check mem.events[0].path == epPath
+    check mem.events[0].path == epRelPath
 
 echo "test_cachedispatch: done"

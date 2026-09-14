@@ -883,7 +883,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
 
     # Build entrypoint object
     let epNode = newJObject()
-    epNode["path"]          = newJString(r.ep.path)
+    epNode["path"]          = newJString(r.ep.tp.display())
     epNode["group"]         = newJString(r.ep.group)
     # rev 14 (issue #10): effective flags identify the leg (see plan/v1 rev 3).
     let flagsNode = newJArray()
@@ -959,7 +959,7 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
   for r in results:
     if r.regressed:
       let rn = newJObject()
-      rn["path"]        = newJString(r.ep.path)
+      rn["path"]        = newJString(r.ep.tp.display())
       rn["currentUs"]   = newJInt(r.durationMs * 1000)
       rn["baselineUs"]  = newJInt(r.perfBaselineUs)
       rn["thresholdUs"] = newJInt(r.perfThresholdUs)

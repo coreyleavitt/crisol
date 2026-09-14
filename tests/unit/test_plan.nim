@@ -39,7 +39,7 @@ suite "plan() — pure compile-decision annotation":
     check p.entrypoints.len == 1
     check p.entrypoints[0].edecision == edNeverBuilt
     check compileView(p.entrypoints[0]) == cdNeverBuilt  # M3: derived accessor
-    check p.entrypoints[0].ep.path == "tests/unit/test_foo.nim"
+    check p.entrypoints[0].ep.tp.display() == "tests/unit/test_foo.nim"
 
   test "multiple entrypoints → all edNeverBuilt":
     let eps = @[
@@ -57,7 +57,7 @@ suite "plan() — pure compile-decision annotation":
     let ep = mkEp("tests/unit/test_x.nim", group = "mygroup", flags = @["-d:foo"])
     let p = plan(Config(), @[ep], emptyDepGraph())
     let pep = p.entrypoints[0]
-    check pep.ep.path  == "tests/unit/test_x.nim"
+    check pep.ep.tp.display()  == "tests/unit/test_x.nim"
     check pep.ep.group == "mygroup"
     check pep.ep.flags == @["-d:foo"]
 

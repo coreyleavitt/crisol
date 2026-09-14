@@ -10,8 +10,9 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_c4_pipeline.nim
 
-import std/[os, sequtils, sets, tables, unittest]
+import std/[options, os, sequtils, sets, tables, unittest]
 import crisol/types
+import crisol/paths
 import crisol/pipeline
 import crisol/order
 import crisol/ledger
@@ -45,7 +46,7 @@ proc makeConfig(root: string; globs: seq[string]): Config =
   )
 
 proc pathsOf(pv: RunPlanView): seq[string] =
-  pv.plan.entrypoints.mapIt(it.ep.path)
+  pv.plan.entrypoints.mapIt(it.ep.tp.display())
 
 proc pathSetOf(pv: RunPlanView): HashSet[string] =
   result = initHashSet[string]()
@@ -57,7 +58,7 @@ proc seedLedger(sd: string; rows: openArray[(string, int64, int64, string)]) =
   var led = openLedger(sd)
   let fh = flagHash(@[])
   for (path, ts, dur, outcome) in rows:
-    let ik = identityKey(path, fh)
+    let ik = identityKey(fromCanonical(path, TrackedRoots()).get, TrackedRoots(), fh)
     append(led, LedgerRow(
       identity:   ik,
       timestamp:  ts,

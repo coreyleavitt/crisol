@@ -290,7 +290,7 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault),
                         useChanged = true, changed = changed,
                         nimVersion = nimVersion)
-  let selectedPaths = pv.plan.entrypoints.mapIt(it.ep.path)
+  let selectedPaths = pv.plan.entrypoints.mapIt(it.ep.tp.display())
   check "tests/unit/test_dependent.nim" in selectedPaths
   check "tests/unit/test_independent.nim" notin selectedPaths
 
@@ -305,10 +305,10 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
 
   var depReason = none(SelectionReason)
   for d in detailed:
-    if d.ep.path == "tests/unit/test_dependent.nim":
+    if d.ep.tp.display() == "tests/unit/test_dependent.nim":
       depReason = some(d.reason)
   check depReason.isSome and depReason.get == srClosureHit
-  check not detailed.anyIt(it.ep.path == "tests/unit/test_independent.nim")
+  check not detailed.anyIt(it.ep.tp.display() == "tests/unit/test_independent.nim")
 
 # ---------------------------------------------------------------------------
 # Suite — mode dispatch

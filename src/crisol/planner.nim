@@ -7,7 +7,7 @@
 ## executor lives in runner.nim).
 ##
 ## Public API:
-##   slug*(path, flags): string                — stable bin/cache dir key
+##   slug*(tp, roots, flags): string             — stable bin/cache dir key
 ##   binName*(ep): string                      — compiled binary basename
 ##   binPath*(ep, config): string              — stable bin directory
 ##   cachePath*(ep, config): string            — stable nimcache directory
@@ -41,48 +41,37 @@ proc slugify(path: string): string =
     else:
       result.add "__"
 
-proc slug*(path: string; flags: seq[string]): string =
-  ## Stable, readable slug for a (path, flags) pair.
+proc slug*(tp: TrackedPath; roots: TrackedRoots; flags: seq[string]): string =
+  ## Stable, readable slug for a (tp, flags) pair — the KEY for bin and
+  ## cache directories under stateDir.
   ##
   ## Format: `<readablePrefix>-<hash16>`
-  ##   readablePrefix: path with non-alphanum chars (except '-' and '_') → '__'
-  ##   hash16: 64-bit FNV-1a over `path & NUL & sorted-flags-joined-by-0x1f` → 16 hex
+  ##   readablePrefix: keyBytes(tp, roots) with non-alphanum chars (except
+  ##                   '-' and '_') → '__'
+  ##   hash16: 64-bit FNV-1a over `keyBytes & NUL & sorted-flags-joined-by-0x1f`
+  ##           → 16 hex
   ##
-  ## This is the KEY for bin and cache directories under stateDir.
-  let readablePrefix = slugify(path)
+  ## RFC-0009 A5b-i: derives the WHOLE slug (readable prefix AND hash) from
+  ## `keyBytes(tp, roots)` rather than a raw native path string, so the
+  ## readable prefix and the hash can never disagree about which root the
+  ## entrypoint belongs to. Byte-identical to the pre-A-final-ii string
+  ## overload for tag-0/project members (entrypoints are always tag-0).
+  let keyPath = string(keyBytes(tp, roots))
+  let readablePrefix = slugify(keyPath)
   var sortedFlags = flags
   sortedFlags.sort()
-  let hashInput = path & "\x00" & sortedFlags.join("\x1f")
+  let hashInput = keyPath & "\x00" & sortedFlags.join("\x1f")
   let hash16 = toHex16(fnv1a64(hashInput))
   result = readablePrefix & "-" & hash16
 
-proc slug*(tp: TrackedPath; roots: TrackedRoots; flags: seq[string]): string =
-  ## RFC-0009 A5b-i: TrackedPath overload. Derives the WHOLE slug (readable
-  ## prefix AND hash) from `keyBytes(tp, roots)` rather than a raw native
-  ## path string, so the readable prefix and the hash can never disagree
-  ## about which root the entrypoint belongs to. Delegating to the string
-  ## overload with `keyBytes` as the path is byte-identical to it for
-  ## tag-0/project members (entrypoints are always tag-0).
-  slug(string(keyBytes(tp, roots)), flags)
-
 proc epSlug*(ep: Entrypoint; roots: TrackedRoots): string =
-  ## RFC-0009 A5b-i: an entrypoint's slug from its TrackedPath IDENTITY when
-  ## populated (production — `discover` always sets `ep.tp`), falling back to
-  ## the string `ep.path` for a hand-built ep whose `tp` is the zero value.
-  ## This honors A3a-i's contract (hand-built fixtures do NOT set `tp` — the
-  ## producer obligation is `discover`'s alone), so a fixture ep never collapses
-  ## to a degenerate empty-`rel` slug (which would collide all such eps onto one
-  ## bin/cache dir). For a tag-0 entrypoint `keyBytes == rel == path`, so both
-  ## branches are byte-identical; the fallback only guards the zero-`tp` case.
-  ## Exported (RFC-0009 A5b-ii): the consumer sweep reuses this exact
-  ## fallback logic from clean.nim/cachedispatch.nim/runner.nim rather than
-  ## re-deriving it at each call site.
-  if ep.tp.display().len > 0: slug(ep.tp, roots, ep.flags)
-  else:                       slug(ep.path, ep.flags)
+  ## An entrypoint's slug, derived from its TrackedPath identity
+  ## (`discover` always sets `ep.tp`).
+  slug(ep.tp, roots, ep.flags)
 
 proc binName*(ep: Entrypoint): string =
   ## Basename of the compiled binary (no extension).
-  ep.path.extractFilename().changeFileExt("")
+  ep.tp.display().extractFilename().changeFileExt("")
 
 proc binPath*(ep: Entrypoint; config: Config): string =
   ## Absolute path to the directory containing the stable compiled binary.
@@ -112,7 +101,7 @@ proc cachePath*(ep: Entrypoint; config: Config; toolchainFp: string = ""): strin
   ## Absolute path to the STABLE, PERSISTENT nimcache directory for this
   ## entrypoint.
   ##
-  ## Stability: a pure function of (ep.path, ep.flags, toolchainFp) — NOT plan
+  ## Stability: a pure function of (ep.tp, ep.flags, toolchainFp) — NOT plan
   ## position. This is the fix for the RFC-0006 nimcache-persistence bug:
   ## previously runner.nim suffixed this path with the entrypoint's index in
   ## the plan (`_<pepIdx>`), so `--changed`/subset runs (where the affected
@@ -205,7 +194,7 @@ proc decideCompile*(ep: Entrypoint;
       return (cdNeverBuilt, "binary absent (first run or cache cleared)")
 
   let fHash = flagHash(ep.flags)
-  let key = (ep.path, fHash)
+  let key = (ep.tp.display(), fHash)
 
   if key notin graph.entries:
     return (cdStale, "no closure record in dep graph")

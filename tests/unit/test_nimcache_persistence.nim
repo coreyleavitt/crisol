@@ -150,7 +150,7 @@ suite "duplicateSlugs — rare concurrent-duplicate detection":
       mkPep(epA),  # duplicate: same path+flags as the first entry
     ])
     let dups = duplicateSlugs(p, cfg.trackedRoots)
-    check slug(epA.path, epA.flags) in dups
+    check slug(epA.tp, cfg.trackedRoots, epA.flags) in dups
     check dups.len == 1
 
   test "same path but DIFFERENT flags ⇒ NOT a duplicate (different slug)":

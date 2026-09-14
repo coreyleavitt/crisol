@@ -64,7 +64,7 @@ suite "A5 — ledger row carries wait4-tagged maxRssBytes (distinct from rssByte
       require rr.results.len == 1
 
       let ep   = rr.results[0].ep
-      let iKey = identityKey(ep.path, flagHash(ep.flags))
+      let iKey = identityKey(ep.tp, rr.trackedRoots, flagHash(ep.flags))
       let rows = scanLedger(projectRoot / ".crisol", iKey)
       require rows.len == 1
       check rows[0].maxRssBytes > 0

@@ -41,12 +41,12 @@ proc ep(path: string): Entrypoint =
   testEp(path, group = "unit", flags = @[])
 
 proc epPaths(eps: seq[Entrypoint]): seq[string] =
-  eps.mapIt(it.path)
+  eps.mapIt(it.tp.display())
 
 proc pathSet(eps: seq[Entrypoint]): HashSet[string] =
   result = initHashSet[string]()
   for e in eps:
-    result.incl e.path
+    result.incl e.tp.display()
 
 proc durTable(pairs: openArray[(string, int64)]): Table[string, int64] =
   ## Build a duration table keyed by identity key string.
@@ -55,7 +55,7 @@ proc durTable(pairs: openArray[(string, int64)]): Table[string, int64] =
   result = initTable[string, int64]()
   let fh = flagHash(@[])
   for (k, v) in pairs:
-    result[$identityKey(k, fh)] = v
+    result[$identityKey(testEp(k).tp, testRoots, fh)] = v
 
 proc unionBalanced(eps: seq[Entrypoint]; n: int;
                    dOf: Table[string, int64]): seq[Entrypoint] =
@@ -75,7 +75,7 @@ proc seedLedger(sd: string; rows: openArray[(string, int64, string)]) =
   var led = openLedger(sd)
   let fh = flagHash(@[])
   for (path, dur, outcome) in rows:
-    let ik = identityKey(path, fh)
+    let ik = identityKey(testEp(path).tp, testRoots, fh)
     let row = LedgerRow(
       identity:   ik,
       timestamp:  1000i64,
@@ -147,9 +147,9 @@ suite "balancedShardOf — completeness and disjointness":
     var counts = initCountTable[string]()
     for k in 1..n:
       for e in balancedShardOf(eps, k, n, dOf):
-        counts.inc(e.path)
+        counts.inc(e.tp.display())
     for e in eps:
-      check counts[e.path] == 1
+      check counts[e.tp.display()] == 1
 
 # ---------------------------------------------------------------------------
 # Suite: balancedShardOf — even split for equal durations
@@ -206,14 +206,14 @@ suite "balancedShardOf — one huge item":
     for k in 1..n:
       let s = balancedShardOf(eps, k, n, dOf)
       for e in s:
-        if e.path == "huge.nim":
+        if e.tp.display() == "huge.nim":
           inc hugeCount
           hugeBin = k
     check hugeCount == 1   # huge ep in exactly one bin
     # That bin contains only the huge ep (LPT assigns it first, all alone).
     let hugeShard = balancedShardOf(eps, hugeBin, n, dOf)
     check hugeShard.len == 1
-    check hugeShard[0].path == "huge.nim"
+    check hugeShard[0].tp.display() == "huge.nim"
 
 # ---------------------------------------------------------------------------
 # Suite: balancedShardOf — determinism
@@ -445,8 +445,8 @@ suite "shardWithHistory — outcome filter":
     # Seed the "filtered" ep with a compileFailed row first, then two pass rows.
     var led = openLedger(sd)
     let fh = flagHash(@[])
-    let filtIk = identityKey("tests/unit/test_compile_filtered.nim", fh)
-    let baseIk  = identityKey("tests/unit/test_baseline.nim", fh)
+    let filtIk = identityKey(testEp("tests/unit/test_compile_filtered.nim").tp, testRoots, fh)
+    let baseIk  = identityKey(testEp("tests/unit/test_baseline.nim").tp, testRoots, fh)
 
     # compileFailed row — should be EXCLUDED from duration median.
     append(led, LedgerRow(identity: filtIk, timestamp: 1000i64, inputHash: "x",
@@ -480,8 +480,8 @@ suite "shardWithHistory — outcome filter":
     # filtered ep has higher median after exclusion → goes to bin 0 → shard k=1.
     check s1.len == 1
     check s2.len == 1
-    check s1[0].path == "tests/unit/test_compile_filtered.nim"
-    check s2[0].path == "tests/unit/test_baseline.nim"
+    check s1[0].tp.display() == "tests/unit/test_compile_filtered.nim"
+    check s2[0].tp.display() == "tests/unit/test_baseline.nim"
 
 when isMainModule:
   echo "test_c3_balanced_shard done"

@@ -3,8 +3,9 @@
 ## Derives a REAL tag-0 `tp` for a test-built Entrypoint via the fixture
 ## roots below, mirroring the producer obligation `discover` owns in
 ## production, so tests exercise the same tp identity production does.
-## Purely additive: `Entrypoint.path` and the planner's zero-tp epSlug
-## fallback are untouched (both removed in A-final-ii).
+## `Entrypoint.path` and the planner's zero-tp epSlug fallback were removed
+## in A-final-ii; this constructor now sets only `tp` (and group/flags/
+## runTimeoutSecs) on the returned Entrypoint.
 
 import std/[options, os]
 import crisol/[types, paths]
@@ -19,13 +20,11 @@ let testRoots* = initTrackedRoots(getCurrentDir(), @[], "")
 
 proc testEp*(path: string; group = "unit"; flags: seq[string] = @[];
              runTimeoutSecs = 0): Entrypoint =
-  ## Test-only Entrypoint constructor (A-final-i): derives a real tag-0 tp from
-  ## `path` via the fixture roots, mirroring discover's producer obligation so
-  ## tests exercise the same tp identity production does. Falls back to a zero
-  ## tp only for a path that is not a valid canonical rel (rare) -- that path
-  ## then still works via epSlug's fallback until A-final-ii.
+  ## Test-only Entrypoint constructor: derives a real tag-0 tp from `path`
+  ## via the fixture roots, mirroring discover's producer obligation so
+  ## tests exercise the same tp identity production does. Falls back to a
+  ## zero tp only for a path that is not a valid canonical rel (rare).
   let tp = fromCanonical(path, testRoots)
   Entrypoint(
-    path: path,
     tp: (if tp.isSome: tp.get else: default(TrackedPath)),
     group: group, flags: flags, runTimeoutSecs: runTimeoutSecs)

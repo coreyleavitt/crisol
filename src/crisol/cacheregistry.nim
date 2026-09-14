@@ -402,9 +402,9 @@ proc rootInsideStateDir(root, stateDir: string; foldPolicy: FoldPolicy): bool =
   ## and a cache-recursing remote was wrongly ALLOWED. Under `fpNone`
   ## (case-sensitive volume — the default), `fold(s, fpNone) == s`, so this
   ## is byte-identical to the pre-fix behavior.
-  let a = fold(normalizedPath(absolutePath(root)), foldPolicy)
-  let b = fold(normalizedPath(absolutePath(stateDir)), foldPolicy)
-  a == b or a.startsWith(b & DirSep)
+  let a = fold(normalizedPath(absolutePath(root)), foldPolicy)  # canon-ok: A5c rootInsideStateDir fold-routed canonicalization
+  let b = fold(normalizedPath(absolutePath(stateDir)), foldPolicy)  # canon-ok: A5c rootInsideStateDir fold-routed canonicalization
+  isUnderRoot(a, b)
 
 proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
                       reg: BackendRegistry; secrets: CacheSecrets;

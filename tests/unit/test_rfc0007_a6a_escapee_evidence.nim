@@ -70,13 +70,14 @@ proc runSingle(fixtureName, markerName: string; scratchTag: string;
   writeFile(fixt, readFile(fixtureDir() / fixtureName))
 
   let pep = PlannedEntrypoint(
-    ep: testEp(fixt, group = "unit", flags = @[]),
+    ep: testEp(extractFilename(fixt), group = "unit", flags = @[]),
     edecision: edNeverBuilt, runTimeoutMs: runTimeoutMs)
   let p = RunPlan(entrypoints: @[pep], jobs: 1)
   var g = emptyDepGraph()
   let results = execute(
     p, config = Config(projectRoot: dir, stateDir: ".crisol",
-                       compileTimeoutSecs: 120, timeoutSecs: 60),
+                       compileTimeoutSecs: 120, timeoutSecs: 60,
+                       trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
     graph = g, showProgress = false,
     cache = cacheDisabled(isoSpec))
   check results.len == 1

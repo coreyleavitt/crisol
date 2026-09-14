@@ -199,7 +199,7 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   # key shape used by the depgraph (Table[(string, string), DepGraphEntry]).
   var currentKeys = initHashSet[(string, string)]()
   for ep in eps:
-    currentKeys.incl (ep.path, flagHash(ep.flags))
+    currentKeys.incl (ep.tp.display(), flagHash(ep.flags))
 
   # Load the graph AS PERSISTED (issue #12): `loadDepGraph`'s freshness view
   # compares the stored header's nimVersion against a caller-supplied

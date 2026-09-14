@@ -31,7 +31,7 @@ from crisol/process/types as ptypes import nil
 let qroots = initTrackedRoots(getCurrentDir(), @[], "")
 
 proc makeEp(path: string): Entrypoint =
-  Entrypoint(path: path, group: "unit", tp: fromCanonical(path, qroots).get)
+  Entrypoint(group: "unit", tp: fromCanonical(path, qroots).get)
 
 proc qPathsOf(q: HashSet[string]): HashSet[TrackedPath] =
   ## Mirror config.docToConfig: reduce every raw user entry to its TrackedPath
@@ -114,7 +114,7 @@ suite "B4 isQuarantined — B3 path-match rule":
     proc forcedLower(rootAbs, sd: string): Option[FoldPolicy] = some(fpAsciiLower)
     let froots = initTrackedRoots(getCurrentDir(), @[], "", forcedLower)
     # Live entrypoint spelled lower-case; quarantine entry spelled upper-case.
-    let ep  = Entrypoint(path: "tests/integration/foo.nim", group: "unit",
+    let ep  = Entrypoint(group: "unit",
                          tp: fromCanonical("tests/integration/foo.nim", froots).get)
     let res = failResult(ep, @[])
     var qPaths = initHashSet[TrackedPath]()
