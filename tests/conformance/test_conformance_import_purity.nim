@@ -39,5 +39,26 @@ suite "rfc-0007 A2a-ii — conformance suite import purity":
     for o in offenders:
       echo "  IMPORT PURITY VIOLATION: " & o
 
+  test "no tests/support/*.nim file imports std/posix (RFC-0009 B-inventory)":
+    # The de-POSIX sweep's SHARED helpers must themselves be portable, or a
+    # single posix import in tests/support/ would re-POSIX every test that
+    # uses it — defeating the windows-green goal from one place. The sweep
+    # regex is RFC-0009's pinned `^\s*(import|from).*\bposix\b`.
+    let supportDir = thisDir.parentDir / "support"
+    var offenders: seq[string]
+    if dirExists(supportDir):
+      for kind, path in walkDir(supportDir):
+        if kind != pcFile or not path.endsWith(".nim"): continue
+        for line in lines(path):
+          let s = line.strip()
+          if (s.startsWith("import") or s.startsWith("from")) and
+             (" posix" in s or "/posix" in s or "[posix" in s or
+              ",posix" in s or "\tposix" in s):
+            offenders.add(path.extractFilename & ": " & s)
+            break
+    check offenders.len == 0
+    for o in offenders:
+      echo "  tests/support POSIX IMPORT: " & o
+
 when isMainModule:
   echo "test_conformance_import_purity done"
