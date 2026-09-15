@@ -13,17 +13,23 @@
 ##
 ## Usage: run under forkExecEnvScratch with a small rlimitNofile.
 
-import std/posix
+when defined(posix):
+  import std/posix
 
-const MaxAttempts = 2048  # far more than any small test limit
+  const MaxAttempts = 2048  # far more than any small test limit
 
-var opened = 0
-for _ in 0 ..< MaxAttempts:
-  let fd = posix.open("/dev/null".cstring, O_RDONLY)
-  if fd < 0:
-    # errno == EMFILE or ENFILE — we hit the limit
-    quit(1)
-  opened += 1
+  var opened = 0
+  for _ in 0 ..< MaxAttempts:
+    let fd = posix.open("/dev/null".cstring, O_RDONLY)
+    if fd < 0:
+      # errno == EMFILE or ENFILE — we hit the limit
+      quit(1)
+    opened += 1
 
-# Opened MaxAttempts fds without hitting a limit — no ceiling active.
-quit(0)
+  # Opened MaxAttempts fds without hitting a limit — no ceiling active.
+  quit(0)
+else:
+  # RLIMIT_NOFILE / EMFILE is a POSIX-only concept; the A4b integration tests
+  # that run this fixture are themselves POSIX-gated. On Windows it is a no-op
+  # that exits cleanly (never invoked in a limit scenario there).
+  quit(0)
