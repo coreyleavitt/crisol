@@ -68,7 +68,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_httpraw_real.nim
 
-import std/[nativesockets, net, os, posix, strutils, times]
+import std/[nativesockets, net, os, strutils, times]
 import crisol/cachewire
 import crisol/httpraw
 
@@ -93,53 +93,62 @@ type
   ServerArgs = tuple[fd: SocketHandle, scenario: ServerScenario]
 
 proc serverThreadProc(args: ServerArgs) {.thread.} =
-  let clientFd = accept(args.fd, nil, nil)
+  # nativesockets.accept is the portable (posix accept(2) / winsock accept)
+  # wrapper -- the raw SocketHandle it returns is what crosses the thread
+  # boundary as a plain value; wrapping it in a `net.Socket` here (in the
+  # receiving thread, never shared) gives a portable send/close without
+  # sharing any GC'd ref across the thread boundary.
+  let (clientFd, _) = accept(args.fd)
   if clientFd == osInvalidSocket:
     return
-  case args.scenario
-  of ssOk200:
-    let body = "{\"ok\":true}"
-    let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Fake: yes\r\n" &
-               "Content-Length: " & $body.len & "\r\n\r\n" & body
-    discard send(clientFd, resp.cstring, resp.len, 0)
-  of ssNegativeContentLength:
-    # T2: `Content-Length: -1` must never be read as the "header absent"
-    # sentinel -- it's malformed framing, not an EOF-delimited body.
-    let resp = "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\nhello"
-    discard send(clientFd, resp.cstring, resp.len, 0)
-  of ssContentLengthOverflow:
-    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\nhello"
-    discard send(clientFd, resp.cstring, resp.len, 0)
-  of ssContentLengthGarbage:
-    let resp = "HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhello"
-    discard send(clientFd, resp.cstring, resp.len, 0)
-  of ssLyingContentLength:
-    # T1a: declares 100 bytes of body, sends 40, then closes -- must map to
-    # `toUnreachable` (httpraw.nim:529's claimed "closed before the
-    # declared length arrived" rule), never a served (truncated) body.
-    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" & "x".repeat(40)
-    discard send(clientFd, resp.cstring, resp.len, 0)
-  of ssGarbageStatusLine:
-    # T1b: not an HTTP response at all -- `parseStatusAndHeaders` must
-    # reject it (`parsedOk == false`), mapping to `toUnreachable`.
-    let resp = "NOT AN HTTP RESPONSE\r\n\r\ntrailing junk that must never be parsed"
-    discard send(clientFd, resp.cstring, resp.len, 0)
-  of ssChunked:
-    # Multiple chunks, a chunk extension (ignored), and a trailer -- the
-    # same RFC-7230 shapes test_chunkedcodec.nim vector-tests in isolation,
-    # here proving the real socket path decodes them identically.
-    let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" &
-               "Transfer-Encoding: chunked\r\n\r\n" &
-               "4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-Trailer: done\r\n\r\n"
-    discard send(clientFd, resp.cstring, resp.len, 0)
-  of ss404:
-    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
-    discard send(clientFd, resp.cstring, resp.len, 0)
-  of ssSilent:
-    # Accept completes the TCP handshake; then say nothing for well past
-    # the client's recv deadline before ever touching the socket again.
-    sleep(1500)
-  discard posix.close(clientFd)
+  let clientSocket = newSocket(clientFd, buffered = false)
+  try:
+    case args.scenario
+    of ssOk200:
+      let body = "{\"ok\":true}"
+      let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Fake: yes\r\n" &
+                 "Content-Length: " & $body.len & "\r\n\r\n" & body
+      clientSocket.send(resp)
+    of ssNegativeContentLength:
+      # T2: `Content-Length: -1` must never be read as the "header absent"
+      # sentinel -- it's malformed framing, not an EOF-delimited body.
+      let resp = "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\nhello"
+      clientSocket.send(resp)
+    of ssContentLengthOverflow:
+      let resp = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\nhello"
+      clientSocket.send(resp)
+    of ssContentLengthGarbage:
+      let resp = "HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhello"
+      clientSocket.send(resp)
+    of ssLyingContentLength:
+      # T1a: declares 100 bytes of body, sends 40, then closes -- must map to
+      # `toUnreachable` (httpraw.nim:529's claimed "closed before the
+      # declared length arrived" rule), never a served (truncated) body.
+      let resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" & "x".repeat(40)
+      clientSocket.send(resp)
+    of ssGarbageStatusLine:
+      # T1b: not an HTTP response at all -- `parseStatusAndHeaders` must
+      # reject it (`parsedOk == false`), mapping to `toUnreachable`.
+      let resp = "NOT AN HTTP RESPONSE\r\n\r\ntrailing junk that must never be parsed"
+      clientSocket.send(resp)
+    of ssChunked:
+      # Multiple chunks, a chunk extension (ignored), and a trailer -- the
+      # same RFC-7230 shapes test_chunkedcodec.nim vector-tests in isolation,
+      # here proving the real socket path decodes them identically.
+      let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" &
+                 "Transfer-Encoding: chunked\r\n\r\n" &
+                 "4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-Trailer: done\r\n\r\n"
+      clientSocket.send(resp)
+    of ss404:
+      let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+      clientSocket.send(resp)
+    of ssSilent:
+      # Accept completes the TCP handshake; then say nothing for well past
+      # the client's recv deadline before ever touching the socket again.
+      sleep(1500)
+  except OSError:
+    discard  # mirrors the original raw send()'s silently-discarded errors
+  clientSocket.close()
 
 proc startFakeServer(scenario: ServerScenario): tuple[thr: ref Thread[ServerArgs], listener: Socket, port: Port] =
   var listener = newSocket()

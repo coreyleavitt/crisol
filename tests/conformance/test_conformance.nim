@@ -28,7 +28,7 @@
 ## material (the double-reap misuse Defect, a Supervisor lifecycle-misuse
 ## regression test, not one of the nine contract items).
 
-import std/[options, os, posix, unittest, monotimes, times]
+import std/[options, os, unittest, monotimes, times]
 import ./helpers
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ suite "conformance 2+3 — timeout kill, cooperative vs escalated":
     check report.stop.get.reason == krTimeout
     check report.stop.get.escalated == false
     check report.exit.kind == ekSignaled          # honest — never a fabricated ekExited
-    check report.exit.sig == int(SIGTERM)
+    check report.exit.sig == 15  # SIGTERM (POSIX-standard number; the runner reports these)
     removeFile(outPath)
 
   test "term_ignores: requestStop then forceKill -> escalated:true, SIGKILL observed":
@@ -137,7 +137,7 @@ suite "conformance 2+3 — timeout kill, cooperative vs escalated":
     check report.stop.get.reason == krTimeout
     check report.stop.get.escalated == true
     check report.exit.kind == ekSignaled
-    check report.exit.sig == int(SIGKILL)
+    check report.exit.sig == 9  # SIGKILL (POSIX-standard number; the runner reports these)
     removeFile(outPath)
 
 # ---------------------------------------------------------------------------

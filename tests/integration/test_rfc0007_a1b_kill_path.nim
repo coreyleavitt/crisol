@@ -25,8 +25,8 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_rfc0007_a1b_kill_path.nim
 
-import std/[json, os, times, unittest]
-import std/posix as posix_mod
+import std/[json, os, unittest]
+import ../support/capture
 import crisol         # imports runMain
 
 # ---------------------------------------------------------------------------
@@ -37,25 +37,6 @@ proc fixtureDir(): string =
   let thisFile = currentSourcePath()
   let testsDir = thisFile.parentDir.parentDir
   testsDir / "fixtures"
-
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  ## Same idiom as test_issue13_persist_failure.nim's captureStdout — not
-  ## imported, so this file has no test-to-test dependency.
-  let outPath = getTempDir() / ("crisol_rfc0007_a1b_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
 
 proc firstEntrypoint(jsonText: string): JsonNode =
   let doc = parseJson(jsonText)
@@ -70,9 +51,12 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
 
   test "hang_forever: outcome killed + honest run.cause/run.exit (SIGTERM, not escalated)":
     let fd = fixtureDir()
-    let (_, output) = captureStdout(@["run", fd / "hang_forever.nim",
-                                      "--timeout", "2", "--jobs", "1", "--json",
-                                      "--no-cache"])
+    var code = 0
+    let output = captureStdout(proc() =
+      code = runMain(@["run", fd / "hang_forever.nim",
+                        "--timeout", "2", "--jobs", "1", "--json",
+                        "--no-cache"]))
+    discard code
     let ep = firstEntrypoint(output)
 
     # rfc-0007 A1d-i: the wire cutover — `outcome` is now deriveOutcome(r),
@@ -94,16 +78,19 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
     # pollSlot synthesized SIGKILL unconditionally regardless of what
     # actually happened — this is the fabrication being fixed.
     check ep["run"]["exit"]["kind"].getStr == "signaled"
-    check ep["run"]["exit"]["sig"].getInt == int(SIGTERM)
+    check ep["run"]["exit"]["sig"].getInt == 15  # SIGTERM (POSIX-standard number; the runner reports these)
     # rfc-0007 A1d-i: evidence is now a real node too (not just exit/cause).
     check ep["run"].hasKey("evidence")
     check ep["run"]["evidence"]["killDomain"].kind == JString
 
   test "term_ignores: SIGTERM-ignoring child forces escalation to SIGKILL":
     let fd = fixtureDir()
-    let (_, output) = captureStdout(@["run", fd / "term_ignores.nim",
-                                      "--timeout", "2", "--jobs", "1", "--json",
-                                      "--no-cache"])
+    var code = 0
+    let output = captureStdout(proc() =
+      code = runMain(@["run", fd / "term_ignores.nim",
+                        "--timeout", "2", "--jobs", "1", "--json",
+                        "--no-cache"]))
+    discard code
     let ep = firstEntrypoint(output)
 
     check ep["outcome"].getStr == "killed"
@@ -112,13 +99,15 @@ suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
     check ep["run"]["cause"]["escalated"].getBool == true
 
     check ep["run"]["exit"]["kind"].getStr == "signaled"
-    check ep["run"]["exit"]["sig"].getInt == int(SIGKILL)
+    check ep["run"]["exit"]["sig"].getInt == 9  # SIGKILL (POSIX-standard number; the runner reports these)
 
   test "pass_always: run.exit.code == 0":
     let fd = fixtureDir()
-    let (code, output) = captureStdout(@["run", fd / "pass_always.nim",
-                                         "--timeout", "2", "--jobs", "1", "--json",
-                                         "--no-cache"])
+    var code = 0
+    let output = captureStdout(proc() =
+      code = runMain(@["run", fd / "pass_always.nim",
+                        "--timeout", "2", "--jobs", "1", "--json",
+                        "--no-cache"]))
     check code == 0
     let ep = firstEntrypoint(output)
     check ep["outcome"].getStr == "passed"

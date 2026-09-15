@@ -15,7 +15,7 @@
 ##         tests/unit/test_jsonout.nim
 
 import std/[json, monotimes, options, os, sequtils, sets, strutils, times, unittest]
-import std/posix as posix_mod
+import ../support/capture
 import crisol/types
 import crisol/jsonout
 import crisol/paths
@@ -864,27 +864,8 @@ suite "jsonout - persistLastRun":
       check false   # must not propagate any exception
 
 # ---------------------------------------------------------------------------
-# stdout capture helper using POSIX dup2
+# stdout capture helper — shared portable implementation (tests/support/capture)
 # ---------------------------------------------------------------------------
-
-proc captureStdoutToFile(path: string; body: proc()): void =
-  ## Redirect fd 1 (stdout) to `path`, call body(), then restore.
-  ## Uses raw POSIX dup/dup2/close; safe for in-process capture.
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(1) failed")
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()  # fd 1 now points at the file; we can close the extra fd
-  try:
-    body()
-  finally:
-    # Flush whatever Nim's stdout buffer has
-    flushFile(stdout)
-    discard posix_mod.dup2(savedFd, 1.cint)
-    discard posix_mod.close(savedFd)
 
 # ---------------------------------------------------------------------------
 # Fresh CRISOL_STATE_DIR helper (RFC-0006 Issue-2 regression coverage)
@@ -1435,13 +1416,13 @@ suite "jsonout - P3 symlink-safe temp write":
     # temp path is PID-suffixed (`<finalPath>.<pid>.tmp`), not a bare
     # `<finalPath>.tmp` — plant the symlink at the REAL path atomicPublish
     # will actually open.
-    let tmpPath   = finalPath & "." & $posix_mod.getpid() & ".tmp"
+    let tmpPath   = finalPath & "." & $getCurrentProcessId() & ".tmp"
 
     # Plant a sentinel file and a symlink pointing to it at the .tmp location.
     let sentinel = tmpDir / "sentinel_must_not_be_overwritten.txt"
     writeFile(sentinel, "ORIGINAL")
     # Create a symlink: lastrun.json.<pid>.tmp -> sentinel
-    discard posix_mod.symlink(sentinel.cstring, tmpPath.cstring)
+    createSymlink(sentinel, tmpPath)
 
     let cfg = Config(
       projectRoot:        tmpDir,

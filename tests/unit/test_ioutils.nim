@@ -26,8 +26,10 @@
 ##      trailing 0xC2) is left untouched.
 
 import std/[os, strutils]
-import std/posix as posix_mod
 import crisol/ioutils
+
+when defined(posix):
+  import std/posix as posix_mod
 
 # ---------------------------------------------------------------------------
 # 1. writeAllFd: round-trip through a real file
@@ -37,14 +39,15 @@ block test_writeallfd_file_roundtrip:
   let path = getTempDir() / "crisol_ioutils_test_roundtrip.txt"
   defer: (try: removeFile(path) except CatchableError: discard)
 
-  let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_TRUNC or
-              posix_mod.O_CLOEXEC
-  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(0o600))
-  assert fd >= 0, "failed to open temp file: " & $posix_mod.strerror(posix_mod.errno)
+  # Portable fd open (ioutils' own createOverwrite), not a hand-rolled
+  # posix.open — writeAllFd/closeFd are cross-platform, so the fd source
+  # should be too.
+  let (fd, openError, _) = createOverwrite(path)
+  assert fd >= 0, "failed to open temp file: " & openError
 
   let data = "hello, world — writeAllFd test payload\n"
   let ok = writeAllFd(fd, data)
-  discard posix_mod.close(fd)
+  closeFd(fd)
 
   assert ok, "writeAllFd must return true on success"
   let readBack = readFile(path)
@@ -67,13 +70,11 @@ block test_writeallfd_empty:
   let path = getTempDir() / "crisol_ioutils_test_empty.txt"
   defer: (try: removeFile(path) except CatchableError: discard)
 
-  let flags = posix_mod.O_CREAT or posix_mod.O_WRONLY or posix_mod.O_TRUNC or
-              posix_mod.O_CLOEXEC
-  let fd = posix_mod.open(path.cstring, flags, posix_mod.Mode(0o600))
-  assert fd >= 0, "failed to open temp file"
+  let (fd, openError, _) = createOverwrite(path)
+  assert fd >= 0, "failed to open temp file: " & openError
 
   let ok = writeAllFd(fd, "")
-  discard posix_mod.close(fd)
+  closeFd(fd)
 
   assert ok, "writeAllFd with empty data must return true"
 
@@ -85,26 +86,33 @@ block test_writeallfd_empty:
 ## unit under test via coverage of the n>0 branch).
 # ---------------------------------------------------------------------------
 
-block test_writeallfd_pipe:
-  var pipeFds: array[2, cint]
-  let rc = posix_mod.pipe(pipeFds)
-  assert rc == 0, "pipe() failed"
-  let rdFd = pipeFds[0]
-  let wrFd = pipeFds[1]
+when defined(posix):
+  # No portable pipe-fd equivalent is used here: this specifically exercises
+  # writeAllFd's byte-level write loop against a pipe write-end (distinct
+  # from a regular file's write path — the O_APPEND-less short-write /
+  # EINTR-retry branch), via a raw posix pipe(2). Windows has no exact
+  # analog wired into ioutils, and the regular-file roundtrip above already
+  # covers writeAllFd's cross-platform contract, so this stays posix-only.
+  block test_writeallfd_pipe:
+    var pipeFds: array[2, cint]
+    let rc = posix_mod.pipe(pipeFds)
+    assert rc == 0, "pipe() failed"
+    let rdFd = pipeFds[0]
+    let wrFd = pipeFds[1]
 
-  let payload = "pipe payload test"
-  let ok = writeAllFd(wrFd, payload)
-  discard posix_mod.close(wrFd)
+    let payload = "pipe payload test"
+    let ok = writeAllFd(wrFd, payload)
+    discard posix_mod.close(wrFd)
 
-  assert ok, "writeAllFd to pipe write-end must return true"
+    assert ok, "writeAllFd to pipe write-end must return true"
 
-  # Read back from the read-end.
-  var buf = newString(payload.len)
-  let n = posix_mod.read(rdFd, buf.cstring, buf.len)
-  discard posix_mod.close(rdFd)
+    # Read back from the read-end.
+    var buf = newString(payload.len)
+    let n = posix_mod.read(rdFd, buf.cstring, buf.len)
+    discard posix_mod.close(rdFd)
 
-  assert n == payload.len, "pipe read got " & $n & " bytes, expected " & $payload.len
-  assert buf == payload, "pipe payload mismatch: " & buf.repr
+    assert n == payload.len, "pipe read got " & $n & " bytes, expected " & $payload.len
+    assert buf == payload, "pipe payload mismatch: " & buf.repr
 
 # ---------------------------------------------------------------------------
 # 5. atomicPublish: writes atomically, returns (true, ""), round-trips, no
@@ -123,7 +131,7 @@ block test_atomicputfile_roundtrip:
   assert fileExists(path), "final file must exist after atomicPublish"
   assert readFile(path) == data, "round-trip mismatch"
 
-  let myPidTmp = path & "." & $posix_mod.getpid() & ".tmp"
+  let myPidTmp = path & "." & $getCurrentProcessId() & ".tmp"
   assert not fileExists(myPidTmp), "writer-own .tmp must not exist after rename"
 
 # ---------------------------------------------------------------------------
@@ -148,7 +156,7 @@ block test_atomicputfile_replace:
 
 block test_atomicputfile_preplanted_own_tmp:
   let path = getTempDir() / "crisol_ioutils_test_atomicput_preplanted.txt"
-  let myPidTmp = path & "." & $posix_mod.getpid() & ".tmp"
+  let myPidTmp = path & "." & $getCurrentProcessId() & ".tmp"
   defer:
     (try: removeFile(path) except CatchableError: discard)
     (try: removeFile(myPidTmp) except CatchableError: discard)
@@ -186,26 +194,33 @@ block test_atomicputfile_nonexistent_dir_reports_error:
 #    string containing the OS reason (permission denied) (RFC-0006 review
 #    R10). Skipped when running as root — root bypasses permission bits, so
 #    this specific failure mode cannot be exercised as root.
+#
+# POSIX-only: the read-only-directory trick (chmod off owner-write) is a
+# VACUOUS pass on Windows — a directory's read-only attribute there does not
+# block file creation inside it — so this whole case is gated rather than
+# converted, matching how `atomicPublish`/`createOverwrite` themselves only
+# treat directory-mode denial as a real, testable failure mode on posix.
 # ---------------------------------------------------------------------------
 
-block test_atomicputfile_unwritable_dir_reports_error:
-  if posix_mod.geteuid() == 0:
-    echo "test_ioutils: skipping unwritable-dir case (running as root)"
-  else:
-    let roDir = getTempDir() / "crisol_ioutils_test_readonly_dir"
-    (try: removeDir(roDir) except CatchableError: discard)
-    createDir(roDir)
-    setFilePermissions(roDir, {fpUserRead, fpUserExec})
-    defer:
-      setFilePermissions(roDir, {fpUserRead, fpUserWrite, fpUserExec})
+when defined(posix):
+  block test_atomicputfile_unwritable_dir_reports_error:
+    if posix_mod.geteuid() == 0:
+      echo "test_ioutils: skipping unwritable-dir case (running as root)"
+    else:
+      let roDir = getTempDir() / "crisol_ioutils_test_readonly_dir"
       (try: removeDir(roDir) except CatchableError: discard)
-    let path = roDir / "target.txt"
+      createDir(roDir)
+      setFilePermissions(roDir, {fpUserRead, fpUserExec})
+      defer:
+        setFilePermissions(roDir, {fpUserRead, fpUserWrite, fpUserExec})
+        (try: removeDir(roDir) except CatchableError: discard)
+      let path = roDir / "target.txt"
 
-    let (ok, error) = atomicPublish(path, "should never land")
-    assert not ok, "atomicPublish into an unwritable dir must return ok=false"
-    assert error.len > 0,
-      "atomicPublish must report a NON-EMPTY error naming the OS reason, got empty string"
-    assert not fileExists(path), "no file may be created on a create-temp-file failure"
+      let (ok, error) = atomicPublish(path, "should never land")
+      assert not ok, "atomicPublish into an unwritable dir must return ok=false"
+      assert error.len > 0,
+        "atomicPublish must report a NON-EMPTY error naming the OS reason, got empty string"
+      assert not fileExists(path), "no file may be created on a create-temp-file failure"
 
 # ---------------------------------------------------------------------------
 # 10. sanitizeControlBytes: control/ANSI injection guard for untrusted-origin

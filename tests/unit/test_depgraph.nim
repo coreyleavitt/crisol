@@ -12,7 +12,6 @@
 ##   - Missing file → empty graph: loadDepGraph on missing depgraph → empty, no raise.
 
 import std/[os, sets, json, tables]
-import std/posix as posix_mod
 import crisol/types
 import crisol/depgraph
 
@@ -312,12 +311,12 @@ block test_saveDepGraph_symlink_write_through_protection:
   # temp path is PID-suffixed (`<finalPath>.<pid>.tmp`), not a bare
   # `<finalPath>.tmp` — plant the symlink at the REAL path atomicPublish
   # will actually open.
-  let tmpPath    = finalPath & "." & $posix_mod.getpid() & ".tmp"
+  let tmpPath    = finalPath & "." & $getCurrentProcessId() & ".tmp"
 
   # Plant a sentinel and a symlink at the .tmp location.
   let sentinel = root / "sentinel_must_not_be_overwritten.txt"
   writeFile(sentinel, "ORIGINAL")
-  discard posix_mod.symlink(sentinel.cstring, tmpPath.cstring)
+  createSymlink(sentinel, tmpPath)
 
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
@@ -371,7 +370,7 @@ block test_format_version_pin:
     "DepGraphFormatVersion pin: expected 6 (RFC-0009 A3c-i), got " & $DepGraphFormatVersion
 
   # A v4 graph on disk is treated as absent (discarded, not migrated).
-  let root = getTempDir() / ("crisol_depgraph_v4pin_" & $getpid())
+  let root = getTempDir() / ("crisol_depgraph_v4pin_" & $getCurrentProcessId())
   removeDir(root)
   ensureStateDirExists(root)
   defer: removeDir(root)
@@ -390,7 +389,7 @@ block test_format_version_pin:
   # once on load (the CHANGELOG format-6 migration promise). It carries the
   # v5 `externals` shape (issue #16) to prove the discard is driven purely by
   # the formatVersion mismatch, not by a shape parse failure.
-  let root5 = getTempDir() / ("crisol_depgraph_v5pin_" & $getpid())
+  let root5 = getTempDir() / ("crisol_depgraph_v5pin_" & $getCurrentProcessId())
   removeDir(root5)
   ensureStateDirExists(root5)
   defer: removeDir(root5)

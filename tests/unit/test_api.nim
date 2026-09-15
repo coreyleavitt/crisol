@@ -39,10 +39,7 @@
 ##         tests/unit/test_api.nim
 
 import std/[base64, json, options, os, osproc, strutils, tables, times, unittest]
-from std/posix as posix_mod import nil  # RFC-0005 code-review L2's captureStderr
-                                         # only -- `import nil` so `Rusage` etc.
-                                         # never collide unqualified with
-                                         # crisol/process/types's own
+import ../support/capture
 import crisol/api
 import crisol/render     # RFC-0005 code-review D1: renderCacheStats
 import crisol/types
@@ -845,27 +842,6 @@ proc offlineTierDeps(): CacheDeps =
       ),
       sink: NilSink[TelemetryEvent](),
     ))
-
-proc captureStderr(body: proc()): string =
-  ## fd-level stderr redirect (mirrors test_b2b_cache_stats_cli.nim's own
-  ## `captureBoth`) -- works regardless of whether the write goes through
-  ## Nim's `stderr` object or a lower-level handle, since it swaps the real
-  ## OS file descriptor 2, not a Nim-level reference.
-  let tag = $getCurrentProcessId() & "_" & $epochTime().int64
-  let errPath = getTempDir() / ("crisol_l2_err_" & tag & ".txt")
-  let errF = open(errPath, fmWrite)
-  let errFd: cint = errF.getFileHandle.cint
-  let savedErrFd: cint = posix_mod.dup(2.cint)
-  discard posix_mod.dup2(errFd, 2.cint)
-  errF.close()
-  try:
-    body()
-  finally:
-    flushFile(stderr)
-    discard posix_mod.dup2(savedErrFd, 2.cint)
-    discard posix_mod.close(savedErrFd)
-  result = readFile(errPath)
-  try: removeFile(errPath) except CatchableError: discard
 
 suite "RFC-0005 code-review L2 — unconditional per-tier 100%-error warning":
 

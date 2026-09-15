@@ -12,7 +12,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_cli_s6.nim
 
-import std/[os, posix, strutils, times, unittest]
+import std/[os, strutils, times, unittest]
 import crisol        # runMain
 import crisol/config  # loadConfig
 
@@ -21,7 +21,7 @@ import crisol/config  # loadConfig
 # ---------------------------------------------------------------------------
 
 proc makeTmpDir(): string =
-  result = getTempDir() / ("crisol_s6_" & $getpid() & "_" & $epochTime().int)
+  result = getTempDir() / ("crisol_s6_" & $getCurrentProcessId() & "_" & $epochTime().int)
   createDir(result)
 
 # ---------------------------------------------------------------------------
@@ -128,8 +128,7 @@ suite "crisol S6 — crisol init":
 
     # Create crisol.kdl as a symlink pointing at the sentinel.
     let symlinkPath = root / "crisol.kdl"
-    let rc = symlink(sentinel.cstring, symlinkPath.cstring)
-    check rc == 0  # symlink created successfully
+    createSymlink(sentinel, symlinkPath)  # raises on failure
 
     let oldCwd = getCurrentDir()
     setCurrentDir(root)
