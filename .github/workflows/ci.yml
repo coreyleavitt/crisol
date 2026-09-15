@@ -431,6 +431,21 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a5c_cache_portability.nim
 
+      # RFC-0009 B4a — harness bring-up: run the GENERAL unit suite on real
+      # Windows through the SAME honest-exit wrapper the Linux/macOS legs use
+      # (ci/run-tests.sh -> nimble test -> per-file `nim r`), scoped to
+      # tests/unit only. This is the first time the non-windows-specific unit
+      # suite compiles AND runs natively here: every POSIX-backend unit test
+      # is now gated `when defined(posix)` (B1/B2/B3a/B3b/B3c) so it skips by
+      # design, while the portable majority runs for real. tests/conformance
+      # joins at B4b (the completion gate); tests/integration stays out of
+      # this leg's scope, mirroring the macOS leg.
+      - name: rfc-0009 B4a — unit suite (native, ci/run-tests.sh)
+        env:
+          CRISOL_TIER: windows
+          CRISOL_TEST_DIRS: tests/unit
+        run: bash ci/run-tests.sh
+
   macos:
     runs-on: macos-latest
     steps:
