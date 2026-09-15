@@ -29,255 +29,259 @@
 ##   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
 ##     --path:src tests/conformance/test_conformance_timing.nim
 
-import std/[os, osproc, posix, unittest, monotimes, times, sequtils, options]
+when defined(posix):
+  import std/[os, osproc, posix, unittest, monotimes, times, sequtils, options]
 
-if getEnv("CRISOL_TIMING_TESTS") == "":
-  quit(0)
+  if getEnv("CRISOL_TIMING_TESTS") == "":
+    quit(0)
 
-import ./helpers
+  import ./helpers
 
-# ---------------------------------------------------------------------------
-# Fixtures compiled once at module load (after the gate — never compiled on
-# the main leg).
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Fixtures compiled once at module load (after the gate — never compiled on
+  # the main leg).
+  # ---------------------------------------------------------------------------
 
-let hangBin        = compileFixture("hang_forever")
-let termIgnoresBin = compileFixture("term_ignores")
-let sleepBin       = compileFixture("sleep_then_exit")
+  let hangBin        = compileFixture("hang_forever")
+  let termIgnoresBin = compileFixture("term_ignores")
+  let sleepBin       = compileFixture("sleep_then_exit")
 
-# ---------------------------------------------------------------------------
-# Timeout-kill grace timing.
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Timeout-kill grace timing.
+  # ---------------------------------------------------------------------------
 
-suite "conformance timing — timeout-kill grace timing":
+  suite "conformance timing — timeout-kill grace timing":
 
-  test "hang_forever dies within one grace window of requestStop, not merely 'eventually'":
-    var sv = initSupervisor(installSignals = false)
-    let outPath = tmpOutputFile("timing_grace_single")
-    let spec = ChildSpec(argv: @[hangBin], cwd: getCurrentDir(), env: @[],
-                          sinks: combinedSink(outPath))
-    let sr = sv.spawn(spec)
-    check sr.ok
-    let t0 = getMonoTime()
-    sv.requestStop(sr.id, krTimeout)
-    let ev = sv.next(t0 + initDuration(seconds = 5))
-    let elapsed = getMonoTime() - t0
-    check ev.kind == weChildExited
-    discard sv.reap(ev.id)
-    echo "  observed: hang_forever died ", elapsed.inMilliseconds, " ms after requestStop"
-    # A generous bound (SIGTERM default disposition is near-instant on any
-    # host; 1s covers scheduler noise) — pins "in grace", not "on a timer".
-    check elapsed < initDuration(seconds = 1)
-    removeFile(outPath)
-
-# ---------------------------------------------------------------------------
-# Item 4 — shared grace window: N children stopped together tear down in ONE
-# grace window, not N sequential ones. requestStop is non-blocking (§1) —
-# the executor pattern below is exactly what A2b's teardown machinery does:
-# fire all the stop acts, THEN wait once with a single shared deadline.
-# ---------------------------------------------------------------------------
-
-suite "conformance timing — item 4: shared grace window":
-
-  test "3 term_ignores children, stopped together, tear down in ~one grace window":
-    const graceMs = 300
-    var sv = initSupervisor(installSignals = false)
-    var outPaths: seq[string]
-    var ids: seq[ChildId]
-    for i in 0 ..< 3:
-      let outPath = tmpOutputFile("shared_grace_" & $i)
-      outPaths.add outPath
-      let spec = ChildSpec(argv: @[termIgnoresBin], cwd: getCurrentDir(), env: @[],
+    test "hang_forever dies within one grace window of requestStop, not merely 'eventually'":
+      var sv = initSupervisor(installSignals = false)
+      let outPath = tmpOutputFile("timing_grace_single")
+      let spec = ChildSpec(argv: @[hangBin], cwd: getCurrentDir(), env: @[],
                             sinks: combinedSink(outPath))
       let sr = sv.spawn(spec)
       check sr.ok
-      ids.add sr.id
-    # term_ignores installs SIG_IGN in the first line of main — same startup
-    # race note as test_conformance.nim's item 3 case.
-    os.sleep(150)
+      let t0 = getMonoTime()
+      sv.requestStop(sr.id, krTimeout)
+      let ev = sv.next(t0 + initDuration(seconds = 5))
+      let elapsed = getMonoTime() - t0
+      check ev.kind == weChildExited
+      discard sv.reap(ev.id)
+      echo "  observed: hang_forever died ", elapsed.inMilliseconds, " ms after requestStop"
+      # A generous bound (SIGTERM default disposition is near-instant on any
+      # host; 1s covers scheduler noise) — pins "in grace", not "on a timer".
+      check elapsed < initDuration(seconds = 1)
+      removeFile(outPath)
 
-    let t0 = getMonoTime()
-    for id in ids:
-      sv.requestStop(id, krTimeout)   # non-blocking (§1) — fired for all 3 up front
+  # ---------------------------------------------------------------------------
+  # Item 4 — shared grace window: N children stopped together tear down in ONE
+  # grace window, not N sequential ones. requestStop is non-blocking (§1) —
+  # the executor pattern below is exactly what A2b's teardown machinery does:
+  # fire all the stop acts, THEN wait once with a single shared deadline.
+  # ---------------------------------------------------------------------------
 
-    # Reap each child the MOMENT it's observed exited, not after the whole
-    # batch: next() is level-triggered (§1) — an unreaped exited child is
-    # re-reported on every call, so leaving one unreaped would starve the
-    # scan of ever noticing its siblings exit. Reporting is deferred into
-    # `reports`, keyed by id, so the escalated/exit assertions below still
-    # run once, after the whole batch is down.
-    var reports: seq[tuple[id: ChildId; report: ReapReport]]
-    let graceDeadline = t0 + initDuration(milliseconds = graceMs)
-    while getMonoTime() < graceDeadline and reports.len < ids.len:
-      let ev = sv.next(graceDeadline)
-      if ev.kind == weChildExited:
+  suite "conformance timing — item 4: shared grace window":
+
+    test "3 term_ignores children, stopped together, tear down in ~one grace window":
+      const graceMs = 300
+      var sv = initSupervisor(installSignals = false)
+      var outPaths: seq[string]
+      var ids: seq[ChildId]
+      for i in 0 ..< 3:
+        let outPath = tmpOutputFile("shared_grace_" & $i)
+        outPaths.add outPath
+        let spec = ChildSpec(argv: @[termIgnoresBin], cwd: getCurrentDir(), env: @[],
+                              sinks: combinedSink(outPath))
+        let sr = sv.spawn(spec)
+        check sr.ok
+        ids.add sr.id
+      # term_ignores installs SIG_IGN in the first line of main — same startup
+      # race note as test_conformance.nim's item 3 case.
+      os.sleep(150)
+
+      let t0 = getMonoTime()
+      for id in ids:
+        sv.requestStop(id, krTimeout)   # non-blocking (§1) — fired for all 3 up front
+
+      # Reap each child the MOMENT it's observed exited, not after the whole
+      # batch: next() is level-triggered (§1) — an unreaped exited child is
+      # re-reported on every call, so leaving one unreaped would starve the
+      # scan of ever noticing its siblings exit. Reporting is deferred into
+      # `reports`, keyed by id, so the escalated/exit assertions below still
+      # run once, after the whole batch is down.
+      var reports: seq[tuple[id: ChildId; report: ReapReport]]
+      let graceDeadline = t0 + initDuration(milliseconds = graceMs)
+      while getMonoTime() < graceDeadline and reports.len < ids.len:
+        let ev = sv.next(graceDeadline)
+        if ev.kind == weChildExited:
+          reports.add (ev.id, sv.reap(ev.id))
+
+      # term_ignores never dies cooperatively (SIG_IGN) — escalate whoever's left.
+      let reapedSoFar = reports.len
+      for id in ids:
+        if not reports.anyIt(it.id == id):
+          sv.forceKill(id)
+
+      let killDeadline = getMonoTime() + initDuration(seconds = 5)
+      while reports.len < ids.len:
+        let ev = sv.next(killDeadline)
+        check ev.kind == weChildExited   # never weDeadline — all 3 must die
         reports.add (ev.id, sv.reap(ev.id))
 
-    # term_ignores never dies cooperatively (SIG_IGN) — escalate whoever's left.
-    let reapedSoFar = reports.len
-    for id in ids:
-      if not reports.anyIt(it.id == id):
-        sv.forceKill(id)
+      let totalElapsed = getMonoTime() - t0
+      check reapedSoFar == 0   # SIG_IGN: none died cooperatively during grace
+      for (_, report) in reports:
+        check report.stop.isSome
+        check report.stop.get.escalated == true
+        check report.exit.kind == ekSignaled
+        check report.exit.sig == int(SIGKILL)
 
-    let killDeadline = getMonoTime() + initDuration(seconds = 5)
-    while reports.len < ids.len:
-      let ev = sv.next(killDeadline)
-      check ev.kind == weChildExited   # never weDeadline — all 3 must die
-      reports.add (ev.id, sv.reap(ev.id))
+      echo "  observed: 3 children stopped together, all reaped in ",
+           totalElapsed.inMilliseconds, " ms (grace window: ", graceMs, " ms)"
+      # ONE shared grace window, not three sequential ones: 3 serial
+      # (grace + kill-response) cycles would be >= 3 * graceMs (900ms) before
+      # even counting kill-response time. A generous bound catches a
+      # regression to N sequential windows while tolerating scheduler noise.
+      check totalElapsed < initDuration(milliseconds = graceMs * 2)
 
-    let totalElapsed = getMonoTime() - t0
-    check reapedSoFar == 0   # SIG_IGN: none died cooperatively during grace
-    for (_, report) in reports:
-      check report.stop.isSome
-      check report.stop.get.escalated == true
-      check report.exit.kind == ekSignaled
-      check report.exit.sig == int(SIGKILL)
+      for p in outPaths: removeFile(p)
 
-    echo "  observed: 3 children stopped together, all reaped in ",
-         totalElapsed.inMilliseconds, " ms (grace window: ", graceMs, " ms)"
-    # ONE shared grace window, not three sequential ones: 3 serial
-    # (grace + kill-response) cycles would be >= 3 * graceMs (900ms) before
-    # even counting kill-response time. A generous bound catches a
-    # regression to N sequential windows while tolerating scheduler noise.
-    check totalElapsed < initDuration(milliseconds = graceMs * 2)
+  # ---------------------------------------------------------------------------
+  # Item 9 — shutdown wakeup: a signal delivered while blocked in next()
+  # returns weShutdown well before the deadline (moved from
+  # tests/integration/test_rfc0007_a2a_supervisor.nim's A2a-i seed case, now
+  # gated per this file's header).
+  # ---------------------------------------------------------------------------
 
-    for p in outPaths: removeFile(p)
+  suite "conformance timing — item 9: shutdown wakeup":
 
-# ---------------------------------------------------------------------------
-# Item 9 — shutdown wakeup: a signal delivered while blocked in next()
-# returns weShutdown well before the deadline (moved from
-# tests/integration/test_rfc0007_a2a_supervisor.nim's A2a-i seed case, now
-# gated per this file's header).
-# ---------------------------------------------------------------------------
-
-suite "conformance timing — item 9: shutdown wakeup":
-
-  test "a signal delivered while blocked in next() returns weShutdown promptly":
-    var sv = initSupervisor(installSignals = true)
-    let t0 = getMonoTime()
-    # A helper process delivers SIGINT to THIS process after a short delay —
-    # a real, externally-delivered signal (not a same-thread coincidence),
-    # arriving while `next` is expected to be blocked in poll(2).
-    let helper = startProcess("/bin/sh", args = @["-c",
-                 "sleep 0.2; kill -INT " & $getpid()],
-                 options = {poUsePath})
-    let farDeadline = t0 + initDuration(seconds = 10)
-    let ev = sv.next(farDeadline)
-    let elapsed = getMonoTime() - t0
-    check ev.kind == weShutdown
-    check ev.signal.signum == int(SIGINT)
-    echo "  observed: weShutdown ", elapsed.inMilliseconds,
-         " ms after signal delivery (deadline was 10000 ms out)"
-    check elapsed < initDuration(seconds = 2)   # well before the 10s deadline
-    discard waitForExit(helper)
-    close(helper)
-
-
-# ---------------------------------------------------------------------------
-# rfc-0007 B2 — event-driven exit detection: a registered child's pidfd
-# becoming readable wakes `next()` directly, instead of waiting out the
-# poll(2)-tier's up-to-25ms tick. `CRISOL_FORCE_POLL=1` (this file's own
-# knob-under-test) picks the OTHER bound deliberately, so running this suite
-# under both env states (see this repo's `./dev test` / `./dev timing` CI
-# wiring) proves both tiers live, not just the default one.
-#
-# Run BOTH tiers directly:
-#   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
-#     --path:src tests/conformance/test_conformance_timing.nim
-#   ./dev run env CRISOL_TIMING_TESTS=1 CRISOL_FORCE_POLL=1 nim r \
-#     --hints:off --warnings:off --path:src tests/conformance/test_conformance_timing.nim
-# ---------------------------------------------------------------------------
-
-when defined(linux):
-  # rfc-0007 C1b: gated to Linux — this is the pidfd/epoll latency-
-  # discrimination proof (event-driven wake vs the 25ms poll tick). On
-  # the macOS CI runner scheduling noise exceeds that 25ms delta, so the
-  # discrimination is not reliably observable there; the macosx suite
-  # below owns Darwin's kqueue backend with a functional-detection bound.
-  # (Before C1b the macos leg ran no timing cases at all — this restores
-  # that scope now that the leg enables CRISOL_TIMING_TESTS for kqueue.)
-  suite "conformance timing — B2: event-driven exit detection":
-
-    test "a child's exit is observed promptly, not merely within the old 25ms poll tick":
-      var sv = initSupervisor(installSignals = false)
-      let outPath = tmpOutputFile("b2_latency")
-      const sleepMs = 200
-      let spec = ChildSpec(argv: @[sleepBin], cwd: getCurrentDir(),
-                            env: @[("CRISOL_SLEEP_MS", $sleepMs)],
-                            sinks: combinedSink(outPath))
+    test "a signal delivered while blocked in next() returns weShutdown promptly":
+      var sv = initSupervisor(installSignals = true)
       let t0 = getMonoTime()
-      let sr = sv.spawn(spec)
-      check sr.ok
-      let ev = sv.next(t0 + initDuration(seconds = 5))
+      # A helper process delivers SIGINT to THIS process after a short delay —
+      # a real, externally-delivered signal (not a same-thread coincidence),
+      # arriving while `next` is expected to be blocked in poll(2).
+      let helper = startProcess("/bin/sh", args = @["-c",
+                   "sleep 0.2; kill -INT " & $getpid()],
+                   options = {poUsePath})
+      let farDeadline = t0 + initDuration(seconds = 10)
+      let ev = sv.next(farDeadline)
       let elapsed = getMonoTime() - t0
-      check ev.kind == weChildExited
-      discard sv.reap(ev.id)
-      echo "  observed: exit detected ", elapsed.inMilliseconds,
-           " ms after spawn (fixture slept ", sleepMs, " ms)"
-      let forcedPoll = getEnv("CRISOL_FORCE_POLL", "") notin ["", "0"]
-      if forcedPoll:
-        # Poll(2) fallback tier: bounded by the retained ~25ms tick, same
-        # latency shape as pre-B2 — generous margin for scheduler noise.
-        check elapsed < initDuration(milliseconds = sleepMs + 60)
-      else:
-        # Event-driven tier: the child's pidfd becomes readable and wakes
-        # epoll_wait directly — detection latency is scheduling noise, not a
-        # poll quantum. A regression back to a poll-shaped wait (forgetting to
-        # register/consult the pidfd) would blow this bound.
-        check elapsed < initDuration(milliseconds = sleepMs + 20)
-      removeFile(outPath)
+      check ev.kind == weShutdown
+      check ev.signal.signum == int(SIGINT)
+      echo "  observed: weShutdown ", elapsed.inMilliseconds,
+           " ms after signal delivery (deadline was 10000 ms out)"
+      check elapsed < initDuration(seconds = 2)   # well before the 10s deadline
+      discard waitForExit(helper)
+      close(helper)
 
-# ---------------------------------------------------------------------------
-# rfc-0007 C1b — kqueue EVFILT_PROC event-driven exit detection (macOS).
-# Darwin's kqueue peer of the (Linux-gated) B2 case above. This is a
-# FUNCTIONAL liveness proof, deliberately NOT a latency-discrimination one:
-# `nextEvent` sweeps `pollSweepChildren` every ≤25ms tick on EVERY backend,
-# so the gap between an event-driven wake and the poll tick is ≤25ms — and
-# GitHub's macos-latest runners carry more than 25ms of spawn/scheduling
-# noise under CI load (observed ~50ms), so "event-driven, not poll" cannot
-# be told apart from noise here the way B2's tight bound tells it apart on
-# Linux. What this DOES prove, end-to-end through the real Supervisor, is
-# that the kqueue-backed `next()` delivers a child's exit PROMPTLY (far
-# inside the 5s deadline, not hung) — the C1b kqueue `next` is additionally
-# exercised on every spawn by the whole macos conformance run. The
-# CRISOL_FORCE_POLL branch proves the poll fallback stays reachable on
-# Darwin (forcePollRequested is cross-platform since C1b).
-#
-# Run both tiers directly on a macOS host:
-#   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
-#     --path:src tests/conformance/test_conformance_timing.nim
-#   ./dev run env CRISOL_TIMING_TESTS=1 CRISOL_FORCE_POLL=1 nim r \
-#     --hints:off --warnings:off --path:src tests/conformance/test_conformance_timing.nim
-# ---------------------------------------------------------------------------
 
-when defined(macosx):
-  suite "conformance timing — C1b: kqueue-backed next() delivers exits promptly (macOS)":
+  # ---------------------------------------------------------------------------
+  # rfc-0007 B2 — event-driven exit detection: a registered child's pidfd
+  # becoming readable wakes `next()` directly, instead of waiting out the
+  # poll(2)-tier's up-to-25ms tick. `CRISOL_FORCE_POLL=1` (this file's own
+  # knob-under-test) picks the OTHER bound deliberately, so running this suite
+  # under both env states (see this repo's `./dev test` / `./dev timing` CI
+  # wiring) proves both tiers live, not just the default one.
+  #
+  # Run BOTH tiers directly:
+  #   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
+  #     --path:src tests/conformance/test_conformance_timing.nim
+  #   ./dev run env CRISOL_TIMING_TESTS=1 CRISOL_FORCE_POLL=1 nim r \
+  #     --hints:off --warnings:off --path:src tests/conformance/test_conformance_timing.nim
+  # ---------------------------------------------------------------------------
 
-    test "a child's exit is delivered promptly by the kqueue backend, far inside the deadline":
-      var sv = initSupervisor(installSignals = false)
-      let outPath = tmpOutputFile("c1b_kqueue_latency")
-      const sleepMs = 200
-      let spec = ChildSpec(argv: @[sleepBin], cwd: getCurrentDir(),
-                            env: @[("CRISOL_SLEEP_MS", $sleepMs)],
-                            sinks: combinedSink(outPath))
-      let t0 = getMonoTime()
-      let sr = sv.spawn(spec)
-      check sr.ok
-      let ev = sv.next(t0 + initDuration(seconds = 5))
-      let elapsed = getMonoTime() - t0
-      check ev.kind == weChildExited
-      discard sv.reap(ev.id)
-      echo "  observed: exit detected ", elapsed.inMilliseconds,
-           " ms after spawn (fixture slept ", sleepMs, " ms; ",
-           (if getEnv("CRISOL_FORCE_POLL", "") notin ["", "0"]: "poll" else: "kqueue"),
-           " tier)"
-      # A single CI-noise-safe functional bound for both tiers: detection
-      # lands just after the child's own sleep, never seconds later. Generous
-      # against macos-latest scheduling noise (the same reason C1a widened
-      # `ccSpanUs`), yet a hung/broken `next()` — kqueue fd never consulted
-      # AND the poll fallback also broken — blows straight through it.
-      check elapsed < initDuration(milliseconds = sleepMs + 300)
-      removeFile(outPath)
+  when defined(linux):
+    # rfc-0007 C1b: gated to Linux — this is the pidfd/epoll latency-
+    # discrimination proof (event-driven wake vs the 25ms poll tick). On
+    # the macOS CI runner scheduling noise exceeds that 25ms delta, so the
+    # discrimination is not reliably observable there; the macosx suite
+    # below owns Darwin's kqueue backend with a functional-detection bound.
+    # (Before C1b the macos leg ran no timing cases at all — this restores
+    # that scope now that the leg enables CRISOL_TIMING_TESTS for kqueue.)
+    suite "conformance timing — B2: event-driven exit detection":
 
-when isMainModule:
-  echo "test_conformance_timing done"
+      test "a child's exit is observed promptly, not merely within the old 25ms poll tick":
+        var sv = initSupervisor(installSignals = false)
+        let outPath = tmpOutputFile("b2_latency")
+        const sleepMs = 200
+        let spec = ChildSpec(argv: @[sleepBin], cwd: getCurrentDir(),
+                              env: @[("CRISOL_SLEEP_MS", $sleepMs)],
+                              sinks: combinedSink(outPath))
+        let t0 = getMonoTime()
+        let sr = sv.spawn(spec)
+        check sr.ok
+        let ev = sv.next(t0 + initDuration(seconds = 5))
+        let elapsed = getMonoTime() - t0
+        check ev.kind == weChildExited
+        discard sv.reap(ev.id)
+        echo "  observed: exit detected ", elapsed.inMilliseconds,
+             " ms after spawn (fixture slept ", sleepMs, " ms)"
+        let forcedPoll = getEnv("CRISOL_FORCE_POLL", "") notin ["", "0"]
+        if forcedPoll:
+          # Poll(2) fallback tier: bounded by the retained ~25ms tick, same
+          # latency shape as pre-B2 — generous margin for scheduler noise.
+          check elapsed < initDuration(milliseconds = sleepMs + 60)
+        else:
+          # Event-driven tier: the child's pidfd becomes readable and wakes
+          # epoll_wait directly — detection latency is scheduling noise, not a
+          # poll quantum. A regression back to a poll-shaped wait (forgetting to
+          # register/consult the pidfd) would blow this bound.
+          check elapsed < initDuration(milliseconds = sleepMs + 20)
+        removeFile(outPath)
+
+  # ---------------------------------------------------------------------------
+  # rfc-0007 C1b — kqueue EVFILT_PROC event-driven exit detection (macOS).
+  # Darwin's kqueue peer of the (Linux-gated) B2 case above. This is a
+  # FUNCTIONAL liveness proof, deliberately NOT a latency-discrimination one:
+  # `nextEvent` sweeps `pollSweepChildren` every ≤25ms tick on EVERY backend,
+  # so the gap between an event-driven wake and the poll tick is ≤25ms — and
+  # GitHub's macos-latest runners carry more than 25ms of spawn/scheduling
+  # noise under CI load (observed ~50ms), so "event-driven, not poll" cannot
+  # be told apart from noise here the way B2's tight bound tells it apart on
+  # Linux. What this DOES prove, end-to-end through the real Supervisor, is
+  # that the kqueue-backed `next()` delivers a child's exit PROMPTLY (far
+  # inside the 5s deadline, not hung) — the C1b kqueue `next` is additionally
+  # exercised on every spawn by the whole macos conformance run. The
+  # CRISOL_FORCE_POLL branch proves the poll fallback stays reachable on
+  # Darwin (forcePollRequested is cross-platform since C1b).
+  #
+  # Run both tiers directly on a macOS host:
+  #   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
+  #     --path:src tests/conformance/test_conformance_timing.nim
+  #   ./dev run env CRISOL_TIMING_TESTS=1 CRISOL_FORCE_POLL=1 nim r \
+  #     --hints:off --warnings:off --path:src tests/conformance/test_conformance_timing.nim
+  # ---------------------------------------------------------------------------
+
+  when defined(macosx):
+    suite "conformance timing — C1b: kqueue-backed next() delivers exits promptly (macOS)":
+
+      test "a child's exit is delivered promptly by the kqueue backend, far inside the deadline":
+        var sv = initSupervisor(installSignals = false)
+        let outPath = tmpOutputFile("c1b_kqueue_latency")
+        const sleepMs = 200
+        let spec = ChildSpec(argv: @[sleepBin], cwd: getCurrentDir(),
+                              env: @[("CRISOL_SLEEP_MS", $sleepMs)],
+                              sinks: combinedSink(outPath))
+        let t0 = getMonoTime()
+        let sr = sv.spawn(spec)
+        check sr.ok
+        let ev = sv.next(t0 + initDuration(seconds = 5))
+        let elapsed = getMonoTime() - t0
+        check ev.kind == weChildExited
+        discard sv.reap(ev.id)
+        echo "  observed: exit detected ", elapsed.inMilliseconds,
+             " ms after spawn (fixture slept ", sleepMs, " ms; ",
+             (if getEnv("CRISOL_FORCE_POLL", "") notin ["", "0"]: "poll" else: "kqueue"),
+             " tier)"
+        # A single CI-noise-safe functional bound for both tiers: detection
+        # lands just after the child's own sleep, never seconds later. Generous
+        # against macos-latest scheduling noise (the same reason C1a widened
+        # `ccSpanUs`), yet a hung/broken `next()` — kqueue fd never consulted
+        # AND the poll fallback also broken — blows straight through it.
+        check elapsed < initDuration(milliseconds = sleepMs + 300)
+        removeFile(outPath)
+
+  when isMainModule:
+    echo "test_conformance_timing done"
+else:
+  when isMainModule:
+    echo "test_conformance_timing: skipped (POSIX-only backend test)"

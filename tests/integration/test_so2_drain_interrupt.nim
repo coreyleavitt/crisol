@@ -33,146 +33,150 @@
 ##      exits; the parent asserts `interrupted == true` AND `l2PutCalls ==
 ##      0` — the queued entry was never flushed to the remote tier.
 
-import std/[os, posix, strutils, times, unittest]
-import crisol/api
-import crisol/sandbox
-import crisol/types      # CacheConfig
-import crisol/cachetier   # Tier, TieredCache
-import crisol/cachememory # memory()
-import crisol/cacheregistry # CacheRuntime
-import crisol/cacheport  # CacheBackend, nonePolicy, NilSink
-import crisol/cachetelemetry # TelemetryEvent
+when defined(posix):
+  import std/[os, posix, strutils, times, unittest]
+  import crisol/api
+  import crisol/sandbox
+  import crisol/types      # CacheConfig
+  import crisol/cachetier   # Tier, TieredCache
+  import crisol/cachememory # memory()
+  import crisol/cacheregistry # CacheRuntime
+  import crisol/cacheport  # CacheBackend, nonePolicy, NilSink
+  import crisol/cachetelemetry # TelemetryEvent
 
-proc fixtureDir(): string =
-  let thisFile = currentSourcePath()
-  thisFile.parentDir.parentDir / "fixtures"
+  proc fixtureDir(): string =
+    let thisFile = currentSourcePath()
+    thisFile.parentDir.parentDir / "fixtures"
 
-proc pollForFile(path: string; timeoutMs: int): bool =
-  let step = 50
-  var elapsed = 0
-  while elapsed < timeoutMs:
-    if fileExists(path): return true
-    os.sleep(step)
-    elapsed += step
-  false
+  proc pollForFile(path: string; timeoutMs: int): bool =
+    let step = 50
+    var elapsed = 0
+    while elapsed < timeoutMs:
+      if fileExists(path): return true
+      os.sleep(step)
+      elapsed += step
+    false
 
-proc countingPutBackend(inner: CacheBackend): tuple[backend: CacheBackend; putCalls: ref int] =
-  ## Wraps `inner` so a test can prove its `put` was NEVER called, without
-  ## needing to know the exact `SoundnessKey` a live run derives (mirrors
-  ## test_cachetier.nim's `countingBackend`, scoped to `put` only since
-  ## `get` is never exercised by this scenario).
-  let putCalls = new(int)
-  let captured = inner
-  let backend = CacheBackend(
-    scheme: captured.scheme,
-    get:    captured.get,
-    put:    proc(entry: StoredEntry): CacheVerdict =
-              inc putCalls[]
-              captured.put(entry),
-    probe:  captured.probe,
-  )
-  (backend, putCalls)
+  proc countingPutBackend(inner: CacheBackend): tuple[backend: CacheBackend; putCalls: ref int] =
+    ## Wraps `inner` so a test can prove its `put` was NEVER called, without
+    ## needing to know the exact `SoundnessKey` a live run derives (mirrors
+    ## test_cachetier.nim's `countingBackend`, scoped to `put` only since
+    ## `get` is never exercised by this scenario).
+    let putCalls = new(int)
+    let captured = inner
+    let backend = CacheBackend(
+      scheme: captured.scheme,
+      get:    captured.get,
+      put:    proc(entry: StoredEntry): CacheVerdict =
+                inc putCalls[]
+                captured.put(entry),
+      probe:  captured.probe,
+    )
+    (backend, putCalls)
 
-suite "RFC-0005 code-review SO2 — end-of-run drain skipped on an interrupted run":
+  suite "RFC-0005 code-review SO2 — end-of-run drain skipped on an interrupted run":
 
-  test "SIGINT mid-run: a fast entrypoint's already-queued remote entry is never flushed":
-    let tag        = "crisol_so2_drain_" & $getpid()
-    let markerFile = getTempDir() / (tag & "_marker")
-    let resultFile = getTempDir() / (tag & "_result")
-    let stateDir   = getTempDir() / (tag & "_state")
+    test "SIGINT mid-run: a fast entrypoint's already-queued remote entry is never flushed":
+      let tag        = "crisol_so2_drain_" & $getpid()
+      let markerFile = getTempDir() / (tag & "_marker")
+      let resultFile = getTempDir() / (tag & "_result")
+      let stateDir   = getTempDir() / (tag & "_state")
 
-    if fileExists(markerFile): removeFile(markerFile)
-    if fileExists(resultFile): removeFile(resultFile)
-    removeDir(stateDir)
-    createDir(stateDir)
-    defer:
-      try: removeFile(markerFile) except: discard
-      try: removeFile(resultFile) except: discard
-      try: removeDir(stateDir) except: discard
+      if fileExists(markerFile): removeFile(markerFile)
+      if fileExists(resultFile): removeFile(resultFile)
+      removeDir(stateDir)
+      createDir(stateDir)
+      defer:
+        try: removeFile(markerFile) except: discard
+        try: removeFile(resultFile) except: discard
+        try: removeDir(stateDir) except: discard
 
-    let childPid = fork()
-    check childPid >= 0
+      let childPid = fork()
+      check childPid >= 0
 
-    if childPid == 0:
-      # =====================================================================
-      # CHILD: install signal handlers (installSignals:true), run over
-      # pass_fast.nim + hang_forever.nim with a two-tier CacheDeps.
-      # =====================================================================
-      putEnv("CRISOL_PASS_FAST_MARKER", markerFile)
-      putEnv("CRISOL_STATE_DIR", stateDir)
+      if childPid == 0:
+        # =====================================================================
+        # CHILD: install signal handlers (installSignals:true), run over
+        # pass_fast.nim + hang_forever.nim with a two-tier CacheDeps.
+        # =====================================================================
+        putEnv("CRISOL_PASS_FAST_MARKER", markerFile)
+        putEnv("CRISOL_STATE_DIR", stateDir)
 
-      let l1 = memory()
-      let (l2, l2PutCalls) = countingPutBackend(memory())
+        let l1 = memory()
+        let (l2, l2PutCalls) = countingPutBackend(memory())
 
-      # RFC-0005 code-review R2-D5a: `buildRuntime` gained a fourth
-      # parameter, `resolvedSecrets` (the run's pre-resolved+scrubbed
-      # CacheSecrets, now threaded in by runTestsWith itself rather than
-      # resolved inside this closure) -- this fixture builds its own
-      # fixed two-tier CacheRuntime and never needs real secrets, so it is
-      # accepted and discarded like the other three unused params.
-      let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; sd: string; maxEntries: int;
-                                              resolvedSecrets: CacheSecrets;
-                                              trackedRoots: TrackedRoots): CacheRuntime =
-        discard cfg; discard sd; discard maxEntries; discard resolvedSecrets
-        discard trackedRoots
-        CacheRuntime(
-          cache: TieredCache(
-            tiers: @[
-              Tier(name: "l1", backend: l1, backfillOnHit: false, verifyTrust: false),
-              Tier(name: "l2", backend: l2, backfillOnHit: false, verifyTrust: false),
-            ],
-            trust: nonePolicy(),
-          ),
-          sink: NilSink[TelemetryEvent](),
-        ))
+        # RFC-0005 code-review R2-D5a: `buildRuntime` gained a fourth
+        # parameter, `resolvedSecrets` (the run's pre-resolved+scrubbed
+        # CacheSecrets, now threaded in by runTestsWith itself rather than
+        # resolved inside this closure) -- this fixture builds its own
+        # fixed two-tier CacheRuntime and never needs real secrets, so it is
+        # accepted and discarded like the other three unused params.
+        let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; sd: string; maxEntries: int;
+                                                resolvedSecrets: CacheSecrets;
+                                                trackedRoots: TrackedRoots): CacheRuntime =
+          discard cfg; discard sd; discard maxEntries; discard resolvedSecrets
+          discard trackedRoots
+          CacheRuntime(
+            cache: TieredCache(
+              tiers: @[
+                Tier(name: "l1", backend: l1, backfillOnHit: false, verifyTrust: false),
+                Tier(name: "l2", backend: l2, backfillOnHit: false, verifyTrust: false),
+              ],
+              trust: nonePolicy(),
+            ),
+            sink: NilSink[TelemetryEvent](),
+          ))
 
-      let fdir = fixtureDir()
-      let opts = RunOptions(
-        selection:      filesSelection(fdir / "pass_fast.nim", fdir / "hang_forever.nim"),
-        jobs:           2,
-        timeoutSecs:    300,
-        hermeticLevel:  hlNone,   # CRISOL_PASS_FAST_MARKER must reach pass_fast.nim
-        installSignals: true,
-        persist:        false,
-        manageLock:     true,
-      )
+        let fdir = fixtureDir()
+        let opts = RunOptions(
+          selection:      filesSelection(fdir / "pass_fast.nim", fdir / "hang_forever.nim"),
+          jobs:           2,
+          timeoutSecs:    300,
+          hermeticLevel:  hlNone,   # CRISOL_PASS_FAST_MARKER must reach pass_fast.nim
+          installSignals: true,
+          persist:        false,
+          manageLock:     true,
+        )
 
-      try:
-        let rr = runTestsWith(opts, deps)
-        writeFile(resultFile, (if rr.interrupted: "1" else: "0") & "," & $l2PutCalls[])
-      except:
-        writeFile(resultFile, "EXC," & getCurrentExceptionMsg())
-      quit(0)
-      # =====================================================================
+        try:
+          let rr = runTestsWith(opts, deps)
+          writeFile(resultFile, (if rr.interrupted: "1" else: "0") & "," & $l2PutCalls[])
+        except:
+          writeFile(resultFile, "EXC," & getCurrentExceptionMsg())
+        quit(0)
+        # =====================================================================
 
-    # -------------------------------------------------------------------
-    # PARENT: wait for pass_fast's marker, then send a real SIGINT.
-    # -------------------------------------------------------------------
-    let appeared = pollForFile(markerFile, 60_000)
-    check appeared
-    if not appeared:
-      discard kill(childPid, SIGKILL)
-      var ws: cint = 0
-      discard waitpid(childPid, ws, 0)
-      fail()
-    else:
-      check kill(childPid, SIGINT) == 0
+      # -------------------------------------------------------------------
+      # PARENT: wait for pass_fast's marker, then send a real SIGINT.
+      # -------------------------------------------------------------------
+      let appeared = pollForFile(markerFile, 60_000)
+      check appeared
+      if not appeared:
+        discard kill(childPid, SIGKILL)
+        var ws: cint = 0
+        discard waitpid(childPid, ws, 0)
+        fail()
+      else:
+        check kill(childPid, SIGINT) == 0
 
-      var wstatus: cint = 0
-      let deadline = epochTime() + 30.0
-      var reaped = false
-      while epochTime() < deadline:
-        let r = waitpid(childPid, wstatus, WNOHANG)
-        if r == childPid:
-          reaped = true
-          break
-        os.sleep(100)
-      check reaped
+        var wstatus: cint = 0
+        let deadline = epochTime() + 30.0
+        var reaped = false
+        while epochTime() < deadline:
+          let r = waitpid(childPid, wstatus, WNOHANG)
+          if r == childPid:
+            reaped = true
+            break
+          os.sleep(100)
+        check reaped
 
-      check fileExists(resultFile)
-      if fileExists(resultFile):
-        let parts = readFile(resultFile).strip().split(',')
-        check parts.len == 2
-        if parts.len == 2:
-          check parts[0] == "1"    # rr.interrupted == true
-          check parts[1] == "0"    # l2's put was never called
+        check fileExists(resultFile)
+        if fileExists(resultFile):
+          let parts = readFile(resultFile).strip().split(',')
+          check parts.len == 2
+          if parts.len == 2:
+            check parts[0] == "1"    # rr.interrupted == true
+            check parts[1] == "0"    # l2's put was never called
+else:
+  when isMainModule:
+    echo "test_so2_drain_interrupt: skipped (POSIX-only backend test)"

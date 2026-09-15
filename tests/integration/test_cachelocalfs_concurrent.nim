@@ -39,149 +39,153 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_cachelocalfs_concurrent.nim
 
-import std/[options, os, strutils, unittest]
-import std/posix
-import crisol/types
-import crisol/cacheport
-import crisol/cachewire      # storageFormatVersion
-import crisol/cachelocalfs
-import crisol/resultcache    # cacheVersionDirAt
-import crisol/process/types as ptypes
+when defined(posix):
+  import std/[options, os, strutils, unittest]
+  import std/posix
+  import crisol/types
+  import crisol/cacheport
+  import crisol/cachewire      # storageFormatVersion
+  import crisol/cachelocalfs
+  import crisol/resultcache    # cacheVersionDirAt
+  import crisol/process/types as ptypes
 
-# ---------------------------------------------------------------------------
-# Helpers (mirrors test_cachetier.nim's/test_cachetrust.nim's sample*Result
-# fixtures)
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Helpers (mirrors test_cachetier.nim's/test_cachetrust.nim's sample*Result
+  # fixtures)
+  # ---------------------------------------------------------------------------
 
-proc sampleProcessResult(exitCode: int): ptypes.ProcessResult =
-  ptypes.ProcessResult(
-    exit:  ptypes.Exit(kind: ptypes.ekExited, code: exitCode),
-    cause: ptypes.Cause(by: ptypes.cbProcess),
-    evidence: ptypes.Evidence(
-      killDomain: ptypes.kdsProcessGroup,
-      tree:       ptypes.toComplete,
-      escapees:   @[],
-      limits:     default(ptypes.LimitsAchieved),
-      hermetic:   ptypes.hlIsolated,
-      killSnapshot: @[],
-      cooperativeUnavailable: false,
-    ),
-    rusage: none(ptypes.Rusage),
-    durationUs: 1_000,
-  )
+  proc sampleProcessResult(exitCode: int): ptypes.ProcessResult =
+    ptypes.ProcessResult(
+      exit:  ptypes.Exit(kind: ptypes.ekExited, code: exitCode),
+      cause: ptypes.Cause(by: ptypes.cbProcess),
+      evidence: ptypes.Evidence(
+        killDomain: ptypes.kdsProcessGroup,
+        tree:       ptypes.toComplete,
+        escapees:   @[],
+        limits:     default(ptypes.LimitsAchieved),
+        hermetic:   ptypes.hlIsolated,
+        killSnapshot: @[],
+        cooperativeUnavailable: false,
+      ),
+      rusage: none(ptypes.Rusage),
+      durationUs: 1_000,
+    )
 
-const Iterations = 300
-  ## Per writer (2 writers -> 600 total `put`s of the SAME key). Each `put`
-  ## is a handful of syscalls (open/write/close/rename) on a local tmpfs-
-  ## class filesystem — comfortably keeps the whole race well under 10s.
+  const Iterations = 300
+    ## Per writer (2 writers -> 600 total `put`s of the SAME key). Each `put`
+    ## is a handful of syscalls (open/write/close/rename) on a local tmpfs-
+    ## class filesystem — comfortably keeps the whole race well under 10s.
 
-proc entryFor(key: SoundnessKey; writerId, iter: int): StoredEntry =
-  ## `exitCode` encodes (writerId, iter) so a decoded entry's provenance is
-  ## checkable — a torn read that still (implausibly) parsed as valid JSON
-  ## would carry an exit code tracing to NEITHER writer.
-  StoredEntry(
-    key:            key,
-    keyInputs:      none(KeyInputs),
-    result: CachedResult(
-      run:             sampleProcessResult(writerId * 1_000_000 + iter),
-      records:         @[],
-      cachedAt:        1_700_001_000'i64,
-      payloadChecksum: "",
-    ),
-    storageVersion: storageFormatVersion,
-    attestation:    none(Attestation),
-  )
+  proc entryFor(key: SoundnessKey; writerId, iter: int): StoredEntry =
+    ## `exitCode` encodes (writerId, iter) so a decoded entry's provenance is
+    ## checkable — a torn read that still (implausibly) parsed as valid JSON
+    ## would carry an exit code tracing to NEITHER writer.
+    StoredEntry(
+      key:            key,
+      keyInputs:      none(KeyInputs),
+      result: CachedResult(
+        run:             sampleProcessResult(writerId * 1_000_000 + iter),
+        records:         @[],
+        cachedAt:        1_700_001_000'i64,
+        payloadChecksum: "",
+      ),
+      storageVersion: storageFormatVersion,
+      attestation:    none(Attestation),
+    )
 
-proc freshRoot(): string =
-  result = getTempDir() / ("crisol_cachelocalfs_concurrent_" & $getpid())
-  removeDir(result)
-  createDir(result)
+  proc freshRoot(): string =
+    result = getTempDir() / ("crisol_cachelocalfs_concurrent_" & $getpid())
+    removeDir(result)
+    createDir(result)
 
-# ---------------------------------------------------------------------------
-# Suite
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Suite
+  # ---------------------------------------------------------------------------
 
-suite "cachelocalfs — real concurrent writers (T20)":
+  suite "cachelocalfs — real concurrent writers (T20)":
 
-  test "two OS processes racing put() of the same key never produce a torn/corrupt entry; no stray .tmp survives":
-    let root = freshRoot()
-    defer: removeDir(root)
-    let key = SoundnessKey("2020202020202020")
-    let backend = localFsBackend(root, autoCreate = true, maxEntries = 0)
+    test "two OS processes racing put() of the same key never produce a torn/corrupt entry; no stray .tmp survives":
+      let root = freshRoot()
+      defer: removeDir(root)
+      let key = SoundnessKey("2020202020202020")
+      let backend = localFsBackend(root, autoCreate = true, maxEntries = 0)
 
-    proc writerLoop(writerId: int) =
-      for i in 0 ..< Iterations:
-        discard backend.put(entryFor(key, writerId, i))
+      proc writerLoop(writerId: int) =
+        for i in 0 ..< Iterations:
+          discard backend.put(entryFor(key, writerId, i))
 
-    # -------------------------------------------------------------------
-    # Spawn two real child processes, each hammering the SAME key.
-    # -------------------------------------------------------------------
-    let pid1 = fork()
-    check pid1 >= 0
-    if pid1 == 0:
-      writerLoop(1)
-      exitnow(0)
+      # -------------------------------------------------------------------
+      # Spawn two real child processes, each hammering the SAME key.
+      # -------------------------------------------------------------------
+      let pid1 = fork()
+      check pid1 >= 0
+      if pid1 == 0:
+        writerLoop(1)
+        exitnow(0)
 
-    let pid2 = fork()
-    check pid2 >= 0
-    if pid2 == 0:
-      writerLoop(2)
-      exitnow(0)
+      let pid2 = fork()
+      check pid2 >= 0
+      if pid2 == 0:
+        writerLoop(2)
+        exitnow(0)
 
-    # -------------------------------------------------------------------
-    # PARENT: read the SAME key continuously for the whole race window,
-    # reaping each child (WNOHANG) as it exits.
-    # -------------------------------------------------------------------
-    var child1Done = false
-    var child2Done = false
-    var reads = 0
-    var hits = 0
+      # -------------------------------------------------------------------
+      # PARENT: read the SAME key continuously for the whole race window,
+      # reaping each child (WNOHANG) as it exits.
+      # -------------------------------------------------------------------
+      var child1Done = false
+      var child2Done = false
+      var reads = 0
+      var hits = 0
 
-    while not (child1Done and child2Done):
-      let fetched = backend.get(key)
-      case fetched.verdict
-      of cvOk:
-        inc hits
-        let code = fetched.value.result.run.exit.code
-        let writerId = code div 1_000_000
-        let iter = code mod 1_000_000
-        check writerId in [1, 2]
-        check iter >= 0 and iter < Iterations
-        check fetched.value.storageVersion == storageFormatVersion
-      of cvMiss:
-        discard  # nothing written yet -- fine, not a race window at all
-      else:
-        checkpoint("unexpected verdict mid-race: " & $fetched.verdict)
-        fail()
-      inc reads
+      while not (child1Done and child2Done):
+        let fetched = backend.get(key)
+        case fetched.verdict
+        of cvOk:
+          inc hits
+          let code = fetched.value.result.run.exit.code
+          let writerId = code div 1_000_000
+          let iter = code mod 1_000_000
+          check writerId in [1, 2]
+          check iter >= 0 and iter < Iterations
+          check fetched.value.storageVersion == storageFormatVersion
+        of cvMiss:
+          discard  # nothing written yet -- fine, not a race window at all
+        else:
+          checkpoint("unexpected verdict mid-race: " & $fetched.verdict)
+          fail()
+        inc reads
 
-      if not child1Done:
-        var ws: cint = 0
-        if waitpid(pid1, ws, WNOHANG) == pid1: child1Done = true
-      if not child2Done:
-        var ws: cint = 0
-        if waitpid(pid2, ws, WNOHANG) == pid2: child2Done = true
+        if not child1Done:
+          var ws: cint = 0
+          if waitpid(pid1, ws, WNOHANG) == pid1: child1Done = true
+        if not child2Done:
+          var ws: cint = 0
+          if waitpid(pid2, ws, WNOHANG) == pid2: child2Done = true
 
-    checkpoint("reader loop performed " & $reads & " reads, " & $hits & " of them cvOk, during the race")
-    check reads > 0
+      checkpoint("reader loop performed " & $reads & " reads, " & $hits & " of them cvOk, during the race")
+      check reads > 0
 
-    # -------------------------------------------------------------------
-    # Final state: a clean, decodable entry from one of the two writers.
-    # -------------------------------------------------------------------
-    let final = backend.get(key)
-    check final.verdict == cvOk
-    check final.value.storageVersion == storageFormatVersion
-    let finalWriterId = final.value.result.run.exit.code div 1_000_000
-    check finalWriterId in [1, 2]
+      # -------------------------------------------------------------------
+      # Final state: a clean, decodable entry from one of the two writers.
+      # -------------------------------------------------------------------
+      let final = backend.get(key)
+      check final.verdict == cvOk
+      check final.value.storageVersion == storageFormatVersion
+      let finalWriterId = final.value.result.run.exit.code div 1_000_000
+      check finalWriterId in [1, 2]
 
-    # -------------------------------------------------------------------
-    # No stray .tmp file survives a clean (non-crash) exit of both writers
-    # -- atomicPublish's rename(2) always removes the PID-suffixed tmp file
-    # it created, on every successful put.
-    # -------------------------------------------------------------------
-    let verDir = cacheVersionDirAt(root)
-    var strayTmp: seq[string] = @[]
-    for kind, path in walkDir(verDir):
-      if kind == pcFile and path.endsWith(".tmp"):
-        strayTmp.add path
-    check strayTmp.len == 0
+      # -------------------------------------------------------------------
+      # No stray .tmp file survives a clean (non-crash) exit of both writers
+      # -- atomicPublish's rename(2) always removes the PID-suffixed tmp file
+      # it created, on every successful put.
+      # -------------------------------------------------------------------
+      let verDir = cacheVersionDirAt(root)
+      var strayTmp: seq[string] = @[]
+      for kind, path in walkDir(verDir):
+        if kind == pcFile and path.endsWith(".tmp"):
+          strayTmp.add path
+      check strayTmp.len == 0
+else:
+  when isMainModule:
+    echo "test_cachelocalfs_concurrent: skipped (POSIX-only backend test)"

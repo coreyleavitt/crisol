@@ -12,16 +12,19 @@
 ## classifyCause's authorship rule wins regardless of how the child actually
 ## died: cbRunner/krTimeout/escalated:false, oKilled — never a pass, even
 ## though the observed Exit is ekExited/code:0.
-import std/posix
+when defined(posix):
+  import std/posix
 
-proc onTerm(sig: cint) {.noconv.} =
-  exitnow(0)
+  proc onTerm(sig: cint) {.noconv.} =
+    exitnow(0)
 
-var sa: Sigaction
-sa.sa_handler = onTerm
-discard sigemptyset(sa.sa_mask)
-sa.sa_flags = 0
-discard sigaction(SIGTERM, sa, nil)
+  var sa: Sigaction
+  sa.sa_handler = onTerm
+  discard sigemptyset(sa.sa_mask)
+  sa.sa_flags = 0
+  discard sigaction(SIGTERM, sa, nil)
 
-while true:
-  discard posix.sleep(cint(1000))
+  while true:
+    discard posix.sleep(cint(1000))
+else:
+  discard

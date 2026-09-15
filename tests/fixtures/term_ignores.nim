@@ -3,8 +3,11 @@
 ## the child still alive, forcing escalation to SIGKILL — proves
 ## `cause.escalated == true` and the observed exit symbol is SIGKILL (not the
 ## SIGTERM `hang_forever` dies on under default dispositions).
-import std/[os, posix]
+when defined(posix):
+  import std/[os, posix]
 
-signal(SIGTERM, SIG_IGN)
-while true:
-  os.sleep(1000)
+  signal(SIGTERM, SIG_IGN)
+  while true:
+    os.sleep(1000)
+else:
+  discard

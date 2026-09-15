@@ -23,30 +23,33 @@
 ## involved) — the OBSERVABLE escapee a pgid scan can actually see (A6a's
 ## post-reap scan), never calling setpgid/setsid: contrast
 ## spawn_grandchild_setsid.nim, which is invisible by construction.
-import std/[os, posix]
+when defined(posix):
+  import std/[os, posix]
 
-const MarkerName = "spawn_grandchild.pid"
+  const MarkerName = "spawn_grandchild.pid"
 
-proc writeMarker(path, s: string) =
-  let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o600)
-  if fd >= 0:
-    discard posix.write(fd, s.cstring, s.len)
-    discard posix.close(fd)
+  proc writeMarker(path, s: string) =
+    let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o600)
+    if fd >= 0:
+      discard posix.write(fd, s.cstring, s.len)
+      discard posix.close(fd)
 
-let gcPid = fork()
-if gcPid < 0:
-  quit(1)
-if gcPid == 0:
-  # GRANDCHILD — same pgroup (no setpgid/setsid). Signal readiness, then
-  # sleep long enough for the parent's reaper to scan the group before
-  # this process would exit on its own.
-  writeMarker(MarkerName, $getpid())
-  for i in 1 .. 30: discard posix.sleep(1)
+  let gcPid = fork()
+  if gcPid < 0:
+    quit(1)
+  if gcPid == 0:
+    # GRANDCHILD — same pgroup (no setpgid/setsid). Signal readiness, then
+    # sleep long enough for the parent's reaper to scan the group before
+    # this process would exit on its own.
+    writeMarker(MarkerName, $getpid())
+    for i in 1 .. 30: discard posix.sleep(1)
+    quit(0)
+
+  # PARENT — wait for the grandchild's readiness signal, then exit fast.
+  var waitedMs = 0
+  while not fileExists(MarkerName) and waitedMs < 2000:
+    os.sleep(10)
+    waitedMs += 10
   quit(0)
-
-# PARENT — wait for the grandchild's readiness signal, then exit fast.
-var waitedMs = 0
-while not fileExists(MarkerName) and waitedMs < 2000:
-  os.sleep(10)
-  waitedMs += 10
-quit(0)
+else:
+  discard

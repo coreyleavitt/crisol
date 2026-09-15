@@ -23,103 +23,107 @@
 ##   ./dev run env CRISOL_TIMING_TESTS=1 nim r --hints:off --warnings:off \
 ##     --path:src tests/timing/test_rfc0007_a1f_limit_timing.nim
 
-import std/[options, os, unittest]
-import std/posix
-import crisol/types
-import crisol/runner
-import crisol/depgraph
-import crisol/sandbox
-import crisol/process/types as ptypes
-import "../support/testep"
+when defined(posix):
+  import std/[options, os, unittest]
+  import std/posix
+  import crisol/types
+  import crisol/runner
+  import crisol/depgraph
+  import crisol/sandbox
+  import crisol/process/types as ptypes
+  import "../support/testep"
 
-if getEnv("CRISOL_TIMING_TESTS") == "":
-  quit(0)
+  if getEnv("CRISOL_TIMING_TESTS") == "":
+    quit(0)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
 
-proc fixtureDir(): string =
-  let thisFile = currentSourcePath()
-  let testsDir = thisFile.parentDir.parentDir
-  testsDir / "fixtures"
+  proc fixtureDir(): string =
+    let thisFile = currentSourcePath()
+    let testsDir = thisFile.parentDir.parentDir
+    testsDir / "fixtures"
 
-proc mkEp(path: string): Entrypoint =
-  testEp(path, group = "test", flags = @[])
+  proc mkEp(path: string): Entrypoint =
+    testEp(path, group = "test", flags = @[])
 
-# ---------------------------------------------------------------------------
-# Suite 1 — SIGXCPU requested+achieved (real CPU burn)
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Suite 1 — SIGXCPU requested+achieved (real CPU burn)
+  # ---------------------------------------------------------------------------
 
-suite "rfc-0007 A1f — SIGXCPU requested+achieved via execute() (timing)":
+  suite "rfc-0007 A1f — SIGXCPU requested+achieved via execute() (timing)":
 
-  test "rlimit_cpu with a 1s RLIMIT_CPU: cbLimit(lkCpu), SIGXCPU":
-    ## Generous wall-clock budget (10s) so CI scheduler noise cannot cause a
-    ## false timeout — SIGXCPU itself fires within 1-2 CPU-seconds on any
-    ## host, well inside that budget.
-    let fdir = fixtureDir()
-    let eps  = @[mkEp(fdir / "rlimit_cpu.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
-    let p    = plan(cfg, eps, emptyDepGraph())
-    var g = emptyDepGraph()
-    let spec = resolveSandbox(level = hlIsolated,
-      rlimits = RlimitOverrides(limitCpu: some(1'i64)))
-    let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec))
+    test "rlimit_cpu with a 1s RLIMIT_CPU: cbLimit(lkCpu), SIGXCPU":
+      ## Generous wall-clock budget (10s) so CI scheduler noise cannot cause a
+      ## false timeout — SIGXCPU itself fires within 1-2 CPU-seconds on any
+      ## host, well inside that budget.
+      let fdir = fixtureDir()
+      let eps  = @[mkEp(fdir / "rlimit_cpu.nim")]
+      let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
+      let p    = plan(cfg, eps, emptyDepGraph())
+      var g = emptyDepGraph()
+      let spec = resolveSandbox(level = hlIsolated,
+        rlimits = RlimitOverrides(limitCpu: some(1'i64)))
+      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec))
 
-    check results.len == 1
-    check results[0].run.kind == ptypes.pkRan
-    check results[0].run.res.exit.kind == ptypes.ekSignaled
-    check results[0].run.res.exit.sig == int(SIGXCPU)
-    check results[0].run.res.cause.by == ptypes.cbLimit
-    check results[0].run.res.cause.limit == ptypes.lkCpu
+      check results.len == 1
+      check results[0].run.kind == ptypes.pkRan
+      check results[0].run.res.exit.kind == ptypes.ekSignaled
+      check results[0].run.res.exit.sig == int(SIGXCPU)
+      check results[0].run.res.cause.by == ptypes.cbLimit
+      check results[0].run.res.cause.limit == ptypes.lkCpu
 
-# ---------------------------------------------------------------------------
-# Suite 2 — compile-interrupt
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Suite 2 — compile-interrupt
+  # ---------------------------------------------------------------------------
 
-suite "rfc-0007 A1f — compile-interrupt attributes correctly (timing)":
+  suite "rfc-0007 A1f — compile-interrupt attributes correctly (timing)":
 
-  test "SIGINT during compile: oKilled, compile.cause runner/interrupt, run phase never started":
-    ## compile_interrupt.nim holds `nim c` open ~5-6 real wall-clock seconds
-    ## (a compile-time `staticExec("sleep 5")`) — a watcher fork sends SIGINT
-    ## to THIS test process 1.5s in, comfortably inside that window, well
-    ## before the compile could ever finish on its own. rfc-0007 A2b:
-    ## `installSignals = true` makes THIS execute() call's own Supervisor own
-    ## SIGINT installation for its duration — the same in-process mechanism
-    ## tests/integration/test_signal.nim's suite 2 already uses for a normal
-    ## (non-interrupted) run; here the signal is real and lands mid-compile.
+    test "SIGINT during compile: oKilled, compile.cause runner/interrupt, run phase never started":
+      ## compile_interrupt.nim holds `nim c` open ~5-6 real wall-clock seconds
+      ## (a compile-time `staticExec("sleep 5")`) — a watcher fork sends SIGINT
+      ## to THIS test process 1.5s in, comfortably inside that window, well
+      ## before the compile could ever finish on its own. rfc-0007 A2b:
+      ## `installSignals = true` makes THIS execute() call's own Supervisor own
+      ## SIGINT installation for its duration — the same in-process mechanism
+      ## tests/integration/test_signal.nim's suite 2 already uses for a normal
+      ## (non-interrupted) run; here the signal is real and lands mid-compile.
 
-    let fdir = fixtureDir()
-    let eps  = @[mkEp(fdir / "compile_interrupt.nim")]
-    let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
-    let p    = plan(cfg, eps, emptyDepGraph())
-    var g = emptyDepGraph()
+      let fdir = fixtureDir()
+      let eps  = @[mkEp(fdir / "compile_interrupt.nim")]
+      let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
+      let p    = plan(cfg, eps, emptyDepGraph())
+      var g = emptyDepGraph()
 
-    let myPid = getpid()
-    let watcherPid = fork()
-    check watcherPid >= 0
-    if watcherPid == 0:
-      # Watcher: NOT the entrypoint child — signals the TEST PROCESS itself,
-      # which installed the handler above and will observe it inside
-      # execute()'s poll loop.
-      os.sleep(1500)
-      discard kill(myPid, SIGINT)
-      exitnow(0)
+      let myPid = getpid()
+      let watcherPid = fork()
+      check watcherPid >= 0
+      if watcherPid == 0:
+        # Watcher: NOT the entrypoint child — signals the TEST PROCESS itself,
+        # which installed the handler above and will observe it inside
+        # execute()'s poll loop.
+        os.sleep(1500)
+        discard kill(myPid, SIGINT)
+        exitnow(0)
 
-    var interrupted = false
-    let results = execute(p, config = cfg, graph = g, interruptedOut = addr interrupted,
-                          installSignals = true)
+      var interrupted = false
+      let results = execute(p, config = cfg, graph = g, interruptedOut = addr interrupted,
+                            installSignals = true)
 
-    var ws: cint = 0
-    discard waitpid(watcherPid, ws, 0)
+      var ws: cint = 0
+      discard waitpid(watcherPid, ws, 0)
 
-    check interrupted
-    check results.len == 1  # §2 emission rule: compiling->pkRan is emitted
-    check results[0].outcome == oKilled
-    check results[0].compile.kind == ptypes.pkRan
-    check results[0].compile.res.cause.by == ptypes.cbRunner
-    check results[0].compile.res.cause.reason == ptypes.krInterrupt
-    check results[0].run.kind == ptypes.pkSkipped  # run phase never started
+      check interrupted
+      check results.len == 1  # §2 emission rule: compiling->pkRan is emitted
+      check results[0].outcome == oKilled
+      check results[0].compile.kind == ptypes.pkRan
+      check results[0].compile.res.cause.by == ptypes.cbRunner
+      check results[0].compile.res.cause.reason == ptypes.krInterrupt
+      check results[0].run.kind == ptypes.pkSkipped  # run phase never started
 
-when isMainModule:
-  echo "test_rfc0007_a1f_limit_timing done"
+  when isMainModule:
+    echo "test_rfc0007_a1f_limit_timing done"
+else:
+  when isMainModule:
+    echo "test_rfc0007_a1f_limit_timing: skipped (POSIX-only backend test)"
