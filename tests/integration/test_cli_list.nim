@@ -11,47 +11,13 @@
 ##         tests/integration/test_cli_list.nim
 
 import std/[json, monotimes, os, strutils, unittest]
-import std/posix as posix_mod
 import crisol  # runMain
+import ../support/capture
 
 proc fixtureDir(): string =
   let thisFile = currentSourcePath()
   let testsDir = thisFile.parentDir.parentDir
   testsDir / "fixtures"
-
-proc captureStdoutToFile(path: string; body: proc()): void =
-  ## Redirect fd 1 (stdout) to `path`, call body(), then restore.
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(1) failed")
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stdout)
-    discard posix_mod.dup2(savedFd, 1.cint)
-    discard posix_mod.close(savedFd)
-
-proc captureStderrToFile(path: string; body: proc()): void =
-  ## Redirect fd 2 (stderr) to `path`, call body(), then restore.
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(2.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(2) failed")
-  discard posix_mod.dup2(fileFd, 2.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stderr)
-    discard posix_mod.dup2(savedFd, 2.cint)
-    discard posix_mod.close(savedFd)
 
 # Result-phase markers that must NEVER appear in a plan render.
 const RunMarkers = ["[OK]", "[FAIL]", "[COMPILE]", "PASSED:", "FAILED:"]

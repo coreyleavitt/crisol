@@ -14,9 +14,9 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_a0_env_pin_cli.nim
 
-import std/[os, strutils, times, unittest]
-import std/posix as posix_mod
+import std/[os, strutils, unittest]
 import crisol   # runMain
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -25,7 +25,7 @@ import crisol   # runMain
 proc freshProjectRoot(name: string): string =
   ## A dedicated temp project (own crisol.kdl + .crisol state dir) so this
   ## file's probe files never collide across cases.
-  result = getTempDir() / ("crisol_a0_" & name & "_" & $getpid())
+  result = getTempDir() / ("crisol_a0_" & name & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   writeFile(result / "crisol.kdl", """
@@ -43,39 +43,6 @@ writeFile("env_pin_probe.txt", "PINNED=" & getEnv("CRISOL_ENV_PIN_TEST", "<UNSET
 quit(0)
 """
 
-proc captureBoth(args: seq[string]): tuple[code: int; stdout: string; stderr: string] =
-  ## Captures BOTH stdout and stderr of one runMain() invocation
-  ## simultaneously. Identical recipe to test_b3c_verify_cache_cli.nim's
-  ## captureBoth — reused rather than re-derived.
-  let tag = $getpid() & "_" & $epochTime().int64
-  let outPath = getTempDir() / ("crisol_a0_out_" & tag & ".txt")
-  let errPath = getTempDir() / ("crisol_a0_err_" & tag & ".txt")
-  let outF = open(outPath, fmWrite)
-  let errF = open(errPath, fmWrite)
-  let outFd: cint = outF.getFileHandle.cint
-  let errFd: cint = errF.getFileHandle.cint
-  let savedOutFd: cint = posix_mod.dup(1.cint)
-  let savedErrFd: cint = posix_mod.dup(2.cint)
-  discard posix_mod.dup2(outFd, 1.cint)
-  discard posix_mod.dup2(errFd, 2.cint)
-  outF.close()
-  errF.close()
-  var code = 0
-  try:
-    code = runMain(args)
-  finally:
-    flushFile(stdout)
-    flushFile(stderr)
-    discard posix_mod.dup2(savedOutFd, 1.cint)
-    discard posix_mod.dup2(savedErrFd, 2.cint)
-    discard posix_mod.close(savedOutFd)
-    discard posix_mod.close(savedErrFd)
-  let outText = readFile(outPath)
-  let errText = readFile(errPath)
-  try: removeFile(outPath) except CatchableError: discard
-  try: removeFile(errPath) except CatchableError: discard
-  (code: code, stdout: outText, stderr: errText)
-
 # ---------------------------------------------------------------------------
 # 1 — the pinned value reaches the run child, regardless of the host's value.
 # ---------------------------------------------------------------------------
@@ -90,9 +57,11 @@ suite "A0 CLI — --env-pin injects NAME=VALUE into the run child env":
     writeFile(root / epPath, EnvPinProbeFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--env-pin", "CRISOL_ENV_PIN_TEST=pinned-value"])
-    check r.code == 0
+    var code = 0
+    discard captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--env-pin", "CRISOL_ENV_PIN_TEST=pinned-value"]))
+    check code == 0
 
     let probePath = root / "env_pin_probe.txt"
     check fileExists(probePath)
@@ -107,9 +76,11 @@ suite "A0 CLI — --env-pin injects NAME=VALUE into the run child env":
     writeFile(root / epPath, EnvPinProbeFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--env-pin", "CRISOL_ENV_PIN_TEST=pinned-value"])
-    check r.code == 0
+    var code = 0
+    discard captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--env-pin", "CRISOL_ENV_PIN_TEST=pinned-value"]))
+    check code == 0
 
     let probePath = root / "env_pin_probe.txt"
     check fileExists(probePath)
@@ -127,10 +98,12 @@ suite "A0 CLI — malformed --env-pin is rejected":
     writeFile(root / "tests" / "unit" / "test_probe.nim", "quit(0)\n")
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--env-pin", "NOEQUALSIGN"])
-    check r.code == 3
-    check "--env-pin" in r.stderr
+    var code = 0
+    let (_, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--env-pin", "NOEQUALSIGN"]))
+    check code == 3
+    check "--env-pin" in errText
 
   test "--env-pin with empty NAME -> ExitEnvironment(3)":
     let root = freshProjectRoot("empty_name")
@@ -138,10 +111,12 @@ suite "A0 CLI — malformed --env-pin is rejected":
     writeFile(root / "tests" / "unit" / "test_probe.nim", "quit(0)\n")
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--env-pin", "=somevalue"])
-    check r.code == 3
-    check "--env-pin" in r.stderr
+    var code = 0
+    let (_, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--env-pin", "=somevalue"]))
+    check code == 3
+    check "--env-pin" in errText
 
 when isMainModule:
   echo "test_a0_env_pin_cli: done"

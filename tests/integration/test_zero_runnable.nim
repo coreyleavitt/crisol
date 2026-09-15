@@ -11,7 +11,6 @@
 ##         tests/integration/test_zero_runnable.nim
 
 import std/[monotimes, options, os, osproc, sets, strutils, unittest]
-import std/posix as posix_mod
 import crisol
 import crisol/types
 import crisol/jsonout
@@ -21,6 +20,7 @@ import crisol/planner  # for CrisolProtocolMajor
 
 import crisol/process/types as ptypes
 import "../support/testep"
+import ../support/capture
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -69,24 +69,6 @@ import std/unittest
 suite "x":
   test "ok": check true
 """
-
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_zr_cap_" & $getMonoTime().ticks & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-
-  let code = runMain(args)
-
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
 
 # ---------------------------------------------------------------------------
 # Suite 1 — --changed on a clean tree with seeded dep graph → exit 0
@@ -159,9 +141,10 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
 
     # Run with --changed. Tree is clean → changedSet empty → closure ∩ {} = ∅
     # → runnable == 0 → exit 0 with "nothing affected" message.
-    let r = captureStdout(@["run", "--changed"])
-    check r.code == 0
-    check "nothing" in r.output
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["run", "--changed"]))
+    check code == 0
+    check "nothing" in output
 
 # ---------------------------------------------------------------------------
 # Suite 2 — --failed with no prior failures → exit 0
@@ -241,7 +224,8 @@ group "unit" {
     setCurrentDir(repo)
     defer: setCurrentDir(oldCwd)
 
-    let r = captureStdout(@["run"])
-    check r.code == 0
-    check "gated out" in r.output or "gated" in r.output or
-          r.output.contains("nothing to run")
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["run"]))
+    check code == 0
+    check "gated out" in output or "gated" in output or
+          output.contains("nothing to run")

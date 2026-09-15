@@ -10,28 +10,8 @@
 ##         tests/integration/test_cli_s5.nim
 
 import std/[os, strutils, unittest]
-import std/posix as posix_mod
 import crisol   # runMain
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-proc captureStdout(body: proc()): string =
-  let outPath = getTempDir() / ("crisol_s5_" & $getpid() & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stdout)
-    discard posix_mod.dup2(savedFd, 1.cint)
-    discard posix_mod.close(savedFd)
-  result = readFile(outPath)
-  try: removeFile(outPath) except: discard
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Suite

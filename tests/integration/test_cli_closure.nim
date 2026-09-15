@@ -22,10 +22,10 @@
 ##         tests/integration/test_cli_closure.nim
 
 import std/[json, monotimes, os, strutils, unittest]
-import std/posix as posix_mod
 import crisol  # runMain
 import crisol/render  # pathFlagsWarnings — reuse run/list's exact wording
 import crisol/jsonout  # ClosureV1Schema/ClosureV1Revision — schema/revision pin
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,40 +35,6 @@ proc uniqueTmpDir(tag: string): string =
   let mono = getMonoTime()
   result = getTempDir() / ("crisol_closure_" & tag & "_" & $mono.ticks)
   createDir(result)
-
-proc captureStdoutToFile(path: string; body: proc()): void =
-  ## Redirect fd 1 (stdout) to `path`, call body(), then restore.
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(1) failed")
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stdout)
-    discard posix_mod.dup2(savedFd, 1.cint)
-    discard posix_mod.close(savedFd)
-
-proc captureStderrToFile(path: string; body: proc()): void =
-  ## Redirect fd 2 (stderr) to `path`, call body(), then restore.
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(2.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(2) failed")
-  discard posix_mod.dup2(fileFd, 2.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stderr)
-    discard posix_mod.dup2(savedFd, 2.cint)
-    discard posix_mod.close(savedFd)
 
 proc writeF(root, rel, content: string) =
   let p = root / rel

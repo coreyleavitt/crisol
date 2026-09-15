@@ -17,8 +17,8 @@
 ##         tests/integration/test_cli_group.nim
 
 import std/[json, os, strutils, unittest]
-import std/posix as posix_mod3
 import crisol
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -28,32 +28,6 @@ proc fixtureDir(): string =
   let thisFile = currentSourcePath()
   let testsDir = thisFile.parentDir.parentDir
   testsDir / "fixtures"
-
-proc captureStdoutToFile(path: string; body: proc()): void =
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod3.dup(1.cint)
-  discard posix_mod3.dup2(fileFd, 1.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stdout)
-    discard posix_mod3.dup2(savedFd, 1.cint)
-    discard posix_mod3.close(savedFd)
-
-proc captureStderrToFile(path: string; body: proc()): void =
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod3.dup(2.cint)
-  discard posix_mod3.dup2(fileFd, 2.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stderr)
-    discard posix_mod3.dup2(savedFd, 2.cint)
-    discard posix_mod3.close(savedFd)
 
 # ---------------------------------------------------------------------------
 # Suite 1 — --group / --all-groups flag parsing
@@ -195,7 +169,7 @@ suite "crisol CLI — C2 --group / --all-groups":
     ## --group when a path is also given (the issue #3 bug), the plan carries
     ## both legs / the "special" leg (wrong). Threading --group into
     ## GroupSelection.withinGroups must yield exactly the "unit" leg.
-    let root = getTempDir() / ("crisol_c2_issue3_" & $getpid())
+    let root = getTempDir() / ("crisol_c2_issue3_" & $getCurrentProcessId())
     createDir(root)
     defer: removeDir(root)
 
@@ -216,7 +190,7 @@ group "unit" {
     let epPath = unitDir / "test_a.nim"
     writeFile(epPath, "quit(0)\n")
 
-    let outPath = getTempDir() / ("crisol_c2_issue3_out_" & $getpid() & ".json")
+    let outPath = getTempDir() / ("crisol_c2_issue3_out_" & $getCurrentProcessId() & ".json")
     defer: (try: removeFile(outPath) except: discard)
 
     var code = 0

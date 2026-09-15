@@ -15,30 +15,13 @@
 ##         tests/integration/test_rfc0007_a1d2_cache_replay.nim
 
 import std/[json, os, times, unittest]
-import std/posix as posix_mod
 import crisol         # imports runMain
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers (per-file idiom, no cross-test-file import -- see
 # test_rfc0007_a1b_kill_path.nim's identical captureStdout)
 # ---------------------------------------------------------------------------
-
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_rfc0007_a1d2_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
 
 proc firstEntrypoint(jsonText: string): JsonNode =
   let doc = parseJson(jsonText)
@@ -48,7 +31,7 @@ proc firstEntrypoint(jsonText: string): JsonNode =
 proc freshProjectRoot(name: string): string =
   ## A dedicated temp project (own crisol.kdl + .crisol state dir) so this
   ## test's cache entries never collide with any other test's.
-  result = getTempDir() / ("crisol_a1d2_" & name & "_" & $getpid())
+  result = getTempDir() / ("crisol_a1d2_" & name & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   writeFile(result / "crisol.kdl", """
@@ -70,8 +53,9 @@ suite "rfc-0007 A1d-ii — cache replay carries the real stored observation (cri
     let cfgPath = root / "crisol.kdl"
 
     # Cold: live run. Only oPassed results are ever stored (pass-only store).
-    let (code1, out1) = captureStdout(@["run", "--config", cfgPath,
-                                        "--jobs", "1", "--json"])
+    var code1 = 0
+    let out1 = captureStdout(proc() = code1 = runMain(@["run", "--config", cfgPath,
+                                        "--jobs", "1", "--json"]))
     check code1 == 0
     let ep1 = firstEntrypoint(out1)
     check ep1["outcome"].getStr == "passed"
@@ -80,8 +64,9 @@ suite "rfc-0007 A1d-ii — cache replay carries the real stored observation (cri
     check ep1["run"].hasKey("rusage")
 
     # Warm: identical config + entrypoint -> served from cache (edCached).
-    let (code2, out2) = captureStdout(@["run", "--config", cfgPath,
-                                        "--jobs", "1", "--json"])
+    var code2 = 0
+    let out2 = captureStdout(proc() = code2 = runMain(@["run", "--config", cfgPath,
+                                        "--jobs", "1", "--json"]))
     check code2 == 0
     let ep2 = firstEntrypoint(out2)
     check ep2["outcome"].getStr == "passed"

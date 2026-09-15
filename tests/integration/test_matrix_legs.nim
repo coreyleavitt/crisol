@@ -10,32 +10,15 @@
 ##         tests/integration/test_matrix_legs.nim
 
 import std/[json, os, osproc, sets, strutils, times, unittest]
-import std/posix as posix_mod
 import crisol
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_matrix_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
-
 proc newProject(tag: string): string =
-  result = getTempDir() / ("crisol_matrix_" & tag & "_" & $getpid())
+  result = getTempDir() / ("crisol_matrix_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   createDir(result / ".crisol")
@@ -80,9 +63,10 @@ suite "issue #10 — matrix legs end-to-end":
     writeFile(root / "crisol.kdl", MatrixKdl)
     writeFile(root / "tests" / "unit" / "test_probe.nim", LegProbe)
 
-    let r = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check r.code == 0
-    let j = parseJson(r.output.strip())
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check code == 0
+    let j = parseJson(output.strip())
 
     # Two separately-reported legs, one per group, both passed.
     check j["entrypoints"].len == 2
@@ -111,9 +95,10 @@ suite "issue #10 — crisol list shows each leg's effective flags":
     writeFile(root / "crisol.kdl", MatrixKdlWithGlobal)
     writeFile(root / "tests" / "unit" / "test_probe.nim", LegProbe)
 
-    let r = captureStdout(@["list", "--config", root / "crisol.kdl", "--json"])
-    check r.code == 0
-    let j = parseJson(r.output.strip())
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["list", "--config", root / "crisol.kdl", "--json"]))
+    check code == 0
+    let j = parseJson(output.strip())
     check j["schema"].getStr == "crisol/plan/v1"
     check j["schemaRevision"].getInt >= 3
     check j["entrypoints"].len == 2
@@ -138,9 +123,10 @@ suite "issue #10 — explicit path runs every matching leg; --group narrows":
     let probe = root / "tests" / "unit" / "test_probe.nim"
     writeFile(probe, LegProbe)
 
-    let r = captureStdout(@["list", "--config", root / "crisol.kdl", "--json", probe])
-    check r.code == 0
-    let j = parseJson(r.output.strip())
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["list", "--config", root / "crisol.kdl", "--json", probe]))
+    check code == 0
+    let j = parseJson(output.strip())
     check j["entrypoints"].len == 2
     var seen: seq[(string, seq[string])]
     for ep in j["entrypoints"]:
@@ -157,10 +143,11 @@ suite "issue #10 — explicit path runs every matching leg; --group narrows":
     let probe = root / "tests" / "unit" / "test_probe.nim"
     writeFile(probe, LegProbe)
 
-    let r = captureStdout(@["list", "--config", root / "crisol.kdl", "--json",
-                            "--group", "unit-b", probe])
-    check r.code == 0
-    let j = parseJson(r.output.strip())
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["list", "--config", root / "crisol.kdl", "--json",
+                            "--group", "unit-b", probe]))
+    check code == 0
+    let j = parseJson(output.strip())
     check j["entrypoints"].len == 1
     check j["entrypoints"][0]["group"].getStr == "unit-b"
 
@@ -195,16 +182,18 @@ quit(0)
     git(root, "commit -q -m baseline")
 
     # A full run records each leg's closure from ITS OWN compile.
-    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full.code == 0
-    check parseJson(full.output.strip())["entrypoints"].len == 2
+    var fullCode = 0
+    let fullOutput = captureStdout(proc() = fullCode = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check fullCode == 0
+    check parseJson(fullOutput.strip())["entrypoints"].len == 2
 
     # Touch the define-gated dependency; only legA's closure contains it.
     writeFile(root / "tests" / "unit" / "extra.nim", "proc extraValue*(): int = 1 # touched\n")
-    let plan = captureStdout(@["run", "--config", root / "crisol.kdl",
-                               "--changed", "--dry-run", "--json"])
-    check plan.code == 0
-    let j = parseJson(plan.output.strip())
+    var planCode = 0
+    let planOutput = captureStdout(proc() = planCode = runMain(@["run", "--config", root / "crisol.kdl",
+                               "--changed", "--dry-run", "--json"]))
+    check planCode == 0
+    let j = parseJson(planOutput.strip())
     check j["entrypoints"].len == 1
     check j["entrypoints"][0]["group"].getStr == "unit-a"
     check j["entrypoints"][0]["flags"] == %*["-d:legA"]

@@ -11,44 +11,8 @@
 ##         tests/integration/test_cli_s4.nim
 
 import std/[os, strutils, unittest]
-import std/posix as posix_mod
 import crisol   # runMain
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-proc captureStdout(body: proc()): string =
-  let outPath = getTempDir() / ("crisol_s4_" & $getpid() & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stdout)
-    discard posix_mod.dup2(savedFd, 1.cint)
-    discard posix_mod.close(savedFd)
-  result = readFile(outPath)
-  try: removeFile(outPath) except: discard
-
-proc captureStderr(body: proc()): string =
-  let outPath = getTempDir() / ("crisol_s4_err_" & $getpid() & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(2.cint)
-  discard posix_mod.dup2(fileFd, 2.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stderr)
-    discard posix_mod.dup2(savedFd, 2.cint)
-    discard posix_mod.close(savedFd)
-  result = readFile(outPath)
-  try: removeFile(outPath) except: discard
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # S4.1 — --help / -h → stdout, exit 0
@@ -127,7 +91,7 @@ suite "crisol S4.4 — clean --config <path>":
   test "clean --config <path> targets the state dir from that config":
     ## Build a project with a custom state-dir in its config.
     ## Verify that clean --config <cfg> prunes from that dir, not the default.
-    let root = getTempDir() / ("crisol_s4_clean_" & $getpid())
+    let root = getTempDir() / ("crisol_s4_clean_" & $getCurrentProcessId())
     createDir(root)
     defer: removeDir(root)
 
@@ -159,7 +123,7 @@ suite "crisol S4.4 — clean --config <path>":
     check not dirExists(stateDir / "cache" / "orphan_aabbccdd")
 
   test "clean --config=<path> (inline form) targets the state dir from that config":
-    let root = getTempDir() / ("crisol_s4_clean_eq_" & $getpid())
+    let root = getTempDir() / ("crisol_s4_clean_eq_" & $getCurrentProcessId())
     createDir(root)
     defer: removeDir(root)
 

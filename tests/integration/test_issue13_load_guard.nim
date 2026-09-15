@@ -13,33 +13,16 @@
 ##         tests/integration/test_issue13_load_guard.nim
 
 import std/[json, os, osproc, strutils, times, unittest]
-import std/posix as posix_mod
 import crisol
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers (shapes copied from tests/integration/test_issue12_clean_gc.nim —
 # not imported, so this file has no test-to-test dependency).
 # ---------------------------------------------------------------------------
 
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_issue13_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
-
 proc newProject(tag: string): string =
-  result = getTempDir() / ("crisol_issue13_" & tag & "_" & $getpid())
+  result = getTempDir() / ("crisol_issue13_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   createDir(result / ".crisol")
@@ -80,9 +63,10 @@ suite "issue #13.1 — M10 load guard drops escaping relative closure paths":
 
     # Real run: compiles + runs the entrypoint, writing a REAL depgraph with
     # a REAL closure for tests/unit/t_a.nim.
-    let full = captureStdout(@["run", "--config", cfgPath, "--json"])
-    check full.code == 0
-    let fullJson = parseJson(full.output.strip())
+    var fullCode = 0
+    let fullOutput = captureStdout(proc() = fullCode = runMain(@["run", "--config", cfgPath, "--json"]))
+    check fullCode == 0
+    let fullJson = parseJson(fullOutput.strip())
     check fullJson["entrypoints"].len == 1
     check fullJson["entrypoints"][0]["outcome"].getStr == "passed"
 
@@ -102,10 +86,11 @@ suite "issue #13.1 — M10 load guard drops escaping relative closure paths":
 
     # `crisol closure --json` must load the tampered graph through the M10
     # guard: the entrypoint's closure survives (minus the tampered paths).
-    let cls = captureStdout(@["closure", "tests/unit/t_a.nim", "--json",
-                              "--config", cfgPath])
-    check cls.code == 0
-    let clsJson = parseJson(cls.output.strip())
+    var clsCode = 0
+    let clsOutput = captureStdout(proc() = clsCode = runMain(@["closure", "tests/unit/t_a.nim", "--json",
+                              "--config", cfgPath]))
+    check clsCode == 0
+    let clsJson = parseJson(clsOutput.strip())
     check clsJson["entries"].len == 1
     let e = clsJson["entries"][0]
     check e["recorded"].getBool == true

@@ -23,33 +23,16 @@
 ##         tests/integration/test_issue11_closure_inputs.nim
 
 import std/[json, os, osproc, strutils, times, unittest]
-import std/posix as posix_mod
 import crisol
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers (shapes copied from tests/integration/test_matrix_legs.nim — not
 # imported, so this file has no test-to-test dependency).
 # ---------------------------------------------------------------------------
 
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_issue11_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
-
 proc newProject(tag: string): string =
-  result = getTempDir() / ("crisol_issue11_" & tag & "_" & $getpid())
+  result = getTempDir() / ("crisol_issue11_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit" / "parts")
   createDir(result / ".crisol")
@@ -97,8 +80,9 @@ suite "issue #11 — include'd file is a tracked compile input":
     git(root, "commit -q -m baseline")
 
     # Full run: compiles + runs test_inc, which writes answer.marker == "1".
-    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full.code == 0
+    var fullCode = 0
+    let fullOutput = captureStdout(proc() = fullCode = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check fullCode == 0
     let markerPath = root / "tests" / "unit" / "answer.marker"
     check fileExists(markerPath)
     check readFile(markerPath).strip == "1"
@@ -108,28 +92,31 @@ suite "issue #11 — include'd file is a tracked compile input":
 
     # --changed --dry-run must select test_inc.nim: its closure must contain
     # the include'd file for the git-diff intersection to hit.
-    let plan = captureStdout(@["run", "--config", root / "crisol.kdl",
-                               "--changed", "--dry-run", "--json"])
-    check plan.code == 0
-    let planJson = parseJson(plan.output.strip())
+    var planCode = 0
+    let planOutput = captureStdout(proc() = planCode = runMain(@["run", "--config", root / "crisol.kdl",
+                               "--changed", "--dry-run", "--json"]))
+    check planCode == 0
+    let planJson = parseJson(planOutput.strip())
     check planJson["entrypoints"].len == 1
     check planJson["entrypoints"][0]["path"].getStr.endsWith("tests/unit/test_inc.nim")
 
     # --changed (real run) must actually RECOMPILE test_inc.nim: a stale
     # binary would rewrite marker with the OLD Answer (1), not the new one.
-    let changed = captureStdout(@["run", "--config", root / "crisol.kdl",
-                                  "--changed", "--json"])
-    check changed.code == 0
-    let changedJson = parseJson(changed.output.strip())
+    var changedCode = 0
+    let changedOutput = captureStdout(proc() = changedCode = runMain(@["run", "--config", root / "crisol.kdl",
+                                  "--changed", "--json"]))
+    check changedCode == 0
+    let changedJson = parseJson(changedOutput.strip())
     check changedJson["entrypoints"].len == 1
     check changedJson["entrypoints"][0]["outcome"].getStr == "passed"
     check readFile(markerPath).strip == "2"
 
     # `closure --json <path>` must list the include'd file as a tracked
     # compile input of test_inc.nim.
-    let cl = captureStdout(@["closure", "--json", "--config", root / "crisol.kdl", epPath])
-    check cl.code == 0
-    let clJson = parseJson(cl.output.strip())
+    var clCode = 0
+    let clOutput = captureStdout(proc() = clCode = runMain(@["closure", "--json", "--config", root / "crisol.kdl", epPath]))
+    check clCode == 0
+    let clJson = parseJson(clOutput.strip())
     check clJson["entries"].len == 1
     var closureSet: seq[string]
     for c in clJson["entries"][0]["closure"]:
@@ -171,8 +158,9 @@ suite "issue #11 — staticRead target is a tracked compile input":
     git(root, "commit -q -m baseline")
 
     # Full run: compiles + runs test_sr, which writes sr.marker == "1".
-    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full.code == 0
+    var fullCode = 0
+    let fullOutput = captureStdout(proc() = fullCode = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check fullCode == 0
     let markerPath = root / "tests" / "unit" / "sr.marker"
     check fileExists(markerPath)
     check readFile(markerPath).strip == "1"
@@ -182,10 +170,11 @@ suite "issue #11 — staticRead target is a tracked compile input":
 
     # --changed --dry-run must select test_sr.nim: its closure must contain
     # the staticRead target for the git-diff intersection to hit.
-    let plan = captureStdout(@["run", "--config", root / "crisol.kdl",
-                               "--changed", "--dry-run", "--json"])
-    check plan.code == 0
-    let planJson = parseJson(plan.output.strip())
+    var planCode = 0
+    let planOutput = captureStdout(proc() = planCode = runMain(@["run", "--config", root / "crisol.kdl",
+                               "--changed", "--dry-run", "--json"]))
+    check planCode == 0
+    let planJson = parseJson(planOutput.strip())
     check planJson["entrypoints"].len == 1
     check planJson["entrypoints"][0]["path"].getStr.endsWith("tests/unit/test_sr.nim")
 
@@ -193,19 +182,21 @@ suite "issue #11 — staticRead target is a tracked compile input":
     # binary would rewrite marker with the OLD Answer (1), not the new one —
     # staticRead is evaluated at compile time, so this also proves the
     # recompile actually re-executed the staticRead, not just relinked.
-    let changed = captureStdout(@["run", "--config", root / "crisol.kdl",
-                                  "--changed", "--json"])
-    check changed.code == 0
-    let changedJson = parseJson(changed.output.strip())
+    var changedCode = 0
+    let changedOutput = captureStdout(proc() = changedCode = runMain(@["run", "--config", root / "crisol.kdl",
+                                  "--changed", "--json"]))
+    check changedCode == 0
+    let changedJson = parseJson(changedOutput.strip())
     check changedJson["entrypoints"].len == 1
     check changedJson["entrypoints"][0]["outcome"].getStr == "passed"
     check readFile(markerPath).strip == "2"
 
     # `closure --json <path>` must list the staticRead target as a tracked
     # compile input of test_sr.nim.
-    let cl = captureStdout(@["closure", "--json", "--config", root / "crisol.kdl", epPath])
-    check cl.code == 0
-    let clJson = parseJson(cl.output.strip())
+    var clCode = 0
+    let clOutput = captureStdout(proc() = clCode = runMain(@["closure", "--json", "--config", root / "crisol.kdl", epPath]))
+    check clCode == 0
+    let clJson = parseJson(clOutput.strip())
     check clJson["entries"].len == 1
     var closureSet2: seq[string]
     for c in clJson["entries"][0]["closure"]:
@@ -250,8 +241,9 @@ suite "issue #11 — nim.cfg next to the entrypoint is a tracked compile input":
 
     # Full run: compiles + runs test_cfg, which writes cfg.marker == "plain"
     # (nim.cfg carries no -d:flip yet).
-    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full.code == 0
+    var fullCode = 0
+    let fullOutput = captureStdout(proc() = fullCode = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check fullCode == 0
     let markerPath = root / "tests" / "unit" / "cfg.marker"
     check fileExists(markerPath)
     check readFile(markerPath).strip == "plain"
@@ -260,10 +252,11 @@ suite "issue #11 — nim.cfg next to the entrypoint is a tracked compile input":
     # Nim registers it in fileInfos as soon as it is read, even when it
     # contributes no flags — so the closure already lists it before any
     # edit. (Selection on the edit below depends on exactly this.)
-    let clPre = captureStdout(@["closure", "--json", "--config", root / "crisol.kdl", epPath])
-    check clPre.code == 0
+    var clPreCode = 0
+    let clPreOutput = captureStdout(proc() = clPreCode = runMain(@["closure", "--json", "--config", root / "crisol.kdl", epPath]))
+    check clPreCode == 0
     var closurePre: seq[string]
-    for c in parseJson(clPre.output.strip())["entries"][0]["closure"]:
+    for c in parseJson(clPreOutput.strip())["entries"][0]["closure"]:
       closurePre.add c.getStr
     check "tests/unit/nim.cfg" in closurePre
 
@@ -272,29 +265,32 @@ suite "issue #11 — nim.cfg next to the entrypoint is a tracked compile input":
 
     # --changed --dry-run must select test_cfg.nim: its closure must contain
     # nim.cfg for the git-diff intersection to hit.
-    let plan = captureStdout(@["run", "--config", root / "crisol.kdl",
-                               "--changed", "--dry-run", "--json"])
-    check plan.code == 0
-    let planJson = parseJson(plan.output.strip())
+    var planCode = 0
+    let planOutput = captureStdout(proc() = planCode = runMain(@["run", "--config", root / "crisol.kdl",
+                               "--changed", "--dry-run", "--json"]))
+    check planCode == 0
+    let planJson = parseJson(planOutput.strip())
     check planJson["entrypoints"].len == 1
     check planJson["entrypoints"][0]["path"].getStr.endsWith("tests/unit/test_cfg.nim")
 
     # --changed (real run) must actually RECOMPILE test_cfg.nim under the new
     # -d:flip: a stale binary would rewrite marker with "plain", not
     # "flipped".
-    let changed = captureStdout(@["run", "--config", root / "crisol.kdl",
-                                  "--changed", "--json"])
-    check changed.code == 0
-    let changedJson = parseJson(changed.output.strip())
+    var changedCode = 0
+    let changedOutput = captureStdout(proc() = changedCode = runMain(@["run", "--config", root / "crisol.kdl",
+                                  "--changed", "--json"]))
+    check changedCode == 0
+    let changedJson = parseJson(changedOutput.strip())
     check changedJson["entrypoints"].len == 1
     check changedJson["entrypoints"][0]["outcome"].getStr == "passed"
     check readFile(markerPath).strip == "flipped"
 
     # `closure --json <path>` must list nim.cfg as a tracked compile input
     # of test_cfg.nim.
-    let cl = captureStdout(@["closure", "--json", "--config", root / "crisol.kdl", epPath])
-    check cl.code == 0
-    let clJson = parseJson(cl.output.strip())
+    var clCode = 0
+    let clOutput = captureStdout(proc() = clCode = runMain(@["closure", "--json", "--config", root / "crisol.kdl", epPath]))
+    check clCode == 0
+    let clJson = parseJson(clOutput.strip())
     check clJson["entries"].len == 1
     var closureSet3: seq[string]
     for c in clJson["entries"][0]["closure"]:

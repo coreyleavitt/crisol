@@ -26,32 +26,11 @@
 ##         tests/integration/test_b3b_verify_cache.nim
 
 import std/[json, os, strutils, unittest]
-import std/posix as posix_mod
 import crisol/api
 import crisol/types
 
 import "../support/helpers"
-
-# ---------------------------------------------------------------------------
-# stderr capture helper (mirrors tests/unit/test_jsonout.nim's
-# captureStdoutToFile — POSIX dup/dup2/close, fd 2 instead of fd 1).
-# ---------------------------------------------------------------------------
-
-proc captureStderrToFile(path: string; body: proc()): void =
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(2.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(2) failed")
-  discard posix_mod.dup2(fileFd, 2.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stderr)
-    discard posix_mod.dup2(savedFd, 2.cint)
-    discard posix_mod.close(savedFd)
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers

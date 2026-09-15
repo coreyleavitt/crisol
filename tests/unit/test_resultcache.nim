@@ -27,33 +27,11 @@
 ##      real stderr (fd-level capture), not just the once-set's bookkeeping.
 
 import std/[os, json, options, strutils]
-import std/posix as posix_m  # L10: getpid() for PID-unique tmp filename check; also fd-capture (test 10)
 import crisol/types
 import crisol/resultcache
 import crisol/process/types as ptypes
 import crisol/depgraph  # fnv1a64/toHex16 — recompute a matching checksum in test 8
-
-# ---------------------------------------------------------------------------
-# Stderr fd-capture helper (test 10) — redirects the OS-level fd 2 for the
-# duration of `body`, so the rate-limiting proof exercises the REAL stream
-# `warnStoreFailureOnce` writes to, not merely the once-set's internal state.
-# ---------------------------------------------------------------------------
-
-proc withCapturedStderr(body: proc()): string =
-  stdout.flushFile()
-  stderr.flushFile()
-  let capPath = getTempDir() / ("crisol_resultcache_stderr_capture_" & $posix_m.getpid() & ".txt")
-  let savedFd = posix_m.dup(2.cint)
-  let capFd = posix_m.open(capPath.cstring,
-                            posix_m.O_WRONLY or posix_m.O_CREAT or posix_m.O_TRUNC, 0o600)
-  discard posix_m.dup2(capFd, 2.cint)
-  discard posix_m.close(capFd)
-  body()
-  stderr.flushFile()
-  discard posix_m.dup2(savedFd, 2.cint)
-  discard posix_m.close(savedFd)
-  result = readFile(capPath)
-  removeFile(capPath)
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -219,7 +197,7 @@ block test_atomic_no_tmp:
 
   # The writer-own PID-based .tmp is gone (renamed to .json or cleaned on error).
   # Walk the cache dir to confirm no PID-style .tmp was left behind.
-  let myPidTmp = keyFile(sd, key) & "." & $posix_m.getpid() & ".tmp"
+  let myPidTmp = keyFile(sd, key) & "." & $getCurrentProcessId() & ".tmp"
   assert not fileExists(myPidTmp), "writer-own .tmp must not exist after rename"
 
   # NOTE: the stale legacy-format .tmp may still be present — its cleanup is
@@ -415,7 +393,7 @@ block test_store_failure_warning_rate_limited_per_root:
   assert storeCachedAt(rootA, SoundnessKey("c0c0c0c0c0c0c0c0"), sampleResult(), maxCacheEntries = 2)
   assert storeCachedAt(rootA, SoundnessKey("c1c1c1c1c1c1c1c1"), sampleResult(), maxCacheEntries = 2)
 
-  let captured = withCapturedStderr(proc() =
+  let captured = captureStderr(proc() =
     for i in 0 ..< 3:
       let k = SoundnessKey("c2c2c2c2c2c2c2c" & $i)
       let ok = storeCachedAt(rootA, k, sampleResult(), maxCacheEntries = 2)
@@ -465,7 +443,7 @@ block test_store_ioerror_when_file_blocks_version_dir:
   defer: removeFile(verDir)
 
   var ok = true
-  let captured = withCapturedStderr(proc() =
+  let captured = captureStderr(proc() =
     ok = storeCachedAt(root, SoundnessKey("8080808080808080"), sampleResult())
   )
   assert not ok, "a version dir blocked by a file (IOError) must degrade to false, not crash"

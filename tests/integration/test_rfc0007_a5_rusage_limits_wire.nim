@@ -30,8 +30,8 @@
 ##         tests/integration/test_rfc0007_a5_rusage_limits_wire.nim
 
 import std/[json, os, times, unittest]
-import std/posix as posix_mod
 import crisol         # imports runMain
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,25 +41,6 @@ proc fixtureDir(): string =
   let thisFile = currentSourcePath()
   let testsDir = thisFile.parentDir.parentDir
   testsDir / "fixtures"
-
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  ## Same idiom as test_rfc0007_a1b_kill_path.nim's captureStdout — not
-  ## imported, so this file has no test-to-test dependency.
-  let outPath = getTempDir() / ("crisol_rfc0007_a5_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
 
 proc firstEntrypoint(jsonText: string): JsonNode =
   let doc = parseJson(jsonText)
@@ -72,7 +53,7 @@ proc writeFD(root, rel, content: string) =
   writeFile(p, content)
 
 proc uniqueTmpDir(tag: string): string =
-  getTempDir() / ("crisol_a5_" & tag & "_" & $getpid() & "_" & $epochTime().int64)
+  getTempDir() / ("crisol_a5_" & tag & "_" & $getCurrentProcessId() & "_" & $epochTime().int64)
 
 # ---------------------------------------------------------------------------
 # Suite 1 — rusage reaches the wire
@@ -82,8 +63,9 @@ suite "rfc-0007 A5 — rusage reaches the crisol/run/v2 wire":
 
   test "pass_always: run.rusage is non-null with a plausible nonzero maxRssBytes":
     let fd = fixtureDir()
-    let (code, output) = captureStdout(@["run", fd / "pass_always.nim",
-                                         "--jobs", "1", "--json", "--no-cache"])
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["run", fd / "pass_always.nim",
+                                         "--jobs", "1", "--json", "--no-cache"]))
     check code == 0
     let ep = firstEntrypoint(output)
     check ep["run"]["kind"].getStr == "ran"
@@ -119,7 +101,8 @@ suite "rfc-0007 A5 — per-limit evidence.limits reaches the crisol/run/v2 wire"
     setCurrentDir(root)
     defer: setCurrentDir(oldCwd)
 
-    let (code, output) = captureStdout(@["run", "--jobs", "1", "--json", "--no-cache"])
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["run", "--jobs", "1", "--json", "--no-cache"]))
     check code == 0
     let ep = firstEntrypoint(output)
     check ep["run"]["kind"].getStr == "ran"

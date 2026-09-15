@@ -23,9 +23,9 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_b3c_verify_cache_cli.nim
 
-import std/[json, os, strutils, times, unittest]
-import std/posix as posix_mod
+import std/[json, os, strutils, unittest]
 import crisol   # runMain
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,7 +34,7 @@ import crisol   # runMain
 proc freshProjectRoot(name: string): string =
   ## A dedicated temp project (own crisol.kdl + .crisol state dir) so this
   ## file's cache entries / counter files never collide across cases.
-  result = getTempDir() / ("crisol_b3c_" & name & "_" & $getpid())
+  result = getTempDir() / ("crisol_b3c_" & name & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   writeFile(result / "crisol.kdl", """
@@ -60,43 +60,6 @@ if n mod 2 == 1: quit(0) else: quit(1)
 
 const DeterministicFixture = "quit(0)\n"
 
-proc captureBoth(args: seq[string]): tuple[code: int; stdout: string; stderr: string] =
-  ## Captures BOTH stdout and stderr of one runMain() invocation
-  ## simultaneously (fd 1 -> outPath, fd 2 -> errPath) -- neither of the
-  ## codebase's existing single-stream capture helpers
-  ## (test_cli_s4.captureStdout/captureStderr,
-  ## test_rfc0007_a6a_cli.captureStdout) covers both at once, and this
-  ## file's tracer needs the JSON on stdout AND the divergence warning on
-  ## stderr from the SAME call.
-  let tag = $getpid() & "_" & $epochTime().int64
-  let outPath = getTempDir() / ("crisol_b3c_out_" & tag & ".txt")
-  let errPath = getTempDir() / ("crisol_b3c_err_" & tag & ".txt")
-  let outF = open(outPath, fmWrite)
-  let errF = open(errPath, fmWrite)
-  let outFd: cint = outF.getFileHandle.cint
-  let errFd: cint = errF.getFileHandle.cint
-  let savedOutFd: cint = posix_mod.dup(1.cint)
-  let savedErrFd: cint = posix_mod.dup(2.cint)
-  discard posix_mod.dup2(outFd, 1.cint)
-  discard posix_mod.dup2(errFd, 2.cint)
-  outF.close()
-  errF.close()
-  var code = 0
-  try:
-    code = runMain(args)
-  finally:
-    flushFile(stdout)
-    flushFile(stderr)
-    discard posix_mod.dup2(savedOutFd, 1.cint)
-    discard posix_mod.dup2(savedErrFd, 2.cint)
-    discard posix_mod.close(savedOutFd)
-    discard posix_mod.close(savedErrFd)
-  let outText = readFile(outPath)
-  let errText = readFile(errPath)
-  try: removeFile(outPath) except CatchableError: discard
-  try: removeFile(errPath) except CatchableError: discard
-  (code: code, stdout: outText, stderr: errText)
-
 # ---------------------------------------------------------------------------
 # 1 + 2 — nondeterministic fixture: divergence surfaces on the wire and in
 # stderr; --verify-cache-strict flips the exit code, plain --verify-cache
@@ -113,22 +76,26 @@ suite "B3c CLI — nondeterministic fixture: verifyFails + stderr warning":
     let cfgPath = root / "crisol.kdl"
 
     # Run 1: live, populates the cache (n=1, odd -> exit 0 -> stored).
-    let pop = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check pop.code == 0
+    var popCode = 0
+    discard captureBoth(proc() =
+      popCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check popCode == 0
 
     # Run 2: served from cache; --verify-cache re-executes the sampled hit
     # for real (n=2, even -> exit 1) -> diverges from the stored exit 0.
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--verify-cache", "--verify-cache-pct", "100",
-                          "--verify-cache-seed", "1", "--json"])
-    check r.code == 0   # unstrict: divergence never touches the exit code
+    var code = 0
+    let (outText, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--verify-cache", "--verify-cache-pct", "100",
+                       "--verify-cache-seed", "1", "--json"]))
+    check code == 0   # unstrict: divergence never touches the exit code
 
-    let doc = parseJson(r.stdout)
+    let doc = parseJson(outText)
     check doc["verifyFails"].getInt == 1
     check doc["schemaRevision"].getInt >= 19
 
-    check epPath in r.stderr
-    check "diverg" in r.stderr.toLowerAscii
+    check epPath in errText
+    check "diverg" in errText.toLowerAscii
 
   test "strict: the SAME divergence flips the exit code to 1":
     let root = freshProjectRoot("flip_strict")
@@ -137,18 +104,22 @@ suite "B3c CLI — nondeterministic fixture: verifyFails + stderr warning":
     writeFile(root / epPath, NondeterministicFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let pop = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check pop.code == 0
+    var popCode = 0
+    discard captureBoth(proc() =
+      popCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check popCode == 0
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--verify-cache", "--verify-cache-pct", "100",
-                          "--verify-cache-seed", "1", "--verify-cache-strict",
-                          "--json"])
-    check r.code == 1   # strict: a divergence set is a CI-gate failure
+    var code = 0
+    let (outText, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--verify-cache", "--verify-cache-pct", "100",
+                       "--verify-cache-seed", "1", "--verify-cache-strict",
+                       "--json"]))
+    check code == 1   # strict: a divergence set is a CI-gate failure
 
-    let doc = parseJson(r.stdout)
+    let doc = parseJson(outText)
     check doc["verifyFails"].getInt == 1
-    check epPath in r.stderr
+    check epPath in errText
 
 # ---------------------------------------------------------------------------
 # 1b — omitting --verify-cache-pct falls back to the KDL verify-cache-pct
@@ -178,15 +149,19 @@ group "unit" {
 }
 """)
 
-    let pop = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check pop.code == 0
+    var popCode = 0
+    discard captureBoth(proc() =
+      popCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check popCode == 0
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--verify-cache", "--json"])
-    check r.code == 0
-    let doc = parseJson(r.stdout)
+    var code = 0
+    let (outText, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--verify-cache", "--json"]))
+    check code == 0
+    let doc = parseJson(outText)
     check doc["verifyFails"].getInt == 0
-    check "diverg" notin r.stderr.toLowerAscii
+    check "diverg" notin errText.toLowerAscii
 
 # ---------------------------------------------------------------------------
 # 3 — deterministic fixture: no divergence, ever.
@@ -201,16 +176,20 @@ suite "B3c CLI — deterministic fixture: verifyFails == 0":
     writeFile(root / epPath, DeterministicFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let pop = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check pop.code == 0
+    var popCode = 0
+    discard captureBoth(proc() =
+      popCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check popCode == 0
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--verify-cache", "--verify-cache-pct", "100",
-                          "--verify-cache-strict", "--json"])
-    check r.code == 0
-    let doc = parseJson(r.stdout)
+    var code = 0
+    let (outText, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--verify-cache", "--verify-cache-pct", "100",
+                       "--verify-cache-strict", "--json"]))
+    check code == 0
+    let doc = parseJson(outText)
     check doc["verifyFails"].getInt == 0
-    check "diverg" notin r.stderr.toLowerAscii
+    check "diverg" notin errText.toLowerAscii
 
 # ---------------------------------------------------------------------------
 # 4 — the three parameter flags each REQUIRE --verify-cache.
@@ -224,10 +203,12 @@ suite "B3c CLI — --verify-cache-{pct,seed,strict} each require --verify-cache"
     writeFile(root / "tests" / "unit" / "test_pass.nim", DeterministicFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--verify-cache-strict"])
-    check r.code == 3
-    check "--verify-cache" in r.stderr
+    var code = 0
+    let (_, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--verify-cache-strict"]))
+    check code == 3
+    check "--verify-cache" in errText
 
   test "--verify-cache-pct without --verify-cache -> ExitEnvironment (3)":
     let root = freshProjectRoot("pct_alone")
@@ -235,10 +216,12 @@ suite "B3c CLI — --verify-cache-{pct,seed,strict} each require --verify-cache"
     writeFile(root / "tests" / "unit" / "test_pass.nim", DeterministicFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--verify-cache-pct", "50"])
-    check r.code == 3
-    check "--verify-cache" in r.stderr
+    var code = 0
+    let (_, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--verify-cache-pct", "50"]))
+    check code == 3
+    check "--verify-cache" in errText
 
   test "--verify-cache-seed without --verify-cache -> ExitEnvironment (3)":
     let root = freshProjectRoot("seed_alone")
@@ -246,10 +229,12 @@ suite "B3c CLI — --verify-cache-{pct,seed,strict} each require --verify-cache"
     writeFile(root / "tests" / "unit" / "test_pass.nim", DeterministicFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--verify-cache-seed", "7"])
-    check r.code == 3
-    check "--verify-cache" in r.stderr
+    var code = 0
+    let (_, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--verify-cache-seed", "7"]))
+    check code == 3
+    check "--verify-cache" in errText
 
 when isMainModule:
   echo "test_b3c_verify_cache_cli: done"

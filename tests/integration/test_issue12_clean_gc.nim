@@ -21,34 +21,17 @@
 ##         tests/integration/test_issue12_clean_gc.nim
 
 import std/[json, os, osproc, sets, strutils, tables, times, unittest]
-import std/posix as posix_mod
 import crisol
 import crisol/[config, depgraph, nimprobe]
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers (shapes copied from tests/integration/test_issue11_closure_inputs.nim
 # — not imported, so this file has no test-to-test dependency).
 # ---------------------------------------------------------------------------
 
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_issue12_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
-
 proc newProject(tag: string): string =
-  result = getTempDir() / ("crisol_issue12_" & tag & "_" & $getpid())
+  result = getTempDir() / ("crisol_issue12_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   createDir(result / ".crisol")
@@ -92,9 +75,10 @@ suite "issue #12 — crisol clean GCs the real (fingerprinted) depgraph":
 
     # Real run: compiles + runs BOTH entrypoints, writing a REAL depgraph
     # stamped with the REAL probed Nim fingerprint (never "").
-    let full = captureStdout(@["run", "--config", cfgPath, "--json"])
-    check full.code == 0
-    let fullJson = parseJson(full.output.strip())
+    var fullCode = 0
+    let fullOutput = captureStdout(proc() = fullCode = runMain(@["run", "--config", cfgPath, "--json"]))
+    check fullCode == 0
+    let fullJson = parseJson(fullOutput.strip())
     check fullJson["entrypoints"].len == 2
     for epNode in fullJson["entrypoints"]:
       check epNode["outcome"].getStr == "passed"
@@ -106,9 +90,10 @@ suite "issue #12 — crisol clean GCs the real (fingerprinted) depgraph":
 
     # `clean` must load the REAL (fingerprinted) depgraph, GC it against
     # discovery, and report exactly 1 dropped entry.
-    let cln = captureStdout(@["clean", "--config", cfgPath])
-    check cln.code == 0
-    check "1 depgraph entry(ies)" in cln.output
+    var clnCode = 0
+    let clnOutput = captureStdout(proc() = clnCode = runMain(@["clean", "--config", cfgPath]))
+    check clnCode == 0
+    check "1 depgraph entry(ies)" in clnOutput
 
     # Reload with the freshness view (same call shape as `run`) and verify
     # the on-disk graph itself was actually mutated: the gone entry is
@@ -138,9 +123,10 @@ suite "issue #12 — crisol clean GCs the real (fingerprinted) depgraph":
     let beforeMtime   = getLastModificationTime(depPath)
     sleep(1100)
 
-    let cln2 = captureStdout(@["clean", "--config", cfgPath])
-    check cln2.code == 0
-    check "0 depgraph entry(ies)" in cln2.output
+    var cln2Code = 0
+    let cln2Output = captureStdout(proc() = cln2Code = runMain(@["clean", "--config", cfgPath]))
+    check cln2Code == 0
+    check "0 depgraph entry(ies)" in cln2Output
 
     let afterContent = readFile(depPath)
     let afterMtime   = getLastModificationTime(depPath)

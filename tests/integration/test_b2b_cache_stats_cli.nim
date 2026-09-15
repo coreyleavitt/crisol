@@ -36,16 +36,16 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_b2b_cache_stats_cli.nim
 
-import std/[json, os, strutils, times, unittest]
-import std/posix as posix_mod
+import std/[json, os, strutils, unittest]
 import crisol   # runMain
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_b1c_explain_miss_cli.nim's freshProjectRoot/captureBoth)
 # ---------------------------------------------------------------------------
 
 proc freshProjectRoot(name: string): string =
-  result = getTempDir() / ("crisol_b2b_" & name & "_" & $getpid())
+  result = getTempDir() / ("crisol_b2b_" & name & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   writeFile(result / "crisol.kdl", """
@@ -55,36 +55,6 @@ group "unit" {
 """)
 
 const PassFixture = "quit(0)\n"
-
-proc captureBoth(args: seq[string]): tuple[code: int; stdout: string; stderr: string] =
-  let tag = $getpid() & "_" & $epochTime().int64
-  let outPath = getTempDir() / ("crisol_b2b_out_" & tag & ".txt")
-  let errPath = getTempDir() / ("crisol_b2b_err_" & tag & ".txt")
-  let outF = open(outPath, fmWrite)
-  let errF = open(errPath, fmWrite)
-  let outFd: cint = outF.getFileHandle.cint
-  let errFd: cint = errF.getFileHandle.cint
-  let savedOutFd: cint = posix_mod.dup(1.cint)
-  let savedErrFd: cint = posix_mod.dup(2.cint)
-  discard posix_mod.dup2(outFd, 1.cint)
-  discard posix_mod.dup2(errFd, 2.cint)
-  outF.close()
-  errF.close()
-  var code = 0
-  try:
-    code = runMain(args)
-  finally:
-    flushFile(stdout)
-    flushFile(stderr)
-    discard posix_mod.dup2(savedOutFd, 1.cint)
-    discard posix_mod.dup2(savedErrFd, 2.cint)
-    discard posix_mod.close(savedOutFd)
-    discard posix_mod.close(savedErrFd)
-  let outText = readFile(outPath)
-  let errText = readFile(errPath)
-  try: removeFile(outPath) except CatchableError: discard
-  try: removeFile(errPath) except CatchableError: discard
-  (code: code, stdout: outText, stderr: errText)
 
 # ---------------------------------------------------------------------------
 # 1 + 2 — cold run then warm rerun: sane, real values
@@ -100,10 +70,12 @@ suite "B2b CLI — --cache-stats --json: cold run then warm rerun":
     let cfgPath = root / "crisol.kdl"
 
     # Run 1: cold -- nothing cached yet, this consult is a genuine miss.
-    let r1 = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--cache-stats", "--json"])
-    check r1.code == 0
-    let doc1 = parseJson(r1.stdout)
+    var code1 = 0
+    let (out1, _) = captureBoth(proc() =
+      code1 = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                        "--cache-stats", "--json"]))
+    check code1 == 0
+    let doc1 = parseJson(out1)
     check doc1["schemaRevision"].getInt == 26  # rev 25: RFC-0009 A2's top-level trackedRoots array
     check doc1.hasKey("cacheStats")
     let cs1 = doc1["cacheStats"]
@@ -120,10 +92,12 @@ suite "B2b CLI — --cache-stats --json: cold run then warm rerun":
     check cs1["remoteErrors"].getInt == 0
 
     # Run 2: warm -- served from cache; a genuine hit this time.
-    let r2 = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--cache-stats", "--json"])
-    check r2.code == 0
-    let doc2 = parseJson(r2.stdout)
+    var code2 = 0
+    let (out2, _) = captureBoth(proc() =
+      code2 = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                        "--cache-stats", "--json"]))
+    check code2 == 0
+    let doc2 = parseJson(out2)
     let cs2 = doc2["cacheStats"]
     check cs2["l1Hits"].getInt > 0
     check cs2["hitPct"].getFloat > 0.0
@@ -142,14 +116,16 @@ suite "B2b CLI — --cache-stats --json: human line on stderr only":
     writeFile(root / epPath, PassFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                         "--cache-stats", "--json"])
-    check r.code == 0
-    check "cache:" in r.stderr
-    check "hit rate" in r.stderr
+    var code = 0
+    let (outText, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--cache-stats", "--json"]))
+    check code == 0
+    check "cache:" in errText
+    check "hit rate" in errText
     # stdout carries ONLY the JSON document -- parseable, no stray text.
-    discard parseJson(r.stdout)
-    check "cache:" notin r.stdout
+    discard parseJson(outText)
+    check "cache:" notin outText
 
 # ---------------------------------------------------------------------------
 # 4 — human mode: the summary line appears on stdout
@@ -164,10 +140,12 @@ suite "B2b CLI — --cache-stats, human mode: summary line on stdout":
     writeFile(root / epPath, PassFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1", "--cache-stats"])
-    check r.code == 0
-    check "cache:" in r.stdout
-    check "hit rate" in r.stdout
+    var code = 0
+    let (outText, _) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1", "--cache-stats"]))
+    check code == 0
+    check "cache:" in outText
+    check "hit rate" in outText
 
 # ---------------------------------------------------------------------------
 # 5 — without --cache-stats: nothing surfaces (default off, additive)
@@ -182,16 +160,20 @@ suite "B2b CLI — without --cache-stats: no cacheStats field, no summary line":
     writeFile(root / epPath, PassFixture)
     let cfgPath = root / "crisol.kdl"
 
-    let rJson = captureBoth(@["run", "--config", cfgPath, "--jobs", "1", "--json"])
-    check rJson.code == 0
-    let doc = parseJson(rJson.stdout)
+    var jsonCode = 0
+    let (jsonOut, jsonErr) = captureBoth(proc() =
+      jsonCode = runMain(@["run", "--config", cfgPath, "--jobs", "1", "--json"]))
+    check jsonCode == 0
+    let doc = parseJson(jsonOut)
     check not doc.hasKey("cacheStats")
-    check "cache:" notin rJson.stderr
-    check "cache:" notin rJson.stdout
+    check "cache:" notin jsonErr
+    check "cache:" notin jsonOut
 
-    let rHuman = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check rHuman.code == 0
-    check "cache:" notin rHuman.stdout
+    var humanCode = 0
+    let (humanOut, _) = captureBoth(proc() =
+      humanCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check humanCode == 0
+    check "cache:" notin humanOut
 
 when isMainModule:
   echo "test_b2b_cache_stats_cli: done"

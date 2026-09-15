@@ -22,51 +22,22 @@
 ##         tests/integration/test_rfc9_a2_trackedroots_cli.nim
 
 import std/[json, os, strutils, times, unittest]
-import std/posix as posix_mod
 import crisol   # runMain
+import ../support/capture
 
 proc freshProjectRoot(name: string): string =
-  result = getTempDir() / ("crisol_rfc9_a2_" & name & "_" & $getpid())
+  result = getTempDir() / ("crisol_rfc9_a2_" & name & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
 
 const PassFixture = "quit(0)\n"
-
-proc captureStdout(args: seq[string]): tuple[code: int; stdout: string] =
-  let tag = $getpid() & "_" & $epochTime().int64
-  let outPath = getTempDir() / ("crisol_rfc9_a2_out_" & tag & ".txt")
-  let errPath = getTempDir() / ("crisol_rfc9_a2_err_" & tag & ".txt")
-  let outF = open(outPath, fmWrite)
-  let errF = open(errPath, fmWrite)
-  let outFd: cint = outF.getFileHandle.cint
-  let errFd: cint = errF.getFileHandle.cint
-  let savedOutFd: cint = posix_mod.dup(1.cint)
-  let savedErrFd: cint = posix_mod.dup(2.cint)
-  discard posix_mod.dup2(outFd, 1.cint)
-  discard posix_mod.dup2(errFd, 2.cint)
-  outF.close()
-  errF.close()
-  var code = 0
-  try:
-    code = runMain(args)
-  finally:
-    flushFile(stdout)
-    flushFile(stderr)
-    discard posix_mod.dup2(savedOutFd, 1.cint)
-    discard posix_mod.dup2(savedErrFd, 2.cint)
-    discard posix_mod.close(savedOutFd)
-    discard posix_mod.close(savedErrFd)
-  let outText = readFile(outPath)
-  try: removeFile(outPath) except CatchableError: discard
-  try: removeFile(errPath) except CatchableError: discard
-  (code: code, stdout: outText)
 
 suite "RFC-0009 A2 — trackedRoots evidence, wired end-to-end into real CLI --json":
 
   test "crisol run --json (real CLI) with one configured dep root reports BOTH roots":
     let root = freshProjectRoot("live")
     defer: removeDir(root)
-    let depParent = getTempDir() / ("crisol_rfc9_a2_dep_" & $getpid())
+    let depParent = getTempDir() / ("crisol_rfc9_a2_dep_" & $getCurrentProcessId())
     removeDir(depParent)
     let depDir = depParent / "mydep"
     createDir(depDir)
@@ -82,9 +53,11 @@ group "unit" {
 }
 """ % [depDir])
 
-    let r = captureStdout(@["run", "--config", cfgPath, "--jobs", "1", "--json"])
-    check r.code == 0
-    let doc = parseJson(r.stdout)
+    var code = 0
+    let (stdoutText, stderrText) = captureBoth(proc() = code = runMain(@["run", "--config", cfgPath, "--jobs", "1", "--json"]))
+    discard stderrText
+    check code == 0
+    let doc = parseJson(stdoutText)
     check doc["schemaRevision"].getInt == 26
 
     # RED before wiring: `doc["trackedRoots"]` renders the jsonout

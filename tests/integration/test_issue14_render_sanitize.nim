@@ -13,23 +13,8 @@
 ##         tests/integration/test_issue14_render_sanitize.nim
 
 import std/[json, os, strutils, unittest]
-import std/posix as posix_mod
 import crisol
-
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  let outPath = getTempDir() / ("crisol_i14_cap_" & $getpid() & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
+import ../support/capture
 
 proc rawControlBytes(s: string): seq[int] =
   ## Every offending byte position: < 0x20 other than '\n', or DEL.
@@ -37,7 +22,7 @@ proc rawControlBytes(s: string): seq[int] =
     if (c.ord < 0x20 and c != '\n') or c.ord == 0x7f: result.add i
 
 proc newProject(tag: string): string =
-  result = getTempDir() / ("crisol_i14_" & tag & "_" & $getpid())
+  result = getTempDir() / ("crisol_i14_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   createDir(result / ".crisol")
@@ -57,21 +42,23 @@ suite "issue #14 — report bodies carry no raw control bytes":
     defer: removeDir(root)
     writeFile(root / "crisol.kdl", HostileKdl)
 
-    let r = captureStdout(@["list", "--config", root / "crisol.kdl"])
-    check r.code == 0
-    check rawControlBytes(r.output).len == 0
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["list", "--config", root / "crisol.kdl"]))
+    check code == 0
+    check rawControlBytes(output).len == 0
     # The row is still there, with the control bytes replaced, not dropped.
-    check "[unit?[2J?x]" in r.output
-    check "-d:a?[31mb" in r.output
+    check "[unit?[2J?x]" in output
+    check "-d:a?[31mb" in output
 
   test "crisol list --json: the same fields are JSON-escaped, never raw":
     let root = newProject("json")
     defer: removeDir(root)
     writeFile(root / "crisol.kdl", HostileKdl)
 
-    let r = captureStdout(@["list", "--config", root / "crisol.kdl", "--json"])
-    check r.code == 0
-    check rawControlBytes(r.output).len == 0
-    let j = parseJson(r.output.strip())
+    var code = 0
+    let output = captureStdout(proc() = code = runMain(@["list", "--config", root / "crisol.kdl", "--json"]))
+    check code == 0
+    check rawControlBytes(output).len == 0
+    let j = parseJson(output.strip())
     # Round-trips to the ORIGINAL bytes: JSON is data, not terminal output.
     check j["entrypoints"][0]["group"].getStr == "unit\x1b[2J\tx"

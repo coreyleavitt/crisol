@@ -49,11 +49,11 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_issue13_persist_failure.nim
 
-import std/[os, osproc, strutils, times, unittest]
-import std/posix as posix_mod
+import std/[os, osproc, strutils, unittest]
 import crisol
 import crisol/[config, depgraph, planner, types]
 import "../support/testep"
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers (shapes copied from tests/integration/test_issue11_closure_inputs.nim
@@ -61,55 +61,23 @@ import "../support/testep"
 # has no test-to-test dependency).
 # ---------------------------------------------------------------------------
 
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_issue13_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
+proc runCaptured(args: seq[string]): tuple[code: int; output: string] =
+  ## Run runMain with stdout captured via the shared portable helper;
+  ## return code + text.
+  var code = 0
+  let output = captureStdout(proc() = code = runMain(args))
+  (code: code, output: output)
 
-proc captureBoth(args: seq[string]): tuple[code: int; stdout: string; stderr: string] =
-  ## Like `captureStdout`, but also captures stderr (fd 2) separately —
-  ## needed to assert on the runner's persist-failure warning without
-  ## losing the ability to also assert on stdout's JSON.
-  let tag = $getpid() & "_" & $epochTime().int64
-  let outPath = getTempDir() / ("crisol_issue13_capout_" & tag & ".txt")
-  let errPath = getTempDir() / ("crisol_issue13_caperr_" & tag & ".txt")
-  let outF = open(outPath, fmWrite)
-  let errF = open(errPath, fmWrite)
-  let outFd: cint = outF.getFileHandle.cint
-  let errFd: cint = errF.getFileHandle.cint
-  let savedOutFd: cint = posix_mod.dup(1.cint)
-  let savedErrFd: cint = posix_mod.dup(2.cint)
-  discard posix_mod.dup2(outFd, 1.cint)
-  discard posix_mod.dup2(errFd, 2.cint)
-  outF.close()
-  errF.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  flushFile(stderr)
-  discard posix_mod.dup2(savedOutFd, 1.cint)
-  discard posix_mod.dup2(savedErrFd, 2.cint)
-  discard posix_mod.close(savedOutFd)
-  discard posix_mod.close(savedErrFd)
-  let outText = readFile(outPath)
-  let errText = readFile(errPath)
-  removeFile(outPath)
-  removeFile(errPath)
+proc runCapturedBoth(args: seq[string]): tuple[code: int; stdout: string; stderr: string] =
+  ## Like `runCaptured`, but also captures stderr separately — needed to
+  ## assert on the runner's persist-failure warning without losing the
+  ## ability to also assert on stdout's JSON.
+  var code = 0
+  let (outText, errText) = captureBoth(proc() = code = runMain(args))
   (code: code, stdout: outText, stderr: errText)
 
 proc newProject(tag: string): string =
-  result = getTempDir() / ("crisol_issue13_" & tag & "_" & $getpid())
+  result = getTempDir() / ("crisol_issue13_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   createDir(result / ".crisol")
@@ -156,7 +124,7 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
     let markerPath = root / "marker.txt"
 
     # Step 1: full run, marker == "1".
-    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
+    let full = runCaptured(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
     check full.code == 0
     check fileExists(markerPath)
     check readFile(markerPath).strip == "1"
@@ -181,7 +149,7 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
     removeFile(tmpFaultDir)
     createDir(tmpFaultDir)
 
-    let broken = captureBoth(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
+    let broken = runCapturedBoth(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
     check readFile(markerPath).strip == "2"
     check "could not record its source closure" in broken.stderr
     check "dependency graph could not be persisted" in broken.stderr
@@ -202,6 +170,6 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
     removeDir(tmpFaultDir)
     writeFile(epPath, markerBody(root, "1"))
 
-    let reverted = captureStdout(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
+    let reverted = runCaptured(@["run", "--config", root / "crisol.kdl", "--json", "--no-cache"])
     check reverted.code == 0
     check readFile(markerPath).strip == "1"

@@ -17,8 +17,8 @@
 ##         tests/integration/test_changed.nim
 
 import std/[monotimes, options, os, osproc, sets, strutils, unittest]
-import std/posix as posix_mod
 import crisol            # runMain
+import ../support/capture
 import crisol/types
 import crisol/gitdiff
 import crisol/jsonout
@@ -194,22 +194,11 @@ suite "crisol D5 — changedFiles":
 # ---------------------------------------------------------------------------
 
 proc captureRunMain(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_d5_cap_" & $getMonoTime().ticks & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-
-  let code = runMain(args)
-
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
+  ## Run runMain with stdout captured via the shared portable helper;
+  ## return code + text.
+  var code = 0
+  let output = captureStdout(proc() = code = runMain(args))
+  (code: code, output: output)
 
 suite "crisol D5 — --changed end-to-end":
 

@@ -25,12 +25,12 @@
 ##         tests/integration/test_cli_run.nim
 
 import std/[json, monotimes, options, os, strutils, unittest]
-import std/posix as posix_mod2
 import crisol         # imports runMain
 import crisol/types
 import crisol/jsonout
 import crisol/process/types as ptypes
 import "../support/testep"
+import ../support/capture
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -341,18 +341,10 @@ suite "crisol CLI — B7 --failed":
     defer: (try: removeFile(outPath) except: discard)
 
     # We need to capture stdout to inspect the plan output.
-    let f = open(outPath, fmWrite)
-    let fileFd: cint  = f.getFileHandle.cint
-    let savedFd: cint = posix_mod2.dup(1.cint)
-    discard posix_mod2.dup2(fileFd, 1.cint)
-    f.close()
-
-    let code = runMain(@["run", fd / "fail_always.nim", fd / "pass_always.nim",
-                         "--dry-run", "--failed", "--jobs", "1"])
-
-    flushFile(stdout)
-    discard posix_mod2.dup2(savedFd, 1.cint)
-    discard posix_mod2.close(savedFd)
+    var code = 0
+    captureStdoutToFile(outPath, proc () =
+      code = runMain(@["run", fd / "fail_always.nim", fd / "pass_always.nim",
+                       "--dry-run", "--failed", "--jobs", "1"]))
 
     check code == 0
     let planText = readFile(outPath)
@@ -410,23 +402,6 @@ proc writeFD(root, rel, content: string) =
   createDir(p.parentDir)
   writeFile(p, content)
 
-proc captureStderrToFileD(path: string; body: proc()): void =
-  ## Redirect fd 2 (stderr) to `path`, call body(), then restore.
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod2.dup(2.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(2) failed")
-  discard posix_mod2.dup2(fileFd, 2.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stderr)
-    discard posix_mod2.dup2(savedFd, 2.cint)
-    discard posix_mod2.close(savedFd)
-
 suite "crisol CLI — no-entrypoints-matched carries plan warnings":
 
   test "run <nonexistent path> with an unknown config key → exit 3 and stderr still carries the config warning":
@@ -444,7 +419,7 @@ suite "crisol CLI — no-entrypoints-matched carries plan warnings":
     let errPath = getTempDir() / "crisol_norun_plan_err.txt"
     defer: (try: removeFile(errPath) except: discard)
     var code = 0
-    captureStderrToFileD(errPath, proc () =
+    captureStderrToFile(errPath, proc () =
       code = runMain(@["run", "does/not/exist.nim"]))
     check code == 3
     let err = readFile(errPath)
@@ -457,23 +432,6 @@ suite "crisol CLI — no-entrypoints-matched carries plan warnings":
 # depgraph loader and the caller's ConfigWarning surfacing), and present in
 # the run/v1 JSON `warnings` array.
 # ---------------------------------------------------------------------------
-
-proc captureStdoutToFileD(path: string; body: proc()): void =
-  ## Redirect fd 1 (stdout) to `path`, call body(), then restore.
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod2.dup(1.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(1) failed")
-  discard posix_mod2.dup2(fileFd, 1.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stdout)
-    discard posix_mod2.dup2(savedFd, 1.cint)
-    discard posix_mod2.close(savedFd)
 
 suite "crisol CLI — stale depgraph nimVersion is a visible, once-only diagnostic":
 
@@ -504,8 +462,8 @@ suite "crisol CLI — stale depgraph nimVersion is a visible, once-only diagnost
     defer: (try: removeFile(outPath) except: discard)
     defer: (try: removeFile(errPath) except: discard)
     var code = 0
-    captureStderrToFileD(errPath, proc () =
-      captureStdoutToFileD(outPath, proc () =
+    captureStderrToFile(errPath, proc () =
+      captureStdoutToFile(outPath, proc () =
         code = runMain(@["run", "tests/unit/test_a.nim", "--json"])))
     check code == 0
 
@@ -551,7 +509,7 @@ suite "crisol CLI — gate-skip line sanitizes a control byte in the group name"
     let outPath = getTempDir() / "crisol_cli_run_gate_tab_out.txt"
     defer: (try: removeFile(outPath) except: discard)
     var code = 0
-    captureStdoutToFileD(outPath, proc () =
+    captureStdoutToFile(outPath, proc () =
       code = runMain(@["run", "tests/unit/test_a.nim"]))
     check code == 0
 

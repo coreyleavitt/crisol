@@ -22,35 +22,18 @@
 ##         tests/integration/test_issue16_headers.nim
 
 import std/[json, os, osproc, strutils, times, unittest]
-import std/posix as posix_mod
 import crisol
 import crisol/[types, planner, nimprobe, ccprobe, closure]
 import "../support/testep"
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers (shapes copied from tests/integration/test_issue11_externals.nim —
 # not imported, so this file has no test-to-test dependency).
 # ---------------------------------------------------------------------------
 
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  ## Run runMain with stdout redirected to a temp file; return code + text.
-  let outPath = getTempDir() / ("crisol_issue16_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
-
 proc newProject(tag: string): string =
-  result = getTempDir() / ("crisol_issue16_" & tag & "_" & $getpid())
+  result = getTempDir() / ("crisol_issue16_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests")
   createDir(result / "native")
@@ -128,12 +111,14 @@ suite "issue #16 slice 1a — a {.compile.}d source's #include'd header is track
     let (root, epPath) = setupProject("cadd")
     defer: removeDir(root)
 
-    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full.code == 0
+    var fullCode = 0
+    discard captureStdout(proc() = fullCode = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check fullCode == 0
 
-    let cl = captureStdout(@["closure", "--json", "--config", root / "crisol.kdl", epPath])
-    check cl.code == 0
-    let clJson = parseJson(cl.output.strip())
+    var clCode = 0
+    let clOutput = captureStdout(proc() = clCode = runMain(@["closure", "--json", "--config", root / "crisol.kdl", epPath]))
+    check clCode == 0
+    let clJson = parseJson(clOutput.strip())
     check clJson["entries"].len == 1
     var closureSet: seq[string]
     for c in clJson["entries"][0]["closure"]:
@@ -149,8 +134,9 @@ suite "issue #16 slice 1a — a {.compile.}d source's #include'd header is track
     let (root, epPath) = setupProject("cadd_sel")
     defer: removeDir(root)
 
-    let full = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full.code == 0
+    var fullCode = 0
+    discard captureStdout(proc() = fullCode = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check fullCode == 0
 
     # Edit ONLY the header (not add.c, not the entrypoint itself). Left
     # UNCOMMITTED, deliberately — `--changed`'s default baseRef is
@@ -163,10 +149,11 @@ suite "issue #16 slice 1a — a {.compile.}d source's #include'd header is track
     # then check --changed --dry-run against the uncommitted change).
     writeFile(root / "native" / "add.h", AddHV2)
 
-    let plan = captureStdout(@["run", "--config", root / "crisol.kdl",
-                               "--changed", "--dry-run", "--json"])
-    check plan.code == 0
-    let planJson = parseJson(plan.output.strip())
+    var planCode = 0
+    let planOutput = captureStdout(proc() = planCode = runMain(@["run", "--config", root / "crisol.kdl",
+                               "--changed", "--dry-run", "--json"]))
+    check planCode == 0
+    let planJson = parseJson(planOutput.strip())
     check planJson["entrypoints"].len == 1
     check planJson["entrypoints"][0]["path"].getStr.endsWith("tests/test_cadd.nim")
 
@@ -187,9 +174,10 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     let (root, epPath) = setupProject("t3")
     defer: removeDir(root)
 
-    let full1 = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full1.code == 0
-    let full1Json = parseJson(full1.output.strip())
+    var full1Code = 0
+    let full1Output = captureStdout(proc() = full1Code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check full1Code == 0
+    let full1Json = parseJson(full1Output.strip())
     check full1Json["entrypoints"].len == 1
     check full1Json["entrypoints"][0]["outcome"].getStr == "passed"
 
@@ -198,19 +186,21 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     # entrypoint itself is touched — only native/add.h.
     writeFile(root / "native" / "add.h", AddHV2)
 
-    let full2 = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    let full2Json = parseJson(full2.output.strip())
+    var full2Code = 0
+    let full2Output = captureStdout(proc() = full2Code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    let full2Json = parseJson(full2Output.strip())
     check full2Json["entrypoints"].len == 1
     check full2Json["entrypoints"][0]["outcome"].getStr != "passed"
-    check full2.code != 0
+    check full2Code != 0
 
   test "T4: a header-only edit is busted even with a warm nimcache and no depgraph record":
     let (root, epPath) = setupProject("t4")
     defer: removeDir(root)
 
-    let full1 = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full1.code == 0
-    let full1Json = parseJson(full1.output.strip())
+    var full1Code = 0
+    let full1Output = captureStdout(proc() = full1Code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check full1Code == 0
+    let full1Json = parseJson(full1Output.strip())
     check full1Json["entrypoints"].len == 1
     check full1Json["entrypoints"][0]["outcome"].getStr == "passed"
 
@@ -223,19 +213,21 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
 
     writeFile(root / "native" / "add.h", AddHV2)
 
-    let full2 = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    let full2Json = parseJson(full2.output.strip())
+    var full2Code = 0
+    let full2Output = captureStdout(proc() = full2Code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    let full2Json = parseJson(full2Output.strip())
     check full2Json["entrypoints"].len == 1
     check full2Json["entrypoints"][0]["outcome"].getStr != "passed"
-    check full2.code != 0
+    check full2Code != 0
 
     # The depgraph record is rebuilt by this run; closure --json must still
     # list the header (rule 2's cold-every-foreign-object recovery lets
     # extractCompileInputs's cc -M rediscovery run fresh instead of failing
     # closed for want of a carried-forward header record).
-    let cl = captureStdout(@["closure", "--json", "--config", root / "crisol.kdl", epPath])
-    check cl.code == 0
-    let clJson = parseJson(cl.output.strip())
+    var clCode = 0
+    let clOutput = captureStdout(proc() = clCode = runMain(@["closure", "--json", "--config", root / "crisol.kdl", epPath]))
+    check clCode == 0
+    let clJson = parseJson(clOutput.strip())
     check clJson["entries"].len == 1
     var closureSet: seq[string]
     for c in clJson["entries"][0]["closure"]:
@@ -246,9 +238,10 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     let (root, epPath) = setupProject("t5")
     defer: removeDir(root)
 
-    let full1 = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full1.code == 0
-    let full1Json = parseJson(full1.output.strip())
+    var full1Code = 0
+    let full1Output = captureStdout(proc() = full1Code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check full1Code == 0
+    let full1Json = parseJson(full1Output.strip())
     check full1Json["entrypoints"].len == 1
     check full1Json["entrypoints"][0]["outcome"].getStr == "passed"
 
@@ -257,10 +250,11 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     # load-bearing signal here, not merely a repeated "passed" outcome (a
     # wastefully-busted-then-recompiled binary would also pass, since the
     # source hasn't changed).
-    let plan2 = captureStdout(@["run", "--config", root / "crisol.kdl",
-                                "--dry-run", "--json"])
-    check plan2.code == 0
-    let plan2Json = parseJson(plan2.output.strip())
+    var plan2Code = 0
+    let plan2Output = captureStdout(proc() = plan2Code = runMain(@["run", "--config", root / "crisol.kdl",
+                                "--dry-run", "--json"]))
+    check plan2Code == 0
+    let plan2Json = parseJson(plan2Output.strip())
     check plan2Json["entrypoints"].len == 1
     let epNode = plan2Json["entrypoints"][0]
     check epNode["path"].getStr == "tests/test_cadd.nim"
@@ -288,9 +282,10 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     let (root, epPath) = setupProject("t6")
     defer: removeDir(root)
 
-    let full1 = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full1.code == 0
-    let full1Json = parseJson(full1.output.strip())
+    var full1Code = 0
+    let full1Output = captureStdout(proc() = full1Code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check full1Code == 0
+    let full1Json = parseJson(full1Output.strip())
     check full1Json["entrypoints"].len == 1
     check full1Json["entrypoints"][0]["outcome"].getStr == "passed"
 
@@ -305,15 +300,17 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     # from the previous recordClosure instead of re-deriving it.
     writeFile(epPath, CaddProbe & "# warm-recompile trigger\n")
 
-    let full2 = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    check full2.code == 0
-    let full2Json = parseJson(full2.output.strip())
+    var full2Code = 0
+    let full2Output = captureStdout(proc() = full2Code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    check full2Code == 0
+    let full2Json = parseJson(full2Output.strip())
     check full2Json["entrypoints"].len == 1
     check full2Json["entrypoints"][0]["outcome"].getStr == "passed"
 
-    let cl = captureStdout(@["closure", "--json", "--config", root / "crisol.kdl", epPath])
-    check cl.code == 0
-    let clJson = parseJson(cl.output.strip())
+    var clCode = 0
+    let clOutput = captureStdout(proc() = clCode = runMain(@["closure", "--json", "--config", root / "crisol.kdl", epPath]))
+    check clCode == 0
+    let clJson = parseJson(clOutput.strip())
     check clJson["entries"].len == 1
     var closureSet: seq[string]
     for c in clJson["entries"][0]["closure"]:
@@ -324,8 +321,9 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     # bustStaleExternalObjects detect the change correctly on this THIRD run.
     writeFile(root / "native" / "add.h", AddHV2)
 
-    let full3 = captureStdout(@["run", "--config", root / "crisol.kdl", "--json"])
-    let full3Json = parseJson(full3.output.strip())
+    var full3Code = 0
+    let full3Output = captureStdout(proc() = full3Code = runMain(@["run", "--config", root / "crisol.kdl", "--json"]))
+    let full3Json = parseJson(full3Output.strip())
     check full3Json["entrypoints"].len == 1
     check full3Json["entrypoints"][0]["outcome"].getStr != "passed"
-    check full3.code != 0
+    check full3Code != 0

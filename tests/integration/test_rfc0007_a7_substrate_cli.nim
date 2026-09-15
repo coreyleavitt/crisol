@@ -23,35 +23,19 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_rfc0007_a7_substrate_cli.nim
 
-import std/[json, os, posix, strutils, times, unittest]
-import std/posix as posix_mod
+import std/[json, os, strutils, times, unittest]
 import crisol         # imports runMain
+import ../support/capture
 
 proc fixtureDir(): string =
   let thisFile = currentSourcePath()
   let testsDir = thisFile.parentDir.parentDir
   testsDir / "fixtures"
 
-proc captureStdout(args: seq[string]): tuple[code: int; output: string] =
-  let outPath = getTempDir() / ("crisol_rfc0007_a7_cap_" & $getpid() & "_" &
-                                $epochTime().int64 & ".txt")
-  let f = open(outPath, fmWrite)
-  let fileFd: cint  = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(1.cint)
-  discard posix_mod.dup2(fileFd, 1.cint)
-  f.close()
-  let code = runMain(args)
-  flushFile(stdout)
-  discard posix_mod.dup2(savedFd, 1.cint)
-  discard posix_mod.close(savedFd)
-  let text = readFile(outPath)
-  removeFile(outPath)
-  (code: code, output: text)
-
 proc freshProjectRoot(name: string): string =
   ## A dedicated temp project (own crisol.kdl + .crisol state dir) so this
   ## test's cache entries never collide with any other test's.
-  result = getTempDir() / ("crisol_a7_" & name & "_" & $getpid())
+  result = getTempDir() / ("crisol_a7_" & name & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
   writeFile(result / "crisol.kdl", """
@@ -121,8 +105,9 @@ suite "rfc-0007 A7 — run/v2 substrate node reaches the wire via crisol run --j
   writeFile(root / "tests" / "unit" / "test_pass_always.nim",
            readFile(fixtureDir() / "pass_always.nim"))
   let cfgPath = root / "crisol.kdl"
-  let (code, output) = captureStdout(@["run", "--config", cfgPath,
-                                       "--jobs", "1", "--json"])
+  var code = 0
+  let output = captureStdout(proc() = code = runMain(@["run", "--config", cfgPath,
+                                       "--jobs", "1", "--json"]))
   let doc = parseJson(output)
 
   test "exit 0 and top-level substrate key present":
@@ -165,8 +150,9 @@ suite "rfc-0007 A7 — plan/v1 substrate node reaches the wire via crisol run --
   writeFile(root / "tests" / "unit" / "test_pass_always.nim",
            readFile(fixtureDir() / "pass_always.nim"))
   let cfgPath = root / "crisol.kdl"
-  let (code, output) = captureStdout(@["run", "--config", cfgPath,
-                                       "--dry-run", "--json"])
+  var code = 0
+  let output = captureStdout(proc() = code = runMain(@["run", "--config", cfgPath,
+                                       "--dry-run", "--json"]))
   let doc = parseJson(output)
 
   test "exit 0 and top-level substrate key present":

@@ -32,31 +32,11 @@
 ##         tests/integration/test_verifycache_records_diverge.nim
 
 import std/[options, os, strutils, unittest]
-import std/posix as posix_mod
 import crisol/api
 import crisol/types
 
 import "../support/helpers"
-
-# ---------------------------------------------------------------------------
-# stderr capture helper (mirrors test_b3b_verify_cache.nim's own copy).
-# ---------------------------------------------------------------------------
-
-proc captureStderrToFile(path: string; body: proc()): void =
-  let f = open(path, fmWrite)
-  let fileFd: cint = f.getFileHandle.cint
-  let savedFd: cint = posix_mod.dup(2.cint)
-  if savedFd < 0:
-    f.close()
-    raise newException(OSError, "dup(2) failed")
-  discard posix_mod.dup2(fileFd, 2.cint)
-  f.close()
-  try:
-    body()
-  finally:
-    flushFile(stderr)
-    discard posix_mod.dup2(savedFd, 2.cint)
-    discard posix_mod.close(savedFd)
+import ../support/capture
 
 proc baseOpts(projectRoot: string; vc: VerifyCache): RunOptions =
   RunOptions(

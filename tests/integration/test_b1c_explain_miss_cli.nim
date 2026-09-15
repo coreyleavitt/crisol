@@ -31,16 +31,16 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_b1c_explain_miss_cli.nim
 
-import std/[json, os, sequtils, strutils, times, unittest]
-import std/posix as posix_mod
+import std/[json, os, sequtils, strutils, unittest]
 import crisol   # runMain
+import ../support/capture
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_b3c_verify_cache_cli.nim's captureBoth/freshProjectRoot)
 # ---------------------------------------------------------------------------
 
 proc freshProjectRoot(name: string): string =
-  result = getTempDir() / ("crisol_b1c_" & name & "_" & $getpid())
+  result = getTempDir() / ("crisol_b1c_" & name & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result / "tests" / "unit")
 
@@ -53,36 +53,6 @@ group "unit" {
 """)
 
 const PassFixture = "quit(0)\n"
-
-proc captureBoth(args: seq[string]): tuple[code: int; stdout: string; stderr: string] =
-  let tag = $getpid() & "_" & $epochTime().int64
-  let outPath = getTempDir() / ("crisol_b1c_out_" & tag & ".txt")
-  let errPath = getTempDir() / ("crisol_b1c_err_" & tag & ".txt")
-  let outF = open(outPath, fmWrite)
-  let errF = open(errPath, fmWrite)
-  let outFd: cint = outF.getFileHandle.cint
-  let errFd: cint = errF.getFileHandle.cint
-  let savedOutFd: cint = posix_mod.dup(1.cint)
-  let savedErrFd: cint = posix_mod.dup(2.cint)
-  discard posix_mod.dup2(outFd, 1.cint)
-  discard posix_mod.dup2(errFd, 2.cint)
-  outF.close()
-  errF.close()
-  var code = 0
-  try:
-    code = runMain(args)
-  finally:
-    flushFile(stdout)
-    flushFile(stderr)
-    discard posix_mod.dup2(savedOutFd, 1.cint)
-    discard posix_mod.dup2(savedErrFd, 2.cint)
-    discard posix_mod.close(savedOutFd)
-    discard posix_mod.close(savedErrFd)
-  let outText = readFile(outPath)
-  let errText = readFile(errPath)
-  try: removeFile(outPath) except CatchableError: discard
-  try: removeFile(errPath) except CatchableError: discard
-  (code: code, stdout: outText, stderr: errText)
 
 # ---------------------------------------------------------------------------
 # 1 + 2 — flag change surfaces kcFlags via --json (structured, stderr human)
@@ -98,16 +68,20 @@ suite "B1c CLI — --explain-miss over --json: kcFlags on a flag change":
     let cfgPath = root / "crisol.kdl"
 
     writeGroupConfig(root, "flags \"-d:e2ev1\"")
-    let pop = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check pop.code == 0
+    var popCode = 0
+    discard captureBoth(proc() =
+      popCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check popCode == 0
 
     writeGroupConfig(root, "flags \"-d:e2ev2\"")
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--explain-miss", "--json"])
-    check r.code == 0
+    var code = 0
+    let (outText, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--explain-miss", "--json"]))
+    check code == 0
 
     # stdout stays parseable JSON even with the flag on.
-    let doc = parseJson(r.stdout)
+    let doc = parseJson(outText)
     check doc["schemaRevision"].getInt == 26
     let eps = doc["entrypoints"]
     check eps.len == 1
@@ -145,8 +119,8 @@ suite "B1c CLI — --explain-miss over --json: kcFlags on a flag change":
     # too (as the keyDiff[].component string value, asserted above), so the
     # correct negative check is that no HUMAN "explain:" line leaks into
     # stdout, not that the bare component name is absent from stdout.
-    check "kcFlags" in r.stderr
-    check "explain:" notin r.stdout
+    check "kcFlags" in errText
+    check "explain:" notin outText
 
 # ---------------------------------------------------------------------------
 # 3 — env-pin change surfaces kcHermeticEnv + the variable NAME (never a value)
@@ -162,16 +136,20 @@ suite "B1c CLI — --explain-miss over --json: kcHermeticEnv names the variable 
     let cfgPath = root / "crisol.kdl"
     writeGroupConfig(root, "")
 
-    let pop = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                            "--env-pin", "TERM=e2e-term-v1"])
-    check pop.code == 0
+    var popCode = 0
+    discard captureBoth(proc() =
+      popCode = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                          "--env-pin", "TERM=e2e-term-v1"]))
+    check popCode == 0
 
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1",
-                          "--env-pin", "TERM=e2e-term-v2",
-                          "--explain-miss", "--json"])
-    check r.code == 0
+    var code = 0
+    let (outText, errText) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1",
+                       "--env-pin", "TERM=e2e-term-v2",
+                       "--explain-miss", "--json"]))
+    check code == 0
 
-    let doc = parseJson(r.stdout)
+    let doc = parseJson(outText)
     let eps = doc["entrypoints"]
     check eps.len == 1
     var sawEnv = false
@@ -186,8 +164,8 @@ suite "B1c CLI — --explain-miss over --json: kcHermeticEnv names the variable 
         check "e2e-term-v2" notin $kd
     check sawEnv
 
-    check "kcHermeticEnv" in r.stderr
-    check "TERM" in r.stderr
+    check "kcHermeticEnv" in errText
+    check "TERM" in errText
 
 # ---------------------------------------------------------------------------
 # 4 — the same flag-change scenario in HUMAN mode: explanation on stdout
@@ -203,14 +181,18 @@ suite "B1c CLI — --explain-miss, human mode: kcFlags line on stdout":
     let cfgPath = root / "crisol.kdl"
 
     writeGroupConfig(root, "flags \"-d:e2ev1\"")
-    let pop = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check pop.code == 0
+    var popCode = 0
+    discard captureBoth(proc() =
+      popCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check popCode == 0
 
     writeGroupConfig(root, "flags \"-d:e2ev2\"")
-    let r = captureBoth(@["run", "--config", cfgPath, "--jobs", "1", "--explain-miss"])
-    check r.code == 0
-    check "kcFlags" in r.stdout
-    check "explain:" in r.stdout
+    var code = 0
+    let (outText, _) = captureBoth(proc() =
+      code = runMain(@["run", "--config", cfgPath, "--jobs", "1", "--explain-miss"]))
+    check code == 0
+    check "kcFlags" in outText
+    check "explain:" in outText
 
 # ---------------------------------------------------------------------------
 # 5 — without --explain-miss, nothing surfaces (default off, additive)
@@ -226,19 +208,25 @@ suite "B1c CLI — without --explain-miss: no keyDiff field, no explain line":
     let cfgPath = root / "crisol.kdl"
 
     writeGroupConfig(root, "flags \"-d:e2ev1\"")
-    let pop = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check pop.code == 0
+    var popCode = 0
+    discard captureBoth(proc() =
+      popCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check popCode == 0
 
     writeGroupConfig(root, "flags \"-d:e2ev2\"")
-    let rJson = captureBoth(@["run", "--config", cfgPath, "--jobs", "1", "--json"])
-    check rJson.code == 0
-    let doc = parseJson(rJson.stdout)
+    var jsonCode = 0
+    let (jsonOut, jsonErr) = captureBoth(proc() =
+      jsonCode = runMain(@["run", "--config", cfgPath, "--jobs", "1", "--json"]))
+    check jsonCode == 0
+    let doc = parseJson(jsonOut)
     check not doc["entrypoints"][0].hasKey("keyDiff")
-    check "explain:" notin rJson.stderr
+    check "explain:" notin jsonErr
 
-    let rHuman = captureBoth(@["run", "--config", cfgPath, "--jobs", "1"])
-    check rHuman.code == 0
-    check "explain:" notin rHuman.stdout
+    var humanCode = 0
+    let (humanOut, _) = captureBoth(proc() =
+      humanCode = runMain(@["run", "--config", cfgPath, "--jobs", "1"]))
+    check humanCode == 0
+    check "explain:" notin humanOut
 
 when isMainModule:
   echo "test_b1c_explain_miss_cli: done"
