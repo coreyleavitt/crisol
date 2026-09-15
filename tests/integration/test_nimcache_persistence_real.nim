@@ -28,7 +28,6 @@
 ##         tests/integration/test_nimcache_persistence_real.nim
 
 import std/[options, os, sets, strutils, tables, times, unittest]
-import std/posix as posix_mod
 import crisol/[types, runner, depgraph, closure]
 import "../support/testep"
 
@@ -43,7 +42,7 @@ proc fixtureDir(): string =
 
 proc makeTempRoot(tag: string): string =
   let tmp = getTempDir() / ("crisol_nimcache_persist_" & tag & "_" &
-                            $posix_mod.getpid() & "_" &
+                            $getCurrentProcessId() & "_" &
                             $int64(epochTime() * 1_000_000))
   createDir(tmp)
   tmp

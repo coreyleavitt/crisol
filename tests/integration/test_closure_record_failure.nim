@@ -34,14 +34,13 @@
 ##         tests/integration/test_closure_record_failure.nim
 
 import std/[options, os, sets, tables, times, unittest]
-import std/posix as posix_mod
 import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache, closure, ccprobe]
 import "../support/helpers"  # legacySeams
 import "../support/testep"
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_record_" & tag & "_" &
-                           $posix_mod.getpid() & "_" &
+                           $getCurrentProcessId() & "_" &
                            $int64(epochTime() * 1_000_000))
   createDir(result)
 

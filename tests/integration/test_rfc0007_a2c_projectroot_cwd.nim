@@ -30,14 +30,13 @@
 ##         tests/integration/test_rfc0007_a2c_projectroot_cwd.nim
 
 import std/[os, times, unittest]
-import std/posix as posix_mod
 import crisol            # imports runMain
 import crisol/[types, runner, depgraph, planner]
 import "../support/testep"
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_a2c_" & tag & "_" &
-                           $posix_mod.getpid() & "_" &
+                           $getCurrentProcessId() & "_" &
                            $int64(epochTime() * 1_000_000))
   createDir(result)
 

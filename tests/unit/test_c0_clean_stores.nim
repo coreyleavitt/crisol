@@ -18,7 +18,6 @@
 ##         tests/unit/test_c0_clean_stores.nim
 
 import std/[os, options, sets, tables, times, unittest]
-import std/posix as posix_mod
 import crisol/[types, clean, resultcache]
 
 # ---------------------------------------------------------------------------
@@ -26,7 +25,7 @@ import crisol/[types, clean, resultcache]
 # ---------------------------------------------------------------------------
 
 proc makeTempRoot(tag: string): string =
-  let tmp = getTempDir() / ("crisol_c0_" & tag & "_" & $posix_mod.getpid() & "_" &
+  let tmp = getTempDir() / ("crisol_c0_" & tag & "_" & $getCurrentProcessId() & "_" &
                              $int64(epochTime() * 1_000_000))
   createDir(tmp)
   tmp

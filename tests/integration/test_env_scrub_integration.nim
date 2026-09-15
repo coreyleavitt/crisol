@@ -9,7 +9,7 @@
 ## rfc-0007 A2a-i: migrated off `spawn.forkExecEnvScratch` + the deleted
 ## `spawn.supervise` onto the Supervisor — see `../support/spawnhelpers`.
 
-import std/[unittest, os, osproc, posix, options, strutils]
+import std/[unittest, os, osproc, options, strutils]
 import crisol/[types, sandbox]
 import crisol/process
 import "../support/spawnhelpers"
@@ -20,7 +20,7 @@ import "../support/spawnhelpers"
 
 proc tmpOutputFile(): (string) =
   ## Path for capturing child stdout+stderr.
-  getTempDir() / "crisol_envscrub_" & $getpid() & ".txt"
+  getTempDir() / "crisol_envscrub_" & $getCurrentProcessId() & ".txt"
 
 proc readOutputFile(path: string): string =
   readFile(path)

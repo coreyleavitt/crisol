@@ -30,7 +30,7 @@
 ## Audited 2026-09-14 (RFC-0009 A-final-ii follow-on). The counts below
 ## supersede the RFC's informal estimates (B1 ~3, B2 52, B3a ≤16, B3b ~3):
 ## classifying by the literal dominant posix API — reading past comments,
-## docstrings, and test-name strings — yields 14/22/38/1. The two large
+## docstrings, and test-name strings — yields 13/23/38/1 (test_conformance_timing.nim moved B1->B2 during B1: it uses SIGKILL/SIGINT, not getpid-only). The two large
 ## shifts are real: `getpid`-only tests (B1) and the `captureBoth` FD-capture
 ## idiom (B3a) are each far more common than the thematic estimate assumed,
 ## and NO test in-tree calls `setrlimit` directly (limits flow through
@@ -47,7 +47,7 @@ const thisDir = currentSourcePath().parentDir()
 const repoRoot = thisDir.parentDir.parentDir
 const testsRoot = repoRoot / "tests"
 
-# --- B1: getpid-only (14) --------------------------------------------------
+# --- B1: getpid-only (13) --------------------------------------------------
 const B1 = [
   "tests/integration/test_closure_record_failure.nim",
   "tests/integration/test_closure_searchpath.nim",
@@ -61,11 +61,10 @@ const B1 = [
   "tests/unit/test_a1c_gc.nim",
   "tests/unit/test_artifactledger_gc.nim",
   "tests/unit/test_compilecost_gc.nim",
-  "tests/conformance/test_conformance_timing.nim",
   "tests/fixtures/hang_with_pid.nim",
 ]
 
-# --- B2: process-control + signal → when defined(posix) gate (22) ----------
+# --- B2: process-control + signal → when defined(posix) gate (23) ----------
 const B2 = [
   "tests/fixtures/self_sigkill.nim",
   "tests/fixtures/spawn_grandchild.nim",
@@ -89,6 +88,7 @@ const B2 = [
   "tests/unit/test_rfc0007_a6a_escapee_evidence.nim",
   "tests/unit/test_run_tests.nim",
   "tests/unit/test_process_capabilities.nim",
+  "tests/conformance/test_conformance_timing.nim",
 ]
 
 # --- B3a: filesystem / FD plumbing → std/os,syncio (or gate) (38) ----------
@@ -179,24 +179,38 @@ suite "RFC-0009 B-inventory — posix-bucket work order":
       for f in uniq:
         if seen.count(f) > 1: echo "  DUPLICATE across buckets: " & f
 
-  test "bucket sizes match the audited inventory (14 / 22 / 38 / 1)":
-    check B1.len == 14
-    check B2.len == 22
+  test "bucket sizes match the audited inventory (13 / 23 / 38 / 1)":
+    check B1.len == 13
+    check B2.len == 23
     check B3a.len == 38
     check B3b.len == 1
 
-  test "the bucket union equals the LIVE std/posix sweep over tests/**":
-    var union = allBucketed()
-    union.sort()
+  test "every file in the LIVE std/posix sweep is bucketed (completeness)":
+    # COMPLETENESS, not equality: the buckets are a FROZEN audit of the 75
+    # files that imported std/posix at B-inventory time, and they are the
+    # permanent work order. As the sweep slices run, files leave the live set
+    # — B1 (getpid→getCurrentProcessId) and the B3a captureBoth conversions
+    # drop their posix import entirely, while B2/B3b stay in the sweep behind
+    # a `when defined(posix)` gate. So `union == live` only held at
+    # B-inventory time; the durable invariant is `live ⊆ union`: no test may
+    # import std/posix without being in the inventory. A newly-added posix
+    # import therefore fails this test until it is triaged into a bucket, and
+    # the frozen `union.len == 75` pin below catches a mangled bucket const.
+    let union = allBucketed()
     let live = posixImporters()
-    check union == live
-    if union != live:
-      for f in live:
-        if f notin union: echo "  IN SWEEP, NOT BUCKETED (triage it): " & f
-      for f in union:
-        if f notin live: echo "  BUCKETED, NOT IN SWEEP (stale entry): " & f
+    var untracked: seq[string]
+    for f in live:
+      if f notin union: untracked.add f
+    for f in untracked:
+      echo "  IN SWEEP, NOT BUCKETED (triage into a B-bucket): " & f
+    check untracked.len == 0
+    echo "  (sweep progress: " & $live.len & "/" & $union.len &
+         " audited files still import std/posix)"
     # (tests/support/ is kept posix-free by test_conformance_import_purity.nim,
     # RFC-0009 B-inventory's extension of the existing import-purity meta-test.)
+
+  test "the audited inventory total is frozen at 75 (13 + 23 + 38 + 1)":
+    check allBucketed().len == 75
 
 when isMainModule:
   echo "test_rfc9_bucket_inventory done"

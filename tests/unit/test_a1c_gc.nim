@@ -37,7 +37,6 @@
 ##      0 evictions (sidecars never inflate the apparent entry count).
 
 import std/[os, json, options, sequtils, strutils, tables, times]
-import std/posix as posix_mod
 import crisol/[types, resultcache, ledger, clean, depgraph]
 import crisol/keys
 import crisol/cachewire
@@ -49,7 +48,7 @@ import crisol/process/types as ptypes  # default(Limits) for the sidecar fixture
 # ---------------------------------------------------------------------------
 
 proc freshSD(tag: string): string =
-  result = getTempDir() / ("crisol_a1c_" & tag & "_" & $posix_mod.getpid())
+  result = getTempDir() / ("crisol_a1c_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result)
 
@@ -395,7 +394,7 @@ block test_compact_empty:
 # ---------------------------------------------------------------------------
 
 block test_cleanorphans_cache_eviction:
-  let root = getTempDir() / ("crisol_a1c_cleanorphans_rc_" & $posix_mod.getpid())
+  let root = getTempDir() / ("crisol_a1c_cleanorphans_rc_" & $getCurrentProcessId())
   removeDir(root)
   createDir(root)
   defer: removeDir(root)
@@ -442,7 +441,7 @@ block test_cleanorphans_cache_eviction:
 # ---------------------------------------------------------------------------
 
 block test_cleanorphans_ledger_compact:
-  let root = getTempDir() / ("crisol_a1c_cleanorphans_led_" & $posix_mod.getpid())
+  let root = getTempDir() / ("crisol_a1c_cleanorphans_led_" & $getCurrentProcessId())
   removeDir(root)
   createDir(root)
   defer: removeDir(root)

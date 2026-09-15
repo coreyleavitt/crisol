@@ -19,7 +19,6 @@
 ##      call).
 
 import std/[os, strutils]
-import std/posix as posix_mod
 import crisol/[types, ledger, artifactledger, compilecost, clean]
 
 # ---------------------------------------------------------------------------
@@ -27,7 +26,7 @@ import crisol/[types, ledger, artifactledger, compilecost, clean]
 # ---------------------------------------------------------------------------
 
 proc freshSD(tag: string): string =
-  result = getTempDir() / ("crisol_ccgc_" & tag & "_" & $posix_mod.getpid())
+  result = getTempDir() / ("crisol_ccgc_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result)
 
@@ -187,7 +186,7 @@ block test_compact_empty:
 # ---------------------------------------------------------------------------
 
 block test_cleanorphans_compacts_compilecost_stream:
-  let root = getTempDir() / ("crisol_ccgc_cleanorphans_" & $posix_mod.getpid())
+  let root = getTempDir() / ("crisol_ccgc_cleanorphans_" & $getCurrentProcessId())
   removeDir(root)
   createDir(root)
   defer: removeDir(root)

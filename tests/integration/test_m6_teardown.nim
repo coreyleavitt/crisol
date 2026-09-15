@@ -39,7 +39,6 @@
 ##         tests/integration/test_m6_teardown.nim
 
 import std/[os, strutils, unittest]
-import std/posix
 import crisol/[types, runner, depgraph, sandbox]
 import "../support/testep"
 
@@ -93,7 +92,7 @@ suite "M6 — exception path: graceful teardown via teardownLiveSlots":
 
     # hang_with_pid writes its pid; hang_forever does not.  Use a temp file so
     # hang_forever can report its pid via HANG_PID_FILE passthrough.
-    let pidFile = getTempDir() / "crisol_m6_pid_" & $int(getpid()) & ".txt"
+    let pidFile = getTempDir() / "crisol_m6_pid_" & $int(getCurrentProcessId()) & ".txt"
     defer: (try: removeFile(pidFile) except: discard)
 
     let spec = resolveSandbox(passthroughs = @["HANG_PID_FILE"])
@@ -159,7 +158,7 @@ suite "M6 — exception path: graceful teardown via teardownLiveSlots":
     let passFixt     = fd / "pass_always.nim"
     let hangPidFixt  = fd / "hang_with_pid.nim"
 
-    let pidFile = getTempDir() / "crisol_m6_scratch_" & $int(getpid()) & ".txt"
+    let pidFile = getTempDir() / "crisol_m6_scratch_" & $int(getCurrentProcessId()) & ".txt"
     defer: (try: removeFile(pidFile) except: discard)
 
     # Count crisol_run_* dirs in tmpdir before the run.
@@ -227,7 +226,7 @@ suite "M6 — exception path: graceful teardown via teardownLiveSlots":
     let fd           = fixtureDir()
     let hangPidFixt  = fd / "hang_with_pid.nim"
 
-    let pidFile = getTempDir() / "crisol_m6_r22_" & $int(getpid()) & ".txt"
+    let pidFile = getTempDir() / "crisol_m6_r22_" & $int(getCurrentProcessId()) & ".txt"
     defer: (try: removeFile(pidFile) except: discard)
 
     proc countRunDirsR22(): int =
@@ -238,7 +237,7 @@ suite "M6 — exception path: graceful teardown via teardownLiveSlots":
     let before = countRunDirsR22()
 
     # Run TWO hang_with_pid slots so both write PIDs; both should be dead after teardown.
-    let pidFile2 = getTempDir() / "crisol_m6_r22b_" & $int(getpid()) & ".txt"
+    let pidFile2 = getTempDir() / "crisol_m6_r22b_" & $int(getCurrentProcessId()) & ".txt"
     defer: (try: removeFile(pidFile2) except: discard)
 
     let spec = resolveSandbox(passthroughs = @["HANG_PID_FILE"])

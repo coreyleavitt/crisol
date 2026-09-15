@@ -19,7 +19,6 @@
 ##      in the same cleanOrphans call — proves exec path is not disturbed).
 
 import std/[os, strutils]
-import std/posix as posix_mod
 import crisol/[types, ledger, artifactledger, clean]
 
 # ---------------------------------------------------------------------------
@@ -27,7 +26,7 @@ import crisol/[types, ledger, artifactledger, clean]
 # ---------------------------------------------------------------------------
 
 proc freshSD(tag: string): string =
-  result = getTempDir() / ("crisol_artgc_" & tag & "_" & $posix_mod.getpid())
+  result = getTempDir() / ("crisol_artgc_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
   createDir(result)
 
@@ -189,7 +188,7 @@ block test_compact_empty:
 # ---------------------------------------------------------------------------
 
 block test_cleanorphans_compacts_artifact_stream:
-  let root = getTempDir() / ("crisol_artgc_cleanorphans_" & $posix_mod.getpid())
+  let root = getTempDir() / ("crisol_artgc_cleanorphans_" & $getCurrentProcessId())
   removeDir(root)
   createDir(root)
   defer: removeDir(root)

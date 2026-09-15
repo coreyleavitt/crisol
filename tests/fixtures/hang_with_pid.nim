@@ -4,11 +4,11 @@
 ## (if set), then hangs forever.  Used by test_signal.nim to detect when the
 ## child process has started before sending a signal.
 
-import std/[os, posix]
+import std/os
 
 let pidFile = getEnv("HANG_PID_FILE")
 if pidFile.len > 0:
-  writeFile(pidFile, $int(getpid()) & "\n")
+  writeFile(pidFile, $int(getCurrentProcessId()) & "\n")
 
 while true:
-  discard posix.sleep(cint(1000))
+  os.sleep(1_000_000)

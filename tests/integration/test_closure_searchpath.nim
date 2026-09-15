@@ -20,14 +20,13 @@
 ##         tests/integration/test_closure_searchpath.nim
 
 import std/[os, sets, tables, times, unittest, json, strutils]
-import std/posix as posix_mod
 import crisol/[types, runner, depgraph, narrow, planner]
 import "../support/rfc9_narrow_support"
 import "../support/testep"
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_searchpath_" & tag & "_" &
-                           $posix_mod.getpid() & "_" &
+                           $getCurrentProcessId() & "_" &
                            $int64(epochTime() * 1_000_000))
   createDir(result)
 

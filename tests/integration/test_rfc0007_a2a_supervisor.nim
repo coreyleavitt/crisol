@@ -15,7 +15,7 @@
 ##
 ## The runner does NOT drive the Supervisor yet (A2b).
 
-import std/[unittest, os, osproc, posix, monotimes, times]
+import std/[unittest, os, osproc, monotimes, times]
 import crisol/process
 
 # ---------------------------------------------------------------------------
@@ -23,7 +23,7 @@ import crisol/process
 # ---------------------------------------------------------------------------
 
 proc tmpOutputFile(): (string) =
-  getTempDir() / "crisol_sv_test_" & $getpid() & "_" & $epochTime().int64 & ".txt"
+  getTempDir() / "crisol_sv_test_" & $getCurrentProcessId() & "_" & $epochTime().int64 & ".txt"
 
 let fixtureDir  = currentSourcePath().parentDir().parentDir() / "fixtures"
 let binDir      = fixtureDir / "bin"

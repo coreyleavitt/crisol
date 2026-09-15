@@ -18,7 +18,7 @@
 ##   5. hlNone: no crisol scratch TMPDIR injected (no new crisol_scratch_* dir)
 ##   6. cleanup-on-failure: a failing child still gets scratch dir removed
 
-import std/[unittest, os, osproc, posix, strutils]
+import std/[unittest, os, osproc, strutils]
 import crisol/[types, sandbox]
 import crisol/process
 import "../support/spawnhelpers"
@@ -28,7 +28,7 @@ import "../support/spawnhelpers"
 # ---------------------------------------------------------------------------
 
 proc tmpOutputFile(): (string) =
-  getTempDir() / "crisol_scratch_test_" & $getpid() & ".txt"
+  getTempDir() / "crisol_scratch_test_" & $getCurrentProcessId() & ".txt"
 
 proc readOutput(path: string): string =
   if fileExists(path): readFile(path) else: ""
