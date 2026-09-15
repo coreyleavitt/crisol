@@ -7,199 +7,204 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_ccprobe.nim
 
-import std/[os, unittest, strutils]
-import crisol/ccprobe
 
-# ---------------------------------------------------------------------------
-# Seam helpers
-# ---------------------------------------------------------------------------
+when defined(posix):
+  import std/[os, unittest, strutils]
+  import crisol/ccprobe
 
-proc makeRun(ccOut: string, ccOk: bool,
-             lddOut: string, lddOk: bool): RunProc =
-  ## Returns a run proc that serves synthetic output keyed by command name.
-  result = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-    case cmd
-    of "cc":
-      (output: ccOut, ok: ccOk)
-    of "ldd":
-      (output: lddOut, ok: lddOk)
-    else:
-      (output: "", ok: false)
+  # ---------------------------------------------------------------------------
+  # Seam helpers
+  # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Suite 1: normal operation — both probes succeed
-# ---------------------------------------------------------------------------
+  proc makeRun(ccOut: string, ccOk: bool,
+               lddOut: string, lddOk: bool): RunProc =
+    ## Returns a run proc that serves synthetic output keyed by command name.
+    result = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      case cmd
+      of "cc":
+        (output: ccOut, ok: ccOk)
+      of "ldd":
+        (output: lddOut, ok: lddOk)
+      else:
+        (output: "", ok: false)
 
-suite "ccVersion — both probes succeed":
+  # ---------------------------------------------------------------------------
+  # Suite 1: normal operation — both probes succeed
+  # ---------------------------------------------------------------------------
 
-  test "combines cc first line and ldd first line with '|' separator":
-    let run = makeRun(
-      "gcc (GCC) 13.2.0\nCopyright (C) ...",  true,
-      "ldd (GNU libc) 2.38\nCopyright (C) ...", true)
-    let v = ccVersion(run)
-    check v == "gcc (GCC) 13.2.0|ldd (GNU libc) 2.38"
+  suite "ccVersion — both probes succeed":
 
-  test "takes only the FIRST line of multi-line compiler banner":
-    let ccBanner = "cc (Ubuntu 12.3.0-1ubuntu1~22.04) 12.3.0\n" &
-                   "Copyright (C) 2022 Free Software Foundation, Inc.\n" &
-                   "This is free software; see the source for copying conditions."
-    let lddBanner = "ldd (Ubuntu GLIBC 2.35-0ubuntu3.7) 2.35\n" &
-                    "Copyright (C) 2022 Free Software Foundation, Inc."
-    let run = makeRun(ccBanner, true, lddBanner, true)
-    let v = ccVersion(run)
-    check v == "cc (Ubuntu 12.3.0-1ubuntu1~22.04) 12.3.0|ldd (Ubuntu GLIBC 2.35-0ubuntu3.7) 2.35"
+    test "combines cc first line and ldd first line with '|' separator":
+      let run = makeRun(
+        "gcc (GCC) 13.2.0\nCopyright (C) ...",  true,
+        "ldd (GNU libc) 2.38\nCopyright (C) ...", true)
+      let v = ccVersion(run)
+      check v == "gcc (GCC) 13.2.0|ldd (GNU libc) 2.38"
 
-  test "trims trailing whitespace and newlines from each first line":
-    let run = makeRun(
-      "gcc (GCC) 13.2.0  \n",  true,
-      "ldd (GNU libc) 2.38  \n", true)
-    let v = ccVersion(run)
-    check v == "gcc (GCC) 13.2.0|ldd (GNU libc) 2.38"
-    check not v.endsWith(" ")
-    check not v.endsWith("\n")
+    test "takes only the FIRST line of multi-line compiler banner":
+      let ccBanner = "cc (Ubuntu 12.3.0-1ubuntu1~22.04) 12.3.0\n" &
+                     "Copyright (C) 2022 Free Software Foundation, Inc.\n" &
+                     "This is free software; see the source for copying conditions."
+      let lddBanner = "ldd (Ubuntu GLIBC 2.35-0ubuntu3.7) 2.35\n" &
+                      "Copyright (C) 2022 Free Software Foundation, Inc."
+      let run = makeRun(ccBanner, true, lddBanner, true)
+      let v = ccVersion(run)
+      check v == "cc (Ubuntu 12.3.0-1ubuntu1~22.04) 12.3.0|ldd (Ubuntu GLIBC 2.35-0ubuntu3.7) 2.35"
 
-  test "trims leading whitespace from each first line":
-    let run = makeRun(
-      "  gcc (GCC) 13.2.0\n",  true,
-      "  ldd (GNU libc) 2.38\n", true)
-    let v = ccVersion(run)
-    check v == "gcc (GCC) 13.2.0|ldd (GNU libc) 2.38"
+    test "trims trailing whitespace and newlines from each first line":
+      let run = makeRun(
+        "gcc (GCC) 13.2.0  \n",  true,
+        "ldd (GNU libc) 2.38  \n", true)
+      let v = ccVersion(run)
+      check v == "gcc (GCC) 13.2.0|ldd (GNU libc) 2.38"
+      check not v.endsWith(" ")
+      check not v.endsWith("\n")
 
-# ---------------------------------------------------------------------------
-# Suite 2: graceful degradation when probes fail
-# ---------------------------------------------------------------------------
+    test "trims leading whitespace from each first line":
+      let run = makeRun(
+        "  gcc (GCC) 13.2.0\n",  true,
+        "  ldd (GNU libc) 2.38\n", true)
+      let v = ccVersion(run)
+      check v == "gcc (GCC) 13.2.0|ldd (GNU libc) 2.38"
 
-suite "ccVersion — probe failures yield sentinels":
+  # ---------------------------------------------------------------------------
+  # Suite 2: graceful degradation when probes fail
+  # ---------------------------------------------------------------------------
 
-  test "cc probe failure (ok=false) substitutes CcSentinel, ldd succeeds":
-    let run = makeRun("", false, "ldd (GNU libc) 2.38", true)
-    let v = ccVersion(run)
-    check v == CcSentinel & "|ldd (GNU libc) 2.38"
-    check v.len > 0
+  suite "ccVersion — probe failures yield sentinels":
 
-  test "ldd probe failure (non-glibc/missing, ok=false) substitutes LddSentinel, cc succeeds":
-    let run = makeRun("gcc (GCC) 13.2.0", true, "", false)
-    let v = ccVersion(run)
-    check v == "gcc (GCC) 13.2.0|" & LddSentinel
-    check v.len > 0
+    test "cc probe failure (ok=false) substitutes CcSentinel, ldd succeeds":
+      let run = makeRun("", false, "ldd (GNU libc) 2.38", true)
+      let v = ccVersion(run)
+      check v == CcSentinel & "|ldd (GNU libc) 2.38"
+      check v.len > 0
 
-  test "both probes fail → both sentinels, still a stable non-empty string":
-    let run = makeRun("", false, "", false)
-    let v = ccVersion(run)
-    check v == CcSentinel & "|" & LddSentinel
-    check v.len > 0
+    test "ldd probe failure (non-glibc/missing, ok=false) substitutes LddSentinel, cc succeeds":
+      let run = makeRun("gcc (GCC) 13.2.0", true, "", false)
+      let v = ccVersion(run)
+      check v == "gcc (GCC) 13.2.0|" & LddSentinel
+      check v.len > 0
 
-  test "cc probe succeeds but returns empty output → CcSentinel substituted":
-    let run = makeRun("", true, "ldd (GNU libc) 2.38", true)
-    let v = ccVersion(run)
-    check v == CcSentinel & "|ldd (GNU libc) 2.38"
+    test "both probes fail → both sentinels, still a stable non-empty string":
+      let run = makeRun("", false, "", false)
+      let v = ccVersion(run)
+      check v == CcSentinel & "|" & LddSentinel
+      check v.len > 0
 
-  test "ldd probe succeeds but returns empty output → LddSentinel substituted":
-    let run = makeRun("gcc (GCC) 13.2.0", true, "", true)
-    let v = ccVersion(run)
-    check v == "gcc (GCC) 13.2.0|" & LddSentinel
+    test "cc probe succeeds but returns empty output → CcSentinel substituted":
+      let run = makeRun("", true, "ldd (GNU libc) 2.38", true)
+      let v = ccVersion(run)
+      check v == CcSentinel & "|ldd (GNU libc) 2.38"
 
-# ---------------------------------------------------------------------------
-# Suite 3: determinism
-# ---------------------------------------------------------------------------
+    test "ldd probe succeeds but returns empty output → LddSentinel substituted":
+      let run = makeRun("gcc (GCC) 13.2.0", true, "", true)
+      let v = ccVersion(run)
+      check v == "gcc (GCC) 13.2.0|" & LddSentinel
 
-suite "ccVersion — determinism":
+  # ---------------------------------------------------------------------------
+  # Suite 3: determinism
+  # ---------------------------------------------------------------------------
 
-  test "same inputs → identical output (pure function of injected output)":
-    let run = makeRun("gcc (GCC) 13.2.0", true, "ldd (GNU libc) 2.38", true)
-    let v1 = ccVersion(run)
-    let v2 = ccVersion(run)
-    check v1 == v2
+  suite "ccVersion — determinism":
 
-  test "different cc version output → different fingerprint":
-    let run1 = makeRun("gcc (GCC) 12.0.0", true, "ldd (GNU libc) 2.38", true)
-    let run2 = makeRun("gcc (GCC) 13.2.0", true, "ldd (GNU libc) 2.38", true)
-    check ccVersion(run1) != ccVersion(run2)
+    test "same inputs → identical output (pure function of injected output)":
+      let run = makeRun("gcc (GCC) 13.2.0", true, "ldd (GNU libc) 2.38", true)
+      let v1 = ccVersion(run)
+      let v2 = ccVersion(run)
+      check v1 == v2
 
-  test "different ldd version output → different fingerprint":
-    let run1 = makeRun("gcc (GCC) 13.2.0", true, "ldd (GNU libc) 2.35", true)
-    let run2 = makeRun("gcc (GCC) 13.2.0", true, "ldd (GNU libc) 2.38", true)
-    check ccVersion(run1) != ccVersion(run2)
+    test "different cc version output → different fingerprint":
+      let run1 = makeRun("gcc (GCC) 12.0.0", true, "ldd (GNU libc) 2.38", true)
+      let run2 = makeRun("gcc (GCC) 13.2.0", true, "ldd (GNU libc) 2.38", true)
+      check ccVersion(run1) != ccVersion(run2)
 
-  test "output with only whitespace/newline lines → sentinel substituted":
-    ## A probe that returns only blank lines should be treated as empty output.
-    let run = makeRun("   \n  \n", true, "ldd (GNU libc) 2.38", true)
-    let v = ccVersion(run)
-    check v == CcSentinel & "|ldd (GNU libc) 2.38"
+    test "different ldd version output → different fingerprint":
+      let run1 = makeRun("gcc (GCC) 13.2.0", true, "ldd (GNU libc) 2.35", true)
+      let run2 = makeRun("gcc (GCC) 13.2.0", true, "ldd (GNU libc) 2.38", true)
+      check ccVersion(run1) != ccVersion(run2)
 
-# ---------------------------------------------------------------------------
-# Suite 4: realRun — arg safety (no shell interpretation, M9 fix)
-# ---------------------------------------------------------------------------
-##
-## Verifies that realRun does NOT pass args through a shell (i.e. does NOT use
-## execCmdEx with join-on-space).  The discriminator: run
-##   /bin/sh -c 'echo $#' -- "one two"
-## With a correct execv-style call, sh receives exactly ONE positional parameter
-## ("one two" as a single atom) and prints "1".
-## With the old shell-join (execCmdEx), the shell command becomes:
-##   /bin/sh -c echo $# -- one two
-## which runs `echo` as the -c script and counts 4 positional params, printing "4".
+    test "output with only whitespace/newline lines → sentinel substituted":
+      ## A probe that returns only blank lines should be treated as empty output.
+      let run = makeRun("   \n  \n", true, "ldd (GNU libc) 2.38", true)
+      let v = ccVersion(run)
+      check v == CcSentinel & "|ldd (GNU libc) 2.38"
 
-suite "realRun — execv-style, no shell splitting":
+  # ---------------------------------------------------------------------------
+  # Suite 4: realRun — arg safety (no shell interpretation, M9 fix)
+  # ---------------------------------------------------------------------------
+  ##
+  ## Verifies that realRun does NOT pass args through a shell (i.e. does NOT use
+  ## execCmdEx with join-on-space).  The discriminator: run
+  ##   /bin/sh -c 'echo $#' -- "one two"
+  ## With a correct execv-style call, sh receives exactly ONE positional parameter
+  ## ("one two" as a single atom) and prints "1".
+  ## With the old shell-join (execCmdEx), the shell command becomes:
+  ##   /bin/sh -c echo $# -- one two
+  ## which runs `echo` as the -c script and counts 4 positional params, printing "4".
 
-  test "arg containing a space arrives as ONE argument, not split by shell":
-    ## M9: realRun must use startProcess (no poEvalCommand), not execCmdEx.
-    ## If realRun still uses execCmdEx (join-on-space), this test fails because
-    ## sh would count 4 positional params instead of 1.
-    let (output, ok) = realRun("/bin/sh", ["-c", "echo $#", "--", "one two"])
-    check ok
-    let trimmed = output.strip()
-    check trimmed == "1"
+  suite "realRun — execv-style, no shell splitting":
 
-  test "realRun returns ok=true for a command that exits 0":
-    ## rfc-0007 C1a: `true`/`false` live at /bin/true and /bin/false on
-    ## Linux but only at /usr/bin/true and /usr/bin/false on macOS — a
-    ## PATH lookup is the portable spelling on both, not a platform branch.
-    let (_, ok) = realRun(findExe("true"), [])
-    check ok
+    test "arg containing a space arrives as ONE argument, not split by shell":
+      ## M9: realRun must use startProcess (no poEvalCommand), not execCmdEx.
+      ## If realRun still uses execCmdEx (join-on-space), this test fails because
+      ## sh would count 4 positional params instead of 1.
+      let (output, ok) = realRun("/bin/sh", ["-c", "echo $#", "--", "one two"])
+      check ok
+      let trimmed = output.strip()
+      check trimmed == "1"
 
-  test "realRun returns ok=false for a command that exits non-zero":
-    let (_, ok) = realRun(findExe("false"), [])
-    check not ok
+    test "realRun returns ok=true for a command that exits 0":
+      ## rfc-0007 C1a: `true`/`false` live at /bin/true and /bin/false on
+      ## Linux but only at /usr/bin/true and /usr/bin/false on macOS — a
+      ## PATH lookup is the portable spelling on both, not a platform branch.
+      let (_, ok) = realRun(findExe("true"), [])
+      check ok
 
-  test "realRun captures stdout output":
-    let (output, ok) = realRun("/bin/echo", ["hello"])
-    check ok
-    check output.strip() == "hello"
+    test "realRun returns ok=false for a command that exits non-zero":
+      let (_, ok) = realRun(findExe("false"), [])
+      check not ok
 
-# ---------------------------------------------------------------------------
-# Suite 5: realRunIn — rfc-0007 A2c (issue #17): the returned RunProc always
-# spawns its subprocess with the GIVEN workingDir, regardless of the calling
-# process's own cwd.
-# ---------------------------------------------------------------------------
+    test "realRun captures stdout output":
+      let (output, ok) = realRun("/bin/echo", ["hello"])
+      check ok
+      check output.strip() == "hello"
 
-suite "realRunIn — subprocess cwd is the given workingDir, not the caller's":
+  # ---------------------------------------------------------------------------
+  # Suite 5: realRunIn — rfc-0007 A2c (issue #17): the returned RunProc always
+  # spawns its subprocess with the GIVEN workingDir, regardless of the calling
+  # process's own cwd.
+  # ---------------------------------------------------------------------------
 
-  test "the subprocess sees workingDir as its cwd even when the caller's cwd differs":
-    let target = getTempDir() / "crisol_ccprobe_realrunin_target"
-    createDir(target)
-    defer: removeDir(target)
+  suite "realRunIn — subprocess cwd is the given workingDir, not the caller's":
 
-    let savedCwd = getCurrentDir()
-    setCurrentDir(getTempDir())   # deliberately NOT `target`
-    defer: setCurrentDir(savedCwd)
+    test "the subprocess sees workingDir as its cwd even when the caller's cwd differs":
+      let target = getTempDir() / "crisol_ccprobe_realrunin_target"
+      createDir(target)
+      defer: removeDir(target)
 
-    let run = realRunIn(target)
-    let (output, ok) = run("/bin/pwd", [])
-    check ok
-    # rfc-0007 C1a: compare against the REALPATH (symlinks resolved), not
-    # the lexical absolutePath — `chdir`'s effective cwd (what `pwd`
-    # actually observes via getcwd(2)) is inherently the resolved path.
-    # On Linux getTempDir() ("/tmp") is not itself a symlink, so this is a
-    # no-op there; on macOS getTempDir() routes through /var ->
-    # /private/var, so the two forms genuinely differ.
-    check output.strip() == target.expandFilename.normalizedPath
+      let savedCwd = getCurrentDir()
+      setCurrentDir(getTempDir())   # deliberately NOT `target`
+      defer: setCurrentDir(savedCwd)
 
-  test "workingDir = \"\" behaves exactly like realRun (inherits the caller's cwd)":
-    let run = realRunIn("")
-    let (output, ok) = run("/bin/echo", ["hello"])
-    check ok
-    check output.strip() == "hello"
+      let run = realRunIn(target)
+      let (output, ok) = run("/bin/pwd", [])
+      check ok
+      # rfc-0007 C1a: compare against the REALPATH (symlinks resolved), not
+      # the lexical absolutePath — `chdir`'s effective cwd (what `pwd`
+      # actually observes via getcwd(2)) is inherently the resolved path.
+      # On Linux getTempDir() ("/tmp") is not itself a symlink, so this is a
+      # no-op there; on macOS getTempDir() routes through /var ->
+      # /private/var, so the two forms genuinely differ.
+      check output.strip() == target.expandFilename.normalizedPath
 
-when isMainModule:
-  echo "All ccprobe tests passed."
+    test "workingDir = \"\" behaves exactly like realRun (inherits the caller's cwd)":
+      let run = realRunIn("")
+      let (output, ok) = run("/bin/echo", ["hello"])
+      check ok
+      check output.strip() == "hello"
+
+  when isMainModule:
+    echo "All ccprobe tests passed."
+else:
+  when isMainModule:
+    echo "test_ccprobe: skipped (POSIX shell/binaries)"

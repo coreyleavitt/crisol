@@ -23,6 +23,7 @@ import std/[os, sets, tables, times, unittest, json, strutils]
 import crisol/[types, runner, depgraph, narrow, planner]
 import "../support/rfc9_narrow_support"
 import "../support/testep"
+import ../support/symlinkprobe
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_searchpath_" & tag & "_" &
@@ -165,6 +166,7 @@ doAssert xValue() == 5
     ## manifests show exactly this shape for milpa's `_deps/*` -> CAS symlinks).
     ## The closure must record the LEXICAL project-relative path,
     ## "_deps/dep/src/dep.nim", not the realpath.
+    if not symlinksAvailable(): skip()
     let root = makeTempRoot("triggerB")
     defer: removeDir(root)
     let cas = makeTempRoot("triggerB_cas")
@@ -234,6 +236,7 @@ doAssert depValue() == 7
     ## path (through the CAS), which is NOT under any tracked root — so the
     ## dep must be recovered via the index fallback, not the plain
     ## `@m` candidate.
+    if not symlinksAvailable(): skip()
     let root = makeTempRoot("triggerC")
     defer: removeDir(root)
     let cas = makeTempRoot("triggerC_cas")
@@ -372,6 +375,7 @@ suite "closure resolves @m bodies through a symlinked entrypoint FILE by the fil
     ## file on EVERY subsequent run, permanently invalidating the entry
     ## ("could not record its source closure … force-selected" every run,
     ## precision lost for this entrypoint).
+    if not symlinksAvailable(): skip()
     let root = makeTempRoot("r4_1_symlinked_ep_file")
     defer: removeDir(root)
 
@@ -425,6 +429,7 @@ suite "closure resolves @m bodies through a symlinked entrypoint DIRECTORY via a
     ## is the real-compile counterpart of the synthetic (manifest-only) pin
     ## in tests/unit/test_source_index.nim — same case-2 mechanism, driven
     ## through execute() end-to-end instead of a hand-written nimcache JSON.
+    if not symlinksAvailable(): skip()
     let root = makeTempRoot("case2_dir_real_compile")
     defer: removeDir(root)
 
@@ -472,6 +477,7 @@ suite "closure resolves through a projectRoot that is itself a symlinked directo
     ## `<tmp>/link_proj` -> `<tmp>/deep/er/real_proj`; the entrypoint
     ## `tests/t.nim` imports a relative sibling `src/foo` (one directory up)
     ## and a same-directory sibling `sib`.
+    if not symlinksAvailable(): skip()
     let parent = makeTempRoot("symlinked_projectroot")
     defer: removeDir(parent)
 
@@ -531,6 +537,7 @@ suite "closure records a dep reached through a dep-root symlink whose target sit
     ## lives under projectRoot by construction — so it must be recovered via
     ## the roots existence-check fallback and recorded at its LEXICAL,
     ## project-relative path.
+    if not symlinksAvailable(): skip()
     let root = makeTempRoot("dotdir_deep")
     defer: removeDir(root)
 
@@ -596,6 +603,7 @@ doAssert depValue() == 7
     ## exercises the `@m` branch's pre-existing `lookupByReal` recovery
     ## (unaffected by this fix), recorded here to confirm it already covers
     ## this dot-dir layout even though the `@p` branch (above) did not.
+    if not symlinksAvailable(): skip()
     let root = makeTempRoot("dotdir_shallow")
     defer: removeDir(root)
 

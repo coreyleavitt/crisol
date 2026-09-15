@@ -14,6 +14,7 @@
 import std/[os, sets, json, tables]
 import crisol/types
 import crisol/depgraph
+import ../support/symlinkprobe
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -299,6 +300,9 @@ block test_saveDepGraph_symlink_write_through_protection:
   ## A pre-existing <depgraph>.<pid>.tmp symlink pointing to a sentinel file
   ## must NOT cause saveDepGraph to overwrite the sentinel.
   ## Mirror of the jsonout P3 test.
+  if not symlinksAvailable():
+    echo "SKIP: symlinks unavailable"
+    break
   let root = getTempDir() / "crisol_depgraph_p5sym"
   createDir(root)
   defer: removeDir(root)

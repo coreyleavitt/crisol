@@ -1078,7 +1078,15 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
 
   try:
     createDir(stateDir)
-  except OSError as e:
+  except OSError, IOError:
+    # createDir raises OSError for a raw mkdir/CreateDirectory failure (e.g.
+    # permission denied), but IOError when a path component already exists
+    # and is NOT a directory (existsOrCreateDir's post-check) -- the portable
+    # "unwritable projectRoot" shape (a file sitting where a directory is
+    # expected) hits this second case identically on POSIX and Windows.
+    # Both are "could not create the state dir" from our caller's point of
+    # view, so both must be swallowed here per this proc's contract.
+    let e = getCurrentException()
     stderr.write("crisol: warning: could not create state dir '" & stateDir &
                  "': " & e.msg & "\n")
     return

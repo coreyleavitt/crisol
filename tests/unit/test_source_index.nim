@@ -15,6 +15,7 @@ import std/[os, sets, json, strutils, unittest, options]
 import crisol/types
 import crisol/paths
 import crisol/closure
+import ../support/symlinkprobe
 
 proc projTp(rel: string; roots: TrackedRoots): TrackedPath =
   ## RFC-0009 A4b test helper: build the expected project (tag-0) closure
@@ -123,6 +124,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("vendor/foo.nim", cfg.trackedRoots)])
 
   test "index exclusions: state dir, hidden dir, nimcache dir, and a nested symlinked dir are never candidates":
+    if not symlinksAvailable(): skip()
     let root = freshRoot("excl")
     defer: removeDir(root)
     let outside = freshRoot("excl_outside")
@@ -174,6 +176,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## REALPATH, not the lexical (symlinked) root — yielding a `..`-laden,
     ## realpath-relative body (trigger B). A body with no `..`
     ## at all (the old pin) is a shape Nim never emits for a symlinked root.
+    if not symlinksAvailable(): skip()
     let root = freshRoot("deproot_symlink")
     defer: removeDir(root)
     let outside = freshRoot("deproot_outside")
@@ -381,6 +384,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## REALPATH-canonicalized source, so a realistic body here is realpath-
     ## relative; lookup must report the file's LEXICAL project path
     ## (lib/dep.nim), not the untracked outside real path.
+    if not symlinksAvailable(): skip()
     let root = freshRoot("symlinkfile")
     defer: removeDir(root)
     let outside = freshRoot("symlinkfile_outside")
@@ -439,6 +443,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## `closureMemberSpelling`'s doc comment in closure.nim for why a
     ## dep-root member must spell as absolute for `depgraph.recordClosure`'s
     ## downstream `classify` round-trip to stay sound.
+    if not symlinksAvailable(): skip()
     let root = freshRoot("s3_m_symlink")
     defer: removeDir(root)
     let outside = freshRoot("s3_m_symlink_outside")
@@ -580,6 +585,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## closure instead. The fix detects that `expandFilename(epDir) !=
     ## epDir` and resolves the body from the REAL epDir, recovering the file
     ## at its LEXICAL path via `byReal`.
+    if not symlinksAvailable(): skip()
     let root = freshRoot("f2_symlinked_epdir")
     defer: removeDir(root)
     let stDir = freshRoot("f2_symlinked_epdir_st")
@@ -627,6 +633,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## @m body of plain "helper.nim" — the real dependency is
     ## `other/helper.nim`. `closureContentHash` then raises on the missing
     ## file on every subsequent run, permanently invalidating the entry.
+    if not symlinksAvailable(): skip()
     let root = freshRoot("symlinked_ep_file")
     defer: removeDir(root)
     createDir(root / "tests")
@@ -661,6 +668,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## itself instead: it lies OUTSIDE `root` (a sibling temp dir), so
     ## `extractClosure`'s ordinary under-tracked-root filter correctly drops
     ## it, exactly like any other untracked out-of-root import.
+    if not symlinksAvailable(): skip()
     let root = freshRoot("case2_miss")
     defer: removeDir(root)
     let st = freshRoot("case2_miss_st")

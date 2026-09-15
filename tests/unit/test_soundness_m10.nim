@@ -14,6 +14,7 @@
 import std/[os, sets, json, tables, options]
 import crisol/types
 import crisol/depgraph
+import ../support/symlinkprobe
 
 proc makeTmpConfig(root: string): Config =
   ## RFC-0009 A3c-ii: unlike test_depgraph.nim's/test_depgraph_guard.nim's
@@ -244,6 +245,9 @@ block test_m10_symlinked_source_inside_root_retained:
   ## root, must be RETAINED (not resolved-and-dropped) -- and
   ## closureContentHash must still succeed against it (hashes through the
   ## link, exactly as the extractor recorded it).
+  if not symlinksAvailable():
+    echo "SKIP: symlinks unavailable"
+    break
   let root = getTempDir() / "crisol_m10_e"
   createDir(root)
   defer: removeDir(root)
@@ -297,6 +301,9 @@ block test_m10_depRoot_via_symlink_absolute_path_retained:
   ## a directory outside root must still admit a stored ABSOLUTE closure
   ## path inside it -- lexically, the path is under the depRoot as
   ## configured, so it is retained (no realpath resolution).
+  if not symlinksAvailable():
+    echo "SKIP: symlinks unavailable"
+    break
   let root = getTempDir() / "crisol_m10_f"
   createDir(root)
   defer: removeDir(root)

@@ -18,6 +18,7 @@
 
 import std/[os, unittest, tempfiles]
 import crisol/[types, config, paths]
+import ../support/symlinkprobe
 
 proc writeFile(dir, name, content: string): string =
   result = dir / name
@@ -123,6 +124,7 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     check kind == cekConfig
 
   test "two dep roots aliasing one physical directory (via symlink) -> cekConfig":
+    if not symlinksAvailable(): skip()
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let depParent = makeTmpDir()

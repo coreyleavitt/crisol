@@ -27,6 +27,7 @@
 
 import std/[os, strutils]
 import crisol/ioutils
+import ../support/symlinkprobe
 
 when defined(posix):
   import std/posix as posix_mod
@@ -344,6 +345,9 @@ block test_createoverwrite_replaces_existing_content:
   assert readFile(path) == "new", "createOverwrite must truncate the prior content"
 
 block test_createoverwrite_nofollow_refuses_symlink:
+  if not symlinksAvailable():
+    echo "SKIP: symlinks unavailable"
+    break
   let target = getTempDir() / "crisol_ioutils_test_createoverwrite_target.txt"
   let link   = getTempDir() / "crisol_ioutils_test_createoverwrite_link.txt"
   writeFile(target, "target content")
@@ -448,6 +452,9 @@ block test_writeguardedfile_overwrite_true_replaces_content:
   assert readFile(path) == "fresh template"
 
 block test_writeguardedfile_overwrite_true_still_refuses_symlink:
+  if not symlinksAvailable():
+    echo "SKIP: symlinks unavailable"
+    break
   let target = getTempDir() / "crisol_ioutils_test_writeguarded_target.txt"
   let link   = getTempDir() / "crisol_ioutils_test_writeguarded_link.txt"
   writeFile(target, "target content")

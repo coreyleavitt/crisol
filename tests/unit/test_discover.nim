@@ -12,6 +12,7 @@ import crisol/discover
 import crisol/paths
 import crisol/config
 import "../support/testep"
+import ../support/symlinkprobe
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -341,6 +342,7 @@ suite "discover – cross-group overlap":
 
 suite "discover – symlink directories not followed":
   test "symlinked dir containing matching file yields no Entrypoint":
+    if not symlinksAvailable(): skip()
     let root    = makeTempRoot("symlink_root")
     let symTarget = makeTempRoot("symlink_target")
     defer:

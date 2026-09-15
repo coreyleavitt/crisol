@@ -15,6 +15,7 @@
 import std/[os, strutils, times, unittest]
 import crisol        # runMain
 import crisol/config  # loadConfig
+import ../support/symlinkprobe
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -119,6 +120,7 @@ suite "crisol S6 — crisol init":
     ## Regression: O_NOFOLLOW must prevent write-through on --force.
     ## Even with --force, init must not follow the symlink and overwrite the
     ## sentinel file that the symlink points to.
+    if not symlinksAvailable(): skip()
     let root = makeTmpDir()
     defer: removeDir(root)
 

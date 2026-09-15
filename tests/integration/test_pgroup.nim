@@ -21,102 +21,107 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_pgroup.nim
 
-import std/[os, osproc, strutils, unittest, options, monotimes, times]
-import crisol/process
+when defined(posix):
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+  import std/[os, osproc, strutils, unittest, options, monotimes, times]
+  import crisol/process
 
-proc pollForFile(path: string; timeoutMs: int): bool =
-  let step = 10
-  var elapsed = 0
-  while elapsed < timeoutMs:
-    if fileExists(path): return true
-    os.sleep(step)
-    elapsed += step
-  false
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
 
-proc pidDeadOrZombie(pid: int; timeoutMs: int): bool =
-  ## Poll until the pid is either gone from /proc (ESRCH — fully reaped) or
-  ## a zombie (state 'Z' — killed but not yet reaped by init). Both confirm
-  ## the process was killed; a zombie executes no more code.
-  let step = 20
-  var elapsed = 0
-  let statPath = "/proc/" & $pid & "/stat"
-  while elapsed < timeoutMs:
-    if not fileExists(statPath):
-      return true
-    let content = readFile(statPath)
-    let closeIdx = content.rfind(')')
-    if closeIdx >= 0 and closeIdx + 2 < content.len:
-      if content[closeIdx + 2] == 'Z':
+  proc pollForFile(path: string; timeoutMs: int): bool =
+    let step = 10
+    var elapsed = 0
+    while elapsed < timeoutMs:
+      if fileExists(path): return true
+      os.sleep(step)
+      elapsed += step
+    false
+
+  proc pidDeadOrZombie(pid: int; timeoutMs: int): bool =
+    ## Poll until the pid is either gone from /proc (ESRCH — fully reaped) or
+    ## a zombie (state 'Z' — killed but not yet reaped by init). Both confirm
+    ## the process was killed; a zombie executes no more code.
+    let step = 20
+    var elapsed = 0
+    let statPath = "/proc/" & $pid & "/stat"
+    while elapsed < timeoutMs:
+      if not fileExists(statPath):
         return true
-    os.sleep(step)
-    elapsed += step
-  false
+      let content = readFile(statPath)
+      let closeIdx = content.rfind(')')
+      if closeIdx >= 0 and closeIdx + 2 < content.len:
+        if content[closeIdx + 2] == 'Z':
+          return true
+      os.sleep(step)
+      elapsed += step
+    false
 
-# ---------------------------------------------------------------------------
-# Compile the fixture at module load time
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Compile the fixture at module load time
+  # ---------------------------------------------------------------------------
 
-let fixtureDir  = currentSourcePath().parentDir().parentDir() / "fixtures"
-let binDir      = fixtureDir / "bin"
-let nimcacheDir = fixtureDir / "nimcache"
-createDir(binDir)
+  let fixtureDir  = currentSourcePath().parentDir().parentDir() / "fixtures"
+  let binDir      = fixtureDir / "bin"
+  let nimcacheDir = fixtureDir / "nimcache"
+  createDir(binDir)
 
-let src   = fixtureDir / "spawn_pgroup_child.nim"
-let bin   = binDir / "spawn_pgroup_child"
-let cache = nimcacheDir / "spawn_pgroup_child"
-let (o, rc) = execCmdEx("nim c --mm:orc --nimcache:" & cache & " -o:" & bin & " " & src)
-doAssert rc == 0, "spawn_pgroup_child compile failed:\n" & o
+  let src   = fixtureDir / "spawn_pgroup_child.nim"
+  let bin   = binDir / "spawn_pgroup_child"
+  let cache = nimcacheDir / "spawn_pgroup_child"
+  let (o, rc) = execCmdEx("nim c --mm:orc --nimcache:" & cache & " -o:" & bin & " " & src)
+  doAssert rc == 0, "spawn_pgroup_child compile failed:\n" & o
 
-# ---------------------------------------------------------------------------
-# Suite
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Suite
+  # ---------------------------------------------------------------------------
 
-suite "process-group kill — grandchild reap, through the Supervisor":
+  suite "process-group kill — grandchild reap, through the Supervisor":
 
-  test "requestStop+forceKill kills the whole domain; grandchild never survives":
-    let tmpDir       = getTempDir()
-    let gcPidFile    = tmpDir / "crisol_pgroup_gc_pid.txt"
-    let survivedFile = tmpDir / "crisol_pgroup_survived.txt"
-    if fileExists(gcPidFile):    removeFile(gcPidFile)
-    if fileExists(survivedFile): removeFile(survivedFile)
-    let outPath = tmpDir / "crisol_pgroup_out_" & $getCurrentProcessId() & ".txt"
+    test "requestStop+forceKill kills the whole domain; grandchild never survives":
+      let tmpDir       = getTempDir()
+      let gcPidFile    = tmpDir / "crisol_pgroup_gc_pid.txt"
+      let survivedFile = tmpDir / "crisol_pgroup_survived.txt"
+      if fileExists(gcPidFile):    removeFile(gcPidFile)
+      if fileExists(survivedFile): removeFile(survivedFile)
+      let outPath = tmpDir / "crisol_pgroup_out_" & $getCurrentProcessId() & ".txt"
 
-    var sv = initSupervisor(installSignals = false)
-    let spec = ChildSpec(argv: @[bin, gcPidFile, survivedFile], cwd: getCurrentDir(),
-                          env: @[], sinks: combinedSink(outPath))
-    let sr = sv.spawn(spec)
-    check sr.ok
+      var sv = initSupervisor(installSignals = false)
+      let spec = ChildSpec(argv: @[bin, gcPidFile, survivedFile], cwd: getCurrentDir(),
+                            env: @[], sinks: combinedSink(outPath))
+      let sr = sv.spawn(spec)
+      check sr.ok
 
-    # Wait for the grandchild to announce its pid (up to 3 s).
-    check pollForFile(gcPidFile, 3000)
-    let grandchildPid = parseInt(readFile(gcPidFile).strip())
-    check grandchildPid > 0
+      # Wait for the grandchild to announce its pid (up to 3 s).
+      check pollForFile(gcPidFile, 3000)
+      let grandchildPid = parseInt(readFile(gcPidFile).strip())
+      check grandchildPid > 0
 
-    # Cooperative stop first (the real requestStop/forceKill sequence a
-    # timeout uses) — the child ignores SIGTERM in this fixture (mirrors a
-    # blocked/hung compile grandchild that would otherwise survive), so a
-    # short grace window elapses and forceKill escalates.
-    sv.requestStop(sr.id, krTimeout)
-    var ev = sv.next(getMonoTime() + initDuration(milliseconds = 300))
-    if ev.kind != weChildExited:
-      sv.forceKill(sr.id)
-      ev = sv.next(getMonoTime() + initDuration(seconds = 5))
-    check ev.kind == weChildExited
-    let report = sv.reap(ev.id)
-    check report.stop.isSome
+      # Cooperative stop first (the real requestStop/forceKill sequence a
+      # timeout uses) — the child ignores SIGTERM in this fixture (mirrors a
+      # blocked/hung compile grandchild that would otherwise survive), so a
+      # short grace window elapses and forceKill escalates.
+      sv.requestStop(sr.id, krTimeout)
+      var ev = sv.next(getMonoTime() + initDuration(milliseconds = 300))
+      if ev.kind != weChildExited:
+        sv.forceKill(sr.id)
+        ev = sv.next(getMonoTime() + initDuration(seconds = 5))
+      check ev.kind == weChildExited
+      let report = sv.reap(ev.id)
+      check report.stop.isSome
 
-    # The grandchild (same pgroup, never re-parented via setpgid) must be
-    # dead or a zombie — SIGKILL to the whole domain reached it too.
-    check pidDeadOrZombie(grandchildPid, 2000)
-    check not fileExists(survivedFile)
+      # The grandchild (same pgroup, never re-parented via setpgid) must be
+      # dead or a zombie — SIGKILL to the whole domain reached it too.
+      check pidDeadOrZombie(grandchildPid, 2000)
+      check not fileExists(survivedFile)
 
-    removeFile(outPath)
-    if fileExists(gcPidFile):    removeFile(gcPidFile)
-    if fileExists(survivedFile): removeFile(survivedFile)
+      removeFile(outPath)
+      if fileExists(gcPidFile):    removeFile(gcPidFile)
+      if fileExists(survivedFile): removeFile(survivedFile)
 
-when isMainModule:
-  echo "test_pgroup done"
+  when isMainModule:
+    echo "test_pgroup done"
+else:
+  when isMainModule:
+    echo "test_pgroup: skipped (POSIX /proc, pgid/killpg)"

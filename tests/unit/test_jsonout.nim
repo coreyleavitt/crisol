@@ -25,6 +25,7 @@ import crisol/runner  # for summarize
 import crisol/cachetelemetry  # RFC-0005 code-review T16: CacheStats field construction
 import crisol
 import "../support/testep"
+import ../support/symlinkprobe
 
 # ---------------------------------------------------------------------------
 # Helpers -- build synthetic EntrypointResults
@@ -846,10 +847,16 @@ suite "jsonout - persistLastRun":
     check fileExists(tmpDir / stateDir / "lastrun.json")
 
   test "persistLastRun does not crash when projectRoot is unwritable":
-    ## Use a path under /proc that cannot be created to trigger the error path.
+    ## Portable guaranteed-failure: a real FILE (not a directory) as the
+    ## parent of projectRoot. createDir(<file>/"unwritable") fails with
+    ## ENOTDIR on POSIX and ERROR_DIRECTORY on Windows -- unlike "/proc/...",
+    ## which isn't reliably unwritable on Windows, this holds on both.
     ## We just verify it does not raise any exception.
+    let notADir = getTempDir() / ("crisol_jsonout_notadir_" & $getCurrentProcessId())
+    writeFile(notADir, "x")   # a FILE, not a directory
+    defer: removeFile(notADir)
     let cfg = Config(
-      projectRoot:        "/proc/nonexistent_crisol_test_xyzzy",
+      projectRoot:        notADir / "unwritable",
       stateDir:           ".crisol",
       groups:             @[],
       jobs:               1,
@@ -1405,6 +1412,7 @@ suite "jsonout - P3 symlink-safe temp write":
     ##
     ## More specifically: we verify that the FINAL write goes to lastrun.json
     ## (not to some other path), and that the normal round-trip still works.
+    if not symlinksAvailable(): skip()
     let tmpDir   = uniqueTmpDir("p3sym")
     let stateDir = ".crisol_test"
     createDir(tmpDir)
