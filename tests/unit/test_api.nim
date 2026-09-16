@@ -100,6 +100,18 @@ import "../support/helpers"
 import "../support/testep"
 
 # ---------------------------------------------------------------------------
+# RFC-0009 B4a diagnostic: surface a non-rsOk RunReport.error. The suites
+# below otherwise only assert `status == rsOk`, which hides the actual
+# structural cause (bad config, rejected remote, held lock, empty discovery)
+# on the native Windows leg. checkpoint() output is shown only when a check
+# in the same test subsequently fails, so this is silent on green POSIX runs.
+# ---------------------------------------------------------------------------
+template checkRunOk(rr: untyped) =
+  if rr.status != rsOk:
+    checkpoint("[B4a-diag] status=" & $rr.status & " error=" & rr.error)
+  check rr.status == rsOk
+
+# ---------------------------------------------------------------------------
 # Selection constructors
 # ---------------------------------------------------------------------------
 
@@ -546,7 +558,7 @@ suite "api type surface":
     let pr = PlanReport()
     let rr = RunReport()
     check pr.entrypoints.len == 0
-    check rr.status == rsOk
+    checkRunOk(rr)
 
 # ---------------------------------------------------------------------------
 # rfc-0007 A1c: runResult / failureLine digest helpers over a real Phase
@@ -654,7 +666,7 @@ suite "R13 — measure-compile-reuse requested with no workerBinary surfaces a s
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl",
                             measureCompileReuse: true)
       let rr = runTests(opts)
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.exitCode == 0
       check rr.results.len == 1
       check rr.results[0].outcome == oPassed
@@ -774,7 +786,7 @@ suite "RunReport.cacheStats — RFC-0005 B2b end-to-end (real runTests, no CLI)"
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl"))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.cacheStats.total == 0
       check rr.cacheStats.l1Hits == 0
       check rr.cacheStats.hitPct == 0.0
@@ -783,7 +795,7 @@ suite "RunReport.cacheStats — RFC-0005 B2b end-to-end (real runTests, no CLI)"
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.cacheStats.misses > 0
       check rr.cacheStats.l1Hits == 0
       check rr.cacheStats.hitPct == 0.0
@@ -800,7 +812,7 @@ suite "RunReport.cacheStats — RFC-0005 B2b end-to-end (real runTests, no CLI)"
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       discard runTests(RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true))
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.cacheStats.l1Hits > 0
       check rr.cacheStats.hitPct > 0.0
 
@@ -851,7 +863,7 @@ suite "RFC-0005 code-review L2 — unconditional per-tier 100%-error warning":
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       var rr: RunReport
       let errText = captureStderr(proc() = rr = runTestsWith(opts, offlineTierDeps()))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check "cache tier 'l1' errored on every consulted read this run" in errText
 
   test "--cache-stats on, always-offline l1 -> warning present exactly once (no dup)":
@@ -860,7 +872,7 @@ suite "RFC-0005 code-review L2 — unconditional per-tier 100%-error warning":
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
       var rr: RunReport
       let errText = captureStderr(proc() = rr = runTestsWith(opts, offlineTierDeps()))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check errText.count("cache tier 'l1' errored on every consulted read this run") == 1
 
   test "healthy tier -> no per-tier warning":
@@ -869,7 +881,7 @@ suite "RFC-0005 code-review L2 — unconditional per-tier 100%-error warning":
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       var rr: RunReport
       let errText = captureStderr(proc() = rr = runTestsWith(opts, productionCacheDeps()))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check "errored on every consulted read" notin errText
 
 # ---------------------------------------------------------------------------
@@ -888,7 +900,7 @@ suite "RFC-0005 code-review D1 — local (l1) put failures count as localErrors,
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
       let rr = runTestsWith(opts, offlineTierDeps())
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.cacheStats.localErrors == 1
       check rr.cacheStats.remoteErrors == 0
 
@@ -1029,7 +1041,7 @@ suite "runTestsWith / CacheDeps — production parity":
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       let rr = runTestsWith(opts, productionCacheDeps())
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored
 
@@ -1068,7 +1080,7 @@ suite "RFC-0005 code-review D5 — no env mutation under opts.noCache":
       putEnv("CRISOL_CACHE_TOKEN", "must-survive-noCache")
       defer: delEnv("CRISOL_CACHE_TOKEN")
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", noCache: true))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check getEnv("CRISOL_CACHE_TOKEN") == "must-survive-noCache"
 
   test "cache-enabled (default, noCache: false) -> CRISOL_CACHE_* env IS scrubbed (existing behavior, pinned)":
@@ -1077,7 +1089,7 @@ suite "RFC-0005 code-review D5 — no env mutation under opts.noCache":
       putEnv("CRISOL_CACHE_TOKEN", "should-be-scrubbed-cache-on")
       defer: delEnv("CRISOL_CACHE_TOKEN")
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl"))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check getEnv("CRISOL_CACHE_TOKEN") == ""
 
 # ---------------------------------------------------------------------------
@@ -1177,7 +1189,7 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
       # backing Tables (which persist across calls: `deps` closes over the
       # SAME `l1`/`l2` backend values on every call).
       let rr1 = runTestsWith(opts, deps)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check rr1.results.len == 1
       check rr1.results[0].cacheDecision == cdmStored
       # First-ever compile: the entrypoint is edNeverBuilt at plan time, not
@@ -1194,7 +1206,7 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
       # rejects the entry on EVERY consulted tier, so the waterfall finds
       # nothing servable and the entrypoint reruns live.
       let rr2 = runTestsWith(opts, deps)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results.len == 1
       let r2 = rr2.results[0]
       check r2.cacheDecision == cdmStored          # the live rerun re-publishes (self-healing)
@@ -1258,7 +1270,7 @@ group "unit" {
     globs "tests/unit/test_*.nim"
 }
 remote-cache "broken" {
-    url "file://""" & blockedPath & """"
+    url "file://""" & blockedPath.replace('\\', '/') & """"
 }
 """)
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
@@ -1273,7 +1285,7 @@ remote-cache "broken" {
       # end-of-run flush (harmless -- proves nothing about the offline
       # lookup path this test targets).
       let rr1 = runTests(opts)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check rr1.results[0].cacheDecision == cdmStored
 
       # Wipe l1 only -- binary + depgraph stay warm, so run 2 IS a real
@@ -1283,7 +1295,7 @@ remote-cache "broken" {
       removeDir(projectRoot / ".crisol" / "cache")
 
       let rr2 = runTests(opts)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results.len == 1
       check rr2.results[0].cacheLookup == cvOffline
       check rr2.cacheStats.remoteErrors > 0
@@ -1307,7 +1319,7 @@ group "unit" {
     globs "tests/unit/test_*.nim"
 }
 remote-cache "mirror" {
-    url "file://""" & remoteRoot & """"
+    url "file://""" & remoteRoot.replace('\\', '/') & """"
 }
 """)
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
@@ -1317,7 +1329,7 @@ remote-cache "mirror" {
       # join point (RFC-0005 "Deferred remote puts") -- asserting on the
       # POST-run filesystem state is exactly what proves the flush ran.
       let rr1 = runTests(opts)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check rr1.results.len == 1
       check rr1.results[0].cacheDecision == cdmStored
       # the deferred-put flush must have published to the remote tier by end of run
@@ -1330,7 +1342,7 @@ remote-cache "mirror" {
       removeDir(projectRoot / ".crisol" / "cache")
 
       let rr2 = runTests(opts)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results.len == 1
       check rr2.results[0].cacheDecision == cdmHit
       check rr2.results[0].cacheTier == "mirror"
@@ -1394,7 +1406,7 @@ group "unit" {
     globs "tests/unit/test_*.nim"
 }
 remote-cache "mirror" {
-    url "file://""" & remoteRoot & """"
+    url "file://""" & remoteRoot.replace('\\', '/') & """"
 }
 cache-trust {
     policy "hmac"
@@ -1408,7 +1420,7 @@ cache-trust {
       # Run 1: cold -> live -> publishes an ATTESTED entry to L2 (the
       # "mirror" remote) by end of run (the deferred-put flush).
       let rr1 = runTests(opts)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check rr1.results.len == 1
       check rr1.results[0].cacheDecision == cdmStored
       check remoteHasAnyEntry(remoteRoot)
@@ -1445,7 +1457,7 @@ cache-trust {
       # fresh from its own environment.
       putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")
       let rr2 = runTests(opts)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results.len == 1
       let r2 = rr2.results[0]
       check r2.cacheLookup == cvTrustBadSignature
@@ -1490,7 +1502,7 @@ group "unit" {
     globs "tests/unit/test_*.nim"
 }
 remote-cache "mirror" {
-    url "file://""" & remoteRoot & """"
+    url "file://""" & remoteRoot.replace('\\', '/') & """"
 }
 cache-trust {
     policy "hmac"
@@ -1502,7 +1514,7 @@ cache-trust {
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
 
       let rr1 = runTests(opts)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check remoteHasAnyEntry(remoteRoot)
 
       let entryPath = findStoredEntryJson(remoteRoot)
@@ -1517,7 +1529,7 @@ cache-trust {
 
       putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")  # see the sibling test's comment
       let rr2 = runTests(opts)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results.len == 1
       check rr2.results[0].cacheLookup == cvCorrupt
       check rr2.results[0].cacheDecision == cdmStored  # self-heal here too
@@ -1577,7 +1589,7 @@ group "unit" {
     globs "tests/unit/test_*.nim"
 }
 remote-cache "mirror" {
-    url "file://""" & remoteRoot & """"
+    url "file://""" & remoteRoot.replace('\\', '/') & """"
 }
 cache-trust {
     policy "ed25519"
@@ -1592,7 +1604,7 @@ cache-trust {
       # Run 1 (signer): cold -> live -> publishes an ATTESTED entry to L2
       # (the "mirror" remote) by end of run (the deferred-put flush).
       let rr1 = runTests(opts)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check rr1.results.len == 1
       check rr1.results[0].cacheDecision == cdmStored
       check remoteHasAnyEntry(remoteRoot)
@@ -1618,7 +1630,7 @@ cache-trust {
       # pinned public key already in crisol.kdl.
       check getEnv("CRISOL_CACHE_SIGN_KEY") == ""
       let rr2 = runTests(opts)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results.len == 1
       let r2 = rr2.results[0]
       check r2.cacheDecision == cdmHit
@@ -1650,7 +1662,7 @@ cache-trust {
       # backfilled entry DIRECTLY from l1, and it verifies again under the
       # same pinned key, genuinely, from disk.
       let rr3 = runTests(opts)
-      check rr3.status == rsOk
+      checkRunOk(rr3)
       check rr3.results.len == 1
       check rr3.results[0].cacheDecision == cdmHit
       check rr3.results[0].cacheTier == "l1"
@@ -1704,7 +1716,7 @@ group "unit" {
     globs "tests/unit/test_*.nim"
 }
 remote-cache "mirror" {
-    url "file://""" & remoteRoot & """"
+    url "file://""" & remoteRoot.replace('\\', '/') & """"
 }
 cache-trust {
     policy "ed25519"
@@ -1719,7 +1731,7 @@ cache-trust {
       # genuinely, validly-signed entry to the "mirror" remote.
       putEnv("CRISOL_CACHE_SIGN_KEY", seedB64B)
       let rr1 = runTests(opts)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check rr1.results.len == 1
       check rr1.results[0].cacheDecision == cdmStored
       check remoteHasAnyEntry(remoteRoot)
@@ -1745,7 +1757,7 @@ cache-trust {
       # crisol.kdl -- key B was never trusted.
       check getEnv("CRISOL_CACHE_SIGN_KEY") == ""
       let rr2 = runTests(opts)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results.len == 1
       let r2 = rr2.results[0]
       check r2.cacheLookup == cvTrustUnpinnedSigner
@@ -1809,7 +1821,7 @@ suite "RFC-0005 A2c-ii — post-compile consult: a genuinely cold project hits a
     writeFile(p1 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
     writeFile(p1 / "crisol.kdl", kdl)
     let rr1 = runTests(RunOptions(configPath: p1 / "crisol.kdl"))
-    check rr1.status == rsOk
+    checkRunOk(rr1)
     check rr1.results[0].cacheDecision == cdmStored
     check remoteHasAnyEntry(remoteRoot)
 
@@ -1827,7 +1839,7 @@ suite "RFC-0005 A2c-ii — post-compile consult: a genuinely cold project hits a
     writeFile(p2 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
     writeFile(p2 / "crisol.kdl", kdl)
     let rr2 = runTests(RunOptions(configPath: p2 / "crisol.kdl"))
-    check rr2.status == rsOk
+    checkRunOk(rr2)
     check rr2.results.len == 1
     let r2 = rr2.results[0]
     check r2.cacheDecision == cdmHit
@@ -1855,7 +1867,7 @@ suite "RFC-0005 A2c-ii — post-compile consult: a genuinely cold project hits a
     # (edRunFresh / cdSkipFresh), which is only possible if A2c-ii's hit
     # path left P2's on-disk state exactly as a real compile+run would have.
     let rr3 = runTests(RunOptions(configPath: p2 / "crisol.kdl"))
-    check rr3.status == rsOk
+    checkRunOk(rr3)
     check rr3.results[0].compileSkipped == true
 
 # ---------------------------------------------------------------------------
@@ -1902,7 +1914,7 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     writeFile(p1 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
     writeFile(p1 / "crisol.kdl", kdl)
     let rr1 = runTests(RunOptions(configPath: p1 / "crisol.kdl"))
-    check rr1.status == rsOk
+    checkRunOk(rr1)
     check rr1.results.len == 1
     check rr1.results[0].cacheDecision == cdmStored
     check anyFileUnder(p1 / ".crisol" / "cache")  # entry in L1 (P1's own)
@@ -1920,7 +1932,7 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     writeFile(p2 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
     writeFile(p2 / "crisol.kdl", kdl)
     let rr2 = runTests(RunOptions(configPath: p2 / "crisol.kdl", cacheStats: true))
-    check rr2.status == rsOk
+    checkRunOk(rr2)
     check rr2.results.len == 1
     let r2 = rr2.results[0]
     check r2.compileSkipped == false
@@ -1954,7 +1966,7 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
 
     # --- Run 3: P2/S2 again -- binary + depgraph + P2's L1 all warm now. --
     let rr3 = runTests(RunOptions(configPath: p2 / "crisol.kdl", cacheStats: true))
-    check rr3.status == rsOk
+    checkRunOk(rr3)
     check rr3.results.len == 1
     let r3 = rr3.results[0]
     check r3.compileSkipped == true
@@ -1977,7 +1989,7 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     # --- Secondary: evict P2's L1 only -- binary + depgraph stay warm. ----
     removeDir(p2 / ".crisol" / "cache")
     let rr4 = runTests(RunOptions(configPath: p2 / "crisol.kdl", cacheStats: true))
-    check rr4.status == rsOk
+    checkRunOk(rr4)
     check rr4.results.len == 1
     let r4 = rr4.results[0]
     check r4.compileSkipped == true          # binary + depgraph still warm
@@ -2020,7 +2032,7 @@ suite "RFC-0005 code-review SO5 — verify-cache never persists the depgraph for
     writeFile(p1 / "tests" / "unit" / "test_a.nim", RemoteCacheProjectFixture)
     writeFile(p1 / "crisol.kdl", kdl)
     let rr1 = runTests(RunOptions(configPath: p1 / "crisol.kdl"))
-    check rr1.status == rsOk
+    checkRunOk(rr1)
     check rr1.results[0].cacheDecision == cdmStored
     check remoteHasAnyEntry(remoteRoot)
 
@@ -2036,7 +2048,7 @@ suite "RFC-0005 code-review SO5 — verify-cache never persists the depgraph for
     writeFile(p2 / "crisol.kdl", kdl)
     let rr2 = runTests(RunOptions(configPath: p2 / "crisol.kdl",
                                   verifyCache: verifySample(pct = 100)))
-    check rr2.status == rsOk
+    checkRunOk(rr2)
     check rr2.results.len == 1
     let r2 = rr2.results[0]
     # Proves this hit genuinely came from the POST-COMPILE consult, not a
@@ -2077,7 +2089,7 @@ suite "RFC-0005 code-review SO5 — verify-cache never persists the depgraph for
     check onDisk.entries.len == 1
 
     let rr3 = runTests(RunOptions(configPath: p2 / "crisol.kdl"))
-    check rr3.status == rsOk
+    checkRunOk(rr3)
     check rr3.results[0].compileSkipped == true
 
 suite "RFC-0005 A3c-ii — RunOptions.noRemoteCache (--no-remote-cache)":
@@ -2094,20 +2106,20 @@ group "unit" {
     globs "tests/unit/test_*.nim"
 }
 remote-cache "mirror" {
-    url "file://""" & remoteRoot & """"
+    url "file://""" & remoteRoot.replace('\\', '/') & """"
 }
 """)
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", noRemoteCache: true)
 
       let rr1 = runTests(opts)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check rr1.results[0].cacheDecision == cdmStored
       # --no-remote-cache must drop the remote tier entirely -- nothing ever queued or flushed to it
       check not remoteHasAnyEntry(remoteRoot)
 
       # l1 stays warm across the SAME opts (still noRemoteCache) -> a real hit.
       let rr2 = runTests(opts)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results[0].cacheDecision == cdmHit
       check rr2.results[0].cacheTier == "l1"
 
@@ -2127,7 +2139,7 @@ remote-cache "l1" {
       # the remote before configuredCache ever sees it makes the run
       # succeed regardless of the (moot) remote's own misconfiguration.
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl", noRemoteCache: true))
-      check rr.status == rsOk
+      checkRunOk(rr)
 
 # ---------------------------------------------------------------------------
 # RFC-0005 C3b -- E2E-3 (RFC's own acceptance text, verbatim): "http/s3
@@ -2244,7 +2256,7 @@ suite "RFC-0005 C3b -- E2E-3: http remote wired live through runTestsWith(testRe
       let fs = newE2E3Server(e2e3OkReply(200, e2e3EncodedHitBody()))
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       let rr = runTestsWith(opts, e2e3Deps(fs))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmHit
       check rr.results[0].cacheTier == "mirror"
@@ -2259,7 +2271,7 @@ suite "RFC-0005 C3b -- E2E-3: http remote wired live through runTestsWith(testRe
       let fs = newE2E3Server(e2e3OkReply(404), e2e3OkReply(200))
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       let rr = runTestsWith(opts, e2e3Deps(fs))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored
       check rr.results[0].cacheLookup == cvMiss
@@ -2275,7 +2287,7 @@ suite "RFC-0005 C3b -- E2E-3: http remote wired live through runTestsWith(testRe
       let fs = newE2E3Server(e2e3UnreachableReply())
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
       let rr = runTestsWith(opts, e2e3Deps(fs))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 2
       for r in rr.results:
         check r.cacheLookup == cvOffline
@@ -2296,7 +2308,7 @@ suite "RFC-0005 C3b -- E2E-3: http remote wired live through runTestsWith(testRe
       let fs = newE2E3Server(e2e3OkReply(404), e2e3OkReply(401))
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
       let rr = runTestsWith(opts, e2e3Deps(fs))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored  # l1 wrote fine regardless of the remote
       check fs.calls.len == 2
@@ -2311,7 +2323,7 @@ suite "RFC-0005 C3b -- E2E-3: http remote wired live through runTestsWith(testRe
       let fs = newE2E3Server(e2e3OkReply(200, hugeBody), e2e3OkReply(200))
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       let rr = runTestsWith(opts, e2e3Deps(fs))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheLookup == cvCorrupt
       check rr.results[0].cacheDecision == cdmStored
@@ -2323,7 +2335,7 @@ suite "RFC-0005 C3b -- E2E-3: http remote wired live through runTestsWith(testRe
       let fs = newE2E3Server(e2e3OkReply(200, e2e3EncodedHitBody()))
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", noRemoteCache: true)
       let rr = runTestsWith(opts, e2e3Deps(fs))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored
       check rr.results[0].cacheTier == ""       # never served from any tier -- l1 only
@@ -2398,14 +2410,14 @@ cache-trust {
       let deps = e2e3StoreDeps(st, secrets)
 
       let rr1 = runTestsWith(opts, deps)
-      check rr1.status == rsOk
+      checkRunOk(rr1)
       check rr1.results[0].cacheDecision == cdmStored
       check st.objects.len == 1  # the deferred-put flush published to s3 by end of run
 
       removeDir(projectRoot / ".crisol" / "cache")  # wipe l1 only
 
       let rr2 = runTestsWith(opts, deps)
-      check rr2.status == rsOk
+      checkRunOk(rr2)
       check rr2.results.len == 1
       check rr2.results[0].cacheDecision == cdmHit
       check rr2.results[0].cacheTier == "team-s3"
@@ -2491,7 +2503,7 @@ suite "RFC-0005 C6 -- secure-by-default credential scopes end to end (auth-valid
                                   getStatus = 200, getBody = e2e3EncodedHitBody())
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       let rr = runTestsWith(opts, e2e3AuthDeps(fs, "read-tok"))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmHit
       check rr.results[0].cacheTier == "mirror"
@@ -2508,7 +2520,7 @@ suite "RFC-0005 C6 -- secure-by-default credential scopes end to end (auth-valid
       let fs = newE2E3AuthServer(readTokens = @["read-tok"], writeTokens = @["write-tok"])
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
       let rr = runTestsWith(opts, e2e3AuthDeps(fs, "read-tok"))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 2
       for r in rr.results:
         check r.cacheDecision == cdmStored  # l1 wrote fine regardless of the remote refusal
@@ -2531,7 +2543,7 @@ suite "RFC-0005 C6 -- secure-by-default credential scopes end to end (auth-valid
       let fs = newE2E3AuthServer(readTokens = @["read-tok"], writeTokens = @["write-tok"])
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
       let rr = runTestsWith(opts, e2e3AuthDeps(fs, "write-tok"))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored
       check fs.calls.len == 2
@@ -2590,7 +2602,7 @@ suite "RunReport.compileBlock presence — R14-T6 end-to-end":
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "echo \"ok\"\n")
       let rr = runTests(RunOptions(configPath: projectRoot / "crisol.kdl"))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.compileBlock == nil
 
   test "measureCompileReuse=true, sound worker -> compileBlock present":
@@ -2601,7 +2613,7 @@ suite "RunReport.compileBlock presence — R14-T6 end-to-end":
         measureCompileReuse: true,
         workerBinary:        crisolBinForApi,
       ))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.compileBlock != nil
       check rr.compileBlock.hasKey("segments")
 
@@ -2612,5 +2624,5 @@ suite "RunReport.compileBlock presence — R14-T6 end-to-end":
         configPath:          projectRoot / "crisol.kdl",
         measureCompileReuse: true,
       ))
-      check rr.status == rsOk
+      checkRunOk(rr)
       check rr.compileBlock == nil
