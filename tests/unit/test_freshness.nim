@@ -49,9 +49,16 @@ proc makeEp(path: string; flags: seq[string] = @[]): Entrypoint =
   testEp(path, group = "unit", flags = flags)
 
 proc makeBin(config: Config; ep: Entrypoint): string =
-  ## Create a real (empty) binary file at the stable bin path; return the full path.
+  ## Create a real (empty) binary file at the stable bin path; return the full
+  ## path. RFC-0009 B4a: this MUST use the platform executable extension
+  ## (`addFileExt(_, ExeExt)`) so the fixture writes to the SAME path
+  ## `decideCompile` now checks for freshness (`stableBinPath`) and that
+  ## `promoteCompiledBinary` copies to on a real compile — on Windows the
+  ## linker emits `<name>.exe`, so an extensionless fixture binary is invisible
+  ## to the freshness check there and every decision diverges. `ExeExt == ""`
+  ## on POSIX, so this is byte-identical to the old path there.
   let bdir = binPath(ep, config)
-  let bfull = bdir / binName(ep)
+  let bfull = addFileExt(bdir / binName(ep), ExeExt)
   createDir(bdir)
   writeFile(bfull, "")
   bfull

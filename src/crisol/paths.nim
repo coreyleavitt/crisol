@@ -532,7 +532,21 @@ when defined(windows):
     flags: int32
 
   const
-    fileCaseSensitiveInfoClass = 21'i32   # FILE_INFO_BY_HANDLE_CLASS
+    fileCaseSensitiveInfoClass = 23'i32   # FILE_INFO_BY_HANDLE_CLASS ::
+      ## FileCaseSensitiveInfo. MUST be 23, not 21 (FileDispositionInfoEx) --
+      ## verified against mingw-w64's minwinbase.h enum ordinal (0-indexed:
+      ## FileBasicInfo=0 .. FileFullDirectoryRestartInfo=15,
+      ## FileStorageInfo=16 .. FileIdExtdDirectoryRestartInfo=20,
+      ## FileDispositionInfoEx=21, FileRenameInfoEx=22, FileCaseSensitiveInfo=23,
+      ## FileNormalizedNameInfo=24). The old value (21) queried
+      ## FileDispositionInfoEx instead -- a DIFFERENT info class whose
+      ## `FILE_DISPOSITION_INFO_EX.Flags` happens to be a same-sized `ULONG`,
+      ## so the call did not fail loudly; it silently read the wrong bit,
+      ## making the OS-query tier answer `some(fpAsciiLower)` (a normal
+      ## handle's disposition flags are 0) far more often than it should have,
+      ## masking whatever the REAL per-directory case-sensitivity flag was
+      ## and never falling through to the read-only/create-and-stat
+      ## fallbacks that a genuine query failure would trigger.
     fileCsFlagCaseSensitiveDir = 0x00000001'i32
 
   proc getFileInformationByHandleEx(hFile: Handle; infoClass: int32;

@@ -263,7 +263,15 @@ proc tracked*(index: SourceIndex; native: string): PathClass =
 proc addToIndex(index: var SourceIndex; lexical: string; real: string) =
   let base = lexical.extractFilename
   index.byBasename.mgetOrPut(base, @[]).add IndexedFile(lexical: lexical, real: real)
-  let realNorm = real.normalizedPath
+  # RFC-0009 B4a: keyed forward-slash-normalized (`pathnorm.normalizePath(_,
+  # '/')`), NOT `real.normalizedPath` (native — backslash on Windows).
+  # `resolveMangledAll`'s `@m` branch queries `lookupByReal` with a
+  # forward-slash-normalized candidate (`pathnorm.normalizePath(_, '/')`,
+  # matching crisol's forward-slash canonical model) — keying this table
+  # natively would silently never match on Windows (byte-identical to
+  # forward-slash on POSIX, where DirSep already IS '/', which is why this
+  # divergence was invisible there).
+  let realNorm = pathnorm.normalizePath(real, '/')
   index.byReal.mgetOrPut(realNorm, @[]).add lexical
 
 proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
@@ -460,9 +468,30 @@ proc lookup(index: SourceIndex; body: string): seq[string] =
   let base = sufComps[^1]
   if base notin index.byBasename: return
   let suffixPattern = $DirSep & suffix
+  # Component-boundary match: `suffix` must either be preceded by a
+  # separator in the candidate (the ordinary case — `suffixPattern`,
+  # prepending one, guards against a decoy like "myfoo.nim" matching
+  # suffix "foo.nim") OR equal the candidate outright. The `==` arm matters
+  # when `suffix` itself degenerates to a full ROOT-ANCHORED path with no
+  # separator of its own to its left — `strippedSuffix` only strips leading
+  # ""/"."/".." components, so a realpath-relative `@p`/`@n` body (RFC-0009,
+  # the symlinked-search-path-root case) that carries the target's whole
+  # absolute path after those leading ".." components reduces `suffix` to
+  # that absolute path verbatim. On POSIX this coincidentally still worked
+  # under `endsWith` alone: a '/'-rooted absolute path's split-by-DirSep
+  # yields a leading EMPTY component that `strippedSuffix` also strips, so
+  # `suffix` == the real path MINUS its leading '/' and prepending one back
+  # via `suffixPattern` reconstructs it exactly. A Windows drive-absolute
+  # path (`C:\Users\...`) has no such leading empty component to strip —
+  # "C:" is the first real component — so `suffix` == the real path
+  # VERBATIM and `suffixPattern`'s prepended separator makes it one
+  # character too long to ever match via `endsWith`. The `==` arm covers
+  # this platform asymmetry directly rather than relying on the POSIX-only
+  # coincidence.
   var seen = initHashSet[string]()
   for f in index.byBasename[base]:
-    if f.lexical.endsWith(suffixPattern) or f.real.endsWith(suffixPattern):
+    if f.lexical == suffix or f.lexical.endsWith(suffixPattern) or
+       f.real == suffix or f.real.endsWith(suffixPattern):
       if f.lexical notin seen:
         seen.incl f.lexical
         result.add f.lexical
@@ -482,7 +511,15 @@ proc lookupByReal(index: SourceIndex; realAbs: string): seq[string] =
   ## out-of-every-root import therefore correctly resolves to nothing here
   ## (no indexed file shares its realpath) rather than over-selecting an
   ## unrelated same-suffix decoy elsewhere in the tree.
-  index.byReal.getOrDefault(realAbs, @[])
+  ##
+  ## RFC-0009 B4a: `realAbs` is re-normalized forward-slash here (self-
+  ## normalizing at the query boundary, matching `addToIndex`'s storage key)
+  ## rather than trusting every call site to already hand in a forward-
+  ## slash-consistent key — `analyzeManifest`'s `depfiles` fallback queries
+  ## with a native-normalized (`.normalizedPath`) candidate, which would
+  ## otherwise silently never match this table's forward-slash keys on
+  ## Windows.
+  index.byReal.getOrDefault(pathnorm.normalizePath(realAbs, '/'), @[])
 
 proc underAnyRoot(index: SourceIndex; absPath: string): bool =
   ## RFC-0009 A4a (D2): thin wrapper over `tracked`/`classify` — the

@@ -199,10 +199,18 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     # Realpath-relative body: many leading ".." components (the exact count
     # does not matter for the fix — lookup strips ALL leading ".." /"."/""
     # components) followed by the REAL (symlink-resolved) absolute path to
-    # outside/src/dep.nim, mangled with @s in place of '/'.
+    # outside/src/dep.nim, mangled with @s in place of '/'. The ".." run and
+    # the absolute path are joined with an explicit "/": a POSIX absolute
+    # path already starts with '/' (so plain concatenation happened to work
+    # before), but a Windows drive-absolute path (`C:/Users/...`) does NOT —
+    # naive concatenation merged the last ".." straight into the drive
+    # letter ("..C:"), a fixture bug that only misbuilds the manifest body
+    # on Windows. `.strip(chars = {'/'})` avoids a doubled separator on
+    # POSIX where `realOutsideAbs` already supplies its own leading '/'.
     let realOutsideAbs = safeExpandFilename(outside)
-    let mangledBody = ("../../../.." & realOutsideAbs & "/src/dep.nim")
-                        .replace("/", "@s")
+    let mangledBody = ("../../../../" &
+                        realOutsideAbs.strip(leading = true, trailing = false, chars = {'/'}) &
+                        "/src/dep.nim").replace("/", "@s")
     writeManifest(nc, "t", compile = @[], link = @[
       nc / "@mt.nim.c.o",
       nc / ("@p" & mangledBody & ".c.o"),
@@ -408,9 +416,15 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     defer: removeSymlinkSafe(root / "lib" / "dep.nim")
 
     let nc = root / "nimcache"
+    # Same explicit-"/"-join fixture fix as the symlinked-dep-root test
+    # above: a Windows drive-absolute `realOutsideAbs` has no leading '/' of
+    # its own, so plain concatenation onto the ".." run silently merges into
+    # "..C:" — a fixture bug invisible on POSIX, where the absolute path's
+    # own leading '/' supplies the missing separator.
     let realOutsideAbs = safeExpandFilename(outside)
-    let mangledBody = ("../../../.." & realOutsideAbs & "/dep.nim")
-                        .replace("/", "@s")
+    let mangledBody = ("../../../../" &
+                        realOutsideAbs.strip(leading = true, trailing = false, chars = {'/'}) &
+                        "/dep.nim").replace("/", "@s")
     writeManifest(nc, "t", compile = @[], link = @[
       nc / "@mt.nim.c.o",
       nc / ("@p" & mangledBody & ".c.o"),

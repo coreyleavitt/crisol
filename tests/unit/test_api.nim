@@ -978,7 +978,18 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     # needs to reuse (SO5's fix) -- the CACHE's own stored blob (which run
     # 2's cdmHit synthesis read) is untouched; only the per-entrypoint
     # stable path is gone.
-    let stableBin = binPath(pep2.ep, cfg) / binName(pep2.ep)
+    #
+    # RFC-0009 B4a: MUST be `stableBinPath`, not a raw `binPath / binName`
+    # concatenation -- the latter is deliberately extensionless (see
+    # `binName`'s own doc comment; it doubles as the nimcache-manifest base
+    # name) and never what `promoteCompiledBinary`/`spawnRunDirect` actually
+    # write/read on Windows (`<bare>.exe`). Deleting the extensionless path
+    # here was a no-op on Windows (`fileExists` false, `removeFile` a silent
+    # no-op on an already-absent file) -- the REAL stable binary survived,
+    # so the "verify" sub-run below actually re-executed it successfully
+    # instead of hitting the intended pkSpawnFailed path, and this test's
+    # own `fileExists`/`errText` assertions failed.
+    let stableBin = stableBinPath(pep2.ep, cfg)
     check fileExists(stableBin)
     removeFile(stableBin)
 
