@@ -77,6 +77,28 @@ proc binPath*(ep: Entrypoint; config: Config): string =
   ## Absolute path to the directory containing the stable compiled binary.
   stateDirOf(config) / "bin" / epSlug(ep, config.trackedRoots)
 
+proc stableBinPath*(ep: Entrypoint; config: Config): string =
+  ## Absolute path to the STABLE, on-disk compiled binary that `decideCompile`
+  ## checks for freshness, that `promoteCompiledBinary` copies the fresh
+  ## per-slot binary to, and that a `cdSkipFresh` run spawns directly.
+  ##
+  ## `binName(ep)` is deliberately extensionless — it doubles as the
+  ## nimcache-manifest base name (`<bare>.json`) and must stay that way (see
+  ## `binName`'s own doc comment) — but the actual file the linker produces,
+  ## and the path a child-process spawn needs, both require the platform
+  ## executable extension: on native Windows, `CreateProcessW` does not
+  ## reliably resolve/execute a fully-qualified path to an extensionless PE
+  ## file, so an extensionless stable binary is silently unspawnable there
+  ## (RFC-0009 B4a: this is what produced `rsStructural`/zero results in
+  ## `test_api`'s fresh runs — the run child never started).
+  ##
+  ## This is the ONE place that appends the extension to the stable binary's
+  ## path, so the promotion target (copyFile dest), the freshness/eligibility
+  ## check (decideCompile's `fileExists`), and the direct-run spawn target
+  ## all agree on every platform. `addFileExt` is a no-op when `ExeExt == ""`
+  ## (POSIX) — POSIX byte-identical.
+  addFileExt(binPath(ep, config) / binName(ep), ExeExt)
+
 proc toolchainFingerprint*(nimVersion: string; ccVersion: string): string =
   ## Short, stable fingerprint of the compiler toolchain (RFC-0006 nimcache-
   ## persistence soundness rule).
@@ -185,7 +207,9 @@ proc decideCompile*(ep: Entrypoint;
   ##   7. forceCompile → cdStale (binary exists, force requested).
   ##   8. → cdSkipFresh.
 
-  let binFull = binPath(ep, config) / binName(ep)
+  # RFC-0009 B4a: the stable binary's real on-disk name (with the platform
+  # executable extension on Windows) — see `stableBinPath`'s doc comment.
+  let binFull = stableBinPath(ep, config)
 
   if not fileExists(binFull):
     if forceCompile:

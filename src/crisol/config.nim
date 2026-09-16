@@ -193,15 +193,6 @@ proc findGitRoot(startDir: string): string =
 proc cfgErr(msg: string) {.noReturn.} =
   raise newCrisolError(cekConfig, msg)
 
-proc safeRealAbs(p: string): string =
-  ## RFC-0009 A2: best-effort realpath, mirroring paths.nim's own private
-  ## `safeExpandFilename` fallback (degrade to `p` unchanged on any OSError/
-  ## ValueError -- e.g. a not-yet-existing dep-root path). Used ONLY for the
-  ## config-time dep-root alias check below; `paths.initTrackedRoots`
-  ## independently computes each `NativeRoot`'s own `realAbs` the same way.
-  try: expandFilename(p)
-  except OSError, ValueError: p
-
 proc validateStateDir(dir: string) =
   ## Reject any state-dir that is absolute or contains ".." components.
   ## Both forms can redirect crisol's entire state tree outside the project
@@ -920,7 +911,17 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # never reads cwd itself) -- closes the closure.nim:357/depgraph.nim:927
     # cwd-join bug on the root definitions themselves.
     let depAbs = nativeCanonicalize(entry.path, projectRootAbs).path
-    let depReal = safeRealAbs(depAbs)
+    # RFC-0009 B4a: this MUST be `paths.safeExpandFilename` (true realpath,
+    # symlink/junction-resolving via GetFinalPathNameByHandleW on Windows),
+    # not the plain `expandFilename` this config-time alias check used to
+    # call directly -- `expandFilename`'s Windows branch is GetFullPathNameW,
+    # purely LEXICAL, and never follows a reparse point, so two dep-roots
+    # aliased via a symlink/junction silently produced two DIFFERENT
+    # `depReal` values there and the alias went undetected. `paths.
+    # initTrackedRoots` already computes each `NativeRoot`'s own `realAbs`
+    # via this same helper -- this call now agrees with it instead of
+    # duplicating a stale, POSIX-only-correct reimplementation.
+    let depReal = safeExpandFilename(depAbs)
     let effectiveName =
       if entry.explicitName.isSome: entry.explicitName.get
       else: depAbs.extractFilename()

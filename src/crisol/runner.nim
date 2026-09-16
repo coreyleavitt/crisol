@@ -965,9 +965,11 @@ proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string):
   ## honest outcome — this is exactly what a genuine post-compile cache hit
   ## (RFC-0005 A2c-ii) requires before it can be served: `cdmHit` relies on
   ## a stable binary existing at rest.
-  let bname        = binName(ep)
   let stableBinDir = binPath(ep, config)
-  let stableBin    = stableBinDir / bname
+  # RFC-0009 B4a: route through `stableBinPath` (not `stableBinDir / bname`)
+  # so the promotion target agrees with decideCompile's freshness check and
+  # spawnRunDirect's spawn target on every platform — see its doc comment.
+  let stableBin    = stableBinPath(ep, config)
   if binCompiled.len == 0 or binCompiled == stableBin:
     return true
   try:
@@ -1284,7 +1286,12 @@ proc spawnRunDirect(
   ## S2b: run deadline set from effectiveRunTimeoutMs(ep, config).
 
   let ep = pep.ep
-  let binFull = binPath(ep, config) / binName(ep)
+  # RFC-0009 B4a: the stable binary's real on-disk name (with the platform
+  # executable extension on Windows) — see `stableBinPath`'s doc comment;
+  # this must agree with promoteCompiledBinary's copy target and
+  # decideCompile's freshness check, or a cdSkipFresh run spawns a path
+  # nothing was ever written to.
+  let binFull = stableBinPath(ep, config)
   let rtMs = effectiveRunTimeoutMs(ep, config)  # S2b: per-entrypoint run budget
 
   # M8: use mkdtemp for temp output directory.
@@ -1976,9 +1983,10 @@ proc execute*(
               if compiledThisRun and slotCacheDir.len > 0:
                 if completedOutcome notin {oCompileFailed, oSpawnError}:
                   let ep = p.entrypoints[completedIdx].ep
-                  let bname = binName(ep)
-                  let stableBinDir = binPath(ep, config)
-                  let stableBin    = stableBinDir / bname
+                  # RFC-0009 B4a: `stableBinPath` (not `binPath / binName`)
+                  # so this warning/discard path names the SAME file
+                  # `promoteCompiledBinary` just wrote — see its doc comment.
+                  let stableBin    = stableBinPath(ep, config)
                   # Invariant on exit from this block: either (the depgraph
                   # entry on disk matches the stable binary at `stableBin`) or
                   # (no stable binary exists at `stableBin`) — NEVER a binary

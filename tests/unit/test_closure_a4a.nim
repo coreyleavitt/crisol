@@ -87,7 +87,7 @@ block test_a4a_symlinked_dep_root_realpath_candidate_classifies_tracked:
   # canonicalizes via realpath (or a depfiles entry naming the resolved
   # path directly) would hand back — NOT the lexical `symlinkDepRoot`-based
   # spelling.
-  let realCandidate = expandFilename(symlinkDepRoot / "lib" / "widget.nim")
+  let realCandidate = safeExpandFilename(symlinkDepRoot / "lib" / "widget.nim")
   doAssert realCandidate != (symlinkDepRoot / "lib" / "widget.nim").normalizedPath,
     "fixture bug: realpath must differ from the lexical symlinked-dep-root path"
 

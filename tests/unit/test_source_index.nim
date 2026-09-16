@@ -200,7 +200,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     # does not matter for the fix — lookup strips ALL leading ".." /"."/""
     # components) followed by the REAL (symlink-resolved) absolute path to
     # outside/src/dep.nim, mangled with @s in place of '/'.
-    let realOutsideAbs = outside.expandFilename
+    let realOutsideAbs = safeExpandFilename(outside)
     let mangledBody = ("../../../.." & realOutsideAbs & "/src/dep.nim")
                         .replace("/", "@s")
     writeManifest(nc, "t", compile = @[], link = @[
@@ -408,7 +408,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     defer: removeSymlinkSafe(root / "lib" / "dep.nim")
 
     let nc = root / "nimcache"
-    let realOutsideAbs = outside.expandFilename
+    let realOutsideAbs = safeExpandFilename(outside)
     let mangledBody = ("../../../.." & realOutsideAbs & "/dep.nim")
                         .replace("/", "@s")
     writeManifest(nc, "t", compile = @[], link = @[
@@ -475,8 +475,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     # Realpath-relative @m body, computed exactly as Nim's mangler does:
     # the shortest relative path from the entrypoint's (real) directory to
     # the dep's REAL (symlink-resolved) path.
-    let realDepNim = expandFilename(outside / "dep" / "src" / "dep.nim")
-    let realEpDir = expandFilename(root / "tests")
+    let realDepNim = safeExpandFilename(outside / "dep" / "src" / "dep.nim")
+    let realEpDir = safeExpandFilename(root / "tests")
     let mangledBody = relativePath(realDepNim, realEpDir).replace($DirSep, "@s")
     writeManifest(nc, "t", compile = @[], link = @[
       nc / "@mt.nim.c.o",
@@ -617,8 +617,8 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     # Nim's mangler does — the shortest relative path from realpath(epDir)
     # to the target, with leading ".." components as needed. `st` and
     # `root` are siblings, so this body carries just one leading "..".
-    let realFoo = expandFilename(root / "src" / "foo.nim")
-    let realSt = expandFilename(stDir)
+    let realFoo = safeExpandFilename(root / "src" / "foo.nim")
+    let realSt = safeExpandFilename(stDir)
     let mangledBody = relativePath(realFoo, realSt).replace($DirSep, "@s")
 
     writeManifest(nc, "t", compile = @[], link = @[
