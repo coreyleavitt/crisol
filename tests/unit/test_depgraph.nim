@@ -26,18 +26,24 @@ proc makeTmpConfig(root: string): Config =
 proc ensureStateDirExists(root: string) =
   createDir(root / ".crisol")
 
+let tpSetRoots = initTrackedRoots(getTempDir(), @[], "")
+  ## RFC-0009 B4a: a REAL `TrackedRoots` anchored at the OS temp directory.
+  ## A vacuous/zero-value `TrackedRoots` (project.abs == "") only ever
+  ## classified a path `pcTracked` by accident of `underRoot`'s "/"-prefix
+  ## fallback -- a POSIX-only coincidence that made every ABSOLUTE spelling
+  ## match trivially on Linux/macOS but never on Windows (`C:\...` doesn't
+  ## start with "/"). `getTempDir()` is an ancestor of every real absolute
+  ## path any test in this file builds (`getTempDir() / "crisol_depgraph_*"`
+  ## subdirectories), and a harmless anchor for the bare project-relative
+  ## vectors that only need SOME valid root to classify `pcTracked` under.
+
 proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
-  ## RFC-0009 A3c-ii: build a `HashSet[TrackedPath]` via `classify` under a
-  ## vacuous (zero-value) `TrackedRoots` -- matches `makeTmpConfig`'s
-  ## `Config`, which leaves `trackedRoots` at ITS zero value too, so a
-  ## closure built here round-trips identically through save/load in the
-  ## SAME test (both sides classify under the same vacuous root). Every
-  ## absolute OR project-relative spelling classifies `pcTracked` under
-  ## this root by construction (see `classify`/`underRoot` with an empty
-  ## `roots.project.abs`).
+  ## Build a `HashSet[TrackedPath]` via `classify` under `tpSetRoots` (see
+  ## above). Every absolute OR project-relative spelling classifies
+  ## `pcTracked` under this root by construction.
   result = initHashSet[TrackedPath]()
   for p in paths:
-    let pc = classify(p, default(TrackedRoots))
+    let pc = classify(p, tpSetRoots)
     doAssert pc.kind == pcTracked, "test path failed to classify: " & p
     result.incl pc.tp
 
@@ -204,7 +210,7 @@ block test_isEntryStale_missing_file:
   updateEntry(g, path, fh, tpSet(nonExistent))
 
   let key = (path, fh)
-  assert isEntryStale(g, key, root, default(TrackedRoots)),
+  assert isEntryStale(g, key, root, tpSetRoots),
     "isEntryStale must be true when closure contains a non-existent file"
 
 block test_isEntryStale_all_files_exist:
@@ -222,7 +228,7 @@ block test_isEntryStale_all_files_exist:
   updateEntry(g, path, fh, tpSet(realFile))
 
   let key = (path, fh)
-  assert not isEntryStale(g, key, root, default(TrackedRoots)),
+  assert not isEntryStale(g, key, root, tpSetRoots),
     "isEntryStale must be false when all closure files exist"
 
 block test_isEntryStale_absent_entry:

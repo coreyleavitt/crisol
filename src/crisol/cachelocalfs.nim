@@ -75,7 +75,7 @@ import crisol/fnv
 import crisol/paths      # RFC-0009 A5b-i: CacheKeyPath overload of sidecarPath
 
 proc entryPath(root: string; key: SoundnessKey): string {.inline.} =
-  cacheVersionDirAt(root) / ($key & ".json")
+  cacheVersionDirAt(root) & "/" & ($key & ".json")
 
 proc countEntries(dir: string): int =
   ## Mirrors `resultcache`'s `countCacheEntries` exactly — count `*.json`
@@ -111,14 +111,14 @@ proc classifyRootForRead(root: string; autoCreate: bool): RootState =
 # ---------------------------------------------------------------------------
 
 proc inputsDirAt(root: string): string {.inline.} =
-  cacheVersionDirAt(root) / "inputs"
+  cacheVersionDirAt(root) & "/inputs"
 
 proc sidecarPath*(root: string; path: string): string =
   ## `<root>/v<N>/inputs/<fnv(path)>.json` — keyed by the entrypoint PATH
   ## (never `identityKey`/`SoundnessKey`), so a flag change still finds the
   ## sidecar and explains as `kcFlags` rather than "no prior inputs"
   ## (RFC-0005 "Miss-explanation").
-  inputsDirAt(root) / (toHex16(fnv1a64(path)) & ".json")
+  inputsDirAt(root) & "/" & (toHex16(fnv1a64(path)) & ".json")
 
 proc sidecarPath*(root: string; key: CacheKeyPath): string =
   ## RFC-0009 A5b-i: `CacheKeyPath` overload — additive only. In-module

@@ -13,7 +13,7 @@
 ## Run with:
 ##   ./dev test tests/unit/test_statedirof.nim
 
-import std/[os, unittest, tempfiles]
+import std/[os, unittest, tempfiles, strutils]
 import crisol/[types, config]
 
 proc makeTmpDir(): string =
@@ -76,7 +76,12 @@ suite "stateDirOf — CRISOL_STATE_DIR env override":
     setCurrentDir(otherCwd)
     putEnv("CRISOL_STATE_DIR", "relative_state/../relative_state/sub")
     try:
-      check stateDirOf(cfg) == cfg.projectRoot / "relative_state" / "sub"
+      # RFC-0009 B4a: stateDirOf's env-set branch routes through
+      # nativeCanonicalize, which always returns forward-slash canonical
+      # text (see paths.nim) -- regardless of host OS. std/os's `/` would
+      # yield a backslash-joined expectation on native Windows, so build
+      # the expected value as an explicit forward-slash string instead.
+      check stateDirOf(cfg) == cfg.projectRoot.replace('\\', '/') & "/relative_state/sub"
       check stateDirOf(cfg) != otherCwd / "relative_state" / "sub"
     finally:
       delEnv("CRISOL_STATE_DIR")
@@ -88,6 +93,7 @@ suite "stateDirOf — CRISOL_STATE_DIR env override":
     let cfg = loadKdl(tmp, "state-dir \".crisol\"\n")
     putEnv("CRISOL_STATE_DIR", tmp & "//nested///dir")
     try:
-      check stateDirOf(cfg) == tmp / "nested" / "dir"
+      # RFC-0009 B4a: see the note above -- forward-slash canonical expected.
+      check stateDirOf(cfg) == tmp.replace('\\', '/') & "/nested/dir"
     finally:
       delEnv("CRISOL_STATE_DIR")

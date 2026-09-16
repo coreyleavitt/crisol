@@ -26,6 +26,7 @@ import std/[os, sets, json]
 import crisol/types
 import crisol/paths
 import crisol/closure
+import ../support/symlinkprobe
 
 proc writeManifestWithDepfile(dir, bname: string; depfilePath: string) =
   ## `link` carries only the entrypoint's own module object (so
@@ -56,24 +57,24 @@ block test_a4a_symlinked_dep_root_realpath_candidate_classifies_tracked:
   let symlinkDepRoot = getTempDir() / "crisol_a4a_dep_symlink"
   removeDir(projRoot)
   removeDir(realDepDir)
-  if symlinkExists(symlinkDepRoot) or fileExists(symlinkDepRoot):
-    removeFile(symlinkDepRoot)
+  removeSymlinkSafe(symlinkDepRoot)
+  if not symlinksAvailable():
+    echo "SKIP test_closure_a4a: symlinks unavailable in this environment"
+    quit(0)
   createDir(projRoot / "tests")
   createDir(realDepDir / "lib")
   writeFile(realDepDir / "lib" / "widget.nim", "# widget\n")
 
-  try:
-    createSymlink(realDepDir, symlinkDepRoot)
-  except OSError as e:
-    echo "SKIP test_closure_a4a: symlink creation failed in this environment: " & e.msg
-    removeDir(projRoot)
-    removeDir(realDepDir)
-    quit(0)
+  createSymlink(realDepDir, symlinkDepRoot)
 
   defer:
+    # RFC-0009 B4a: symlinkDepRoot is a DIRECTORY symlink -- removeFile()
+    # is ERROR_ACCESS_DENIED for a directory reparse point on Windows (only
+    # RemoveDirectoryW can unlink one). Unlink it via removeSymlinkSafe
+    # BEFORE removing the (unrelated) projRoot/realDepDir directories.
+    removeSymlinkSafe(symlinkDepRoot)
     removeDir(projRoot)
     removeDir(realDepDir)
-    removeFile(symlinkDepRoot)
 
   var cfg = Config(projectRoot: projRoot, stateDir: ".crisol",
                    depRoots: @[symlinkDepRoot])

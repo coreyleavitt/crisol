@@ -16,13 +16,22 @@
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src tests/unit/test_rfc9_a2_config.nim
 
-import std/[os, unittest, tempfiles]
+import std/[os, unittest, tempfiles, strutils]
 import crisol/[types, config, paths]
 import ../support/symlinkprobe
 
 proc writeFile(dir, name, content: string): string =
   result = dir / name
   writeFile(result, content)
+
+proc kdlPath(p: string): string =
+  ## RFC-0009 B4a: a native OS-joined path (`std/os`'s `/`) carries
+  ## backslashes on Windows; embedded verbatim into a `crisol.kdl` string
+  ## literal, a backslash is parsed as an escape-sequence introducer and the
+  ## KDL parser raises "invalid escape sequence". config.nim accepts
+  ## forward slashes everywhere, so every dep-root path embedded into KDL
+  ## text in this file goes through this normalizer first.
+  p.replace('\\', '/')
 
 proc makeTmpDir(): string =
   createTempDir("crisol_rfc9_a2_", "")
@@ -76,7 +85,7 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     createDir(depDir)
 
     let cfgPath = writeFile(tmp, "crisol.kdl",
-      "dep-roots \"" & depDir & "\"\n" &
+      "dep-roots \"" & kdlPath(depDir) & "\"\n" &
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
     let (cfg, _) = loadConfig(configPath = cfgPath)
 
@@ -93,7 +102,7 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     createDir(depDir)
 
     let cfgPath = writeFile(tmp, "crisol.kdl",
-      "dep-roots \"" & depDir & "\" name=\"custom\"\n" &
+      "dep-roots \"" & kdlPath(depDir) & "\" name=\"custom\"\n" &
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
     let (cfg, _) = loadConfig(configPath = cfgPath)
 
@@ -109,8 +118,8 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     createDir(depParent / "mydep")
 
     let cfgPath = writeFile(tmp, "crisol.kdl",
-      "dep-roots \"" & (depParent / "MyDep") & "\"\n" &
-      "dep-roots \"" & (depParent / "mydep") & "\"\n" &
+      "dep-roots \"" & kdlPath(depParent / "MyDep") & "\"\n" &
+      "dep-roots \"" & kdlPath(depParent / "mydep") & "\"\n" &
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
 
     var caught = false
@@ -133,10 +142,17 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     createDir(real)
     let alias = depParent / "alias"
     createSymlink(real, alias)
+    # RFC-0009 B4a: `alias` is a DIRECTORY symlink -- std/os's removeDir
+    # (invoked on `depParent` via the earlier `defer`) calls removeFile on
+    # every entry it walks, which is ERROR_ACCESS_DENIED for a directory
+    # reparse point on Windows (only RemoveDirectoryW can unlink one).
+    # Unlink it explicitly, via the LIFO-ordered defer below, before
+    # removeDir(depParent) ever runs.
+    defer: removeSymlinkSafe(alias)
 
     let cfgPath = writeFile(tmp, "crisol.kdl",
-      "dep-roots \"" & real & "\" name=\"one\"\n" &
-      "dep-roots \"" & alias & "\" name=\"two\"\n" &
+      "dep-roots \"" & kdlPath(real) & "\" name=\"one\"\n" &
+      "dep-roots \"" & kdlPath(alias) & "\" name=\"two\"\n" &
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
 
     var caught = false
@@ -158,7 +174,7 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     createDir(depDir)
 
     let cfgPath = writeFile(tmp, "crisol.kdl",
-      "dep-roots \"" & depDir & "\" name=\"bad/name\"\n" &
+      "dep-roots \"" & kdlPath(depDir) & "\" name=\"bad/name\"\n" &
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
 
     var caught = false
@@ -180,7 +196,7 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     createDir(depDir)
 
     let cfgPath = writeFile(tmp, "crisol.kdl",
-      "dep-roots \"" & depDir & "\" name=\"bad:name\"\n" &
+      "dep-roots \"" & kdlPath(depDir) & "\" name=\"bad:name\"\n" &
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
 
     var caught = false
@@ -202,7 +218,7 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     createDir(depParent / "b")
 
     let cfgPath = writeFile(tmp, "crisol.kdl",
-      "dep-roots \"" & (depParent / "a") & "\" \"" & (depParent / "b") &
+      "dep-roots \"" & kdlPath(depParent / "a") & "\" \"" & kdlPath(depParent / "b") &
       "\" name=\"ambiguous\"\n" &
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
 
@@ -237,7 +253,7 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     setCurrentDir(elsewhere)
 
     let cfgPath = writeFile(projectRoot, "crisol.kdl",
-      "dep-roots \"" & siblingSrc & "\" name=\"abs\"\n" &
+      "dep-roots \"" & kdlPath(siblingSrc) & "\" name=\"abs\"\n" &
       "dep-roots \"../sibling/src\" name=\"rel\"\n" &
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
 

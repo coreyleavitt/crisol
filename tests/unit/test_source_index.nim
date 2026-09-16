@@ -145,6 +145,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     # (d) planted under a symlinked dir nested inside the project tree
     writeFile(outside / "x.nim", "# x outside\n")
     createSymlink(outside, root / "linked")
+    defer: removeSymlinkSafe(root / "linked")
 
     let nc = root / "nimcache"
     writeManifest(nc, "t", compile = @[], link = @[
@@ -189,6 +190,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     createDir(outside / "src")
     writeFile(outside / "src" / "dep.nim", "# dep\n")
     createSymlink(outside, depRootPath)
+    defer: removeSymlinkSafe(depRootPath)
 
     let ep = projRoot / "tests" / "t.nim"
     writeFile(ep, "# ep\n")
@@ -280,24 +282,32 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## `@p` (SourceIndex-based --path resolution) and `@m` (resolved
     ## relative to the entrypoint's own source directory, via a leading
     ## `..` body) — both must decode "lib@h1@c2@sw.nim" to "lib#1:2/w.nim".
-    let root = freshRoot("hashcolonescapes")
-    defer: removeDir(root)
-    createDir(root / "tests")
-    createDir(root / "lib#1:2")
-    let ep = root / "tests" / "t.nim"
-    writeFile(ep, "# ep\n")
-    writeFile(root / "lib#1:2" / "w.nim", "# w\n")
-    let nc = root / "nimcache"
-    writeManifest(nc, "t", compile = @[], link = @[
-      nc / "@mt.nim.c.o",
-      nc / "@plib@h1@c2@sw.nim.c.o",
-      nc / "@m..@slib@h1@c2@sw.nim.c.o",
-    ])
-    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
-    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
-    let cl = extractClosure(nc, "t", ep, cfg)
-    check projTp("lib#1:2/w.nim", cfg.trackedRoots) in cl
-    check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("lib#1:2/w.nim", cfg.trackedRoots)])
+    ##
+    ## RFC-0009 B4a: gated on Windows. The fixture needs a real directory
+    ## named "lib#1:2" on disk -- NTFS categorically forbids ':' in a
+    ## filename, so no real Windows filesystem could ever present this
+    ## vector; there is nothing to fix here, only to exclude.
+    when defined(windows):
+      skip()
+    else:
+      let root = freshRoot("hashcolonescapes")
+      defer: removeDir(root)
+      createDir(root / "tests")
+      createDir(root / "lib#1:2")
+      let ep = root / "tests" / "t.nim"
+      writeFile(ep, "# ep\n")
+      writeFile(root / "lib#1:2" / "w.nim", "# w\n")
+      let nc = root / "nimcache"
+      writeManifest(nc, "t", compile = @[], link = @[
+        nc / "@mt.nim.c.o",
+        nc / "@plib@h1@c2@sw.nim.c.o",
+        nc / "@m..@slib@h1@c2@sw.nim.c.o",
+      ])
+      var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+      cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
+      let cl = extractClosure(nc, "t", ep, cfg)
+      check projTp("lib#1:2/w.nim", cfg.trackedRoots) in cl
+      check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("lib#1:2/w.nim", cfg.trackedRoots)])
 
   test "ambiguity pin: a body present under two tracked locations resolves to both (R7 over-selection)":
     let root = freshRoot("ambig")
@@ -395,6 +405,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     writeFile(ep, "# ep\n")
     writeFile(outside / "dep.nim", "# outside dep\n")
     createSymlink(outside / "dep.nim", root / "lib" / "dep.nim")
+    defer: removeSymlinkSafe(root / "lib" / "dep.nim")
 
     let nc = root / "nimcache"
     let realOutsideAbs = outside.expandFilename
@@ -455,6 +466,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     createDir(outside / "dep" / "src")
     writeFile(outside / "dep" / "src" / "dep.nim", "# dep\n")
     createSymlink(outside / "dep", depRootPath)
+    defer: removeSymlinkSafe(depRootPath)
 
     let ep = root / "tests" / "t.nim"
     writeFile(ep, "# ep\n")
@@ -596,6 +608,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     writeFile(root / "src" / "foo.nim", "# foo\n")
     writeFile(stDir / "t.nim", "# ep\n")
     createSymlink(stDir, root / "a" / "b" / "tests")
+    defer: removeSymlinkSafe(root / "a" / "b" / "tests")
 
     let ep = root / "a" / "b" / "tests" / "t.nim"
     let nc = root / "nimcache"
@@ -641,6 +654,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     writeFile(root / "other" / "helper.nim", "# helper, real sibling\n")
     writeFile(root / "other" / "t.nim", "# ep, real file\n")
     createSymlink(root / "other" / "t.nim", root / "tests" / "t.nim")
+    defer: removeSymlinkSafe(root / "tests" / "t.nim")
 
     let ep = root / "tests" / "t.nim"      # lexical, symlinked FILE
     let nc = root / "nimcache"
@@ -677,6 +691,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     createDir(root / "a" / "b")
     writeFile(st / "t.nim", "# ep\n")
     createSymlink(st, root / "a" / "b" / "tests")
+    defer: removeSymlinkSafe(root / "a" / "b" / "tests")
 
     let ep = root / "a" / "b" / "tests" / "t.nim"
     let nc = root / "nimcache"

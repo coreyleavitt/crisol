@@ -262,6 +262,7 @@ block test_m10_symlinked_source_inside_root_retained:
 
   let linkPath = root / "src" / "linked.nim"
   createSymlink(outsideTarget, linkPath)
+  defer: removeSymlinkSafe(linkPath)
 
   let headerNode = %* {
     "nimVersion": "2.2.10",
@@ -317,6 +318,7 @@ block test_m10_depRoot_via_symlink_absolute_path_retained:
 
   let depRootLink = root / "_deps" / "x"
   createSymlink(outsideDepsDir, depRootLink)
+  defer: removeSymlinkSafe(depRootLink)
 
   let absClosurePath = depRootLink / "lib.nim"  # absolute, lexically under depRootLink
 

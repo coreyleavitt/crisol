@@ -1,0 +1,5 @@
+# RFC-0009 B4a: force LF in the working tree on every host. crisol hashes the
+# raw bytes of committed fixture files (fnv.chainedContentHash) and derives
+# cross-host cache keys from tree content; a Windows CRLF checkout would change
+# those bytes and break the SAME-tree-SAME-key portability guarantee (§4).
+* text=auto eol=lf

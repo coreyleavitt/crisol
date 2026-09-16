@@ -32,6 +32,7 @@
 ##   - Entries differ by compile flag, confirming (path, flag-hash) keying.
 
 import std/[os, strutils]
+import crisol/paths      # nativeCanonicalize (host-agnostic path resolution, RFC-0009 B4a)
 
 type
   MangledKind* = enum
@@ -72,11 +73,17 @@ proc decodeMangledPath*(cFilePath: string; entrypointPath: string): string =
   let noExt   = base[0 .. ^3]           # strip ".c"  e.g. "@mdeptest_dep.nim"
   let noPrefix = noExt[2 .. ^1]         # strip "@m"  e.g. "deptest_dep.nim"
                                         # or "@s"-encoded: "..@ssrc@smylib.nim"
-  # Decode @s → path separator, @@ → @ (Nim escapes @ as @@).
+  # Decode @s → path separator, @@ → @ (Nim escapes @ as @@). @s decodes to a
+  # forward slash, NOT $DirSep: this function must be host-agnostic (RFC-0009
+  # B4a) — a Windows build decoding to '\' produced a backslash-mixed path
+  # that disagreed with the forward-slash canonical form the rest of the
+  # identity system uses.
   let decoded = noPrefix
     .replace("@@", "\x00")              # protect literal @ temporarily
-    .replace("@s", $DirSep)             # @s → /
+    .replace("@s", "/")                 # @s → forward slash (host-agnostic)
     .replace("\x00", "@")               # restore literal @
-  # Resolve relative to the entrypoint's source directory.
-  let epDir  = entrypointPath.parentDir
-  result = (epDir / decoded).normalizedPath  # canon-ok: resolve closure member relative to entrypoint source dir (lexical, closure §5)
+  # Resolve relative to the entrypoint's source directory through the paths
+  # seam's host-agnostic canonicalizer (forward-slash, dot-segments resolved),
+  # not os `/`+normalizedPath (which reintroduce native separators on Windows).
+  let epDir = entrypointPath.parentDir
+  result = nativeCanonicalize(decoded, epDir).path

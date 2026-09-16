@@ -98,12 +98,17 @@ block test_own_file_beats_miss:
   var g = emptyGraph()
   let e = ep("tests/unit/test_self.nim")
   # Closure has a non-existent file; would be stale if we got that far.
+  # RFC-0009 B4a: nonExistent is a REAL absolute OS path (under tmpDir) --
+  # classify() needs a root that actually anchors it (a vacuous "/" root
+  # only ever worked for POSIX-shaped absolutes), so anchor at tmpDir
+  # itself, same as the tmpRoots vectors below.
   let tmpDir = getTempDir()
+  let tmpRoots = mkRoots(tmpDir)
   let nonExistent = tmpDir / "crisol_d4_self_unrel_" & $getCurrentProcessId() & ".nim"
-  g.updateEntry(e.tp.display(), flagHash(e.flags), toSet(roots, nonExistent))
+  g.updateEntry(e.tp.display(), flagHash(e.flags), toSet(tmpRoots, nonExistent))
   # changed only contains ep.path — the own-file rule fires (priority 2).
-  let changed = changedTp(roots, "tests/unit/test_self.nim")
-  let result = selectByDiff(@[e], changed, g, roots, "")
+  let changed = changedTp(tmpRoots, "tests/unit/test_self.nim")
+  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
   assert result.len == 1, "own-file-changed must be included even on closure miss"
   assert result[0].reason == srOwnFileChanged,
     "expected srOwnFileChanged, got " & $result[0].reason
@@ -116,16 +121,19 @@ block test_own_file_beats_stale:
   # ep.path is in changed AND the entry is stale (closure has a missing file).
   # Priority: srOwnFileChanged comes before srStaleEntry.
   let tmpDir = getTempDir()
+  let tmpRoots = mkRoots(tmpDir)
   let missingFile = tmpDir / "crisol_d4_test_missing_" & $getCurrentProcessId() & ".nim"
   # Do NOT create missingFile — it must not exist.
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_priority.nim")
   # Closure includes a file that does not exist → isEntryStale would return true.
-  g.updateEntry(e.tp.display(), flagHash(e.flags), toSet(roots, missingFile))
+  # RFC-0009 B4a: missingFile is a real absolute OS path; anchor at tmpDir
+  # (see test_own_file_beats_miss above).
+  g.updateEntry(e.tp.display(), flagHash(e.flags), toSet(tmpRoots, missingFile))
   # ep.path is also in changed → own-file rule fires first.
-  let changed = changedTp(roots, "tests/unit/test_priority.nim")
-  let result = selectByDiff(@[e], changed, g, roots, "")
+  let changed = changedTp(tmpRoots, "tests/unit/test_priority.nim")
+  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
   assert result.len == 1
   assert result[0].reason == srOwnFileChanged,
     "own-file must beat stale; got " & $result[0].reason
@@ -165,20 +173,24 @@ block test_stale_entry:
   # Create a real temp file, populate a closure with it, then delete it.
   # isEntryStale will detect the missing file and return true.
   let tmpDir = getTempDir()
+  let tmpRoots = mkRoots(tmpDir)
   let tmpFile = tmpDir / "crisol_d4_stale_" & $getCurrentProcessId() & ".nim"
   writeFile(tmpFile, "# temp\n")
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_stale.nim")
   # Closure references the temp file (which exists right now).
-  g.updateEntry(e.tp.display(), flagHash(e.flags), toSet(roots, tmpFile))
+  # RFC-0009 B4a: tmpFile is a real absolute OS path; anchor at tmpDir so
+  # isEntryStale's toNative(roots) round-trips it to the real path (not a
+  # POSIX-only "/" vacuous root) — see test_own_file_beats_miss above.
+  g.updateEntry(e.tp.display(), flagHash(e.flags), toSet(tmpRoots, tmpFile))
 
   # Now delete the file to simulate a missing closure dependency.
   removeFile(tmpFile)
 
   # changed is disjoint — would be a miss if fresh — but entry is stale.
-  let changed = changedTp(roots, "src/crisol/unrelated.nim")
-  let result = selectByDiff(@[e], changed, g, roots, "")
+  let changed = changedTp(tmpRoots, "src/crisol/unrelated.nim")
+  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
   assert result.len == 1,
     "stale entry must be included even when changed is disjoint"
   assert result[0].reason == srStaleEntry,
@@ -251,15 +263,18 @@ block test_known_miss_excluded:
 
 block test_priority_own_file_vs_stale:
   let tmpDir = getTempDir()
+  let tmpRoots = mkRoots(tmpDir)
   let missingFile2 = tmpDir / "crisol_d4_prio_" & $getCurrentProcessId() & ".nim"
   # missingFile2 does NOT exist — closure will be stale.
+  # RFC-0009 B4a: missingFile2 is a real absolute OS path; anchor at tmpDir
+  # (see test_own_file_beats_miss above).
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_prio.nim")
-  g.updateEntry(e.tp.display(), flagHash(e.flags), toSet(roots, missingFile2))
+  g.updateEntry(e.tp.display(), flagHash(e.flags), toSet(tmpRoots, missingFile2))
   # Both conditions: own-file in changed AND entry is stale.
-  let changed = changedTp(roots, "tests/unit/test_prio.nim")
-  let result = selectByDiff(@[e], changed, g, roots, "")
+  let changed = changedTp(tmpRoots, "tests/unit/test_prio.nim")
+  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
   assert result.len == 1
   # Own-file rule (priority 2) fires before stale rule (priority 4).
   assert result[0].reason == srOwnFileChanged,

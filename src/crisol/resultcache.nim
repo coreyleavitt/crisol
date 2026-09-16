@@ -174,10 +174,10 @@ proc isResultCacheRootName*(name: string): bool =
 # shares this ONE proc rather than re-deriving the dir name itself.
 
 proc cacheVersionDirAt*(root: string): string {.inline.} =
-  root / resultCacheDirName()
+  root & "/" & resultCacheDirName()
 
 proc keyFilePathAt(root: string; key: SoundnessKey): string {.inline.} =
-  cacheVersionDirAt(root) / ($key & ".json")
+  cacheVersionDirAt(root) & "/" & ($key & ".json")
 
 # ---------------------------------------------------------------------------
 # Payload (de)serialization — the canonical form the checksum is taken over
@@ -552,7 +552,7 @@ proc pruneOrphanSidecars(verDir: string; liveKeys: HashSet[string]) =
   ## Delete any `<verDir>/inputs/<fnv(path)>.json` sidecar whose every
   ## recorded SoundnessKey has no surviving `<key>.json` entry -- i.e. the
   ## path it was keyed on has no live cache entry left.
-  let inputsDir = verDir / "inputs"
+  let inputsDir = verDir & "/inputs"
   if not dirExists(inputsDir): return
   for kind, path in walkDir(inputsDir):
     if kind != pcFile or not path.endsWith(".json"): continue

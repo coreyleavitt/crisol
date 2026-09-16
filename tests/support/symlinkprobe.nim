@@ -36,3 +36,24 @@ proc symlinksAvailable*(): bool =
   finally:
     try: removeDir(dir) except CatchableError: discard
   cached
+
+proc removeSymlinkSafe*(path: string) =
+  ## Unlink a symlink created by a test, correctly on every platform. Nim's
+  ## os.removeDir walks a tree and calls removeFile() on any entry — but on
+  ## Windows removeFile() is DeleteFileW, which returns ERROR_ACCESS_DENIED for
+  ## a DIRECTORY-type reparse point (only RemoveDirectoryW can unlink one). So
+  ## a test that createSymlink()'d a directory and then let removeDir() clean up
+  ## crashes with "Access is denied" on Windows. Call this on each symlink path
+  ## BEFORE removing the enclosing directory. No std/posix (import-purity).
+  if not (fileExists(path) or dirExists(path) or symlinkExists(path)):
+    return
+  when defined(windows):
+    # A directory symlink must go via removeDir (RemoveDirectoryW); a file
+    # symlink via removeFile. dirExists follows the link, so a dangling one
+    # falls through to removeFile.
+    if dirExists(path):
+      try: removeDir(path) except CatchableError: (try: removeFile(path) except CatchableError: discard)
+    else:
+      try: removeFile(path) except CatchableError: discard
+  else:
+    try: removeFile(path) except CatchableError: discard
