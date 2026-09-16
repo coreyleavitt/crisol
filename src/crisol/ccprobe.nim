@@ -229,12 +229,29 @@ proc shellSplit*(s: string): tuple[toks: seq[string]; ok: bool] =
         return (toks: newSeq[string](), ok: false)   # unterminated double quote
       inc i   # skip closing quote
     of '\\':
-      haveCur = true
-      if i + 1 < n:
-        cur.add s[i + 1]
-        i += 2
+      when defined(windows):
+        # RFC-0009 B4a: on Windows a bare `\` outside quotes is a LITERAL
+        # path separator, not a shell escape — Windows/MSVC argv rules only
+        # treat `\` as special immediately before a `"` (already handled by
+        # the `"` case above; a lone backslash between tokens is never an
+        # escape). The nimcache manifest's `compile[]` ccCmd strings on
+        # Windows are backslash-separated paths, NOT POSIX-escaped, so
+        # consuming `\` as an escape here would corrupt e.g. `-o
+        # obj\add.obj` into `-o objadd.obj`, and deriveCcMInvocation's
+        # ccCmdOutputObj match (closure.nim) would then never find it.
+        # POSIX keeps the original escaping tokenizer unconditionally (the
+        # `else` branch below) — this `when` compiles to only ONE arm per
+        # target, so POSIX output is byte-identical to before this fix.
+        haveCur = true
+        cur.add c
+        inc i
       else:
-        return (toks: newSeq[string](), ok: false)   # trailing unescaped backslash
+        haveCur = true
+        if i + 1 < n:
+          cur.add s[i + 1]
+          i += 2
+        else:
+          return (toks: newSeq[string](), ok: false)   # trailing unescaped backslash
     else:
       haveCur = true
       cur.add c

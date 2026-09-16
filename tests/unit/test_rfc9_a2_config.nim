@@ -89,7 +89,13 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
       "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
     let (cfg, _) = loadConfig(configPath = cfgPath)
 
-    check cfg.depRoots == @[depDir]
+    # RFC-0009 B4a: `cfg.depRoots` stores the path AS WRITTEN in the KDL text
+    # (config.nim: "depRoots (the plain path list) is untouched, unchanged
+    # behavior") -- and the KDL text embedded `kdlPath(depDir)` (forward-
+    # slash), not `depDir` itself (native, backslash on Windows). Normalize
+    # the expected side to match -- a no-op on POSIX (`depDir` has no
+    # backslashes there).
+    check cfg.depRoots == @[depDir.replace('\\', '/')]
     check cfg.trackedRoots.deps.len == 1
     check cfg.trackedRoots.deps[0].name == "mydep"
 

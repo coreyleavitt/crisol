@@ -180,7 +180,7 @@
 ## `{.compile.}` object, and a non-absolute `{.link.}` entry — both name a
 ## `link` member `extractClosure` cannot attribute to any source file.
 
-import std/[algorithm, json, os, sets, strutils, tables]
+import std/[algorithm, json, os, pathnorm, sets, strutils, tables]
 import crisol/types
 import crisol/paths    # RFC-0009 A4a: classify/TrackedPath/PathClass/display/toNative
                         # — the index/relativize identity layer, below.
@@ -308,9 +308,7 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
   ## `index.roots` directly (bypassing the index, and hence this pruning)
   ## rather than treating a pruned-and-therefore-unindexed file as
   ## untracked.
-  let realDir =
-    try: expandFilename(dir)
-    except OSError: dir
+  let realDir = safeExpandFilename(dir)
   for entry in walkDir(dir):
     let name = entry.path.lastPathPart
     case entry.kind
@@ -325,9 +323,13 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
     of pcFile:
       index.addToIndex(recordRoot / name, realDir / name)
     of pcLinkToFile:
-      let real =
-        try: expandFilename(entry.path)
-        except OSError: recordRoot / name
+      # RFC-0009 B4a: safeExpandFilename returns `entry.path` unchanged on
+      # failure (never raises), not `recordRoot / name` like the old
+      # try/except did — acceptable: a failed realpath falls back to the
+      # (still-correct, just non-canonical) lexical path either way, and
+      # `addToIndex`/`lookup` degrade the same as any other unresolvable
+      # symlink target.
+      let real = safeExpandFilename(entry.path)
       index.addToIndex(recordRoot / name, real)
 
 proc buildSourceIndex*(config: Config): SourceIndex =
@@ -378,9 +380,12 @@ proc buildSourceIndex*(config: Config): SourceIndex =
   let prAbs = config.projectRoot.absolutePath.normalizedPath
   result.roots.add prAbs
   if dirExists(prAbs):
-    let prReal =
-      try: prAbs.expandFilename.normalizedPath
-      except OSError: prAbs
+    # RFC-0009 B4a: safeExpandFilename is already canonical/forward-slash
+    # (Windows: GetFinalPathNameByHandleW, long-path-prefix-stripped; POSIX:
+    # realpath(3)) — no separate `.normalizedPath` pass needed. On POSIX,
+    # expandFilename-ing an already-normalized absolute path is itself
+    # canonical, so this is byte-identical to the old expression there.
+    let prReal = safeExpandFilename(prAbs)
     if prReal != prAbs: result.roots.add prReal
     walkForIndex(prAbs, prAbs, stateDirAbs, result)
 
@@ -806,14 +811,31 @@ proc resolveMangledAll(mangledName: string;
     # Relative to the entrypoint's source directory. `body` is always
     # computed by the compiler from `parentDir(realpath(ENTRYPOINT FILE))`
     # — see this proc's doc comment for the two cases this splits into.
-    let epAbs = entrypointPath.absolutePath
+    #
+    # RFC-0009 B4a: `safeExpandFilename` (used for `realEpDir` below)
+    # returns FORWARD-SLASH on Windows, but a plain `.absolutePath` /
+    # `.parentDir` is NATIVE (backslash on Windows) — comparing a
+    # forward-slash `realEpDir` against a backslash `epDir` below would
+    # wrongly diverge (Case 1 vs Case 2) on Windows even when the
+    # entrypoint carries no symlink at all. Normalize `epAbs` to
+    # forward-slash up front so `epDir`, `realEpDir`, and both candidates
+    # stay forward-slash-consistent end to end — matching crisol's
+    # forward-slash internal model. `replace('\\', '/')` is a no-op on
+    # POSIX (no backslashes in a POSIX path), so this is byte-identical
+    # there.
+    let epAbs = entrypointPath.absolutePath.replace('\\', '/')
     let epDir = epAbs.parentDir
-    let realEpDir =
-      try: expandFilename(epAbs).parentDir
-      except OSError:
-        try: expandFilename(epDir)
-        except OSError: epDir
-    let lexicalCandidate = (epDir / body).normalizedPath
+    let realEpDir = safeExpandFilename(epAbs).parentDir
+    # `(epDir / body)` would insert the NATIVE separator (backslash on
+    # Windows) even though both operands are forward-slash — use an
+    # explicit join instead so the candidate stays forward-slash on
+    # Windows too. `pathnorm.normalizePath(_, '/')` — the same primitive
+    # `.normalizedPath` wraps, but with an explicit forward-slash `dirSep`
+    # instead of `.normalizedPath`'s native-`DirSep` default — collapses
+    # `.`/`..`/redundant separators without reintroducing a backslash;
+    # on POSIX `DirSep` already IS '/', so this is byte-identical to the
+    # old `.normalizedPath` there.
+    let lexicalCandidate = pathnorm.normalizePath(epDir & "/" & body, '/')
     var seen = initHashSet[string]()
 
     if realEpDir == epDir:
@@ -854,7 +876,9 @@ proc resolveMangledAll(mangledName: string;
       # any ordinary out-of-root import, rather than fabricating a
       # nonexistent lexical sibling that would pollute the closure and
       # break closureContentHash.
-      let realCandidate = (realEpDir / body).normalizedPath
+      # Same forward-slash-consistent join/normalize as `lexicalCandidate`
+      # above — see that site's comment.
+      let realCandidate = pathnorm.normalizePath(realEpDir & "/" & body, '/')
       result = @[]
       addUnique(result, seen, index.lookupByReal(realCandidate))
       if result.len == 0:

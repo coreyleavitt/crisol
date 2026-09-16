@@ -2559,7 +2559,13 @@ suite "RunReport.compileBlock presence — R14-T6 end-to-end":
     ## end-to-end needs the real binary as RunOptions.workerBinary, exactly
     ## as the integration gate tests already do.
     let crisolRoot = currentSourcePath().parentDir.parentDir.parentDir
-    result = getTempDir() / "crisol_test_api_r14t6_bin" / "crisol"
+    # RFC-0009 B4a: on Windows the C linker appends `.exe` to an
+    # extensionless `-o:` target (same issue runner.nim's compile-success
+    # path resolves for the real crisol runner) — name the target with
+    # ExeExt UP FRONT so both the `-o:` arg below and the fileExists check
+    # agree with what the linker actually writes. `ExeExt == ""` on POSIX,
+    # so `addFileExt` is a no-op there.
+    result = addFileExt(getTempDir() / "crisol_test_api_r14t6_bin" / "crisol", ExeExt)
     createDir(result.parentDir)
     let cmd = "nim c --hints:off --warnings:off -d:release --mm:orc -o:" &
               result.quoteShell & " " & (crisolRoot / "src" / "crisol.nim").quoteShell

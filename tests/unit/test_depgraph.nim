@@ -11,7 +11,7 @@
 ##   - Deleted-entrypoint GC: gcDeletedEntrypoints drops unlisted keys.
 ##   - Missing file → empty graph: loadDepGraph on missing depgraph → empty, no raise.
 
-import std/[os, sets, json, tables]
+import std/[options, os, sets, json, tables]
 import crisol/types
 import crisol/depgraph
 import ../support/symlinkprobe
@@ -26,16 +26,25 @@ proc makeTmpConfig(root: string): Config =
 proc ensureStateDirExists(root: string) =
   createDir(root / ".crisol")
 
-let tpSetRoots = initTrackedRoots(getTempDir(), @[], "")
-  ## RFC-0009 B4a: a REAL `TrackedRoots` anchored at the OS temp directory.
-  ## A vacuous/zero-value `TrackedRoots` (project.abs == "") only ever
-  ## classified a path `pcTracked` by accident of `underRoot`'s "/"-prefix
-  ## fallback -- a POSIX-only coincidence that made every ABSOLUTE spelling
-  ## match trivially on Linux/macOS but never on Windows (`C:\...` doesn't
-  ## start with "/"). `getTempDir()` is an ancestor of every real absolute
-  ## path any test in this file builds (`getTempDir() / "crisol_depgraph_*"`
-  ## subdirectories), and a harmless anchor for the bare project-relative
-  ## vectors that only need SOME valid root to classify `pcTracked` under.
+proc fixedProbe(policy: FoldPolicy): FoldProbe =
+  result = proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(policy)
+
+let tpSetRoots = initTrackedRoots(getTempDir(), @[], "", fixedProbe(fpNone))
+  ## RFC-0009 B4a: a REAL `TrackedRoots` anchored at the OS temp directory,
+  ## with a FIXED fpNone fold probe. Two reasons for both choices:
+  ##   * REAL root (not the vacuous/zero-value `default(TrackedRoots)`): a
+  ##     zero root (project.abs == "") only classified a path `pcTracked` by
+  ##     accident of `underRoot`'s "/"-prefix fallback — a POSIX-only
+  ##     coincidence that matched every ABSOLUTE spelling on Linux/macOS but
+  ##     never on Windows (`C:\...` doesn't start with "/"). `getTempDir()` is
+  ##     an ancestor of every real absolute path this file builds.
+  ##   * FIXED fpNone (not the host-probed default): the tps built here are
+  ##     compared with `==` against tps `loadDepGraph` reconstructs under a
+  ##     `makeTmpConfig` whose `trackedRoots` is the default (fpNone). A
+  ##     host-probed policy makes this root fpAsciiLower on macOS/Windows,
+  ##     tripping TrackedPath's `a.fold == b.fold` same-policy invariant on
+  ##     those legs (it was invisible on Linux, where the probe returns
+  ##     fpNone anyway). fpNone keeps every tp in this file on one policy.
 
 proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
   ## Build a `HashSet[TrackedPath]` via `classify` under `tpSetRoots` (see

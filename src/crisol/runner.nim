@@ -640,6 +640,26 @@ proc finalizeSlot(
       slots[idx].state = ssIdle
       return FinalizeOutcome(kind: fkDone, res: res)
     else:
+      # RFC-0009 B4a: on Windows the C linker appends `.exe` to crisol's
+      # extensionless `-o:` compile target (spawnCompileStable's
+      # `binCompiled = binDirSlot / bname`, bname from binName() —
+      # deliberately extensionless, matching the equally-extensionless
+      # `stableBin`/manifest-json naming, which this must NOT touch), so the
+      # binary the compiler actually wrote lands at `binCompiled & ".exe"`
+      # while the slot still tracks the bare path. Every downstream consumer
+      # of `slots[idx].binCompiled`/`binFull` for THIS compile — the
+      # post-compile cache-hit promotion just below, `transitionToRun`'s run
+      # spawn (which reads `slot.binFull`), and the post-run stable-copy
+      # promotion (execute's fkDone handler, which captures `binCompiled`
+      # off the slot right after this compile's child exits) — needs the
+      # real on-disk path, so resolve it ONCE here, before anything reads
+      # either field. `addFileExt` is a no-op when `ExeExt == ""` (POSIX),
+      # so this block is inert there — POSIX byte-identical.
+      if not fileExists(slots[idx].binCompiled) and
+         fileExists(addFileExt(slots[idx].binCompiled, ExeExt)):
+        slots[idx].binCompiled = addFileExt(slots[idx].binCompiled, ExeExt)
+        slots[idx].binFull     = slots[idx].binCompiled
+
       # Compile succeeded, no stop act — capture it onto the slot so the
       # eventual run-phase result (below, or a later kill) carries BOTH
       # phases.

@@ -558,6 +558,37 @@ when defined(windows):
     else:
       some(fpAsciiLower)
 
+  proc getFinalPathNameByHandleW(hFile: Handle; lpszFilePath: WideCString;
+      cchFilePath, dwFlags: int32): int32
+    {.stdcall, dynlib: "kernel32", importc: "GetFinalPathNameByHandleW".}
+
+  proc winRealPath(p: string): string =
+    ## True realpath via GetFinalPathNameByHandleW: opens `p` (file OR
+    ## directory, via FILE_FLAG_BACKUP_SEMANTICS) and asks the OS to resolve
+    ## every reparse point (symlink/junction/mount point) along the path.
+    ## `expandFilename`'s own Windows branch is GetFullPathNameW — purely
+    ## LEXICAL, it never follows a reparse point (RFC-0009 B4a). As a side
+    ## effect this also canonicalizes 8.3 short-name components (RUNNER~1):
+    ## GetFinalPathNameByHandleW's default flags always return the long form.
+    ## Never raises: any failure returns `p` unchanged (safeExpandFilename's
+    ## degrade contract).
+    let winPath = p.replace('/', '\\')
+    let h = createFileW(newWideCString(winPath), 0'i32,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, Handle(0))
+    if h == INVALID_HANDLE_VALUE: return p
+    defer: discard closeHandle(h)
+    var bufSize = 260'i32                       # MAX_PATH; grown on demand
+    var buf = newWideCString(bufSize.int)
+    var n = getFinalPathNameByHandleW(h, buf, bufSize, 0'i32)
+    if n == 0'i32: return p
+    if n > bufSize:                             # buffer too small: n = needed
+      bufSize = n
+      buf = newWideCString(bufSize.int)
+      n = getFinalPathNameByHandleW(h, buf, bufSize, 0'i32)
+      if n == 0'i32 or n > bufSize: return p
+    result = $buf
+
 elif defined(macosx):
   import std/posix
 
@@ -743,10 +774,24 @@ proc memoizedProbe(rootAbs, stateDir: string;
   result = probe(rootAbs, stateDir)
   probeMemo[rootAbs] = result
 
-proc safeExpandFilename(p: string): string =
-  try: expandFilename(p)
-  except OSError: p
-  except ValueError: p
+proc safeExpandFilename*(p: string): string =
+  ## Cross-platform "true realpath" — resolves symlinks/junctions to their
+  ## target. POSIX: `expandFilename` (== realpath(3)). Windows: `winRealPath`
+  ## (GetFinalPathNameByHandleW), because `expandFilename` there is
+  ## GetFullPathNameW, which is LEXICAL and never follows a reparse point
+  ## (RFC-0009 B4a). The Windows result is forward-slash-normalized and
+  ## long-path-prefix-stripped so it matches `nativeCanonicalize`'s output
+  ## form — `classify` compares `realAbs` against a `nativeCanonicalize`'d
+  ## candidate via a raw (non-normalizing) prefix match, so a `\`-separated
+  ## or `\\?\`-prefixed answer would silently never match. Exported so
+  ## closure.nim shares this ONE realpath primitive rather than calling the
+  ## lexical-on-Windows `expandFilename` directly. Never raises.
+  when defined(windows):
+    stripLongPathPrefix(winRealPath(p).replace('\\', '/'))
+  else:
+    try: expandFilename(p)
+    except OSError: p
+    except ValueError: p
 
 proc initTrackedRoots*(projectNative: string;
                         deps: seq[tuple[name, native: string]];
