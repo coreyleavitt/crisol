@@ -1809,7 +1809,7 @@ suite "RFC-0005 A2c-ii — post-compile consult: a genuinely cold project hits a
     createDir(remoteRoot)
     defer: removeDir(remoteRoot)
     let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n" &
-              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot & "\"\n}\n"
+              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot.replace('\\', '/') & "\"\n}\n"
 
     # Project P1: an ordinary live run publishes this exact closure to the
     # shared remote (own project root, own stateDir -- P2 below shares
@@ -1904,7 +1904,7 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     createDir(remoteRoot)  # a configured remote is never auto-created
     defer: removeDir(remoteRoot)
     let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n" &
-              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot & "\"\n}\n"
+              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot.replace('\\', '/') & "\"\n}\n"
 
     # --- Run 1: project P1 / stateDir S1 -- an ordinary live run. ----------
     let p1 = getTempDir() / ("crisol_a2ciii_e2e1_p1_" & $getCurrentProcessId())
@@ -2022,7 +2022,7 @@ suite "RFC-0005 code-review SO5 — verify-cache never persists the depgraph for
     createDir(remoteRoot)
     defer: removeDir(remoteRoot)
     let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n" &
-              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot & "\"\n}\n"
+              "remote-cache \"mirror\" {\n    url \"file://" & remoteRoot.replace('\\', '/') & "\"\n}\n"
 
     # P1: an ordinary live run publishes this exact closure to the shared remote.
     let p1 = getTempDir() / ("crisol_so5_p1_" & $getCurrentProcessId())

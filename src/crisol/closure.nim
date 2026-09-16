@@ -413,13 +413,36 @@ proc strippedSuffix(body: string): string =
   ## The SINGLE place this stripping rule lives — shared by `lookup` (index
   ## suffix match) and `resolveMangledAll`'s roots existence-check fallback
   ## (below), so the two can never diverge on what counts as "the suffix".
-  let normBody = body.replace('\\', DirSep).replace('/', DirSep)
-  var comps = normBody.split(DirSep)
+  ##
+  ## RFC-0009 B4b: returns a FORWARD-SLASH-joined suffix — crisol's
+  ## canonical internal separator — never a native (`DirSep`) one.  `body`
+  ## itself may already carry NATIVE separators here (`decodeBody` decodes
+  ## `@s` to `$DirSep`, matching what the compiler's own mangler encodes),
+  ## so both `\` and `/` are normalized away before splitting; only the
+  ## OUTPUT join changes from `$DirSep` to `/`. This matters for `lookup`'s
+  ## `IndexedFile.real` comparison: `walkForIndex`'s `pcFile` branch builds
+  ## `.real` via `realDir / name` (`os.\`/\``), which — because
+  ## `addNormalizePath` treats both `DirSep` and `AltSep` as separators and
+  ## re-EMITS every one of them as `dirSep` (default `DirSep`) — happens to
+  ## fully re-nativize `.real` to backslash on Windows even though `realDir`
+  ## itself (from `safeExpandFilename`) started forward-slash.  The
+  ## `pcLinkToFile` branch, by contrast, stores `.real` as
+  ## `safeExpandFilename`'s raw output DIRECTLY — no `os.\`/\`` pass — so it
+  ## stays forward-slash.  A suffix joined with native `$DirSep` therefore
+  ## matched the (accidentally re-nativized) `pcFile` case but never the
+  ## (never re-nativized) `pcLinkToFile` case on Windows: a project-internal
+  ## symlink to an outside FILE indexes its realpath forward-slash, while
+  ## the old native-joined suffix was all-backslash, so `==`/`endsWith`
+  ## both failed silently. Forward-slash is the one form BOTH branches
+  ## produce (or can cheaply be compared under, via `lookup`'s own
+  ## `replace('\\', '/')` on the indexed fields) — see `lookup`, below.
+  let normBody = body.replace('\\', '/')
+  var comps = normBody.split('/')
   var start = 0
   while start < comps.len and comps[start] in ["", ".", ".."]:
     inc start
   if start >= comps.len: return ""
-  comps[start .. ^1].join($DirSep)
+  comps[start .. ^1].join("/")
 
 proc lookup(index: SourceIndex; body: string): seq[string] =
   ## Resolve a decoded `@p`/`@n` body (a path relative to SOME search-path
@@ -462,12 +485,12 @@ proc lookup(index: SourceIndex; body: string): seq[string] =
   ## recovered separately, by `resolveMangledAll`'s roots existence-check
   ## fallback, when this lookup returns nothing.
   result = @[]
-  let suffix = strippedSuffix(body)
+  let suffix = strippedSuffix(body)          # forward-slash canonical
   if suffix.len == 0: return
-  let sufComps = suffix.split(DirSep)
+  let sufComps = suffix.split('/')
   let base = sufComps[^1]
   if base notin index.byBasename: return
-  let suffixPattern = $DirSep & suffix
+  let suffixPattern = "/" & suffix
   # Component-boundary match: `suffix` must either be preceded by a
   # separator in the candidate (the ordinary case — `suffixPattern`,
   # prepending one, guards against a decoy like "myfoo.nim" matching
@@ -478,20 +501,34 @@ proc lookup(index: SourceIndex; body: string): seq[string] =
   # the symlinked-search-path-root case) that carries the target's whole
   # absolute path after those leading ".." components reduces `suffix` to
   # that absolute path verbatim. On POSIX this coincidentally still worked
-  # under `endsWith` alone: a '/'-rooted absolute path's split-by-DirSep
+  # under `endsWith` alone: a '/'-rooted absolute path's split-by-'/'
   # yields a leading EMPTY component that `strippedSuffix` also strips, so
   # `suffix` == the real path MINUS its leading '/' and prepending one back
   # via `suffixPattern` reconstructs it exactly. A Windows drive-absolute
-  # path (`C:\Users\...`) has no such leading empty component to strip —
-  # "C:" is the first real component — so `suffix` == the real path
-  # VERBATIM and `suffixPattern`'s prepended separator makes it one
-  # character too long to ever match via `endsWith`. The `==` arm covers
-  # this platform asymmetry directly rather than relying on the POSIX-only
-  # coincidence.
+  # path (`C:/Users/...` once forward-slash-normalized) has no such leading
+  # empty component to strip — "C:" is the first real component — so
+  # `suffix` == the real path VERBATIM and `suffixPattern`'s prepended
+  # separator makes it one character too long to ever match via `endsWith`.
+  # The `==` arm covers this platform asymmetry directly rather than
+  # relying on the POSIX-only coincidence.
+  #
+  # RFC-0009 B4b: `f.lexical`/`f.real` are compared here FORWARD-SLASH
+  # NORMALIZED (`replace('\\', '/')`), never raw — `IndexedFile.real` is
+  # backslash-native for a walked `pcFile` (an artifact of `os.\`/\`` always
+  # re-emitting `DirSep`, see `strippedSuffix`'s doc comment) but
+  # forward-slash for a `pcLinkToFile` symlink target (`safeExpandFilename`'s
+  # own canonical form, never native-rejoined). Comparing both against a
+  # forward-slash `suffix` without first normalizing away that construction-
+  # side inconsistency silently drops the `pcLinkToFile` case on Windows —
+  # `f.real`'s embedded '/' never matches `suffixPattern`'s '\'.  `.replace`
+  # on an already-forward-slash string (POSIX; the `pcFile` case in
+  # general) is a no-op, so this stays byte-identical everywhere else.
   var seen = initHashSet[string]()
   for f in index.byBasename[base]:
-    if f.lexical == suffix or f.lexical.endsWith(suffixPattern) or
-       f.real == suffix or f.real.endsWith(suffixPattern):
+    let lexFwd = f.lexical.replace('\\', '/')
+    let realFwd = f.real.replace('\\', '/')
+    if lexFwd == suffix or lexFwd.endsWith(suffixPattern) or
+       realFwd == suffix or realFwd.endsWith(suffixPattern):
       if f.lexical notin seen:
         seen.incl f.lexical
         result.add f.lexical
