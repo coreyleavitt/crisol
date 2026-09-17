@@ -212,4 +212,22 @@ else
   fail=1
 fi
 
+# RFC-0009 wiring-audit W2 (slice S6): the spawned-binary argv path
+# (`crisol run --changed <ref>`) for the load-bearing fold-membership
+# selection property, proven by test_windows_cli_smoke.nim's second test.
+# WINDOWS-ONLY, unlike A3b-ii/A4b/A5c above: the whole file is
+# `when defined(windows)` gated (mirroring test_windows_smoke.nim), so on
+# the macos leg it takes the `else` branch and never even compiles this
+# test -- its isMainModule marker there is the different string
+# "test_windows_cli_smoke: skipped (not windows)", not "... done". So this
+# check only applies to the windows leg; it would misfire against macos's
+# harness.log otherwise.
+if [ "$LEG" = "windows" ]; then
+  check_must_execute \
+    "W2 case-variant --changed argv-path selection (test_windows_cli_smoke.nim)" \
+    "test_windows_cli_smoke done" \
+    "CLI-SMOKE-CASECHANGED REAL" \
+    "CLI-SMOKE-CASECHANGED SKIPPED"
+fi
+
 exit $fail

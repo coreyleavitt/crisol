@@ -142,3 +142,8 @@ nimble `test` task silently drops missing dirs and writes the OK marker for 0 fi
 - **QUEUED:** S4 (gate hardening — after S3, since the overload-absence check depends on S3's final surface); S6 (case-variant `--changed` in spawned-binary windows CLI smoke — after S7, shared files ci.yml/RFC doc).
 - **Open forks: NONE.** All decisions recorded above under "Design decisions".
 - **Resume:** collect S3/S5/S7 agent reports → verify diffs → run `./dev test` on the combined quiescent tree → commit each slice separately → launch S4 then S6 → final: full CI green all 5 legs, then `quipu set 0009/wiring proven` (only once every audit gap W1–W5 is closed and CI confirms).
+
+### Fix-round progress — refresh 2
+- **S1 DONE** 3595f45 (CI 35195944991: timing green, 4 legs in progress at last check). **S3 DONE** b388100. **S5 DONE** 934b837. **S7 DONE** a733970. All pushed; combined-tree `./dev test` green (unit 213 OK, conformance 27 OK) + windows nim check clean before the batch commits. CI run 35198760958 pending on a733970.
+- **S4, S6 IN FLIGHT** (parallel subagents): S4 gate hardening (isAbsolute tripwire + overload-absence check + src/crisol.nim in scan set + inert allowlist entries dropped + closure/config whole-file exemptions → per-site canon-ok markers; `.display()` tripwire RENOUNCED via RFC W4 bracketed note — settled). S6 case-variant `--changed` scenario in the spawned-binary CLI smoke + RFC placeholder removal + must-exec wiring if needed.
+- **Open forks: NONE.** Resume: collect S4/S6 reports → verify → `./dev test` quiescent → commit separately → push → confirm CI green all 5 legs on final HEAD → then `quipu set 0009/wiring proven` (warrant: the final green CI run + this ledger) and report the TDD summary.
