@@ -77,22 +77,25 @@ tests/unit/test_rfc0007_a6a_escapee_evidence.nim
 tests/unit/test_run_tests.nim
 EOF
 )"
-    # S5 wiring-audit fix: windows-latest also lacks symlink-create
-    # privilege, so every test/block gated on symlinkprobe.nim's
-    # `symlinksAvailable()` self-skips here too. test_closure_a4a.nim is its
-    # own whole-file skip (its only block quit(0)s) and belongs in
-    # EXPECTED_SKIP above, not here; these six are per-test/per-block skips
-    # inside files whose OTHER tests run for real, so they get the distinct
-    # CRISOL-SKIP-TEST marker instead.
-    EXPECTED_SKIP_TEST="$(cat <<'EOF'
-tests/unit/test_depgraph.nim#test_saveDepGraph_symlink_write_through_protection
-tests/unit/test_discover.nim#symlinked_dir_not_followed
-tests/unit/test_ioutils.nim#test_createoverwrite_nofollow_refuses_symlink
-tests/unit/test_ioutils.nim#test_writeguardedfile_overwrite_true_still_refuses_symlink
-tests/unit/test_jsonout.nim#p3_symlink_safe_temp_write
-tests/unit/test_rfc9_a2_config.nim#dep_roots_alias_symlink_cekConfig
-EOF
-)"
+    # S5 wiring-audit fix, re-pinned empirically (CI run 35207827512,
+    # 2026-09-17): the current windows-latest image CAN create symlinks in
+    # the temp-dir probes (`symlinkprobe.nim`'s file symlink AND
+    # test_closure_a4a's directory symlink both succeed), so every
+    # symlinksAvailable()-gated test/block runs its REAL body on this leg
+    # and the expected per-test skip set is EMPTY — the markers exist so
+    # that a future runner-image regression (privilege revoked again)
+    # fails THIS gate loudly instead of skipping silently; re-pin the set
+    # below to the observed markers if that happens. (A5c is unrelated:
+    # its own in-fixture directory-symlink probe still fails on this
+    # image and its documented skip is accepted leg-aware, below.) The
+    # six marker-bearing sites, for re-pinning:
+    #   tests/unit/test_depgraph.nim#test_saveDepGraph_symlink_write_through_protection
+    #   tests/unit/test_discover.nim#symlinked_dir_not_followed
+    #   tests/unit/test_ioutils.nim#test_createoverwrite_nofollow_refuses_symlink
+    #   tests/unit/test_ioutils.nim#test_writeguardedfile_overwrite_true_still_refuses_symlink
+    #   tests/unit/test_jsonout.nim#p3_symlink_safe_temp_write
+    #   tests/unit/test_rfc9_a2_config.nim#dep_roots_alias_symlink_cekConfig
+    EXPECTED_SKIP_TEST=""
     ;;
   macos)
     # macos-latest (Darwin) IS posix: every `when defined(posix)` gate takes
