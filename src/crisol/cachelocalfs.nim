@@ -113,27 +113,29 @@ proc classifyRootForRead(root: string; autoCreate: bool): RootState =
 proc inputsDirAt(root: string): string {.inline.} =
   cacheVersionDirAt(root) & "/inputs"
 
-proc sidecarPath*(root: string; path: string): string =
-  ## `<root>/v<N>/inputs/<fnv(path)>.json` — keyed by the entrypoint PATH
-  ## (never `identityKey`/`SoundnessKey`), so a flag change still finds the
-  ## sidecar and explains as `kcFlags` rather than "no prior inputs"
-  ## (RFC-0005 "Miss-explanation").
-  inputsDirAt(root) & "/" & (toHex16(fnv1a64(path)) & ".json")
-
 proc sidecarPath*(root: string; key: CacheKeyPath): string =
-  ## RFC-0009 A5b-i: `CacheKeyPath` overload — additive only. In-module
-  ## callers (`readSidecar`/`writeSidecar`, below) still take a bare `path:
-  ## string` from EXTERNAL callers with no `TrackedPath` in hand; threading a
-  ## `tp` through those is A5b-ii's job, once callers have one to thread.
-  sidecarPath(root, string(key))
+  ## `<root>/v<N>/inputs/<fnv(key)>.json` — keyed by the entrypoint's
+  ## `CacheKeyPath` (never `identityKey`/`SoundnessKey`), so a flag change
+  ## still finds the sidecar and explains as `kcFlags` rather than "no
+  ## prior inputs" (RFC-0005 "Miss-explanation"). RFC-0009 A5b-i introduced
+  ## this overload; slice S3 (wiring-audit) made it the sole implementation
+  ## — the raw-`string`-path overload it used to wrap is gone, so this is
+  ## now the ONLY route to a sidecar file path, string or typed callers
+  ## alike (the `readSidecar`/`writeSidecar` `TrackedPath` overloads below
+  ## are its only callers).
+  inputsDirAt(root) & "/" & (toHex16(fnv1a64(string(key))) & ".json")
 
-proc readSidecar*(root: string; path: string): Sidecar =
-  ## Read the path-keyed explain sidecar. Absent, unreadable, or
-  ## structurally corrupt (including truncated JSON) degrades gracefully to
-  ## an EMPTY sidecar — never an error, never a crash (RFC-0005's "older
-  ## writer, first-ever run" case, generalized to any read failure).
+proc readSidecar*(root: string; tp: TrackedPath; roots: TrackedRoots): Sidecar =
+  ## Read the path-keyed explain sidecar, keyed via `keyBytes(tp, roots)`
+  ## through the `CacheKeyPath` `sidecarPath` overload above. Absent,
+  ## unreadable, or structurally corrupt (including truncated JSON)
+  ## degrades gracefully to an EMPTY sidecar — never an error, never a
+  ## crash (RFC-0005's "older writer, first-ever run" case, generalized to
+  ## any read failure). Byte-identical to keying directly off a raw path
+  ## string for entrypoints (always tag-0): `keyBytes` returns exactly
+  ## `tp.rel` for a tag-0 `tp`.
   result = Sidecar(order: @[], records: initTable[string, SidecarEntry]())
-  let p = sidecarPath(root, path)
+  let p = sidecarPath(root, keyBytes(tp, roots))
   if not fileExists(p): return
   var raw: string
   try: raw = readFile(p)
@@ -144,33 +146,22 @@ proc readSidecar*(root: string; path: string): Sidecar =
   let parsed = sidecarFromJson(node)
   if parsed.isSome: result = parsed.get
 
-proc readSidecar*(root: string; tp: TrackedPath; roots: TrackedRoots): Sidecar =
-  ## RFC-0009 A5b-ii: `TrackedPath` overload — keys via `keyBytes(tp, roots)`
-  ## (the `CacheKeyPath` `sidecarPath` overload above) rather than a raw path
-  ## string. Byte-identical to the string overload for entrypoints (always
-  ## tag-0): `keyBytes` returns exactly `tp.rel` for a tag-0 `tp`.
-  readSidecar(root, string(keyBytes(tp, roots)))
-
-proc writeSidecar*(root: string; path: string; entry: SidecarEntry;
-                   maxRecords = DefaultMaxSidecarRecords) =
+proc writeSidecar*(root: string; tp: TrackedPath; roots: TrackedRoots;
+                   entry: SidecarEntry; maxRecords = DefaultMaxSidecarRecords) =
   ## Update the path-keyed sidecar's most-recent record for
   ## `entry.inputs.flagHash`, pruning to `maxRecords` distinct flagHashes
   ## (`cachewire.upsertSidecarRecord`). Best-effort: a sidecar is
   ## diagnostic, never load-bearing, so any I/O failure here is silently
   ## swallowed rather than surfaced as a run warning (unlike a genuine
-  ## cache-entry write failure).
-  let cur = readSidecar(root, path)
+  ## cache-entry write failure). Keyed via `keyBytes(tp, roots)`, same as
+  ## `readSidecar` above.
+  let key = keyBytes(tp, roots)
+  let cur = readSidecar(root, tp, roots)
   let next = upsertSidecarRecord(cur, entry.inputs.flagHash, entry, maxRecords)
   let dir = inputsDirAt(root)
   try: createDir(dir)
   except OSError: return
-  discard atomicPublish(sidecarPath(root, path), $sidecarToJson(next))
-
-proc writeSidecar*(root: string; tp: TrackedPath; roots: TrackedRoots;
-                   entry: SidecarEntry; maxRecords = DefaultMaxSidecarRecords) =
-  ## RFC-0009 A5b-ii: `TrackedPath` overload — see `readSidecar`'s `tp`
-  ## overload above; byte-identical to the string overload for entrypoints.
-  writeSidecar(root, string(keyBytes(tp, roots)), entry, maxRecords)
+  discard atomicPublish(sidecarPath(root, key), $sidecarToJson(next))
 
 proc localFsBackend*(root: string; autoCreate: bool; maxEntries: int): CacheBackend =
   let ser = jsonCacheSerializer()

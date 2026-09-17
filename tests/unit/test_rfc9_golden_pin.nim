@@ -133,19 +133,26 @@ suite "rfc9_golden_pin — planner.slug literal byte-pins":
       "tests__a__b__c__d__e__f__g__h__i__j__deep_ep__nim-745b86e3ced9efb7"
 
 # ===========================================================================
-# 3. cachelocalfs.sidecarPath — literal byte-pins (pure string function;
-#    the `root` param is caller-supplied and never touches disk here, so a
-#    fixed placeholder string is legitimate — sidecarPath does no I/O).
+# 3. cachelocalfs.sidecarPath — literal byte-pins (pure function over its
+#    `CacheKeyPath` argument; the `root` param is caller-supplied and never
+#    touches disk here, so a fixed placeholder string is legitimate —
+#    sidecarPath does no I/O). Slice S3 (wiring-audit) sealed the raw-
+#    `string`-path overload private->deleted; these pins now go through the
+#    live `CacheKeyPath` overload, keyed via `keyBytes(tp, roots)` off the
+#    same tag-0 `tp`s used above — byte-identical to the old string keying
+#    since `keyBytes` returns exactly `tp.rel` for a tag-0 `tp`.
 # ===========================================================================
 
 suite "rfc9_golden_pin — cachelocalfs.sidecarPath literal byte-pins":
 
   test "simple":
-    check sidecarPath("state-root", simplePath) ==
+    let simpleTp = fromCanonical(simplePath, testRoots).get
+    check sidecarPath("state-root", keyBytes(simpleTp, testRoots)) ==
       "state-root/v3/inputs/e8559c40017309d9.json"
 
   test "maxdepth":
-    check sidecarPath("state-root", deepPath) ==
+    let deepTp = fromCanonical(deepPath, testRoots).get
+    check sidecarPath("state-root", keyBytes(deepTp, testRoots)) ==
       "state-root/v3/inputs/56b57a6a7f7a269c.json"
 
 # ===========================================================================

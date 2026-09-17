@@ -864,7 +864,7 @@ suite "realSeams — explain-miss sidecar (RFC-0005 B1b)":
     let seams = realSeams(ctx, addr g, rt)
     let pep = pepAt("tests/unit/test_corruptsc.nim")
 
-    let scPath = sidecarPath(rt.localRoot, pep.ep.tp.display())
+    let scPath = sidecarPath(rt.localRoot, keyBytes(pep.ep.tp, testRoots))
     createDir(parentDir(scPath))
     writeFile(scPath, "{ broken")
 
@@ -901,7 +901,7 @@ suite "realSeams — explain-miss sidecar (RFC-0005 B1b)":
     let d = derive(seams, pep)
     check seams.store(pep, d, samplePassResult())
 
-    let scPath = sidecarPath(rt.localRoot, pep.ep.tp.display())
+    let scPath = sidecarPath(rt.localRoot, keyBytes(pep.ep.tp, testRoots))
     check fileExists(scPath)
     let raw = readFile(scPath)
     check sentinel notin raw

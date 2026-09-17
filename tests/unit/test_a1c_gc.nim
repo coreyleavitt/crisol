@@ -41,7 +41,10 @@ import crisol/[types, resultcache, ledger, clean, depgraph]
 import crisol/keys
 import crisol/cachewire
 import crisol/cachelocalfs
+import crisol/paths            # TrackedPath/keyBytes -- sidecarPath/writeSidecar/readSidecar
+                                # are TrackedPath-keyed only since slice S3 (wiring-audit)
 import crisol/process/types as ptypes  # default(Limits) for the sidecar fixtures below
+import "../support/testep"     # testRoots -- fixture roots for fromCanonical below
 
 # ---------------------------------------------------------------------------
 # Helpers — state-dir factories
@@ -546,11 +549,19 @@ proc sampleKeyInputsFor(flagHash: string): KeyInputs =
     protocolMajor:       1,
   )
 
+proc sidecarKeyFor(path: string): CacheKeyPath =
+  ## `writeSidecar`/`readSidecar`/`sidecarPath` are `TrackedPath`-keyed only
+  ## since slice S3 (wiring-audit) sealed the raw-`string`-path overloads;
+  ## this test file still names its fixture entrypoints by bare relative
+  ## path, so route them through `fromCanonical` + `keyBytes` here rather
+  ## than at every call site.
+  keyBytes(fromCanonical(path, testRoots).get, testRoots)
+
 proc seedSidecarRecord(root: string; path: string; key: string; flagHash: string) =
   ## `root` is the cache ROOT (`stateDir / "cache"`), matching
   ## `cachelocalfs.writeSidecar`'s own parameter — the same value
   ## `gcResultCacheAt` is called with below.
-  writeSidecar(root, path, SidecarEntry(
+  writeSidecar(root, fromCanonical(path, testRoots).get, testRoots, SidecarEntry(
     key:       SoundnessKey(key),
     inputs:    sampleKeyInputsFor(flagHash),
     envDigest: @[("HOME", "aa11bb22cc33dd44")],
@@ -564,7 +575,7 @@ block test_sidecar_pruned_when_its_only_entry_is_evicted:
 
   seedCacheEntry(sd, "keyA0000keyA0000", cachedAt = 1_000)  # old
   seedSidecarRecord(root, path, "keyA0000keyA0000", "flagA")
-  let sc = sidecarPath(root, path)
+  let sc = sidecarPath(root, sidecarKeyFor(path))
   assert fileExists(sc), "sidecar must exist before GC"
 
   # Age-evict everything older than (nowSecs - maxAgeSecs).
@@ -580,7 +591,7 @@ block test_sidecar_survives_when_its_entry_stays_live:
 
   seedCacheEntry(sd, "keyB0000keyB0000", cachedAt = 999_999)  # recent
   seedSidecarRecord(root, path, "keyB0000keyB0000", "flagB")
-  let sc = sidecarPath(root, path)
+  let sc = sidecarPath(root, sidecarKeyFor(path))
 
   let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 100, nowSecs = 1_000_000)
   assert r.evicted == 0
@@ -597,7 +608,7 @@ block test_sidecar_survives_if_any_record_still_live:
   seedCacheEntry(sd, "keyLive0keyLive0", cachedAt = 999_999)
   seedSidecarRecord(root, path, "keyGoneForevr000", "flagOld")
   seedSidecarRecord(root, path, "keyLive0keyLive0", "flagNew")
-  let sc = sidecarPath(root, path)
+  let sc = sidecarPath(root, sidecarKeyFor(path))
 
   let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 100, nowSecs = 1_000_000)
   assert r.evicted == 0
@@ -614,7 +625,7 @@ block test_sidecar_pruned_when_all_records_are_dead:
   seedCacheEntry(sd, "keyOld1keyOld100", cachedAt = 1_000)
   seedSidecarRecord(root, path, "keyOld1keyOld100", "flagA")
   seedSidecarRecord(root, path, "keyOld2keyOld200", "flagB")
-  let sc = sidecarPath(root, path)
+  let sc = sidecarPath(root, sidecarKeyFor(path))
 
   let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 100, nowSecs = 1_000_000)
   assert r.evicted == 1
@@ -627,7 +638,7 @@ block test_corrupt_sidecar_is_pruned_not_crashed:
   let path = "tests/unit/test_corrupt.nim"
 
   seedSidecarRecord(root, path, "keyC0000keyC0000", "flagC")
-  let sc = sidecarPath(root, path)
+  let sc = sidecarPath(root, sidecarKeyFor(path))
   writeFile(sc, "{ not json at all ]]]")
 
   let r = gcResultCacheAt(root, maxEntries = 0, maxAgeSecs = 0, nowSecs = 1_000_000)
