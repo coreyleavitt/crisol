@@ -246,14 +246,23 @@ when defined(windows):
         writeRepoFile("tests/unit/Widget.nim", "proc widgetValue*(): int = 4242\n")
 
         # --- Lightweight negative control (the CLI-observable equivalent of
-        # A3b-ii's mandatory raw-string check): the diff crisol's own
-        # gitdiff.nim runs (`git diff -z --no-renames --relative --name-only
-        # <base>`) reports the NEW spelling; the OLD spelling (still
-        # resolvable on this case-insensitive volume, and still the spelling
-        # RUN 1's persisted dep graph carries) does not appear in the diff at
-        # all -- only the fold can make the two identities match.
-        let rawDiff = gitCmd("diff -z --no-renames --relative --name-only " & renameRev).output
-        let diffEntries = rawDiff.split('\0')
+        # A3b-ii's mandatory raw-string check): git's diff reports the NEW
+        # spelling; the OLD spelling (still resolvable on this
+        # case-insensitive volume, and still the spelling RUN 1's persisted
+        # dep graph carries) does not appear in the diff at all -- only the
+        # fold can make the two identities match. The control asks only
+        # WHICH spellings git names, so its parse is deliberately
+        # framing-agnostic (split on NUL and newlines both): the harness's
+        # execCmdEx invocation is not production's pinned `-z` argv
+        # (gitdiff.nim's own NUL framing is exercised for real by RUN 2
+        # below, which must fold this very diff to select correctly), and
+        # the first CI run showed the harness path delivering
+        # newline-framed output on windows.
+        let rawDiff = gitCmd("diff --no-renames --relative --name-only " & renameRev).output
+        var diffEntries: seq[string]
+        for entry in rawDiff.split({'\0', '\n', '\r'}):
+          let e = entry.strip()
+          if e.len > 0: diffEntries.add e
         echo "CLI-SMOKE-CASECHANGED: raw git diff entries = ", $diffEntries
         check "tests/unit/Widget.nim" in diffEntries
         check "tests/unit/widget.nim" notin diffEntries
