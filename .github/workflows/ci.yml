@@ -313,11 +313,15 @@ jobs:
       - name: nim check — process.nim on real Windows
         run: nim check --hints:off --path:src src/crisol/process.nim
 
-      # A2d's acceptance for this leg: COMPILES and the smoke test PASSES —
-      # spawn, losslessly observed exit code, and a Job-Object-backed kill.
-      # Conformance-green is explicitly NOT required here (RFC-0009 gates
-      # that, Stage D) — test_conformance.nim itself imports std/posix
-      # unconditionally and would not even compile on this target.
+      # A2d's acceptance for this leg (historical): COMPILES and the smoke test
+      # PASSES — spawn, losslessly observed exit code, and a Job-Object-backed
+      # kill. Since then RFC-0009 Stage B de-POSIX'd the suite and the B4b step
+      # below widened this leg to the full tests/unit:tests/conformance sweep;
+      # test_conformance.nim no longer imports std/posix (B3a-ii) and compiles
+      # here, but it is the POSIX process-backend conformance suite, so it
+      # self-skips `when not defined(posix)` on windows (that backend is proven
+      # by the per-file test_windows_* steps in this job). This smoke step is
+      # kept as the fast early spawn/kill check ahead of the fuller sweep.
       - name: Compile and run the Windows smoke test
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_smoke.nim
 
