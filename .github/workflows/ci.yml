@@ -462,7 +462,6 @@ jobs:
       # passing (or even a failing) assertion step layered on top of it.
       - name: rfc-0009 B4b — unit + conformance suite (native, ci/run-tests.sh)
         env:
-          CRISOL_TIER: windows
           CRISOL_TEST_DIRS: tests/unit:tests/conformance
         run: |
           set -o pipefail

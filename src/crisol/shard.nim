@@ -85,9 +85,12 @@ proc shardOf*(eps: seq[Entrypoint]; k, n: int;
   ##
   ## `roots` (RFC-0009 A5b-ii): additive, defaults to the zero `TrackedRoots`
   ## — harmless for every entrypoint (always tag-0; `keyBytes`'s tag-0 branch
-  ## never reads `roots`), and for a hand-built fixture ep (zero `tp`)
-  ## `identityKey(ep, roots)` falls back to the plain-path string overload
-  ## regardless of `roots`. Real callers thread `config.trackedRoots`.
+  ## never reads `roots`), and for a hand-built fixture ep (zero `tp`, i.e.
+  ## rootTag 0 with an empty `rel`) `identityKey(ep, roots)` simply keys off
+  ## that empty rel (there is no plain-path string overload to fall back to
+  ## — `identityKey` has only the tp-based and ep-based arities). Fixtures
+  ## that need distinguishable identities must construct real `TrackedPath`s.
+  ## Real callers thread `config.trackedRoots`.
   ##
   ## Preconditions (caller is responsible for validation):
   ##   n >= 1
