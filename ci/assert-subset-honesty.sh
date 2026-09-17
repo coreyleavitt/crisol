@@ -139,13 +139,31 @@ check_must_execute \
 # suite's own "[OK] <test name>" line is already proof the real body ran to
 # completion; the explicit SKIP check below just gives a clearer failure
 # message than a bare "marker not found" would.
-if grep -qF "SKIP test_rfc9_a5c_cache_portability" "$LOG"; then
-  echo "MUST-EXECUTE FAILED ($LEG): A5c cache-portability E2E (test_rfc9_a5c_cache_portability.nim) SKIPPED (no symlink privilege in this environment)" >&2
-  fail=1
-elif grep -qF "[OK] a depRoot closure member's cache key survives relocating the project tree" "$LOG"; then
+# A5c is leg-aware. Unlike A3b-ii/A4b (which need only a case-insensitive
+# volume — present on both windows-latest NTFS and macos-latest APFS), A5c
+# needs to CREATE a symlink (a symlinked depRoot). GitHub-hosted
+# windows-latest runners lack SeCreateSymbolicLinkPrivilege / Developer
+# Mode, so A5c self-skips there BY DESIGN (same convention as
+# test_closure_a4a.nim / symlinkprobe.nim) — this is its DOCUMENTED skip
+# (RFC-0009 line 555/A5c: "Self-skips only on an environment that cannot
+# create symlinks at all"), and A5c's own slice was accepted green with
+# exactly this windows self-skip (CI 34721929202). Its cache-portability
+# property is proven on the macOS case-insensitive leg, which HAS symlink
+# privilege and MUST run the real body. So: on macos the real body is
+# mandatory; on windows a documented symlink self-skip is honest and
+# accepted, but a SILENT disappearance (neither the [OK] line nor the
+# documented SKIP) still fails — that is the R3-19 honesty guarantee.
+if grep -qF "[OK] a depRoot closure member's cache key survives relocating the project tree" "$LOG"; then
   echo "MUST-EXECUTE OK ($LEG): A5c cache-portability E2E (test_rfc9_a5c_cache_portability.nim) ran its real body"
+elif grep -qF "SKIP test_rfc9_a5c_cache_portability" "$LOG"; then
+  if [ "$LEG" = "windows" ]; then
+    echo "MUST-EXECUTE OK ($LEG): A5c self-skipped for its documented reason (no symlink-create privilege on windows-latest); cache-portability is proven on the macOS case-insensitive leg"
+  else
+    echo "MUST-EXECUTE FAILED ($LEG): A5c SKIPPED, but this leg can create symlinks and MUST run the real body" >&2
+    fail=1
+  fi
 else
-  echo "MUST-EXECUTE FAILED ($LEG): A5c cache-portability E2E (test_rfc9_a5c_cache_portability.nim) marker not found (neither SKIP nor its [OK] line present)" >&2
+  echo "MUST-EXECUTE FAILED ($LEG): A5c cache-portability E2E (test_rfc9_a5c_cache_portability.nim) marker not found (neither its [OK] line nor a documented SKIP present -- silent disappearance)" >&2
   fail=1
 fi
 
