@@ -10,4 +10,4 @@ when defined(posix):
   while true:
     os.sleep(1000)
 else:
-  discard
+  echo "CRISOL-SKIP: tests/fixtures/term_ignores.nim"

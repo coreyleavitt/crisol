@@ -118,4 +118,5 @@ when defined(posix):
       check elapsed < initDuration(milliseconds = WatcherDelayMs + GracePeriodMs * 2)
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/timing/test_rfc0007_a2b_shared_grace.nim"
     echo "test_rfc0007_a2b_shared_grace: skipped (POSIX-only backend test)"

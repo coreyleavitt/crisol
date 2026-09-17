@@ -126,4 +126,5 @@ when defined(posix):
     echo "test_rfc0007_a1f_limit_timing done"
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/timing/test_rfc0007_a1f_limit_timing.nim"
     echo "test_rfc0007_a1f_limit_timing: skipped (POSIX-only backend test)"

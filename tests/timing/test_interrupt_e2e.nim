@@ -219,4 +219,5 @@ when defined(posix):
       runInterruptCase((sig: SIGTERM, expectedExit: 143, label: "sigterm"))
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/timing/test_interrupt_e2e.nim"
     echo "test_interrupt_e2e: skipped (POSIX-only backend test)"

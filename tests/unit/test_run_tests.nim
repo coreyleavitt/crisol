@@ -413,4 +413,5 @@ when defined(posix):
           check parts[2] == "0"   # rr.exitCode == 0
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/unit/test_run_tests.nim"
     echo "test_run_tests: skipped (POSIX-only backend test)"

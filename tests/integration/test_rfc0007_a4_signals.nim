@@ -143,4 +143,5 @@ when defined(posix):
         check parts[1] == $int(SIGTERM)   # shutdownRequested() saw the SAME signum
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/integration/test_rfc0007_a4_signals.nim"
     echo "test_rfc0007_a4_signals: skipped (POSIX-only backend test)"

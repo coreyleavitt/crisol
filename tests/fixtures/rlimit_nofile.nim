@@ -32,4 +32,5 @@ else:
   # RLIMIT_NOFILE / EMFILE is a POSIX-only concept; the A4b integration tests
   # that run this fixture are themselves POSIX-gated. On Windows it is a no-op
   # that exits cleanly (never invoked in a limit scenario there).
+  echo "CRISOL-SKIP: tests/fixtures/rlimit_nofile.nim"
   quit(0)

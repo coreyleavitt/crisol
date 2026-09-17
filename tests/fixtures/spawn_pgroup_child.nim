@@ -53,4 +53,4 @@ when defined(posix):
     discard posix.sleep(cint(1))
   quit(0)
 else:
-  discard
+  echo "CRISOL-SKIP: tests/fixtures/spawn_pgroup_child.nim"

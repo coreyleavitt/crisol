@@ -179,4 +179,5 @@ when defined(posix):
             check parts[1] == "0"    # l2's put was never called
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/integration/test_so2_drain_interrupt.nim"
     echo "test_so2_drain_interrupt: skipped (POSIX-only backend test)"

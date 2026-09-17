@@ -233,4 +233,5 @@ when defined(posix):
       check results[0].outcome == oFailed
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/integration/test_signal.nim"
     echo "test_signal: skipped (POSIX-only backend test)"

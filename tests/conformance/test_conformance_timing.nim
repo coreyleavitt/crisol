@@ -284,4 +284,5 @@ when defined(posix):
     echo "test_conformance_timing done"
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/conformance/test_conformance_timing.nim"
     echo "test_conformance_timing: skipped (POSIX-only backend test)"

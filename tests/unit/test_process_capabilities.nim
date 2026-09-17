@@ -134,4 +134,5 @@ when defined(posix):
     echo "test_process_capabilities: done"
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/unit/test_process_capabilities.nim"
     echo "test_process_capabilities: skipped (POSIX-only backend test)"

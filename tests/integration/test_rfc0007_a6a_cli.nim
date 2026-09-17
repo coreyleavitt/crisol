@@ -226,4 +226,5 @@ when defined(posix):
     echo "test_rfc0007_a6a_cli done"
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/integration/test_rfc0007_a6a_cli.nim"
     echo "test_rfc0007_a6a_cli: skipped (POSIX-only backend test)"

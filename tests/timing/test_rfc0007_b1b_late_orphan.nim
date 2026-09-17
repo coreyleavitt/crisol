@@ -161,4 +161,5 @@ when defined(posix):
     echo "test_rfc0007_b1b_late_orphan done"
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/timing/test_rfc0007_b1b_late_orphan.nim"
     echo "test_rfc0007_b1b_late_orphan: skipped (POSIX-only backend test)"

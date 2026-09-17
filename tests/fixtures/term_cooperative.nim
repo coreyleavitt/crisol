@@ -27,4 +27,4 @@ when defined(posix):
   while true:
     discard posix.sleep(cint(1000))
 else:
-  discard
+  echo "CRISOL-SKIP: tests/fixtures/term_cooperative.nim"

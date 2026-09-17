@@ -13,4 +13,4 @@ when defined(posix):
   # the signal were ever blocked/lost.
   quit(1)
 else:
-  discard
+  echo "CRISOL-SKIP: tests/fixtures/self_sigkill.nim"

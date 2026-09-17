@@ -514,4 +514,5 @@ when defined(posix):
         check code == 0
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/integration/test_clean.nim"
     echo "test_clean: skipped (POSIX-only backend test)"

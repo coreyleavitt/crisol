@@ -86,4 +86,4 @@ when defined(posix):
   sleep(2000)
   quit(0)
 else:
-  discard
+  echo "CRISOL-SKIP: tests/fixtures/spawn_late_orphan.nim"

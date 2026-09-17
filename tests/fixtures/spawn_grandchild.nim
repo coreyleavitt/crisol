@@ -52,4 +52,4 @@ when defined(posix):
     waitedMs += 10
   quit(0)
 else:
-  discard
+  echo "CRISOL-SKIP: tests/fixtures/spawn_grandchild.nim"

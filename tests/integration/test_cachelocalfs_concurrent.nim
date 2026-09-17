@@ -188,4 +188,5 @@ when defined(posix):
       check strayTmp.len == 0
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/integration/test_cachelocalfs_concurrent.nim"
     echo "test_cachelocalfs_concurrent: skipped (POSIX-only backend test)"

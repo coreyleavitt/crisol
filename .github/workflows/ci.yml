@@ -431,20 +431,49 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a5c_cache_portability.nim
 
-      # RFC-0009 B4a — harness bring-up: run the GENERAL unit suite on real
-      # Windows through the SAME honest-exit wrapper the Linux/macOS legs use
-      # (ci/run-tests.sh -> nimble test -> per-file `nim r`), scoped to
-      # tests/unit only. This is the first time the non-windows-specific unit
-      # suite compiles AND runs natively here: every POSIX-backend unit test
-      # is now gated `when defined(posix)` (B1/B2/B3a/B3b/B3c) so it skips by
-      # design, while the portable majority runs for real. tests/conformance
-      # joins at B4b (the completion gate); tests/integration stays out of
-      # this leg's scope, mirroring the macOS leg.
-      - name: rfc-0009 B4a — unit suite (native, ci/run-tests.sh)
+      # RFC-0009 B4b — COMPLETION GATE: widen the windows leg's scope from
+      # B4a's tests/unit-only bring-up to tests/unit:tests/conformance, still
+      # native, still through the SAME honest-exit wrapper the Linux/macOS
+      # legs use (ci/run-tests.sh -> nimble test -> per-file `nim r`). This is
+      # the first time the general (non-windows-specific) conformance suite
+      # compiles AND runs natively here alongside the unit suite: every
+      # POSIX-backend test is gated `when defined(posix)` (B1/B2/B3a/B3b/B3c)
+      # so it skips BY DESIGN, while the portable majority — including the
+      # load-bearing identity conformance tests (A3b-ii, A4b, A5c) — runs for
+      # real. Explicitly OUT of scope for this leg (mirroring the macos-latest
+      # leg's own long-standing unit+conformance-only scope, below):
+      # tests/integration (heavier process-spawning CLI coverage — Linux/
+      # macOS only), tests/timing (the dedicated serial timing job covers
+      # this), and tests/fixtures (these compile as CHILD PROGRAMS spawned
+      # BY tests/integration cases via compileFixture — they are never
+      # discovered by the harness's own test_*.nim sweep and never invoked at
+      # all when their driving integration test is itself posix-gated).
+      #
+      # SUBSET-HONESTY (RFC-0009 round-3 R3-19): ci/assert-subset-honesty.sh
+      # asserts, BY NAME not count, that the exact expected set of gated files
+      # skipped (and no other), and that the three identity conformance tests
+      # ran their REAL body, not a self-skip. `set -o pipefail` +
+      # `${PIPESTATUS[0]}` preserve run-tests.sh's own honest exit code
+      # through the `tee` — a suite failure must never be masked by a
+      # passing (or even a failing) assertion step layered on top of it.
+      - name: rfc-0009 B4b — unit + conformance suite (native, ci/run-tests.sh)
         env:
           CRISOL_TIER: windows
-          CRISOL_TEST_DIRS: tests/unit
-        run: bash ci/run-tests.sh
+          CRISOL_TEST_DIRS: tests/unit:tests/conformance
+        run: |
+          set -o pipefail
+          bash ci/run-tests.sh 2>&1 | tee harness.log
+          suite_status=${PIPESTATUS[0]}
+          bash ci/assert-subset-honesty.sh harness.log windows
+          honesty_status=$?
+          if [ "$suite_status" -ne 0 ]; then
+            echo "rfc-0009 B4b: harness suite FAILED (exit $suite_status) -- see output above" >&2
+            exit "$suite_status"
+          fi
+          if [ "$honesty_status" -ne 0 ]; then
+            echo "rfc-0009 B4b: subset-honesty assertion FAILED (exit $honesty_status)" >&2
+            exit "$honesty_status"
+          fi
 
   macos:
     runs-on: macos-latest
@@ -486,6 +515,14 @@ jobs:
       # own TIMING-SENSITIVE cases stay inert here: they self-gate on
       # CRISOL_TIMING_TESTS (unset in this step), same convention as every
       # other leg — the step below turns them on for this leg specifically.
+      # RFC-0009 B4b — SUBSET-HONESTY covers this leg too (not just windows):
+      # ci/assert-subset-honesty.sh asserts, BY NAME, that nothing in the
+      # B2/B3b gated set skips here (macOS/Darwin IS posix, so every
+      # `when defined(posix)` gate takes its real branch -- the expected-skip
+      # set for "macos" is empty) and that the three identity conformance
+      # tests (A3b-ii, A4b, A5c) ran their real body. Same pipefail +
+      # PIPESTATUS discipline as the windows leg: run-tests.sh's own honest
+      # exit code must never be masked by `tee` or by the assertion step.
       - name: Run unit + conformance suites (kqueue/libproc backend)
         env:
           CRISOL_TIER: macos
@@ -504,7 +541,20 @@ jobs:
           # per-file step on the windows job (which runs conformance files
           # individually rather than via CRISOL_TEST_DIRS sweep).
           CRISOL_EXPECT_FOLD: fpAsciiLower
-        run: bash ci/run-tests.sh
+        run: |
+          set -o pipefail
+          bash ci/run-tests.sh 2>&1 | tee harness.log
+          suite_status=${PIPESTATUS[0]}
+          bash ci/assert-subset-honesty.sh harness.log macos
+          honesty_status=$?
+          if [ "$suite_status" -ne 0 ]; then
+            echo "rfc-0009 B4b: harness suite FAILED (exit $suite_status) -- see output above" >&2
+            exit "$suite_status"
+          fi
+          if [ "$honesty_status" -ne 0 ]; then
+            echo "rfc-0009 B4b: subset-honesty assertion FAILED (exit $honesty_status)" >&2
+            exit "$honesty_status"
+          fi
 
       # rfc-0007 C1b: tests/conformance's TIMING-SENSITIVE cases (self-gated
       # on CRISOL_TIMING_TESTS, unset in the step above) include this

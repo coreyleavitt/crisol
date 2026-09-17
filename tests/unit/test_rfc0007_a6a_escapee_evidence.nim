@@ -231,4 +231,5 @@ when defined(posix):
   echo "test_rfc0007_a6a_escapee_evidence: done"
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/unit/test_rfc0007_a6a_escapee_evidence.nim"
     echo "test_rfc0007_a6a_escapee_evidence: skipped (POSIX-only backend test)"

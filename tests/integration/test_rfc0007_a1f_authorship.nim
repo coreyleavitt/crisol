@@ -324,4 +324,5 @@ when defined(posix):
       check code != 0
 else:
   when isMainModule:
+    echo "CRISOL-SKIP: tests/integration/test_rfc0007_a1f_authorship.nim"
     echo "test_rfc0007_a1f_authorship: skipped (POSIX-only backend test)"
