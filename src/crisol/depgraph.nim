@@ -594,7 +594,7 @@ proc staleExternalObjects*(graph: DepGraph; path: string; flags: seq[string];
     if not stale:
       try:
         stale = chainedContentHash(ext.headers.mapIt(
-          (key: it, nativePath: (if it.isAbsolute: it else: projectRoot / it)))
+          (key: it, nativePath: (if it.isAbsolute: it else: projectRoot / it)))  # canon-ok: header nativePath join for staleness content-hash (headers keyed by own string, not TrackedPath)
         ) != ext.headersHash
       except CatchableError:
         stale = true

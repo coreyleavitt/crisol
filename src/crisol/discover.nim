@@ -236,7 +236,7 @@ proc normalizeRootRelative(p: string; config: Config): string =
   ## anything `pcOutside` degrades to the raw string, unchanged, matching
   ## today's `except: p` fallback but now total and exception-free by
   ## construction rather than relying on `relativePath` never raising.
-  if not isAbsolute(p): return p
+  if not isAbsolute(p): return p  # canon-ok: branch gating the classify call below, not a root-membership check
   let pc = classify(p, config.trackedRoots)
   case pc.kind
   of pcTracked: pc.tp.display

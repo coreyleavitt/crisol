@@ -549,9 +549,15 @@ proc toNative*(tp: TrackedPath; roots: TrackedRoots): string =
   ## PRODUCTION INVARIANT (RFC-0009 A-final-ii): this is the ONLY way to
   ## turn a TrackedPath back into a filesystem path to open, compile, or
   ## spawn. `display(tp)` (== `tp.rel`) is for HUMANS and logs/JSON only —
-  ## it is root-relative and never fed to an OS file operation. The
-  ## path-identity gate does not (cannot cheaply) enforce this textually, so
-  ## it is stated here as the contract every I/O caller honors.
+  ## it is root-relative and never fed to an OS file operation. A direct
+  ## textual scan for a `.display()` call feeding I/O is undecidable (data-
+  ## flow, not lexical — post-completion, wiring-audit W4, 2026-09-17), so
+  ## the path-identity gate (`test_rfc9_path_identity_gate.nim`) does not
+  ## attempt one; it instead enforces the two lexically-decidable backstops
+  ## this invariant actually reduces to: `toNative` being the sole sanctioned
+  ## inverse out of `TrackedPath` (this type seal), and Tier 4's check that
+  ## no key-surface proc reverts to a string-typed identity/path parameter
+  ## (the concrete way a caller would bypass `toNative` in practice).
   let rootAbs =
     if tp.rootTag == RootTag(0): roots.fproject.abs
     else: roots.fdeps[int(uint16(tp.rootTag)) - 1].abs

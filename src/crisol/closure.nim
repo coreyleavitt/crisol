@@ -325,7 +325,7 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
     of pcDir:
       if name.startsWith("."): continue
       if name == "nimcache": continue
-      let entryAbs = entry.path.absolutePath.normalizedPath
+      let entryAbs = entry.path.absolutePath.normalizedPath  # canon-ok: index walk dir-exclusion compare (filesystem-real, not identity)
       if stateDirAbs.len > 0 and entryAbs == stateDirAbs: continue
       walkForIndex(entry.path, recordRoot / name, stateDirAbs, index)
     of pcFile:
@@ -385,7 +385,7 @@ proc buildSourceIndex*(config: Config): SourceIndex =
     # dormant fallback here).
   let stateDirAbs = stateDirOf(config)
 
-  let prAbs = config.projectRoot.absolutePath.normalizedPath
+  let prAbs = config.projectRoot.absolutePath.normalizedPath  # canon-ok: index root real-path (walkForIndex traversal root, not identity)
   result.roots.add prAbs
   if dirExists(prAbs):
     # RFC-0009 B4a: safeExpandFilename is already canonical/forward-slash
@@ -398,7 +398,7 @@ proc buildSourceIndex*(config: Config): SourceIndex =
     walkForIndex(prAbs, prAbs, stateDirAbs, result)
 
   for dr in config.depRoots:
-    let drAbs = dr.absolutePath.normalizedPath
+    let drAbs = dr.absolutePath.normalizedPath  # canon-ok: index dep-root real-path (walkForIndex traversal root, not identity)
     result.roots.add drAbs
     if dirExists(drAbs):
       walkForIndex(drAbs, drAbs, stateDirAbs, result)
@@ -723,9 +723,9 @@ proc classifyForeignLinkEntry(objPath: string; nimcacheDir: string): ForeignLink
   ## entry is `flkPrebuiltRel` unconditionally: without an absolute path
   ## there is no directory to compare against the nimcache dir in the first
   ## place, so the tuple-form/prebuilt distinction cannot even be posed.
-  if objPath.isAbsolute:
-    let objDir  = objPath.parentDir.absolutePath.normalizedPath
-    let cacheDir = nimcacheDir.absolutePath.normalizedPath
+  if objPath.isAbsolute:  # canon-ok: shape classification branch, not a root-membership check
+    let objDir  = objPath.parentDir.absolutePath.normalizedPath  # canon-ok: nimcache-dir shape comparison (filesystem-real, not identity)
+    let cacheDir = nimcacheDir.absolutePath.normalizedPath  # canon-ok: nimcache-dir shape comparison (filesystem-real, not identity)
     if objDir == cacheDir:
       flkTupleCompile
     else:
@@ -981,7 +981,7 @@ proc resolveMangledAll(mangledName: string;
       if suffix.len > 0:
         var seen = initHashSet[string]()
         for root in index.roots:
-          let cand = (root / suffix).normalizedPath
+          let cand = (root / suffix).normalizedPath  # canon-ok: tracked-root candidate existence probe (filesystem-real, not identity)
           if fileExists(cand) or symlinkExists(cand):
             if cand notin seen:
               seen.incl cand
@@ -1243,7 +1243,7 @@ proc analyzeManifest(nimcacheDir: string;
       " — was the entrypoint compiled without -d:nimBetterRun?" &
       " cannot derive the source closure soundly")
 
-  let epAbs = entrypoint.absolutePath.normalizedPath
+  let epAbs = entrypoint.absolutePath.normalizedPath  # canon-ok: entrypoint real-path root for @m/@p/@n resolution, fold-routed via index.tracked
 
   var files = initHashSet[TrackedPath]()
     ## RFC-0009 A4a (D4): the FINAL membership accumulation, retyped to
@@ -1262,7 +1262,7 @@ proc analyzeManifest(nimcacheDir: string;
   for pair in manifest.compile:
     let (obj, ok) = ccCmdOutputObj(pair.ccCmd)
     if ok:
-      objToCcCmd[obj.normalizedPath] = pair.ccCmd
+      objToCcCmd[obj.normalizedPath] = pair.ccCmd  # canon-ok: manifest object-path lookup key (matches objKey below, not TrackedPath identity)
 
   for objPath in manifest.link:
     # moduleMangledNameOf applies the ".nim.{c,cpp,m}.o" module-object contract:
@@ -1302,7 +1302,7 @@ proc analyzeManifest(nimcacheDir: string;
           # under a tracked root, silently excluded otherwise (e.g. a system
           # library) — same under-tracked-root gate applied below to every
           # resolved candidate.
-          let absObj = objPath.absolutePath.normalizedPath
+          let absObj = objPath.absolutePath.normalizedPath  # canon-ok: fold-routed via index.tracked immediately below
           let pcObj = index.tracked(absObj)
           if pcObj.kind == pcTracked:
             files.incl pcObj.tp
@@ -1342,7 +1342,7 @@ proc analyzeManifest(nimcacheDir: string;
         # plain `string` field (unretyped this slice), spelled via
         # `closureMemberSpelling` — the same spelling `extractClosure` used
         # to return pre-A4b.
-        let objKey = objPath.normalizedPath
+        let objKey = objPath.normalizedPath  # canon-ok: manifest object-path lookup key (matches objToCcCmd above, not TrackedPath identity)
         let hasCcCmd = objKey in objToCcCmd
         let ccCmd = if hasCcCmd: objToCcCmd[objKey] else: ""
         let rel = closureMemberSpelling(tp, index.trackedRoots)
@@ -1352,7 +1352,7 @@ proc analyzeManifest(nimcacheDir: string;
   for df in manifest.depfiles:
     # depfiles entries are already absolute paths (no @m/@p/@n mangling) —
     # normalize only. Existence is NOT checked (R5 policy, same as `link`).
-    let abs = df.path.absolutePath.normalizedPath
+    let abs = df.path.absolutePath.normalizedPath  # canon-ok: fold-routed via index.tracked immediately below
     let pcDf = index.tracked(abs)
     if pcDf.kind == pcTracked:
       files.incl pcDf.tp
@@ -1363,7 +1363,7 @@ proc analyzeManifest(nimcacheDir: string;
       # uses: an exact realpath match against the index, keeping every
       # lexical candidate that is itself under-tracked-root.
       for cand in index.lookupByReal(abs):
-        let candAbs = cand.absolutePath.normalizedPath
+        let candAbs = cand.absolutePath.normalizedPath  # canon-ok: fold-routed via index.tracked immediately below
         let pcCand = index.tracked(candAbs)
         if pcCand.kind == pcTracked:
           files.incl pcCand.tp
@@ -1425,7 +1425,7 @@ proc extractCompileInputs*(nimcacheDir: string;
                            config: Config;
                            index: SourceIndex;
                            carried: openArray[ExternalSource];
-                           ccRun: RunProc = realRunIn(config.projectRoot.absolutePath.normalizedPath)): CompileInputs =
+                           ccRun: RunProc = realRunIn(config.projectRoot.absolutePath.normalizedPath)): CompileInputs =  # canon-ok: real compile subprocess cwd
   ## Extract the source-dependency closure AND, for every `{.compile.}`d
   ## single-path external (D3c) it names, the header set that external's
   ## `#include`s — folded into `result.files` so `--changed` selection and
@@ -1475,7 +1475,7 @@ proc extractCompileInputs*(nimcacheDir: string;
   ##
   ## `result.files = analyzeManifest(...).files UNION every external's headers`.
   let analyzed = analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index)
-  let prAbs = config.projectRoot.absolutePath.normalizedPath
+  let prAbs = config.projectRoot.absolutePath.normalizedPath  # canon-ok: project-root real-path for header-join below, fold-routed via index.tracked
 
   var carriedBySource = initTable[string, ExternalSource]()
   for c in carried:
@@ -1511,8 +1511,8 @@ proc extractCompileInputs*(nimcacheDir: string;
         ## same classify gate as every other soundness check in this module.
       for h in ccIncludeHeaders(output, inv.sourceFile):
         let habs =
-          if h.isAbsolute: h.normalizedPath
-          else: (prAbs / h).normalizedPath
+          if h.isAbsolute: h.normalizedPath  # canon-ok: header path branch, fold-routed via index.tracked below
+          else: (prAbs / h).normalizedPath  # canon-ok: header path branch, fold-routed via index.tracked below
         let pcH = index.tracked(habs)
         if pcH.kind != pcTracked: continue    # system header, etc. — excluded
         let tpH = pcH.tp
@@ -1547,7 +1547,7 @@ proc extractCompileInputs*(nimcacheDir: string;
     # path.
     var headerPairs = newSeq[tuple[key: string; nativePath: string]](headers.len)
     for i, h in headers:
-      headerPairs[i] = (key: h, nativePath: (if h.isAbsolute: h else: config.projectRoot / h))
+      headerPairs[i] = (key: h, nativePath: (if h.isAbsolute: h else: config.projectRoot / h))  # canon-ok: header nativePath join for content read (headers keyed by own string, not TrackedPath, per doc above)
     let hHash = chainedContentHash(headerPairs)
     externals.add ExternalSource(source: ext.source, obj: ext.obj,
                                  headers: headers, headersHash: hHash)

@@ -114,8 +114,8 @@ proc stateDirOf*(cfg: Config): string =
   let env = getEnv("CRISOL_STATE_DIR")
   if env.len > 0: return nativeCanonicalize(env, cfg.projectRoot).path
   if cfg.stateDir.len == 0: return ""
-  if cfg.stateDir.isAbsolute: return cfg.stateDir
-  absolutePath(cfg.projectRoot / cfg.stateDir)
+  if cfg.stateDir.isAbsolute: return cfg.stateDir  # canon-ok: A2 stateDir join branch, not a root-membership check
+  absolutePath(cfg.projectRoot / cfg.stateDir)  # canon-ok: A2 stateDir resolution (join relative stateDir onto projectRoot, never cwd)
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -162,7 +162,7 @@ proc conventionConfig(root: string; probe: FoldProbe = probeFoldPolicy): Config 
 # ---------------------------------------------------------------------------
 
 proc findConfigFile(startDir: string): string =
-  var dir = absolutePath(startDir)
+  var dir = absolutePath(startDir)  # canon-ok: A2 sanctioned cwd walk-up (config-file search origin)
   while true:
     let candidate = dir / "crisol.kdl"
     if fileExists(candidate):
@@ -177,7 +177,7 @@ proc findConfigFile(startDir: string): string =
 # ---------------------------------------------------------------------------
 
 proc findGitRoot(startDir: string): string =
-  var dir = absolutePath(startDir)
+  var dir = absolutePath(startDir)  # canon-ok: A2 sanctioned cwd walk-up (git-root search origin)
   while true:
     if dirExists(dir / ".git") or fileExists(dir / ".git"):
       return dir
@@ -197,7 +197,7 @@ proc validateStateDir(dir: string) =
   ## Reject any state-dir that is absolute or contains ".." components.
   ## Both forms can redirect crisol's entire state tree outside the project
   ## root via os.joinPath's "absolute second operand replaces first" semantics.
-  if isAbsolute(dir):
+  if isAbsolute(dir):  # canon-ok: config validation guard (rejects an absolute state-dir), not a root-membership check
     cfgErr("config: 'state-dir' must be a relative path, got '" & dir & "'")
   # Split on both / and \\ (portable) and scan for ".." components.
   let parts = dir.replace("\\", "/").split("/")
@@ -1025,7 +1025,7 @@ proc parseConfigFile(path: string; probe: FoldProbe = probeFoldPolicy): (Config,
       r.getErr.formatError(src, path))
 
   var warns: seq[ConfigWarning]
-  let cfg = docToConfig(r.get, parentDir(absolutePath(path)), path, warns, probe)
+  let cfg = docToConfig(r.get, parentDir(absolutePath(path)), path, warns, probe)  # canon-ok: projectRoot derived from the explicit config-file path argument, not cwd
   (cfg, warns)
 
 # ---------------------------------------------------------------------------

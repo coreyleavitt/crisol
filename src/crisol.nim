@@ -541,7 +541,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         targetPath = a
       inc ii
 
-    let absTarget = if isAbsolute(targetPath): targetPath
+    let absTarget = if isAbsolute(targetPath): targetPath  # canon-ok: init subcommand's CLI-arg-to-cwd join, not a root-membership check
                     else: getCurrentDir() / targetPath
 
     # ioutils.writeGuardedFile: single atomic open() — no TOCTOU, no symlink
