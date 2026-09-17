@@ -346,6 +346,11 @@ block test_createoverwrite_replaces_existing_content:
 
 block test_createoverwrite_nofollow_refuses_symlink:
   if not symlinksAvailable():
+    # RFC-0009 S5 wiring audit: per-block `break` (the file keeps running
+    # after it) -- must NOT emit the whole-file CRISOL-SKIP marker; emits
+    # the distinct per-test CRISOL-SKIP-TEST marker instead (see
+    # ci/assert-subset-honesty.sh's windows symlink-skip manifest).
+    echo "CRISOL-SKIP-TEST: tests/unit/test_ioutils.nim#test_createoverwrite_nofollow_refuses_symlink"
     echo "SKIP: symlinks unavailable"
     break
   let target = getTempDir() / "crisol_ioutils_test_createoverwrite_target.txt"
@@ -453,6 +458,11 @@ block test_writeguardedfile_overwrite_true_replaces_content:
 
 block test_writeguardedfile_overwrite_true_still_refuses_symlink:
   if not symlinksAvailable():
+    # RFC-0009 S5 wiring audit: per-block `break` (the file keeps running
+    # after it) -- must NOT emit the whole-file CRISOL-SKIP marker; emits
+    # the distinct per-test CRISOL-SKIP-TEST marker instead (see
+    # ci/assert-subset-honesty.sh's windows symlink-skip manifest).
+    echo "CRISOL-SKIP-TEST: tests/unit/test_ioutils.nim#test_writeguardedfile_overwrite_true_still_refuses_symlink"
     echo "SKIP: symlinks unavailable"
     break
   let target = getTempDir() / "crisol_ioutils_test_writeguarded_target.txt"

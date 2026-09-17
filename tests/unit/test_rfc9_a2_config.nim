@@ -139,7 +139,13 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     check kind == cekConfig
 
   test "two dep roots aliasing one physical directory (via symlink) -> cekConfig":
-    if not symlinksAvailable(): skip()
+    if not symlinksAvailable():
+      # RFC-0009 S5 wiring audit: per-test skip() (this suite keeps running
+      # after it) -- must NOT emit the whole-file CRISOL-SKIP marker; emits
+      # the distinct per-test CRISOL-SKIP-TEST marker instead (see
+      # ci/assert-subset-honesty.sh's windows symlink-skip manifest).
+      echo "CRISOL-SKIP-TEST: tests/unit/test_rfc9_a2_config.nim#dep_roots_alias_symlink_cekConfig"
+      skip()
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let depParent = makeTmpDir()

@@ -1412,7 +1412,13 @@ suite "jsonout - P3 symlink-safe temp write":
     ##
     ## More specifically: we verify that the FINAL write goes to lastrun.json
     ## (not to some other path), and that the normal round-trip still works.
-    if not symlinksAvailable(): skip()
+    if not symlinksAvailable():
+      # RFC-0009 S5 wiring audit: per-test skip() (this suite keeps running
+      # after it) -- must NOT emit the whole-file CRISOL-SKIP marker; emits
+      # the distinct per-test CRISOL-SKIP-TEST marker instead (see
+      # ci/assert-subset-honesty.sh's windows symlink-skip manifest).
+      echo "CRISOL-SKIP-TEST: tests/unit/test_jsonout.nim#p3_symlink_safe_temp_write"
+      skip()
     let tmpDir   = uniqueTmpDir("p3sym")
     let stateDir = ".crisol_test"
     createDir(tmpDir)

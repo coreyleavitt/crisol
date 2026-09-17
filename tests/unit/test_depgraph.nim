@@ -316,6 +316,11 @@ block test_saveDepGraph_symlink_write_through_protection:
   ## must NOT cause saveDepGraph to overwrite the sentinel.
   ## Mirror of the jsonout P3 test.
   if not symlinksAvailable():
+    # RFC-0009 S5 wiring audit: per-block `break` (the file keeps running
+    # after it) -- must NOT emit the whole-file CRISOL-SKIP marker; emits
+    # the distinct per-test CRISOL-SKIP-TEST marker instead (see
+    # ci/assert-subset-honesty.sh's windows symlink-skip manifest).
+    echo "CRISOL-SKIP-TEST: tests/unit/test_depgraph.nim#test_saveDepGraph_symlink_write_through_protection"
     echo "SKIP: symlinks unavailable"
     break
   let root = getTempDir() / "crisol_depgraph_p5sym"

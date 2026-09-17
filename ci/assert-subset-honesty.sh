@@ -11,15 +11,25 @@
 #   a single pass, and posix is always defined there, so nothing in scope
 #   ever hits an `else` skip branch.
 #
-# Asserts two things, by NAME rather than by count (RFC-0009 round-3 R3-19 —
-# a count-equality check would pass against a DIFFERENT set of skips, hiding
-# a regression where a load-bearing identity test silently starts skipping
-# while an unrelated file starts running in its place):
+# Asserts three things, by NAME rather than by count (RFC-0009 round-3 R3-19
+# — a count-equality check would pass against a DIFFERENT set of skips,
+# hiding a regression where a load-bearing identity test silently starts
+# skipping while an unrelated file starts running in its place):
 #
 #   1. EXPECTED-SKIP: the set of `CRISOL-SKIP: <path>` markers observed in
 #      the harness log exactly equals the pinned per-leg expected-skip set
-#      below.
-#   2. MUST-EXECUTE: the three load-bearing identity conformance tests
+#      below (whole-FILE self-skips: the entrypoint prints nothing else).
+#   2. EXPECTED-SKIP-TEST (S5 wiring-audit fix): the set of
+#      `CRISOL-SKIP-TEST: <path>#<label>` markers observed exactly equals the
+#      pinned per-leg expected set below (per-test/per-block self-skips
+#      inside a file whose other tests still run for real — these files each
+#      call tests/support/symlinkprobe.nim's `symlinksAvailable()` and
+#      self-skip only the individual test/block, via unittest `skip()` or a
+#      bare `block`/`break`, when this environment cannot create a symlink.
+#      windows-latest lacks SeCreateSymbolicLinkPrivilege, so these are
+#      EXPECTED there; macos-latest (APFS) has it, so these MUST run for
+#      real there — same leg-aware shape as A5c below).
+#   3. MUST-EXECUTE: the three load-bearing identity conformance tests
 #      (A3b-ii, A4b, A5c) ran their REAL body, not a self-skip.
 #
 # Source of truth for what CAN skip: tests/conformance/test_rfc9_bucket_
@@ -67,6 +77,22 @@ tests/unit/test_rfc0007_a6a_escapee_evidence.nim
 tests/unit/test_run_tests.nim
 EOF
 )"
+    # S5 wiring-audit fix: windows-latest also lacks symlink-create
+    # privilege, so every test/block gated on symlinkprobe.nim's
+    # `symlinksAvailable()` self-skips here too. test_closure_a4a.nim is its
+    # own whole-file skip (its only block quit(0)s) and belongs in
+    # EXPECTED_SKIP above, not here; these six are per-test/per-block skips
+    # inside files whose OTHER tests run for real, so they get the distinct
+    # CRISOL-SKIP-TEST marker instead.
+    EXPECTED_SKIP_TEST="$(cat <<'EOF'
+tests/unit/test_depgraph.nim#test_saveDepGraph_symlink_write_through_protection
+tests/unit/test_discover.nim#symlinked_dir_not_followed
+tests/unit/test_ioutils.nim#test_createoverwrite_nofollow_refuses_symlink
+tests/unit/test_ioutils.nim#test_writeguardedfile_overwrite_true_still_refuses_symlink
+tests/unit/test_jsonout.nim#p3_symlink_safe_temp_write
+tests/unit/test_rfc9_a2_config.nim#dep_roots_alias_symlink_cekConfig
+EOF
+)"
     ;;
   macos)
     # macos-latest (Darwin) IS posix: every `when defined(posix)` gate takes
@@ -77,6 +103,10 @@ EOF
     # before printing either marker — correctly absent from both
     # EXPECTED_SKIP and MUST-EXECUTE on this leg.)
     EXPECTED_SKIP=""
+    # macos-latest (APFS) HAS symlink-create privilege, so every
+    # symlinksAvailable()-gated test/block above runs its real body here —
+    # the expected CRISOL-SKIP-TEST set is empty, same shape as A5c below.
+    EXPECTED_SKIP_TEST=""
     ;;
   *)
     echo "assert-subset-honesty.sh: unknown leg '$LEG' (expected windows|macos)" >&2
@@ -96,6 +126,21 @@ if [ "$ACTUAL_SKIP" != "$EXPECTED_SORTED" ]; then
 else
   n=$(printf '%s\n' "$EXPECTED_SORTED" | sed '/^$/d' | wc -l | tr -d ' ')
   echo "SUBSET-HONESTY OK ($LEG): skip set matches by name (${n} file(s))"
+fi
+
+# --- EXPECTED-SKIP-TEST: per-test/per-block symlink self-skips (S5) ---
+ACTUAL_SKIP_TEST="$(grep -o 'CRISOL-SKIP-TEST: [^[:space:]]*' "$LOG" | sed 's/^CRISOL-SKIP-TEST: //' | sort -u)"
+EXPECTED_TEST_SORTED="$(printf '%s\n' "$EXPECTED_SKIP_TEST" | sed '/^$/d' | sort -u)"
+
+if [ "$ACTUAL_SKIP_TEST" != "$EXPECTED_TEST_SORTED" ]; then
+  echo "SUBSET-HONESTY FAILED ($LEG): observed per-test skip set (by NAME) != expected per-test skip set" >&2
+  echo "--- diff: '<' expected-only (missing skip -- a test that should skip but ran)," >&2
+  echo "          '>' actual-only (unexpected skip -- a test skipping that should have run) ---" >&2
+  diff <(printf '%s\n' "$EXPECTED_TEST_SORTED") <(printf '%s\n' "$ACTUAL_SKIP_TEST") >&2
+  fail=1
+else
+  n=$(printf '%s\n' "$EXPECTED_TEST_SORTED" | sed '/^$/d' | wc -l | tr -d ' ')
+  echo "SUBSET-HONESTY OK ($LEG): per-test skip set matches by name (${n} test(s))"
 fi
 
 # --- MUST-EXECUTE: the three identity conformance tests ran their REAL body

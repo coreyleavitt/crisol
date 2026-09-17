@@ -59,6 +59,13 @@ block test_a4a_symlinked_dep_root_realpath_candidate_classifies_tracked:
   removeDir(realDepDir)
   removeSymlinkSafe(symlinkDepRoot)
   if not symlinksAvailable():
+    # RFC-0009 S5 wiring audit: this is the file's ONLY block, and quit(0)
+    # here terminates the whole process before "PASS test_closure_a4a" is
+    # ever reached -- a genuine whole-file self-skip, so it must emit the
+    # same CRISOL-SKIP marker as the other posix-gated whole-file skips (see
+    # ci/assert-subset-honesty.sh) rather than the bare human-readable SKIP
+    # line alone, which the honesty gate cannot see.
+    echo "CRISOL-SKIP: tests/unit/test_closure_a4a.nim"
     echo "SKIP test_closure_a4a: symlinks unavailable in this environment"
     quit(0)
   createDir(projRoot / "tests")
