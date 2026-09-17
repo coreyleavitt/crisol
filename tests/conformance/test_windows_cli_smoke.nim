@@ -188,6 +188,11 @@ when defined(windows):
         discard gitCmd("config user.email crisol@test.local")
         discard gitCmd("config user.name crisol-test")
         discard gitCmd("config commit.gpgsign false")
+        # The runner's global autocrlf would (a) rewrite the LF fixture
+        # files on checkout and (b) print an "LF will be replaced by CRLF"
+        # warning that execCmdEx's merged stderr splices into the raw
+        # `git diff -z` output below, corrupting the NUL-split entries.
+        discard gitCmd("config core.autocrlf false")
 
         writeRepoFile(".gitignore", ".crisol/\n")
         writeRepoFile("crisol.kdl", "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n")
@@ -196,7 +201,11 @@ when defined(windows):
                       "import widget\nproc helperValue*(): int = widgetValue() + 1\n")
         writeRepoFile("tests/unit/test_dependent.nim",
                       "import std/unittest\nimport helper\nsuite \"dependent\":\n" &
-                      "  test \"ok\": check helperValue() == 4243\n")
+                      "  test \"ok\": check helperValue() > 0\n")
+        # The dependent test's assertion is deliberately value-INDEPENDENT:
+        # it must pass both before (helperValue 43) and after (4243) the
+        # widget edit below -- the scenario's subject is which entrypoints
+        # get SELECTED, never whether the fixture's arithmetic changed.
         writeRepoFile("tests/unit/test_independent.nim",
                       "import std/unittest\nsuite \"independent\":\n  test \"ok\": check true\n")
         discard gitCmd("add -A")
