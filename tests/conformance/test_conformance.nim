@@ -31,6 +31,27 @@
 import std/[options, os, unittest, monotimes, times]
 import ./helpers
 
+# RFC-0009 B4b: this is the POSIX process-backend conformance suite. It drives
+# the substrate through process.nim (the §1 selection ladder), but its
+# assertions bake in POSIX process semantics — ekSignaled exits and their
+# `.sig` field, rlimit-derived `lsApplied` achieved-limit readback, and
+# process-group/subreaper kill domains. On Windows, process.nim selects the
+# Windows Job-Object backend, whose conformance is proven SEPARATELY by the
+# per-file test_windows_* suite on the windows leg (smoke/ntstatus/forensics/
+# iocp/sinks/coopstop/limits/containment/memprobe/lock/…); this file's POSIX
+# assertions do not hold there. So it skips by design on non-POSIX, exactly
+# as B4b's definition-of-done states ("the posix-backend categories skip by
+# design"). The CRISOL-SKIP marker feeds ci/assert-subset-honesty.sh (it is a
+# pinned member of the windows expected-skip set).
+when not defined(posix):
+  when isMainModule:
+    echo "CRISOL-SKIP: tests/conformance/test_conformance.nim"
+    echo "test_conformance: skipped (POSIX process-backend conformance; the " &
+         "Windows backend is proven by the test_windows_* suite run per-file " &
+         "on the windows leg)"
+    echo "test_conformance done"
+  quit(0)
+
 # ---------------------------------------------------------------------------
 # Fixtures compiled once at module load.
 # ---------------------------------------------------------------------------

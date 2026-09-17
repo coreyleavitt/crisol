@@ -52,7 +52,15 @@ case "$LEG" in
     # windows-latest is NOT posix: every `when defined(posix)` whole-file
     # gate (B2 + B3b) takes its `else` branch. Of that set, only these four
     # files fall inside tests/unit:tests/conformance.
+    # test_conformance.nim is the POSIX process-backend conformance suite: it
+    # COMPILES on windows (B3a-ii de-POSIX'd its imports) but its assertions
+    # are POSIX-semantic (ekSignaled/.sig, rlimit lsApplied, process-group
+    # kill domains), so it self-skips `when not defined(posix)` — the Windows
+    # backend is proven by the per-file test_windows_* suite instead. It is
+    # NOT in the B2/B3b import buckets (it imports no std/posix any more), but
+    # it IS a posix-backend-category skip on windows, so it belongs here.
     EXPECTED_SKIP="$(cat <<'EOF'
+tests/conformance/test_conformance.nim
 tests/conformance/test_conformance_timing.nim
 tests/unit/test_process_capabilities.nim
 tests/unit/test_rfc0007_a6a_escapee_evidence.nim
