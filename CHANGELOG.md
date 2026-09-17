@@ -6,6 +6,31 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### BREAKING CHANGE — dependency graph format 7: dep-root closure members' persistence spelling is fixed; one-time full recompile (RFC-0009 wiring-audit W1)
+
+**Prior behaviour:** a dependency-graph closure member under a configured
+dep root was serialized as a bare, unqualified relative path — on disk,
+indistinguishable from a project-root member. On load, that string was
+reconstructed through the project-first path classifier, which has no
+notion of a dep-root qualifier and silently re-tagged every such member as
+a phantom project-root path. A warm run with any dep-root closure member
+was therefore permanently treated as stale (the phantom member's file
+never existed at its assumed project-relative location, or its content
+hash never matched a real file there), and `crisol closure --json` emitted
+the bare relative path for such a member instead of the documented
+`dep:<name>/<rel>` wire spelling (crisol/closure/v1 rev 3).
+
+**New behaviour:** each closure member is now persisted in its portable
+`keyBytes` spelling — `dep:<name>/<rel>` for a dep-root member, unchanged
+for a project-root member — and reconstructed on load via the exact
+inverse of that grammar, so a dep-root member round-trips back to its own
+tracked root instead of a phantom project-root path. The header's per-root
+ordinal tag, which nothing ever read back, is dropped; a root is resolved
+by its configured name alone, exactly as a closure member already names
+it. A format-6 (or older) graph's dep-root closure members cannot be
+reattributed to their real root after the fact, so such a graph is
+discarded once, triggering a single full recompile.
+
 ### Added — degraded-run evidence in `--json` output, and its dep graph is no longer persisted (RFC-0009 A-degraded D5/D6)
 
 A run is "degraded" when the fold-policy probe (RFC-0009 §3) genuinely

@@ -478,6 +478,46 @@ proc fromJson*(node: JsonNode; roots: TrackedRoots): Option[TrackedPath] =
       return fromCanonical(RootTag(uint16(i + 1)), rel, roots)
   none(TrackedPath)
 
+proc fromKeyBytes*(s: string; roots: TrackedRoots): Option[TrackedPath] =
+  ## The inverse of `keyBytes` — the depgraph closure member reader (RFC-0009
+  ## W1). Reconstructs a `TrackedPath` from a persisted `string(keyBytes(tp,
+  ## roots))` string, e.g. a depgraph closure entry read back off disk. Three
+  ## arms, mirroring `keyBytes`' own three cases exactly:
+  ##   - `"dep:<name>/<rel>"` — the root name is the text between `"dep:"`
+  ##     and the first `/`; resolved against the CURRENT `roots.deps[i].name`
+  ##     to `RootTag(i+1)`. An empty name, a `:` inside the name, an absent
+  ##     `/` at all, an empty `rel`, or an unresolvable name (a renamed or
+  ##     removed dep root) all return `none`.
+  ##   - `"./<rel>"` — the §4 R3-20 escape (`keyBytes`' own `dep:` guard for
+  ##     a tag-0 rel whose first segment merely LOOKS like `dep:foo`).
+  ##     `rel` (the text after `./`) must itself satisfy `looksLikeDepEscape`
+  ##     — nothing else legally begins `./` (see `keyBytes`' "the escape is
+  ##     injective" note), so any other `./`-prefixed text is malformed and
+  ##     returns `none`.
+  ##   - anything else — tag 0, unchanged.
+  ## Every arm delegates final shape validation to `fromCanonical`, which
+  ## never raises: parsing persisted/untrusted text never crashes here
+  ## either — a shape violation degrades to `none`, the caller chooses
+  ## degrade vs abort (the same family rule `fromCanonical`/`fromJson`
+  ## follow). Never touches cwd or disk.
+  if s.startsWith("dep:"):
+    let rest = s[4 .. ^1]
+    let idx = rest.find('/')
+    if idx < 0: return none(TrackedPath)
+    let name = rest[0 ..< idx]
+    let rel = rest[idx + 1 .. ^1]
+    if name.len == 0 or ':' in name or rel.len == 0: return none(TrackedPath)
+    for i, d in roots.fdeps:
+      if d.name == name:
+        return fromCanonical(RootTag(uint16(i + 1)), rel, roots)
+    return none(TrackedPath)
+  elif s.startsWith("./"):
+    let rel = s[2 .. ^1]
+    if not looksLikeDepEscape(rel): return none(TrackedPath)
+    return fromCanonical(RootTag(0), rel, roots)
+  else:
+    return fromCanonical(RootTag(0), s, roots)
+
 # ---------------------------------------------------------------------------
 # toNative — the sole inverse, for I/O.
 # ---------------------------------------------------------------------------

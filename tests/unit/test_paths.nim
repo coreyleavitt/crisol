@@ -431,6 +431,77 @@ suite "toJson / fromJson — round trip":
     check fromJson(%*"not-an-object", roots).isNone
 
 # ===========================================================================
+# fromKeyBytes — the keyBytes grammar's inverse (RFC-0009 W1). The depgraph
+# closure member reader: `fromKeyBytes(string(keyBytes(tp, roots)), roots)`
+# must recover the ORIGINAL TrackedPath, tag and all — this is exactly the
+# round trip the pre-W1 depgraph read side got wrong (it used `classify`,
+# which re-tags every dep-root member as a phantom tag-0 project path).
+# ===========================================================================
+
+suite "fromKeyBytes — the keyBytes grammar's inverse":
+
+  test "project-tag plain rel round-trips":
+    let roots = rootsWith("/fake/proj-fkb1", fpNone)
+    let tp = tracked("/fake/proj-fkb1/a/b.nim", roots).get
+    check fromKeyBytes(string(keyBytes(tp, roots)), roots).get == tp
+
+  test "project-tag dep:* escape case round-trips":
+    let roots = rootsWith("/fake/proj-fkb2", fpNone)
+    let tp = tracked("/fake/proj-fkb2/dep:foo/bar.nim", roots).get
+    check tp.isProject
+    check string(keyBytes(tp, roots)) == "./dep:foo/bar.nim"
+    check fromKeyBytes(string(keyBytes(tp, roots)), roots).get == tp
+
+  test "a real dep-root member round-trips to its OWN root tag, not tag 0":
+    let roots = rootsWith("/fake/proj-fkb3", fpNone,
+                           @[("mydep", "/fake/dep-fkb3")])
+    let tp = tracked("/fake/dep-fkb3/src/foo.nim", roots).get
+    check not tp.isProject
+    let bytes = string(keyBytes(tp, roots))
+    check bytes == "dep:mydep/src/foo.nim"
+    let back = fromKeyBytes(bytes, roots)
+    check back.isSome
+    check back.get == tp
+    check not back.get.isProject
+
+  test "an unresolvable dep root name degrades to none, never crashes":
+    let roots = rootsWith("/fake/proj-fkb4", fpNone,
+                           @[("mydep", "/fake/dep-fkb4")])
+    check fromKeyBytes("dep:goneDep/src/foo.nim", roots).isNone
+
+  test "malformed dep: text (empty name) degrades to none":
+    let roots = rootsWith("/fake/proj-fkb5", fpNone,
+                           @[("mydep", "/fake/dep-fkb5")])
+    check fromKeyBytes("dep:/x", roots).isNone
+
+  test "malformed dep: text (colon inside the name) degrades to none":
+    let roots = rootsWith("/fake/proj-fkb6", fpNone,
+                           @[("mydep", "/fake/dep-fkb6")])
+    check fromKeyBytes("dep:a:b/x", roots).isNone
+
+  test "malformed dep: text (no '/' at all) degrades to none":
+    let roots = rootsWith("/fake/proj-fkb7", fpNone,
+                           @[("mydep", "/fake/dep-fkb7")])
+    check fromKeyBytes("dep:mydep", roots).isNone
+
+  test "malformed dep: text (empty rel after the name) degrades to none":
+    let roots = rootsWith("/fake/proj-fkb8", fpNone,
+                           @[("mydep", "/fake/dep-fkb8")])
+    check fromKeyBytes("dep:mydep/", roots).isNone
+
+  test "a bare ./ prefix without the dep-escape shape degrades to none":
+    # Nothing else legitimately begins "./" (see keyBytes' own "the escape
+    # is injective" note) -- nothing under this SPELLING was ever produced
+    # by keyBytes for such a rel.
+    let roots = rootsWith("/fake/proj-fkb9", fpNone)
+    check fromKeyBytes("./x", roots).isNone
+    check fromKeyBytes("./foo/bar.nim", roots).isNone
+
+  test "empty text degrades to none":
+    let roots = rootsWith("/fake/proj-fkb10", fpNone)
+    check fromKeyBytes("", roots).isNone
+
+# ===========================================================================
 # Probe-memo bypass for injected probes (A3b-ii) — the injectable §3 seam
 # must survive a prior default/other-probe call against the SAME root.
 # ===========================================================================

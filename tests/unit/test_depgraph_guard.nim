@@ -516,7 +516,7 @@ suite "depgraph load provenance: discarded persisted graph":
     check "a|b" in d.message
     check "unreadable: cannot open: /tmp/a|b/depgraph" in d.message
 
-  test "RFC-0009 A3c-i: root descriptor (project + one named dep, each with its own injected foldPolicy) round-trips byte-for-byte through save/loadStoredDepGraph":
+  test "RFC-0009 A3c-i/W1: root descriptor (project + one named dep, each with its own injected foldPolicy) round-trips byte-for-byte through save/loadStoredDepGraph":
     let root = graphRoot("roots_roundtrip")
     defer: removeDir(root)
     let depNative = root / "depdir"
@@ -536,8 +536,8 @@ suite "depgraph load provenance: discarded persisted graph":
     let loaded = loadStoredDepGraph(cfg, d)
     check d.kind == dgdNone
     check loaded.header.roots.len == 2
-    check loaded.header.roots[0] == (tag: 0, name: "", foldPolicy: fpNone)
-    check loaded.header.roots[1] == (tag: 1, name: "mydep", foldPolicy: fpAsciiLower)
+    check loaded.header.roots[0] == (name: "", foldPolicy: fpNone)
+    check loaded.header.roots[1] == (name: "mydep", foldPolicy: fpAsciiLower)
 
   test "RFC-0009 A3c-i: loadDepGraph discards as absent when a persisted root NAME is unknown to the current roots (dgdRootUnknown)":
     let root = graphRoot("root_unknown")

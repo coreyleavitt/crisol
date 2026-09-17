@@ -13,19 +13,27 @@
 ##     "nimVersion":     "<string>",   -- e.g. "2.2.10"
 ##     "formatVersion":  <int>,        -- DepGraphFormatVersion
 ##     "roots": [                      -- RFC-0009 A3c-i: this file's OWN local
-##       {                             -- tag->name assignment, never a bare
-##         "tag":        <int>,        -- ordinal (a config dep-order edit could
-##         "name":       "<string>",   -- otherwise silently rebind an old tag to
-##         "foldPolicy": "<string>"    -- the wrong root). "" name = project root
-##       },                            -- (tag 0); "fpNone"/"fpAsciiLower" =
-##       ...                          -- that root's PROBED FoldPolicy at the
-##     ]                              -- time this file was last saved.
+##       {                             -- name/foldPolicy table, in TrackedRoots
+##         "name":       "<string>",   -- order (project first). "" name =
+##         "foldPolicy": "<string>"    -- project root; "fpNone"/"fpAsciiLower"
+##       },                            -- = that root's PROBED FoldPolicy at
+##       ...                          -- the time this file was last saved.
+##     ]                              -- No ordinal tag is persisted here (RFC-
+##                                     -- 0009 W1) -- a closure member (below)
+##                                     -- already names its root by NAME, so a
+##                                     -- header-only tag would be write-only
+##                                     -- (nothing ever reads it back).
 ##   },
 ##   "entries": [
 ##     {
 ##       "path":          "<string>",       -- entrypoint path (project-root-relative)
 ##       "flagHash":      "<16 hex chars>", -- 64-bit FNV-1a over sorted flags
-##       "closure":       ["<string>", ...] -- project-root-relative source paths
+##       "closure":       ["<string>", ...] -- each member in its keyBytes spelling
+##                                           -- (RFC-0009 W1, paths.keyBytes): a
+##                                           -- project-root member is project-
+##                                           -- root-relative, forward-slashed,
+##                                           -- unchanged from before; a dep-root
+##                                           -- member is `dep:<name>/<rel>`.
 ##       "closureHash":   "<16 hex chars>", -- 64-bit chained FNV-1a over sorted closure file CONTENTS
 ##       "protocolMajor": <int>             -- crisol protocol major at build time
 ##     },
@@ -98,7 +106,7 @@
 ## `moveFile` (rename(2)) for an atomic replacement.  Readers always see either
 ## the old or the new file, never a torn write.
 
-import std/[algorithm, json, os, sequtils, sets, strutils, tables]
+import std/[algorithm, json, options, os, sequtils, sets, strutils, tables]
 import crisol/types
 import crisol/config   # for stateDirOf
 import crisol/closure  # for extractClosure/extractCompileInputs/SourceIndex/
@@ -128,11 +136,25 @@ export fnv
 # Constants
 # ---------------------------------------------------------------------------
 
-const DepGraphFormatVersion* = 6
+const DepGraphFormatVersion* = 7
   ## Increment this when the JSON schema changes in an incompatible way.
   ## A loaded file with a different formatVersion is treated as absent.
   ##
   ## History:
+  ##   7 — RFC-0009 W1 (wiring-audit fix): each closure member is now
+  ##       serialized in its `paths.keyBytes` spelling instead of a bare
+  ##       `display(tp)` rel, so a dep-root member round-trips back to its
+  ##       OWN root tag instead of `classify`'s project-first join
+  ##       re-tagging it as a phantom tag-0 project path (the read side now
+  ##       uses `paths.fromKeyBytes`, the keyBytes grammar's inverse, in
+  ##       place of `classify`). The header's per-root `tag` column is
+  ##       dropped — nothing ever read it back, a closure member already
+  ##       names its root by NAME. A v6 file's dep-root closure members are
+  ##       exactly the phantom tag-0 spellings this bump fixes: they cannot
+  ##       be re-attributed to their real root after the fact (the bare rel
+  ##       string alone no longer tells you which root it came from), so
+  ##       the graph is discarded once — a one-time full recompile — rather
+  ##       than migrated in place, exactly like every prior bump below.
   ##   6 — RFC-0009 A3c-i: the header gains `roots` — this file's own local
   ##       tag->name table, and each named root's probed `foldPolicy` at save
   ##       time (`DepGraphHeader.roots`; never a bare ordinal — see the type
@@ -182,15 +204,21 @@ type
   DepGraphHeader* = object
     nimVersion*:    string  ## Nim version string (e.g. "2.2.10")
     formatVersion*: int     ## DepGraphFormatVersion
-    roots*: seq[tuple[tag: int; name: string; foldPolicy: FoldPolicy]]
-      ## RFC-0009 A3c-i: this FILE's own local tag->name assignment, one
+    roots*: seq[tuple[name: string; foldPolicy: FoldPolicy]]
+      ## RFC-0009 A3c-i: this FILE's own local name/foldPolicy table, one
       ## record per root tracked when the graph was last saved — project
-      ## root first (`tag: 0`, `name: ""`), then each configured dep root in
-      ## `TrackedRoots` order (`tag: 1..N`). Never a bare ordinal without its
-      ## name: a config dep-order edit would otherwise silently rebind an
-      ## old tag to the wrong root on the next load. `foldPolicy` is that
-      ## root's own PROBED policy at save time (never re-derived from the
-      ## in-memory value later — see `saveDepGraph`, the sole producer).
+      ## root first (`name: ""`), then each configured dep root in
+      ## `TrackedRoots` order. `foldPolicy` is that root's own PROBED policy
+      ## at save time (never re-derived from the in-memory value later — see
+      ## `saveDepGraph`, the sole producer).
+      ##
+      ## No ordinal `tag` column (RFC-0009 W1 — dropped; previously present
+      ## but read by nothing): a closure member (`DepGraphEntry.closure`)
+      ## already names its own root by NAME via its `paths.keyBytes`
+      ## spelling (`dep:<name>/<rel>`), so a tag here would be entirely
+      ## write-only. Root identity in this header was ALWAYS resolved by
+      ## `name` (see the load-time validation below) — the tag never did
+      ## any work even before this bump.
       ##
       ## Populated at SAVE time from `config.trackedRoots` (`saveDepGraph`),
       ## not at construction (`initDepGraph` has no `Config` to source it
@@ -591,12 +619,17 @@ proc gcDeletedEntrypoints*(graph:               var DepGraph;
 proc toJson(graph: DepGraph; roots: TrackedRoots): JsonNode =
   ## Serialize a DepGraph to a JsonNode.
   ##
-  ## RFC-0009 A3c-ii: `entry.closure` is `HashSet[TrackedPath]` — each
-  ## member is sorted by `cmpKeyBytes(_, _, roots)` (the SOLE ordering over
-  ## `TrackedPath`; there is deliberately no `<`) and serialized via
-  ## `display`, which for a tag-0 (project) member is byte-identical to the
-  ## project-relative string this file stored before the retype — the
-  ## on-disk closure format is unchanged.
+  ## RFC-0009 W1: `entry.closure` is `HashSet[TrackedPath]` — each member is
+  ## sorted by `cmpKeyBytes(_, _, roots)` (the SOLE ordering over
+  ## `TrackedPath`; there is deliberately no `<`) and serialized via its
+  ## `keyBytes` spelling (`paths.keyBytes`), not `display`: a tag-0
+  ## (project) member's keyBytes is byte-identical to `display` (and to the
+  ## project-relative string this file stored before the retype) EXCEPT the
+  ## §4 `dep:*` escape (a tag-0 rel that itself looks like `dep:foo/...`
+  ## gets a `./` prefix), so the on-disk format for an ordinary project path
+  ## is unchanged; a dep-root member is now `dep:<name>/<rel>` instead of
+  ## the bare rel `display` would have produced — bare rel lost which root
+  ## the member came from on the read side (the defect this bump fixes).
   let headerNode = newJObject()
   headerNode["nimVersion"]    = newJString(graph.header.nimVersion)
   headerNode["formatVersion"] = newJInt(graph.header.formatVersion)
@@ -604,7 +637,6 @@ proc toJson(graph: DepGraph; roots: TrackedRoots): JsonNode =
   let rootsArr = newJArray()
   for r in graph.header.roots:
     let rNode = newJObject()
-    rNode["tag"]        = newJInt(r.tag)
     rNode["name"]       = newJString(r.name)
     rNode["foldPolicy"] = newJString($r.foldPolicy)  ## "fpNone"/"fpAsciiLower"
     rootsArr.add rNode
@@ -615,11 +647,12 @@ proc toJson(graph: DepGraph; roots: TrackedRoots): JsonNode =
     let (path, fHash) = key
     let closureArr = newJArray()
     # Sort for deterministic output. No `<` exists on TrackedPath (R3-3) —
-    # `cmpKeyBytes` is the sole ordering; serialize each member's `display`.
+    # `cmpKeyBytes` is the sole ordering; serialize each member's `keyBytes`
+    # spelling (RFC-0009 W1 — see the proc doc above for why not `display`).
     var sortedClosure = toSeq(entry.closure)
     sortedClosure.sort(proc(a, b: TrackedPath): int = cmpKeyBytes(a, b, roots))
     for tp in sortedClosure:
-      closureArr.add newJString(display(tp))
+      closureArr.add newJString(string(keyBytes(tp, roots)))
     let externalsArr = newJArray()
     var sortedExternals = entry.externals
     sortedExternals.sort(proc(a, b: ExternalSource): int = cmp(a.source, b.source))
@@ -706,33 +739,30 @@ proc fromJson(node: JsonNode; roots: TrackedRoots; discarded: var DepGraphDiscar
   result.header.nimVersion    = storedNimVerStr
   result.header.formatVersion = DepGraphFormatVersion
 
-  # Parse header.roots (RFC-0009 A3c-i). OPTIONAL at this shape-validation
-  # layer -- absent (e.g. a hand-built fixture predating this field, or one
-  # that never touches the roots mechanism) parses as `@[]`, mirroring how
-  # `closureHash`/`protocolMajor`/`externals` are tolerated as absent on an
-  # entry, below. Every REAL file (`saveDepGraph`, the sole producer) always
-  # writes it non-empty (at minimum the project root, tag 0) -- an absent
-  # array here can only mean a hand-built document, never a genuinely
-  # persisted graph, so leniency costs nothing in production. If PRESENT,
-  # it must be well-formed: a malformed element is a fact about the stored
-  # bytes (dgdMalformed), not something a `loadDepGraph`-layer freshness
-  # judgment should paper over.
+  # Parse header.roots (RFC-0009 A3c-i; no `tag` column since W1 -- nothing
+  # ever read it back, see DepGraphHeader.roots' doc). OPTIONAL at this
+  # shape-validation layer -- absent (e.g. a hand-built fixture predating
+  # this field, or one that never touches the roots mechanism) parses as
+  # `@[]`, mirroring how `closureHash`/`protocolMajor`/`externals` are
+  # tolerated as absent on an entry, below. Every REAL file (`saveDepGraph`,
+  # the sole producer) always writes it non-empty (at minimum the project
+  # root) -- an absent array here can only mean a hand-built document,
+  # never a genuinely persisted graph, so leniency costs nothing in
+  # production. If PRESENT, it must be well-formed: a malformed element is
+  # a fact about the stored bytes (dgdMalformed), not something a
+  # `loadDepGraph`-layer freshness judgment should paper over.
   let rootsNode = headerNode{"roots"}
   if rootsNode != nil:
     if rootsNode.kind != JArray:
       discarded = DepGraphDiscard(kind: dgdMalformed, stored: "header roots not an array")
       return
-    var roots: seq[tuple[tag: int; name: string; foldPolicy: FoldPolicy]] = @[]
+    var roots: seq[tuple[name: string; foldPolicy: FoldPolicy]] = @[]
     for rNode in rootsNode:
       if rNode.kind != JObject:
         discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root entry not an object")
         return
-      let tagNode  = rNode{"tag"}
       let nameNode = rNode{"name"}
       let fpNode   = rNode{"foldPolicy"}
-      if tagNode == nil or tagNode.kind != JInt:
-        discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root missing/invalid tag")
-        return
       if nameNode == nil or nameNode.kind != JString:
         discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root missing/invalid name")
         return
@@ -745,7 +775,7 @@ proc fromJson(node: JsonNode; roots: TrackedRoots; discarded: var DepGraphDiscar
       except ValueError:
         discarded = DepGraphDiscard(kind: dgdMalformed, stored: "root has unrecognized foldPolicy")
         return
-      roots.add (tag: tagNode.getInt(0), name: nameNode.getStr(""), foldPolicy: fp)
+      roots.add (name: nameNode.getStr(""), foldPolicy: fp)
     result.header.roots = roots
 
   # Parse entries
@@ -771,18 +801,27 @@ proc fromJson(node: JsonNode; roots: TrackedRoots; discarded: var DepGraphDiscar
     let fHash   = flagHashNode.getStr("")
     if path == "" or fHash == "": continue
 
-    # RFC-0009 A3c-ii: classify-at-load both converts each stored
-    # project-root-relative string to its TrackedPath identity AND drops
-    # any member that does not resolve under a tracked root — this
-    # SUBSUMES the separate post-load underRootNorm filter that used to run
-    # over the string closure (M10; see loadStoredDepGraph, below).
+    # RFC-0009 W1: `fromKeyBytes` (paths.nim) is the keyBytes grammar's
+    # inverse — replaces the old `classify(s, roots)` call here. `classify`
+    # is the wrong direction for ALREADY-canonical persisted text: its
+    # project-first join has no notion of the `dep:<name>/` prefix, so it
+    # silently re-tagged every persisted dep-root member as a phantom tag-0
+    # project path (the defect this format bump fixes — see History above).
+    # `fromKeyBytes` returning `none` drops that member (degrade-never-
+    # crash): a renamed/removed dep root's NAME is caught at the HEADER
+    # level by `loadDepGraph`'s dgdRootUnknown check (below, in file order),
+    # which discards the WHOLE graph before any caller ever sees these
+    # entries — so a `none` surviving to a live caller can only mean the
+    # entry's bytes themselves are corrupt, never a legitimate stale-root
+    # scenario. This subsumes the old M10 underRootNorm role (dropping any
+    # member that doesn't resolve under a tracked root) the same way the
+    # pre-W1 classify-at-load conversion did.
     var closure = initHashSet[TrackedPath]()
     for item in closureNode:
       let s = item.getStr("")
       if s.len == 0: continue
-      let pc = classify(s, roots)
-      if pc.kind == pcTracked: closure.incl pc.tp
-      # pcOutside members are dropped — exactly what M10's underRootNorm did.
+      let tpOpt = fromKeyBytes(s, roots)
+      if tpOpt.isSome: closure.incl tpOpt.get
 
     let closureHash   = if closureHashNode != nil: closureHashNode.getStr("") else: ""
     let protocolMajor = if protocolMajNode != nil: protocolMajNode.getInt(0)  else: 0
@@ -824,14 +863,15 @@ proc depgraphPath*(config: Config): string =
   ## Absolute path to the depgraph file.
   stateDirOf(config) / "depgraph"
 
-proc rootsDescriptor(roots: TrackedRoots): seq[tuple[tag: int; name: string; foldPolicy: FoldPolicy]] =
-  ## RFC-0009 A3c-i: this file's own local tag->name table (`DepGraphHeader.
-  ## roots`) — project root first (`tag: 0`, `name: ""`), then each
-  ## configured dep root in `TrackedRoots` order (`tag: 1..N`), mirroring
-  ## `TrackedRoots`' own tagging (paths.nim §1) exactly.
-  result.add (tag: 0, name: roots.project.name, foldPolicy: roots.project.foldPolicy)
-  for i, d in roots.deps:
-    result.add (tag: i + 1, name: d.name, foldPolicy: d.foldPolicy)
+proc rootsDescriptor(roots: TrackedRoots): seq[tuple[name: string; foldPolicy: FoldPolicy]] =
+  ## RFC-0009 A3c-i/W1: this file's own local name/foldPolicy table
+  ## (`DepGraphHeader.roots`) — project root first (`name: ""`), then each
+  ## configured dep root in `TrackedRoots` order. No ordinal tag (dropped at
+  ## W1 — see `DepGraphHeader.roots`'s doc): a closure member already names
+  ## its own root by NAME via `paths.keyBytes`.
+  result.add (name: roots.project.name, foldPolicy: roots.project.foldPolicy)
+  for d in roots.deps:
+    result.add (name: d.name, foldPolicy: d.foldPolicy)
 
 proc saveDepGraph*(graph: DepGraph; config: Config): bool =
   ## Write the graph to `<projectRoot>/<stateDir>/depgraph` atomically.
@@ -1147,12 +1187,13 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
 
   for key in toSeq(result.entries.keys):
     var entry = result.entries[key]
-    # RFC-0009 A3c-ii: the closure-path M10 filter that used to run HERE
+    # RFC-0009 A3c-ii/W1: the closure-path M10 filter that used to run HERE
     # (drop any string member not under a tracked root) is now SUBSUMED by
-    # the classify-at-parse conversion in `fromJson`, above — every member
-    # already surviving into `entry.closure` is a `TrackedPath` built via
-    # `classify`'s `pcTracked` arm; a `pcOutside` member was already dropped
-    # there. `entry.closure` needs no further filtering here.
+    # the `fromKeyBytes`-at-parse conversion in `fromJson`, above — every
+    # member already surviving into `entry.closure` is a `TrackedPath` that
+    # `fromKeyBytes` successfully resolved; an unresolvable/malformed member
+    # was already dropped there. `entry.closure` needs no further filtering
+    # here.
 
     # M10, extended (issue #16): `entry.externals[].source` must resolve
     # under a tracked root (same rule/gate as a closure path — an
@@ -1175,8 +1216,9 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
 
     # Defense in depth — see DepGraphEntry.closure, invariant NONEMPTY-CLOSURE:
     # the writer refuses to record an empty closure, but if one reaches disk
-    # anyway (or every member was dropped as pcOutside at classify-time,
-    # above), treat it as absent so decideCompile/narrow re-derive it.
+    # anyway (or every member was dropped as unresolvable/malformed at
+    # fromKeyBytes-parse-time, above), treat it as absent so decideCompile/
+    # narrow re-derive it.
     if entry.closure.len == 0:
       result.entries.del(key)
       continue

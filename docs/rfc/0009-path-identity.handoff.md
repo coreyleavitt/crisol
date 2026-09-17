@@ -84,3 +84,54 @@ Full detail in the session review ledger: `<scratchpad>/rfc0009-review-ledger.md
 - **FORK B — `Entrypoint.path` migration strategy.** Retype is whole-program-atomic (20 modules, 221 test constructions). Options: (a) **full additive ladder** (RFC-0007-A1 precedent: add ProjectPath alongside path:string, migrate surfaces one per slice, remove path:string via compiler-enumerated + scripted test sweep) — keeps the "un-canonicalized comparison = compile error" enforcement the RFC's motivation stakes on. (b) **surface-only** (keep path:string permanently as display; introduce ProjectPath only at membership/key surfaces) — much smaller blast radius, forfeits compile-time enforcement. **Reco: (a) ladder** — the enforcement IS the design's thesis (echoes ChildId/LimitKind); RFC-0007 paid exactly this cost. Corey owns the effort/risk-vs-rigor call.
 - **FORK C — cache-key fold scope (reshapes the load-bearing property).** Options: (a) **fold keys per-volume** (current draft) — warm hits across manifest/discovery case drift on one volume; cross-policy fleet split; sound only with a correct probe. (b) **keys always `fpNone`, fold membership only** — keys derive from discovery's on-disk case (canonical by construction), so folding buys little; fleet-portable, probe-independent for keys, sound on case-sensitive volumes; cost: drops the "warm hit across spellings" half of the load-bearing property (cache goes cold, never wrong, on case drift). **Reco: (b)** — crisol's value is sound SELECTION not compile speed (MEMORY → crisol-value-is-selection); membership-fold delivers the soundness, keys-fpNone keeps portability+simplicity. Corey owns whether Windows cache-warmth-across-drift is worth the probe dependency + fleet split.
 - **FORK 3 (recommended-resolved, not blocking):** artifactid/ccprobe/measurement Windows-correctness — **scoped OUT** via a new Non-goal (measurement is RFC-0006's concern, parked on negative benchmark). Applied to the draft; flag if Corey disagrees.
+
+## Wiring audit — 2026-09-17 (post-completion, pre-code-review)
+
+Three-lens audit (identity boundary / cache-key chain / CI-test wiring), all findings verified against the code by the control loop. **Verdict: NOT wiring-complete — `wiring` stays `unproven`.** Selection half of the load-bearing property is live end-to-end (real shared plan phase, both case-insensitive legs). Cache half is proven for single-root only; the multi-root (depRoot) persistence machinery is dark (W1).
+
+### W1 — BLOCKER (kinds 2+3+5+7): dep-root closure members do not survive depgraph persist/load
+- Write side `depgraph.nim:622` serializes each member as bare `display(tp)`; read side `depgraph.nim:783` reconstructs via `classify(s, roots)`, whose project-first relative join (`paths.nim:377-390`) re-tags every dep-root member as a phantom tag-0 project path.
+- Declared-not-implemented: A3c-i "at load, an entry's local tag resolves through the header's table" — header `tag` is written (`depgraph.nim:607`) and parsed (`:730-748`) but read by nothing.
+- Consumer-less producers built for exactly this: `paths.toJson` (`paths.nim:451`), `paths.fromJson` (`:462`), tag-arity `fromCanonical` (`:427`) — zero production consumers (unit tests only).
+- Blast radius: (a) warm runs with dep-root closure members are permanently `cdStale` (`planner.nim:248,258`) — the nimcache-persistence lever is dead in exactly the milpa-CAS depRoot config root-tagging was built for; (b) warm `crisol closure --json` emits bare rel instead of `dep:<name>/rel` (`api.nim:1015-1021` reads the loaded graph) — violates crisol/closure/v1 rev 3 toward amoxtli. Sound (over-selection only, never a wrong hit).
+- Why CI is green: no test round-trips a dep-root member through save→load→decideCompile; A4b and all `test_closure_warm.nim` fixtures use `depRoots: @[]`; A5c asserts result-cache stats that survive the forced recompile.
+- Fix: persist the `keyBytes` spelling (tag-0 bytes unchanged on disk) or `paths.toJson` objects; read back via `dep:<name>/` parse → name→tag → `fromCanonical(tag, rel, roots)` / `fromJson`. DepGraphFormatVersion bump (pin+History+CHANGELOG together). Add a warm dep-root round-trip conformance test asserting freshness + wire spelling.
+
+### W2 (kind 7): "driving the real crisol binary" is not what the identity proofs do
+A3b-ii drives `api.runTests` (`test_rfc9_a3bii_fold_selection.nim:198`) + `pipeline.buildRunPlan` (`:290`); A5c drives `runTests` (`:144,170`); A4b drives `runner.plan/execute`. The macos leg never builds the binary. Unproven delta: `src/crisol.nim` argv→facade glue on the case-insensitive legs. Fix: add a case-variant `--changed` scenario to the spawned-binary CLI smoke (windows) or amend the property wording to "the real shared plan phase via the public facade".
+
+### W3 (kinds 7+5): sidecar string overload survived A-final-ii's "DELETED" claim
+`cachelocalfs.nim:116` string `sidecarPath` is still the live route; the `CacheKeyPath` overload (`:123`) has zero callers; `readSidecar` tp overload's comment (`:147-151`) claims routing via the typed overload but calls the string chain. (`slug`/`identityKey` string arities genuinely gone.) Fix: route tp overloads through the typed overload, privatize the string arities, add the overload-absence gate check.
+
+### W4 (kinds 3+7): grep-gate implements fewer checks than A-final-ii declares
+`test_rfc9_path_identity_gate.nim` lacks: the `isAbsolute`-root-check tripwire, the production-`.display()`-misuse tripwire (`paths.nim:509-514` admits it), the overload-absence scan. Allowlist drift: whole-file exemptions for `closure.nim` (25 unmarked canon primitives) and `config.nim` (6) bypass the `# canon-ok:` marker mechanism; `ccprobe`/`artifactid`/`report` entries currently match zero primitives (inert). Gate walks `src/crisol/` only — `src/crisol.nim` never scanned (zero violations today).
+
+### W5 (kinds 2/6): subset-honesty gate blind to non-marker skips
+`ci/assert-subset-honesty.sh:87` collects only `CRISOL-SKIP:` markers. Windows symlink self-skips via `quit(0)`/unittest `skip()` are invisible and pinned in no manifest: `test_closure_a4a.nim:62`, `test_discover.nim:345`, `test_jsonout.nim:1415`, `test_rfc9_a2_config.nim:142`, `test_ioutils.nim:349,456`, `test_depgraph.nim:319`. "A new silent skip fails the gate" holds only for marker-emitting skips. Fix: collect the `SKIP` echo/skip() conventions too, pin a named windows symlink-skip set.
+
+### W6 (kinds 5+3, minor): `NativeAbs` `==`/`hash`/`$` have no production consumer
+RFC §1 declares them SourceIndex Table keys; `closure.nim:216-224` keys `Table[string, …]`. Wire SourceIndex to `NativeAbs` keys as designed, or correct the RFC/type doc.
+
+### W7 (kind 2, low): relative CLI file selectors bypass classify
+`discover.nim:239` returns a relative selector verbatim (assumed project-relative) instead of joining against captured cwd + `classify` (RFC §1 round-2 rule). Fails loud (no-match diagnosis), never mis-selects.
+
+### W8 (kind 6): empty sweep is a green sweep
+nimble `test` task silently drops missing dirs and writes the OK marker for 0 files; timing and cgroup legs have no must-execute floor (test leg has meta-inversion; windows/macos have must-exec markers).
+
+### W9 (trivia)
+`shard.nim:89-90` comment names a nonexistent `identityKey` string-overload fallback; this handoff's header still says "(DRAFT)"; RFC-0007 handoff (`:4,:41`) still says D2b unchecked vs `0007-execution-substrate.md:32,584` DONE; `CRISOL_TIER=windows` (`ci.yml:465`) has no live reader on its leg; bucket-inventory anti-regression is one-directional (declared in-test — accepted).
+
+**Disposition:** all findings are wire-it, none delete. W1 (+W2–W5 in the same round) → /tdd before /code-review. Audit control-loop verified W1, W2, W3, W5 and the closure-wire consequence directly against the code.
+
+## Wiring-audit FIX ROUND — started 2026-09-17 (Corey: "get going"; /tdd)
+
+**Session HEAD at start: 7bf565f. Slice plan (vertical, tracer first):**
+- **S1 (W1, BLOCKER):** persist depgraph closure members in their `keyBytes` spelling (tag-0 bytes unchanged; `dep:<name>/rel`; `./` escape per §4 R3-20 — already implemented in `paths.keyBytes`); new inverse `paths.fromKeyBytes(s, roots): Option[TrackedPath]` replaces `classify`-at-load (`depgraph.nim:783`); drop the unread header `tag` column (names ride inline); `DepGraphFormatVersion` 6→7 + History + CHANGELOG (guard tests use the symbol — no literal pin found). Tracer: conformance test — dep-root project, cold `runTests`, then (a) `closureReport` emits `dep:<name>/rel`, (b) `planTests` decision is NOT `edStale`. Both RED today.
+- **S2:** fold into S1 assertions (phantom-alias distinctness) if cheap, else separate.
+- **S3 (W3):** route sidecar tp overloads through the typed `CacheKeyPath` overload; privatize string arities; migrate test callers.
+- **S4 (W4):** gate additions (isAbsolute-root check, overload-absence, scan `src/crisol.nim`, drop inert allowlist entries, closure/config → `# canon-ok:` markers); decide `.display()` tripwire posture in-slice.
+- **S5 (W5):** standardize the 6 windows symlink self-skips on `CRISOL-SKIP:` markers + pin a named windows expected-skip set in `ci/assert-subset-honesty.sh`.
+- **S6 (W2):** case-variant `--changed` scenario in the spawned-binary windows CLI smoke + amend RFC property wording honestly.
+- **S7 (W9):** doc/comment riders (shard.nim:89 comment, this handoff's DRAFT header, 0007 handoff D2b lines, `CRISOL_TIER=windows`).
+
+**Design decisions (settled, recorded — carry verbatim into slice briefs):** persisted member format = keyBytes string (injective per §4 escape; NOT toJson objects, NOT local-tag indirection — A3c-i's tag-resolution mechanism is superseded by inline names, which honor the same persist-by-NAME invariant; RFC text amended in S7); member parse failure at load = drop member (degrade-never-crash family rule; header discard-check already guarantees resolvable root names); measure-plan (`runner.nim:1134`) is entrypoint-level tag-0 — untouched. Gates per slice: `./dev test` (quiescent tree); CI all-legs on push (direct to main per standing rule). Resume: continue slice sequence above; findings ledger in the audit section above.

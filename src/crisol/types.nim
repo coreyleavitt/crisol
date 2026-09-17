@@ -871,11 +871,12 @@ type
     group*:       string          ## resolved group name
     flagHash*:    string          ## flagHash(ep.flags); 16 hex chars
     recorded*:    bool            ## true iff the depgraph has an entry for (path, flagHash)
-    closure*:     seq[string]     ## sorted closure paths as stored in the depgraph:
-                                   ## project-root-relative with forward slashes for
-                                   ## files inside the project root; ABSOLUTE for
-                                   ## files under a configured dep-root (outside the
-                                   ## project root — see depgraph.DepGraphEntry.closure).
+    closure*:     seq[string]     ## sorted closure paths in their portable `keyBytes`
+                                   ## spelling (RFC-0009 A3d-iv/W1): project-root-relative
+                                   ## with forward slashes for files inside the project
+                                   ## root; `dep:<name>/<rel>` for files under a configured
+                                   ## dep-root (never a machine-local absolute path — see
+                                   ## depgraph.DepGraphEntry.closure / paths.keyBytes).
                                    ## Empty when `recorded` is false.
     closureHash*: string          ## 16 hex chars; "" when not recorded
 
