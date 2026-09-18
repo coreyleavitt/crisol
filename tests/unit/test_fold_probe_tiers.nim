@@ -50,15 +50,82 @@
 ##     name tier 3's own internal call will use a moment later. Same
 ##     `createSymlink`-may-be-unprivileged honest-skip convention as the
 ##     tier-2 dangling-symlink test above.
+##
+## CI-fix round (2026-09-17/18) — VOLUME-AWARE tier-2 fixtures:
+##   The above fabrication notes describe what is constructible on THIS
+##   container's ext4 (case-sensitive). The first real macOS CI run exposed
+##   that three tier-2 fixtures had baked in a case-SENSITIVE-volume
+##   assumption instead of actually depending on it: macOS runners' temp
+##   volume is APFS, which is case-INSENSITIVE (case-preserving) — see
+##   project memory `rfc0009-macos-test-gotchas`. A single `writeFile` of
+##   `Alpha.txt` makes the case-flipped spelling `alpha.txt` exist BY
+##   CONSTRUCTION there (same directory entry), so "flipped spelling
+##   absent" and "flipped spelling present, DISTINCT file" are unfabricable
+##   on that volume — a second `writeFile` under the flipped spelling folds
+##   onto the SAME file instead of creating a second one. Rather than
+##   skip-everything, these fixtures now PROBE the real temp volume's own
+##   case behavior once (`detectCaseInsensitiveVolume`, mirroring
+##   `readOnlyFallback`'s own identity-comparison logic) and branch:
+##   case-sensitive volumes keep the original three scenarios unchanged;
+##   case-insensitive volumes honestly self-skip the two unfabricable ones
+##   and instead run a NEW positive scenario ("flipped spelling present,
+##   SAME file, REAL volume fold") that ONLY a case-insensitive volume can
+##   prove without the hardlink stand-in above — the missing positive proof
+##   of tier 2's insensitive branch that Linux ext4 can never exercise. The
+##   dangling-symlink fall-through test's TERMINAL answer also depends on
+##   volume behavior (its own fallback candidate pair folds together on an
+##   insensitive volume, changing the provable verdict from `fpNone` to
+##   `fpAsciiLower`); the symlink-is-skipped property itself is
+##   volume-independent, so that test now asserts the volume-appropriate
+##   terminal value rather than assuming ext4's.
 
 import std/[unittest, options, os, strutils]
 import crisol/paths
+
+proc flipAsciiCaseLocal(s: string): string =
+  ## Local mirror of `crisol/paths`'s private (unexported) `flipAsciiCase` —
+  ## this file already duplicates tier-3 constants/logic elsewhere in spirit
+  ## (see `probeBaseName`'s doc comment); kept ASCII-only, identical
+  ## semantics, so the volume probe below exercises the exact same
+  ## case-flip notion `readOnlyFallback` does.
+  result = newString(s.len)
+  for i, c in s:
+    if c >= 'a' and c <= 'z': result[i] = char(ord(c) - 32)
+    elif c >= 'A' and c <= 'Z': result[i] = char(ord(c) + 32)
+    else: result[i] = c
 
 proc freshDir(tag: string): string =
   result = getTempDir() / ("crisol_test_fold_tiers_" & tag & "_" & $getCurrentProcessId())
   try: removeDir(result)
   except OSError: discard
   createDir(result)
+
+proc detectCaseInsensitiveVolume(): bool =
+  ## Tiny setup probe, mirroring `readOnlyFallback`'s OWN identity-comparison
+  ## logic (RFC-0009 F6): write one file, then check whether its ASCII
+  ## case-flipped spelling both EXISTS and shares the same OS file identity
+  ## (`fileIdentity` — device+file-id). This answers honestly for whatever
+  ## volume actually backs `getTempDir()` on THIS CI leg (ext4 on the Linux
+  ## container, APFS on macOS runners) instead of assuming either. Path
+  ## composed directly from `getTempDir()`/`freshDir` throughout — never
+  ## compared lexically against a realpath-resolved spelling (the macOS
+  ## `/var` -> `/private/var` symlink gotcha; see project memory
+  ## `rfc0009-macos-test-gotchas`).
+  let dir = freshDir("volprobe")
+  defer: removeDir(dir)
+  let originalName = "CaseProbe.tmp"
+  let original = dir / originalName
+  writeFile(original, "x")
+  let flipped = dir / flipAsciiCaseLocal(originalName)
+  if not fileExists(flipped):
+    return false
+  let originalId = fileIdentity(original)
+  let flippedId = fileIdentity(flipped)
+  originalId.isSome and flippedId.isSome and originalId.get == flippedId.get
+
+let volumeIsCaseInsensitive = detectCaseInsensitiveVolume()
+  ## Computed once at process start (before any suite runs) since it is a
+  ## property of the volume, not of any individual test's fixture dir.
 
 # ---------------------------------------------------------------------------
 # fileIdentity — the tier-2 identity helper itself (F6)
@@ -85,10 +152,17 @@ suite "fileIdentity — tier 2's identity helper (F6)":
 suite "readOnlyFallback (probe tier 2) — F6":
 
   test "flipped spelling absent -> fpNone (case-sensitive; unchanged behavior)":
-    let dir = freshDir("t2-absent")
-    defer: removeDir(dir)
-    writeFile(dir / "Alpha.txt", "x")
-    check readOnlyFallback(dir) == some(fpNone)
+    if volumeIsCaseInsensitive:
+      echo "SKIPPED: this temp volume is case-insensitive (e.g. macOS " &
+           "APFS) -- writing `Alpha.txt` makes its case-flipped spelling " &
+           "`alpha.txt` EXIST by construction (same directory entry), so " &
+           "\"flipped spelling absent\" is unfabricable here"
+      skip()
+    else:
+      let dir = freshDir("t2-absent")
+      defer: removeDir(dir)
+      writeFile(dir / "Alpha.txt", "x")
+      check readOnlyFallback(dir) == some(fpNone)
 
   test "flipped spelling present, DISTINCT file -> fpNone, PROVEN not assumed":
     # Two genuinely separate files whose names are exact case-flips of each
@@ -96,11 +170,39 @@ suite "readOnlyFallback (probe tier 2) — F6":
     # one could never let both coexist), so `fpNone` here is a proof, not a
     # default -- the exact F6 gap: a pre-fix probe would have seen the
     # flipped spelling exist and wrongly answered `fpAsciiLower`.
-    let dir = freshDir("t2-distinct")
-    defer: removeDir(dir)
-    writeFile(dir / "Alpha.txt", "original")
-    writeFile(dir / "aLPHA.TXT", "distinct")
-    check readOnlyFallback(dir) == some(fpNone)
+    if volumeIsCaseInsensitive:
+      echo "SKIPPED: this temp volume is case-insensitive -- two files " &
+           "whose names are exact case-flips of each other cannot coexist " &
+           "here (the second write folds onto the first, same directory " &
+           "entry), so the DISTINCT-file scenario is unfabricable"
+      skip()
+    else:
+      let dir = freshDir("t2-distinct")
+      defer: removeDir(dir)
+      writeFile(dir / "Alpha.txt", "original")
+      writeFile(dir / "aLPHA.TXT", "distinct")
+      check readOnlyFallback(dir) == some(fpNone)
+
+  test "flipped spelling present, SAME file, REAL volume fold -> fpAsciiLower":
+    # The positive proof the hardlink test below only SIMULATES: on a
+    # genuinely case-insensitive volume, no hardlink trick is needed at all
+    # -- a plain write under one spelling already makes the case-flipped
+    # spelling resolve to the SAME file, exactly what `fileIdentity` (and
+    # so `readOnlyFallback`) is meant to detect. This is the missing
+    # positive proof of tier 2's insensitive branch that Linux ext4 can
+    # never exercise on its own -- only a real case-insensitive CI leg
+    # (macOS/APFS) can run it, hence the skip on a case-sensitive volume.
+    if not volumeIsCaseInsensitive:
+      echo "SKIPPED: this temp volume is case-sensitive -- a plain " &
+           "case-flipped write cannot create a same-identity pair without " &
+           "the hardlink simulation in the test above; this scenario " &
+           "proves the same branch via the volume's OWN real fold instead"
+      skip()
+    else:
+      let dir = freshDir("t2-samefile-real")
+      defer: removeDir(dir)
+      writeFile(dir / "Gamma.txt", "content")
+      check readOnlyFallback(dir) == some(fpAsciiLower)
 
   test "flipped spelling present, SAME file (hardlink) -> fpAsciiLower":
     # A hard link under the case-flipped name gives two directory entries
@@ -132,6 +234,17 @@ suite "readOnlyFallback (probe tier 2) — F6":
     # exist -- `fileIdentity` on it fails, and this tier must skip it rather
     # than let that failure manufacture a wrong answer. `Beta.txt`/`bETA.TXT`
     # give it a second, genuinely resolvable candidate to fall through to.
+    #
+    # Re-examined for volume-awareness: `Dangle`'s OWN identity check fails
+    # regardless of volume type (its target genuinely does not exist either
+    # way), so the skip-and-fall-through PROPERTY under test is fabricable
+    # on both. What differs is the fallback pair's TERMINAL answer: on a
+    # case-sensitive volume `Beta.txt`/`bETA.TXT` stay two distinct files
+    # (`fpNone`, as before); on a case-insensitive volume the second write
+    # folds onto the first (one file, two spellings), which is itself a
+    # genuinely resolvable same-identity candidate (`fpAsciiLower`) -- both
+    # are honest, volume-appropriate proofs that the dangling candidate was
+    # skipped rather than allowed to manufacture a wrong answer.
     let dir = freshDir("t2-dangling")
     defer: removeDir(dir)
     var linked = true
@@ -146,7 +259,8 @@ suite "readOnlyFallback (probe tier 2) — F6":
     else:
       writeFile(dir / "Beta.txt", "original")
       writeFile(dir / "bETA.TXT", "distinct")
-      check readOnlyFallback(dir) == some(fpNone)
+      let expected = if volumeIsCaseInsensitive: fpAsciiLower else: fpNone
+      check readOnlyFallback(dir) == some(expected)
 
 # ---------------------------------------------------------------------------
 # Tier 3 — createAndStatFallback (F7)
@@ -184,9 +298,15 @@ suite "createAndStatFallback (probe tier 3) — F7":
 
     var containerRootCanWriteAnyway = true
     try:
+      # `std/syncio.writeFile` raises `IOError` on a genuine write failure,
+      # not `OSError` -- catching only `OSError` here let a real macOS
+      # (non-root) IOError escape unhandled instead of setting
+      # `containerRootCanWriteAnyway = false` as intended. A raise here
+      # means unwritable-confirmed (proceed to the actual assertion below);
+      # success means the container's root bypassed the chmod (self-skip).
       writeFile(dir / "probe_write_check.tmp", "x")
       removeFile(dir / "probe_write_check.tmp")
-    except OSError:
+    except IOError, OSError:
       containerRootCanWriteAnyway = false
 
     if containerRootCanWriteAnyway:

@@ -108,9 +108,24 @@
 ## RUN 1 itself failing at the `nim c` step with a file-not-found/
 ## cannot-open error (as opposed to one of the checks below failing), that
 ## is a Nim toolchain limitation, not this test's subject — see
-## docs/rfc/0009-path-identity-review.md row F16. The real windows
-## execution of this file has not happened yet as of this writing; it
-## lands on the next CI push.
+## docs/rfc/0009-path-identity-review.md row F16.
+##
+## The first real windows-latest run of this file (CI run 35311339453)
+## failed, but NOT in the product surface under test: this file's OWN
+## fixture setup (`buildDeepChain`'s `createDir`/`writeFile` on the deep
+## tree) used plain `std/os` calls, which hit the same Win32 MAX_PATH
+## ceiling `paths.toNative`'s `\\?\` prefixing exists to work around —
+## `toNative` only prefixes paths the CRISOL BINARY under test builds for
+## its own I/O, never this harness's fixture I/O. Fixed with a local,
+## windows-only `winLongPath`/`removeDeepTree` pair (mirroring
+## `paths.applyWinLongPathPrefix`, which stays unexported — duplicated here
+## rather than exported for one test file) applied to every harness touch
+## of the deep tree: creation, the content edit between RUN 2 and RUN 3,
+## and recursive teardown. The crisol-binary invocations themselves
+## continue to receive UNPREFIXED spellings — that is the product surface
+## this file proves. The real windows-latest re-run against this fixed
+## harness has not landed yet as of this writing; it lands on the next CI
+## push.
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
@@ -132,6 +147,48 @@ when defined(windows):
 
   const segName = "longpath_segment_fixture"   # 25 chars, arbitrary but fixed
 
+  proc winLongPath(path: string): string =
+    ## CI-fix round (2026-09-17/18): local, windows-only mirror of
+    ## `crisol/paths.nim`'s own (unexported — single internal caller,
+    ## `toNative`) `applyWinLongPathPrefix`. `toNative`'s `\\?\` handling
+    ## covers only paths the CRISOL BINARY under test builds for ITS OWN
+    ## I/O; it has no bearing on THIS TEST HARNESS's own fixture
+    ## setup/teardown (`createDir`/`writeFile`/`removeDir`/`walkDir` on the
+    ## deep tree), which hits the exact same Win32 MAX_PATH ceiling and
+    ## must prefix itself independently. Duplicated rather than exported
+    ## from the product module for one test file's use (same convention as
+    ## `winMaxPathThreshold` above). Idempotent (a path already carrying the
+    ## `\\?\` prefix is returned unchanged) so it composes safely with
+    ## `walkDir`'s own child-path joining during recursive removal below.
+    if path.len >= 4 and path[0 ..< 4] == "\\\\?\\":
+      return path
+    if path.len <= winMaxPathThreshold:
+      path
+    elif path.len >= 2 and path[0] == '\\' and path[1] == '\\':
+      "\\\\?\\UNC\\" & path[2 .. ^1]
+    else:
+      "\\\\?\\" & path
+
+  proc removeDeepTree(path: string) =
+    ## Recursive removal that extended-length-prefixes EVERY enumerate/
+    ## delete call as it descends. Plain `std/os.removeDir` IS already
+    ## recursive, but its own internal recursion builds child paths without
+    ## ever adding the `\\?\` prefix, so it hits the SAME MAX_PATH ceiling
+    ## the creation loop below works around -- this walks manually so every
+    ## call at every depth is prefixed.
+    let p = winLongPath(path)
+    if not dirExists(p):
+      return
+    for kind, child in walkDir(p):
+      case kind
+      of pcFile, pcLinkToFile:
+        removeFile(winLongPath(child))
+      of pcDir:
+        removeDeepTree(child)
+      of pcLinkToDir:
+        removeDir(winLongPath(child))  # don't recurse through a dir symlink
+    removeDir(p)
+
   proc buildDeepChain(repo: string):
       tuple[leafAbsPath, leafRelPath: string; segCount: int] =
     ## Grows a chain of nested directories `deep/<segName>/<segName>/.../`
@@ -149,8 +206,11 @@ when defined(windows):
       dir = dir / segName
       let leafAbs = dir / "deep_leaf.nim"
       if leafAbs.len > winMaxPathThreshold + 60:
-        createDir(dir)
-        writeFile(leafAbs, "proc deepLeafValue*(): int = 42\n")
+        # Both calls below touch the deep chain itself, past MAX_PATH --
+        # extended-length-prefixed, unlike the shallow `writeRepoFile`
+        # helper (its targets never grow deep).
+        createDir(winLongPath(dir))
+        writeFile(winLongPath(leafAbs), "proc deepLeafValue*(): int = 42\n")
         let leafRel = "deep/" & segs.join("/") & "/deep_leaf.nim"
         return (leafAbsPath: leafAbs, leafRelPath: leafRel, segCount: segs.len)
 
@@ -208,7 +268,7 @@ when defined(windows):
       echo "W2-LONGPATH REAL: constructing a real >MAX_PATH directory chain and driving the compiled crisol binary through it"
 
       let repo = getTempDir() / ("crisol_w2_longpath_repo_" & $getCurrentProcessId())
-      removeDir(repo)
+      removeDeepTree(repo)  # best-effort: a stale previous run may have left a >MAX_PATH tree
       createDir(repo)
 
       proc git(args: string): tuple[output: string; exitCode: int] =
@@ -235,7 +295,12 @@ when defined(windows):
       let longpathsCfg = git("config core.longpaths true")
       check longpathsCfg.exitCode == 0
 
-      let (leafAbs, leafRel, segCount) = buildDeepChain(repo)
+      let (leafAbs, leafRel, segCount) =
+        try:
+          buildDeepChain(repo)
+        except OSError as e:
+          echo "W2-LONGPATH FIXTURE SETUP FAILED (buildDeepChain: creating/writing the deep tree itself -- NOT a product assertion): ", e.msg
+          raise
       echo "W2-LONGPATH REAL: deep_leaf.nim absolute path length = ", leafAbs.len,
            " (", segCount, " nested segments; MAX_PATH threshold = ", winMaxPathThreshold, ")"
       check leafAbs.len > winMaxPathThreshold
@@ -305,8 +370,13 @@ when defined(windows):
 
       # Edit deep_leaf.nim's CONTENT — uncommitted working-tree change, the
       # thing RUN 3's --changed must see via git AND decideCompile must see
-      # via toNative's content-hash read.
-      writeFile(leafAbs, "proc deepLeafValue*(): int = 4242\n")
+      # via toNative's content-hash read. This is this HARNESS's own I/O on
+      # the deep path, extended-length-prefixed like buildDeepChain's above.
+      try:
+        writeFile(winLongPath(leafAbs), "proc deepLeafValue*(): int = 4242\n")
+      except OSError as e:
+        echo "W2-LONGPATH FIXTURE SETUP FAILED (editing deep_leaf.nim content -- NOT a product assertion): ", e.msg
+        raise
 
       # Lightweight negative-control-lite (independent of crisol's own git
       # invocation): confirm git itself really does see the deep path as
@@ -344,10 +414,16 @@ when defined(windows):
       # would leave this `true` instead.
       check compileSkippedFor(doc3, "tests/unit/test_dependent.nim") == false
 
-      # Clean up.
-      removeDir(repo)
-      removeDir(workDir)
-      removeDir(workDir & "_nimcache")
+      # Clean up. `repo`'s own subtree grows past MAX_PATH (the deep chain),
+      # so it needs the prefixed recursive remover, not plain `removeDir`;
+      # teardown failure is reported but does not overturn a verdict the
+      # checks above already reached.
+      try:
+        removeDeepTree(repo)
+        removeDir(workDir)
+        removeDir(workDir & "_nimcache")
+      except OSError as e:
+        echo "W2-LONGPATH: cleanup (teardown, not a product assertion) failed: ", e.msg
 
   when isMainModule:
     echo "test_rfc9_w2_longpath_e2e done"
