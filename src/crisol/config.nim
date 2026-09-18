@@ -29,6 +29,12 @@
 ## env-pin "USER" "ci-runner"            // RFC-0005 A0: pin NAME=VALUE into every child env
 ##                                       // (repeatable node = more pins); the pinned value,
 ##                                       // not the host's own, enters the soundness key.
+## chdir-into-scratch #true              // code-review r20: opt-in -- chdir the run child into
+##                                       // its per-slot scratch tmpdir instead of projectRoot.
+## env-passthrough "MY_TOOL_HOME"        // code-review r21: extend sandbox.DefaultEnvAllowlist
+##                                       // (repeatable node = more names); the host's live
+##                                       // value for the name enters the soundness key, same
+##                                       // as every other allowlisted var.
 ##
 ## group "unit" {
 ##     globs "tests/unit/test_*.nim"
@@ -771,6 +777,13 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # RFC-0005 A0: repeatable `env-pin "NAME" "VALUE"` nodes -> NAME=VALUE
     # pairs pinned into every child env (see sandbox.filterEnv's tail).
     envPins: seq[(string, string)]
+    # rfc-0007 code-review r20: config-declared opt-in for
+    # SandboxSpec.chdirIntoScratch. Same strengthen-only bool-node shape as
+    # strict-hygiene/measure-compile-reuse above.
+    chdirIntoScratch: bool = false
+    # rfc-0007 code-review r21: repeatable `env-passthrough "NAME"` nodes ->
+    # NAMEs added to sandbox.DefaultEnvAllowlist for this run.
+    envPassthroughs: seq[string]
     # RFC-0005 A3c-i: repeatable `remote-cache "<name>" { }` blocks — parsed
     # in the second pass below (the block has children, same as perfCheck/
     # reuseCheck). Order-preserving; empty = single-tier local.
@@ -937,6 +950,23 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if args[0].len == 0:
         cfgErr("config: 'env-pin' NAME must not be empty")
       envPins.add (args[0], args[1])
+    of "chdir-into-scratch":
+      # rfc-0007 code-review r20: bool node, same shape as strict-hygiene.
+      let v = n.arg(0)
+      if v.isNone or v.get.kind != kvBool:
+        cfgErr("config: 'chdir-into-scratch' requires a boolean argument (#true/#false)")
+      chdirIntoScratch = v.get.boolVal
+    of "env-passthrough":
+      # rfc-0007 code-review r21: `env-passthrough "NAME"` -- exactly 1
+      # string arg. Repeatable: each node contributes ONE name, mirroring
+      # env-pin's one-node-one-entry shape (not flags'/dep-roots' flatten-all).
+      let args = collectStrArgs(n, "env-passthrough")
+      if args.len != 1:
+        cfgErr("config: 'env-passthrough' requires exactly 1 string argument " &
+               "(NAME), got " & $args.len)
+      if args[0].len == 0:
+        cfgErr("config: 'env-passthrough' NAME must not be empty")
+      envPassthroughs.add args[0]
     of "group":        discard
     of "perf-check":   discard  # C6: parsed in second pass (has children)
     of "reuse-check":  discard  # M-report (b1): parsed in second pass (has children)
@@ -1050,6 +1080,8 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     explainMiss:        explainMiss,
     cacheStats:         cacheStats,
     envPins:            envPins,
+    chdirIntoScratch:   chdirIntoScratch,
+    envPassthroughs:    envPassthroughs,
     cache:              CacheConfig(remotes: remoteCaches, trust: trustCfg),
     workerBinary:       "",  # INTERNAL plumbing; not user-facing, no KDL node — the CLI/library
                              # caller sets this post-load (see api.planImpl / crisol.nim).

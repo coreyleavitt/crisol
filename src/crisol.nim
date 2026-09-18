@@ -154,7 +154,8 @@ Usage:
               [--hermetic <none|isolated|network>]
               [--rlimit-nofile <N>] [--rlimit-cpu <N>] [--rlimit-as <N>]
               [--rlimit-fsize <N>] [--rlimit-core <N>] [--limit-memory <N>]
-              [--env-pin NAME=VALUE]...
+              [--chdir-into-scratch]
+              [--env-pin NAME=VALUE]... [--env-passthrough NAME]...
               [--no-remote-cache]
               [--explain-miss | --explain-miss-verbose]
               [--cache-stats]
@@ -219,10 +220,12 @@ Additional options for 'run':
                   evidence.escapees on the wire) but does not fail the run.
                   Also settable via crisol.kdl's `strict-hygiene #true`.
   --hermetic <L>  Hermeticity level for child sandboxes: none (no env scrub /
-                  no rlimits / inherit parent env), isolated (default: env
-                  allowlist + isolated tmpdir + config-declared rlimits), or
-                  network (superset of isolated + net-ns isolation; currently
-                  degrades — net-ns not wired — so such runs are not cached).
+                  no rlimits / inherit parent env), or isolated (default: env
+                  allowlist + isolated tmpdir + config-declared rlimits).
+                  `network` is REJECTED (exit 3): net-ns isolation is not
+                  implemented (a future RFC-0008 mechanism); crisol refuses
+                  to record an unenforced hermeticity vouch rather than
+                  silently accept the request as a no-op.
   --rlimit-nofile N
                   Override RLIMIT_NOFILE (max open fds) for hermetic sandbox
                   children.  Default: 1024 (or crisol.kdl's `rlimit-nofile`,
@@ -261,6 +264,24 @@ Additional options for 'run':
                   pinned variable is cache-key-stable across hosts. Also
                   settable via crisol.kdl's `env-pin "NAME" "VALUE"` (CLI
                   wins on a name collision). Nothing is pinned by default.
+  --chdir-into-scratch
+                  Opt-in: chdir the RUN child (not the compile child) into
+                  its per-slot scratch tmpdir instead of projectRoot before
+                  exec.  Also settable via crisol.kdl's
+                  `chdir-into-scratch #true`.  Off by default: a run
+                  child's cwd stays projectRoot, same as before this flag
+                  existed.
+  --env-passthrough NAME
+                  Extend the hermetic sandbox's env allowlist with NAME
+                  (repeatable), in addition to sandbox.DefaultEnvAllowlist.
+                  The variable's live host VALUE reaches the child AND
+                  enters the soundness key (same allowlist mechanism as
+                  every other allowlisted var -- see hermeticEnvHash), so
+                  two runs with a different host value for NAME get
+                  different cache keys. Also settable via crisol.kdl's
+                  `env-passthrough "NAME"` (repeatable; union with the CLI
+                  set). Nothing is passed through by default beyond
+                  DefaultEnvAllowlist.
   --measure-compile-reuse
                   Diagnostic: run compile slots through the measurement
                   worker and emit the `compile` block's segmented cc%/
@@ -743,6 +764,9 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     verifyCacheSeed:   Option[int64] = none(int64)  # --verify-cache-seed N
     verifyCacheStrict: bool = false  # --verify-cache-strict: a divergence flips the exit code
     envPins: seq[(string, string)]   # RFC-0005 A0: collected from --env-pin NAME=VALUE (repeatable)
+    chdirIntoScratch: bool = false   # rfc-0007 code-review r20: --chdir-into-scratch
+    envPassthroughs: seq[string]     # rfc-0007 code-review r21: collected from
+                                      # --env-passthrough NAME (repeatable)
     explainMissFlag:        bool = false  # RFC-0005 B1c: --explain-miss
     explainMissVerboseFlag: bool = false  # RFC-0005 B1c: --explain-miss-verbose (implies explain)
     cacheStatsFlag:         bool = false  # RFC-0005 B2b: --cache-stats
@@ -776,7 +800,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                  "retries", "fail-on-flaky", "strict-hygiene", "junit", "shard", "order",
                  "perf-check", "hermetic", "measure-compile-reuse",
                  "rlimit-nofile", "rlimit-cpu", "rlimit-as", "rlimit-fsize",
-                 "rlimit-core", "limit-memory",
+                 "rlimit-core", "limit-memory", "chdir-into-scratch", "env-passthrough",
                  "verify-cache", "verify-cache-pct",
                  "verify-cache-seed", "verify-cache-strict", "env-pin",
                  "explain-miss", "explain-miss-verbose", "cache-stats",
@@ -1031,6 +1055,17 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                        raw & "')\n")
           return ExitEnvironment
         envPins.add (pinName, pinValue)
+      of "chdir-into-scratch":
+        chdirIntoScratch = true
+      of "env-passthrough":
+        # rfc-0007 code-review r21: --env-passthrough NAME (repeatable).
+        # Malformed input (empty NAME) is a usage error, same shape as
+        # --env-pin above.
+        let raw = nextVal("env-passthrough")
+        if raw == "":
+          stderr.write("crisol: --env-passthrough requires a NAME argument\n")
+          return ExitEnvironment
+        envPassthroughs.add raw
       else:
         stderr.write("crisol: unknown flag '--" & key & "'\n\n")
         stderr.write(usage())
@@ -1206,6 +1241,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     measureCompileReuse: measureCompileReuse,  # RFC-0006: gate measurement worker into compile slot
     verifyCache:         verifyCacheOpts,  # RFC-0005 B3c: --verify-cache facade
     envPins:             envPins,       # RFC-0005 A0: --env-pin NAME=VALUE (repeatable)
+    chdirIntoScratch:    chdirIntoScratch,  # rfc-0007 code-review r20: --chdir-into-scratch
+    envPassthroughs:     envPassthroughs,   # rfc-0007 code-review r21: --env-passthrough NAME (repeatable)
     explainMiss:         explainMissFlag,         # RFC-0005 B1c: verbose already folded in above
     explainMissVerbose:  explainMissVerboseFlag,  # RFC-0005 B1c
     cacheStats:          cacheStatsFlag,          # RFC-0005 B2b

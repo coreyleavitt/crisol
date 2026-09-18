@@ -325,6 +325,23 @@ type
     ## config pin (CLI wins), mirroring rlimitNofile's override precedence.
     ## Empty by default: nothing pinned unless an operator opts in.
     envPins*:            seq[(string, string)] = @[]
+    ## rfc-0007 code-review r20: per-run opt-in for `SandboxSpec.
+    ## chdirIntoScratch` (CLI `--chdir-into-scratch`). false (default) =
+    ## the run child's cwd stays `projectRoot` (the A2c contract). Merged
+    ## with `Config.chdirIntoScratch` (KDL `chdir-into-scratch #true`) in
+    ## planImpl -- CLI/library wins when true, same override precedence as
+    ## the rlimit-* family (NOT strict-hygiene's strengthen-only framing --
+    ## this is a plain behavioral toggle, not a safety property).
+    chdirIntoScratch*:   bool = false
+    ## rfc-0007 code-review r21: per-run env-var NAMEs to extend
+    ## `sandbox.DefaultEnvAllowlist` with (CLI `--env-passthrough NAME`,
+    ## repeatable). Merged with `Config.envPassthroughs` (KDL
+    ## `env-passthrough "NAME"`) in planImpl via `envPassthroughsFrom` --
+    ## union of both sets, deduplicated (mirroring envPins' merge shape,
+    ## but additive rather than override since a NAME here carries no
+    ## value to collide on). Empty by default: nothing added unless an
+    ## operator opts in.
+    envPassthroughs*:    seq[string] = @[]
     ## RFC-0006 M-artifact-identity PASS (b2): --measure-compile-reuse.
     ## false (default) → compile slots run plain `nim c`, byte-for-byte
     ## unchanged from before this pass. true → compile slots run the
@@ -885,9 +902,49 @@ proc envPinsFrom*(cfg: Config; opts: RunOptions): seq[(string, string)] =
   ## merge is independently unit-testable without a real run.
   overrideByName(cfg.envPins, opts.envPins)
 
+proc envPassthroughsFrom*(cfg: Config; opts: RunOptions): seq[string] =
+  ## rfc-0007 code-review r21: pure projection merging `Config.
+  ## envPassthroughs` (KDL `env-passthrough "NAME"`) with `RunOptions.
+  ## envPassthroughs` (CLI/library `--env-passthrough NAME`) into the final
+  ## NAME set `resolveSandbox`'s `passthroughs` param receives. Unlike
+  ## `envPinsFrom` above, a NAME carries no value to collide on, so this is
+  ## a plain UNION (deduplicated), not an override-by-name merge. Extracted
+  ## (like `envPinsFrom`/`rlimitOverridesFrom`) so the merge is
+  ## independently unit-testable without a real run.
+  ##
+  ## CRITICAL: when both sets are empty this returns `@[]` -- byte-identical
+  ## to `resolveSandbox`'s own `passthroughs = @[]` default, so a run with
+  ## no passthroughs configured is completely unaffected (the allowlist
+  ## `resolveSandbox` builds, and therefore `hermeticEnvHash`/the soundness
+  ## key, are unchanged from before this slice -- see sandbox.
+  ## DefaultEnvAllowlist's doc and resolveSandbox's `passthroughs` param).
+  deduplicate(cfg.envPassthroughs & opts.envPassthroughs, isSorted = false)
+
 proc planImpl(opts: RunOptions): PlanImplResult =
   ## Internal plan phase shared by planTests and runTests.
   ## Raises CrisolError on any structural problem.
+
+  # rfc-0007 code-review r19: `--hermetic network` (RunOptions.hermeticLevel
+  # == hlNetwork) is a live arm for a mechanism that has never been
+  # implemented -- no network isolation exists anywhere (types.nim documents
+  # netIso as unenforced). Two silent consequences follow from accepting it:
+  # (a) evidence.hermetic serializes "network" on the run/v2 wire -- an
+  # unenforced vouch an external reader cannot detect; (b) evidenceSatisfies
+  # silently disables ALL cache store/serve for the run, with no warning.
+  # RFC-0007 §6 sanctions REFUSING TO CACHE an hlNetwork run until RFC-0008's
+  # observer exists -- it never sanctions silently ACCEPTING the level as a
+  # live no-op. Reject loudly and structurally here instead: this is the ONE
+  # point every CLI invocation and every library caller of planTests()/
+  # runTests() flows through (there is no separate KDL config key for
+  # hermetic level today -- RunOptions.hermeticLevel is the only producer),
+  # so one check covers every entry point. The hlNetwork enum value itself
+  # stays (the wire/type is for RFC-0008's future producer) -- this only
+  # makes it unreachable.
+  if opts.hermeticLevel == hlNetwork:
+    raise newCrisolError(cekConfig,
+      "hermetic level 'network' is not implemented; network isolation is " &
+      "a future mechanism (RFC-0008) and crisol will not record an " &
+      "unenforced vouch")
 
   # 1. Load config. A test-injected fold probe (RFC-0009 §3 seam) governs the
   #    whole run's trackedRoots — including the fold policy persisted into the
@@ -928,6 +985,15 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   # RFC-0005 A0: merge CLI/library --env-pin into the config-declared pins
   # (CLI wins on a name collision); resolveSandbox reads cfg.envPins below.
   cfg.envPins = envPinsFrom(cfg, opts)
+  # rfc-0007 code-review r20: CLI/library --chdir-into-scratch can only
+  # strengthen a config-file `chdir-into-scratch #true` setting to true --
+  # same override precedence as the rlimit-* family above (a bare CLI flag
+  # can only ever request true, never explicitly request false).
+  if opts.chdirIntoScratch: cfg.chdirIntoScratch = true
+  # rfc-0007 code-review r21: merge CLI/library --env-passthrough into the
+  # config-declared passthrough NAMEs (union, deduplicated); resolveSandbox
+  # reads cfg.envPassthroughs below.
+  cfg.envPassthroughs = envPassthroughsFrom(cfg, opts)
 
   # 3. Assemble narrowing inputs.
   let useFailed  = opts.narrowing.kind in {nkFailed, nkFailedOrChanged}
@@ -1446,9 +1512,29 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # M4: bundle spec+policy+seams into a CacheContext so the invariant
   # (active iff keyOf!=nil AND policy.enabled) is enforced structurally.
   let spec  = resolveSandbox(level = opts.hermeticLevel,
+                              passthroughs = cfg.envPassthroughs,  # r21
+                              chdirIntoScratch = cfg.chdirIntoScratch,  # r20
                               rlimits = rlimitOverridesFrom(cfg),
                               envPins = cfg.envPins,
                               memoryLimit = cfg.limitMemory)
+  # rfc-0007 code-review r18: sandbox.MinSafeRlimitAs's doc comment has long
+  # promised "crisol logs a warning when limitAs < MinSafeRlimitAs at
+  # spec-resolution time" -- no such warning existed anywhere, so a small
+  # --rlimit-as/rlimit-as silently made every child SIGSEGV before main()
+  # even returned, reported as a bare crash with zero guidance. This is the
+  # ONE production call site of resolveSandbox -- every CLI `run` invocation
+  # and every library caller of runTests()/runTestsWith() flows through it --
+  # so the check belongs here rather than duplicated at each entry point.
+  # Reads the RESOLVED value (spec.limits, post CLI/config merge) rather than
+  # cfg.rlimitAs directly, so hlNone (rlimits inactive; resolveSandbox returns
+  # a zero Limits) never warns about a ceiling that is never applied.
+  let resolvedRlimitAs = spec.limits.req[ptypes.lkAddressSpace]
+  if resolvedRlimitAs.isSome and resolvedRlimitAs.get < MinSafeRlimitAs:
+    stderr.write("crisol: warning: rlimit-as " & $resolvedRlimitAs.get &
+                 " is below the safe minimum for Nim/ORC test binaries (" &
+                 $MinSafeRlimitAs & " bytes / 3 GiB) -- the child may " &
+                 "SIGSEGV before main() returns, reported as a bare crash " &
+                 "with no further guidance (see sandbox.MinSafeRlimitAs)\n")
   # nimcache-persistence (RFC-0006): the SAME ccVersion/nimVersion probes
   # already used by RFC-0004's SoundnessKey (via realSeams below) are reused
   # here — folded into execute()'s toolchain fingerprint, which keys the

@@ -510,6 +510,30 @@ type
                                 ## same-named config pin; see api.envPinsFrom) before reaching
                                 ## `resolveSandbox`. Empty by default -- nothing pinned unless an
                                 ## operator opts in (§Non-Goals: no default pins in RFC-0005).
+    chdirIntoScratch*: bool    ## rfc-0007 code-review r20: config-declared opt-in for
+                                ## `SandboxSpec.chdirIntoScratch` (sandbox.nim) -- runner.nim's
+                                ## run child picks its cwd from this field, but before this slice
+                                ## NOTHING ever set it (no RunOptions field, no KDL key, no CLI
+                                ## flag existed). Populated from the top-level `chdir-into-scratch
+                                ## #true` KDL node, and/or strengthened per-run by
+                                ## `RunOptions.chdirIntoScratch` (CLI/library wins when true,
+                                ## mirroring the rlimit-* family's override precedence -- see
+                                ## api.planImpl). Default false: byte-for-byte unchanged (run
+                                ## child cwd stays `projectRoot`, the A2c contract) until an
+                                ## operator opts in.
+    envPassthroughs*: seq[string]
+                                ## rfc-0007 code-review r21: NAME entries from repeatable
+                                ## top-level `env-passthrough "NAME"` KDL nodes, extending
+                                ## `sandbox.DefaultEnvAllowlist` for this run --
+                                ## `resolveSandbox`'s own `passthroughs` param was reachable from
+                                ## no config key or CLI flag before this slice, despite
+                                ## DefaultEnvAllowlist's doc promising extensibility. Merged with
+                                ## `RunOptions.envPassthroughs` (union, deduplicated) in
+                                ## api.planImpl before reaching `resolveSandbox`. A passed-through
+                                ## variable's live host VALUE already enters the soundness key via
+                                ## the existing allowlist -> `filterEnv` -> `hermeticEnvHash` path
+                                ## (no separate fold needed -- see api.envPassthroughsFrom's doc).
+                                ## Empty by default -- nothing added unless an operator opts in.
     explainMiss*: bool          ## RFC-0005 B1c: resolved --explain-miss / `explain-miss #true`
                                 ## KDL node (config < CLI: api.planImpl strengthens a config
                                 ## `false` to `true` when the CLI flag is passed, mirroring
