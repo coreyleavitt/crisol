@@ -47,3 +47,7 @@ tests/fixtures/tmp/
 /.crisol-test-result
 # CI nimcache cache dir (actions/cache@v4 target, mounted as XDG_CACHE_HOME).
 .ci-nimcache/
+
+# compiled module-shadowing binaries (review r55): never track
+src/crisol/api
+src/crisol/runner
