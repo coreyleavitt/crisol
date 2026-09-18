@@ -44,7 +44,8 @@ reason = "W2 landed: config keys rlimit-cpu/as/fsize/core + limit-memory with CL
 [[item]]
 id    = "w3"
 title = "Wiring W3 (medium): run/v2 surfaces diverge complementarily -- stdout never carries compileStats/reuseAlerts (schema doc: ALWAYS PRESENT), lastrun.json emits unprobed zero-value substrate/trackedRoots as if probed (contradicts persistLastRun's matches-stdout claim). Wire: symmetrize the two emission call sites."
-state = "open"
+state = "resolved"
+reason = "W3 landed: RunReport.reuseAlerts; stdout run/v2 carries compileStats/reuseAlerts; persistLastRun carries real substrate/trackedRoots; stdout-vs-lastrun symmetry E2E in tests/integration/test_rfc0007_w3_wire_symmetry.nim"
 
 [[item]]
 id    = "w4"

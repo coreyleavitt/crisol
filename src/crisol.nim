@@ -1337,6 +1337,8 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
                               rr.memThrottledSlots,
                               lateOrphansReaped = rr.lateOrphansReaped,
+                              compileBlock = rr.compileBlock,   # rfc-0007 W3
+                              reuseAlerts = rr.reuseAlerts,     # rfc-0007 W3
                               interrupted = rr.interrupted,
                               policy = policy, substrate = process.capabilities(),
                               verifyFails = rr.verifyDivergences.len,

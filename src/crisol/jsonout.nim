@@ -74,6 +74,18 @@
 ##     "reuseAlerts": [   // rev 8: ALWAYS PRESENT; empty when reuse-check disabled
 ##       { groupId, configHash, rTime, alertBelow }
 ##     ]
+##     // rfc-0007 W3: this promise now genuinely holds on the CLI's stdout
+##     // run/v2 emission too. Before W3, `crisol.nim`'s ONE stdout call site
+##     // never threaded `RunReport.compileBlock`/the reuse-check alert array
+##     // through at all, so BOTH `compileStats` was silently absent from
+##     // stdout (even under `--measure-compile-reuse`, where lastrun.json
+##     // DID carry it) and `reuseAlerts` was always `[]` on stdout regardless
+##     // of reuse-check state or real alerts -- the "empty when disabled"
+##     // half of this sentence was true only of jsonout's OWN nil default,
+##     // never of what the CLI actually emitted. `RunReport` now exposes
+##     // `reuseAlerts*` (mirroring the pre-existing `compileBlock*`) so the
+##     // CLI can thread the same values stdout and lastrun.json already
+##     // agreed on internally.
 ##     // NO "substrate" key: absent until A7 lands the substrate-identity
 ##     // block.  Absence IS the honest placeholder — no null, no stub object.
 ##     "cacheStats": {   // rev 21 (RFC-0005 B2b); PRESENT ONLY under --cache-stats
@@ -642,6 +654,27 @@ const RunSchemaRevision* = 26
   ##                     above). `reason` is `trackedRoots.degradedReason`
   ##                     verbatim (D2's semicolon-joined, root-naming
   ##                     message) -- never empty when the key is present.
+  ##   rfc-0007 W3 (no revision bump -- CONTENT change only; every field
+  ##   below already existed on the wire with a default value, so this is
+  ##   the two emission surfaces disagreeing less, not a new shape):
+  ##     - stdout (`crisol run --json`) now carries `compileStats`/
+  ##       `reuseAlerts` from the SAME `RunReport.compileBlock`/
+  ##       `RunReport.reuseAlerts*` values lastrun.json already had --
+  ##       previously the CLI's only stdout call site never threaded either
+  ##       through, so `compileStats` was silently absent from stdout even
+  ##       under `--measure-compile-reuse`, and `reuseAlerts` was always `[]`
+  ##       regardless of reuse-check state or real alerts.
+  ##     - lastrun.json now carries the SAME `substrate`/`trackedRoots`
+  ##       values stdout already had (`persistLastRun` gained matching
+  ##       params) -- previously it always rendered the zero-value defaults
+  ##       (an all-false `Capabilities()`, a project-only `TrackedRoots`),
+  ##       contradicting `persistLastRun`'s own "matches the stdout JSON
+  ##       path exactly" doc claim. `verifyFails`/`cacheStats` remain
+  ##       deliberately EXCLUDED from that "matches" claim (by design, not
+  ##       an oversight this slice touches): `verifyFails` is always 0 on
+  ##       lastrun.json because `--verify-cache` runs AFTER persistLastRun
+  ##       (api.nim's own ordering comment); `cacheStats` is never persisted
+  ##       to lastrun.json at all (no param exists for it on `persistLastRun`).
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -1058,7 +1091,9 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
                      lateOrphansReaped: int = 0;
                      compileBlock: JsonNode = nil;
                      reuseAlerts: JsonNode = nil;
-                     policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy) =
+                     policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
+                     substrate: ptypes.Capabilities = ptypes.Capabilities();
+                     trackedRoots: TrackedRoots = default(TrackedRoots)) =
   ## Write lastrun.json atomically to <projectRoot>/<stateDir>/lastrun.json.
   ## Creates the state directory if it does not exist.
   ## On any failure: prints a warning to stderr and returns -- never raises.
@@ -1074,6 +1109,14 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   ## when there is no telemetry to report -- threads through unchanged.
   ## reuseAlerts: M-report pass (b1) alert array, or nil (default; persisted
   ## as an empty array) -- threads through unchanged.
+  ## substrate/trackedRoots: rfc-0007 W3 — the SAME `process.capabilities()`/
+  ## `cfg.trackedRoots` values the CLI's stdout run/v2 emission carries for
+  ## this run. Before this param pair existed, lastrun.json always rendered
+  ## toJson's zero-value defaults (an all-false `Capabilities()`, a project-
+  ## only `TrackedRoots`) no matter what the SAME run's stdout reported —
+  ## silently contradicting this proc's own "matches the stdout JSON path
+  ## exactly" claim above. Default to the zero values for any caller that
+  ## never opted in (tests, etc.) — same posture as `policy` above.
   let stateDir = stateDirOf(config)
   let finalPath = stateDir / "lastrun.json"
 
@@ -1103,7 +1146,9 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
                              lateOrphansReaped = lateOrphansReaped,
                              compileBlock = compileBlock,
                              reuseAlerts = reuseAlerts,
-                             policy = policy)
+                             policy = policy,
+                             substrate = substrate,
+                             trackedRoots = trackedRoots)
   let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
     stderr.write("crisol: warning: could not write lastrun.json: " & err & "\n")

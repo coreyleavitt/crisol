@@ -130,6 +130,28 @@ proc runCrisolMeasured(stateDir: string; extraArgs: seq[string] = @[]):
   close(p)
   (exitCode: code, output: output)
 
+proc runCrisolMeasuredJsonStdout(stateDir: string; extraArgs: seq[string] = @[]):
+                       tuple[exitCode: int; stdout: string] =
+  ## Like runCrisolMeasured, but keeps stderr OUT of the captured text (its
+  ## own separate pipe, drained and discarded) instead of merging it into
+  ## stdout via poStdErrToStdOut -- --json mode routes every human/warning
+  ## line to stderr by design (e.g. the ad-hoc "no configured group" notice
+  ## this fixture's bare path triggers), and merging would corrupt the
+  ## captured text as a JSON document. Callers parseJson(result.stdout)
+  ## directly.
+  let p = startProcess(
+    crisolBin,
+    workingDir = projectRoot(),
+    args = @["run", epRelPath, "--measure-compile-reuse", "--jobs", "1", "--json"] & extraArgs,
+    env = {"CRISOL_STATE_DIR": stateDir, "PATH": getEnv("PATH"), "HOME": getEnv("HOME")}.newStringTable,
+    options = {poUsePath},
+  )
+  let outText = p.outputStream.readAll()
+  discard p.errorStream.readAll()
+  let code = p.waitForExit()
+  close(p)
+  (exitCode: code, stdout: outText)
+
 # ---------------------------------------------------------------------------
 # Suite
 # ---------------------------------------------------------------------------
@@ -308,6 +330,34 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
       check abs(pctSum - 1.0) < 1e-9
 
     echo "M-report pass (a) sample compile.segments node:\n", $segments
+
+  test "ON: real crisol binary run --json ALSO carries 'compileStats' on STDOUT, not only lastrun.json (rfc-0007 W3)":
+    ## The wiring-audit gap this slice closes: the only stdout run/v2
+    ## emission (crisol.nim's toJsonString call) never threaded
+    ## RunReport.compileBlock/reuseAlerts through, so `compileStats` was
+    ## silently absent from stdout even though the exact same run's
+    ## lastrun.json (just above) carries it. Both surfaces are built from
+    ## the SAME toJson path -- this is a caller-side wiring bug, not a
+    ## schema difference, so lastrun.json and stdout must agree here.
+    let stateDir = freshStateDir("report_a_stdout")
+    defer: removeDir(stateDir)
+
+    let (exitCode, stdoutText) = runCrisolMeasuredJsonStdout(stateDir)
+    check exitCode == 0
+
+    let doc = parseJson(stdoutText)
+    check doc["schemaRevision"].getInt == RunSchemaRevision
+
+    check doc.hasKey("compileStats")   # RED before the wire fix: absent
+    let segments = doc["compileStats"]["segments"]
+    check segments.kind == JArray
+    check segments.len >= 1
+
+    # reuseAlerts: ALWAYS PRESENT per the schema doc, even though reuse-check
+    # was never configured for this run (present-and-empty, not absent).
+    check doc.hasKey("reuseAlerts")
+    check doc["reuseAlerts"].kind == JArray
+    check doc["reuseAlerts"].len == 0
 
   test "ON: persisted 'compile' block carries ambientCcacheDetected (bool) and non-empty topUnits (M-report pass b1)":
     let stateDir = freshStateDir("report_b1_fields")

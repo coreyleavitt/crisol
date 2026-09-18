@@ -59,6 +59,10 @@ import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runn
 # -- types.nim imports paths.nim itself but does not export it, so this
 # module needs its own import to name the type in RunReport's field.
 import crisol/paths
+# rfc-0007 W3: `process.capabilities()` -- the real substrate node, so
+# `persistLastRun` below can thread the SAME value the CLI's stdout run/v2
+# emission already carries (crisol.nim:43 imports this identically).
+import crisol/process
 # rfc-0007 A2b: `crisol/signals` (the process-global gotSignal flag) is no
 # longer needed to drive `interrupted` — `runner.execute`'s OWN Supervisor
 # now owns SIGINT/SIGTERM installation for the duration of the call
@@ -455,6 +459,15 @@ type
                                   ## compile summary line without re-scanning the
                                   ## ledgers. nil when opts.persist is false, or when
                                   ## measureCompileReuse is not enabled (no telemetry).
+    reuseAlerts*:       JsonNode  ## rfc-0007 W3: the SAME reuse-check alert array
+                                  ## persisted to lastrun.json (compilereport.
+                                  ## buildReuseAlerts), exposed here so the CLI's
+                                  ## stdout run/v2 emission can carry it too --
+                                  ## same shape/nilability convention as
+                                  ## `compileBlock` above (nil when opts.persist is
+                                  ## false, or when compileBlock is nil / reuse-
+                                  ## check is disabled -- buildReuseAlerts already
+                                  ## degrades to an empty JArray in that case).
     verifyDivergences*: seq[VerifyDivergence]  ## RFC-0005 B3b: the --verify-cache
                                   ## post-run pass's findings. ALWAYS empty when
                                   ## opts.verifyCache.enabled is false. Deliberately
@@ -1660,6 +1673,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # was never observed this run must not silently leave the --failed
   # selection, so the last COMPLETE run stays the anchor.
   var compileBlock: JsonNode = nil
+  var reuseAlerts: JsonNode = nil
   if opts.persist and not interrupted:
     # RFC-0006 M-report pass (a): the segmented `compile` block
     # only carries data when the telemetry stream was actually written
@@ -1676,12 +1690,17 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # surface from the (unconditional) `compile` measurement block itself --
     # buildReuseAlerts naturally yields an empty array when cfg.reuseCheck is
     # disabled or compileBlock is nil (measurement off / no telemetry yet).
-    let reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
+    # rfc-0007 W3: hoisted to the outer `reuseAlerts` local (rather than a
+    # block-scoped `let`) so it also reaches RunReport below -- the CLI's
+    # stdout emission needs the exact same value persistLastRun gets.
+    reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
     persistLastRun(results, s, cfg, warnings = pr.warnings,
                    memThrottledSlots = memThrottled,
                    lateOrphansReaped = lateOrphansReaped,
                    compileBlock = compileBlock,
-                   reuseAlerts = reuseAlerts, policy = policy)
+                   reuseAlerts = reuseAlerts, policy = policy,
+                   substrate = process.capabilities(),  # rfc-0007 W3
+                   trackedRoots = cfg.trackedRoots)      # rfc-0007 W3
 
   # RFC-0005 B3b: the --verify-cache post-run pass. Placement is load-
   # bearing (RFC "Binary precondition... the pass runs before releaseLock,
@@ -1753,6 +1772,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     exitCode:          if interrupted: 128 + shutdownSignum
                         else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
     compileBlock:      compileBlock,
+    reuseAlerts:       reuseAlerts,  # rfc-0007 W3
     interrupted:       interrupted,
     verifyDivergences: verifyDivergences,
     verifyCouldNotReexec: verifyCouldNotReexec,  # RFC-0005 code-review SO4
