@@ -60,8 +60,9 @@ fail=0
 case "$LEG" in
   windows)
     # windows-latest is NOT posix: every `when defined(posix)` whole-file
-    # gate (B2 + B3b) takes its `else` branch. Of that set, only these four
-    # files fall inside tests/unit:tests/conformance.
+    # gate (B2 + B3b) takes its `else` branch. Of that set, these files
+    # fall inside tests/unit:tests/conformance (W1's cgroup-kill-gate unit
+    # test joined 2026-09-18 — posix-only, whole-file gated).
     # test_conformance.nim is the POSIX process-backend conformance suite: it
     # COMPILES on windows (B3a-ii de-POSIX'd its imports) but its assertions
     # are POSIX-semantic (ekSignaled/.sig, rlimit lsApplied, process-group
@@ -74,6 +75,7 @@ tests/conformance/test_conformance.nim
 tests/conformance/test_conformance_timing.nim
 tests/unit/test_process_capabilities.nim
 tests/unit/test_rfc0007_a6a_escapee_evidence.nim
+tests/unit/test_rfc0007_w1_cgroup_kill_gate.nim
 tests/unit/test_run_tests.nim
 EOF
 )"
