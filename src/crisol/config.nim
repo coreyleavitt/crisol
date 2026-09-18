@@ -16,6 +16,12 @@
 ## dep-roots "../sibling/src"           // repeated node = more dep roots
 ## quarantine "tests/integration/test_x.nim"  // B3: failure excluded from exit-1
 ## rlimit-nofile 2048                   // Fix 1: override sandbox RLIMIT_NOFILE (default 1024)
+## rlimit-cpu 60                        // rfc-0007 W2: RLIMIT_CPU (CPU seconds); unset by default
+## rlimit-as 4294967296                 // rfc-0007 W2: RLIMIT_AS (bytes); unset by default
+## rlimit-fsize 268435456               // rfc-0007 W2: RLIMIT_FSIZE (bytes, default 256 MiB)
+## rlimit-core 0                        // rfc-0007 W2: RLIMIT_CORE (bytes, default 0 -- disabled)
+## limit-memory 67108864                // rfc-0007 W2: cgroup memory.max ceiling (bytes); NOT
+##                                       // an rlimit -- unset by default (req[lkMemory])
 ## verify-cache-pct 5                   // RFC-0005 B3c: --verify-cache sample-percent default
 ## explain-miss #true                   // RFC-0005 B1c: ↔ --explain-miss (config < CLI;
 ##                                       // --explain-miss-verbose is CLI-only, no KDL key)
@@ -743,6 +749,13 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # Fix 1 (RLIMIT_NOFILE plumbing): config-declared override for the
     # sandbox's max-open-fds ceiling. none = use sandbox.DefaultRlimitNofile.
     rlimitNofile: Option[int64] = none(int64)
+    # rfc-0007 wiring-audit W2: the remaining four rlimit-* config keys +
+    # the (non-rlimit) limit-memory key -- same shape as rlimitNofile above.
+    rlimitCpu:    Option[int64] = none(int64)
+    rlimitAs:     Option[int64] = none(int64)
+    rlimitFsize:  Option[int64] = none(int64)
+    rlimitCore:   Option[int64] = none(int64)
+    limitMemory:  Option[int64] = none(int64)
     # RFC-0005 B3c: --verify-cache-pct's config-file default. Always a
     # concrete value (never a sentinel) -- DefaultVerifyCachePct until the
     # KDL node overrides it, mirroring timeoutSecs above.
@@ -858,6 +871,40 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       if v < 1:
         cfgErr("config: 'rlimit-nofile' must be >= 1, got " & $v)
       rlimitNofile = some(int64(v))
+    of "rlimit-cpu":
+      # rfc-0007 wiring-audit W2: RLIMIT_CPU override (CPU seconds).
+      let v = requireIntArg(n, "rlimit-cpu")
+      if v < 1:
+        cfgErr("config: 'rlimit-cpu' must be >= 1, got " & $v)
+      rlimitCpu = some(int64(v))
+    of "rlimit-as":
+      # rfc-0007 wiring-audit W2: RLIMIT_AS override (virtual address space, bytes).
+      let v = requireIntArg(n, "rlimit-as")
+      if v < 1:
+        cfgErr("config: 'rlimit-as' must be >= 1, got " & $v)
+      rlimitAs = some(int64(v))
+    of "rlimit-fsize":
+      # rfc-0007 wiring-audit W2: RLIMIT_FSIZE override (max file write size, bytes).
+      let v = requireIntArg(n, "rlimit-fsize")
+      if v < 1:
+        cfgErr("config: 'rlimit-fsize' must be >= 1, got " & $v)
+      rlimitFsize = some(int64(v))
+    of "rlimit-core":
+      # rfc-0007 wiring-audit W2: RLIMIT_CORE override (core dump size, bytes).
+      # Unlike the other four rlimit-* keys, 0 is a legitimate, meaningful
+      # value here (explicitly disable core dumps -- also this module's own
+      # built-in default), so only negative values are rejected.
+      let v = requireIntArg(n, "rlimit-core")
+      if v < 0:
+        cfgErr("config: 'rlimit-core' must be >= 0, got " & $v)
+      rlimitCore = some(int64(v))
+    of "limit-memory":
+      # rfc-0007 wiring-audit W2: the cgroup memory.max ceiling (req[lkMemory]).
+      # NOT an rlimit -- deliberately its own top-level key, per the RFC.
+      let v = requireIntArg(n, "limit-memory")
+      if v < 1:
+        cfgErr("config: 'limit-memory' must be >= 1, got " & $v)
+      limitMemory = some(int64(v))
     of "verify-cache-pct":
       # RFC-0005 B3c: sample-percentage default for --verify-cache; only
       # meaningful when --verify-cache is passed on the CLI (enabled is
@@ -994,6 +1041,11 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     measureCompileReuse: measureCompileReuse,
     strictHygiene:      strictHygiene,
     rlimitNofile:       rlimitNofile,
+    rlimitCpu:          rlimitCpu,
+    rlimitAs:           rlimitAs,
+    rlimitFsize:        rlimitFsize,
+    rlimitCore:         rlimitCore,
+    limitMemory:        limitMemory,
     verifyCachePct:     verifyCachePct,
     explainMiss:        explainMiss,
     cacheStats:         cacheStats,

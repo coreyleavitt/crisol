@@ -306,6 +306,15 @@ type
     ## precedence below in planImpl — lets a library caller raise the ceiling
     ## for one run without editing crisol.kdl.
     rlimitNofile*:       Option[int64] = none(int64)
+    ## rfc-0007 wiring-audit W2: per-run overrides for the remaining four
+    ## rlimit-* fields + the (non-rlimit) memory ceiling, same
+    ## can-only-strengthen precedence as rlimitNofile above (RunOptions wins
+    ## over a config-file value when set; none = defer to Config/built-in).
+    rlimitCpu*:          Option[int64] = none(int64)
+    rlimitAs*:           Option[int64] = none(int64)
+    rlimitFsize*:        Option[int64] = none(int64)
+    rlimitCore*:         Option[int64] = none(int64)
+    limitMemory*:        Option[int64] = none(int64)
     ## RFC-0005 A0: per-run NAME=VALUE pins (CLI `--env-pin`, repeatable).
     ## Merged with `Config.envPins` (KDL `env-pin "NAME" "VALUE"`) in
     ## planImpl via `envPinsFrom` -- a pin here overrides a same-named
@@ -838,13 +847,21 @@ proc shouldReportCompileBlock*(measureCompileReuse: bool): bool =
   measureCompileReuse
 
 proc rlimitOverridesFrom*(cfg: Config): RlimitOverrides =
-  ## Fix 1: pure projection of Config's rlimit-override fields into the
-  ## RlimitOverrides bundle resolveSandbox expects. Extracted (like
-  ## shouldReportCompileBlock above) so the Config → SandboxSpec wiring is
-  ## independently unit-testable without a real run. Currently only
-  ## limitNofile is config-plumbed; the other RlimitOverrides fields stay
-  ## none here (resolveSandbox applies its own safe built-in defaults).
-  RlimitOverrides(limitNofile: cfg.rlimitNofile)
+  ## Fix 1 / rfc-0007 wiring-audit W2: pure projection of Config's
+  ## rlimit-override fields into the RlimitOverrides bundle resolveSandbox
+  ## expects. Extracted (like shouldReportCompileBlock above) so the
+  ## Config → SandboxSpec wiring is independently unit-testable without a
+  ## real run. All five RlimitOverrides fields are now config-plumbed (W2
+  ## closed the gap Fix 1 left: limitAs/limitCpu/limitFsize/limitCore used
+  ## to stay none unconditionally here, so resolveSandbox always fell back
+  ## to its own built-in defaults for those four regardless of crisol.kdl).
+  RlimitOverrides(
+    limitAs:     cfg.rlimitAs,
+    limitCpu:    cfg.rlimitCpu,
+    limitFsize:  cfg.rlimitFsize,
+    limitNofile: cfg.rlimitNofile,
+    limitCore:   cfg.rlimitCore,
+  )
 
 proc envPinsFrom*(cfg: Config; opts: RunOptions): seq[(string, string)] =
   ## RFC-0005 A0: pure projection merging `Config.envPins` (KDL) with
@@ -888,6 +905,13 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
   # Fix 1: RunOptions.rlimitNofile, when set, overrides Config.rlimitNofile.
   if opts.rlimitNofile.isSome: cfg.rlimitNofile = opts.rlimitNofile
+  # rfc-0007 wiring-audit W2: same CLI/library-wins precedence for the
+  # remaining four rlimit-* fields + the (non-rlimit) memory ceiling.
+  if opts.rlimitCpu.isSome:    cfg.rlimitCpu    = opts.rlimitCpu
+  if opts.rlimitAs.isSome:     cfg.rlimitAs     = opts.rlimitAs
+  if opts.rlimitFsize.isSome:  cfg.rlimitFsize  = opts.rlimitFsize
+  if opts.rlimitCore.isSome:   cfg.rlimitCore   = opts.rlimitCore
+  if opts.limitMemory.isSome:  cfg.limitMemory  = opts.limitMemory
   # RFC-0005 A0: merge CLI/library --env-pin into the config-declared pins
   # (CLI wins on a name collision); resolveSandbox reads cfg.envPins below.
   cfg.envPins = envPinsFrom(cfg, opts)
@@ -1410,7 +1434,8 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # (active iff keyOf!=nil AND policy.enabled) is enforced structurally.
   let spec  = resolveSandbox(level = opts.hermeticLevel,
                               rlimits = rlimitOverridesFrom(cfg),
-                              envPins = cfg.envPins)
+                              envPins = cfg.envPins,
+                              memoryLimit = cfg.limitMemory)
   # nimcache-persistence (RFC-0006): the SAME ccVersion/nimVersion probes
   # already used by RFC-0004's SoundnessKey (via realSeams below) are reused
   # here — folded into execute()'s toolchain fingerprint, which keys the

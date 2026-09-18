@@ -243,6 +243,63 @@ suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
     check spec.limits.req[lkOpenFiles] == some(1024'i64)
 
 # ---------------------------------------------------------------------------
+# 11c. rfc-0007 wiring-audit W2 — rlimitOverridesFrom projects ALL FIVE
+# rlimit config fields (previously only limitNofile), and resolveSandbox
+# gains a `memoryLimit` param setting req[lkMemory] (previously no config/
+# CLI surface existed for it at all -- process/types.nim's own doc comment
+# on lkMemory said so explicitly).
+# ---------------------------------------------------------------------------
+
+suite "sandbox — W2: rlimitOverridesFrom projects all five rlimit fields":
+
+  test "Config.rlimitCpu round-trips through rlimitOverridesFrom into req[lkCpu]":
+    let cfg  = Config(rlimitCpu: some(7'i64))
+    let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
+    check spec.limits.req[lkCpu] == some(7'i64)
+
+  test "Config.rlimitAs round-trips through rlimitOverridesFrom into req[lkAddressSpace]":
+    let cfg  = Config(rlimitAs: some(4294967296'i64))
+    let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
+    check spec.limits.req[lkAddressSpace] == some(4294967296'i64)
+
+  test "Config.rlimitFsize round-trips through rlimitOverridesFrom into req[lkFileSize]":
+    let cfg  = Config(rlimitFsize: some(1048576'i64))
+    let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
+    check spec.limits.req[lkFileSize] == some(1048576'i64)
+
+  test "Config.rlimitCore round-trips through rlimitOverridesFrom into req[lkCore]":
+    let cfg  = Config(rlimitCore: some(0'i64))
+    let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
+    check spec.limits.req[lkCore] == some(0'i64)
+
+  test "every rlimitOverridesFrom field unset (none) leaves resolveSandbox's own built-in defaults untouched":
+    let cfg  = Config()
+    let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
+    check spec.limits.req[lkCpu]         == none(int64)  # no built-in default (RFC)
+    check spec.limits.req[lkAddressSpace] == none(int64) # no built-in default (RFC)
+    check spec.limits.req[lkFileSize]    == some(DefaultRlimitFsize)
+    check spec.limits.req[lkCore]        == some(DefaultRlimitCore)
+    check spec.limits.req[lkOpenFiles]   == some(DefaultRlimitNofile)
+
+suite "sandbox — W2: resolveSandbox's memoryLimit param sets req[lkMemory]":
+
+  test "memoryLimit unset (default none) leaves req[lkMemory] == none (lsNotRequested downstream)":
+    let spec = resolveSandbox(level = hlIsolated)
+    check spec.limits.req[lkMemory] == none(int64)
+
+  test "memoryLimit some(N) sets req[lkMemory] == some(N)":
+    let spec = resolveSandbox(level = hlIsolated, memoryLimit = some(67108864'i64))
+    check spec.limits.req[lkMemory] == some(67108864'i64)
+
+  test "Config.limitMemory reaches resolveSandbox via the real api.run call-site projection":
+    ## Mirrors the Config -> RlimitOverrides -> SandboxSpec round-trip tests
+    ## above, but for the separate memoryLimit param (limit-memory is
+    ## deliberately NOT an RlimitOverrides field -- it is not an rlimit).
+    let cfg  = Config(limitMemory: some(33554432'i64))
+    let spec = resolveSandbox(level = hlIsolated, memoryLimit = cfg.limitMemory)
+    check spec.limits.req[lkMemory] == some(33554432'i64)
+
+# ---------------------------------------------------------------------------
 # 11b. envPinsFrom (RFC-0005 A0): Config.envPins merged with RunOptions.envPins
 # ---------------------------------------------------------------------------
 

@@ -18,9 +18,15 @@
 ## call past RLIMIT_FSIZE trips SIGXFSZ synchronously, verified empirically)
 ## so it stays here.
 ##
-## No CLI coverage for the two rlimit-requested cases: crisol's CLI exposes
-## `--rlimit-nofile` only (A2a-iii wires --rlimit-cpu/--rlimit-fsize); these
-## two are execute()-only until that plumbing lands.
+## No CLI coverage for the two rlimit-requested cases here: they are
+## execute()-only in THIS file because SIGXCPU requested+achieved needs a
+## real CPU burn (timing-sensitive, lives in tests/timing/
+## test_rfc0007_a1f_limit_timing.nim instead) and fsize's execute()-only
+## case above already exercises the fixture this file uses. rfc-0007
+## wiring-audit W2 landed the CLI/config plumbing itself (`--rlimit-cpu`/
+## `--rlimit-fsize` / crisol.kdl `rlimit-cpu`/`rlimit-fsize`) --
+## see tests/integration/test_rfc0007_w2_limit_wiring.nim for the CLI-level
+## proof of the cpu case.
 
 when defined(posix):
   import std/[json, options, os, strutils, times, unittest]

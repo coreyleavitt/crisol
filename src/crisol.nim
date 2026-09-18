@@ -152,7 +152,8 @@ Usage:
               [--retries <N>] [--fail-on-flaky] [--strict-hygiene]
               [--order <recent-fail|duration|none>]
               [--hermetic <none|isolated|network>]
-              [--rlimit-nofile <N>]
+              [--rlimit-nofile <N>] [--rlimit-cpu <N>] [--rlimit-as <N>]
+              [--rlimit-fsize <N>] [--rlimit-core <N>] [--limit-memory <N>]
               [--env-pin NAME=VALUE]...
               [--no-remote-cache]
               [--explain-miss | --explain-miss-verbose]
@@ -228,6 +229,31 @@ Additional options for 'run':
                   if set).  Raise this for fd-heavy consumer workloads (e.g.
                   one eventfd per in-flight async call) without patching
                   crisol.
+  --rlimit-cpu N  Override RLIMIT_CPU (CPU seconds) for hermetic sandbox
+                  children.  Default: unset (no CPU limit requested), or
+                  crisol.kdl's `rlimit-cpu`, if set.
+  --rlimit-as N   Override RLIMIT_AS (virtual address space, bytes) for
+                  hermetic sandbox children.  Default: unset, or crisol.kdl's
+                  `rlimit-as`, if set.  See sandbox.MinSafeRlimitAs before
+                  setting this below a few GiB -- ORC's own startup
+                  address-space footprint can make a low value crash the
+                  child before main() even returns.
+  --rlimit-fsize N
+                  Override RLIMIT_FSIZE (max file write size, bytes) for
+                  hermetic sandbox children.  Default: 256 MiB, or
+                  crisol.kdl's `rlimit-fsize`, if set.
+  --rlimit-core N Override RLIMIT_CORE (core dump size, bytes) for hermetic
+                  sandbox children.  Default: 0 (core dumps disabled), or
+                  crisol.kdl's `rlimit-core`, if set.
+  --limit-memory N
+                  Request a cgroup-tier memory ceiling (memory.max, bytes)
+                  for hermetic sandbox children -- NOT an rlimit (independent
+                  of --rlimit-as; see RLIMIT_AS vs. lkMemory in
+                  process/types.nim).  Default: unset, or crisol.kdl's
+                  `limit-memory`, if set.  Honestly degrades to "unsupported"
+                  on a host without a usable delegated cgroup-v2 memory
+                  controller (the run still passes; this is a real
+                  observation, not a failure).
   --env-pin NAME=VALUE
                   Pin an env var into every child's environment, regardless
                   of the host's own value for NAME (repeatable). The pinned
@@ -704,6 +730,14 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     measureCompileReuse: bool = false  # RFC-0006: --measure-compile-reuse: gate the
                                         # measurement worker into the compile slot
     rlimitNofile: int = 0        # Fix 1: --rlimit-nofile N; 0 = not specified (use config/built-in)
+    # rfc-0007 wiring-audit W2: same "0/-1 = not specified" sentinel idiom.
+    # rlimitCore uses -1 (not 0) because 0 is itself a valid, meaningful
+    # RLIMIT_CORE value (explicitly disable core dumps).
+    rlimitCpu:    int = 0        # --rlimit-cpu N
+    rlimitAs:     int = 0        # --rlimit-as N
+    rlimitFsize:  int = 0        # --rlimit-fsize N
+    rlimitCore:   int = -1       # --rlimit-core N
+    limitMemory:  int = 0        # --limit-memory N
     verifyCache:       bool = false  # RFC-0005 B3c: --verify-cache: enable the post-run pass
     verifyCachePctFlag: int  = 0     # --verify-cache-pct N; 0 = not specified (use config/built-in)
     verifyCacheSeed:   Option[int64] = none(int64)  # --verify-cache-seed N
@@ -741,7 +775,9 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                  "base", "force-compile", "no-cache", "filter-tag",
                  "retries", "fail-on-flaky", "strict-hygiene", "junit", "shard", "order",
                  "perf-check", "hermetic", "measure-compile-reuse",
-                 "rlimit-nofile", "verify-cache", "verify-cache-pct",
+                 "rlimit-nofile", "rlimit-cpu", "rlimit-as", "rlimit-fsize",
+                 "rlimit-core", "limit-memory",
+                 "verify-cache", "verify-cache-pct",
                  "verify-cache-seed", "verify-cache-strict", "env-pin",
                  "explain-miss", "explain-miss-verbose", "cache-stats",
                  "no-remote-cache"] and isList:
@@ -884,6 +920,61 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
             stderr.write("crisol: --rlimit-nofile must be >= 1\n"); return ExitEnvironment
         except ValueError:
           stderr.write("crisol: --rlimit-nofile: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
+      of "rlimit-cpu":
+        let raw = nextVal("rlimit-cpu")
+        if raw == "":
+          stderr.write(usage()); return ExitEnvironment
+        try:
+          rlimitCpu = parseInt(raw)
+          if rlimitCpu < 1:
+            stderr.write("crisol: --rlimit-cpu must be >= 1\n"); return ExitEnvironment
+        except ValueError:
+          stderr.write("crisol: --rlimit-cpu: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
+      of "rlimit-as":
+        let raw = nextVal("rlimit-as")
+        if raw == "":
+          stderr.write(usage()); return ExitEnvironment
+        try:
+          rlimitAs = parseInt(raw)
+          if rlimitAs < 1:
+            stderr.write("crisol: --rlimit-as must be >= 1\n"); return ExitEnvironment
+        except ValueError:
+          stderr.write("crisol: --rlimit-as: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
+      of "rlimit-fsize":
+        let raw = nextVal("rlimit-fsize")
+        if raw == "":
+          stderr.write(usage()); return ExitEnvironment
+        try:
+          rlimitFsize = parseInt(raw)
+          if rlimitFsize < 1:
+            stderr.write("crisol: --rlimit-fsize must be >= 1\n"); return ExitEnvironment
+        except ValueError:
+          stderr.write("crisol: --rlimit-fsize: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
+      of "rlimit-core":
+        let raw = nextVal("rlimit-core")
+        if raw == "":
+          stderr.write(usage()); return ExitEnvironment
+        try:
+          rlimitCore = parseInt(raw)
+          if rlimitCore < 0:
+            stderr.write("crisol: --rlimit-core must be >= 0\n"); return ExitEnvironment
+        except ValueError:
+          stderr.write("crisol: --rlimit-core: invalid integer '" & raw & "'\n")
+          return ExitEnvironment
+      of "limit-memory":
+        let raw = nextVal("limit-memory")
+        if raw == "":
+          stderr.write(usage()); return ExitEnvironment
+        try:
+          limitMemory = parseInt(raw)
+          if limitMemory < 1:
+            stderr.write("crisol: --limit-memory must be >= 1\n"); return ExitEnvironment
+        except ValueError:
+          stderr.write("crisol: --limit-memory: invalid integer '" & raw & "'\n")
           return ExitEnvironment
       of "verify-cache":
         verifyCache = true
@@ -1107,6 +1198,11 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     hermeticLevel:       hermeticLevel, # RFC-0004: --hermetic level control
     rlimitNofile:        if rlimitNofile > 0: some(int64(rlimitNofile)) else: none(int64),
                                          # Fix 1: --rlimit-nofile override
+    rlimitCpu:   if rlimitCpu > 0:   some(int64(rlimitCpu))   else: none(int64),  # rfc-0007 W2
+    rlimitAs:    if rlimitAs > 0:    some(int64(rlimitAs))    else: none(int64),  # rfc-0007 W2
+    rlimitFsize: if rlimitFsize > 0: some(int64(rlimitFsize)) else: none(int64),  # rfc-0007 W2
+    rlimitCore:  if rlimitCore >= 0: some(int64(rlimitCore))  else: none(int64),  # rfc-0007 W2 (-1 sentinel)
+    limitMemory: if limitMemory > 0: some(int64(limitMemory)) else: none(int64), # rfc-0007 W2
     measureCompileReuse: measureCompileReuse,  # RFC-0006: gate measurement worker into compile slot
     verifyCache:         verifyCacheOpts,  # RFC-0005 B3c: --verify-cache facade
     envPins:             envPins,       # RFC-0005 A0: --env-pin NAME=VALUE (repeatable)

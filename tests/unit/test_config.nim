@@ -1391,6 +1391,228 @@ group "unit" {
     check kind == cekConfig
 
 # ---------------------------------------------------------------------------
+# rfc-0007 wiring-audit W2 — rlimit-cpu/rlimit-as/rlimit-fsize/rlimit-core/
+# limit-memory config plumbing (the cbLimit attribution chain's missing
+# entry-point surface; mirrors rlimit-nofile's round-trip idiom above
+# exactly, one suite per key).
+# ---------------------------------------------------------------------------
+
+suite "config — rlimit-cpu (W2: RLIMIT_CPU override plumbing)":
+
+  test "absent rlimit-cpu -> cfg.rlimitCpu == none":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitCpu == none(int64)
+
+  test "rlimit-cpu N round-trips to cfg.rlimitCpu == some(N)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-cpu 5
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitCpu == some(5'i64)
+
+  test "rlimit-cpu 0 is rejected (must be >= 1)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-cpu 0
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+suite "config — rlimit-as (W2: RLIMIT_AS override plumbing)":
+
+  test "absent rlimit-as -> cfg.rlimitAs == none":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitAs == none(int64)
+
+  test "rlimit-as N round-trips to cfg.rlimitAs == some(N)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-as 4294967296
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitAs == some(4294967296'i64)
+
+  test "rlimit-as 0 is rejected (must be >= 1)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-as 0
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+suite "config — rlimit-fsize (W2: RLIMIT_FSIZE override plumbing)":
+
+  test "absent rlimit-fsize -> cfg.rlimitFsize == none":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitFsize == none(int64)
+
+  test "rlimit-fsize N round-trips to cfg.rlimitFsize == some(N)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-fsize 1048576
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitFsize == some(1048576'i64)
+
+  test "rlimit-fsize -1 is rejected (must be >= 0)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-fsize -1
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+suite "config — rlimit-core (W2: RLIMIT_CORE override plumbing)":
+
+  test "absent rlimit-core -> cfg.rlimitCore == none":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitCore == none(int64)
+
+  test "rlimit-core N round-trips to cfg.rlimitCore == some(N)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-core 0
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.rlimitCore == some(0'i64)
+
+  test "rlimit-core -1 is rejected (must be >= 0)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+rlimit-core -1
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+suite "config — limit-memory (W2: cgroup memory.max / req[lkMemory] plumbing)":
+
+  test "absent limit-memory -> cfg.limitMemory == none":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.limitMemory == none(int64)
+
+  test "limit-memory N round-trips to cfg.limitMemory == some(N)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+limit-memory 67108864
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    let (cfg, _) = loadConfig(configPath = cfgPath)
+    check cfg.limitMemory == some(67108864'i64)
+
+  test "limit-memory 0 is rejected (must be >= 1)":
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let kdl = """
+limit-memory 0
+group "unit" {
+    globs "tests/unit/test_*.nim"
+}
+"""
+    let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
+# ---------------------------------------------------------------------------
 # RFC-0005 B3c — verify-cache-pct config plumbing
 # ---------------------------------------------------------------------------
 

@@ -92,11 +92,16 @@ type
       ## `req[lkMemory]` directly — its own slot, its own producer
       ## (posixcore's cgroup backend), never derived from another kind.
       ## `req[lkMemory]` reads `none` (⇒ `achieved[lkMemory] =
-      ## lsNotRequested`) on every tier/config that never sets it — no
-      ## config/CLI surface exists for it yet (a future increment); this
-      ## phase supplies the producer a caller building `ChildSpec` directly
-      ## can already exercise (see the cgroup conformance/fault-injection/
-      ## OOM tests).
+      ## lsNotRequested`) on every tier/config that never sets it.
+      ## rfc-0007 wiring-audit W2: the config/CLI surface now exists --
+      ## crisol.kdl's top-level `limit-memory N` key (and the mirroring
+      ## `--limit-memory N` CLI flag / `RunOptions.limitMemory`), threaded
+      ## through `resolveSandbox`'s own `memoryLimit` param (sandbox.nim;
+      ## deliberately NOT a `RlimitOverrides` field, since this is not an
+      ## rlimit) straight into `req[lkMemory]`. A caller building
+      ## `ChildSpec` directly can still exercise the producer without any
+      ## of that config plumbing (see the cgroup conformance/fault-
+      ## injection/OOM tests).
 
   Limits* = object           ## the SINGLE home for resource limits.
     req*: array[LimitKind, Option[int64]]

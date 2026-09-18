@@ -446,6 +446,54 @@ type
                                 ## when set, mirroring jobs/timeoutSecs precedence in planImpl).
                                 ## Lets a consumer with an fd-heavy workload (e.g. one eventfd per
                                 ## in-flight async call) raise the ceiling without patching crisol.
+    rlimitCpu*: Option[int64]
+                                ## rfc-0007 wiring-audit W2: config-declared override for
+                                ## RLIMIT_CPU (CPU seconds) in the hermetic sandbox. none = no
+                                ## RLIMIT_CPU requested (the RFC-0004 default -- CPU limits are
+                                ## timing-sensitive so they stay opt-in, never a built-in
+                                ## default). Populated from the top-level `rlimit-cpu N` KDL node,
+                                ## and/or strengthened per-run by `RunOptions.rlimitCpu` (RunOptions
+                                ## wins when set), exactly mirroring rlimitNofile above. Feeds
+                                ## `RlimitOverrides.limitCpu` via `api.rlimitOverridesFrom`, which
+                                ## `resolveSandbox` sets as `req[lkCpu]` -- the real producer of
+                                ## the `cbLimit(lkCpu)`/SIGXCPU attribution chain this key exists
+                                ## to make reachable from a real crisol.kdl.
+    rlimitAs*: Option[int64]
+                                ## rfc-0007 wiring-audit W2: config-declared override for
+                                ## RLIMIT_AS (virtual address space, bytes) in the hermetic
+                                ## sandbox. none = no RLIMIT_AS requested (same "opt-in, no
+                                ## built-in default" rule as rlimitCpu above -- ORC's own startup
+                                ## address-space footprint makes a low default actively dangerous;
+                                ## see sandbox.MinSafeRlimitAs). Populated from `rlimit-as N`,
+                                ## strengthened by `RunOptions.rlimitAs`. Feeds
+                                ## `RlimitOverrides.limitAs` -> `req[lkAddressSpace]`.
+    rlimitFsize*: Option[int64]
+                                ## rfc-0007 wiring-audit W2: config-declared override for
+                                ## RLIMIT_FSIZE (max file write size, bytes) in the hermetic
+                                ## sandbox. none = use sandbox.DefaultRlimitFsize (256 MiB).
+                                ## Populated from `rlimit-fsize N`, strengthened by
+                                ## `RunOptions.rlimitFsize`. Feeds `RlimitOverrides.limitFsize` ->
+                                ## `req[lkFileSize]`, exactly mirroring rlimitNofile.
+    rlimitCore*: Option[int64]
+                                ## rfc-0007 wiring-audit W2: config-declared override for
+                                ## RLIMIT_CORE (core dump size, bytes) in the hermetic sandbox.
+                                ## none = use sandbox.DefaultRlimitCore (0 -- core dumps disabled).
+                                ## Populated from `rlimit-core N`, strengthened by
+                                ## `RunOptions.rlimitCore`. Feeds `RlimitOverrides.limitCore` ->
+                                ## `req[lkCore]`, exactly mirroring rlimitNofile.
+    limitMemory*: Option[int64]
+                                ## rfc-0007 wiring-audit W2: config-declared cgroup-tier memory
+                                ## ceiling (bytes) -- `req[lkMemory]`'s first config/CLI surface.
+                                ## Deliberately NOT named `rlimit-*`: this is not an rlimit (no
+                                ## RLIMIT_* syscall backs it) -- it is the cgroup `memory.max`
+                                ## ceiling posixcore's cgroup backend writes, independent of
+                                ## RLIMIT_AS (see process/types.lkMemory's doc comment for why the
+                                ## two must never be conflated). none = not requested
+                                ## (achieved reads lsNotRequested). Populated from the top-level
+                                ## `limit-memory N` KDL node, strengthened by
+                                ## `RunOptions.limitMemory`. Threaded to `resolveSandbox`'s own
+                                ## `memoryLimit` param directly (NOT via `RlimitOverrides` --
+                                ## that bundle is rlimits only) at the api.run call site.
     verifyCachePct*: int        ## RFC-0005 B3c: the `--verify-cache` sample-percentage DEFAULT a
                                 ## config file can set (`verify-cache-pct N` KDL node) so an
                                 ## invocation-time `--verify-cache` (with no `--verify-cache-pct`

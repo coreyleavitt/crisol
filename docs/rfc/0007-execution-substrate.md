@@ -38,7 +38,8 @@ reason = "W1 landed 35c4564: cgroupTierUsable gates tier on delegation AND cgrou
 [[item]]
 id    = "w2"
 title = "Wiring W2 (high): cbLimit attribution chain for lkCpu/lkAddressSpace/lkMemory has no production producer -- only rlimit-nofile is config-plumbed; B3 OOM attribution and D1b-ii/D1c windows enforcement reachable only from conformance tests. Wire: config keys (+CLI) for cpu/as/memory limits through resolveSandbox."
-state = "open"
+state = "resolved"
+reason = "W2 landed: config keys rlimit-cpu/as/fsize/core + limit-memory with CLI flags and RunOptions mirrors (CLI-wins precedence); rlimitOverridesFrom projects all five; resolveSandbox memoryLimit param sets req[lkMemory]; E2E tracer proves config rlimit-cpu=1 => SIGXCPU => cbLimit(lkCpu) on the crisol run --json wire; limit-memory honest lsUnsupported degradation E2E; cache key already folds all LimitKinds (compiler-forced, no format bump)"
 
 [[item]]
 id    = "w3"

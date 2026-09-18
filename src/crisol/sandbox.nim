@@ -118,6 +118,7 @@ proc resolveSandbox*(
   chdirIntoScratch: bool            = false;
   rlimits:          RlimitOverrides = RlimitOverrides();
   envPins:          seq[(string, string)] = @[];
+  memoryLimit:      Option[int64]  = none(int64);
 ): SandboxSpec =
   ## Resolve a ``SandboxSpec`` from a hermeticity level and optional overrides.
   ##
@@ -145,6 +146,15 @@ proc resolveSandbox*(
   ## injected). See ``filterEnv`` and ``hermeticEnvHash`` below for the two
   ## consequences: the pinned value reaches the child, and it — not the
   ## host's actual value — is what enters the soundness key.
+  ##
+  ## ``memoryLimit`` (rfc-0007 wiring-audit W2) is ``req[lkMemory]``'s own
+  ## param — deliberately NOT a ``RlimitOverrides`` field, since ``lkMemory``
+  ## is not an rlimit (no RLIMIT_* syscall backs it; it is the cgroup
+  ## ``memory.max`` ceiling posixcore's cgroup backend writes). ``none``
+  ## (default) = not requested, same as every other unrequested limit kind —
+  ## there is no built-in safe default to fall back to (unlike fsize/
+  ## nofile/core above): a memory ceiling is only ever what the caller
+  ## explicitly asks for.
 
   if level == hlNone:
     return SandboxSpec(level: hlNone, envPins: envPins)
@@ -168,6 +178,8 @@ proc resolveSandbox*(
   lim.req[ptypes.lkFileSize]     = activeFsize
   lim.req[ptypes.lkOpenFiles]    = activeNofile
   lim.req[ptypes.lkCore]         = activeCore
+  lim.req[ptypes.lkMemory]       = memoryLimit        # default none(int64); no built-in
+                                                       # default (rfc-0007 W2)
 
   SandboxSpec(
     level:                level,
