@@ -63,6 +63,44 @@ proc forcePollRequested(): bool =
   let v = getEnv("CRISOL_FORCE_POLL")
   v.len > 0 and v != "0"
 
+proc forceNoCgroupKillRequested(): bool =
+  ## rfc-0007 wiring-audit W1's env knob — `CRISOL_FORCE_NO_CGROUP_KILL`,
+  ## the same shape/doc style as `CRISOL_FORCE_POLL` above. Consulted
+  ## INSIDE `probeCgroupV2` (below), never as a separate branch at the
+  ## spawn gate: this makes `capabilities()`/the substrate JSON honestly
+  ## report `cgroupKill: false` too, not just the gate's internal
+  ## decision — the same "attempt the mechanism, verify it worked" probe
+  ## discipline this file's capabilities section documents, just with the
+  ## verification forced negative. Two purposes, not one: (1) the test
+  ## seam this slice's conformance/unit tests need to exercise the
+  ## cgroup-tier degrade without a real broken kernel; (2) a genuine
+  ## operator escape hatch for a delegated host whose `cgroup.kill` file
+  ## exists but is known-buggy. Read fresh, same as `forcePollRequested`
+  ## — but because the caller (`cachedCapabilities`) memoises its RESULT
+  ## after the first probe, this only has effect if set before this
+  ## process's first `capabilities()`/`cachedCapabilities()` call; a
+  ## process that probed already will not re-probe on a later env change.
+  let v = getEnv("CRISOL_FORCE_NO_CGROUP_KILL")
+  v.len > 0 and v != "0"
+
+proc cgroupTierUsable*(caps: Capabilities): bool =
+  ## rfc-0007 wiring-audit W1: the cgroup tier's ONE forced-kill mechanism
+  ## is `cgroup.kill` — `forceKillCore`'s cgroup arm writes it and skips
+  ## `killpg` ENTIRELY (not merely redundantly) when a leaf exists. A
+  ## delegated leaf on a kernel that lacks `cgroup.kill` (< 5.14 — RHEL8
+  ## 4.18, 5.4/5.10 LTS containers) therefore cannot honor the tier's
+  ## forced-kill guarantee: `killCgroupLeaf` is deliberately best-effort
+  ## and swallows that write failure, so a SIGTERM-ignoring child would
+  ## survive escalation with NO SIGKILL ever sent, while reap still
+  ## stamped `killDomain = kdsCgroup` — a vouch the mechanism could not
+  ## honor. So `cgroupDelegation` ALONE is not sufficient to select this
+  ## tier; both probed bits must hold, or the spawn must fall to the next
+  ## tier (subreaper/pgid `killpg`) via the existing per-spawn leaf-
+  ## creation-failure degrade path — this predicate is the ONE place that
+  ## decision is made, consulted at the spawn gate instead of the bare
+  ## `cgroupDelegation` check it replaces.
+  caps.cgroupDelegation and caps.cgroupKill
+
 when defined(linux):
   proc c_syscall(number: clong): clong {.importc: "syscall", varargs,
                                          header: "<unistd.h>".}
@@ -359,10 +397,12 @@ type
                                 ## registered EPOLLIN in `core.epollFd` at
                                 ## spawn, closed + EPOLL_CTL_DEL'd at reap
                                 ## (the ONLY two touch points; never leaked).
-    cgroupLeaf: string          ## rfc-0007 B3: "" unless this spawn got a
-                                ## real cgroup-v2 leaf (capabilities().
-                                ## cgroupDelegation AND leaf creation AND the
-                                ## post-fork move both succeeded). Non-empty
+    cgroupLeaf: string          ## rfc-0007 B3 (gated per W1): "" unless
+                                ## this spawn got a real cgroup-v2 leaf
+                                ## (`cgroupTierUsable(capabilities())` —
+                                ## cgroupDelegation AND cgroupKill — AND
+                                ## leaf creation AND the post-fork move all
+                                ## succeeded). Non-empty
                                 ## iff killDomain for this slot is kdsCgroup
                                 ## at reap — "" is the per-spawn honest
                                 ## degrade to the pre-B3 domain.
@@ -693,7 +733,13 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   var cgroupMemWriteOk = none(bool)   # none = never attempted this spawn
   let caps0 = cachedCapabilities()
   when defined(linux):
-    if caps0.cgroupDelegation:
+    # rfc-0007 wiring-audit W1: gated on `cgroupTierUsable`, not bare
+    # `cgroupDelegation` — see that predicate's doc comment. A delegated
+    # host whose kernel lacks `cgroup.kill` cannot honor this tier's
+    # forced-kill guarantee, so this spawn takes NO leaf at all and falls
+    # to the pre-B3 subreaper/pgid domain, exactly like the existing
+    # leaf-creation-failure degrade a few lines below.
+    if cgroupTierUsable(caps0):
       let parent = cgroupSiblingParent()
       if parent.len > 0:
         let created = createCgroupLeaf(parent, cgroupSlotLeafName(getpid(), plannedId))
@@ -889,7 +935,15 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   achieved[lkMemory] =
     if spec.limits.req[lkMemory].isNone: lsNotRequested
     elif cgroupLeafPath.len > 0: (if cgroupMemWriteOk == some(true): lsApplied else: lsFailed)
-    elif caps0.cgroupDelegation: lsFailed       # green probe, THIS leaf failed
+    # rfc-0007 wiring-audit W1: `cgroupTierUsable`, not bare
+    # `cgroupDelegation` — a host gated off the tier by a missing
+    # `cgroup.kill` never ATTEMPTED a leaf for this spawn (see the W1
+    # comment at the gate above), so `lsUnsupported` ("mechanism absent
+    # on this tier") is the honest status, not `lsFailed` ("the mechanism
+    # existed here and broke" — types.nim's own distinction). Only a host
+    # where the tier WAS usable but this one leaf still failed to
+    # materialize is a real `lsFailed`.
+    elif cgroupTierUsable(caps0): lsFailed       # green probe, THIS leaf failed
     else: lsUnsupported                          # mechanism absent on this tier
 
   doAssert plannedId == core.nextIdVal,
@@ -1666,7 +1720,13 @@ when defined(linux):
     try:
       writeFile(leaf / "cgroup.procs", $getpid() & "\n")
       result.delegation = true
-      result.kill = fileExists(leaf / "cgroup.kill")
+      # rfc-0007 wiring-audit W1: the real file-existence probe, THEN the
+      # env override forced negative — never the reverse order (a real
+      # probe that never ran would make `forceNoCgroupKillRequested`
+      # meaningless as an escape hatch for a host where the file exists
+      # but is known-buggy; this order is what makes it a real override,
+      # not merely a fallback default).
+      result.kill = fileExists(leaf / "cgroup.kill") and not forceNoCgroupKillRequested()
       result.memoryPeak = fileExists(leaf / "memory.peak")
     except CatchableError:
       discard   # mkdir succeeded but the move failed — honestly not delegated
