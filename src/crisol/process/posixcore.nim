@@ -228,6 +228,25 @@ proc parseStatLine*(content: string): tuple[ppid, pgrp: int; comm: string; start
 proc readVmRssBytes(pid: int): int64
   ## Forward declaration — real proc lives beside `parseStatLine` below.
 
+type
+  ProcStatInfo = object
+    ## One /proc walk's raw yield per live pid — the shared source both
+    ## `scanProcessGroup` (pgid-only, pre-B1 tier) and B1's
+    ## `discoverAndReapEscapees`/orphan sweep fold over, so the two never
+    ## drift onto separate readings of the same instant. Declared this
+    ## early (rather than beside `walkProcTable` itself, below) purely so
+    ## the forward declaration right after this needs a real type to name.
+    pid, ppid, pgrp: int
+    comm: string
+    starttime: int64
+
+proc walkProcTable(): seq[ProcStatInfo]
+  ## Forward declaration — `initPosixCore`'s r3 pre-existing-children
+  ## snapshot (rfc-0007 code-review finding r3) needs this early, the same
+  ## reason `cgroupLeafSurvivors` needs `parseStatLine` this early (see
+  ## that forward declaration's comment above). Real per-platform bodies
+  ## live below, beside the rest of the "/proc forensics" section.
+
 when defined(linux):
   proc ownCgroupV2Path(): string =
     ## Reads /proc/self/cgroup's unified (v2) line: "0::<path>".
@@ -427,6 +446,26 @@ type
                                   ## macOS + a real kqueue probe +
                                   ## CRISOL_FORCE_POLL unset. Never
                                   ## re-evaluated mid-run (useEpoll's peer).
+    subreaperSet: bool            ## rfc-0007 code-review r3: true iff THIS
+                                  ## core issued PR_SET_CHILD_SUBREAPER at
+                                  ## init (Linux only). `destroyPosixCore`
+                                  ## clears the bit iff this is true — never
+                                  ## unconditionally, so a nested/second
+                                  ## Supervisor sharing a process never
+                                  ## clobbers a bit it did not itself set.
+    preExisting: HashSet[int]     ## rfc-0007 code-review r3: pids that were
+                                  ## already children of this process (ppid
+                                  ## == ownPid) at `initPosixCore` time,
+                                  ## BEFORE the subreaper bit was set —
+                                  ## i.e. the HOST APPLICATION's own
+                                  ## pre-existing children, when crisol runs
+                                  ## embedded as a library rather than as
+                                  ## its own process. Snapshotted once, on
+                                  ## Linux only (empty everywhere else);
+                                  ## `discoverAndReapEscapees` and
+                                  ## `sweepAdoptedOrphan` both consult it so
+                                  ## neither one ever kills or consumes a
+                                  ## process this Supervisor never spawned.
 
 # ---------------------------------------------------------------------------
 # Self-pipe + shutdown signal handler.
@@ -479,7 +518,8 @@ proc initPosixCore*(installSignals: bool): PosixCore =
                       liveCount: 0, pipeRead: -1, pipeWrite: -1,
                       installedSignals: installSignals,
                       epollFd: -1, timerFd: -1, useEpoll: false,
-                      kqueueFd: -1, useKqueue: false)
+                      kqueueFd: -1, useKqueue: false,
+                      subreaperSet: false, preExisting: initHashSet[int]())
   var fds: array[2, cint]
   if posix.pipe(fds) != 0:
     raise newException(OSError, "initSupervisor: failed to create self-pipe")
@@ -572,6 +612,23 @@ proc initPosixCore*(installSignals: bool): PosixCore =
     discard sigaction(SIGINT, sa, nil)
     discard sigaction(SIGTERM, sa, nil)
   when defined(linux):
+    # rfc-0007 code-review r3: snapshot this process's PRE-EXISTING
+    # children BEFORE the subreaper bit goes live, below. When crisol runs
+    # embedded as a library (e.g. amoxtli) rather than as its own process,
+    # `ownPid` IS the host application's pid, and the host may already have
+    # its own worker children running at this point — children this
+    # Supervisor never spawned and has no business killing or reaping.
+    # `discoverAndReapEscapees` (the ppid==ownPid escapee-kill arm) and
+    # `sweepAdoptedOrphan` (the WNOWAIT orphan-consume path) both consult
+    # this set so neither one ever touches a pre-existing host child.
+    # Necessarily a snapshot, not a live view: a host child that starts
+    # AFTER this point is indistinguishable from a genuine orphan crisol
+    # itself adopted (documented, accepted — see destroyPosixCore and
+    # sweepAdoptedOrphan's own comments for the rest of this tradeoff).
+    let ownPidInit = int(getpid())
+    for info in walkProcTable():
+      if info.ppid == ownPidInit:
+        result.preExisting.incl info.pid
     # rfc-0007 B1 (§3): a Supervisor IS a subreaper by construction — set
     # DELIBERATELY here, independent of `probeSubreaper`'s capability probe
     # (which may run lazily, before or after this call, memoised once per
@@ -580,6 +637,7 @@ proc initPosixCore*(installSignals: bool): PosixCore =
     # process from this point on, feeding `discoverAndReapEscapees` and
     # `nextEvent`'s orphan sweep below.
     discard c_prctl(PR_SET_CHILD_SUBREAPER, 1.cint)
+    result.subreaperSet = true
 
 proc liveChildCount*(core: PosixCore): int =
   ## Spawned-but-not-reaped count — the `=destroy` Defect guard (§1).
@@ -601,6 +659,18 @@ proc destroyPosixCore*(core: var PosixCore) =
     # guard above cannot still be outstanding here).
     if core.epollFd >= 0: discard posix.close(core.epollFd)
     if core.timerFd >= 0: discard posix.close(core.timerFd)
+    # rfc-0007 code-review r3: clear the subreaper bit iff THIS core set it
+    # (initPosixCore's own PR_SET_CHILD_SUBREAPER call). Library-embedding
+    # hazard half (a): left set, a Supervisor destroyed inside a longer-
+    # lived host process (e.g. amoxtli) would leave EVERY later orphan of
+    # unrelated host code reparenting here with no loop left to sweep
+    # them — permanent, invisible zombie accumulation in the host. The
+    # inverse hazard is NOT this proc's to fix: a host process that was
+    # ALREADY a subreaper before this Supervisor existed keeps that status
+    # untouched (`subreaperSet` is only ever true when THIS core issued
+    # the call).
+    if core.subreaperSet:
+      discard c_prctl(PR_SET_CHILD_SUBREAPER, 0.cint)
   when defined(macosx):
     # rfc-0007 C1b: the CORE-level kqueue fd — epollFd/timerFd's peer.
     if core.kqueueFd >= 0: discard posix.close(core.kqueueFd)
@@ -1029,16 +1099,6 @@ else:
       discard
     0'i64
 
-type
-  ProcStatInfo = object
-    ## One /proc walk's raw yield per live pid — the shared source both
-    ## `scanProcessGroup` (pgid-only, pre-B1 tier) and B1's
-    ## `discoverAndReapEscapees`/orphan sweep fold over, so the two never
-    ## drift onto separate readings of the same instant.
-    pid, ppid, pgrp: int
-    comm: string
-    starttime: int64
-
 when defined(macosx):
   proc walkProcTable(): seq[ProcStatInfo] =
     ## rfc-0007 C1b: the libproc equivalent of the /proc walk below.
@@ -1146,9 +1206,22 @@ proc decodeExit(wstatus: cint): Exit =
   else:
     Exit(kind: ekExited, code: 0)   # unreachable: never waited with WUNTRACED
 
+proc maxRssBytesFrom*(raw: int64; darwin: bool): int64 =
+  ## `ru_maxrss`'s unit is NOT portable across BSD-derived rusage
+  ## implementations: Linux reports KILOBYTES (scale by 1024 for bytes);
+  ## Darwin reports BYTES already — the same convention `readVmRssBytes`'s
+  ## libproc arm above documents for `pti_resident_size`. Scaling
+  ## unconditionally by 1024 inflated every macOS `wait4` reap's
+  ## maxRssBytes by 1024x (runner.nim/resultjson.nim/ledger.nim all carry
+  ## it downstream as a vouched "wait4" observation). Pure and exported so
+  ## BOTH platform arms are pinned by a unit test on any host — see
+  ## tests/unit/test_rfc0007_r1_maxrss_units.nim — without needing a macOS
+  ## machine to catch a regression in either one.
+  if darwin: raw else: raw * 1024
+
 proc decodeRusage(ru: posix.Rusage): types.Rusage =
   types.Rusage(
-    maxRssBytes: int64(ru.ru_maxrss) * 1024,
+    maxRssBytes: maxRssBytesFrom(int64(ru.ru_maxrss), defined(macosx)),
     userCpuUs:   int64(ru.ru_utime.tv_sec) * 1_000_000 + int64(ru.ru_utime.tv_usec),
     sysCpuUs:    int64(ru.ru_stime.tv_sec) * 1_000_000 + int64(ru.ru_stime.tv_usec),
   )
@@ -1242,6 +1315,25 @@ when defined(linux):
         updated.state = csExited
         core.children[cid] = updated
         return some(WaitEvent(kind: weChildExited, id: ChildId(cid)))
+    # rfc-0007 code-review r3, fix item 3: a pid this process already had
+    # as a child BEFORE it became a subreaper (library-embedding: the HOST
+    # APPLICATION's own pre-existing child, `ownPid` being the host's pid)
+    # is neither a registered slot nor a genuine adoptee — do NOT consume
+    # it. `WNOWAIT` above left the zombie waitable, so simply returning
+    # here (no `wait4`) leaves it exactly as the host will find it; the
+    # host's own later `waitpid` sees it normally, no stolen exit status.
+    # `waitid(P_ALL, WNOWAIT)` will likely keep re-finding this SAME zombie
+    # on every future call until the host reaps it — a bounded skip, never
+    # a blocking wait, so this never livelocks the event loop; it only
+    # pauses genuine orphan-adoption reporting while a host zombie sits
+    # unreaped (registered-slot reaping via `pollSweepChildren`'s targeted
+    # per-pid `wait4` is entirely unaffected — this proc is the only thing
+    # that pauses). The inverse hazard is NOT fixable here: a host that
+    # itself calls `wait(-1)`/`waitid(P_ALL, ...)` can just as easily steal
+    # an orphan crisol adopted — unavoidable when a process is shared,
+    # documented rather than solved.
+    if orphanPid in core.preExisting:
+      return none(WaitEvent)
     # Attribution BEFORE reap (§3): pgid, read while the zombie still
     # exists (WNOWAIT did not consume it).
     var ppid = -1
@@ -1506,6 +1598,24 @@ when defined(linux):
     ## transient rarely reparenting during an ACTUAL run reap could still be
     ## counted as that slot's escapee — conservatively uncacheable, that's
     ## all.
+    ##
+    ## r2 regression fix (cross-slot escapee misattribution): `livePids`
+    ## below doubles as "every OTHER live slot's domain pgid" too —
+    ## `spawnChild` calls `setpgid(childPid, childPid)`, so a slot's pgid
+    ## IS its own leader pid, the same value already collected. Without
+    ## also testing `info.pgrp in livePids`, a candidate whose
+    ## ppid==ownPid (reparented to crisol via a double-fork that never
+    ## called setpgid/setsid — so it KEPT its own slot's pgid) but whose
+    ## pgrp belongs to a DIFFERENT, still-live slot's domain was admitted
+    ## by the plain filter below: this reap would SIGKILL a legitimate,
+    ## still-running peer slot's own helper and stamp it into THIS slot's
+    ## escapees evidence. Accepted misattribution window (never unsound,
+    ## same posture as the compile-toolchain window above): the residual
+    ## case — a descendant of ANOTHER slot that also called setsid, losing
+    ## the pgid link entirely — is genuinely unattributable at this
+    ## subreaper tier and is not solved here; the cgroup tier (reapCore's
+    ## `usedCgroup` arm) has no such hole because it scopes by leaf
+    ## membership, never by pgid/ppid heuristics.
     if not runPhase or not (caps.subreaper and caps.pidfd):
       return scanProcessGroup(pgid)
     result = @[]
@@ -1518,6 +1628,12 @@ when defined(linux):
     for info in walkProcTable():
       if info.pid == ownPid: continue
       if info.pid in livePids: continue
+      if info.pgrp in livePids: continue   # r2 fix — see doc comment above
+      if info.pid in core.preExisting: continue   # r3 fix — never a host
+                                                    # child (library
+                                                    # embedding), see
+                                                    # `preExisting`'s field
+                                                    # doc comment
       if info.pid in seen: continue
       if info.pgrp != int(pgid) and info.ppid != ownPid: continue
       seen.incl info.pid

@@ -75,8 +75,10 @@ tests/conformance/test_conformance.nim
 tests/conformance/test_conformance_timing.nim
 tests/unit/test_process_capabilities.nim
 tests/unit/test_rfc0007_a6a_escapee_evidence.nim
+tests/unit/test_rfc0007_r2_cross_slot_escapee.nim
 tests/unit/test_rfc0007_w1_cgroup_kill_gate.nim
 tests/unit/test_run_tests.nim
+tests/conformance/test_rfc0007_r3_library_embedding.nim
 EOF
 )"
     # S5 wiring-audit fix, re-pinned empirically (CI run 35207827512,
@@ -107,7 +109,15 @@ EOF
     # unit+conformance step this script is invoked from, and `quit(0)`s
     # before printing either marker — correctly absent from both
     # EXPECTED_SKIP and MUST-EXECUTE on this leg.)
-    EXPECTED_SKIP=""
+    # rfc-0007 review round 1 (2026-09-18): r2/r3 tests exercise the Linux
+    # subreaper tier specifically (PR_SET_CHILD_SUBREAPER reparenting; Darwin
+    # reparents orphans to launchd), so both are whole-file linux-gated and
+    # correctly skip on this leg.
+    EXPECTED_SKIP="$(cat <<'EOF'
+tests/unit/test_rfc0007_r2_cross_slot_escapee.nim
+tests/conformance/test_rfc0007_r3_library_embedding.nim
+EOF
+)"
     # macos-latest (APFS) HAS symlink-create privilege, so every
     # symlinksAvailable()-gated test/block above runs its real body here —
     # the expected CRISOL-SKIP-TEST set is empty, same shape as A5c below.
