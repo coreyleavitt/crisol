@@ -1383,6 +1383,22 @@ proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
   slot.deadline        = getMonoTime() + initDuration(milliseconds = runTimeoutMs)
   slot.stopDeadline    = none(MonoTime)
   slot.forceKilled     = false
+  slot.t0              = epochTime()  # rfc-0007 code-review r6: run wall-clock
+                                       # starts HERE, at run spawn — not back at
+                                       # the compile spawn (spawnCompileStable's
+                                       # `slot.t0`, never reset by this proc
+                                       # before this fix). finalizeSlot's
+                                       # `elapsed` (computed from `slot.t0`) is
+                                       # stamped as the RUN phase's durationUs;
+                                       # leaving t0 at its compile-spawn value
+                                       # silently folded compile time into every
+                                       # edRunFresh-adjacent (recompiled) run's
+                                       # reported duration — contaminating
+                                       # cache stores, hit-replay durationMs,
+                                       # wallSavedMs telemetry, and shard-balance
+                                       # history. `spawnRunDirect` (cdSkipFresh)
+                                       # already sets t0 fresh; this brings the
+                                       # recompiled path in line with it.
   slot.testScratchDir  = scratchDir   # A4a/A6: cleaned on all exit paths
   result = true
 
@@ -1814,7 +1830,7 @@ proc execute*(
   # weShutdown exactly as it always did — until no slot is live.
   var shuttingDown = false
 
-  template handleChildExited(childId: ChildId) =
+  template handleChildExited(childId: ChildId; blockTransition: bool = false) =
         ## rfc-0007 A2b: extracted so the weShutdown handler (below) can drain
         ## any child that ALREADY exited but that this executor simply hadn't
         ## gotten around to noticing yet BEFORE committing remaining live slots
@@ -1824,6 +1840,18 @@ proc execute*(
         ## hit earlier with `slots`) trips Nim's memory-safety capture
         ## check at codegen; a template inlines at each call site instead,
         ## sidestepping capture entirely.
+        ##
+        ## rfc-0007 code-review r5(a): `blockTransition` — true ONLY for the
+        ## weShutdown handler's own pre-`shuttingDown` drain loop below.
+        ## `shuttingDown` is still false at that point (it isn't set until
+        ## AFTER the drain completes), so `not shuttingDown` alone would
+        ## compute `allowTransition = true` for a COMPILE child that raced
+        ## to success in that exact window — spawning a brand new run child
+        ## after the interrupt was already observed, then killing it and
+        ## reporting it `oKilled` instead of honestly omitting it (§2).
+        ## A run-phase exit drained here is a genuine completion (the
+        ## entire point of the drain) and is unaffected — `allowTransition`
+        ## is read only by `finalizeSlot`'s COMPILE-success arm.
         let idx              = slotIndexOf(slots, childId)
         let completedIdx     = slots[idx].pepIdx
         let compiledThisRun  = slots[idx].compiledThisRun
@@ -1859,7 +1887,7 @@ proc execute*(
         let finishRss = sv.groupRssBytes(slots[idx].id)
 
         let fo = finalizeSlot(sv, slots, idx, p, maxOutputBytes,
-                              allowTransition = not shuttingDown,
+                              allowTransition = (not shuttingDown) and not blockTransition,
                               projectRoot = config.projectRoot.absolutePath.normalizedPath, # canon-ok: real finalize spawn projectRoot
                               graph = graph, config = config,
                               sourceIndex = sourceIndex,
@@ -2338,25 +2366,54 @@ proc execute*(
           # before any slot is committed to interrupt teardown; each
           # drained exit is processed exactly like a normal completion
           # (full retry/ledger/cache/promotion via handleChildExited),
-          # because that is honestly what it is.
+          # because that is honestly what it is — EXCEPT a compile-phase
+          # SUCCESS, which must not transition into a brand new run child
+          # this late (r5(a) below): `blockTransition = true` routes it
+          # through `fkOmitted` instead (`shuttingDown` is still false
+          # here, so the plain `not shuttingDown` finalizeSlot normally
+          # reads would wrongly compute `allowTransition = true`).
+          #
+          # rfc-0007 code-review r5(b): `evReady.kind == weShutdown` here
+          # is a SECOND genuine interrupt observed while still draining the
+          # first — distinct from weDeadline ("nothing more ready"), which
+          # the old code conflated via a single `else: break`. Record it so
+          # the post-drain stop act below skips the grace window entirely,
+          # matching the "second Ctrl-C" contract (process/types.nim's
+          # WaitEventKind doc) instead of silently downgrading to the
+          # first-interrupt graced path.
           var drainBudget = slots.len
+          var secondShutdownDuringDrain = false
           while drainBudget > 0:
             dec drainBudget
             let evReady = sv.next(getMonoTime())
-            if evReady.kind == weChildExited:
-              handleChildExited(evReady.id)
+            case evReady.kind
+            of weChildExited:
+              handleChildExited(evReady.id, blockTransition = true)
+            of weShutdown:
+              secondShutdownDuringDrain = true
+              break
             else:
-              break  # nothing more immediately ready (weDeadline), or a
-                     # second real signal already — either way, proceed.
+              break  # weDeadline: nothing more immediately ready — proceed.
 
           shuttingDown = true
           wasInterrupted = true
           shutdownSignum = ev.signal.signum
-          for i in 0 ..< slots.len:
-            if slots[i].state == ssLive:
-              sv.requestStop(slots[i].id, ptypes.krInterrupt)
-              if slots[i].stopDeadline.isNone:
-                slots[i].stopDeadline = some(getMonoTime() + initDuration(milliseconds = GracePeriodMs))
+          if secondShutdownDuringDrain:
+            # Skip-grace: the second interrupt already arrived before the
+            # first one even finished being handled — every live slot goes
+            # straight to forceKill, the same treatment a second top-level
+            # weShutdown (the `else` branch below) gets once shuttingDown
+            # is already true.
+            for i in 0 ..< slots.len:
+              if slots[i].state == ssLive:
+                sv.forceKill(slots[i].id)
+                slots[i].forceKilled = true
+          else:
+            for i in 0 ..< slots.len:
+              if slots[i].state == ssLive:
+                sv.requestStop(slots[i].id, ptypes.krInterrupt)
+                if slots[i].stopDeadline.isNone:
+                  slots[i].stopDeadline = some(getMonoTime() + initDuration(milliseconds = GracePeriodMs))
         else:
           for i in 0 ..< slots.len:
             if slots[i].state == ssLive:
