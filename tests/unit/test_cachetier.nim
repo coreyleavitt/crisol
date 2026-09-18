@@ -1305,6 +1305,8 @@ block test_configured_cache_rejects_root_equal_to_state_dir:
 # ---------------------------------------------------------------------------
 
 proc forcedFpAsciiLowerProbe(rootAbs, stateDir: string): Option[FoldPolicy] = some(fpAsciiLower)
+proc forcedFpNoneProbe(rootAbs, stateDir: string): Option[FoldPolicy] = some(fpNone)
+proc failingFoldProbe(rootAbs, stateDir: string): Option[FoldPolicy] = none(FoldPolicy)
 
 block test_configured_cache_rejects_case_variant_root_inside_state_dir_under_folding_policy:
   # Pre-A5c this was the fail-OPEN bug: a raw byte `startsWith` never
@@ -1318,9 +1320,13 @@ block test_configured_cache_rejects_case_variant_root_inside_state_dir_under_fol
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpAsciiLowerProbe)
   var caught = false
   try:
+    # RFC-0009 B-cacheguard: the fold policy the GUARD folds under is now
+    # probed independently of `trackedRoots` (BUG2) -- `foldProbe` (not
+    # `trackedRoots`) is what has to carry the forced policy here.
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                             secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
-                            trackedRoots = trackedRoots)
+                            trackedRoots = trackedRoots,
+                            foldProbe = forcedFpAsciiLowerProbe)
   except CrisolError as e:
     caught = true
     assert e.kind == cekConfig
@@ -1338,7 +1344,8 @@ block test_configured_cache_rejects_ordinary_root_inside_state_dir_under_folding
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                             secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
-                            trackedRoots = trackedRoots)
+                            trackedRoots = trackedRoots,
+                            foldProbe = forcedFpAsciiLowerProbe)
   except CrisolError as e:
     caught = true
     assert e.kind == cekConfig
@@ -1353,7 +1360,8 @@ block test_configured_cache_allows_outside_root_under_folding_policy:
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpAsciiLowerProbe)
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
-                           trackedRoots = trackedRoots)
+                           trackedRoots = trackedRoots,
+                           foldProbe = forcedFpAsciiLowerProbe)
   assert rt.cache.tiers.len == 2
   assert rt.cache.tiers[1].name == "mirror"
 
@@ -1379,6 +1387,171 @@ block test_configured_cache_degraded_trackedroots_rejects_even_an_outside_root:
     assert e.kind == cekConfig
   assert caught, "an unpopulated trackedRoots (degraded config) must fail closed and " &
                  "reject every file:// remote, even a genuinely-outside one"
+
+# ---------------------------------------------------------------------------
+# RFC-0009 B-cacheguard: two verified bugs on top of A5c.
+#
+# BUG1: `rootInsideStateDir` canonicalized with raw stdlib `absolutePath`/
+# `normalizedPath` instead of `paths.nativeCanonicalize` -- (a) a Windows
+# drive letter's own CASE was never normalized (fail-open under fpNone,
+# distinct from A5c's directory-name fold fix), (b) a `\\?\` long-path
+# prefix was never stripped (fail-open under ANY policy), (c) the RFC-8089
+# 3-slash `file:///C:/...` form's naive `"file://".len` substring left an
+# extra leading slash the canonicalizer alone could not fix -- `fileUrlPath`
+# (cacheregistry.nim) now strips it before the path ever reaches
+# `nativeCanonicalize`. All three are pure lexical bugs -- host-agnostic
+# `nativeCanonicalize` makes them reproducible on Linux CI with no real
+# Windows round-trip, exactly like RFC-0009's own conformance vectors.
+#
+# BUG2: the fold policy folded under was always `trackedRoots.project.
+# foldPolicy` -- the PROJECT volume's policy -- but `root`/`stateDir` live
+# on the STATEDIR volume, which `CRISOL_STATE_DIR` redirection can put on a
+# different mount entirely (`config.stateDirOf`). `rootInsideStateDir` now
+# probes `stateDir`'s OWN volume, injectably, via a `FoldProbe` (mirroring
+# `initTrackedRoots`'s own seam) -- `configuredCache`'s new `foldProbe`
+# parameter, not `trackedRoots`.
+# ---------------------------------------------------------------------------
+
+block test_configured_cache_rejects_drive_letter_case_mismatch_under_fpnone:
+  # BUG1(a): under fpNone (case-sensitive volume -- the legal
+  # per-directory-case NTFS default), a byte comparison never normalizes a
+  # drive letter's OWN case, so a remote spelled with a lowercase drive
+  # against an uppercase-drive stateDir slipped past the pre-fix guard even
+  # though both spellings denote the exact same root.
+  let sd = "C:/state"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror",
+                                              url: "file://c:/state/cache/nested")])
+  let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = trackedRoots, foldProbe = forcedFpNoneProbe)
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a drive-letter case mismatch (c: vs C:) must be recognized as the " &
+                 "SAME root under fpNone -- drive-letter case is not a fold-policy question"
+
+block test_configured_cache_rejects_long_path_prefixed_root_under_any_policy:
+  # BUG1(b): a `\\?\`-prefixed spelling was never stripped by the raw
+  # `absolutePath`/`normalizedPath` pre-fix canonicalization -- fails open
+  # under ANY fold policy (fpNone included: the prefix alone, not case,
+  # defeats a byte comparison). Same drive-letter CASE on both sides, so
+  # this isolates the prefix-stripping fix from the drive-case fix above.
+  let sd = "C:/state"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror",
+                                              url: "file://" & "\\\\?\\C:\\state\\cache\\nested")])
+  let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = trackedRoots, foldProbe = forcedFpNoneProbe)
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a \\\\?\\-prefixed spelling of a path inside stateDir must be " &
+                 "rejected under fpNone (the prefix alone previously defeated the guard)"
+
+block test_configured_cache_rejects_file_uri_three_slash_drive_form:
+  # BUG1(c): the RFC-8089 standard 3-slash form (`file:///C:/...`) leaves an
+  # extra leading slash in front of the drive letter after the naive
+  # `"file://".len`-substring extraction -- `/C:/state/...` is not itself a
+  # legal drive-absolute spelling, so even a `nativeCanonicalize` swap alone
+  # (without a url-aware extraction) would misclassify it as POSIX-rooted.
+  let sd = "C:/state"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror",
+                                              url: "file:///C:/state/cache/nested")])
+  let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = trackedRoots, foldProbe = forcedFpNoneProbe)
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "the RFC-8089 3-slash file:///C:/... drive form must resolve to the " &
+                 "same drive-absolute path as file://C:/... and be rejected"
+
+block test_configured_cache_accepts_pathological_posix_single_letter_colon_dir:
+  # F30: the 3-slash drive heuristic above (a single ASCII letter immediately
+  # followed by `:`) must NOT fire for a top-level POSIX directory that only
+  # LOOKS like a one-letter drive spelling -- `file:///a:foo/x` is a real (if
+  # pathological) POSIX absolute path `/a:foo/x`, rooted at a directory
+  # literally named `a:foo`, not a Windows drive form. The distinguishing
+  # rule: a real drive spelling's `:` is always immediately followed by a
+  # separator or the end of the string (`/C:/...` or bare `/C:`); here the
+  # `:` is followed by `f` (part of the directory name), so the heuristic
+  # must leave the leading slash intact and this must stay POSIX-absolute
+  # -- unrelated to `stateDir`, so `configuredCache` must accept it.
+  let sd = freshStateDir14("f30_pathological_posix")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror",
+                                              url: "file:///a:foo/x")])
+  let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
+  var caught = false
+  var caughtMsg = ""
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = trackedRoots, foldProbe = forcedFpNoneProbe)
+  except CrisolError as e:
+    caught = true
+    caughtMsg = e.msg
+  assert not caught, "file:///a:foo/x is a real POSIX path (/a:foo/x, a directory " &
+                     "literally named 'a:foo') unrelated to stateDir '" & sd &
+                     "' -- must not be misparsed as a drive-absolute form and " &
+                     "rejected as inside stateDir; got: " & caughtMsg
+
+block test_configured_cache_uses_statedir_volume_policy_not_projects:
+  # BUG2: the project root is deliberately probed fpNone here (a distinct
+  # root from stateDir -- `CRISOL_STATE_DIR` redirecting the state dir onto
+  # its own, differently-folding mounted volume is `config.stateDirOf`'s
+  # documented use case) while `foldProbe` -- the policy for the volume
+  # `root`/`stateDir` actually live on -- is forced to fpAsciiLower.
+  # Pre-fix, the guard folded under `trackedRoots.project.foldPolicy`
+  # (fpNone here) and would have missed this case-variant nesting entirely
+  # (fail-OPEN); the fix must catch it via `foldProbe` instead.
+  let projectRoot = freshLocalFsRoot("bcacheguard_project")
+  let sd = freshStateDir14("bcacheguard_statedir_policy")
+  let flippedSd = sd.toUpperAscii()
+  let nested = flippedSd / "cache" / "nested"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)])
+  let trackedRoots = initTrackedRoots(projectRoot, @[], sd, probe = forcedFpNoneProbe)
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = trackedRoots, foldProbe = forcedFpAsciiLowerProbe)
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "the cache-recursion guard must fold under stateDir's OWN probed " &
+                 "policy, not an unrelated project root's -- a project probed fpNone " &
+                 "must not mask a case-variant remote on a folding stateDir volume"
+
+block test_configured_cache_fails_closed_on_statedir_probe_failure:
+  # BUG2's fail-closed pole: a GENUINE probe failure for stateDir's own
+  # volume must reject the remote outright, even a remote that is
+  # genuinely OUTSIDE stateDir and would be ALLOWED under any real policy
+  # -- the same "no policy to consult -> fail closed" pole the
+  # unpopulated/degraded `trackedRoots` check above already takes, now
+  # proven for this dedicated probe's own failure too.
+  let sd = freshStateDir14("bcacheguard_probefail")
+  let remoteRoot = freshLocalFsRoot("bcacheguard_probefail_remote")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)])
+  let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = trackedRoots, foldProbe = failingFoldProbe)
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+  assert caught, "a genuine stateDir-volume fold-policy probe failure must fail closed " &
+                 "and reject even a genuinely-outside file:// remote"
 
 block test_configured_cache_rejects_unresolvable_scheme:
   # RFC-0005 C3b registers "http"/"https"/"s3" too -- this now needs a

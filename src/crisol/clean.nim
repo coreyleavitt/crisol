@@ -195,11 +195,11 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   let binDeleted   = pruneDir(binParent,   expectedSlugs)
 
   # Step 4: GC depgraph entries.
-  # Build the currentKeys set as (ep.path, flagHash(ep.flags)) — the same
-  # key shape used by the depgraph (Table[(string, string), DepGraphEntry]).
+  # Build the currentKeys set as entryKey(ep.tp, ep.flags) — the same key
+  # shape used by the depgraph (Table[(string, string), DepGraphEntry]).
   var currentKeys = initHashSet[(string, string)]()
   for ep in eps:
-    currentKeys.incl (ep.tp.display(), flagHash(ep.flags))
+    currentKeys.incl entryKey(ep.tp, ep.flags)
 
   # Load the graph AS PERSISTED (issue #12): `loadDepGraph`'s freshness view
   # compares the stored header's nimVersion against a caller-supplied
@@ -222,13 +222,24 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   # fingerprint with whatever `loadStoredDepGraph` stamped an empty/discarded
   # load with, corrupting the freshness check the next `run` performs.
   #
+  # When a save DOES happen (gcCount > 0): `preserveHeaderRoots: true`
+  # (RFC-0009 wiring-audit fix) keeps `header.roots` exactly as loaded
+  # (STORED), never re-derived from `config.trackedRoots`. This GC pass
+  # never recomputed or validated any entry's closure against the current
+  # roots (that is the whole point of using `loadStoredDepGraph`, above),
+  # so re-stamping the header here would silently launder a renamed or
+  # removed dep root past the next `loadDepGraph`'s dgdRootUnknown/
+  # dgdFoldMismatch check — the same class of bug the nimVersion-freshness
+  # comment above already guards against, just for the `roots` field
+  # instead of `nimVersion`.
+  #
   # `dropped` (what the report claims) must reflect disk, not memory
   # (issue #13.3, D4): if the save itself fails, the on-disk graph is
   # unchanged, so the report must say 0 dropped rather than claim entries
   # were GC'd that are still sitting on disk.
   let dropped =
     if gcCount > 0:
-      (if saveDepGraph(graph, config): gcCount else: 0)
+      (if saveDepGraph(graph, config, preserveHeaderRoots = true): gcCount else: 0)
     else:
       0
 

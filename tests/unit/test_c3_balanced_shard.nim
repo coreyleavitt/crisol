@@ -41,12 +41,12 @@ proc ep(path: string): Entrypoint =
   testEp(path, group = "unit", flags = @[])
 
 proc epPaths(eps: seq[Entrypoint]): seq[string] =
-  eps.mapIt(it.tp.display())
+  eps.mapIt(string(it.tp.display()))
 
 proc pathSet(eps: seq[Entrypoint]): HashSet[string] =
   result = initHashSet[string]()
   for e in eps:
-    result.incl e.tp.display()
+    result.incl string(e.tp.display())
 
 proc durTable(pairs: openArray[(string, int64)]): Table[string, int64] =
   ## Build a duration table keyed by identity key string.
@@ -147,9 +147,9 @@ suite "balancedShardOf — completeness and disjointness":
     var counts = initCountTable[string]()
     for k in 1..n:
       for e in balancedShardOf(eps, k, n, dOf):
-        counts.inc(e.tp.display())
+        counts.inc(string(e.tp.display()))
     for e in eps:
-      check counts[e.tp.display()] == 1
+      check counts[string(e.tp.display())] == 1
 
 # ---------------------------------------------------------------------------
 # Suite: balancedShardOf — even split for equal durations

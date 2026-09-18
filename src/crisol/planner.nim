@@ -15,7 +15,7 @@
 ##   decideCompile*(...): (CompileDecision, string)
 ##   plan*(config, eps, graph, nimVersion, forceCompile): RunPlan
 
-import std/[algorithm, options, os, sequtils, sets, strutils, tables]
+import std/[algorithm, options, os, sets, strutils, tables]
 import std/cpuinfo
 import crisol/[types, config, depgraph, scheduler]
 
@@ -71,7 +71,7 @@ proc epSlug*(ep: Entrypoint; roots: TrackedRoots): string =
 
 proc binName*(ep: Entrypoint): string =
   ## Basename of the compiled binary (no extension).
-  ep.tp.display().extractFilename().changeFileExt("")
+  string(ep.tp.display()).extractFilename().changeFileExt("")
 
 proc binPath*(ep: Entrypoint; config: Config): string =
   ## Absolute path to the directory containing the stable compiled binary.
@@ -217,8 +217,7 @@ proc decideCompile*(ep: Entrypoint;
     else:
       return (cdNeverBuilt, "binary absent (first run or cache cleared)")
 
-  let fHash = flagHash(ep.flags)
-  let key = (ep.tp.display(), fHash)
+  let key = entryKey(ep.tp, ep.flags)
 
   if key notin graph.entries:
     return (cdStale, "no closure record in dep graph")
@@ -245,7 +244,7 @@ proc decideCompile*(ep: Entrypoint;
 
   for tp in entry.closure:
     if not fileExists(toNative(tp, roots)):
-      return (cdStale, "closure file missing: " & display(tp))
+      return (cdStale, "closure file missing: " & string(display(tp)))
 
   # Compute current content hash.
   var computedHash: string

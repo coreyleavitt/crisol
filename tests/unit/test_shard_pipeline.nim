@@ -56,7 +56,7 @@ proc makeConfig(root: string; globs: seq[string]): Config =
 
 proc pathsOf(pv: RunPlanView): seq[string] =
   ## Extract entrypoint paths from the plan view.
-  pv.plan.entrypoints.mapIt(it.ep.tp.display())
+  pv.plan.entrypoints.mapIt(string(it.ep.tp.display()))
 
 proc pathSetOf(pv: RunPlanView): HashSet[string] =
   result = initHashSet[string]()

@@ -71,7 +71,7 @@ proc failingRecordClosure(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## on-disk entry matches the stable binary, or there is no stable
   ## binary" invariant this test exercises.
   let fHash = flagHash(ep.flags)
-  graph.invalidateEntry(ep.tp.display(), fHash)
+  graph.invalidateEntry(string(ep.tp.display()), fHash)
   discard saveDepGraph(graph, config)
   (false, "injected recording failure")
 
@@ -89,7 +89,7 @@ suite "closure recording failure after a successful compile (issue #5)":
     let ep    = testEp("pass_always.nim", group = "default", flags = @[])
     check ep.tp.display().len > 0   # sanity: a real tag-0 tp, not the defensive zero value
     let fHash = flagHash(ep.flags)
-    let key   = (ep.tp.display(), fHash)
+    let key   = (string(ep.tp.display()), fHash)
 
     # Seed a FRESH-looking prior entry: an existing file, its current content
     # hash, current protocol major. Under the old writer this entry survived
@@ -100,8 +100,8 @@ suite "closure recording failure after a successful compile (issue #5)":
     # discard), never read back for content, so it just needs to be SOME
     # non-empty TrackedPath under the tracked project root.
     let seededClosure = [fromCanonical("bait.nim", cfg.trackedRoots).get].toHashSet
-    graph.updateEntry(ep.tp.display(), fHash, seededClosure,
-                      closureContentHash(@[(key: ep.tp.display(), nativePath: epNative)]),
+    graph.updateEntry(string(ep.tp.display()), fHash, seededClosure,
+                      closureContentHash(@[(key: string(ep.tp.display()), nativePath: epNative)]),
                       CrisolProtocolMajor)
     createDir(root / ".crisol")
     doAssert saveDepGraph(graph, cfg)
@@ -142,7 +142,7 @@ proc mockStoreOnlySeams(ms: MockCacheState): CacheSeams =
   ## is not plan-time cache-eligible); store is the seam under test.
   legacySeams(
     keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
-             SoundnessKey("mk-" & pep.ep.tp.display()),
+             SoundnessKey("mk-" & string(pep.ep.tp.display())),
     load = proc(key: SoundnessKey): Option[CachedResult] = none(CachedResult),
     store = proc(key: SoundnessKey; res: CachedResult): bool =
              inc ms.storeCalls; true,

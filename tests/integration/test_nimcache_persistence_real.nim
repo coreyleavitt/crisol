@@ -93,7 +93,7 @@ suite "nimcache-persistence — REUSE (real compile)":
 
     let toolchainFp = toolchainFingerprint("nim-test-v1", "cc-test-v1")
     let expectedCacheDir = cachePath(ep, cfg, toolchainFp)
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
 
     # initDepGraph (not emptyDepGraph, which stamps header.nimVersion = "")
     # so the graph's header matches the nimVersion given to plan()/execute()

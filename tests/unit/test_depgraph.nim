@@ -380,24 +380,33 @@ echo "PASS test_depgraph"
 # ---------------------------------------------------------------------------
 
 block test_format_version_pin:
-  ## DepGraphFormatVersion is 7 as of RFC-0009 W1 (wiring-audit fix): each
-  ## closure member is now serialized in its `paths.keyBytes` spelling
-  ## (`dep:<name>/<rel>` for a dep-root member) instead of a bare
-  ## `display(tp)` rel, so a dep-root member round-trips back to its OWN
-  ## root tag on load instead of being re-tagged as a phantom tag-0 project
-  ## path; the header's per-root `tag` column is dropped (nothing read it
-  ## back). A v6 (or older) graph's dep-root closure members are exactly
-  ## those phantom tag-0 spellings and cannot be re-attributed to their real
-  ## root after the fact, so it is discarded once.
-  ## (v6, RFC-0009 A3c-i: the header gained a `roots` descriptor — this
+  ## DepGraphFormatVersion is 8 as of RFC-0009 F13 (wiring-audit finding):
+  ## `entry.externals[].source`/`.headers` are now serialized in the SAME
+  ## portable `paths.keyBytes` spelling `entry.closure` members already use
+  ## (`dep:<name>/<rel>` for a dep-root source/header) instead of a
+  ## dep-root member spelling its absolute native path. A v7 (or older)
+  ## graph's dep-root externals are exactly those absolute-native spellings
+  ## and cannot be re-attributed to their portable form after the fact
+  ## (an absolute path no longer round-trips through `fromKeyBytes`), so it
+  ## is discarded once.
+  ## (v7, RFC-0009 W1: each closure member is now serialized in its
+  ## `paths.keyBytes` spelling (`dep:<name>/<rel>` for a dep-root member)
+  ## instead of a bare `display(tp)` rel, so a dep-root member round-trips
+  ## back to its OWN root tag on load instead of being re-tagged as a
+  ## phantom tag-0 project path; the header's per-root `tag` column is
+  ## dropped (nothing read it back). A v6 (or older) graph's dep-root
+  ## closure members are exactly those phantom tag-0 spellings and cannot
+  ## be re-attributed to their real root after the fact, so it was
+  ## discarded once.
+  ## v6, RFC-0009 A3c-i: the header gained a `roots` descriptor — this
   ## file's own local name->foldPolicy table — so a graph persisted under
   ## one root layout / fold policy is never silently reused under another.
   ## v5, issue #16: a {.compile.}d external's #include'd headers became
   ## tracked compile inputs recorded per-external in `externals`.)
   ## Bump this pin only together with a History entry in depgraph.nim and a
   ## CHANGELOG "BREAKING CHANGE — dependency graph format N" section.
-  assert DepGraphFormatVersion == 7,
-    "DepGraphFormatVersion pin: expected 7 (RFC-0009 W1), got " & $DepGraphFormatVersion
+  assert DepGraphFormatVersion == 8,
+    "DepGraphFormatVersion pin: expected 8 (RFC-0009 F13), got " & $DepGraphFormatVersion
 
   # A v4 graph on disk is treated as absent (discarded, not migrated).
   let root = getTempDir() / ("crisol_depgraph_v4pin_" & $getCurrentProcessId())

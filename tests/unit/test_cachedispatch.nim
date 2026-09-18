@@ -69,7 +69,7 @@ type Calls = object
   keyCalls:   int
   storeCalls: int
 
-proc legacyKey(pep: PlannedEntrypoint): SoundnessKey = SoundnessKey("k-" & pep.ep.tp.display())
+proc legacyKey(pep: PlannedEntrypoint): SoundnessKey = SoundnessKey("k-" & string(pep.ep.tp.display()))
 
 proc seamsHit(c: var Calls; cr: CachedResult): CacheSeams =
   let cp = addr c
@@ -102,7 +102,7 @@ proc seamsMissWithExplain(c: var Calls; explain: seq[KeyDiff]): CacheSeams =
   CacheSeams(
     keyOf: proc(pep: PlannedEntrypoint): KeyInputs =
              inc cp[].keyCalls
-             KeyInputs(argv: @[pep.ep.tp.display()]),
+             KeyInputs(argv: @[string(pep.ep.tp.display())]),
     load: proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
              inc cp[].loadCalls
              CacheLookup(hit: none(TierHit), verdicts: @[], explain: explain),
@@ -118,7 +118,7 @@ proc seamsMissWithVerdicts(c: var Calls; verdicts: seq[TierVerdict]): CacheSeams
   CacheSeams(
     keyOf: proc(pep: PlannedEntrypoint): KeyInputs =
              inc cp[].keyCalls
-             KeyInputs(argv: @[pep.ep.tp.display()]),
+             KeyInputs(argv: @[string(pep.ep.tp.display())]),
     load: proc(pep: PlannedEntrypoint; d: KeyDerivation): CacheLookup =
              inc cp[].loadCalls
              CacheLookup(hit: none(TierHit), verdicts: verdicts),

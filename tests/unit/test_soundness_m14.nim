@@ -46,7 +46,7 @@ block test_m14_untracked_file_included:
   assert expected.isSome, "M14: precondition: path must reduce cleanly"
   assert expected.get in changed,
     "M14: untracked new file must appear in changedFiles. Got: " &
-    $(changed.mapIt(it.display))
+    $(changed.mapIt(string(it.display)))
 
 block test_m14_gitignored_file_not_included:
   ## An untracked file that matches .gitignore must NOT be included.
@@ -67,7 +67,7 @@ block test_m14_gitignored_file_not_included:
   let changed = changedFiles(repoDir, roots)
   assert not changed.anyIt(it.display == "temp.tmp"),
     "M14: gitignored untracked file must NOT appear in changedFiles. Got: " &
-    $(changed.mapIt(it.display))
+    $(changed.mapIt(string(it.display)))
 
 block test_m14_tracked_modified_file_still_included:
   ## Regression: tracked files that are modified still appear.
@@ -84,7 +84,7 @@ block test_m14_tracked_modified_file_still_included:
   assert expected.isSome, "M14: precondition: 'README.md' must reduce cleanly"
   assert expected.get in changed,
     "M14: modified tracked file must still appear in changedFiles. Got: " &
-    $(changed.mapIt(it.display))
+    $(changed.mapIt(string(it.display)))
 
 block test_m14_clean_repo_no_phantom_untracked:
   ## A completely clean repo with no untracked files → changedFiles is empty.
@@ -97,7 +97,7 @@ block test_m14_clean_repo_no_phantom_untracked:
   # Only README.md is committed and unchanged; no untracked files.
   assert not changed.anyIt(it.display == "README.md"),
     "M14: clean tracked file must not appear as changed. Got: " &
-    $(changed.mapIt(it.display))
+    $(changed.mapIt(string(it.display)))
 
 block test_p2_dash_ref_rejected_before_git_invocation:
   ## P2: a --base ref beginning with '-' must be rejected with cekEnvironment

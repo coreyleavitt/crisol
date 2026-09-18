@@ -89,7 +89,7 @@ suite "skip-fresh — compile avoidance integration":
     # an entry for this ep.
     let graphAfter = loadDepGraph(cfg, "")
     let fHash = flagHash(ep.flags)
-    let key = (ep.tp.display(), fHash)
+    let key = (string(ep.tp.display()), fHash)
     check key in graphAfter.entries
 
   test "run 2: binary present, graph fresh → cdSkipFresh, compileSkipped=true, oPassed":
@@ -112,7 +112,7 @@ suite "skip-fresh — compile avoidance integration":
     # Run 2: load saved graph, plan should give cdSkipFresh.
     let graph2 = loadDepGraph(cfg, "")
     let fHash = flagHash(ep.flags)
-    check (ep.tp.display(), fHash) in graph2.entries
+    check (string(ep.tp.display()), fHash) in graph2.entries
 
     var graph2Mut = graph2
     let p2 = plan(cfg, @[ep], graph2Mut, "", false)

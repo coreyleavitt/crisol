@@ -95,7 +95,7 @@ switch("path", thisDir())
     check results.len == 1
     check results[0].outcome == oPassed
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure
@@ -148,7 +148,7 @@ doAssert xValue() == 5
     check results.len == 1
     check results[0].outcome == oPassed
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure
@@ -210,7 +210,7 @@ doAssert depValue() == 7
       echo "trigger B compile/run output:\n", results[0].output
     check results[0].outcome == oPassed
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure
@@ -289,7 +289,7 @@ doAssert depValue() == 7
       echo "trigger C observed mangled dep entry: ", mangledSeen
       check sawMangledDep
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure
@@ -346,7 +346,7 @@ doAssert libValue() == 9
       echo "untracked-decoy compile/run output:\n", results[0].output
     check results[0].outcome == oPassed
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure
@@ -401,7 +401,7 @@ doAssert helperValue() == 11
       echo "symlinked-entrypoint-file compile/run output:\n", results[0].output
     check results[0].outcome == oPassed
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     # If recordClosure failed (e.g. closureContentHash raised on the bogus
     # "tests/helper.nim"), the entry is invalidated and removed — its
@@ -456,7 +456,7 @@ doAssert fooValue() == 42
       echo "symlinked-entrypoint-dir compile/run output:\n", results[0].output
     check results[0].outcome == oPassed
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure
@@ -509,7 +509,7 @@ doAssert sibValue() == 7
       echo "symlinked-projectRoot compile/run output:\n", results[0].output
     check results[0].outcome == oPassed
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure
@@ -589,7 +589,7 @@ doAssert depValue() == 7
           mangledSeen = base
       echo "dotdir-deep observed mangled dep entry: ", mangledSeen
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure
@@ -646,7 +646,7 @@ doAssert depValue() == 7
           mangledSeen = base
       echo "dotdir-shallow observed mangled dep entry: ", mangledSeen
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
     check key in loaded.entries
     let closure = loaded.entries[key].closure

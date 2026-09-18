@@ -6,6 +6,103 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### BREAKING CHANGE — dependency graph format 8: `{.compile.}`d-external source/header spellings are now portable, never a machine-local absolute path; one-time full recompile (RFC-0009 wiring-audit F13)
+
+**Prior behaviour:** RFC-0009 moved closure-member path identity onto
+`TrackedPath`/`keyBytes` (portable, root-tagged, machine-independent)
+everywhere except the `{.compile.}`d-externals surface (issue #16
+lineage): `ExternalSource.source`/`.headers` spelled a dep-root member as
+its ABSOLUTE NATIVE path (`closureMemberSpelling`'s pre-fix `toNative`
+branch), while a project member spelled project-relative. `ExternalSource.
+headersHash` and the `carriedBySource` carry-forward table therefore keyed
+on that machine-local absolute path, so relocating the checkout (or a dep
+root) silently invalidated carry-forward and forced recompilation;
+`depgraph`'s M10 load guard re-implemented its own root-membership check
+(`underRootNorm`) against these raw strings instead of reusing `classify`;
+and `depgraph.toJson` sorted the externals array by raw
+`cmp(a.source, b.source)` — host-dependent ordering on the wire (never
+unsound — no key/hash consumed the order — but inconsistent with RFC-0009
+§4's "cmpKeyBytes is the only order" invariant).
+
+**New behaviour:** every tracked member — project AND dep-root alike —
+now spells via `paths.keyBytes` end to end: `closureMemberSpelling`
+(`closure.nim`), `ExternalSource.source`/`.headers`, `headersHash`'s
+chained key, `carriedBySource` keying, `depgraph`'s persist/load and its
+`staleExternalObjects` header-staleness read (now takes `TrackedRoots`
+instead of a bare `projectRoot` string), and the M10 load guard (which now
+validates a source/header spelling via `fromKeyBytes` — the SAME
+grammar-inverse `entry.closure` members already use — rather than
+`underRootNorm`'s absolute/relative-native-path assumption). A native path
+is recovered via `fromKeyBytes`->`toNative` strictly at the point of I/O
+(a `cc -M` probe's/`staleExternalObjects`' content read) — never
+persisted. `depgraph.toJson`'s externals sort is unchanged in code
+(`cmp(a.source, b.source)`) but is now PROVABLY the sanctioned
+`cmpKeyBytes` byte order, since `a.source`/`b.source` already ARE the
+`keyBytes` strings. A format-7 (or older) graph's dep-root externals
+cannot be reattributed to their portable spelling after the fact (an
+absolute native path no longer round-trips through `fromKeyBytes`), so
+such a graph is discarded once, triggering a single full recompile.
+
+`tests/unit/test_rfc9_golden_pin.nim`'s existing pins do not touch
+`ExternalSource` (its depRoot vector only exercises `extractClosure`, not
+`extractCompileInputs`) and are unaffected; `tests/unit/test_depgraph.nim`'s
+`DepGraphFormatVersion` pin and `tests/unit/test_issue16_unit.nim`'s
+dep-root-header vector's `headersHash`/`.headers` pins legitimately change
+to the new portable spelling and were updated deliberately. New
+unit-level coverage (`tests/unit/test_rfc9_f13_externals_portability.nim`)
+proves the same logical closure, built under two different absolute
+project roots, produces byte-identical persisted `source`/`headers`
+spellings and `headersHash` inputs — the property this fix exists to
+establish.
+
+### Fixed — dep-root name validation now rejects an empty explicit `name=""` (RFC-0009 wiring-audit)
+
+`dep-roots "vendor/foo" name=""` used to pass config validation and
+collide with the RESERVED `""` name `paths.nim` reserves for the project
+root itself: `keyBytes` would emit an unparseable `dep:/rel` for a member
+under such a root, the depgraph header would persist two `name: ""`
+entries, and `loadDepGraph`'s root-name resolution would silently apply
+the PROJECT root's fold policy to the dep root instead of its own. An
+empty `name=` is now rejected with `cekConfig`, same as the existing `/`
+and `:` rejections.
+
+### Fixed — the `dep:` cache-key escape is now injective for every pathological tag-0 spelling, not just well-formed ones (RFC-0009 wiring-audit)
+
+`paths.looksLikeDepEscape` only escaped a tag-0 rel whose first path
+segment matched the strict `dep:[^/:]+` shape, deliberately skipping a
+first segment that was bare `dep:` (empty "name" half) or contained a
+`:` after `dep:` (e.g. `dep:a:b`). `paths.fromKeyBytes`, however, routes
+ANY string starting `"dep:"` into its dep-root arm and returns `none` on
+a shape failure, with no fallback to a tag-0 reparse. A real tag-0 file
+under a directory literally named `dep:` or `dep:a:b` (legal on ext4)
+therefore round-tripped through `keyBytes` → a persisted depgraph closure
+→ `fromKeyBytes` as `none` and was silently dropped from the closure —
+unsound under-selection, never a crash. `looksLikeDepEscape` now escapes
+ANY tag-0 rel whose first segment merely starts with `dep:`, so these
+spellings round-trip through the existing `./` escape exactly like the
+well-formed `dep:foo` case always did. Not a depgraph format bump: no
+previously-persisted bytes change meaning (a bare, unescaped `"dep:"`
+with an empty or colon-bearing name half never round-tripped correctly
+before this fix either, so nothing valid regresses) — see the
+`DepGraphFormatVersion` doc comment (`depgraph.nim`) for the full call.
+
+### Fixed — `crisol clean` no longer re-stamps the depgraph header's `roots` from the current config, closing a dep-root-rename soundness hole (RFC-0009 wiring-audit)
+
+`saveDepGraph` unconditionally re-derived `header.roots` from the CURRENT
+`config.trackedRoots` on every save — including `crisol clean`'s GC-only
+save path, which never recomputes or validates any entry's closure
+against the current roots. A dep-root rename followed by a `clean` that
+happened to GC any unrelated stale entrypoint would therefore silently
+re-stamp the header to name the NEW root, permanently erasing the
+mismatch signal `loadDepGraph`'s `dgdRootUnknown` check exists to catch
+— the next real run would trivially pass that check and drive
+`--changed` selection off a closure quietly truncated by the rename
+(unsound under-selection). `saveDepGraph` gains a `preserveHeaderRoots`
+parameter (default `false`, unchanged behavior for the real run/compile
+path); `clean.cleanOrphans` now passes `true`, preserving the STORED
+header verbatim so a renamed root is correctly caught — and the whole
+graph discarded — on the very next `loadDepGraph`.
+
 ### BREAKING CHANGE — dependency graph format 7: dep-root closure members' persistence spelling is fixed; one-time full recompile (RFC-0009 wiring-audit W1)
 
 **Prior behaviour:** a dependency-graph closure member under a configured

@@ -121,9 +121,49 @@ proc buildBackend*(reg: BackendRegistry; tier: RemoteTier; token: string): Optio
   else:
     none(CacheBackend)
 
+proc fileUrlPath(url: string): string =
+  ## RFC-0009 B-cacheguard: url-aware `file://` path extraction, replacing
+  ## the naive `url["file://".len .. ^1]` substring this factory and
+  ## `configuredCache`'s cache-recursion guard used to do independently
+  ## (and identically wrong). Handles the two `file://` spellings a
+  ## configured url may use for a Windows-drive path: the bare,
+  ## authority-less form (`file://C:/state/x`, tail already
+  ## drive-absolute) and RFC 8089's standard 3-slash form (`file:///C:/
+  ## state/x`) — that form's empty authority leaves the tail `/C:/state/x`
+  ## after stripping `"file://"`, which is NOT itself a legal
+  ## drive-absolute spelling: `nativeCanonicalize` would read the leading
+  ## `/` as a POSIX root and "C:" as a literal directory name. That one
+  ## extra slash is stripped here, once, so every caller sees the same
+  ## canonical shape `nativeCanonicalize` expects regardless of which
+  ## spelling the operator typed. A plain POSIX tail (`/tmp/x`) is
+  ## unaffected: the strip only fires when a single ASCII letter is
+  ## immediately followed by `:`, AND that colon is immediately followed
+  ## by a separator or end-of-string (`/C:/...` or the bare `/C:`) — a
+  ## real drive spelling always has exactly that shape. Without the
+  ## trailing-separator-or-end check, a pathological but legal POSIX path
+  ## whose top-level directory happens to be named with a single letter
+  ## plus a colon (`file:///a:foo/x`, a real directory literally named
+  ## `a:foo`) would misparse as a drive form and lose its leading slash;
+  ## requiring the colon to terminate the "drive" token keeps that path
+  ## POSIX-absolute (`/a:foo/x`), unaffected.
+  ##
+  ## No percent-decoding: nothing else in this module decodes a configured
+  ## url (`splitS3Url`, below, splits `s3://` on the raw bytes) and a
+  ## `url` is typed KDL text, not a program-generated URI — adding
+  ## decoding only for `file://` would be an inconsistent, unrequested
+  ## scope expansion on top of the two verified bugs this proc exists to
+  ## fix.
+  assert url.startsWith("file://")
+  let tail = url["file://".len .. ^1]
+  if tail.len >= 3 and tail[0] == '/' and tail[1] in {'a'..'z', 'A'..'Z'} and
+     tail[2] == ':' and (tail.len == 3 or tail[3] == '/'):
+    tail[1 .. ^1]
+  else:
+    tail
+
 proc fileBackendFactory(tier: RemoteTier; token: string): CacheBackend =
   discard token  # file:// has no credential axis
-  let root = tier.url["file://".len .. ^1]
+  let root = fileUrlPath(tier.url)
   localFsBackend(root, autoCreate = false, maxEntries = 0)
 
 proc splitS3Url(url: string): tuple[bucket, prefix: string] =
@@ -385,31 +425,71 @@ proc localOnlyCache*(stateDir: string; maxEntries: int): CacheRuntime =
     localRoot: root,
   )
 
-proc rootInsideStateDir(root, stateDir: string; foldPolicy: FoldPolicy): bool =
+proc rootInsideStateDir(root, stateDir: string;
+                         probe: FoldProbe = probeFoldPolicy): bool =
   ## `root` (a configured `file://` remote's directory) resolves equal to,
   ## or nested under, `stateDir` — RFC-0005 "Local-fs root": such a tier
   ## would recurse the L1 cache (`clean.nim`'s `pruneDir` walks the whole
   ## `stateDir`, not just `stateDir/cache`, so ANY location inside it is
-  ## fair game for pruning). Absolute + normalized on both sides so a
-  ## relative config value and trailing separators cannot dodge the check.
+  ## fair game for pruning).
   ##
-  ## RFC-0009 A5c: BOTH sides are folded under `foldPolicy` (`paths.fold` —
-  ## the SAME helper `TrackedPath`'s own `==`/`hash` use) before comparing —
-  ## fixing a fail-*OPEN* bug in the previous raw-byte comparison: on a
-  ## case-insensitive/folding volume, a remote spelled with a different
-  ## case than `stateDir` (e.g. `STATEDIR/x` vs. configured `statedir`)
-  ## would not `startsWith` under a byte comparison, so the check passed
-  ## and a cache-recursing remote was wrongly ALLOWED. Under `fpNone`
-  ## (case-sensitive volume — the default), `fold(s, fpNone) == s`, so this
-  ## is byte-identical to the pre-fix behavior.
-  let a = fold(normalizedPath(absolutePath(root)), foldPolicy)  # canon-ok: A5c rootInsideStateDir fold-routed canonicalization
-  let b = fold(normalizedPath(absolutePath(stateDir)), foldPolicy)  # canon-ok: A5c rootInsideStateDir fold-routed canonicalization
+  ## RFC-0009 A5c: BOTH sides are folded under a probed `FoldPolicy`
+  ## (`paths.fold` — the SAME helper `TrackedPath`'s own `==`/`hash` use)
+  ## before comparing — fixing a fail-*OPEN* bug in the original raw-byte
+  ## comparison: on a case-insensitive/folding volume, a remote spelled
+  ## with a different case than `stateDir` would not `startsWith` under a
+  ## byte comparison, so the check passed and a cache-recursing remote was
+  ## wrongly ALLOWED.
+  ##
+  ## RFC-0009 B-cacheguard (BUG1): canonicalizes BOTH operands through
+  ## `paths.nativeCanonicalize` — never the raw stdlib `absolutePath`/
+  ## `normalizedPath` A5c used — before folding. The raw-stdlib form
+  ## normalizes neither a Windows drive letter's CASE nor a leading
+  ## `\\?\` long-path prefix, so either spelling difference alone defeated
+  ## the fold-routed comparison even after A5c's fix (a fold fix alone is
+  ## insufficient without also fixing the canonicalizer). `isUnderRoot`
+  ## already treats `a == b` as "inside" (a remote rooted exactly AT
+  ## `stateDir` is recursion too, not merely nesting) — preserved
+  ## unchanged here.
+  ##
+  ## RFC-0009 B-cacheguard (BUG2): the fold policy is probed HERE, fresh,
+  ## for `stateDir`'s OWN volume, via `probe` (defaults to the real
+  ## per-volume `paths.probeFoldPolicy`; a test injects a forced policy
+  ## through the same `FoldProbe` seam `initTrackedRoots` uses) — never a
+  ## policy borrowed from some OTHER tracked root (e.g. the project's).
+  ## `root`/`stateDir` live on `stateDir`'s volume (`CRISOL_STATE_DIR`
+  ## redirection to a mounted volume, distinct from the project's own, is
+  ## a documented use case — config.nim's `stateDirOf`), which the
+  ## PROJECT's probed policy has no authority to describe: folding under
+  ## the wrong volume's policy is fail-OPEN one direction (case-sensitive
+  ## project, case-insensitive cache volume) or a spurious fail-CLOSED the
+  ## other. A genuine probe failure here fails CLOSED (`true` — "treat as
+  ## inside", i.e. reject the remote) — the same pole `configuredCache`'s
+  ## own unpopulated/degraded check already takes; there is no policy
+  ## under which guessing is safe.
+  ##
+  ## RFC-0009 F31: routed through `paths.memoizedProbe` rather than calling
+  ## `probe` directly — `configuredCache` (this proc's only caller) probes
+  ## `stateDir` fresh on every invocation (once per configured `file://`
+  ## remote in a run with several), and `memoizedProbe` already gives
+  ## `initTrackedRoots` a per-process, per-root memo for exactly this real
+  ## probe cost. Safe to share: `memoizedProbe` bypasses (never reads, never
+  ## writes) its memo for any non-default `probe`, so an injected test probe
+  ## here still runs fresh every call, same as before — only the REAL
+  ## `probeFoldPolicy` path is now memoized.
+  let policyOpt = memoizedProbe(stateDir, stateDir, probe)
+  if policyOpt.isNone:
+    return true
+  let foldPolicy = policyOpt.get
+  let a = fold(nativeCanonicalize(root, stateDir).path, foldPolicy)      # canon-ok: RFC-0009 B-cacheguard rootInsideStateDir fold-routed canonicalization
+  let b = fold(nativeCanonicalize(stateDir, stateDir).path, foldPolicy)  # canon-ok: RFC-0009 B-cacheguard rootInsideStateDir fold-routed canonicalization
   isUnderRoot(a, b)
 
 proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
                       reg: BackendRegistry; secrets: CacheSecrets;
                       sink: TelemetrySink[TelemetryEvent];
-                      trackedRoots: TrackedRoots = TrackedRoots()): CacheRuntime =
+                      trackedRoots: TrackedRoots = TrackedRoots();
+                      foldProbe: FoldProbe = probeFoldPolicy): CacheRuntime =
   ## RFC-0005 A3c-ii/C4: build the run's `TieredCache` from parsed KDL
   ## (`CacheConfig.remotes` — `types.RemoteTier` — and, since C4,
   ## `CacheConfig.trust` — `types.TrustConfig`), via `reg` (scheme ->
@@ -433,11 +513,20 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
   ##   - a remote named `"l1"` — reserved for the pinned local tier.
   ##   - a `file://` root that resolves inside `stateDir` (`clean` would
   ##     prune it out from under a live remote — see `rootInsideStateDir`).
-  ##     **RFC-0009 A5c:** the comparison is folded under
-  ##     `trackedRoots.project.foldPolicy` — the SAME per-volume policy
-  ##     `TrackedPath`'s own identity uses — so a case-variant remote path
-  ##     inside `stateDir` on a folding volume is caught too (pre-A5c this
-  ##     was a raw byte comparison: fail-*open* on such a volume). `config.
+  ##     **RFC-0009 A5c:** the comparison is folded under a probed
+  ##     `FoldPolicy` — the SAME per-volume-fold mechanism `TrackedPath`'s
+  ##     own identity uses — so a case-variant remote path inside
+  ##     `stateDir` on a folding volume is caught too (pre-A5c this was a
+  ##     raw byte comparison: fail-*open* on such a volume). **RFC-0009
+  ##     B-cacheguard:** that policy is `foldProbe`'d fresh for
+  ##     `stateDir`'s OWN volume (default: the real `paths.probeFoldPolicy`
+  ##     — override with a forced policy exactly as `initTrackedRoots`'s
+  ##     `FoldProbe` seam does), never `trackedRoots.project.foldPolicy` —
+  ##     the project and the configured state dir can sit on DIFFERENT
+  ##     volumes (`CRISOL_STATE_DIR` redirection — `config.stateDirOf`), so
+  ##     the project's own policy has no authority over this comparison; see
+  ##     `rootInsideStateDir`'s own doc comment for the fail-open/fail-closed
+  ##     directions a wrong-volume policy risks. `config.
   ##     loadConfig` always populates `trackedRoots` (RFC-0009 A2) for a
   ##     real run; `trackedRoots` defaults to the zero value here ONLY for
   ##     a caller that builds a `CacheConfig` by hand and skips that (a
@@ -569,7 +658,7 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
         "of it (read-side spoofing/MITM)")
 
     if remote.url.startsWith("file://"):
-      let fsRoot = remote.url["file://".len .. ^1]
+      let fsRoot = fileUrlPath(remote.url)
       # RFC-0009 A5c: fail CLOSED when there is no probed fold policy to
       # consult (`trackedRoots` unpopulated -- see this proc's own doc
       # comment) -- reject unconditionally rather than risk an under-fold
@@ -580,10 +669,14 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
       # fallback), that `fpNone` is a placeholder chosen to avoid aliasing,
       # not a probed answer for THIS root -- trusting it here to admit a
       # `file://` remote would risk the exact under-fold this reject exists
-      # to prevent, so a degraded run rejects unconditionally too.
+      # to prevent, so a degraded run rejects unconditionally too. This
+      # gate is about `trackedRoots`' OWN health (unrelated roots' probes)
+      # -- orthogonal to, and defense-in-depth on top of, `rootInsideStateDir`'s
+      # own independent fail-closed-on-probe-failure (RFC-0009 B-cacheguard,
+      # BUG2) for `stateDir`'s specific volume below.
       let insideStateDir =
         if not populated(trackedRoots) or trackedRoots.degraded: true
-        else: rootInsideStateDir(fsRoot, stateDir, trackedRoots.project.foldPolicy)
+        else: rootInsideStateDir(fsRoot, stateDir, foldProbe)
       if insideStateDir:
         raise newCrisolError(cekConfig,
           "config: remote-cache '" & remote.name & "': url '" & remote.url &

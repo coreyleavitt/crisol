@@ -878,7 +878,7 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
     # worker consumes a plain path and reconstructs its own TrackedPath, see
     # measureworker.nim). This preserves the collision with
     # appendAttemptRow's identityKey(ep, roots) noted above.
-    entrypointPath:    ep.tp.display(),
+    entrypointPath:    string(ep.tp.display()),
     entrypointAbsPath: epAbs,
     flags:             ep.flags,
     nimcacheDir:       cacheDir,
@@ -942,9 +942,9 @@ proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
   ## that cannot be evicted must never be linked into a binary crisol then
   ## reports on. `removeFile` on an already-absent object is a no-op, so
   ## only a genuinely broken state directory reaches this path.
-  let key = (ep.tp.display(), flagHash(ep.flags))
+  let key = entryKey(ep.tp, ep.flags)
   if key in graph.entries:
-    for obj in staleExternalObjects(graph, ep.tp.display(), ep.flags, config.projectRoot):
+    for obj in staleExternalObjects(graph, string(ep.tp.display()), ep.flags, config.trackedRoots):
       removeFile(cacheDir / obj)
   elif hadPriorContent:
     for kind, path in walkDir(cacheDir):
@@ -986,7 +986,7 @@ proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string):
     # way; discard it so the next run starts from cdNeverBuilt instead of
     # trusting it. Not exercisable under test as root (chmod-based faults
     # do not fail for root); this is untested hardening.
-    stderr.write("crisol: warning: " & ep.tp.display() &
+    stderr.write("crisol: warning: " & string(ep.tp.display()) &
                  ": could not promote its compiled binary (" &
                  e.msg & "); the previous binary was discarded\n")
     try: stderr.flushFile() except CatchableError: discard
@@ -2020,7 +2020,7 @@ proc execute*(
                     # whose decideCompile can no longer be trusted to agree
                     # with it (issue #13.3).
                     try: removeFile(stableBin) except CatchableError: discard
-                    stderr.write("crisol: warning: " & ep.tp.display() & ": could not record its " &
+                    stderr.write("crisol: warning: " & string(ep.tp.display()) & ": could not record its " &
                                  "source closure (" & slotClosureError & "); dependency record " &
                                  "invalidated and its binary was discarded — it will be " &
                                  "recompiled and force-selected next run\n")
@@ -2308,7 +2308,7 @@ proc execute*(
               for s in slots:
                 if s.state == ssLive:
                   let elapsed = int64((nowProgress - s.t0) * 1000)
-                  inFlight.add (p.entrypoints[s.pepIdx].ep.tp.display(), elapsed)
+                  inFlight.add (string(p.entrypoints[s.pepIdx].ep.tp.display()), elapsed)
               # M4: compute whether the mem-throttle signal should appear.
               let showThrottle = memThrottleActive(throttledSince, getMonoTime(),
                                                    MemThrottleSignalMs)

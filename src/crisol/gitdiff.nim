@@ -225,8 +225,23 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
       @["ls-files", "-z", "--others", "--exclude-standard"],
       workingDir = projectRoot)
   except:
-    # Best-effort: if ls-files fails for any reason, ignore (safe: over-selection
-    # is not possible here; we just miss some untracked files).
+    # Best-effort, but the risk here must be named honestly: if ls-files
+    # fails for any reason, this is exactly the M14 UNDER-selection this
+    # second invocation exists to close, not a harmless "over-selection is
+    # not possible" no-op -- a newly created, not-yet-`git add`-ed source
+    # file that a change now depends on silently drops out of the changed
+    # set, and `--changed` can then skip the entrypoint that needs it.
+    # Surfaced directly to stderr (this module has no `ConfigWarning` sink:
+    # `changedFiles` runs well before `pipeline.buildRunPlan` assembles that
+    # channel, and retyping this proc's return to carry one would ripple
+    # through its dozen-plus existing test call sites for a Low-severity
+    # diagnostic -- see api.nim's parallel "crisol: warning: ..." stderr
+    # convention for other non-fatal, no-sink-available diagnostics, e.g.
+    # `runTestsWith`'s `--verify-cache` warnings).
+    stderr.write("crisol: warning: `git ls-files --others --exclude-standard` " &
+                 "failed; untracked (not-yet-added) changed files may be " &
+                 "missing from this --changed run's changed set\n")
+    try: stderr.flushFile() except CatchableError: discard
     untrackedCode = -1
 
   if untrackedCode == 0:

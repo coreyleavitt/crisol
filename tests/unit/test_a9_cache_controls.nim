@@ -71,7 +71,7 @@ proc seamsHit(c: var Calls; cr: CachedResult): CacheSeams =
   let cp = addr c
   legacySeams(
     keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
-             inc cp[].keyCalls; SoundnessKey("k-" & pep.ep.tp.display()),
+             inc cp[].keyCalls; SoundnessKey("k-" & string(pep.ep.tp.display())),
     load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls; some(cr),
     store = proc(key: SoundnessKey; res: CachedResult): bool =
@@ -82,7 +82,7 @@ proc seamsMiss(c: var Calls): CacheSeams =
   let cp = addr c
   legacySeams(
     keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
-             inc cp[].keyCalls; SoundnessKey("k-" & pep.ep.tp.display()),
+             inc cp[].keyCalls; SoundnessKey("k-" & string(pep.ep.tp.display())),
     load = proc(key: SoundnessKey): Option[CachedResult] =
              inc cp[].loadCalls; none(CachedResult),
     store = proc(key: SoundnessKey; res: CachedResult): bool =

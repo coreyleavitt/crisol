@@ -909,8 +909,37 @@ type
     ## A selected entrypoint annotated with why it was included.
 
   ConfigWarning* = object
-    ## A diagnostic emitted when an unrecognized key is found in the config
-    ## file.  The human message is composed once at the warning site so neither
+    ## The structured, non-fatal run-advisory channel: a diagnostic worth
+    ## surfacing (stderr AND the `--json` `warnings` array) without failing
+    ## the run outright. Originally just "unrecognized config key"; now
+    ## shared by several unrelated producers, all through this same shape
+    ## because `source`/`context`/`key`/`message` are generic enough to carry
+    ## any resolved-config-or-runtime fact, not only a config-file-parse one
+    ## (see api.nim's `measure-compile-reuse` comment for the precedent this
+    ## set). Current producers (grep `ConfigWarning(` / `makeConfigWarning(`
+    ## for the exact call sites, which drift):
+    ##   - **Unrecognized/invalid config keys** (`config.nim`, `makeConfigWarning`
+    ##     + the inline `verify-trust` advisory) — the original, still-primary
+    ##     use: an unknown KDL node name, or an accepted-but-notable config
+    ##     shape (e.g. an `https://` remote trusted only by TLS, `cache-trust
+    ##     policy "none"`).
+    ##   - **Depgraph discard** (`pipeline.nim`'s `buildRunPlan`, `context:
+    ##     "depgraph"`) — the persisted dep graph was discarded whole
+    ##     (nimVersion/formatVersion/fold-policy mismatch, or an
+    ##     unreadable/malformed file); `depgraph.nim`'s `key`/`message` procs
+    ##     are the single formatting authority for this fact.
+    ##   - **Fold-lever advisory** (`pipeline.nim`'s `buildRunPlan`, `context:
+    ##     "changed-set-fold"`) — a non-ASCII name in the `--changed` changed
+    ##     set, on a config where some tracked root actively folds, distrusted
+    ##     the ASCII-only fold and fell back to the full discovered set for
+    ##     this run (RFC-0009 "Risks accepted", NFC/NFD bullet).
+    ##   - **Measure-compile-reuse with no worker binary** (`api.nim`'s
+    ##     `runTestsWith`, `context: "measure-compile-reuse"`) — an explicit
+    ##     `--measure-compile-reuse` request silently degrades to the
+    ##     monolithic compile path when no worker binary is configured; this
+    ##     makes that degradation visible to a `--json` consumer whose stderr
+    ##     is swallowed, not only to `runner.nim`'s one-shot stderr write.
+    ## The human `message` is composed once at the warning site so neither
     ## the CLI (stderr) nor the JSON schema need to duplicate the formatting.
     source*:  string   ## config file path; "" = convention fallback
     context*: string   ## "top-level" or the group name

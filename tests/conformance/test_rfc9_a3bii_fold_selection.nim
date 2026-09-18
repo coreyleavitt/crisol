@@ -275,7 +275,7 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   check fromCanonical("tests/unit/widget.nim", cfg.trackedRoots).get in persistedClosure
 
   var changedDisplays = initHashSet[string]()
-  for c in changed: changedDisplays.incl c.display
+  for c in changed: changedDisplays.incl string(c.display)
 
   # --- MANDATORY NEGATIVE CONTROL — asserted BEFORE the selection assertion ---
   echo "RFC9-A3BII NEGATIVE CONTROL: persisted graph closure member (raw) = 'tests/unit/widget.nim'"
@@ -290,7 +290,7 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault),
                         useChanged = true, changed = changed,
                         nimVersion = nimVersion)
-  let selectedPaths = pv.plan.entrypoints.mapIt(it.ep.tp.display())
+  let selectedPaths = pv.plan.entrypoints.mapIt(string(it.ep.tp.display()))
   check "tests/unit/test_dependent.nim" in selectedPaths
   check "tests/unit/test_independent.nim" notin selectedPaths
 

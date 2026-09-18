@@ -122,7 +122,7 @@ block test_m9_valid_repo_works:
   assert readme.isSome, "M9: precondition: 'README.md' must reduce cleanly"
   assert readme.get in changed,
     "M9: modified tracked file must appear in changedFiles as a TrackedPath. Got: " &
-    $(changed.mapIt(it.display))
+    $(changed.mapIt(string(it.display)))
 
 # ---------------------------------------------------------------------------
 # M9 test 5 (RFC-0009 A3b-i): -z NUL-separated output survives a non-ASCII
@@ -152,6 +152,6 @@ block test_m9_nonascii_name_survives_quotepath:
   assert expected.isSome, "M9: precondition: non-ASCII name must reduce cleanly"
   assert expected.get in changed,
     "M9: non-ASCII name must survive -z output undistorted. Got: " &
-    $(changed.mapIt(it.display))
+    $(changed.mapIt(string(it.display)))
 
 echo "PASS test_soundness_m9"

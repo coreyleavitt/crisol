@@ -98,7 +98,13 @@
 ## reported 0 dropped on every real graph. `loadStoredDepGraph` sidesteps
 ## the whole problem: it never compares versions, so a clean cannot discard
 ## a real graph, and its save path (see `clean.nim`) never rewrites the
-## header.
+## header — `cleanOrphans` passes `saveDepGraph`'s `preserveHeaderRoots:
+## true` for exactly this reason (RFC-0009 wiring-audit fix: this contract
+## used to be aspirational only — `saveDepGraph` re-stamped `header.roots`
+## from the CURRENT config unconditionally, so a dep-root rename followed
+## by a clean that GC'd anything at all silently laundered the rename past
+## the next `loadDepGraph`'s `dgdRootUnknown` check; see `saveDepGraph`'s
+## own doc for the fix).
 ##
 ## ## Atomic writes
 ##
@@ -136,11 +142,50 @@ export fnv
 # Constants
 # ---------------------------------------------------------------------------
 
-const DepGraphFormatVersion* = 7
+const DepGraphFormatVersion* = 8
   ## Increment this when the JSON schema changes in an incompatible way.
   ## A loaded file with a different formatVersion is treated as absent.
   ##
+  ## NOT bumped for the RFC-0009 wiring-audit `looksLikeDepEscape`
+  ## injectivity fix (`paths.nim`): a tag-0 rel whose first segment is
+  ## `dep:` with an empty or colon-containing "name" half (e.g. a real
+  ## on-disk directory literally named `dep:` or `dep:a:b`) now escapes to
+  ## `"./dep:.../..."` instead of the bare, unescaped `"dep:.../..."` v7
+  ## wrote for it. That bare spelling was NEVER correctly representable —
+  ## v7's `fromKeyBytes` routes any `"dep:"`-prefixed string into its dep-
+  ## root arm and rejects an empty/colon-bearing name, so every prior
+  ## write of one of these pathological rels already silently DROPPED that
+  ## closure member on the very next load (the bug this fix closes), never
+  ## round-tripped it. No currently-persisted v7 file can contain a
+  ## closure member whose spelling changes meaning under the fix — the
+  ## only bytes affected are ones that read back as `none` before AND
+  ## would still read back as `none` now if encountered unescaped (see
+  ## `fromKeyBytes`'s dep-root-arm doc): the fix only changes what a FRESH
+  ## write of such a rel produces going forward. An ordinary `dep:foo/...`
+  ## (well-formed name) is byte-identical before and after — untouched.
+  ## A discard-and-recompute bump exists to protect against a schema
+  ## change altering the MEANING of already-persisted bytes; this fix
+  ## alters the meaning of bytes that were never persisted correctly in
+  ## the first place, so there is nothing for a bump to protect.
+  ##
   ## History:
+  ##   8 — RFC-0009 F13 (wiring-audit finding): `entry.externals[].source`
+  ##       and `.headers[]` are now serialized in their `paths.keyBytes`
+  ##       spelling (`closure.closureMemberSpelling`), the SAME portable
+  ##       grammar W1 (below) already gave `entry.closure` — never a
+  ##       machine-local absolute path. A v7 file's dep-root externals
+  ##       (`source`/`headers` entries under a configured dep root) are
+  ##       exactly the absolute-native spellings this bump retypes: they
+  ##       cannot be re-attributed to their root after the fact (an absolute
+  ##       path alone no longer round-trips through `fromKeyBytes`, which
+  ##       only ever accepts a `dep:<name>/<rel>`/plain-rel/`./`-escaped
+  ##       spelling — see that proc's doc), so the graph is discarded once
+  ##       — a one-time full recompile — rather than migrated in place,
+  ##       exactly like every prior bump below. A v7 file's PROJECT-tagged
+  ##       externals are byte-identical (a tag-0 `keyBytes` spelling was
+  ##       already the pre-F13 project-relative spelling, `dep:`-escape
+  ##       aside), but the bump discards the whole graph anyway — the
+  ##       format is versioned as a whole, not per-field.
   ##   7 — RFC-0009 W1 (wiring-audit fix): each closure member is now
   ##       serialized in its `paths.keyBytes` spelling instead of a bare
   ##       `display(tp)` rel, so a dep-root member round-trips back to its
@@ -263,6 +308,11 @@ type
       ## `cc` command to re-probe — can carry the header set FORWARD instead
       ## of losing it (`closure.extractCompileInputs`'s `carried` parameter,
       ## fed from this field on the entry's previous `recordClosure`).
+      ##
+      ## RFC-0009 F13: `ExternalSource.source`/`.headers` are portable
+      ## `paths.keyBytes` spellings (never a machine-local absolute path,
+      ## even for a dep-root source/header) — see that type's own doc in
+      ## `crisol/closure`.
 
   DepGraphDiscardKind* = enum
     ## Why `loadDepGraph` discarded a persisted graph.
@@ -437,6 +487,36 @@ proc flagHash*(flags: seq[string]): string =
   result = toHex16(fnv1a64(joined))
 
 # ---------------------------------------------------------------------------
+# Public: entryKey
+# ---------------------------------------------------------------------------
+
+proc entryKey*(tp: TrackedPath; flags: seq[string]): tuple[path, flagHash: string] =
+  ## The `DepGraph.entries` primary key — `(display(tp), flagHash(flags))`
+  ## — factored to ONE place (RFC-0009 F24/F32). Before this, every one of
+  ## ~9 call sites across api.nim/cachedispatch.nim/clean.nim/depgraph.nim/
+  ## narrow.nim/planner.nim/runner.nim hand-built the same tuple from the
+  ## same two ingredients; ZERO behavior change here, just one named seam
+  ## instead of nine copies re-deciding it. Named fields (`.path`/
+  ## `.flagHash`) are purely for readability at call sites — Nim tuples are
+  ## structurally typed (field names are not part of the type), so this
+  ## return type is interchangeable with the unnamed `(string, string)`
+  ## `DepGraph.entries: Table[(string, string), DepGraphEntry]` is keyed on.
+  ##
+  ## `display(tp)` — not `keyBytes`/`cmpKeyBytes` — is safe as a Table key
+  ## ONLY because every `tp` reaching this helper today is TAG-0
+  ## (project-root-relative): `Entrypoint.tp` is built exclusively by
+  ## `discover()` walking the project root (see that field's own doc
+  ## comment; F14 made a dep-root selector a hard `cekConfig` rejection
+  ## specifically because entrypoints are never dep-root-domain). A tag-0
+  ## `display()` string is already injective within the project root, so it
+  ## needs no root-tag qualifier the way a general cross-root comparison
+  ## would (F24's ledger note: "invariant re-decided at each boundary
+  ## instead of carried by the type"). The day an entrypoint can legitimately
+  ## live under a dep root, this helper is the one place that widens —
+  ## e.g. to `keyBytes(tp)` — rather than nine.
+  (path: string(display(tp)), flagHash: flagHash(flags))
+
+# ---------------------------------------------------------------------------
 # Public: closureContentHash
 # ---------------------------------------------------------------------------
 
@@ -555,10 +635,16 @@ proc isEntryStale*(graph: DepGraph;
   return false
 
 proc staleExternalObjects*(graph: DepGraph; path: string; flags: seq[string];
-                           projectRoot: string): seq[string] =
+                           roots: TrackedRoots): seq[string] =
   ## Issue #16 slice 1b: which of this entrypoint's `{.compile.}`d external
   ## objects the RUNNER must delete before spawning `nim c`, so Nim actually
   ## recompiles them.
+  ##
+  ## RFC-0009 F13: takes `roots: TrackedRoots` (was a bare `projectRoot:
+  ## string`) — `ext.headers` are now portable `paths.keyBytes` spellings
+  ## (never a machine-local absolute/project-relative-only path, even for a
+  ## dep-root header), so recovering the native path to actually read a
+  ## header's content needs the full root table, not just the project root.
   ##
   ## Nim's own external-object cache (`extccomp.nim`, verified Nim 2.2.10):
   ## `footprint` is a sha1 of the external source's CONTENT plus OS, CPU, cc
@@ -593,9 +679,20 @@ proc staleExternalObjects*(graph: DepGraph; path: string; flags: seq[string];
     var stale = ext.headersHash == ""
     if not stale:
       try:
-        stale = chainedContentHash(ext.headers.mapIt(
-          (key: it, nativePath: (if it.isAbsolute: it else: projectRoot / it)))  # canon-ok: header nativePath join for staleness content-hash (headers keyed by own string, not TrackedPath)
-        ) != ext.headersHash
+        # RFC-0009 F13: each header's KEY is its own portable `keyBytes`
+        # spelling (host-invariant hash input); `nativePath` is recovered
+        # via `fromKeyBytes`->`toNative` at this one point of I/O. A header
+        # that fails to resolve (a corrupt record, or a renamed/removed dep
+        # root) raises here and is caught below — treated the same as any
+        # other unreadable header: conservatively "stale".
+        var pairs = newSeq[tuple[key: string; nativePath: string]](ext.headers.len)
+        for i, h in ext.headers:
+          let hTpOpt = fromKeyBytes(h, roots)
+          if hTpOpt.isNone:
+            raise newCrisolError(cekEnvironment,
+              "cannot resolve header spelling '" & h & "'")
+          pairs[i] = (key: h, nativePath: toNative(hTpOpt.get, roots))
+        stale = chainedContentHash(pairs) != ext.headersHash
       except CatchableError:
         stale = true
     if stale:
@@ -655,12 +752,22 @@ proc toJson(graph: DepGraph; roots: TrackedRoots): JsonNode =
       closureArr.add newJString(string(keyBytes(tp, roots)))
     let externalsArr = newJArray()
     var sortedExternals = entry.externals
+    # RFC-0009 F13: `ExternalSource.source` IS ALREADY a `paths.keyBytes`
+    # spelling (see that type's doc, `crisol/closure`) — the sibling
+    # `closureArr` sort above orders by `cmpKeyBytes`, which for two
+    # `TrackedPath`s reduces to exactly `cmp` over their `keyBytes` STRINGS
+    # (`cmpKeyBytes`'s own body); `a.source`/`b.source` already ARE those
+    # strings, so a plain `cmp` here is the identical byte order under a
+    # different (but sanctioned, RFC-0009 §4) name, not a second,
+    # independently-drifting ordering.
     sortedExternals.sort(proc(a, b: ExternalSource): int = cmp(a.source, b.source))
     for ext in sortedExternals:
       let extNode = newJObject()
       extNode["source"] = newJString(ext.source)
       extNode["obj"]    = newJString(ext.obj)
       let hdrArr = newJArray()
+      # Headers are the same `keyBytes` spelling as `source` — a plain
+      # string sort is likewise the sanctioned byte order.
       var sortedHeaders = ext.headers
       sortedHeaders.sort()
       for h in sortedHeaders:
@@ -811,11 +918,23 @@ proc fromJson(node: JsonNode; roots: TrackedRoots; discarded: var DepGraphDiscar
     # crash): a renamed/removed dep root's NAME is caught at the HEADER
     # level by `loadDepGraph`'s dgdRootUnknown check (below, in file order),
     # which discards the WHOLE graph before any caller ever sees these
-    # entries — so a `none` surviving to a live caller can only mean the
-    # entry's bytes themselves are corrupt, never a legitimate stale-root
-    # scenario. This subsumes the old M10 underRootNorm role (dropping any
-    # member that doesn't resolve under a tracked root) the same way the
-    # pre-W1 classify-at-load conversion did.
+    # entries — so a `none` surviving to a LOADDEPGRAPH caller can only
+    # mean the entry's bytes themselves are corrupt, never a legitimate
+    # stale-root scenario. This subsumes the old M10 underRootNorm role
+    # (dropping any member that doesn't resolve under a tracked root) the
+    # same way the pre-W1 classify-at-load conversion did.
+    #
+    # `fromJson` is ALSO reached from `loadStoredDepGraph` (`crisol clean`'s
+    # loader), which never runs the header-level dgdRootUnknown check by
+    # design (its doc). A `none` here during a `loadStoredDepGraph` call
+    # CAN legitimately mean a renamed/removed dep root — clean tolerates
+    # that (it only GCs by entry key, never reads closure members for a
+    # decision) precisely because `saveDepGraph`'s `preserveHeaderRoots`
+    # (RFC-0009 wiring-audit fix; see `clean.cleanOrphans`) keeps the
+    # on-disk header naming the OLD root even after such a clean, so the
+    # next `loadDepGraph` still catches the mismatch via dgdRootUnknown and
+    # discards the whole (by-then-truncated) graph before any staleness
+    # decision ever sees it.
     var closure = initHashSet[TrackedPath]()
     for item in closureNode:
       let s = item.getStr("")
@@ -873,7 +992,8 @@ proc rootsDescriptor(roots: TrackedRoots): seq[tuple[name: string; foldPolicy: F
   for d in roots.deps:
     result.add (name: d.name, foldPolicy: d.foldPolicy)
 
-proc saveDepGraph*(graph: DepGraph; config: Config): bool =
+proc saveDepGraph*(graph: DepGraph; config: Config;
+                    preserveHeaderRoots: bool = false): bool =
   ## Write the graph to `<projectRoot>/<stateDir>/depgraph` atomically.
   ## Creates the state directory if absent.
   ##
@@ -886,6 +1006,24 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
   ## e.g. inherited from a prior load) is left untouched; only the on-disk
   ## bytes gain the freshly-derived descriptor.
   ##
+  ## `preserveHeaderRoots` (RFC-0009 wiring-audit fix): when `true`, the
+  ## re-stamp above is SKIPPED — `toWrite.header.roots` keeps exactly
+  ## whatever `graph.header.roots` already carried in memory (normally the
+  ## STORED value, inherited verbatim from a prior `loadStoredDepGraph`).
+  ## This is the GC-only save path's mode (`clean.cleanOrphans`, the sole
+  ## caller passing `true`): a clean never recomputes or validates any
+  ## entry's closure against the CURRENT `config.trackedRoots` (it uses
+  ## `loadStoredDepGraph`, never `loadDepGraph`, precisely so it never
+  ## depends on root/version freshness — see that proc's doc), so
+  ## re-stamping the header here would silently launder a renamed or
+  ## removed dep root past the next `loadDepGraph`'s `dgdRootUnknown`/
+  ## `dgdFoldMismatch` check — the exact signal that check exists to catch
+  ## — even though this save recomputed nothing against the new roots.
+  ## Every OTHER caller (`recordClosure`'s success and failure paths) has
+  ## just extracted a fresh closure against the CURRENT roots and must
+  ## keep re-stamping (`preserveHeaderRoots` defaults to `false`,
+  ## unchanged behavior) so the header always reflects what those entries
+  ## were actually computed against.
   ## Returns `true` iff the graph was actually persisted (the final
   ## `moveFile` completed), `false` on ANY failure OR on a degraded run
   ## (RFC-0009 A-degraded D5, `config.trackedRoots.degraded` — see below).
@@ -930,7 +1068,8 @@ proc saveDepGraph*(graph: DepGraph; config: Config): bool =
     return false
 
   var toWrite = graph
-  toWrite.header.roots = rootsDescriptor(config.trackedRoots)
+  if not preserveHeaderRoots:
+    toWrite.header.roots = rootsDescriptor(config.trackedRoots)
   let jsonStr = $toJson(toWrite, config.trackedRoots)
   let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
@@ -1004,10 +1143,10 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ##
   ## The caller only needs to warn on `not ok` and discard the stable
   ## binary; no further recovery step is needed on either path.
-  let fHash = flagHash(ep.flags)
+  let key = entryKey(ep.tp, ep.flags)
+  let fHash = key.flagHash
   let epAbs = toNative(ep.tp, config.trackedRoots)
   try:
-    let key = (ep.tp.display(), fHash)
     let carried = if key in graph.entries: graph.entries[key].externals else: @[]
     let inputs = extractCompileInputs(nimcacheDir, binaryName, epAbs, config,
                                       index, carried, ccRun)
@@ -1023,14 +1162,14 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
     # the SAME classify-filtered set. See `closureHashInputs`.
     let contentHash = closureContentHash(
       closureHashInputs(inputs.files, config.trackedRoots))
-    graph.updateEntry(ep.tp.display(), fHash, inputs.files, contentHash, protocolMajor,
+    graph.updateEntry(key.path, fHash, inputs.files, contentHash, protocolMajor,
                       inputs.externals)
     if saveDepGraph(graph, config):
       result = (ok: true, error: "")
     else:
       result = (ok: false, error: "dependency graph could not be persisted")
   except CatchableError as e:
-    graph.invalidateEntry(ep.tp.display(), fHash)
+    graph.invalidateEntry(key.path, fHash)
     if saveDepGraph(graph, config):
       result = (ok: false, error: e.msg)
     else:
@@ -1117,14 +1256,20 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
 
   # M10 soundness: re-validate closure paths from the on-disk graph.
   #
-  # Rule (issue #13.1): one rule for every closure path, absolute or
-  # relative alike. Normalize each path to a candidate absolute location —
-  # `p` itself if already absolute, else `projectRoot / p` — and keep the
-  # path (stored VERBATIM, exactly as read from disk) iff that candidate is
-  # projectRoot or a configured depRoot, or lives under one of them
-  # (`cand == root or cand.startsWith(root & DirSep)`). Everything else is
-  # dropped silently. `prNorm` and each depRoot are normalized ONCE per
-  # load, not once per path.
+  # Rule (issue #13.1, historical — describes the ORIGINAL closure-path
+  # implementation this section's own doc, below, explains is now SUBSUMED
+  # by `fromKeyBytes`-at-parse in `fromJson`; retained for the threat-model
+  # rationale, which still applies): one rule for every closure path,
+  # absolute or relative alike. Normalize each path to a candidate absolute
+  # location — `p` itself if already absolute, else `projectRoot / p` — and
+  # keep the path (stored VERBATIM, exactly as read from disk) iff that
+  # candidate is projectRoot or a configured depRoot, or lives under one of
+  # them (`cand == root or cand.startsWith(root & DirSep)`). Everything else
+  # is dropped silently. (RFC-0009 F13: the externals filter, below, now
+  # applies the analogous `fromKeyBytes`-based check directly —
+  # `validKeySpelling` — rather than this normalize-and-bounds-check form,
+  # since `source`/`headers` are `paths.keyBytes` spellings too, not native
+  # paths.)
   #
   # Threat model: a tampered or corrupt depgraph file could carry an
   # absolute path like "/etc/shadow", or — the #13.1 gap this closes — a
@@ -1156,21 +1301,27 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
   # is no channel here that reveals file contents. See
   # tests/unit/test_soundness_m10.nim's symlink-retention blocks (issue
   # #13.2) for the pin proving this stays lexical.
-  let prNorm = config.projectRoot.absolutePath.normalizedPath  # canon-ok: M10 traversal-bounds root canonicalization (non-folding, filesystem-real)
-  var rootsNorm = @[prNorm]
-  for dr in config.depRoots:
-    rootsNorm.add dr.absolutePath.normalizedPath  # canon-ok: M10 traversal-bounds dep-root canonicalization
-
-  proc underRootNorm(p: string): bool =
-    ## Shared M10 predicate: normalize `p` (relative -> projectRoot-relative)
-    ## and test it against `rootsNorm` — the identical rule applied to
-    ## `entry.closure` paths, below, and now (issue #16) to
-    ## `entry.externals[].source`/`.headers[]` paths too.
-    let cand = (if p.isAbsolute: p else: prNorm / p).normalizedPath  # canon-ok: M10 traversal-bounds candidate canonicalization (non-folding, filesystem-real)
-    for root in rootsNorm:
-      if isUnderRoot(cand, root):
-        return true
-    false
+  proc validKeySpelling(s: string): bool =
+    ## RFC-0009 F13: M10 guard for `entry.externals[].source`/`.headers[]`,
+    ## now that both are `paths.keyBytes` spellings (`closure.
+    ## closureMemberSpelling`) rather than a raw absolute/projectRoot-
+    ## relative NATIVE path. `fromKeyBytes` is the SAME grammar-inverse
+    ## `entry.closure` members already round-trip through in `fromJson`,
+    ## above — an unresolvable/escaping spelling means the same thing here
+    ## it means there: corrupt/hand-crafted text, or a renamed/removed dep
+    ## root (already caught at the HEADER level by `loadDepGraph`'s
+    ## dgdRootUnknown check before any caller sees these entries — see
+    ## `fromJson`'s doc for why a `none` surviving that far can only mean
+    ## corruption).
+    ##
+    ## SUPERSEDES the pre-F13 `underRootNorm` predicate (removed): that
+    ## treated `source`/`headers` as an absolute-or-projectRoot-relative
+    ## NATIVE path — correct for the pre-F13 spelling, but not even a valid
+    ## READING of a dep-root member's portable `dep:<name>/<rel>` spelling
+    ## (joining it onto projectRoot and testing root-membership would
+    ## silently fail for essentially every dep-root external, dropping the
+    ## record rather than validating it).
+    fromKeyBytes(s, config.trackedRoots).isSome
 
   proc isPlainBasename(s: string): bool =
     ## M10 guard for `entry.externals[].obj` (issue #16): per
@@ -1204,11 +1355,11 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
     # dropped, the rest of the record is kept).
     var filteredExternals: seq[ExternalSource] = @[]
     for ext in entry.externals:
-      if not underRootNorm(ext.source): continue
+      if not validKeySpelling(ext.source): continue
       if not isPlainBasename(ext.obj): continue
       var keptHeaders: seq[string] = @[]
       for h in ext.headers:
-        if underRootNorm(h):
+        if validKeySpelling(h):
           keptHeaders.add h    # kept VERBATIM — exactly as read from disk
       var kept = ext
       kept.headers = keptHeaders

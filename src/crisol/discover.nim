@@ -175,7 +175,7 @@ proc applyGates*(
   var gatedOut: seq[GatedEntry]
   for ep in eps.entries:
     if ep.group in gatedReason:
-      gatedOut.add (path: ep.tp.display(), group: ep.group, reason: gatedReason[ep.group])
+      gatedOut.add (path: string(ep.tp.display()), group: ep.group, reason: gatedReason[ep.group])
     else:
       run.add ep
 
@@ -230,16 +230,36 @@ proc unsafeToSeq*(ds: DiscoveredSet): seq[Entrypoint] =
 proc normalizeRootRelative(p: string; config: Config): string =
   ## Make an absolute selector path root-relative; leave a relative path
   ## as-is. RFC-0009 A3a-i (R3-23): routes through the TOTAL `classify`
-  ## boundary rather than `os.relativePath` — a path under a TRACKED root
-  ## (project or a configured dep root, not just `config.projectRoot`
-  ## verbatim) reduces to its canonical, real-case `tp.display` spelling;
+  ## boundary rather than `os.relativePath` — a path under the TRACKED
+  ## project root reduces to its canonical, real-case `tp.display` spelling;
   ## anything `pcOutside` degrades to the raw string, unchanged, matching
   ## today's `except: p` fallback but now total and exception-free by
   ## construction rather than relying on `relativePath` never raising.
+  ##
+  ## RFC-0009 wiring-audit F14: a selector that classifies to a configured
+  ## DEP root (tag != 0) is out of domain and must be diagnosed, never
+  ## silently resolved. discover() has no concept of a dep-root entrypoint —
+  ## it only ever walks `effectiveProjectRoot(config)`, and every
+  ## `Entrypoint.tp` it produces is tag-0 by construction (see the doc
+  ## comment on `Entrypoint.tp`, types.nim) — so a dep-root `pc.tp.display`
+  ## is just a bare, untagged rel string with no project-root file behind
+  ## it. Returning that string unchanged, as this proc used to, let
+  ## `resolveFilesGroups` match it against `allRel` (PROJECT-walked
+  ## candidates only): a same-spelled project file silently ALIASES the
+  ## dep-root selector (wrong file selected, no diagnostic), and otherwise
+  ## it degrades to a spurious, silent no-match. Silent wrong-file selection
+  ## is never acceptable, so this is a hard, named error instead — the same
+  ## `cekConfig` style `resolveFilesGroups`'s own "unknown group" check uses.
   if not isAbsolute(p): return p  # canon-ok: branch gating the classify call below, not a root-membership check
   let pc = classify(p, config.trackedRoots)
   case pc.kind
-  of pcTracked: pc.tp.display
+  of pcTracked:
+    if not pc.tp.isProject:
+      raise newCrisolError(cekConfig,
+        "selector '" & p & "' names a file under a configured dependency " &
+        "root (" & string(keyBytes(pc.tp, config.trackedRoots)) & "); " &
+        "crisol only discovers test entrypoints under the project root")
+    string(pc.tp.display)
   of pcOutside: p
 
 proc resolveFilesGroups(
@@ -475,6 +495,11 @@ proc discover*(
         )
 
   # 4. Sort by (path, group) — stable ordering for deterministic output.
+  # Display-string order (not cmpKeyBytes) is deliberate: this is the
+  # human-facing listing order over tag-0-only entrypoints, where display
+  # and keyBytes spellings coincide except for the pathological `dep:`
+  # first-segment escape; RFC-0009 §4's cmpKeyBytes rule governs keys and
+  # the wire, and nothing derives a key from this order (review F24).
   entries.sort(proc(a, b: Entrypoint): int =
     let cmp1 = cmp(a.tp.display(), b.tp.display())
     if cmp1 != 0: cmp1 else: cmp(a.group, b.group)

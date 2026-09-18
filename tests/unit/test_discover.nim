@@ -153,7 +153,7 @@ suite "discover – sorted output":
     let ds  = discover(cfg)
     let eps = applyGates(ds, cfg, initGateState([])).run
     check eps.len == 3
-    let paths = eps.mapIt(it.tp.display())
+    let paths = eps.mapIt(string(it.tp.display()))
     check paths == @[
       "tests/unit/test_a.nim",
       "tests/unit/test_b.nim",
@@ -583,3 +583,53 @@ suite "discover – gskFiles absolute selector normalizes via classify":
     # rather than silently mangling or dropping an unrelated absolute path.
     check ds.entries.len == 0
     check ds.adHocPaths == @[outside]
+
+# ---------------------------------------------------------------------------
+# RFC-0009 wiring-audit F14 — an absolute selector naming a dep-root file
+# ---------------------------------------------------------------------------
+
+suite "discover – gskFiles absolute selector naming a dep-root file":
+
+  test "a dep-root selector must not silently alias onto a same-spelled project file":
+    let root    = makeTempRoot("rfc9_f14_dep_alias_proj")
+    let depRoot = makeTempRoot("rfc9_f14_dep_alias_dep")
+    defer:
+      cleanupDir(root)
+      cleanupDir(depRoot)
+
+    # Same root-relative spelling exists under BOTH roots -- the aliasing
+    # trap: `normalizeRootRelative` reduces the dep-root selector to the bare,
+    # untagged rel string "tests/unit/test_a.nim", and `resolveFilesGroups`
+    # matches that string against `allRel` (PROJECT-walked candidates only,
+    # discover() never walks dep roots) -- so a dep-root selector can resolve
+    # to an unrelated PROJECT file of the same spelling.
+    writeFixture(root,    "tests/unit/test_a.nim")
+    writeFixture(depRoot, "tests/unit/test_a.nim")
+
+    var cfg = Config(
+      projectRoot: root,
+      groups: @[Group(name: "unit", globs: @["tests/unit/test_*.nim"])],
+    )
+    cfg.trackedRoots = initTrackedRoots(root, @[(name: "mydep", native: depRoot)], "")
+
+    let absSelector = depRoot / "tests" / "unit" / "test_a.nim"
+    let sel = GroupSelection(kind: gskFiles, paths: @[absSelector])
+
+    # discover() has no concept of a dep-root entrypoint (Entrypoint.tp is
+    # always tag-0 by construction -- see the A3a-i doc comment on
+    # `Entrypoint.tp`), so naming a dep-root file is out of domain: the
+    # principled behavior is a clear, diagnosed rejection, never a silent
+    # aliasing onto an unrelated project file (or a silent no-match).
+    var raised = false
+    var kind: CrisolErrorKind
+    var msg = ""
+    try:
+      discard discover(cfg, sel)
+    except CrisolError as e:
+      raised = true
+      kind   = e.kind
+      msg    = e.msg
+
+    check raised
+    check kind == cekConfig
+    check "mydep" in msg

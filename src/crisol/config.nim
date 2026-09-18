@@ -925,6 +925,19 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     let effectiveName =
       if entry.explicitName.isSome: entry.explicitName.get
       else: depAbs.extractFilename()
+    if effectiveName.len == 0:
+      # An explicit `name=""` (the only realistic way to reach this --
+      # `depAbs.extractFilename()` never yields "" for a `nativeCanonicalize`d
+      # abs path) collides with the reserved "" name `paths.nim` uses for
+      # the PROJECT root: `keyBytes` would emit an unparseable `dep:/rel`
+      # for such a member (bare, no name between "dep:" and the "/" --
+      # `fromKeyBytes` rejects that shape as malformed), `rootsDescriptor`
+      # (depgraph.nim) would write two `name: ""` header entries, and
+      # `currentFoldPolicy` (depgraph.nim's `loadDepGraph`) would resolve
+      # the dep root's NAME lookup to the PROJECT's policy instead. Reject
+      # at config time, same as the '/'/':' cases below.
+      cfgErr("config: dep-root name must not be empty (path '" &
+             entry.path & "')")
     if '/' in effectiveName or ':' in effectiveName:
       cfgErr("config: dep-root name '" & effectiveName & "' must not " &
              "contain '/' or ':' (path '" & entry.path & "')")

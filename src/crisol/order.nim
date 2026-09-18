@@ -50,7 +50,12 @@
 ## `medianDur[ep.path]` = median durationUs of non-compileFailed rows for that ep.
 ##
 ## Both tables are keyed by ep.tp.display() (project-root-relative string),
-## matching how shard.nim keys its duration table.
+## matching how shard.nim keys its duration table. Keying on the display
+## string (not TrackedPath / keyBytes) is deliberate and safe here:
+## Entrypoint.tp is tag-0 by construction, so display() and keyBytes
+## coincide for every real key, and this whole module is ordering-only —
+## a wrong order is a pessimization, never unsound (RFC-0009 review F24;
+## retyping declined as fixture-heavy ripple for no invariant gain).
 
 import std/[algorithm, sequtils, tables]
 import crisol/types
@@ -127,12 +132,12 @@ proc orderBy*(
     ## Two-tier sort:
     ##   Tier 0 (has a recorded failure): descending lastFail timestamp; lex tie-break.
     ##   Tier 1 (never failed):           ascending ep.path.
-    var withFail    = eps.filterIt(it.tp.display() in lastFail)
-    var withoutFail = eps.filterIt(it.tp.display() notin lastFail)
+    var withFail    = eps.filterIt(string(it.tp.display()) in lastFail)
+    var withoutFail = eps.filterIt(string(it.tp.display()) notin lastFail)
 
     withFail.sort(proc(a, b: Entrypoint): int =
-      let ta = lastFail[a.tp.display()]
-      let tb = lastFail[b.tp.display()]
+      let ta = lastFail[string(a.tp.display())]
+      let tb = lastFail[string(b.tp.display())]
       if ta != tb: return cmp(tb, ta)   # DESC timestamp (more recent = smaller cmp result)
       cmp(a.tp.display(), b.tp.display())               # ASC path tie-break
     )
@@ -153,8 +158,8 @@ proc orderBy*(
     ## and any tie at 0 is broken by lex path).
     var sorted = eps
     sorted.sort(proc(a, b: Entrypoint): int =
-      let da = medianDur.getOrDefault(a.tp.display(), 0'i64)
-      let db = medianDur.getOrDefault(b.tp.display(), 0'i64)
+      let da = medianDur.getOrDefault(string(a.tp.display()), 0'i64)
+      let db = medianDur.getOrDefault(string(b.tp.display()), 0'i64)
       if da != db: return cmp(db, da)   # DESC duration
       cmp(a.tp.display(), b.tp.display())               # ASC path tie-break
     )
@@ -217,7 +222,7 @@ proc orderByHistory*(
           if r.timestamp > maxTs:
             maxTs = r.timestamp
       if maxTs >= 0:
-        lastFail[ep.tp.display()] = maxTs
+        lastFail[string(ep.tp.display())] = maxTs
 
     of omDuration:
       # Build medianDur: median of non-compileFailed durationUs rows.
@@ -227,6 +232,6 @@ proc orderByHistory*(
         if not isCompileFailedOutcomeString(r.outcome):
           durs.add r.durationUs
       if durs.len > 0:
-        medianDur[ep.tp.display()] = median(durs)
+        medianDur[string(ep.tp.display())] = median(durs)
 
   orderBy(eps, mode, lastFail, medianDur)

@@ -93,7 +93,7 @@ proc widgetSpelling(closure: HashSet[TrackedPath]; roots: TrackedRoots): string 
   let expected = fromCanonical("src/widget.nim", roots).get
   for tp in closure:
     if tp == expected:
-      return display(tp)
+      return string(display(tp))
   ""
 
 proc closureForPath(g: DepGraph; path: string): HashSet[TrackedPath] =

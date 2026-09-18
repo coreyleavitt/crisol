@@ -294,7 +294,7 @@ proc toJunitXml*(results: seq[EntrypointResult]; summary: Summary;
   buf.add "<testsuites>\n"
 
   for r in results:
-    let epPath = escapeXml(r.ep.tp.display())
+    let epPath = escapeXml(string(r.ep.tp.display()))
     let timeSecs = fmtSecs(r.durationMs)
     let derived = outcome(r, policy)  # rfc-0007 §2/A6b
 

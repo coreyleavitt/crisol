@@ -789,9 +789,10 @@ proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
   ## matches.
   proc(pep: PlannedEntrypoint): KeyInputs =
     let ep    = pep.ep
-    let fHash = flagHash(ep.flags)
+    let key   = entryKey(ep.tp, ep.flags)
+    let fHash = key.flagHash
     let entry =
-      if (ep.tp.display(), fHash) in graph[].entries: graph[].entries[(ep.tp.display(), fHash)]
+      if key in graph[].entries: graph[].entries[key]
       else: DepGraphEntry()
     # L4: argv component reflects the actual binary path used at run time.
     # spawnRunDirect/spawnRun invoke `<stateDir>/bin/<slug>/<binName>` — a full

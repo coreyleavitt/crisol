@@ -22,6 +22,7 @@ import crisol/types
 import crisol/paths
 import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIndex
 import crisol/depgraph
+import crisol/clean     # for cleanOrphans — the BUG 2 clean scenario below
 import "../support/testep"
 
 proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
@@ -582,3 +583,134 @@ suite "depgraph load provenance: discarded persisted graph":
     check d.stored == "fpNone"
     check d.current == "fpAsciiLower"
     check "depgraph discarded" in d.message
+
+suite "RFC-0009 wiring-audit fix (BUG 2): saveDepGraph's preserveHeaderRoots":
+
+  test "preserveHeaderRoots: true leaves header.roots exactly as loaded, never re-derived from the current config":
+    let root = graphRoot("preserve_header")
+    defer: removeDir(root)
+    let depNative = root / "depdir"
+    createDir(depNative)
+
+    var cfgWrite = Config(projectRoot: root, stateDir: ".crisol")
+    cfgWrite.trackedRoots = initTrackedRoots(root, @[("foo", depNative)], ".crisol",
+                                             fixedProbe(fpNone))
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    doAssert saveDepGraph(g, cfgWrite)
+
+    var d1: DepGraphDiscard
+    let loaded = loadStoredDepGraph(cfgWrite, d1)
+    check loaded.header.roots == @[(name: "", foldPolicy: fpNone),
+                                    (name: "foo", foldPolicy: fpNone)]
+
+    # A DIFFERENT config -- the SAME dep root renamed foo -> bar -- saves
+    # `loaded` (still carrying "foo" in memory) with preserveHeaderRoots:
+    # true. The write must keep "foo" rather than re-deriving "bar" from
+    # cfgRenamed.
+    var cfgRenamed = Config(projectRoot: root, stateDir: ".crisol")
+    cfgRenamed.trackedRoots = initTrackedRoots(root, @[("bar", depNative)], ".crisol",
+                                               fixedProbe(fpNone))
+    doAssert saveDepGraph(loaded, cfgRenamed, preserveHeaderRoots = true)
+
+    var d2: DepGraphDiscard
+    let reloaded = loadStoredDepGraph(cfgRenamed, d2)
+    check reloaded.header.roots == @[(name: "", foldPolicy: fpNone),
+                                      (name: "foo", foldPolicy: fpNone)]
+
+  test "preserveHeaderRoots: false (the default) still re-stamps from the current config -- unchanged behavior for the real run/compile path":
+    let root = graphRoot("no_preserve_header")
+    defer: removeDir(root)
+    let depNative = root / "depdir"
+    createDir(depNative)
+
+    var cfgWrite = Config(projectRoot: root, stateDir: ".crisol")
+    cfgWrite.trackedRoots = initTrackedRoots(root, @[("foo", depNative)], ".crisol",
+                                             fixedProbe(fpNone))
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    doAssert saveDepGraph(g, cfgWrite)
+
+    var d1: DepGraphDiscard
+    let loaded = loadStoredDepGraph(cfgWrite, d1)
+
+    var cfgRenamed = Config(projectRoot: root, stateDir: ".crisol")
+    cfgRenamed.trackedRoots = initTrackedRoots(root, @[("bar", depNative)], ".crisol",
+                                               fixedProbe(fpNone))
+    doAssert saveDepGraph(loaded, cfgRenamed)   # default: preserveHeaderRoots = false
+
+    var d2: DepGraphDiscard
+    let reloaded = loadStoredDepGraph(cfgRenamed, d2)
+    check reloaded.header.roots == @[(name: "", foldPolicy: fpNone),
+                                      (name: "bar", foldPolicy: fpNone)]
+
+suite "RFC-0009 wiring-audit fix (BUG 2): crisol clean + a renamed dep root, full scenario":
+
+  test "a dep-root rename survives crisol clean (with an unrelated GC'd entrypoint) -- the NEXT loadDepGraph still discards via dgdRootUnknown":
+    ## Reproduces the full chain the bug report describes: persist a graph
+    ## with dep root "foo", rename it to "bar" in config, run `crisol
+    ## clean` while an UNRELATED stale entrypoint gets GC'd (gcCount > 0,
+    ## the condition that triggers clean's save at all) — before the fix,
+    ## that save unconditionally re-stamped header.roots from the CURRENT
+    ## ("bar") config, permanently erasing the rename signal.
+    let root = graphRoot("clean_rename_scenario")
+    defer: removeDir(root)
+    let depNative = root / "depdir"
+    createDir(depNative)
+    writeFile(depNative / "x.nim", "# stub\n")
+
+    # One LIVE entrypoint: discover() finds it under EITHER config below —
+    # the dep-root rename never touches its own globs.
+    let unitDir = root / "tests" / "unit"
+    createDir(unitDir)
+    writeFile(unitDir / "test_live.nim", "# stub\n")
+
+    proc makeCfg(depName: string): Config =
+      result = Config(
+        projectRoot: root, stateDir: ".crisol", jobs: 1,
+        timeoutSecs: 300, compileTimeoutSecs: 600, maxOutputBytes: 1024 * 1024,
+        groups: @[types.Group(name: "unit", globs: @["tests/unit/test_*.nim"],
+                               optIn: false)],
+      )
+      result.trackedRoots = initTrackedRoots(root, @[(depName, depNative)], ".crisol",
+                                             fixedProbe(fpNone))
+
+    let cfgWrite = makeCfg("foo")
+
+    # The LIVE entry's closure includes a real dep-root member under "foo".
+    let depMember = classify(depNative / "x.nim", cfgWrite.trackedRoots)
+    doAssert depMember.kind == pcTracked
+    var liveClosure = tpSet("tests/unit/test_live.nim")
+    liveClosure.incl depMember.tp
+
+    var g = initDepGraph("2.2.10")
+    g.updateEntry("tests/unit/test_live.nim", flagHash(@[]), liveClosure, "h-live", 1)
+    # A STALE entry for an entrypoint discover() will NOT find under either
+    # config below -- `clean` GCs it, which is what makes gcCount > 0 and
+    # triggers the save this bug is about.
+    g.updateEntry("tests/unit/test_gone.nim", flagHash(@[]),
+                  tpSet("tests/unit/test_gone.nim"), "h-gone", 1)
+    doAssert saveDepGraph(g, cfgWrite)
+
+    var dPre: DepGraphDiscard
+    check loadStoredDepGraph(cfgWrite, dPre).header.roots ==
+      @[(name: "", foldPolicy: fpNone), (name: "foo", foldPolicy: fpNone)]
+
+    # Rename foo -> bar, then run `crisol clean`.
+    let cfgRenamed = makeCfg("bar")
+    let report = cleanOrphans(cfgRenamed)
+    check report.graphEntriesDropped == 1   # only "test_gone.nim" -- proves the GC actually ran
+
+    # The header on disk must still name "foo" -- NOT re-stamped to "bar".
+    var dPost: DepGraphDiscard
+    check loadStoredDepGraph(cfgRenamed, dPost).header.roots ==
+      @[(name: "", foldPolicy: fpNone), (name: "foo", foldPolicy: fpNone)]
+
+    # The next REAL load (loadDepGraph, the compile-avoidance/impact path)
+    # must discard the WHOLE graph via dgdRootUnknown -- the soundness net
+    # the header re-stamp used to defeat.
+    var dLoad: DepGraphDiscard
+    let reloaded = loadDepGraph(cfgRenamed, "2.2.10", dLoad)
+    check reloaded.entries.len == 0
+    check dLoad.kind == dgdRootUnknown
+    check dLoad.stored == "foo"

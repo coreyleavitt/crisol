@@ -109,7 +109,7 @@ suite "extractClosure — @m relative import chain":
     let cl     = extractClosure(nc, bn, src, config)
 
     for tp in cl:
-      let p = display(tp)
+      let p = string(display(tp))
       # Must not be absolute.
       check not p.isAbsolute
       # Must not contain stdlib indicators.
@@ -210,7 +210,7 @@ suite "extractClosure — @p soundness (--path:src project modules tracked)":
     let cl     = extractClosure(nc, bn, src, config)
 
     for tp in cl:
-      let p = display(tp)
+      let p = string(display(tp))
       # system.nim, std/*, etc. must not appear
       check not p.startsWith("lib/")
       check not p.contains("system.nim")
@@ -262,7 +262,7 @@ suite "extractClosure — real {.compile.}d external (R1 regression, issue #5 fi
     check projTp("tests/fixtures/golden_reuse/fixture_substrate.nim") in cl
 
     for tp in cl:
-      check fileExists(projectRoot / display(tp))
+      check fileExists(projectRoot / string(display(tp)))
 
 # ---------------------------------------------------------------------------
 # Test 6 — missing JSON raises CrisolError(cekEnvironment)

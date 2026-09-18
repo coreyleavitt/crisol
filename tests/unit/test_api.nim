@@ -387,7 +387,7 @@ suite "planTests — changedOnly / failedOrChanged narrowing":
       )
       let pr = planTests(opts)
       check pr.entrypoints.len == 1
-      check "test_a.nim" in pr.entrypoints[0].ep.tp.display()
+      check "test_a.nim" in string(pr.entrypoints[0].ep.tp.display())
 
   test "noNarrowing plans all entrypoints (regression)":
     withTempProject:

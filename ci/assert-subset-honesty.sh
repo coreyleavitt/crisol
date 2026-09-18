@@ -233,4 +233,27 @@ if [ "$LEG" = "windows" ]; then
     "CLI-SMOKE-CASECHANGED SKIPPED"
 fi
 
+# RFC-0009 wiring-audit F16: the real on-disk long-path E2E
+# (test_rfc9_w2_longpath_e2e.nim) — a real >MAX_PATH (260-char) directory
+# chain, compiled/run/reselected through the actual spawned crisol binary,
+# proving `paths.toNative`'s `\\?\` prefix boundary against real
+# CreateFileW-backed I/O rather than the lexical round-trip
+# tests/unit/test_paths.nim already covers. WINDOWS-ONLY, same shape as W2
+# immediately above: the whole file is `when defined(windows)` gated (POSIX
+# has no MAX_PATH cliff), so on the macos leg it takes the `else` branch and
+# never compiles this test at all — its isMainModule marker there is
+# "test_rfc9_w2_longpath_e2e: skipped (not windows)", not "... done" — so
+# this check only applies to the windows leg. This test has no legitimate
+# per-environment self-skip (unlike the case-fold/symlink-privilege gated
+# tests above): the fixture builds its own long path deterministically, so a
+# SKIP marker appearing here would itself be a regression, not an honest
+# environment fact.
+if [ "$LEG" = "windows" ]; then
+  check_must_execute \
+    "F16 long-path E2E through toNative (test_rfc9_w2_longpath_e2e.nim)" \
+    "test_rfc9_w2_longpath_e2e done" \
+    "W2-LONGPATH REAL" \
+    "W2-LONGPATH SKIPPED"
+fi
+
 exit $fail

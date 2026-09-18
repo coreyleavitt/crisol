@@ -14,7 +14,17 @@
 ## comparison that survives the eventual migration is a compile error, not a
 ## latent Windows/case-insensitive-volume bug.
 
+# RFC-0009 F29: `createAndStatFallback`'s probe-file create goes through
+# `ioutils.exclusiveCreate`/`writeAllFd`/`closeFd` (RFC-0007 A3's sole owner
+# of raw file I/O in `src/`, `test_rfc7_a3_ioutils_ownership.nim`'s
+# allow-list already documents `paths.nim`'s ONLY direct `std/posix` use as
+# the macOS `pathconf` capability query, never raw open/write) rather than
+# hand-rolling a second hardened-open primitive here. No cycle: `ioutils`
+# imports only `std/os`/`std/posix`/`std/winlean`/`std/sysrand` — nothing
+# under `crisol/` — and `cachelocalfs.nim` already imports both modules side
+# by side.
 import std/[hashes, json, options, os, strutils, tables]
+import crisol/ioutils
 
 # ---------------------------------------------------------------------------
 # §1 — the identity types
@@ -108,6 +118,34 @@ type
     ## type, not `string`, so a cache-key consumer cannot accept a bare `rel`
     ## by accident. `string(k)` is the sole, explicit escape hatch.
 
+  DisplayPath* = distinct string
+    ## `display`'s return type (RFC-0009 A-final-ii, wiring-audit F12). A
+    ## distinct type, not `string`, so the PRODUCTION INVARIANT this module
+    ## has always documented — `toNative` is the ONLY sanctioned way to turn
+    ## a `TrackedPath` back into a filesystem path for I/O; `display`/`$tp`
+    ## is for HUMANS and logs/JSON/key material only, and is NEVER fed to
+    ## `readFile`/`open`/`fileExists`/`execProcess`/`absolutePath`/etc. — is
+    ## now compiler-enforced instead of convention-only: every one of those
+    ## procs takes a `string`, so passing a bare `DisplayPath` (or anything
+    ## built from one without unwrapping it) is a TYPE ERROR, not a silent
+    ## data-flow bug an undecidable textual scan could never catch.
+    ##
+    ## `string(dp)` is the sole, explicit, greppable escape hatch — every
+    ## call site that reaches for it is asserting "this consumer genuinely
+    ## wants the raw text" (JSON emission, XML escaping, string
+    ## concatenation into a human message, a `Table`/tuple key that must
+    ## stay wire-compatible with a persisted or widely-fixture-literal
+    ## shape) and should read as self-evidently safe, or carry a half-line
+    ## comment saying why. `==`/`hash`/`cmp` are borrowed directly (so a
+    ## `DisplayPath` still sorts, hashes, and compares like the string it
+    ## wraps, with zero I/O risk), plus a hand-written heterogeneous `==`
+    ## against a bare `string` — legitimate for comparing against a literal
+    ## in a test or an already-string-typed field, still no way to smuggle
+    ## a `DisplayPath` into an I/O call through it. Deliberately NO `$` and
+    ## NO `&`: either would be exactly as low-friction as `toNative` at an
+    ## I/O call site while being far LESS greppable than `string(...)`,
+    ## which would reopen the hole this type exists to close.
+
 proc path*(n: NativeAbs): string = n.abs
 proc `$`*(n: NativeAbs): string = n.abs
 proc `==`*(a, b: NativeAbs): bool = a.abs == b.abs
@@ -158,8 +196,40 @@ proc fold*(s: string; policy: FoldPolicy): string =
 # TrackedPath — comparison interface (context-free: no TrackedRoots needed).
 # ---------------------------------------------------------------------------
 
-proc display*(tp: TrackedPath): string = tp.rel
-proc `$`*(tp: TrackedPath): string = tp.rel          ## logs/errors: real case
+proc display*(tp: TrackedPath): DisplayPath = DisplayPath(tp.rel)
+  ## The sole accessor for the human/log/JSON/key-material spelling — see
+  ## `DisplayPath`'s own doc for the invariant this return type enforces.
+
+proc `==`*(a, b: DisplayPath): bool {.borrow.}
+proc `==`*(a: DisplayPath; b: string): bool = string(a) == b
+proc `==`*(a: string; b: DisplayPath): bool = a == string(b)
+proc hash*(d: DisplayPath): Hash {.borrow.}
+proc cmp*(a, b: DisplayPath): int {.borrow.}
+proc len*(d: DisplayPath): int {.borrow.}
+  ## A length query is exactly as I/O-safe as a comparison — borrowed for
+  ## the same reason (e.g. a `.len > 0` sanity check on a `display()`
+  ## result, never a byte fed anywhere).
+  ## Borrowed, not re-derived: a `DisplayPath` still sorts/hashes/compares
+  ## exactly like the string it wraps (order.nim's history sort, discover's
+  ## `(path, group)` tie-break) with no I/O risk in doing so — comparison is
+  ## not the operation `toNative` guards against. The two heterogeneous
+  ## `==` overloads (against a bare `string`) exist for the equally-safe,
+  ## extremely common case of comparing a `display()` result against a
+  ## string literal or an already-string-typed field (test assertions,
+  ## `discover`'s own `tp.display == relPath` invariant check below) without
+  ## forcing an explicit `string(...)` unwrap at every such comparison.
+
+proc `$`*(tp: TrackedPath): string = string(display(tp))
+  ## logs/errors: real case. Derives from `display` (never a second,
+  ## independently-drifting `tp.rel` read) but keeps returning a plain
+  ## `string`: `$tp` is idiomatic for direct log/error interpolation, and
+  ## unlike a bare `DisplayPath` escaping via a borrowed `$`, this is a
+  ## SEPARATE, already-decided call — `$tp` reads a `TrackedPath` (never a
+  ## `DisplayPath` value itself), so it adds no new way to unwrap a
+  ## `DisplayPath` that `string(display(tp))` didn't already provide
+  ## explicitly. `display(tp)` stays the sole ACCESSOR; `$tp` is sugar over
+  ## it for the one call shape (`&`/interpolation) that was always going to
+  ## need the plain string anyway.
 proc isProject*(tp: TrackedPath): bool = tp.rootTag == RootTag(0)
 
 proc `==`*(a, b: TrackedPath): bool =
@@ -169,9 +239,13 @@ proc `==`*(a, b: TrackedPath): bool =
   ## TrackedRoots, which probes each root's policy exactly once). A mismatch
   ## here is a cross-policy comparison bug (e.g. a test fixture built under a
   ## different policy than the roots it's compared against), never a
-  ## legitimate case — asserted, not silently masked.
+  ## legitimate case — checked UNCONDITIONALLY via `doAssert` (not a plain
+  ## `assert`): this is a cheap integer compare on a hot path, and the whole
+  ## point of the guarantee is that it survives `-d:danger`/`--assertions:off`
+  ## release builds rather than silently degrading to `a.fold`'s policy for
+  ## one side of a genuinely mismatched pair.
   if a.rootTag == b.rootTag:
-    assert a.fold == b.fold,
+    doAssert a.fold == b.fold,
       "TrackedPath: same rootTag compared under two different fold policies"
   a.rootTag == b.rootTag and fold(a.rel, a.fold) == fold(b.rel, b.fold)
 
@@ -191,14 +265,26 @@ proc firstSegment(rel: string): string =
   if idx < 0: rel else: rel[0 ..< idx]
 
 proc looksLikeDepEscape(rel: string): bool =
-  ## True iff `rel`'s first path segment matches `dep:[^/:]+` — the ESCAPE
-  ## `keyBytes` guards against: a tag-0 directory literally named `dep:foo`
-  ## is legal on ext4, and `classify` is total, so `dep:foo/x.nim` lands
-  ## `pcTracked` tag 0 regardless of any config-time name validation.
-  let seg = firstSegment(rel)
-  if not seg.startsWith("dep:"): return false
-  let rest = seg[4 .. ^1]
-  rest.len > 0 and ':' notin rest
+  ## True iff `rel`'s first path segment merely STARTS WITH `dep:` — the
+  ## ESCAPE `keyBytes` guards against: a tag-0 directory literally named
+  ## `dep:foo` (or `dep:`, or `dep:a:b` — ext4 permits any of these; config-
+  ## time dep-root NAME validation, `config.nim`, has no say over a tag-0
+  ## directory's real on-disk name) is legal, and `classify` is total, so
+  ## `dep:<anything>/x.nim` lands `pcTracked` tag 0 regardless.
+  ##
+  ## Bug history (RFC-0009 wiring-audit): a prior revision only matched the
+  ## strict `dep:[^/:]+` shape (rejecting an empty or colon-containing
+  ## "name" half) to mirror `fromKeyBytes`'s STRICT dep-root-arm grammar —
+  ## but `fromKeyBytes` routes ANY string starting `"dep:"` into that arm
+  ## (returning `none` on a shape failure, never falling back to tag-0), so
+  ## a tag-0 `dep:` or `dep:a:b` rel that this proc declined to escape
+  ## round-tripped through `keyBytes` unescaped, straight into
+  ## `fromKeyBytes`'s dep-root arm, and came back `none` — silently
+  ## DROPPED from a persisted closure (unsound under-selection, never a
+  ## crash). The escape must cover every shape `fromKeyBytes` would
+  ## otherwise misclassify, i.e. every `dep:`-prefixed first segment, full
+  ## stop — see `keyBytes`' "the escape is injective" note.
+  firstSegment(rel).startsWith("dep:")
 
 proc keyBytes*(tp: TrackedPath; roots: TrackedRoots): CacheKeyPath =
   ## Canonical, UNFOLDED cache-key bytes — NEVER the same accessor as
@@ -247,9 +333,10 @@ type AbsKind = enum akPosix, akDrive, akUnc
 proc splitAbsolute(p: string): tuple[kind: AbsKind, prefix: string, rest: string] =
   ## `p` has already had backslashes normalized to `/` and any long-path
   ## prefix stripped. Recognizes exactly one of: a drive-absolute form
-  ## (`C:/...` or bare `C:`), a UNC form (`//server/share...`), or a plain
-  ## POSIX-rooted form (`/...`). Caller has already established `p` is
-  ## absolute.
+  ## (`C:/...`), a UNC form (`//server/share...`), or a plain POSIX-rooted
+  ## form (`/...`). Caller has already established `p` is absolute — per
+  ## `isAbsoluteNative`, a bare two-char `C:` never counts as absolute (it
+  ## is drive-relative), so it never reaches here un-joined.
   if p.len >= 2 and isAsciiAlpha(p[0]) and p[1] == ':':
     let drive = $toUpperAscii(p[0]) & ":"
     let rest = if p.len > 2: p[2 .. ^1] else: ""
@@ -281,12 +368,18 @@ proc resolveDotSegments(rest: string; collapseAboveRoot: bool): seq[string] =
 
 proc isAbsoluteNative(p: string): bool =
   ## Host-agnostic absoluteness check over a backslash-normalized,
-  ## prefix-stripped string: POSIX root, UNC, or a drive form (`C:` or
-  ## `C:/...`) all count; a drive-RELATIVE spelling (`c:foo`) does not.
+  ## prefix-stripped string: POSIX root, UNC, or a drive-absolute form
+  ## (`C:/...`) all count. A bare two-char drive spelling (`C:`, no
+  ## separator) does NOT: real Windows semantics treat bare `C:` as
+  ## drive-RELATIVE — "the current directory of drive C" — not the drive
+  ## root `C:/`; it is deliberately classified the same as `c:foo`
+  ## (drive-relative) below, so both fall through to
+  ## `nativeCanonicalize`'s drive-relative branch (joined against `base`,
+  ## never resolved against an actual per-drive cwd this proc never reads).
   if p.len == 0: return false
   if p[0] == '/': return true
   if p.len >= 2 and isAsciiAlpha(p[0]) and p[1] == ':':
-    return p.len == 2 or p[2] == '/'
+    return p.len > 2 and p[2] == '/'
   false
 
 proc nativeCanonicalize*(native: string; base: string): NativeAbs =
@@ -374,35 +467,120 @@ proc isUnderRoot*(candidate, rootAbs: string): bool =
   let r = rootAbs.replace('\\', '/')
   c == r or underRoot(c, r).isSome
 
-proc classify*(native: string; roots: TrackedRoots): PathClass =
-  ## TOTAL: every native spelling classifies. Nothing is refused here.
-  let na = nativeCanonicalize(native, roots.project.abs)
+proc safeExpandFilename*(p: string): string
+  ## Forward-declared here so `classify`'s injectable `expandCandidate`
+  ## default (RFC-0009 wiring-audit F18, below) can name it without
+  ## reordering this module's existing §1/§2/§3 layout — the real
+  ## definition lives in §3, next to `winRealPath`, which its doc comment
+  ## explains in full.
 
-  let projRel = underRoot(na.abs, roots.project.abs)
-  let projRelReal = underRoot(na.abs, roots.project.realAbs)
+proc looksLike8Dot3Component(seg: string): bool =
+  ## True iff `seg` (one already-split `/`-segment) bears the DOS 8.3
+  ## short-name signature: a `~` immediately followed by an ASCII digit
+  ## (`RUNNER~1`, `PROGRA~1`, …) — the shape every short name Windows
+  ## actually generates. A bare trailing `~` with no digit after it (a
+  ## legal, if unusual, ordinary filename byte) does NOT match: MSDN's own
+  ## 8.3 algorithm always tacks on a numeric disambiguator, so a `~` with no
+  ## following digit is never a genuine short name.
+  for i in 0 ..< seg.len:
+    if seg[i] == '~' and i + 1 < seg.len and seg[i + 1] in {'0'..'9'}:
+      return true
+  false
+
+proc plausibly8Dot3*(nativeAbs: string): bool =
+  ## True iff ANY `/`-separated component of `nativeAbs` (already
+  ## `nativeCanonicalize`'d — forward-slash, absolute) plausibly carries a
+  ## DOS 8.3 short name. Exported (RFC-0009 wiring-audit F18) so this pure,
+  ## cross-platform predicate is directly unit-testable on Linux — the real
+  ## 8.3 EXPANSION `classify` gates behind it only ever does real work on
+  ## Windows (`safeExpandFilename`'s `winRealPath` branch), but the
+  ## predicate itself is ordinary text and needs no platform gate to prove.
+  for seg in nativeAbs.split('/'):
+    if looksLike8Dot3Component(seg): return true
+  false
+
+type CandidateExpander* = proc (p: string): string
+  ## RFC-0009 wiring-audit F18: the injectable candidate-side realpath-
+  ## expansion seam `classify` falls back to — NEVER on the hot path (see
+  ## `classify`'s own doc comment for the cost budget this protects).
+  ## Defaults everywhere to `safeExpandFilename`, the real cross-platform
+  ## realpath primitive (§3): on Windows, `winRealPath`
+  ## (`GetFinalPathNameByHandleW`) resolves a DOS 8.3 short-name component
+  ## to its long form as a documented side effect (see `winRealPath`'s own
+  ## doc comment); on POSIX this fallback is unreachable in practice (8.3
+  ## short names are a Windows/FAT concept — `plausibly8Dot3` can still fire
+  ## on a POSIX path that happens to contain a `~<digit>` component, but
+  ## `expandFilename` there is an ordinary realpath with nothing 8.3-shaped
+  ## to resolve, so the retry is simply a no-op match failure, not a wrong
+  ## answer). An explicitly-injected non-default expander is the Linux-
+  ## testability seam that exercises the FALLBACK'S WIRING (predicate ->
+  ## expand -> re-match) without a real Windows short name to expand,
+  ## mirroring `FoldProbe` above.
+
+proc matchRoots(abs: string; roots: TrackedRoots): Option[PathClass] =
+  ## The shared root-membership decision `classify` applies to a candidate
+  ## abs path — factored out so the RFC-0009 wiring-audit F18 8.3 fallback
+  ## (below) can retry it against an EXPANDED candidate without duplicating
+  ## the matching logic itself. `none` means "no root claims this spelling",
+  ## the caller's cue to either try a fallback or land `pcOutside`.
+  let projRel = underRoot(abs, roots.project.abs)
+  let projRelReal = underRoot(abs, roots.project.realAbs)
   if projRel.isSome or projRelReal.isSome:
     # PROJECT FIRST: a path under the project root is ALWAYS tag 0 — even
     # one that also nests under a configured dep root's own directory.
     let rel = if projRel.isSome: projRel.get else: projRelReal.get
-    return PathClass(kind: pcTracked,
+    return some(PathClass(kind: pcTracked,
       tp: TrackedPath(rootTag: RootTag(0), fold: roots.project.foldPolicy,
-                       rel: rel))
+                       rel: rel)))
 
   var bestIdx = -1
   var bestLen = -1
   var bestRel = ""
   for i, d in roots.fdeps:
-    let r1 = underRoot(na.abs, d.abs)
+    let r1 = underRoot(abs, d.abs)
     if r1.isSome and d.abs.len > bestLen:
       bestLen = d.abs.len; bestIdx = i; bestRel = r1.get
-    let r2 = underRoot(na.abs, d.realAbs)
+    let r2 = underRoot(abs, d.realAbs)
     if r2.isSome and d.realAbs.len > bestLen:
       bestLen = d.realAbs.len; bestIdx = i; bestRel = r2.get
 
   if bestIdx >= 0:
-    return PathClass(kind: pcTracked,
+    return some(PathClass(kind: pcTracked,
       tp: TrackedPath(rootTag: RootTag(uint16(bestIdx + 1)),
-                       fold: roots.fdeps[bestIdx].foldPolicy, rel: bestRel))
+                       fold: roots.fdeps[bestIdx].foldPolicy, rel: bestRel)))
+  none(PathClass)
+
+proc classify*(native: string; roots: TrackedRoots;
+               expandCandidate: CandidateExpander = safeExpandFilename): PathClass =
+  ## TOTAL: every native spelling classifies. Nothing is refused here.
+  ##
+  ## RFC-0009 wiring-audit F18: only ROOTS were ever realpath-expanded
+  ## (`NativeRoot.realAbs`, `initTrackedRoots` time) — the CANDIDATE side
+  ## stayed purely lexical (`nativeCanonicalize` never touches disk), so a
+  ## Windows 8.3 short-name CANDIDATE (`C:\Users\RUNNER~1\...`) under a
+  ## long-form root lexically mismatched and silently landed `pcOutside`
+  ## (dropped from selection/diff reduction) even though it names a real
+  ## tracked file. Fixed as a FALLBACK, not a widening of the hot path:
+  ## `SourceIndex` classifies thousands of paths per run, so this must cost
+  ## nothing for the overwhelming common case. `matchRoots` is tried first
+  ## against the plain lexical candidate, exactly as before; only when that
+  ## fails AND the candidate plausibly contains an 8.3 component
+  ## (`plausibly8Dot3` — a cheap text scan, no I/O) does `expandCandidate`
+  ## (real disk I/O on Windows, a no-op match failure everywhere else) run
+  ## at all, and the result is re-matched exactly once. Still TOTAL: an
+  ## expander that cannot resolve the name returns its input unchanged
+  ## (`safeExpandFilename`'s own "never raises" contract), which re-matches
+  ## identically to the first attempt and falls through to `pcOutside`.
+  let na = nativeCanonicalize(native, roots.project.abs)
+
+  let direct = matchRoots(na.abs, roots)
+  if direct.isSome: return direct.get
+
+  if plausibly8Dot3(na.abs):
+    let expandedAbs = nativeCanonicalize(expandCandidate(na.abs), roots.project.abs).abs
+    if expandedAbs != na.abs:
+      let viaExpansion = matchRoots(expandedAbs, roots)
+      if viaExpansion.isSome: return viaExpansion.get
 
   PathClass(kind: pcOutside, native: na)
 
@@ -427,14 +605,38 @@ proc foldPolicyForTag(tag: RootTag; roots: TrackedRoots): Option[FoldPolicy] =
 proc fromCanonical*(tag: RootTag; rel: string; roots: TrackedRoots): Option[TrackedPath] =
   ## For input that is ALREADY canonical relative form — a persisted `rel`
   ## read back from the dep graph, a `git diff` path. Validates the shape
-  ## invariant (rejecting a leading `\`, any `.`/`..` segment, an absolute
-  ## form — drive letter, UNC, or leading `/` — and a doubled separator: all
-  ## signs the caller handed it un-reduced native text) and applies the
-  ## tagged root's fold policy. Critically never touches cwd. Returns
-  ## `none` on a shape violation — NEVER raises: parsing untrusted/persisted
-  ## text never crashes, the caller chooses degrade vs abort.
+  ## invariant (rejecting a `\` ANYWHERE — not just leading — any `.`/`..`
+  ## segment, an absolute form — drive letter, UNC, or leading `/` — and a
+  ## doubled separator: all signs the caller handed it un-reduced native
+  ## text) and applies the tagged root's fold policy. Critically never
+  ## touches cwd. Returns `none` on a shape violation — NEVER raises:
+  ## parsing untrusted/persisted text never crashes, the caller chooses
+  ## degrade vs abort.
+  ##
+  ## RFC-0009 wiring-audit F15: an EMBEDDED backslash (`"sub\file.nim"`, a
+  ## backslash mid-segment, not just leading) is rejected too, not only a
+  ## leading one. `nativeCanonicalize` (this module's ONE constructor for
+  ## native, OS-spelled text) treats `\` as a path separator
+  ## UNCONDITIONALLY, host-agnostically (its own doc comment: "identity is
+  ## textual, not platform-conditional" — a Windows-shaped spelling
+  ## canonicalizes identically on Linux, macOS, or Windows). Consequently no
+  ## `rel` this module ever legitimately constructs via `classify` can
+  ## contain a literal backslash byte at ANY position: every backslash in
+  ## the original native string was already folded into `/` before the
+  ## result was ever stored in `TrackedPath.rel`. A canonical-text caller
+  ## (git's `--relative` output, always `/`-separated by git's own internal
+  ## convention; a persisted `tp.display()` round-trip) can therefore never
+  ## legitimately hand this proc a backslash at all — an embedded one is
+  ## exactly as diagnostic of un-reduced native text as a leading one, and a
+  ## shape check that only caught the leading case let
+  ## `"sub\file.nim"` (Windows: one un-reduced two-segment path;
+  ## POSIX: would-be single-segment text) through as a single opaque
+  ## segment whose identity could never unify with the correctly-classified
+  ## `"sub/file.nim"` spelling of the same file. Checked ahead of the
+  ## per-segment split below so it also catches a bare `"\"` with no `/` at
+  ## all.
   if rel.len == 0: return none(TrackedPath)
-  if rel[0] == '\\': return none(TrackedPath)
+  if '\\' in rel: return none(TrackedPath)
   if rel.len >= 2 and isAsciiAlpha(rel[0]) and rel[1] == ':':
     return none(TrackedPath)   # drive-letter absolute form
   for seg in rel.split('/'):
@@ -487,13 +689,25 @@ proc fromKeyBytes*(s: string; roots: TrackedRoots): Option[TrackedPath] =
   ##     and the first `/`; resolved against the CURRENT `roots.deps[i].name`
   ##     to `RootTag(i+1)`. An empty name, a `:` inside the name, an absent
   ##     `/` at all, an empty `rel`, or an unresolvable name (a renamed or
-  ##     removed dep root) all return `none`.
+  ##     removed dep root) all return `none`. Since `looksLikeDepEscape`
+  ##     (RFC-0009 wiring-audit fix) now escapes EVERY tag-0 rel whose
+  ##     first segment starts with `dep:` — including the empty-name and
+  ##     colon-in-name shapes — `keyBytes` never legitimately emits a bare
+  ##     `"dep:"`-prefixed string with one of those malformed shapes any
+  ##     more: a bare, unescaped `"dep:/x"` or `"dep:a:b/x"` arriving here
+  ##     can now only mean pre-fix persisted data (a format-7-or-earlier
+  ##     depgraph closure member written before the escape widened) or
+  ##     genuine corruption — never a live round trip. `none` remains the
+  ##     right answer for both: this is the SAME degrade-never-crash
+  ##     posture as any other shape violation, just no longer reachable
+  ##     from a healthy write.
   ##   - `"./<rel>"` — the §4 R3-20 escape (`keyBytes`' own `dep:` guard for
-  ##     a tag-0 rel whose first segment merely LOOKS like `dep:foo`).
-  ##     `rel` (the text after `./`) must itself satisfy `looksLikeDepEscape`
-  ##     — nothing else legally begins `./` (see `keyBytes`' "the escape is
-  ##     injective" note), so any other `./`-prefixed text is malformed and
-  ##     returns `none`.
+  ##     a tag-0 rel whose first segment starts with `dep:` at all — not
+  ##     just a shape that also happens to parse as a well-formed dep-root
+  ##     name). `rel` (the text after `./`) must itself satisfy
+  ##     `looksLikeDepEscape` — nothing else legally begins `./` (see
+  ##     `keyBytes`' "the escape is injective" note), so any other
+  ##     `./`-prefixed text is malformed and returns `none`.
   ##   - anything else — tag 0, unchanged.
   ## Every arm delegates final shape validation to `fromCanonical`, which
   ## never raises: parsing persisted/untrusted text never crashes here
@@ -558,6 +772,16 @@ proc toNative*(tp: TrackedPath; roots: TrackedRoots): string =
   ## inverse out of `TrackedPath` (this type seal), and Tier 4's check that
   ## no key-surface proc reverts to a string-typed identity/path parameter
   ## (the concrete way a caller would bypass `toNative` in practice).
+  ##
+  ## As of this change (wiring-audit F12), the undecidable-scan gap above is
+  ## closed for good, not merely narrowed: `display` returns `DisplayPath`,
+  ## a distinct type, so `readFile(display(tp))`/`open(display(tp))`/etc. no
+  ## longer merely LOOK wrong to a reviewer — they fail to compile. The only
+  ## way to hand a `display()` result to an I/O proc is the explicit,
+  ## greppable `string(...)` unwrap, at which point a `grep -n 'string(.*
+  ## display('` finds every remaining suspect call site directly — the
+  ## textual-scan limitation this paragraph describes is a property of
+  ## SCANNING for a bare `.display()` call, not of the seal itself.
   let rootAbs =
     if tp.rootTag == RootTag(0): roots.fproject.abs
     else: roots.fdeps[int(uint16(tp.rootTag)) - 1].abs
@@ -669,18 +893,100 @@ elif defined(linux):
 
   const caseSensitiveMagics = [0xEF53'i64, 0x58465342'i64, 0x9123683E'i64,
                                 0x01021994'i64]
-    ## ext2/3/4, xfs, btrfs, tmpfs — case-sensitive on Linux regardless of
-    ## mount options (the per-directory ext4/F2FS casefold feature is a
-    ## deliberately-enabled opt-in this query does not distinguish — round-1
-    ## accepted scope, matching this RFC's other narrow-but-documented
-    ## fold-probe simplifications). Answers `fpNone` for a plain ext4 mount
-    ## — crisol's daily toolchain — WITHOUT ever touching disk.
+    ## ext2/3/4, xfs, btrfs, tmpfs — case-sensitive on Linux BY DEFAULT, but
+    ## NOT unconditionally (see `fsCasefoldFlag*` below, RFC-0009 F8): the
+    ## per-directory ext4/F2FS casefold feature (`chattr +F`, `FS_CASEFOLD_FL`)
+    ## still reports one of these SAME magics via `statfs` — the magic alone
+    ## cannot tell a plain ext4 directory from a casefold-enabled one, so it
+    ## is a necessary but not sufficient condition for `fpNone` and is now
+    ## always refined by an inode-flag check before being trusted as final.
+
+  proc c_open(path: cstring; flags: cint): cint
+    {.importc: "open", header: "<fcntl.h>", varargs.}
+  proc c_close(fd: cint): cint
+    {.importc: "close", header: "<unistd.h>".}
+  proc c_ioctlGetFlags(fd: cint; request: culong; flags: ptr int32): cint
+    {.importc: "ioctl", header: "<sys/ioctl.h>".}
+
+  const
+    linuxORdonly = 0.cint
+      ## O_RDONLY, <fcntl.h> — 0 on every Linux arch (glibc).
+    linuxODirectory = 0o200000.cint
+      ## O_DIRECTORY, <fcntl.h> (glibc `bits/fcntl-linux.h`) — Linux-specific,
+      ## not part of POSIX and so not in `std/posix`. Combined with
+      ## `linuxORdonly` so the probe opens `rootAbs` read-only and fails
+      ## outright if it is not actually a directory, rather than silently
+      ## opening some other kind of node.
+    fsIocGetFlags = 0x80086601'u
+      ## FS_IOC_GETFLAGS, `<linux/fs.h>` — `_IOR('f', 1, long)` expanded for
+      ## a 64-bit `long` argument. Hard-coded (no `<linux/fs.h>` #include,
+      ## which would pull kernel headers into a userspace build) per this
+      ## module's existing no-new-deps posture (see `caseSensitiveMagics`).
+    fsCasefoldFlag* = 0x40000000'i32
+      ## FS_CASEFOLD_FL, `<linux/fs.h>` — set on a directory with the
+      ## ext4/F2FS casefold feature enabled (`chattr +F`); inherited by
+      ## every file/dir later created under it. A per-DIRECTORY property,
+      ## exactly the granularity RFC-0009 §3 probes at. Exported so F17's
+      ## unit test can construct a synthetic flags word without duplicating
+      ## the magic number, rather than hand-copying it a second time.
+
+  proc queryCasefoldFlag(rootAbs: string): Option[int32] =
+    ## `FS_IOC_GETFLAGS` on `rootAbs` ITSELF, opened `O_RDONLY|O_DIRECTORY`
+    ## — never touches the directory's contents, only its own inode flags.
+    ## `none` on ANY failure: the `open` failing (permission, race, not a
+    ## directory) or the `ioctl` itself failing/being unsupported (`ENOTTY`
+    ## on a filesystem/kernel that predates the casefold ioctl). A failure
+    ## HERE is not a probe failure — `osQueryFoldPolicy` already has its
+    ## statfs-magic answer in hand before calling this; it only means this
+    ## REFINEMENT has nothing to add, so the magic answer stands unchanged.
+    let fd = c_open(cstring(rootAbs), linuxORdonly or linuxODirectory)
+    if fd < 0'i32: return none(int32)
+    defer: discard c_close(fd)
+    var flags: int32 = 0
+    if c_ioctlGetFlags(fd, culong(fsIocGetFlags), addr flags) != 0'i32:
+      return none(int32)
+    some(flags)
+
+  proc decodeLinuxCasefold*(flagsAnswer: Option[int32];
+                             magicAnswer: Option[FoldPolicy]): Option[FoldPolicy] =
+    ## Pure decision, independent of any real `ioctl` call — this is what
+    ## F17's unit test asserts against DIRECTLY (a real `chattr +F`
+    ## casefold-enabled directory cannot be fabricated on ordinary,
+    ## unprivileged CI, so the `ioctl` PLUMBING above (`queryCasefoldFlag`)
+    ## is exercised only via its failure path there — `ENOTTY`/unsupported
+    ## on this container's plain ext4 mount — while this function's
+    ## flag-SET branch is proven correct by construction instead, exported
+    ## for exactly that purpose).
+    ##
+    ## `FS_CASEFOLD_FL` set ⇒ the directory folds names case-insensitively
+    ## (ext4/F2FS's own Unicode SIMPLE case fold, not a full Unicode fold)
+    ## ⇒ `fpAsciiLower` — crisol's uniform ASCII-only conservative
+    ## approximation of "insensitive" on every platform alike (Windows
+    ## NTFS, macOS APFS, and now Linux casefold), never the filesystem's
+    ## own full-Unicode table (round 1, §Risks — a full-Unicode fold that
+    ## disagrees with the kernel's own table would reintroduce the exact
+    ## split this RFC exists to prevent). Flag absent, or the query itself
+    ## failed/unsupported, ⇒ the STATFS-magic answer stands unrefined: this
+    ## is a refinement of a definitive `fpNone`, never a new failure mode.
+    if flagsAnswer.isSome and (flagsAnswer.get and fsCasefoldFlag) != 0'i32:
+      some(fpAsciiLower)
+    else:
+      magicAnswer
 
   proc osQueryFoldPolicy(rootAbs: string): Option[FoldPolicy] =
     var buf: CStatfsLinux
     if c_statfs(cstring(rootAbs), buf) != 0'i32: return none(FoldPolicy)
-    if int64(buf.f_type) in caseSensitiveMagics: some(fpNone)
-    else: none(FoldPolicy)
+    let magicAnswer =
+      if int64(buf.f_type) in caseSensitiveMagics: some(fpNone)
+      else: none(FoldPolicy)
+    # RFC-0009 F8: a case-sensitive-BY-MAGIC filesystem type still might be
+    # a per-directory casefold-enabled mount (`chattr +F`) — refine via the
+    # inode flag before trusting the magic as final. An UNKNOWN magic was
+    # already a genuine query failure before this fix and stays one: the
+    # refinement only ever turns a magic-based `fpNone` into `fpAsciiLower`,
+    # never manufactures an answer the magic itself didn't already give.
+    if magicAnswer.isNone: return magicAnswer
+    decodeLinuxCasefold(queryCasefoldFlag(rootAbs), magicAnswer)
 
 else:
   proc osQueryFoldPolicy(rootAbs: string): Option[FoldPolicy] =
@@ -693,74 +999,219 @@ proc flipAsciiCase(s: string): string =
     elif c >= 'A' and c <= 'Z': result[i] = char(ord(c) + 32)
     else: result[i] = c
 
-proc readOnlyFallback(rootAbs: string): Option[FoldPolicy] =
+proc fileIdentity*(path: string): Option[tuple[device: DeviceId, file: FileId]] =
+  ## Exported ONLY so tests/unit/test_fold_probe_tiers.nim (RFC-0009 F17)
+  ## can assert this helper's identity-vs-none behavior directly (a
+  ## dangling symlink, in particular) without routing through a whole
+  ## probe tier. Not part of the module's comparison or probe-entry
+  ## interface (`probeFoldPolicy` stays the sole production entry point).
+  ##
+  ## Best-effort OS file identity (device + file-id, via `os.getFileInfo`,
+  ## which follows symlinks by default — works identically on POSIX
+  ## `st_dev`/`st_ino` and Windows' volume-serial/file-index). `none` on ANY
+  ## failure: a dangling symlink, a permission race, or the path vanishing
+  ## between the caller's own existence check and this call. The caller
+  ## MUST treat `none` as "this candidate proves nothing," never silently
+  ## as "distinct" — RFC-0009 §3's "a probe that cannot answer honestly
+  ## returns none" applies one level down, inside a single tier, not only
+  ## at `probeFoldPolicy`'s own top level.
+  try:
+    some(getFileInfo(path).id)
+  except OSError:
+    none(tuple[device: DeviceId, file: FileId])
+
+proc readOnlyFallback*(rootAbs: string): Option[FoldPolicy] =
+  ## Exported ONLY for direct unit-testing of this tier in isolation
+  ## (RFC-0009 F17) — `probeFoldPolicy` stays the sole probe entry point
+  ## production code calls; tier 1 (the OS query) is always definitive on
+  ## every CI leg today, so this tier is otherwise unreachable from a test
+  ## driving `probeFoldPolicy` itself.
+  ##
   ## READ-ONLY fallback: if `rootAbs` already contains at least one
   ## directory entry with an ASCII letter in its name, stat it under a
   ## case-flipped spelling of its own name. No write, no create/stat race
-  ## window, answers definitively without ever requiring write access — the
+  ## window — answers definitively without ever requiring write access, the
   ## case a read-only milpa CAS dep root needs.
-  var chosen = ""
+  ##
+  ## RFC-0009 F6 fix: existence of the flipped spelling ALONE cannot
+  ## distinguish "the same file, seen through its case-flipped spelling"
+  ## from "two genuinely distinct files that happen to be case-flips of
+  ## each other" (a root containing both `A` and `a` — entirely legal on a
+  ## case-sensitive volume). Verified via OS file identity (`fileIdentity`
+  ## — device+file-id, symlink-following):
+  ##   flipped spelling ABSENT                  ⇒ case-sensitive, `fpNone`
+  ##     (unchanged — absence alone is unambiguous on either kind of
+  ##     volume, so this branch never needed an identity check).
+  ##   flipped spelling present, SAME identity  ⇒ case-insensitive,
+  ##     `fpAsciiLower` — the two spellings are literally one file.
+  ##   flipped spelling present, DIFFERENT identity ⇒ case-SENSITIVE,
+  ##     `fpNone`, and this PROVES it rather than merely defaulting to it:
+  ##     a case-INSENSITIVE volume can never let two directory entries
+  ##     differing only by ASCII case coexist as distinct files, so two
+  ##     genuinely distinct files at case-flipped spellings is possible
+  ##     ONLY on a case-sensitive volume.
+  ## An identity check that cannot be resolved honestly — the candidate's
+  ## own stat fails (a dangling symlink: existence and stat disagree), or
+  ## the flipped path's stat fails after `fileExists`/`dirExists` already
+  ## reported it present (a race) — proves nothing about either spelling;
+  ## this tier tries the next letter-bearing entry rather than guessing,
+  ## and returns `none` (falling through to tier 3) only once every
+  ## candidate has been exhausted that way.
+  var candidates: seq[string] = @[]
   try:
     for kind, entryPath in walkDir(rootAbs):
       let name = entryPath.extractFilename()
       if flipAsciiCase(name) != name:
-        chosen = name
-        break
+        candidates.add name
   except OSError:
     return none(FoldPolicy)
-  if chosen.len == 0: return none(FoldPolicy)
-  let flipped = flipAsciiCase(chosen)
-  let flippedPath = rootAbs / flipped
-  result = some(if fileExists(flippedPath) or dirExists(flippedPath): fpAsciiLower
-                else: fpNone)
+  for chosen in candidates:
+    let originalPath = rootAbs / chosen
+    let originalId = fileIdentity(originalPath)
+    if originalId.isNone:
+      continue  # dangling symlink / race on the candidate itself
+    let flipped = flipAsciiCase(chosen)
+    let flippedPath = rootAbs / flipped
+    if not (fileExists(flippedPath) or dirExists(flippedPath)):
+      return some(fpNone)
+    let flippedId = fileIdentity(flippedPath)
+    if flippedId.isNone:
+      continue  # existence check and stat disagree (race) -- try another
+    return some(if originalId.get == flippedId.get: fpAsciiLower else: fpNone)
+  none(FoldPolicy)
 
-when defined(posix) and not defined(macosx):
-  import std/posix   # macosx branch above already imported std/posix for pathconf
+var probeSuffixCache: string
+var probeSuffixCached = false
+  ## RFC-0009 F29: per-process cache for `probeRandomSuffix` below — computed
+  ## at most once per process, on first use, not at module-init time (so a
+  ## process that never reaches tier 3 never pays the `/dev/urandom` read).
 
-proc deviceIdOf(path: string): Option[uint64] =
-  ## Best-effort device identifier, used only to decide whether the
-  ## create-and-stat fallback may reuse `stateDir` (same volume as
-  ## `rootAbs`) or must fall back to `rootAbs` itself. `none` on any
-  ## failure (including "not posix") degrades to the safe choice at the
-  ## call site (rootAbs).
-  when defined(posix):
-    var s: Stat
-    if stat(cstring(path), s) == 0'i32: some(uint64(s.st_dev)) else: none(uint64)
-  else:
-    none(uint64)
+proc probeRandomSuffix(): string =
+  ## 8 bytes from `ioutils.readRandomBytes` (a `/dev/urandom` read on posix,
+  ## BCryptGenRandom-backed on windows via `std/sysrand`), hex-encoded to 16
+  ## lowercase ASCII hex characters, cached for the lifetime of this
+  ## process. `readRandomBytes` is best-effort and never raises; a short or
+  ## empty result degrades this to a shorter (or empty) suffix rather than
+  ## failing the probe outright — the PID component alone already appears
+  ## in the name, and `exclusiveCreate`'s `O_EXCL`/`CREATE_NEW` refusal
+  ## (not name-unpredictability) is the actual guarantee that a pre-placed
+  ## symlink can never be followed; the random suffix only narrows the
+  ## window in which a co-resident process could pre-place a symlink at
+  ## this exact PID's probe name BEFORE this process ever calls tier 3 —
+  ## PID alone is a small, densely-enumerable space on any OS, which is
+  ## exactly what a shared/redirected `CRISOL_STATE_DIR` (RFC-0009 review
+  ## F29) makes newly reachable via `cacheregistry.rootInsideStateDir`'s
+  ## `probeFoldPolicy(stateDir, stateDir)` call.
+  if not probeSuffixCached:
+    let raw = readRandomBytes(8)
+    var suffix = ""
+    for b in raw:
+      suffix.add toHex(BiggestInt(b), 2).toLowerAscii
+    probeSuffixCache = suffix
+    probeSuffixCached = true
+  probeSuffixCache
 
-proc sameVolume(a, b: string): bool =
-  let da = deviceIdOf(a)
-  let db = deviceIdOf(b)
-  da.isSome and db.isSome and da.get == db.get
+proc probeBaseName*(): string =
+  ## Exported ONLY for direct unit-testing of this tier in isolation
+  ## (RFC-0009 F17/F29), same rationale as `readOnlyFallback*` above: a test
+  ## pre-places a symlink at exactly this name (the same name
+  ## `createAndStatFallback` will use in THIS process, since the random
+  ## component is cached per-process) to prove the exclusive-create refuses
+  ## it rather than following it.
+  "." & "crisol_fold_probe_" & $getCurrentProcessId() & "_" &
+    probeRandomSuffix() & ".tmp"
 
-proc createAndStatFallback(rootAbs, stateDir: string): Option[FoldPolicy] =
+proc createAndStatFallback*(rootAbs, stateDir: string): Option[FoldPolicy] =
+  ## Exported ONLY for direct unit-testing of this tier in isolation
+  ## (RFC-0009 F17), same rationale as `readOnlyFallback*` above.
+  ##
   ## LAST RESORT, only if the OS query is unsupported and the read-only
   ## fallback found no entry to test against (an empty root): a probe-file
   ## pair whose name carries a per-PROCESS-unique suffix — never a fixed
   ## name, which would race a concurrent run's create/stat window into a
-  ## false case-sensitive read. Housed in `stateDir` IFF stateDir is on the
-  ## same volume as `rootAbs`; otherwise an ignored dot-name file directly
-  ## in `rootAbs`, removed after.
+  ## false case-sensitive read.
+  ##
+  ## RFC-0009 F7 fix: the probe file is now created in `rootAbs` ITSELF,
+  ## unconditionally — never in `stateDir`. Case-sensitivity is a
+  ## PER-DIRECTORY property of the volume (§3's own rationale for probing
+  ## per-root at all: NTFS's case-sensitivity flag is set per directory,
+  ## not per volume), so a pre-fix version of this tier that housed the
+  ## probe file in `stateDir` "when it's on the same volume as `rootAbs`"
+  ## was unsound even in that same-volume case — `stateDir` and `rootAbs`
+  ## can sit on one volume yet carry DIFFERENT per-directory NTFS flags,
+  ## and reporting `stateDir`'s answer as `rootAbs`'s policy silently
+  ## answers for the wrong directory. `stateDir` stays a parameter — this
+  ## proc's exported caller (`probeFoldPolicy`) is a signature other
+  ## agents' in-flight call sites depend on — but tier 3 no longer reads it
+  ## for directory selection at all.
+  ##
+  ## If `rootAbs` is not writable (a read-only root that also failed the
+  ## read-only fallback above — e.g. genuinely empty and read-only), this
+  ## tier now returns a genuine `none`: a probe failure that flows to the
+  ## caller's existing degraded/conservative pole (`initTrackedRoots`'s
+  ## D1/D2), never a guess and never another directory's answer standing
+  ## in for this one. `createDir(rootAbs)` below is a no-op when `rootAbs`
+  ## already exists (the overwhelmingly common case: a configured project
+  ## or dep root); it exists so a not-yet-created `stateDir`, probed here
+  ## as its OWN root by `cacheregistry.rootInsideStateDir`
+  ## (`probeFoldPolicy(stateDir, stateDir)` — a legitimate per-directory
+  ## use, not the wrong-directory bug this fix removes, since `rootAbs`
+  ## and `stateDir` are the SAME path in that call), still gets a
+  ## definitive answer on a project's very first run rather than a
+  ## spurious `none`.
   ##
   ## RFC-0009 A-degraded (D1): `none` means the probe GENUINELY failed (the
-  ## `writeFile` itself raised) — distinct from a definitive `some(fpNone)`
+  ## create itself failed) — distinct from a definitive `some(fpNone)`
   ## answer (the write succeeded and the case-flipped spelling was simply
   ## absent, a legitimate case-sensitive-volume verdict). Conflating the two
   ## under a bare `fpNone` return (the pre-D1 shape) hid a genuine probe
   ## failure behind the same value a real case-sensitive volume produces —
   ## the bug this Option-typed return exists to fix.
-  let unique = "crisol_fold_probe_" & $getCurrentProcessId()
-  let useStateDir = stateDir.len > 0 and sameVolume(rootAbs, stateDir)
-  let dir = if useStateDir: stateDir else: rootAbs
-  let baseName = if useStateDir: unique & ".tmp" else: "." & unique & ".tmp"
-  let lowerPath = dir / baseName
-  let upperPath = dir / flipAsciiCase(baseName)
+  ##
+  ## RFC-0009 F29 fix (round 3): two independent hardenings, since either
+  ## alone left a gap.
+  ##   1. UNPREDICTABLE NAME — `probeBaseName` (see its own doc comment)
+  ##      appends a per-process random suffix after the PID, so a
+  ##      co-resident process sharing this root (the CRISOL_STATE_DIR
+  ##      redirect `cacheregistry.rootInsideStateDir`'s
+  ##      `probeFoldPolicy(stateDir, stateDir)` call makes newly reachable)
+  ##      cannot pre-place a symlink at a name this process will actually
+  ##      use by simply enumerating the guessable PID space.
+  ##   2. EXCLUSIVE, SYMLINK-REFUSING CREATE — the probe file is opened via
+  ##      `ioutils.exclusiveCreate(_, noFollow = true)`
+  ##      (`O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` on posix, Win32 `CREATE_NEW`
+  ##      + a reparse-point pre/post-check on windows) instead of plain
+  ##      `writeFile`, which happily follows a pre-existing symlink and
+  ##      truncates whatever it targets. `O_EXCL` alone already makes this
+  ##      safe against a symlink specifically — POSIX `open(2)`: "If O_EXCL
+  ##      and O_CREAT are set, and path names a symbolic link, open() shall
+  ##      fail and set errno to [EEXIST]" — so hardening (1) is defense in
+  ##      depth (a smaller race window before the first probe call, not the
+  ##      thing that actually refuses the follow) on top of hardening (2)
+  ##      (the actual refusal), not a substitute for it: name
+  ##      unpredictability alone, without O_EXCL, would still let a symlink
+  ##      planted AFTER this process picks its name (a narrower but
+  ##      nonzero window between `probeBaseName()` and the open) get
+  ##      followed by a plain `writeFile`.
+  ##   `exclusiveCreate` returning `fd < 0` for ANY reason — including
+  ##   `alreadyExists` (the randomized exact name was squatted, or a
+  ##   symlink sits there) — is treated as a genuine probe failure and
+  ##   falls straight through to `none` below: never retried, never
+  ##   followed, never treated as "fall back to reading through it."
+  let baseName = probeBaseName()
+  let lowerPath = rootAbs / baseName
+  let upperPath = rootAbs / flipAsciiCase(baseName)
   result = none(FoldPolicy)
   try:
-    createDir(dir)
-    writeFile(lowerPath, "")
-    result = some(if fileExists(upperPath): fpAsciiLower else: fpNone)
+    createDir(rootAbs)
+    let (fd, _, _) = exclusiveCreate(lowerPath, noFollow = true)
+    if fd >= 0:
+      discard writeAllFd(fd, "")
+      closeFd(fd)
+      result = some(if fileExists(upperPath): fpAsciiLower else: fpNone)
+    # fd < 0 (EEXIST/ELOOP/other OS failure, including a pre-existing
+    # symlink at `lowerPath`) -- result stays none(FoldPolicy) above: the
+    # D1 degraded-conservative pole, never a retry and never a follow.
   except OSError:
     result = none(FoldPolicy)
   finally:
@@ -815,9 +1266,9 @@ var probeMemo: Table[string, Option[FoldPolicy]]
   ## degraded root stays degraded for the rest of this process, never
   ## silently re-probed into a lucky-second-try `some`.
 
-proc memoizedProbe(rootAbs, stateDir: string;
-                    probe: proc (rootAbs, stateDir: string): Option[FoldPolicy]):
-                    Option[FoldPolicy] =
+proc memoizedProbe*(rootAbs, stateDir: string;
+                     probe: proc (rootAbs, stateDir: string): Option[FoldPolicy]):
+                     Option[FoldPolicy] =
   ## The memo is a production hot-path optimization for the DEFAULT probe
   ## ONLY. An explicitly-injected non-default probe (the §3 Linux-testability
   ## seam) BYPASSES the memo entirely — both read and write — so an injected
@@ -827,6 +1278,13 @@ proc memoizedProbe(rootAbs, stateDir: string;
   ## the entry and silently defeat a later forced-policy injection against the
   ## same root — the memo ignoring probe identity is otherwise a footgun the
   ## advertised injectable seam cannot survive.
+  ##
+  ## Exported (RFC-0009 F31) so `cacheregistry.rootInsideStateDir` — which
+  ## probes `stateDir`'s own volume policy fresh on every `configuredCache`
+  ## call otherwise — shares this SAME per-process memo/bypass discipline
+  ## instead of re-probing per configured remote; the bypass-on-non-default
+  ## rule above already keeps that call site's injected-probe test seam
+  ## honored (never memoized, never poisoned by a prior real-probe call).
   if probe != probeFoldPolicy:
     return probe(rootAbs, stateDir)
   if probeMemo.hasKey(rootAbs):

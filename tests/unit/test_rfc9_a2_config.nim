@@ -199,6 +199,36 @@ suite "config — RFC-0009 A2: dep-root naming (R3-8)":
     check caught
     check kind == cekConfig
 
+  test "dep-root explicit empty name -> cekConfig":
+    ## BUG (verified): `name=""` used to sail through -- it collides
+    ## (case-insensitively, and in every other sense) with the RESERVED ""
+    ## name `paths.nim` uses for the project root itself: `keyBytes` would
+    ## emit an unparseable `dep:/rel` for a member under this root,
+    ## `rootsDescriptor` (depgraph.nim) would persist TWO `name: ""` header
+    ## entries, and `loadDepGraph`'s `currentFoldPolicy` would resolve this
+    ## dep root's name lookup to the PROJECT's fold policy instead of its
+    ## own. Reject empty exactly like the '/'/':' cases above.
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    let depParent = makeTmpDir()
+    defer: removeDir(depParent)
+    let depDir = depParent / "mydep"
+    createDir(depDir)
+
+    let cfgPath = writeFile(tmp, "crisol.kdl",
+      "dep-roots \"" & kdlPath(depDir) & "\" name=\"\"\n" &
+      "group \"unit\" { globs \"tests/unit/*.nim\" }\n")
+
+    var caught = false
+    var kind: CrisolErrorKind
+    try:
+      discard loadConfig(configPath = cfgPath)
+    except CrisolError as e:
+      caught = true
+      kind = e.kind
+    check caught
+    check kind == cekConfig
+
   test "dep-root name containing ':' -> cekConfig":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)

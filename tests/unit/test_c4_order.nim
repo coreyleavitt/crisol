@@ -46,12 +46,12 @@ proc ep(path: string): Entrypoint =
   testEp(path, group = "unit", flags = @[])
 
 proc epPaths(eps: seq[Entrypoint]): seq[string] =
-  eps.mapIt(it.tp.display())
+  eps.mapIt(string(it.tp.display()))
 
 proc pathSet(eps: seq[Entrypoint]): HashSet[string] =
   result = initHashSet[string]()
   for e in eps:
-    result.incl e.tp.display()
+    result.incl string(e.tp.display())
 
 proc freshStateDir(name: string): string =
   result = getTempDir() / ("crisol_c4_" & name)

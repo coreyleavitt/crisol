@@ -146,8 +146,38 @@ proc buildRunPlan*(
   # entrypoint whose persisted spelling case-differs post-rename (an unsound
   # miss). Full run = sound over-selection, the same posture an absent dep
   # graph already takes. Shard/order still run after (pessimize only).
+  # RFC-0009 "Risks accepted" NFC/NFD mitigation (docs/rfc/0009-path-
+  # identity.md, "Risks accepted" NFC/NFD bullet) — IMPLEMENTED here, not
+  # merely documented: a non-ASCII byte in the --changed changed-set's
+  # spelling, on a config where some tracked root actively folds, means the
+  # ASCII-only fold (`paths.fold`, `fpAsciiLower == toLowerAscii`) cannot be
+  # trusted to have deduped an NFC/NFD twin pair for that name — narrowing
+  # is skipped and the full discovered set runs instead, same posture as
+  # the `degraded` fallback just below. `narrow.foldUntrusted` is a
+  # deliberately SEPARATE, narrower signal than `cfg.trackedRoots.degraded`:
+  # every probe answered definitively this run (nothing genuinely failed),
+  # so only the narrowing decision is distrusted — NOT the cache
+  # (api.nim's `not cfg.trackedRoots.degraded` cache gates), NOT dep-graph
+  # persistence (RFC-0009 A-degraded D4/D5). fpNone-everywhere (Linux
+  # default): `narrow.anyRootFolds` is always false, so this is always
+  # false and costs one cheap scan of an (ordinarily empty) set.
+  let changedSetFoldUntrusted = foldUntrusted(changed, cfg.trackedRoots)
+  if changedSetFoldUntrusted:
+    planWarnings.add ConfigWarning(
+      source:  "",
+      context: "changed-set-fold",
+      key:     "nonAsciiChangedName",
+      message: "a non-ASCII name in the --changed changed set, on a " &
+               "config where some tracked root folds, cannot be trusted " &
+               "under crisol's ASCII-only fold (NFC/NFD risk -- see " &
+               "docs/rfc/0009-path-identity.md, \"Risks accepted\") -- " &
+               "narrowing skipped this run; running the full discovered " &
+               "set instead",
+    )
+
   var runnable = gated.run
-  if (useFailed or useChanged) and not cfg.trackedRoots.degraded:
+  if (useFailed or useChanged) and not cfg.trackedRoots.degraded and
+     not changedSetFoldUntrusted:
     let failedNarrowed =
       if useFailed:
         gated.run.filterIt((tp: it.tp, group: it.group) in failedKeys)  # RFC-0009 A3d-i: fold-aware failed-key membership (TrackedPath)

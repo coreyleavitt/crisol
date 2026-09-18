@@ -21,7 +21,7 @@
 ## two different policies for one root can no longer collide; the fake roots
 ## below nonetheless stay unique per test, which is clearer regardless.
 
-import std/[unittest, options, os, strutils, json]
+import std/[unittest, options, os, osproc, strutils, json]
 import crisol/paths
 import ../support/symlinkprobe
 
@@ -93,6 +93,36 @@ suite "TrackedPath == — fold semantics under an injected FoldPolicy":
     let b = tracked("/fake/proj-fold-h1/foo.nim", roots).get
     check a == b
     check hash(a) == hash(b)
+
+# ===========================================================================
+# fold() itself — ASCII-only, by design (F25). `fold(s, fpAsciiLower)` is
+# `toLowerAscii`-backed on purpose: bytes above the ASCII range (127) must
+# pass through byte-identically, never Unicode/locale-folded. A regression
+# that swapped `toLowerAscii` for `toLower` (locale-aware) would silently
+# reintroduce exactly the drift this RFC's fold policy exists to forbid —
+# and would NOT be caught by the fpAsciiLower vectors above, which only use
+# plain ASCII letters. Non-ASCII bytes here are UTF-8 multibyte sequences
+# for real letters (Ä, ß, É) spelled as their raw byte sequences, not
+# single Latin-1 code points — `fold` operates on bytes, not codepoints.
+# ===========================================================================
+
+suite "fold — ASCII-only folding (RFC-0009 A5c / F25)":
+
+  test "fpAsciiLower: non-ASCII bytes pass through untouched; adjacent ASCII folds":
+    let s = "A\xC3\x84b\xC3\x9fC\xC3\x89d"
+      # "A" + U+00C4 (Ä) + "b" + U+00DF (ß) + "C" + U+00C9 (É) + "d",
+      # Ä/ß/É each UTF-8-encoded as two bytes, all > 127.
+    let folded = fold(s, fpAsciiLower)
+    check folded == "a\xC3\x84b\xC3\x9fc\xC3\x89d"
+      # A->a, C->c fold; the six non-ASCII bytes are byte-identical.
+
+  test "fpAsciiLower: an all-non-ASCII string is entirely unchanged":
+    let s = "\xC3\x84\xC3\x9f\xC3\x89"  # "ÄßÉ"
+    check fold(s, fpAsciiLower) == s
+
+  test "fpNone: ASCII and non-ASCII bytes both pass through byte-identically":
+    let s = "A\xC3\x84b\xC3\x9fC\xC3\x89d"
+    check fold(s, fpNone) == s
 
 # ===========================================================================
 # toNative round-trip, including a deliberate >260-char path.
@@ -293,6 +323,81 @@ suite "classify — symlinked dep root (NativeRoot.realAbs)":
         check tp.display == "foo.nim"
 
 # ===========================================================================
+# RFC-0009 wiring-audit F18 — candidate-side 8.3 short-name expansion.
+#
+# `plausibly8Dot3` is pure text and cross-platform-testable directly. The
+# real EXPANSION (`safeExpandFilename` on a genuine Windows short name) only
+# ever fires on Windows CI -- on Linux, only the predicate and the fallback
+# WIRING inside `classify` are exercised, via an injected `expandCandidate`
+# (the same injectable-seam pattern `initTrackedRoots`'s `probe` parameter
+# uses for `FoldPolicy`), following the RFC-0009 macOS/Windows gotcha
+# playbook of proving wiring locally and noting the real-disk case as
+# untested-on-CI until a Windows leg runs it.
+# ===========================================================================
+
+suite "plausibly8Dot3 — the DOS short-name signature predicate":
+
+  test "detects a '~<digit>' component (the real RUNNER~1 shape)":
+    check plausibly8Dot3("C:/Users/RUNNER~1/project/foo.nim")
+
+  test "detects the signature in a non-final component":
+    check plausibly8Dot3("C:/PROGRA~1/vendor/foo.nim")
+
+  test "an ordinary path with no tilde does not trigger":
+    check (not plausibly8Dot3("C:/Users/runneradmin/project/foo.nim"))
+
+  test "a bare tilde with no trailing digit does not trigger (not the 8.3 shape)":
+    check (not plausibly8Dot3("/home/~backup/foo.nim"))
+
+  test "a tilde at the very end of a component (no digit follows) does not trigger":
+    check (not plausibly8Dot3("/home/foo~/bar.nim"))
+
+suite "classify — F18 candidate-side 8.3 expansion (injected expandCandidate)":
+
+  test "a short-name candidate under a long-form root resolves via the injected expander":
+    let roots = rootsWith("C:/Users/runneradmin/project", fpNone)
+    # Simulates GetFinalPathNameByHandleW resolving the 8.3 alias to its
+    # long form -- the wiring this test proves, not the real Windows call.
+    proc fakeExpand(p: string): string =
+      p.replace("RUNNER~1", "runneradmin")
+    let pc = classify("C:/Users/RUNNER~1/project/foo.nim", roots, fakeExpand)
+    check pc.kind == pcTracked
+    check pc.tp.isProject
+    check pc.tp.display == "foo.nim"
+
+  test "a short-name candidate under a dep root resolves via the injected expander":
+    let roots = rootsWith("C:/Users/runneradmin/project", fpNone,
+                           @[("mydep", "C:/Users/runneradmin/depsrc")])
+    proc fakeExpand(p: string): string =
+      p.replace("RUNNER~1", "runneradmin")
+    let pc = classify("C:/Users/RUNNER~1/depsrc/foo.nim", roots, fakeExpand)
+    check pc.kind == pcTracked
+    check (not pc.tp.isProject)
+    check pc.tp.display == "foo.nim"
+
+  test "an expander that cannot resolve the short name still degrades to pcOutside, never throws":
+    let roots = rootsWith("C:/Users/runneradmin/project", fpNone)
+    proc noopExpand(p: string): string = p   # safeExpandFilename's own "never raises" degrade: unchanged on failure
+    let pc = classify("C:/Users/RUNNER~1/project/foo.nim", roots, noopExpand)
+    check pc.kind == pcOutside
+
+  test "an ordinary candidate (no 8.3 signature) never invokes the expander at all — zero cost on the hot path":
+    let roots = rootsWith("C:/Users/runneradmin/project", fpNone)
+    proc explodingExpand(p: string): string =
+      doAssert false, "expandCandidate must not be called for a non-8.3-shaped candidate"
+      p
+    let pc = classify("C:/Users/runneradmin/project/foo.nim", roots, explodingExpand)
+    check pc.kind == pcTracked
+    check pc.tp.display == "foo.nim"
+
+  test "a short-name candidate that is genuinely outside every root stays pcOutside even after expansion":
+    let roots = rootsWith("C:/Users/runneradmin/project", fpNone)
+    proc fakeExpand(p: string): string =
+      p.replace("RUNNER~1", "runneradmin")
+    let pc = classify("C:/Users/RUNNER~1/elsewhere/foo.nim", roots, fakeExpand)
+    check pc.kind == pcOutside
+
+# ===========================================================================
 # The dep:* keyBytes escape (Linux-only: a colon-containing filename can't
 # exist on NTFS).
 # ===========================================================================
@@ -364,6 +469,20 @@ suite "fromCanonical — canonical-text shape validation":
   test "rejects a leading backslash":
     let roots = rootsWith("/fake/proj-fc3", fpNone)
     check fromCanonical("\\foo\\bar.nim", roots).isNone
+
+  test "RFC-0009 wiring-audit F15: rejects an EMBEDDED backslash mid-segment":
+    ## Un-reduced native Windows text ("sub\file.nim") handed to
+    ## `fromCanonical` instead of `classify`/`nativeCanonicalize` must be
+    ## rejected exactly like a leading backslash is -- `nativeCanonicalize`
+    ## treats a backslash as a separator UNIVERSALLY, host-agnostically (its
+    ## own doc comment: "identity is textual, not platform-conditional"), so
+    ## no `rel` `classify` ever legitimately constructs can contain a literal
+    ## backslash byte -- every backslash reaching this boundary is un-reduced
+    ## native text, never a real single-segment filename byte, regardless of
+    ## WHERE in the string it appears.
+    let roots = rootsWith("/fake/proj-fc3b", fpNone)
+    check fromCanonical("sub\\file.nim", roots).isNone
+    check fromCanonical("a/b\\c.nim", roots).isNone
 
   test "rejects a leading '/' (absolute form)":
     let roots = rootsWith("/fake/proj-fc4", fpNone)
@@ -452,6 +571,39 @@ suite "fromKeyBytes — the keyBytes grammar's inverse":
     check string(keyBytes(tp, roots)) == "./dep:foo/bar.nim"
     check fromKeyBytes(string(keyBytes(tp, roots)), roots).get == tp
 
+  test "BUG (verified): a tag-0 'dep:a:b/mod.nim' (colon in the pseudo-name) now round-trips through keyBytes/fromKeyBytes":
+    ## Before the fix: `looksLikeDepEscape` declined to escape this shape
+    ## (its first segment "dep:a:b" has a ':' after "dep:"), so `keyBytes`
+    ## emitted it BARE as "dep:a:b/mod.nim" -- indistinguishable, to
+    ## `fromKeyBytes`, from a real dep-root member. `fromKeyBytes` parsed
+    ## a "name" of "a:b", rejected it for containing ':', and returned
+    ## `none` -- silently dropping a real project file from a persisted
+    ## closure (unsound under-selection).
+    let roots = rootsWith("/fake/proj-fkb2b", fpNone)
+    let tp = tracked("/fake/proj-fkb2b/dep:a:b/mod.nim", roots).get
+    check tp.isProject
+    let bytes = string(keyBytes(tp, roots))
+    check bytes == "./dep:a:b/mod.nim"
+    check fromKeyBytes(bytes, roots).get == tp
+
+  test "BUG (verified): a tag-0 'dep:/x.nim' (empty pseudo-name) now round-trips through keyBytes/fromKeyBytes":
+    ## Same defect, other malformed shape: "dep:" alone (empty "name" half)
+    ## used to be emitted bare too.
+    let roots = rootsWith("/fake/proj-fkb2c", fpNone)
+    let tp = tracked("/fake/proj-fkb2c/dep:/x.nim", roots).get
+    check tp.isProject
+    let bytes = string(keyBytes(tp, roots))
+    check bytes == "./dep:/x.nim"
+    check fromKeyBytes(bytes, roots).get == tp
+
+  test "a tag-0 well-formed-looking 'dep:x/y.nim' still round-trips (regression: the widened escape doesn't disturb the already-correct case)":
+    let roots = rootsWith("/fake/proj-fkb2d", fpNone)
+    let tp = tracked("/fake/proj-fkb2d/dep:x/y.nim", roots).get
+    check tp.isProject
+    let bytes = string(keyBytes(tp, roots))
+    check bytes == "./dep:x/y.nim"
+    check fromKeyBytes(bytes, roots).get == tp
+
   test "a real dep-root member round-trips to its OWN root tag, not tag 0":
     let roots = rootsWith("/fake/proj-fkb3", fpNone,
                            @[("mydep", "/fake/dep-fkb3")])
@@ -469,12 +621,21 @@ suite "fromKeyBytes — the keyBytes grammar's inverse":
                            @[("mydep", "/fake/dep-fkb4")])
     check fromKeyBytes("dep:goneDep/src/foo.nim", roots).isNone
 
-  test "malformed dep: text (empty name) degrades to none":
+  test "a BARE, unescaped 'dep:/x' (empty name) degrades to none -- old-format data or corruption, never a live round trip":
+    ## RFC-0009 wiring-audit fix: `looksLikeDepEscape` now escapes EVERY
+    ## tag-0 rel whose first segment starts with "dep:", including this
+    ## empty-name shape -- a HEALTHY `keyBytes` never emits this bare
+    ## spelling any more (see the "escaped dep:/x round-trips" test
+    ## below for what it emits instead: "./dep:/x"). A bare, unescaped
+    ## occurrence arriving here can therefore only mean pre-fix persisted
+    ## data or genuine corruption -- `none` is still the right, degrade-
+    ## never-crash answer for both.
     let roots = rootsWith("/fake/proj-fkb5", fpNone,
                            @[("mydep", "/fake/dep-fkb5")])
     check fromKeyBytes("dep:/x", roots).isNone
 
-  test "malformed dep: text (colon inside the name) degrades to none":
+  test "a BARE, unescaped 'dep:a:b/x' (colon in the name) degrades to none -- old-format data or corruption, never a live round trip":
+    ## Same reasoning as the empty-name case directly above.
     let roots = rootsWith("/fake/proj-fkb6", fpNone,
                            @[("mydep", "/fake/dep-fkb6")])
     check fromKeyBytes("dep:a:b/x", roots).isNone
@@ -521,6 +682,25 @@ suite "initTrackedRoots — injected probe bypasses the per-process memo":
     let second = rootsWith(root, fpAsciiLower)
     check second.project.foldPolicy == fpAsciiLower
 
+# ===========================================================================
+# TrackedRoots.populated() — the cacheregistry fail-closed sentinel (F26).
+# `cacheregistry.configuredCache` is the one consumer: a `false` result
+# means "this `TrackedRoots` was never actually built by `initTrackedRoots`"
+# (a hand-built/malformed `Config` skipped roots resolution entirely), and
+# it fails closed on any `file://` remote rather than guessing a fold
+# policy. See `populated`'s own doc comment in paths.nim.
+# ===========================================================================
+
+suite "TrackedRoots.populated() — the cacheregistry fail-closed sentinel":
+
+  test "a bare zero-value TrackedRoots() is NOT populated":
+    let roots = TrackedRoots()
+    check not roots.populated()
+
+  test "a TrackedRoots built by initTrackedRoots IS populated":
+    let roots = rootsWith("/fake/proj-populated", fpNone)
+    check roots.populated()
+
 suite "isUnderRoot — the sanctioned root-membership primitive":
 
   test "the root itself is a member (container == root)":
@@ -545,3 +725,50 @@ suite "isUnderRoot — the sanctioned root-membership primitive":
     check isUnderRoot("C:\\proj\\a\\b.nim", "C:/proj")
     check isUnderRoot("C:/proj/a/b.nim", "C:\\proj")
     check not isUnderRoot("C:\\proj-old\\a", "C:/proj")
+
+# ===========================================================================
+# DisplayPath — the compiler-enforced seal (RFC-0009 wiring-audit F12).
+#
+# `display(tp)` returns `DisplayPath` (distinct string), not `string`, so
+# the PRODUCTION INVARIANT `toNative` is the sole sanctioned I/O inverse
+# (paths.nim's own doc comment on `toNative`) is now a TYPE ERROR to
+# violate, not a convention a textual scan could never fully enforce. This
+# suite makes that assertion executable: every I/O proc the invariant names
+# must REFUSE a bare `display()` result, and the documented escape hatch
+# (`string(...)`) must still work.
+# ===========================================================================
+
+suite "DisplayPath — display() is compiler-sealed against direct I/O use":
+
+  test "a bare display() result does not compile against any I/O proc":
+    var tp: TrackedPath
+    check not compiles(readFile(display(tp)))
+    check not compiles(open(display(tp)))
+    check not compiles(fileExists(display(tp)))
+    check not compiles(execProcess(display(tp)))
+    check not compiles(absolutePath(display(tp)))
+
+  test "F36: display() deliberately has no $ or & — pinned, not just documented":
+    # `DisplayPath`'s doc comment in paths.nim states `$`/`&` are
+    # deliberately NOT provided (either would be exactly as low-friction as
+    # `toNative` at an I/O call site while being far less greppable than
+    # the `string(...)` escape hatch). Nothing previously pinned that
+    # omission executably — a future overload added elsewhere (a stray
+    # generic, a borrow, a converter) could silently reopen it. `DisplayPath`
+    # has no borrowed/hand-written `$` and no `converter` anywhere in
+    # paths.nim (checked directly above), so these three must fail to
+    # compile for the right reason — "no matching `$`/`&` overload for a
+    # distinct, non-string, non-convertible type" — not by some accidental
+    # generic/converter match.
+    var tp: TrackedPath
+    check not compiles($display(tp))
+    check not compiles(display(tp) & "x")
+    check not compiles("x" & display(tp))
+
+  test "the explicit string(...) escape hatch still compiles":
+    var tp: TrackedPath
+    check compiles(readFile(string(display(tp))))
+    check compiles(open(string(display(tp))))
+    check compiles(fileExists(string(display(tp))))
+    check compiles(execProcess(string(display(tp))))
+    check compiles(absolutePath(string(display(tp))))

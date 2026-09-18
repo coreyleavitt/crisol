@@ -36,7 +36,7 @@ type MockState = ref object
 proc mockSeams(ms: MockState): CacheSeams =
   legacySeams(
     keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
-             SoundnessKey("mk-" & pep.ep.tp.display()),
+             SoundnessKey("mk-" & string(pep.ep.tp.display())),
     load = proc(key: SoundnessKey): Option[CachedResult] =
              inc ms.loadCalls
              if ($key) in ms.store: some(ms.store[$key])
@@ -559,7 +559,7 @@ type RaceState = ref object
 proc raceSeams(rs: RaceState; passResult: CachedResult): CacheSeams =
   legacySeams(
     keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
-             SoundnessKey("mk-" & pep.ep.tp.display()),
+             SoundnessKey("mk-" & string(pep.ep.tp.display())),
     load = proc(key: SoundnessKey): Option[CachedResult] =
              inc rs.loadCalls
              if rs.planted:

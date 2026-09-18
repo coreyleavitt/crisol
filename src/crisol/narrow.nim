@@ -20,7 +20,7 @@
 ## represents "the graph was never built or was invalidated wholesale".  A
 ## graph with entries but no key for *this* ep is "unknown closure".
 
-import std/[options, sets, strutils, tables]
+import std/[sets, strutils, tables]
 import crisol/types
 import crisol/depgraph
 import crisol/paths
@@ -71,7 +71,7 @@ proc selectByDiff*(eps: seq[Entrypoint];
       result.add (ep: ep, reason: srOwnFileChanged)
       continue
 
-    let key = (ep.tp.display(), flagHash(ep.flags))
+    let key = entryKey(ep.tp, ep.flags)
 
     # Rule 3: no entry in graph for this key → unknown closure.
     if key notin graph.entries:
@@ -161,3 +161,74 @@ proc narrowByDiff*(eps: seq[Entrypoint];
   result = newSeq[Entrypoint]()
   for item in detailed:
     result.add item.ep
+
+# ---------------------------------------------------------------------------
+# Public: NFC/NFD changed-set fold-trust lever (RFC-0009 "Risks accepted")
+# ---------------------------------------------------------------------------
+##
+## docs/rfc/0009-path-identity.md, "Risks accepted" (NFC/NFD bullet): the
+## fold is deliberately ASCII-only (`paths.fold`, `fpAsciiLower ==
+## toLowerAscii`). On a folding root, HFS+/APFS-style Unicode normalization
+## (NFC vs NFD) can make a `--changed` diff name and the on-disk spelling of
+## the SAME file fold to two DISTINCT `TrackedPath`s — a silent
+## under-selection the ASCII fold cannot see, because the two byte
+## sequences never compare equal under `toLowerAscii` either. The accepted
+## mitigation: when the changed set contains a non-ASCII name AND some
+## tracked root actually folds, do not trust fold-based narrowing for this
+## run at all — fall back to the full discovered set, mirroring the
+## conservative lever `pipeline.buildRunPlan` already applies for a
+## genuinely degraded probe (`TrackedRoots.degraded`).
+##
+## `foldUntrusted` is a SEPARATE, narrower signal than `degraded`: every
+## probe answered definitively here (nothing failed) — only the *diff-driven
+## narrowing decision* is untrusted for this run, not the probe, the cache,
+## or dep-graph persistence. Setting `TrackedRoots.degraded` instead would
+## have piggy-backed on unrelated behavior (cache bypass, no depgraph
+## persist — RFC-0009 A-degraded D4/D5) that this residual risk does not
+## warrant.
+
+proc changedSetHasNonAscii*(changed: HashSet[TrackedPath]): bool =
+  ## True iff some member of `changed` has a non-ASCII byte anywhere in its
+  ## stored spelling (`display`, the real-case, root-relative spelling —
+  ## RFC-0009 A1).
+  ##
+  ## Deliberately checks the ALREADY-REDUCED `TrackedPath`, not the raw git
+  ## diff name string: `gitdiff.reduceChangedName` (`fromCanonical`/
+  ## `classify`) only decides WHICH tracked root a name falls under — it
+  ## never strips, re-encodes, or otherwise transforms a byte of the name
+  ## — so this is byte-for-byte equivalent to scanning the raw diff name,
+  ## with one deliberate difference that is exactly the desired scoping: a
+  ## name that resolves OUTSIDE every tracked root never becomes a
+  ## `TrackedPath` at all (`gitdiff.reduceChangedName` drops it), so it can
+  ## never spuriously trigger this lever. Over-triggering on a genuinely
+  ## unrelated non-ASCII name elsewhere in the repo is therefore not
+  ## possible — only names within a tracked root's textual reach count.
+  for tp in changed:
+    for ch in string(display(tp)):
+      if ord(ch) > 127:
+        return true
+  false
+
+proc anyRootFolds*(roots: TrackedRoots): bool =
+  ## True iff the project root or any configured dep root has an active
+  ## (non-`fpNone`) fold policy. On the Linux default (every root
+  ## genuinely case-sensitive, `fpNone` everywhere) this is always false,
+  ## so `foldUntrusted` below is always false too — zero behavior change,
+  ## one cheap enum comparison per root.
+  if roots.project.foldPolicy != fpNone:
+    return true
+  for d in roots.deps:
+    if d.foldPolicy != fpNone:
+      return true
+  false
+
+proc foldUntrusted*(changed: HashSet[TrackedPath]; roots: TrackedRoots): bool =
+  ## PURE: true iff the accepted NFC/NFD mitigation should force a full run
+  ## instead of trusting fold-based `--changed` narrowing this run — i.e.
+  ## `changed` carries a non-ASCII name AND some tracked root actually
+  ## folds. See the section doc comment above for the full rationale and
+  ## why this is a separate signal from `TrackedRoots.degraded`.
+  ##
+  ## Safe to call unconditionally (including when `--changed` was never
+  ## requested): an empty `changed` set always answers false.
+  anyRootFolds(roots) and changedSetHasNonAscii(changed)

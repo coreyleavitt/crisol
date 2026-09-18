@@ -147,7 +147,7 @@ proc renderPlan*(plan: RunPlan; gatedOut: seq[GatedEntry];
         if pep.ep.flags.len > 0:
           col("  " & sanitizeControlBytes(pep.ep.flags.join(" ")), Ansi_Dim, color)
         else: ""
-      buf.add "  " & sanitizeControlBytes(pep.ep.tp.display()) &
+      buf.add "  " & sanitizeControlBytes(string(pep.ep.tp.display())) &
               col("  [" & sanitizeControlBytes(pep.ep.group) & "]", Ansi_Dim, color) &
               flagsCol &
               "  " & labelCol & "\n"
@@ -203,7 +203,7 @@ proc planToJson*(plan: RunPlan; gatedOut: seq[GatedEntry];
   let entrypointsNode = newJArray()
   for pep in plan.entrypoints:
     let epNode = newJObject()
-    epNode["path"]         = newJString(pep.ep.tp.display())
+    epNode["path"]         = newJString(string(pep.ep.tp.display()))
     epNode["group"]        = newJString(pep.ep.group)
     # rev 3 (issue #10): effective flags identify the leg — (path, flags) is
     # the entrypoint identity, and the same path under two groups with

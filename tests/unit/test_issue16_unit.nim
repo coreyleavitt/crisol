@@ -16,7 +16,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_issue16_unit.nim
 
-import std/[algorithm, json, os, sets, strutils, tables, unittest]
+import std/[algorithm, json, options, os, sets, strutils, tables, unittest]
 import crisol/types
 import crisol/paths
 import crisol/closure    # ExternalSource, CompileInputs, extractCompileInputs,
@@ -27,21 +27,38 @@ import crisol/depgraph    # DepGraph, updateEntry, saveDepGraph,
                           # DepGraphFormatVersion, depgraphPath, flagHash
 import crisol/fnv         # chainedContentHash
 
-proc headerPairs(headers: seq[string]; root: string): seq[tuple[key: string; nativePath: string]] =
-  ## RFC-0009 A5a: `chainedContentHash` now takes (key, nativePath) pairs.
-  ## Headers are project-relative strings (not `TrackedPath`) — mirrors
-  ## `closure.nim`'s own headersHash pair derivation exactly.
+proc headerPairs(headers: seq[string]; roots: TrackedRoots): seq[tuple[key: string; nativePath: string]] =
+  ## RFC-0009 A5a/F13: `chainedContentHash` takes (key, nativePath) pairs.
+  ## Headers are portable `paths.keyBytes` spellings (never `TrackedPath`
+  ## directly, and — post-F13 — never a raw absolute/project-relative
+  ## native path either, even for a dep-root header) — mirrors
+  ## `closure.nim`'s own headersHash pair derivation exactly: KEY is the
+  ## spelling itself, `nativePath` is recovered via `fromKeyBytes`->
+  ## `toNative` at this one point of I/O.
   for h in headers:
-    result.add((key: h, nativePath: (if h.isAbsolute: h else: root / h)))
+    let tp = fromKeyBytes(h, roots)
+    doAssert tp.isSome, "test helper: header spelling failed to resolve: " & h
+    result.add((key: h, nativePath: toNative(tp.get, roots)))
 
 proc tpOf(p: string; roots: TrackedRoots): TrackedPath =
   ## RFC-0009 A4b: `CompileInputs.files` is now `HashSet[TrackedPath]`.
-  ## Classify a project-relative or dep-root-absolute spelling (exactly the
-  ## strings `closureMemberSpelling` used to produce pre-A4b) against the
-  ## test's REAL `trackedRoots` — never a hand-computed identity.
+  ## Classify a project-relative or dep-root-absolute NATIVE spelling
+  ## (a path the test itself authored, never a production `keyBytes`
+  ## string already produced by `closureMemberSpelling` — see `fromSpelling`
+  ## below for that case) against the test's REAL `trackedRoots` — never a
+  ## hand-computed identity.
   let pc = classify(p, roots)
   doAssert pc.kind == pcTracked, "test path failed to classify: " & p
   pc.tp
+
+proc fromSpelling(s: string; roots: TrackedRoots): TrackedPath =
+  ## RFC-0009 F13: the counterpart to `tpOf` for a string that is ALREADY a
+  ## production `paths.keyBytes` spelling (e.g. one of `ExternalSource.
+  ## headers`, post-F13) — `classify`/`tpOf` would misparse a `dep:<name>/
+  ## <rel>` spelling as native text; `fromKeyBytes` is its actual inverse.
+  let tp = fromKeyBytes(s, roots)
+  doAssert tp.isSome, "test spelling failed to resolve: " & s
+  tp.get
 
 proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
   ## RFC-0009 A3c-ii: `DepGraphEntry.closure` is now `HashSet[TrackedPath]`.
@@ -171,17 +188,26 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
     check ext.obj == "@mnative@sadd.c.o"
     check ext.source == "native/add.c"
 
-    var expectedHeaders = @["native/add.h", "native/other.h", p.vendorH.normalizedPath]
+    # RFC-0009 F13: the dep-root header (vendor.h) now spells portable —
+    # `paths.keyBytes`, e.g. "dep:dep/vendor.h" — never its absolute native
+    # path. Derived via production's own ingestion path (`tpOf` -> classify
+    # -> `keyBytes`), never hand-typed.
+    let vendorTp = tpOf(p.vendorH, cfg.trackedRoots)
+    var expectedHeaders = @["native/add.h", "native/other.h",
+                            string(keyBytes(vendorTp, cfg.trackedRoots))]
     expectedHeaders.sort()
     check ext.headers == expectedHeaders
     check "/usr/include/stdint.h" notin ext.headers   # system header excluded
 
-    check ext.headersHash == chainedContentHash(headerPairs(ext.headers, p.root))
+    check ext.headersHash == chainedContentHash(headerPairs(ext.headers, cfg.trackedRoots))
 
     # files ⊇ headers ∪ source
     check tpOf("native/add.c", cfg.trackedRoots) in inputs.files
     for h in ext.headers:
-      check tpOf(h, cfg.trackedRoots) in inputs.files
+      # RFC-0009 F13: `h` is already a production `keyBytes` spelling —
+      # `fromSpelling` (its inverse), never `tpOf` (which would misparse a
+      # `dep:<name>/<rel>` spelling as native text).
+      check fromSpelling(h, cfg.trackedRoots) in inputs.files
 
   test "dedup: the same header reported both relative and absolute appears once":
     let p = setupExtProject("dedup")
@@ -257,7 +283,7 @@ suite "extractCompileInputs — cached external (carried-forward headers)":
     check inputs.externals[0].headers == @["native/add.h"]
     # headersHash is always FRESHLY computed from the carried headers'
     # current content, never the carried record's own (possibly stale) hash.
-    check inputs.externals[0].headersHash == chainedContentHash(headerPairs(@["native/add.h"], p.root))
+    check inputs.externals[0].headersHash == chainedContentHash(headerPairs(@["native/add.h"], cfg.trackedRoots))
 
   test "no matching compile entry, no carried record: raises CrisolError cekEnvironment naming the source":
     let p = setupExtProject("nocarry")
@@ -395,12 +421,13 @@ suite "staleExternalObjects (issue #16 slice 1b)":
     createDir(root / ".crisol")
     writeFile(root / "native" / "add.h", "// add.h v1\n")
     writeFile(root / "native" / "other.h", "// other.h v1\n")
+    let roots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
 
     var g = initDepGraph("2.2.10")
     let path = "tests/t.nim"
     let fh = flagHash(@[])
-    let hashAdd = chainedContentHash(headerPairs(@["native/add.h"], root))
-    let hashOther = chainedContentHash(headerPairs(@["native/other.h"], root))
+    let hashAdd = chainedContentHash(headerPairs(@["native/add.h"], roots))
+    let hashOther = chainedContentHash(headerPairs(@["native/other.h"], roots))
     let externals = @[
       ExternalSource(source: "native/add.c", obj: "objAdd.o",
                      headers: @["native/add.h"], headersHash: hashAdd),
@@ -409,16 +436,16 @@ suite "staleExternalObjects (issue #16 slice 1b)":
     ]
     updateEntry(g, path, fh, tpSet("tests/t.nim"), "ch", 1, externals)
 
-    check staleExternalObjects(g, path, @[], root).len == 0
+    check staleExternalObjects(g, path, @[], roots).len == 0
 
     writeFile(root / "native" / "add.h", "// add.h v2 EDITED\n")
-    check staleExternalObjects(g, path, @[], root) == @["objAdd.o"]
+    check staleExternalObjects(g, path, @[], roots) == @["objAdd.o"]
 
     writeFile(root / "native" / "add.h", "// add.h v1\n")   # restore
-    check staleExternalObjects(g, path, @[], root).len == 0
+    check staleExternalObjects(g, path, @[], roots).len == 0
 
     removeFile(root / "native" / "other.h")
-    check staleExternalObjects(g, path, @[], root) == @["objOther.o"]
+    check staleExternalObjects(g, path, @[], roots) == @["objOther.o"]
 
   test "headersHash == '' -> always stale regardless of content match; no entry for the key -> empty":
     let root = freshRoot("stale_edge")
@@ -427,11 +454,12 @@ suite "staleExternalObjects (issue #16 slice 1b)":
     createDir(root / ".crisol")
     writeFile(root / "native" / "add.h", "// add.h v1\n")
     writeFile(root / "native" / "other.h", "// other.h v1\n")
+    let roots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
 
     var g = initDepGraph("2.2.10")
     let path = "tests/t.nim"
     let fh = flagHash(@[])
-    let hashOther = chainedContentHash(headerPairs(@["native/other.h"], root))
+    let hashOther = chainedContentHash(headerPairs(@["native/other.h"], roots))
     let externals = @[
       ExternalSource(source: "native/add.c", obj: "objAdd.o",
                      headers: @["native/add.h"], headersHash: ""),
@@ -440,11 +468,11 @@ suite "staleExternalObjects (issue #16 slice 1b)":
     ]
     updateEntry(g, path, fh, tpSet("tests/t.nim"), "ch", 1, externals)
 
-    let stale = staleExternalObjects(g, path, @[], root)
+    let stale = staleExternalObjects(g, path, @[], roots)
     check "objAdd.o" in stale
     check "objOther.o" notin stale
 
-    check staleExternalObjects(g, "tests/nokey.nim", @[], root).len == 0
+    check staleExternalObjects(g, "tests/nokey.nim", @[], roots).len == 0
 
 # ---------------------------------------------------------------------------
 # 9: isModuleObjectName

@@ -56,11 +56,14 @@ const AllowedPosixFiles = [
     # posix use, same rationale as the other allow-listed files here.
   "crisol/paths.nim",
     # RFC-0009 A1: `probeFoldPolicy`'s OS-query step (macOS `pathconf`
-    # _PC_CASE_SENSITIVE) and the create-and-stat fallback's `sameVolume`
-    # device-id check (`posix.stat`'s `st_dev`) are CAPABILITY QUERIES, not
-    # raw file I/O — outside `ioutils`'s remit (open/write/close/atomic
-    # publish), same rationale as `lock/posix.nim`'s direct `flock` use
-    # above.
+    # _PC_CASE_SENSITIVE) is a CAPABILITY QUERY, not raw file I/O — outside
+    # `ioutils`'s remit (open/write/close/atomic publish), same rationale
+    # as `lock/posix.nim`'s direct `flock` use above. (F7 fix, RFC-0009
+    # review ledger: the create-and-stat fallback's `sameVolume`/`deviceIdOf`
+    # same-volume-shortcut this comment used to describe is REMOVED —
+    # tier 3 now always probes `rootAbs` itself, never `stateDir` standing
+    # in for it — so this file's only remaining direct `std/posix` use is
+    # the macOS `pathconf` call.)
 ]
 
 proc allNimFiles(): seq[string] =

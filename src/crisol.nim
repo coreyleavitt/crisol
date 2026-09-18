@@ -1232,7 +1232,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         if isCacheMissDecision(r.cacheDecision):
           for blk in explainMissLines(r.keyDiff, explainMissVerboseFlag):
             for physLine in blk.splitLines():
-              stderr.write("crisol: " & r.ep.tp.display() & ": explain: " & physLine & "\n")
+              stderr.write("crisol: " & string(r.ep.tp.display()) & ": explain: " & physLine & "\n")
     # RFC-0005 B2b: same routing rule -- the cache-stats summary line is
     # exactly such a human line; the structured data lives in the
     # `cacheStats` field below instead.

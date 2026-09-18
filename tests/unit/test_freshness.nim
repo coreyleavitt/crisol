@@ -84,7 +84,7 @@ proc recordEntry(graph: var DepGraph; ep: Entrypoint; config: Config;
   # suite exists to pin.
   let contentHash = closureContentHash(closureHashInputs(closureSet, config.trackedRoots))
   let fHash = flagHash(ep.flags)
-  graph.updateEntry(ep.tp.display(), fHash, closureSet, contentHash, protocolMajor)
+  graph.updateEntry(string(ep.tp.display()), fHash, closureSet, contentHash, protocolMajor)
 
 # ---------------------------------------------------------------------------
 # Suite: closureContentHash
@@ -238,7 +238,7 @@ suite "decideCompile — binary freshness logic":
       doAssert pc.kind == pcTracked, "test closure file failed to classify: " & p
       closureSet.incl pc.tp
     let fHash = flagHash(ep.flags)
-    g.updateEntry(ep.tp.display(), fHash, closureSet, "aaaaaaaaaaaaaaaa", CrisolProtocolMajor)
+    g.updateEntry(string(ep.tp.display()), fHash, closureSet, "aaaaaaaaaaaaaaaa", CrisolProtocolMajor)
 
     let (decision, reason) = decideCompile(ep, g, cfg, "2.2.10", false, CrisolProtocolMajor)
     check decision == cdStale

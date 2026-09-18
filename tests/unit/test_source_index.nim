@@ -531,7 +531,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
         foundDep = true
     check foundDep
     let depSpelling =
-      if isProject(depMember): display(depMember)
+      if isProject(depMember): string(display(depMember))
       else: toNative(depMember, cfg.trackedRoots)
     check depSpelling.endsWith("dep/src/dep.nim")
 

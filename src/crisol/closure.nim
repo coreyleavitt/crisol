@@ -180,10 +180,15 @@
 ## `{.compile.}` object, and a non-absolute `{.link.}` entry — both name a
 ## `link` member `extractClosure` cannot attribute to any source file.
 
-import std/[algorithm, json, os, pathnorm, sets, strutils, tables]
+import std/[algorithm, json, options, os, pathnorm, sets, strutils, tables]
 import crisol/types
 import crisol/paths    # RFC-0009 A4a: classify/TrackedPath/PathClass/display/toNative
-                        # — the index/relativize identity layer, below.
+                        # — the index/relativize identity layer, below. RFC-0009
+                        # F13 adds keyBytes/fromKeyBytes — the portable
+                        # externals-surface spelling (closureMemberSpelling)
+                        # and its inverse (extractCompileInputs' header
+                        # nativePath conversion) — hence `std/options` above,
+                        # for `Option[TrackedPath]`'s `isSome`/`isNone`/`get`.
 import crisol/config   # for stateDirOf — the source-index walk prunes it
 import crisol/ccprobe  # for RunProc/realRun/deriveCcMInvocation/ccIncludeHeaders
                         # (issue #16) — a true leaf module (std-only), so this
@@ -587,22 +592,30 @@ proc addUnique(result: var seq[string]; seen: var HashSet[string];
       result.add cand
 
 proc closureMemberSpelling(tp: TrackedPath; roots: TrackedRoots): string =
-  ## RFC-0009 A4b: post-retype, `extractClosure`/`extractCompileInputs`
-  ## return `TrackedPath` directly — this helper is no longer used at
-  ## THAT boundary. It survives for the two remaining string-spelling
-  ## needs inside `extractCompileInputs`: `AnalyzedExternal.source` (a
-  ## plain `string` field, unretyped — see its type doc) and
-  ## `ExternalSource.headers: seq[string]` (the persisted/wire header
-  ## list, also unretyped this slice). Project (tag-0) members spell as
-  ## their project-relative rel (`display`); dep-root members spell as
-  ## their ABSOLUTE native path (`toNative`) — see `fromCanonical`/
-  ## `classify`'s doc comments for why a dep-root member must spell
-  ## absolute to round-trip soundly through a later bare-string
-  ## `classify` call (still relevant to any caller that persists one of
-  ## these strings and reclassifies it later, e.g. a carried-forward
-  ## `ExternalSource.headers` entry read back via `index.tracked`).
-  if isProject(tp): display(tp)
-  else: toNative(tp, roots)
+  ## RFC-0009 A4b/F13: post-A4b-retype, `extractClosure`/`extractCompileInputs`
+  ## return `TrackedPath` directly — this helper is no longer used at THAT
+  ## boundary. It survives for the two remaining string-spelling needs
+  ## inside `extractCompileInputs`: `AnalyzedExternal.source` (a plain
+  ## `string` field — see its type doc) and `ExternalSource.headers:
+  ## seq[string]` (the persisted/wire header list). `ExternalSource.source`
+  ## is filled from `AnalyzedExternal.source` verbatim, so this proc is
+  ## effectively both fields' single spelling site.
+  ##
+  ## F13 (finding F13, wiring-audit): EVERY tracked member — project (tag-0)
+  ## AND dep-root alike — now spells via `paths.keyBytes`, the same portable
+  ## wire grammar `depgraph`'s closure array already uses: a tag-0 rel
+  ## verbatim (plus the `./` `dep:`-escape), a dep-root member as
+  ## `dep:<name>/<rel>`. Pre-F13 this branched on `isProject` and spelled a
+  ## dep-root member as its ABSOLUTE NATIVE path (`toNative`) — the exact
+  ## machine-local-path leak RFC-0009 exists to kill: `ExternalSource.
+  ## headersHash`/`carriedBySource` keyed on that absolute path, so
+  ## relocating the checkout (or a dep root) silently invalidated
+  ## carry-forward and forced recompilation. A caller that needs to
+  ## actually OPEN the file (a `cc -M` header probe's `nativePath`,
+  ## `depgraph.staleExternalObjects`' content read) converts back via
+  ## `fromKeyBytes`->`toNative` at that ONE point of I/O — never here, and
+  ## never persisted native.
+  string(keyBytes(tp, roots))
 
 proc decodeBody(raw: string): string =
   ## Decode Nim's mangling escapes in the post-prefix mangled body string:
@@ -995,12 +1008,29 @@ type
   ExternalSource* = object
     ## One `{.compile.}`d C/C++ source of an entrypoint (single-path @m/@p/@n
     ## form, D3c — issue #11), plus the header set it `#include`s (issue #16).
-    source*:      string    ## project-relative, forward slashes
+    source*:      string    ## RFC-0009 F13: PORTABLE `paths.keyBytes`
+                             ## spelling (`closureMemberSpelling`) — a tag-0
+                             ## rel verbatim (plus the `./` `dep:`-escape) or
+                             ## `dep:<name>/<rel>` for a dep-root source.
+                             ## NEVER a machine-local absolute path (pre-F13:
+                             ## project members spelled project-relative, but
+                             ## dep-root members spelled their absolute
+                             ## native path — the leak F13 closes). Convert
+                             ## via `fromKeyBytes`->`toNative` at the point of
+                             ## I/O; never persist native.
     obj*:         string    ## object BASENAME inside the entrypoint's
                              ## nimcache, e.g. "@mnative@sadd.c.o"
-    headers*:     seq[string] ## project-relative, sorted, deduped; only
-                               ## tracked-root headers (system headers excluded)
-    headersHash*: string    ## chainedContentHash(headers, projectRoot)
+    headers*:     seq[string] ## RFC-0009 F13: same portable `keyBytes`
+                               ## spelling as `source`, sorted, deduped; only
+                               ## tracked-root headers (system headers
+                               ## excluded).
+    headersHash*: string    ## chainedContentHash over (portable spelling,
+                             ## native path) pairs — the KEY side is each
+                             ## header's portable spelling (host-invariant,
+                             ## RFC-0009 F13), content is read from the
+                             ## native path recovered via
+                             ## `fromKeyBytes`->`toNative` at that one point
+                             ## of I/O.
 
   CompileInputs* = object
     files*:     HashSet[TrackedPath]  ## extractClosure result UNION every
@@ -1013,7 +1043,9 @@ type
     ## job, since that needs to spawn `cc -M`, which `analyzeManifest` must
     ## not do: it stays a pure manifest read, matching `extractClosure`'s
     ## existing no-process-spawn contract).
-    source:   string   ## project-relative — same value that lands in `files`
+    source:   string   ## RFC-0009 F13: portable `keyBytes` spelling
+                        ## (`closureMemberSpelling`) of the SAME `TrackedPath`
+                        ## that lands in `files`/`CompileInputs.files`
     obj:      string   ## object basename
     ccCmd:    string    ## "" when no matching `compile` entry (warm-cached)
     hasCcCmd: bool
@@ -1540,27 +1572,42 @@ proc extractCompileInputs*(nimcacheDir: string;
           "header record exists for it from a previous run")
       headers = carriedBySource[ext.source].headers
 
-    # RFC-0009 A5a: headers are not `TrackedPath` (they stay hashed by their
-    # own string, per module doc) — build (key, nativePath) pairs preserving
-    # the pre-A5a behavior: the chained key is the header's own string
-    # (byte-identical header hash), content read from the resolved absolute
-    # path.
+    # RFC-0009 F13: `headers` are portable `keyBytes` spellings (never
+    # `TrackedPath` — they stay hashed by their own string, per module doc)
+    # — build (key, nativePath) pairs where the KEY is that portable
+    # spelling (host-invariant: the same header hashes identically under a
+    # relocated checkout, closing the leak this fix exists for) and
+    # `nativePath` is recovered via `fromKeyBytes`->`toNative` at THIS one
+    # point of I/O — never a bare `projectRoot / h` join, which only ever
+    # worked pre-F13 because a dep-root header spelled absolute already. A
+    # header that fails to resolve can only be a corrupt carried-forward
+    # record (this run's own freshly-derived headers always round-trip — see
+    # `closureMemberSpelling`'s doc) — fail closed, exactly like every other
+    # closure-extraction failure.
     var headerPairs = newSeq[tuple[key: string; nativePath: string]](headers.len)
     for i, h in headers:
-      headerPairs[i] = (key: h, nativePath: (if h.isAbsolute: h else: config.projectRoot / h))  # canon-ok: header nativePath join for content read (headers keyed by own string, not TrackedPath, per doc above)
+      let hTpOpt = fromKeyBytes(h, index.trackedRoots)
+      if hTpOpt.isNone:
+        raise newCrisolError(cekEnvironment,
+          "cannot resolve the header spelling '" & h & "' for '" & ext.source &
+          "' against the current tracked roots")
+      headerPairs[i] = (key: h, nativePath: toNative(hTpOpt.get, index.trackedRoots))
     let hHash = chainedContentHash(headerPairs)
     externals.add ExternalSource(source: ext.source, obj: ext.obj,
                                  headers: headers, headersHash: hHash)
-    # RFC-0009 A4a (D4): fold each header into the SAME `HashSet[TrackedPath]`
-    # membership accumulation `analyzeManifest` started — classify uniformly,
-    # whether `headers` was just derived (fresh `cc -M` probe, above) or
-    # carried forward from a previous run's persisted `ExternalSource`
-    # (already in `closureMemberSpelling` form either way, so `index.tracked`
-    # round-trips both).
+    # RFC-0009 A4a (D4)/F13: fold each header into the SAME
+    # `HashSet[TrackedPath]` membership accumulation `analyzeManifest`
+    # started — via `fromKeyBytes` (the portable spelling's own inverse),
+    # not `index.tracked`/`classify` (which interprets its argument as a
+    # NATIVE path, not a `keyBytes` string — the two are not
+    # interchangeable), whether `headers` was just derived (fresh `cc -M`
+    # probe, above) or carried forward from a previous run's persisted
+    # `ExternalSource` (already in `closureMemberSpelling` form either way,
+    # so `fromKeyBytes` round-trips both).
     for h in headers:
-      let pcHdr = index.tracked(h)
-      if pcHdr.kind == pcTracked:
-        files.incl pcHdr.tp
+      let hTp = fromKeyBytes(h, index.trackedRoots)
+      if hTp.isSome:
+        files.incl hTp.get
 
   # RFC-0009 A4b: `CompileInputs.files` is `HashSet[TrackedPath]` — return
   # the accumulated set directly, no string round-trip at the boundary.
