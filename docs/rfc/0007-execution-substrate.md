@@ -32,7 +32,8 @@ reason = "ratified by corey 2026-09-18; implemented A1e-ii (db5ee39): finalized-
 [[item]]
 id    = "w1"
 title = "Wiring W1 (high): Capabilities.cgroupKill probed, never consulted -- delegated host without cgroup.kill (kernel <5.14) gets a silent forceKill no-op yet still vouches kdsCgroup/toComplete. Wire: gate cgroup-tier selection on delegation AND kill bit (or fall back to killpg on write failure)."
-state = "open"
+state = "resolved"
+reason = "W1 landed 35c4564: cgroupTierUsable gates tier on delegation AND cgroup.kill; CRISOL_FORCE_NO_CGROUP_KILL probe-level escape hatch; lkMemory lsUnsupported on gated-off tier; unit truth-table + cgroup-leg E2E tracer (kdsProcessGroupSubreaper, killpg kill proven)"
 
 [[item]]
 id    = "w2"
