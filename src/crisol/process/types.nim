@@ -146,7 +146,8 @@ proc `==`*(a, b: Cause): bool =
 proc classifyCause*(exit: Exit;
                      stop: Option[tuple[reason: KillReason, escalated: bool]];
                      limits: Limits; achieved: LimitsAchieved;
-                     memoryOomKill: bool = false): Cause =
+                     memoryOomKill: bool = false;
+                     limitKilled: Option[LimitKind] = none(LimitKind)): Cause =
   ## The SECOND pure function (§2). `cbRunner` iff a stop act was recorded
   ## before the backend observed the exit — the ONE owner of authorship
   ## (§2 "Authorship has ONE owner: the Supervisor's act ledger"); the exit
@@ -158,8 +159,26 @@ proc classifyCause*(exit: Exit;
   ## `memory.events` `oom_kill` > 0 — a fact only the cgroup backend can
   ## supply (posixcore's producer), passed through verbatim. Defaults
   ## false so every existing non-cgroup caller/test is unaffected.
+  ##
+  ## `limitKilled` (rfc-0007 D1c): `some(kind)` iff the backend itself
+  ## observed a kernel limit-kill for THIS child and decoded WHICH limit
+  ## fired — a fact only the windows backend can supply today (its Job posts
+  ## `JOB_OBJECT_MSG_END_OF_PROCESS_TIME`, decoded as an annotation; windows
+  ## exits are ekExited/ekNtStatus, never ekSignaled, so the SIGXCPU arm can
+  ## never fire there). Joined with requested+achieved exactly like
+  ## `memoryOomKill`; exit-kind-agnostic because the kill's exit code is not
+  ## specified by the API. Defaults `none` (the ord-0/weakest-claim rule) so
+  ## POSIX backends and every existing caller/test are unaffected.
   if stop.isSome:
     return Cause(by: cbRunner, reason: stop.get.reason, escalated: stop.get.escalated)
+  if limitKilled.isSome:
+    let k = limitKilled.get
+    if limits.req[k].isSome and achieved[k] == lsApplied:
+      return Cause(by: cbLimit, limit: k)
+    # An annotation we cannot join (not requested, or not vouched applied) is
+    # a kill we did not author and cannot attribute — same negative shape as
+    # B3's memoryOomKill cases.
+    return Cause(by: cbExternal)
   if exit.kind == ekSignaled:
     case exit.sig
     of 9:  # SIGKILL we did not send — OOM killer, operator, unknown, OR
@@ -407,6 +426,12 @@ type
                                  ## memory.events oom_kill > 0. Always false
                                  ## off the cgroup tier (default, zero value —
                                  ## the house rule for every evidence field).
+    limitKilled*: Option[LimitKind]  ## rfc-0007 D1c: the backend decoded a
+                                 ## kernel limit-kill for this child and knows
+                                 ## WHICH limit fired (windows Job
+                                 ## END_OF_PROCESS_TIME => some(lkCpu)).
+                                 ## Always none on POSIX (default, zero value
+                                 ## — the same house rule).
 
   Capabilities* = object      ## §4 — probed once, memoised, reported. A flat
     pidfd*: bool               ## object of per-mechanism booleans;

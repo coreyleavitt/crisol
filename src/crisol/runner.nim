@@ -383,7 +383,7 @@ proc toProcessResult(report: ReapReport; limits: ptypes.Limits;
   ptypes.ProcessResult(
     exit: report.exit,
     cause: ptypes.classifyCause(report.exit, report.stop, limits, report.limits,
-                                report.memoryOomKill),
+                                report.memoryOomKill, report.limitKilled),
     evidence: ptypes.Evidence(
       killDomain:             report.killDomain,
       tree:                   report.tree,

@@ -14,13 +14,14 @@
 ## tests/conformance's own import-purity rule,
 ## test_conformance_import_purity.nim).
 ##
-## OUT OF SCOPE here, deliberately (a separate, tracked follow-up — see
-## process/windows.nim's module header): `classifyCause` attribution of a
-## Job-limit kill to `cbLimit`. A Windows limit kill is classified purely by
-## its `Exit` (`ekExited`/`ekNtStatus`, never `ekSignaled`) — this file
-## asserts enforcement + `lsApplied`, NOT `cause.by == cbLimit` and NOT a
-## specific exit code (a PerProcessUserTimeLimit kill's exit code is
-## CI-unknown).
+## cbLimit attribution (rfc-0007 D1c — the follow-up D1b tracked, now
+## closed): a `PerProcessUserTimeLimit` kill is attributed `cbLimit(lkCpu)`
+## via `ReapReport.limitKilled` (the decoded `JOB_OBJECT_MSG_END_OF_
+## PROCESS_TIME` annotation — see process/windows.nim's module header),
+## joined with requested+achieved in `classifyCause` exactly like B3's
+## `memoryOomKill`. The cpu_spin case asserts it end-to-end. The exit
+## code/kind stays unpinned (a PerProcessUserTimeLimit kill's exit code is
+## CI-unknown) — attribution rides the annotation, not the code.
 ##
 ## Address-space RUNTIME enforcement (an allocation actually failing under
 ## `ProcessMemoryLimit`) is NOT proven here — a deterministic `addr_hog`
@@ -81,10 +82,18 @@ when defined(windows):
       check not fileExists(markerPath)
       if fileExists(markerPath): removeFile(markerPath)
 
-      # Lenient on the exact exit code/kind (a PerProcessUserTimeLimit kill's
-      # exit code is CI-unknown) — assert enforcement + lsApplied, not a
-      # specific code.
-      let cause = classifyCause(report.exit, report.stop, Limits(), report.limits)
+      # rfc-0007 D1c: the kernel kill arrives as the decoded
+      # END_OF_PROCESS_TIME annotation — the attribution fact itself.
+      check report.limitKilled == some(lkCpu)
+
+      # Still lenient on the exact exit code/kind (a PerProcessUserTimeLimit
+      # kill's exit code is CI-unknown) — attribution rides the annotation.
+      # Real requested limits + the report's annotation, exactly as the
+      # production call site (runner.toProcessResult) passes them.
+      let cause = classifyCause(report.exit, report.stop, spec.limits,
+                                 report.limits, limitKilled = report.limitKilled)
+      check cause.by == cbLimit
+      check cause.limit == lkCpu
       let ep = testEp("tests/fixtures/cpu_spin.nim", group = "test", flags = @[])
       let evidence = Evidence(
         killDomain: report.killDomain,

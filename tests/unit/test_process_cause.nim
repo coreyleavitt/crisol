@@ -203,3 +203,51 @@ suite "classifyCause — authorship table (§2)":
     let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
                            noLimits, noneAchieved)
     check c.by == cbProcess
+
+  test "rfc-0007 D1c: a backend limit-kill annotation classifies cbLimit(lkCpu) when lkCpu was requested and achieved — the windows Job END_OF_PROCESS_TIME path (no signal to consult)":
+    ## Windows exits are ekExited/ekNtStatus, never ekSignaled — the SIGXCPU
+    ## arm can never fire there. The backend's decoded IOCP annotation is the
+    ## substitute fact, joined with requested+achieved exactly like
+    ## memoryOomKill.
+    let (lim, ach) = withCpuAchieved()
+    let e = Exit(kind: ekExited, code: 1)  # a Job time-limit kill's code is CI-unknown
+    let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
+                           lim, ach, limitKilled = some(lkCpu))
+    check c.by == cbLimit
+    check c.limit == lkCpu
+
+  test "rfc-0007 D1c: the annotation is exit-kind-agnostic — an ekNtStatus death with the lkCpu annotation still joins to cbLimit(lkCpu)":
+    let (lim, ach) = withCpuAchieved()
+    let e = Exit(kind: ekNtStatus, status: 0xC0000001'u32)
+    let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
+                           lim, ach, limitKilled = some(lkCpu))
+    check c.by == cbLimit
+    check c.limit == lkCpu
+
+  test "rfc-0007 D1c: annotation with achieved lkCpu=lsFailed is cbExternal, not cbLimit — never attributed to a limit we could not vouch was applied":
+    var lim = Limits()
+    lim.req[lkCpu] = some(10'i64)
+    var ach: LimitsAchieved = default(LimitsAchieved)
+    ach[lkCpu] = lsFailed
+    let e = Exit(kind: ekExited, code: 1)
+    let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
+                           lim, ach, limitKilled = some(lkCpu))
+    check c.by == cbExternal
+
+  test "rfc-0007 D1c: annotation with lkCpu never requested is cbExternal (unreachable in practice — the Job message only fires when the limit was installed; same belt-and-suspenders shape as B3)":
+    var ach: LimitsAchieved = default(LimitsAchieved)
+    ach[lkCpu] = lsApplied
+    let e = Exit(kind: ekExited, code: 1)
+    let c = classifyCause(e, none(tuple[reason: KillReason, escalated: bool]),
+                           noLimits, ach, limitKilled = some(lkCpu))
+    check c.by == cbExternal
+
+  test "rfc-0007 D1c: a recorded stop act still wins over the limit annotation — the ONE owner rule is unchanged":
+    ## The runner's own grace-window kill racing a Job limit kill reads
+    ## cbRunner — the same documented, accepted misattribution window as the
+    ## external-SIGTERM-in-grace case.
+    let (lim, ach) = withCpuAchieved()
+    let e = Exit(kind: ekExited, code: 1)
+    let stop = some((reason: krTimeout, escalated: true))
+    let c = classifyCause(e, stop, lim, ach, limitKilled = some(lkCpu))
+    check c.by == cbRunner

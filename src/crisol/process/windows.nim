@@ -101,21 +101,19 @@
 ##     (§5: "openFiles has no analog and is reported lsUnsupported") —
 ##     `lsUnsupported` if requested, `lsNotRequested` otherwise.
 ##
-##     Honest gap, left alone by design (a separate, tracked follow-up, NOT
-##     "a future round wires it"): a Job limit kill carries NO IOCP job-
-##     message decoding here (`next`'s completion-port tier never decodes
-##     its wakeup message — see that proc's header — and this module does
-##     not add a second, limit-specific decode path). So a process killed by
-##     PerProcessUserTimeLimit/ProcessMemoryLimit is classified purely by
-##     its Exit, same as any other exit — `classifyCause` (types.nim) only
-##     ever cites `cbLimit` for `lkCpu` on `exit.kind == ekSignaled and
-##     exit.sig == 24` (SIGXCPU), a POSIX-only path Windows exits never take
-##     (`ekExited`/`ekNtStatus`, never `ekSignaled`) — so a Windows limit
-##     kill reads as `cbProcess` here, not `cbLimit`, even though
-##     `achieved[lkCpu] == lsApplied`. That asymmetry against POSIX's
-##     SIGXCPU-to-cbLimit attribution is real and deliberate: annotating
-##     WHICH limit fired needs the IOCP job-message path, out of scope for
-##     this slice.
+##     cbLimit attribution (rfc-0007 D1c — closes the gap D1b tracked): a
+##     `PerProcessUserTimeLimit` kill is attributed `cbLimit(lkCpu)` via the
+##     IOCP job message `JOB_OBJECT_MSG_END_OF_PROCESS_TIME`, decoded as an
+##     ANNOTATION only (`ReapReport.limitKilled`) — never as a reap path:
+##     life/death is still decided solely by the sweep's process-handle
+##     readback (see `noteJobMessage`/`drainJobMessages`). `classifyCause`
+##     joins the annotation with requested+achieved, the same shape as B3's
+##     `memoryOomKill`. `lkAddressSpace` is DELIBERATELY not attributed:
+##     `JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT` does not report a kill — under
+##     `ProcessMemoryLimit` the allocation merely fails and the process
+##     continues (or crashes on its own failed alloc), so citing
+##     `cbLimit(lkAddressSpace)` from that message would fabricate
+##     authorship; such a death honestly reads `cbProcess`.
 ##   - Evidence.escapees: `@[]` always — and this is CORRECT, not a stub
 ##     (D1b-iii): `spawnChild` never sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK` on
 ##     the Job it creates, so `CREATE_BREAKAWAY_FROM_JOB` is always DENIED
@@ -217,8 +215,9 @@ type
     ## rfc-0007 D1a: SetInformationJobObject class 7. `completionKey` is
     ## echoed back verbatim in `GetQueuedCompletionStatus`'s
     ## `lpCompletionKey` — this backend uses the Job handle's own value so a
-    ## message can be traced to which spawn's Job posted it (never decoded
-    ## in `nextEvent`: the message is a wakeup only, see that proc's header).
+    ## message can be traced to which spawn's Job posted it. Since D1c the
+    ## message is decoded as an ANNOTATION (END_OF_PROCESS_TIME =>
+    ## limitKilled, see noteJobMessage) — never as a reap path.
     completionKey: pointer              # PVOID
     completionPort: Handle              # HANDLE
 
@@ -256,6 +255,13 @@ const
   CREATE_NEW_PROCESS_GROUP            = 0x00000200'i32
   CTRL_C_EVENT                        = 0'i32
   CTRL_BREAK_EVENT                    = 1'i32
+  JOB_OBJECT_MSG_END_OF_PROCESS_TIME  = DWORD(2)
+    ## winnt.h: posted to the Job's completion port when a process is KILLED
+    ## for exceeding PerProcessUserTimeLimit — the message id arrives in
+    ## GQCS's lpNumberOfBytesTransferred, the offending pid in lpOverlapped.
+    ## The ONLY job message this backend decodes (rfc-0007 D1c) — its
+    ## siblings (EXIT_PROCESS=7, ABNORMAL_EXIT_PROCESS=8,
+    ## PROCESS_MEMORY_LIMIT=9, ...) remain wakeups, never consulted.
   jobForceKillExitCode                = 0x4B494C4C'i32
     ## ASCII "KILL", < 0xC0000000 so it lands in `ekExited` (§2's Windows
     ## exit partition) — disambiguated from a genuine same-code exit by
@@ -347,6 +353,9 @@ type
     killSnapshot: seq[ProcSnapshot]  ## rfc-0007 D1a: taken at the first stop
                                      ## act, refreshed at forceKill (§1) —
                                      ## real now that snapshotTree is wired.
+    limitKilled: Option[LimitKind]   ## rfc-0007 D1c: some(lkCpu) iff this
+                                     ## child's Job posted END_OF_PROCESS_TIME
+                                     ## for THIS pid (noteJobMessage).
 
   Supervisor* = object       ## deep module: owns the wait set, the shutdown
     nextIdVal: int32          ## wakeup, and the child registry (§1). Fields
@@ -749,6 +758,43 @@ proc sweepExitedChildren(sv: var Supervisor) =
         entry.rusage = if ok: some(ru) else: none(Rusage)
         entry.state = wcsExited
 
+proc noteJobMessage(sv: var Supervisor; msg: DWORD; key: ULONG_PTR;
+                     ov: POVERLAPPED) =
+  ## rfc-0007 D1c: decode ONE dequeued Job completion packet as an
+  ## ANNOTATION — never a reap path (life/death is decided solely by
+  ## sweepExitedChildren's process-handle readback, unchanged). The only
+  ## message consulted is END_OF_PROCESS_TIME: it reports an actual kernel
+  ## kill under PerProcessUserTimeLimit, the fact classifyCause joins with
+  ## requested+achieved (the memoryOomKill shape). The pid guard matters:
+  ## PerProcessUserTimeLimit is per PROCESS — a grandchild in the same Job
+  ## exceeding it dies alone and must not annotate the direct child's reap.
+  if msg != JOB_OBJECT_MSG_END_OF_PROCESS_TIME:
+    return
+  let msgPid = uint32(cast[uint](ov) and 0xFFFFFFFF'u)
+  for id, entry in sv.children.mpairs:
+    if entry.state != wcsReaped and
+       cast[ULONG_PTR](entry.hJob) == key and uint32(entry.pid) == msgPid:
+      entry.limitKilled = some(lkCpu)
+      return
+
+proc drainJobMessages(sv: var Supervisor) =
+  ## rfc-0007 D1c: drain (timeout 0) every already-posted completion packet,
+  ## decoding each as an annotation. Called after nextEvent's blocking wait
+  ## AND from reap BEFORE the report is built — the exit sweep can observe
+  ## the process handle signaled before the limit message is dequeued, so
+  ## without the reap-side drain the annotation would be lost to that race.
+  if sv.completionPort == 0:
+    return
+  while true:
+    var bytes: DWORD
+    var key: ULONG_PTR
+    var ov: POVERLAPPED
+    let ok = getQueuedCompletionStatus(sv.completionPort, addr bytes, addr key,
+                                        addr ov, DWORD(0))
+    if ok == 0 and ov == nil:
+      return  # queue empty (the documented GQCS timeout idiom)
+    noteJobMessage(sv, bytes, key, ov)
+
 proc nextEvent(sv: var Supervisor; deadline: MonoTime): WaitEvent =
   while true:
     if sv.installedSignals:
@@ -774,19 +820,25 @@ proc nextEvent(sv: var Supervisor; deadline: MonoTime): WaitEvent =
       # Primary tier (D1a): block on the completion port every live
       # child's Job is associated with (spawnChild). JOB_OBJECT_MSG_
       # EXIT_PROCESS / JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS wake this
-      # promptly on exit — but per the epoll/kqueue precedent (B2/C1b),
-      # the message is NEVER decoded or trusted as a second reap path:
-      # success or timeout, either way control falls through to the
-      # sweep above on the next iteration, which is what actually
-      # decides what happened. This also transparently covers a child
-      # whose Job failed association (spawnChild's non-fatal degrade) —
-      # the GQCS call still returns (on its timeout if nothing else),
-      # bounding that child's detection at this same poll tick.
+      # promptly on exit — and per the epoll/kqueue precedent (B2/C1b)
+      # the message is NEVER trusted as a second reap path: success or
+      # timeout, either way control falls through to the sweep above on
+      # the next iteration, which is what actually decides what
+      # happened. Since D1c the dequeued packet IS decoded — but as an
+      # annotation only (noteJobMessage: END_OF_PROCESS_TIME =>
+      # limitKilled), which changes attribution, never liveness. This
+      # also transparently covers a child whose Job failed association
+      # (spawnChild's non-fatal degrade) — the GQCS call still returns
+      # (on its timeout if nothing else), bounding that child's
+      # detection at this same poll tick.
       var bytes: DWORD
       var key: ULONG_PTR
       var ov: POVERLAPPED
-      discard getQueuedCompletionStatus(sv.completionPort, addr bytes, addr key,
-                                         addr ov, DWORD(tickMs))
+      let ok = getQueuedCompletionStatus(sv.completionPort, addr bytes,
+                                          addr key, addr ov, DWORD(tickMs))
+      if ok != 0 or ov != nil:
+        noteJobMessage(sv, bytes, key, ov)
+        drainJobMessages(sv)
     else:
       # Structurally unreachable (initSupervisor raises if completion-port
       # creation fails, mirroring posixcore's fatal epoll_create1) — kept
@@ -1019,6 +1071,10 @@ proc reap*(sv: var Supervisor; id: ChildId; runPhase: bool = false): ReapReport 
   ## by construction. Accepted-and-ignored so the runner's 3-arg `reap` call
   ## type-checks identically against both backends.
   discard runPhase
+  # rfc-0007 D1c: drain pending completion packets BEFORE reading the entry —
+  # the exit sweep can beat the limit message to the queue, and the
+  # annotation must be on the entry before the report is built.
+  drainJobMessages(sv)
   let idx = int32(id)
   if idx notin sv.children:
     doAssert false, "reap: unknown ChildId " & $id
@@ -1038,6 +1094,7 @@ proc reap*(sv: var Supervisor; id: ChildId; runPhase: bool = false): ReapReport 
                                              # coded before snapshotTree was real.
     escapees: @[],                          # breakaway/DETACHED_PROCESS discovery is D1b's job
     cooperativeUnavailable: entry.cooperativeUnavailable,
+    limitKilled: entry.limitKilled,         # rfc-0007 D1c: END_OF_PROCESS_TIME annotation
   )
   discard closeHandle(entry.hProcess)
   discard closeHandle(entry.hJob)
