@@ -8,7 +8,9 @@
 ## the `waitid(P_ALL, WNOWAIT)` orphan sweep; B2 landed pidfd+epoll+timerfd
 ## event-driven `next` (falls back to the original poll(2) tier on
 ## non-Linux, or under `CRISOL_FORCE_POLL`); B3 adds per-slot cgroup v2
-## delegation (`clone3(CLONE_INTO_CGROUP)`, `cgroup.kill`, `memory.peak`)
+## delegation (child self-join via `cgroup.procs` — clone3 rejected, see
+## posixcore's spawn window — `cgroup.kill`, `memory.max`/`lkMemory`;
+## `memory.peak` probed/reported only)
 ## and `lkMemory` (§1 module-layout comment; A2a-i bullet).
 import crisol/process/posix
 export posix

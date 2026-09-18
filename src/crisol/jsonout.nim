@@ -416,8 +416,9 @@ const RunSchemaRevision* = 26
   ##                     instead of the interim zero value A5 left them at —
   ##                     `escapees` in particular now genuinely reports a
   ##                     leaked same-pgroup survivor. `evidence.hermetic`
-  ##                     stays the ord-0 default (runner-authored, no
-  ##                     producer yet — a separate, not-yet-scheduled gap).
+  ##                     stayed the ord-0 default at this rev (superseded:
+  ##                     A6b landed the producer — runner passes the
+  ##                     resolved `spec.level`).
   ##                     No new field, an existing field's CONTENT changes —
   ##                     same rationale as A5's entry above.
   ##   rev 18 (rfc-0007 A7) — top-level `substrate` node: the process

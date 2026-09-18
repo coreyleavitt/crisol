@@ -821,11 +821,11 @@ type
                          ## emission set because their next phase never
                          ## started (queued, or compile-done-run-unstarted) —
                          ## §2's "no representable 'run never started' state"
-                         ## rule.  Always 0 until A1e-ii wires real interrupt
-                         ## partial-run omission; summarize() does not yet
-                         ## produce a non-zero value (it only ever sees the
-                         ## already-emitted result set), so this is an honest
-                         ## placeholder, not a fabricated zero.
+                         ## rule.  Produced since A1e-ii: the interrupt
+                         ## path counts the omitted entries (runner) and api
+                         ## threads the value to the wire; summarize() itself
+                         ## always yields 0 (it only ever sees the
+                         ## already-emitted result set) — by design.
 
   GateStateEntry* = tuple[name: string; value: string]
     ## Internal element of GateState; exported so discover.nim can read it.
