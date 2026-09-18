@@ -114,18 +114,45 @@
 ##     continues (or crashes on its own failed alloc), so citing
 ##     `cbLimit(lkAddressSpace)` from that message would fabricate
 ##     authorship; such a death honestly reads `cbProcess`.
-##   - Evidence.escapees: `@[]` always — and this is CORRECT, not a stub
-##     (D1b-iii): `spawnChild` never sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK` on
-##     the Job it creates, so `CREATE_BREAKAWAY_FROM_JOB` is always DENIED
-##     for anything spawned inside it (a child or grandchild attempting it
-##     gets `CreateProcessW` failure / ERROR_ACCESS_DENIED, never a process
-##     that actually left) — combined with KILL_ON_JOB_CLOSE, the Job is a
-##     COMPLETE containment domain: nothing spawned under it can ever be
-##     outside it. `tests/fixtures/breakaway_attempt.nim` +
-##     `test_windows_containment.nim` prove this directly: a grandchild that
-##     actively attempts breakaway fails, stays IN the Job, and shows up in
-##     `snapshotTree` — the escapee search space is provably empty on this
-##     backend, not merely undiscovered.
+##   - Evidence.escapees (rfc-0007 review r4, corrected — see reap() below):
+##     NOT always `@[]`. `spawnChild` never sets
+##     `JOB_OBJECT_LIMIT_BREAKAWAY_OK` on the Job it creates, so
+##     `CREATE_BREAKAWAY_FROM_JOB` is always DENIED for anything spawned
+##     inside it (a child or grandchild attempting it gets `CreateProcessW`
+##     failure / ERROR_ACCESS_DENIED, never a process that actually left)
+##     — combined with KILL_ON_JOB_CLOSE, the Job IS a COMPLETE containment
+##     domain: nothing spawned under it can ever be OUTSIDE it.
+##     `tests/fixtures/breakaway_attempt.nim` + `test_windows_containment.nim`
+##     prove that directly. But "cannot leave the Job" and "nothing survived
+##     to reap time" are two DIFFERENT claims (process/types.nim's
+##     `escapees` doc: "survivors OBSERVED at kill/reap time" — the contract
+##     explicitly counts a survivor even where it was "then reaped", the
+##     POSIX subreaper tier's own kill-then-report shape,
+##     `test_rfc0007_a6a_escapee_evidence.nim`) — a background child still
+##     alive and CONTAINED inside the Job at reap time is exactly such a
+##     survivor, even though it can never have left. `reap()` now queries
+##     the Job's live pid list (`queryJobPids`, minus this entry's own pid)
+##     BEFORE `closeHandle(entry.hJob)` fires KILL_ON_JOB_CLOSE, and reports
+##     any genuine survivor found there — proven by
+##     `tests/fixtures/leaky_child.nim` + `test_windows_escapees.nim` (a
+##     plain, contained, non-breakaway child still running when its parent
+##     exits 0). The old `@[]` hardcode conflated the two claims: it let a
+##     leaky-but-passing run report clean (cacheable) evidence right up
+##     until the survivor was silently killed, unreported, by the Job
+##     teardown that immediately followed the sealed report. A listed pid
+##     is NOT enough on its own, though (control-loop follow-up):
+##     `queryJobPids` can still list a pid for a brief window after that
+##     process actually died (the exact race `sweepExitedChildren`'s
+##     comment, ~line 824, documents for `GetExitCodeProcess !=
+##     STILL_ACTIVE` alone) — a Job member `TerminateJobObject` just killed,
+##     or one racing its own exit, could otherwise be miscounted as a
+##     survivor, fabricating aliveness and nondeterministically breaking
+##     `test_windows_containment.nim`'s post-forceKill `escapees.len == 0`.
+##     `jobSurvivors` (below) confirms genuine liveness per candidate the
+##     SAME authoritative, non-racing way (`pidStillAlive`:
+##     `WaitForSingleObject(h, 0) != WAIT_OBJECT_0`) before it counts one —
+##     signaled or unopenable means "did not survive to reap time", skipped,
+##     never fabricated.
 ##
 ## FINDING (recorded per the A2d bullet's instruction — no signature change
 ## needed, but worth stating): §1's forceKill doc says escalated is false
@@ -211,6 +238,21 @@ type
     numberOfProcessIdsInList: int32     # DWORD
     processIdList: array[maxJobPids, uint]  # ULONG_PTR[]
 
+  JobPidListHeader = object
+    ## rfc-0007 review r13: a raw, dynamically-sized twin of
+    ## JOBOBJECT_BASIC_PROCESS_ID_LIST above — same first-two-DWORDs layout,
+    ## but with a genuine flexible array member (`UncheckedArray`) instead
+    ## of a `maxJobPids`-bounded one. Used ONLY by `queryJobPids`'s
+    ## ERROR_MORE_DATA retry path, over a manually `alloc`'d buffer sized
+    ## from the Job's own reported true count — the fixed-capacity struct
+    ## above stays the fast/common path (the overwhelming majority of Jobs
+    ## have far fewer than `maxJobPids` members); this is the escape hatch
+    ## for the rare Job whose live member count exceeds it, so the largest
+    ## Jobs are never blinded to `@[]` for want of a bigger buffer.
+    numberOfAssignedProcesses: int32    # DWORD
+    numberOfProcessIdsInList: int32     # DWORD
+    processIdList: UncheckedArray[uint] # ULONG_PTR[] — flexible array member
+
   JOBOBJECT_ASSOCIATE_COMPLETION_PORT = object
     ## rfc-0007 D1a: SetInformationJobObject class 7. `completionKey` is
     ## echoed back verbatim in `GetQueuedCompletionStatus`'s
@@ -255,6 +297,11 @@ const
   CREATE_NEW_PROCESS_GROUP            = 0x00000200'i32
   CTRL_C_EVENT                        = 0'i32
   CTRL_BREAK_EVENT                    = 1'i32
+  ERROR_MORE_DATA                     = 234'i32
+    ## rfc-0007 review r13: winerror.h. `QueryInformationJobObject`'s
+    ## JOBOBJECT_BASIC_PROCESS_ID_LIST class returns this (Win32-documented)
+    ## when the Job has MORE live members than the caller's buffer holds —
+    ## `queryJobPids`'s retry path below.
   JOB_OBJECT_MSG_END_OF_PROCESS_TIME  = DWORD(2)
     ## winnt.h: posted to the Job's completion port when a process is KILLED
     ## for exceeding PerProcessUserTimeLimit — the message id arrives in
@@ -442,12 +489,46 @@ proc globalShutdownSignal*(): Option[ShutdownSignal] =
   if s != 0: some(ShutdownSignal(signum: int(s)))
   else: none(ShutdownSignal)
 
+proc probeCapabilities*(): Capabilities =
+  ## The raw, seam-free probe — real I/O (a throwaway suspended-process
+  ## spawn for `jobObjectNesting`, `GetConsoleCP` for
+  ## `ctrlBreakDeliverable`), freely callable, mirrors posixcore.nim's
+  ## `probeCapabilities`/`cachedCapabilities` split exactly (r26): the raw
+  ## probe stays exported and un-memoised; `cachedCapabilities` below is
+  ## the memoised wrapper every production call site actually uses.
+  Capabilities(
+    pidfd: false, subreaper: false, cgroupDelegation: false, cgroupKill: false,
+    memoryPeak: false, kqueue: false,
+    jobObjectNesting: probeJobObjectNesting(),   # real probe
+    ctrlBreakDeliverable: getConsoleCP() != 0'i32,  # real probe
+    flock: false,       # POSIX-named mechanism; Windows uses LockFileEx (A4/D2)
+    wait4Rusage: false, # POSIX-named mechanism; this backend gets rusage via
+                         # Job accounting instead (real, see reap() below) —
+                         # this field means "wait4 the syscall", not "no rusage".
+  )
+
+var capabilitiesMemo: Option[Capabilities] = none(Capabilities)
+
+proc cachedCapabilities*(): Capabilities =
+  ## Probed exactly once per process (r26 — mirrors posixcore's
+  ## `cachedCapabilities` idiom): before this fix, `capabilities()` built a
+  ## throwaway Supervisor (CreateEvent + IOCP + the real cmd.exe nesting
+  ## probe) on EVERY call, and `initSupervisor` re-probed eagerly on top of
+  ## that — a normal `crisol run --json` calls `process.capabilities()` at
+  ## least twice (api.nim's `persistLastRun` + the CLI's own emission), so
+  ## the probe (a real process spawn) ran at least 3 times per invocation.
+  ## Every later caller — Supervisor-backed (`initSupervisor`) or not (the
+  ## plan/list CLI path, which never spawns anything) — now reads the SAME
+  ## memoised value.
+  if capabilitiesMemo.isNone:
+    capabilitiesMemo = some(probeCapabilities())
+  capabilitiesMemo.get
+
 proc capabilities*(sv: Supervisor): Capabilities =
-  ## Probed once, memoised (§4) — computed eagerly in `initSupervisor`
-  ## (this getter takes `sv: Supervisor`, not `var`, per the §1 signature;
-  ## unlike posixcore's cheap/pure `capabilitiesCore`, `jobObjectNesting`'s
-  ## probe spawns a process, so it is genuinely memoised, not just cheap to
-  ## recompute).
+  ## Probed once, memoised (§4) — `sv.capsCache` is populated from the SAME
+  ## process-global memo `initSupervisor` reads (r26), not a per-Supervisor
+  ## recomputation (this getter takes `sv: Supervisor`, not `var`, per the
+  ## §1 signature).
   sv.capsCache
 
 proc initSupervisor*(installSignals: bool = true): Supervisor =
@@ -464,6 +545,18 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
   ## structural failure here (not a per-child degrade), mirroring
   ## posixcore's fatal `epoll_create1`. Per-child association (spawnChild)
   ## degrades non-fatally instead — see `nextEvent`'s sweep.
+  ##
+  ## rfc-0007 review r22: also consults the MEMOISED nesting probe
+  ## (`cachedCapabilities().jobObjectNesting`, r26) and raises a structural
+  ## OSError here, once, when nesting is unavailable — mirroring posixcore's
+  ## no-half-loop posture (a fatal `epoll_create1` failure, not a per-child
+  ## degrade). Before this fix, a nesting-incapable host (already inside a
+  ## Job without nesting support — pre-Windows-8/Server-2012, or already
+  ## nested past this host's ceiling) silently let every `spawnChild`'s
+  ## `AssignProcessToJobObject` fail one child at a time, each producing an
+  ## undiagnosed `oSpawnError` — the exact shape as the closed w1 finding
+  ## (the cgroupKill gate): the probe already knew up front, but nothing
+  ## consulted it.
   var ev: Handle = 0
   if installSignals:
     ev = createEvent(nil, 1'i32, 0'i32, nil)
@@ -473,7 +566,13 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
   if iocp == 0:
     if ev != 0: discard closeHandle(ev)
     raise newException(OSError, "initSupervisor: CreateIoCompletionPort failed")
-  let consoleAttached = getConsoleCP() != 0'i32
+  let caps = cachedCapabilities()   # r26: probed once per process
+  if not caps.jobObjectNesting:
+    if ev != 0: discard closeHandle(ev)
+    discard closeHandle(iocp)
+    raise newException(OSError,
+      "initSupervisor: host cannot create nested Job Objects; crisol requires Job-based containment")
+  let consoleAttached = caps.ctrlBreakDeliverable
   result = Supervisor(nextIdVal: 0'i32, children: initTable[int32, ChildEntry](),
                        liveCount: 0, installedSignals: installSignals,
                        shutdownEvent: ev, completionPort: iocp,
@@ -481,27 +580,18 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
   if installSignals:
     gShutdownEventHandle = ev
     discard setConsoleCtrlHandler(ctrlHandlerProc, 1'i32)
-  result.capsCache = Capabilities(
-    pidfd: false, subreaper: false, cgroupDelegation: false, cgroupKill: false,
-    memoryPeak: false, kqueue: false,
-    jobObjectNesting: probeJobObjectNesting(),   # real probe
-    ctrlBreakDeliverable: consoleAttached,       # real probe
-    flock: false,       # POSIX-named mechanism; Windows uses LockFileEx (A4/D2)
-    wait4Rusage: false, # POSIX-named mechanism; this backend gets rusage via
-                         # Job accounting instead (real, see reap() below) —
-                         # this field means "wait4 the syscall", not "no rusage".
-  )
+  result.capsCache = caps
 
 proc capabilities*(): Capabilities =
   ## rfc-0007 A7: the same value `capabilities(sv)` returns, for callers
   ## with no live Supervisor (the plan/list CLI path never spawns anything)
-  ## — mirrors posix.nim's parameterless overload. This backend's probe is
-  ## genuinely per-Supervisor-instance (`initSupervisor` computes it once,
-  ## eagerly), so the standalone accessor spins up a throwaway, signal-
-  ## handler-free Supervisor purely to read it; `=destroy` is a no-op here
-  ## (no children were ever spawned).
-  let sv = initSupervisor(installSignals = false)
-  sv.capsCache
+  ## — mirrors posix.nim's parameterless overload. rfc-0007 review r26: no
+  ## longer spins up a throwaway Supervisor (CreateEvent + IOCP + the real
+  ## cmd.exe nesting probe) to read it — reads the SAME process-global memo
+  ## `initSupervisor` populates, so the underlying probe still runs exactly
+  ## once per process regardless of how many times either accessor is
+  ## called.
+  cachedCapabilities()
 
 # ---------------------------------------------------------------------------
 # spawn — CreateProcessW (suspended) + a real Job Object with
@@ -920,15 +1010,61 @@ proc buildPpidMap(): Table[int32, int32] =
 # ---------------------------------------------------------------------------
 
 proc queryJobPids(hJob: Handle): seq[int32] =
+  ## rfc-0007 D1a, hardened by review r13: `JOBOBJECT_BASIC_PROCESS_ID_LIST`
+  ## fills as many pids as fit in the caller's `maxJobPids`(256)-capacity
+  ## buffer and, when the Job holds MORE live members than that, fails the
+  ## call with `ERROR_MORE_DATA` while still reporting the TRUE live count
+  ## in `numberOfAssignedProcesses` (this type's own doc comment already
+  ## documented this — the code used to ignore it and fall through to a
+  ## blanket `return @[]`, blinding every forensics consumer —
+  ## `snapshotTree`/`killSnapshot`/`groupRssBytes` — for exactly the
+  ## LARGEST Jobs, the ones admission/diagnosis most needs visibility
+  ## into). Fixed: on `ERROR_MORE_DATA`, retry ONCE with a buffer sized
+  ## from the reported true count (+ bounded headroom for growth between
+  ## the two calls) rather than looping; a still-too-small retry (the count
+  ## grew again) falls back to the partial list ALREADY captured from the
+  ## first call rather than a second empty-handed attempt — never `@[]`
+  ## when any partial list is available.
   var buf: JOBOBJECT_BASIC_PROCESS_ID_LIST
   var retLen: int32
   if queryInformationJobObject(hJob, jicBasicProcessIdList, addr buf,
-                                int32(sizeof(buf)), addr retLen) == 0'i32:
-    return @[]
-  let n = min(int(buf.numberOfProcessIdsInList), maxJobPids)
-  result = newSeq[int32](n)
-  for i in 0 ..< n:
-    result[i] = int32(buf.processIdList[i])
+                                int32(sizeof(buf)), addr retLen) != 0'i32:
+    let n = min(int(buf.numberOfProcessIdsInList), maxJobPids)
+    result = newSeq[int32](n)
+    for i in 0 ..< n:
+      result[i] = int32(buf.processIdList[i])
+    return
+  let lastErr = getLastError()
+  # Win32-documented: even on this failure, NumberOfProcessIdsInList /
+  # NumberOfAssignedProcesses are valid, and the buffer was partially
+  # filled up to capacity — capture that as the honest floor BEFORE
+  # attempting the bigger retry below, so a retry allocation/call failure
+  # never regresses below what the first call already proved.
+  var fallback: seq[int32] = @[]
+  if lastErr == ERROR_MORE_DATA and buf.numberOfProcessIdsInList > 0'i32:
+    let nf = min(int(buf.numberOfProcessIdsInList), maxJobPids)
+    fallback = newSeq[int32](nf)
+    for i in 0 ..< nf:
+      fallback[i] = int32(buf.processIdList[i])
+  if lastErr != ERROR_MORE_DATA or buf.numberOfAssignedProcesses <= int32(maxJobPids):
+    return fallback   # a genuine failure, or a count the first buffer already covered
+  let capacity = min(int(buf.numberOfAssignedProcesses) + 64, 65536)
+    ## bounded (never an unbounded/looping retry): headroom for growth
+    ## between the two calls, capped so a pathological or racing count
+    ## cannot drive an unbounded allocation.
+  let headerBytes = 2 * sizeof(int32)
+  let bufBytes = headerBytes + capacity * sizeof(uint)
+  let raw = alloc0(bufBytes)
+  defer: dealloc(raw)
+  var retLen2: int32
+  if queryInformationJobObject(hJob, jicBasicProcessIdList, raw,
+                                int32(bufBytes), addr retLen2) == 0'i32:
+    return fallback   # retry itself failed — the first call's partial list stands
+  let hdr = cast[ptr JobPidListHeader](raw)
+  let n2 = min(int(hdr.numberOfProcessIdsInList), capacity)
+  result = newSeq[int32](n2)
+  for i in 0 ..< n2:
+    result[i] = int32(hdr.processIdList[i])
 
 proc snapshotOnePid(pid: int32): Option[ProcSnapshot] =
   ## `ppid` is NOT resolved HERE — this proc only ever produces its own
@@ -960,6 +1096,63 @@ proc snapshotJob(hJob: Handle): seq[ProcSnapshot] =
   result = @[]
   let ppidMap = buildPpidMap()   # D1b-iii: ONE system-wide snapshot per call
   for pid in queryJobPids(hJob):
+    let snap = snapshotOnePid(pid)
+    if snap.isSome:
+      var s = snap.get
+      s.ppid = int(ppidMap.getOrDefault(pid, -1'i32))
+      result.add s
+
+proc pidStillAlive(pid: int32): bool =
+  ## rfc-0007 review r4 (control-loop follow-up): the SAME liveness
+  ## guarantee `sweepExitedChildren`'s comment (this file, ~line 824)
+  ## documents for `entry.hProcess` — gating on `GetExitCodeProcess !=
+  ## STILL_ACTIVE` ALONE races the kernel's own process teardown (a
+  ## terminated-but-not-yet-torn-down process can still be openable and
+  ## readable while its handles are released) — applies just as much to a
+  ## `queryJobPids` candidate: a Job member just killed by
+  ## `TerminateJobObject`, or one racing its own natural exit, can still be
+  ## openable and still be listed in the Job's pid set for a brief window
+  ## after it has actually died. The authoritative, non-racing check is the
+  ## same one `sweepExitedChildren` uses: `WaitForSingleObject(h, 0) !=
+  ## WAIT_OBJECT_0` means genuinely still running (non-signaled); signaled
+  ## (`WAIT_OBJECT_0`) or an unopenable handle both mean "did not survive to
+  ## this instant" — honestly not a survivor, never fabricated.
+  let h = openProcess(PROCESS_QUERY_LIMITED_INFORMATION or SYNCHRONIZE, 0'i32, pid)
+  if h == 0:
+    return false   # already gone (or inaccessible) — cannot be a survivor
+  defer: discard closeHandle(h)
+  waitForSingleObject(h, 0'i32) != WAIT_OBJECT_0
+
+proc jobSurvivors(hJob: Handle; excludePid: int32): seq[ProcSnapshot] =
+  ## rfc-0007 review r4: `reap()`'s escapee producer. Shares `snapshotJob`'s
+  ## machinery (`queryJobPids` + `snapshotOnePid` + `buildPpidMap`) but
+  ## excludes `excludePid` — the just-exited entry's own pid, already
+  ## observed exited via `GetExitCodeProcess` by the time `reap` runs, so it
+  ## should not (and per the Job's own live-member accounting, normally
+  ## does not) still appear in `queryJobPids`; the explicit filter is a
+  ## second, honest belt-and-suspenders check against a race between "we
+  ## observed the exit" and "the OS removed this pid from the Job's live
+  ## list", never a fabricated exclusion. Any OTHER pid still in the list
+  ## that ALSO passes `pidStillAlive` (control-loop follow-up: `queryJobPids`
+  ## alone is not enough — a just-terminated Job member can still be listed
+  ## and still be openable for a brief window after it has actually died,
+  ## see `pidStillAlive`'s doc comment) is a genuine survivor: contained
+  ## (breakaway is always denied — the header comment's containment
+  ## guarantee), but ALIVE at this exact instant, the contract's `escapees`
+  ## claim ("survivors observed at kill/reap time", process/types.nim).
+  ## `snapshotOnePid`'s own honesty rule additionally covers the "exited
+  ## between the pid-list read and here" race (an `OpenProcess` failure
+  ## yields `none`, silently skipped — never a fabricated snapshot for a
+  ## pid that is actually gone by the time this reads it).
+  result = @[]
+  let pids = queryJobPids(hJob)
+  if pids.len == 0: return
+  let ppidMap = buildPpidMap()
+  for pid in pids:
+    if pid == excludePid: continue
+    if not pidStillAlive(pid): continue   # control-loop follow-up: skip a
+                                           # listed-but-already-dead pid —
+                                           # not a survivor, see pidStillAlive
     let snap = snapshotOnePid(pid)
     if snap.isSome:
       var s = snap.get
@@ -1066,10 +1259,23 @@ proc reap*(sv: var Supervisor; id: ChildId; runPhase: bool = false): ReapReport 
   ## `runPhase` exists for POSIX-backend signature parity (posix.nim gates
   ## subreaper-tier reparented-orphan escapee discovery on it). It is a
   ## deliberate NO-OP here: a Job Object with KILL_ON_JOB_CLOSE and breakaway
-  ## disabled is a COMPLETE containment domain (D1b-iii), so there is no
-  ## reparented-orphan escapee discovery to gate — `escapees` is always `@[]`
-  ## by construction. Accepted-and-ignored so the runner's 3-arg `reap` call
-  ## type-checks identically against both backends.
+  ## disabled is a COMPLETE containment domain (D1b-iii) — no process can
+  ## ever LEAVE it — so there is no reparented-orphan escapee DISCOVERY to
+  ## gate (nothing to search for outside the Job). Accepted-and-ignored so
+  ## the runner's 3-arg `reap` call type-checks identically against both
+  ## backends.
+  ##
+  ## rfc-0007 review r4: `escapees` is NOT `@[]` by construction — "cannot
+  ## leave" is a different claim from "nothing survived to reap time" (see
+  ## this module's header). Below, `jobSurvivors` queries the Job's live
+  ## pid list BEFORE `closeHandle(entry.hJob)` fires KILL_ON_JOB_CLOSE: any
+  ## genuine survivor found there — contained, but still alive at this
+  ## exact instant — is a real escapee per the contract
+  ## (process/types.nim's `escapees` doc: "survivors observed at kill/reap
+  ## time", counted "even where the escapees were then reaped",
+  ## rfc-0007 §6). KILL_ON_JOB_CLOSE below still performs the actual
+  ## cleanup — this does not add a kill step, only an honest OBSERVATION
+  ## before that cleanup fires.
   discard runPhase
   # rfc-0007 D1c: drain pending completion packets BEFORE reading the entry —
   # the exit sweep can beat the limit message to the queue, and the
@@ -1081,6 +1287,7 @@ proc reap*(sv: var Supervisor; id: ChildId; runPhase: bool = false): ReapReport 
   let entry = sv.children[idx]
   if entry.state != wcsExited:
     doAssert false, "reap: weChildExited was never reported for ChildId " & $id
+  let escapees = jobSurvivors(entry.hJob, entry.pid)  # r4: BEFORE closeHandle(entry.hJob) below
   result = ReapReport(
     exit: entry.exit,
     rusage: entry.rusage,
@@ -1092,12 +1299,14 @@ proc reap*(sv: var Supervisor; id: ChildId; runPhase: bool = false): ReapReport 
                                              # process in it by construction — toComplete,
                                              # not the toUnobservable the A2d spike hard-
                                              # coded before snapshotTree was real.
-    escapees: @[],                          # breakaway/DETACHED_PROCESS discovery is D1b's job
+    escapees: escapees,                     # rfc-0007 review r4: genuine survivors, observed
+                                             # BEFORE KILL_ON_JOB_CLOSE kills them below —
+                                             # never the old hardcoded `@[]`.
     cooperativeUnavailable: entry.cooperativeUnavailable,
     limitKilled: entry.limitKilled,         # rfc-0007 D1c: END_OF_PROCESS_TIME annotation
   )
   discard closeHandle(entry.hProcess)
-  discard closeHandle(entry.hJob)
+  discard closeHandle(entry.hJob)            # KILL_ON_JOB_CLOSE: kills `escapees` above, now — AFTER they were observed and reported
   sv.children[idx] = ChildEntry(state: wcsReaped)
   dec sv.liveCount
 
