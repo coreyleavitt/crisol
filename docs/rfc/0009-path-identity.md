@@ -104,7 +104,8 @@ reason = "paths.nim toJson emits {root,path} display-only (never persists ident)
 [[item]]
 id = "i16"
 title = "Windows-leg CI evidence pending next push: F16 longpath E2E (must-exec-gated) + F18 real 8.3 expansion; all review Lows now fixed (see 0009-path-identity-review.md)"
-state = "open"
+state = "resolved"
+reason = "CI run 35321900619 all 5 legs green: longpath E2E executed on windows (Tier B: crisol-side >MAX_PATH traversal, structured compileFailed, cache round-trip proven; full compile-through gated on nim.exe long-path awareness, auto-asserts as Tier A when available); macos proved tier-2 insensitive branch on real APFS; windows leg ran under real 8.3 temp paths (RUNNER~1). All review Lows fixed; F28 wontfix."
 +++
 
 # RFC-0009 — Path identity: `TrackedPath` and the Windows suite
