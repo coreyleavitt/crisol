@@ -435,6 +435,26 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a5c_cache_portability.nim
 
+      # RFC-0009 wiring-audit F16 (TIER A unlock attempt): enable Windows'
+      # long-path registry key before the suite step below runs
+      # test_rfc9_w2_longpath_e2e.nim. Harmless either way — this only
+      # widens what Win32 itself permits; it does not by itself make any
+      # given process long-path-aware. IF this runner's nim.exe binary
+      # manifest also declares longPathAware, this can unlock that test's
+      # TIER A (full compile-through proof) instead of its documented TIER
+      # B graceful-degradation fallback; empirically (CI run 35315917270,
+      # before this step existed) nim.exe's own file opens were not
+      # long-path-aware regardless of this OS-level switch, so TIER B is
+      # the realistic near-term outcome — but the test's own adaptive tier
+      # selection (see its header doc comment) handles either outcome
+      # honestly, so this step is pure upside. `shell: pwsh` overrides this
+      # job's default `bash` (Git Bash cannot run a PowerShell cmdlet):
+      # `Set-ItemProperty` is PowerShell-only; pwsh ships on windows-latest
+      # runners alongside Git Bash.
+      - name: rfc-0009 F16 — enable Windows LongPathsEnabled registry key
+        shell: pwsh
+        run: Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1
+
       # RFC-0009 B4b — COMPLETION GATE: widen the windows leg's scope from
       # B4a's tests/unit-only bring-up to tests/unit:tests/conformance, still
       # native, still through the SAME honest-exit wrapper the Linux/macOS

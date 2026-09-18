@@ -247,7 +247,16 @@ fi
 # per-environment self-skip (unlike the case-fold/symlink-privilege gated
 # tests above): the fixture builds its own long path deterministically, so a
 # SKIP marker appearing here would itself be a regression, not an honest
-# environment fact.
+# environment fact. CI run 35315917270 (empirical): this runner's nim.exe
+# cannot itself open a >MAX_PATH source, so the test runs an ADAPTIVE TIER B
+# (graceful-degradation proof of crisol's own traversal/caching/structured-
+# failure reporting) rather than TIER A's full compile-through proof — see
+# the test file's own header doc comment. Neither tier touches these two
+# markers: "W2-LONGPATH REAL" is echoed unconditionally at the very start of
+# the test body, before either tier is selected, and "test_rfc9_w2_longpath_
+# e2e done" is the unconditional isMainModule marker at the very end — both
+# print regardless of which tier the run took, so this MUST-EXECUTE check
+# stays tier-agnostic by construction and needs no per-tier marker.
 if [ "$LEG" = "windows" ]; then
   check_must_execute \
     "F16 long-path E2E through toNative (test_rfc9_w2_longpath_e2e.nim)" \
