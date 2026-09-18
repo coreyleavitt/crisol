@@ -14,17 +14,20 @@ size = "xl"
 [[item]]
 id    = "i1"
 title = "Interrupt never persists lastrun.json (v2 interrupted:true only); never-observed entrypoint must not join --failed."
-state = "open"
+state = "resolved"
+reason = "ratified by corey 2026-09-18; implemented A1e-ii (db5ee39, CI 33701282507): no lastrun persist on interrupt, stdout run/v2 interrupted:true only"
 
 [[item]]
 id    = "i2"
 title = "lsUnsupported ⇒ cacheable-with-label; lsFailed ⇒ uncacheable (§6); extends toUnobservable so openFiles keeps caching."
-state = "open"
+state = "resolved"
+reason = "ratified by corey 2026-09-18; implemented A6a evidenceSatisfies (eba223c) + D1b-ii windows lkOpenFiles=lsUnsupported (9c5ffad): lsUnsupported cacheable-with-label, lsFailed refuses"
 
 [[item]]
 id    = "i3"
 title = "Round-1's interrupt partial-results amendment stands, still veto-able; now fully specified (emission set, no-persist)."
-state = "open"
+state = "resolved"
+reason = "ratified by corey 2026-09-18; implemented A1e-ii (db5ee39): finalized-only emission set, krInterrupt attribution, no ledger rows, no persist"
 +++
 
 # RFC-0007 — Execution substrate: process contract, honest results, platform backends
@@ -538,7 +541,7 @@ Rejected: fail-by-default (pgid-only macOS would be flakier than Linux for the s
 
 Dependency-correct order: **A0 → A1a…A1f → A2a-i/ii/iii → A2d → A2b → A2c → A3…A7 (+ A7-gate)** — the cross-platform spike (A2d) runs *before* the runner consumes the contract (A2b), so signature fixes land against shims, not against a fresh rewrite. **Stage A precedes the RFC-0005 build.** Stages B–D are independent of 0005 and may interleave with it. The A1 ladder exists because the field *removal* is whole-program-atomic in Nim — no single agent can hold the full blast radius (11 `src/` modules read `.outcome`; ~52 test files pin old fields/strings — measured), so production happens additively and removal is one compiler-enumerated sweep.
 
-**Fixture inventory (build before the slices that consume them):** `hang_forever` (exists; dies on SIGTERM — the *honest* A1 expectation); `crash_segv` (deliberate SIGSEGV; `coreDumped` is pinned **false** on the default path — `RLIMIT_CORE=0` under the default sandbox — and documented tier-dependent, never asserted true anywhere); `self_sigkill` (sends itself SIGKILL — `cbExternal`); `term_cooperative` (traps SIGTERM, exits 0 within grace — `cbRunner`, `oKilled`, *not* a pass); `term_ignores` (ignores SIGTERM — `escalated: true`, SIGKILL); `spawn_grandchild` (leaks a same-pgroup grandchild and exits 0 — the OBSERVABLE escapee a pgid scan can actually see: A6a/A6b's driver); `spawn_grandchild_setsid` (daemonizes via setsid — INVISIBLE to a pgid scan by construction, the same blindness §3 documents for macOS: it pins the honest `toUnobservable` label at A6a and flips to observed-and-reaped at B1); `pass_fast` (writes a completion marker file — the SIGINT E2E's synchronization point); `cpu_burn` for `SIGXCPU` (exists as `rlimit_cpu`); `fsize_overrun` (exists; consumed by A1f's `lkFileSize` cases). Windows variants (Stage D): an access-violation crasher (**D1a** — the `ekNtStatus` producer proof), a CTRL_BREAK-handler fixture, a Job-breakaway attempt, and a `DETACHED_PROCESS`/`FreeConsole` fixture (**D1b** — the only producer of `cooperativeUnavailable: true`). Grace-window fixtures are timing tests: they run under the same serial gating as `CRISOL_TIMING_TESTS`.
+**Fixture inventory (build before the slices that consume them):** `hang_forever` (exists; dies on SIGTERM — the *honest* A1 expectation); `crash_segv` (deliberate SIGSEGV; `coreDumped` observed honestly — pinned false only where `/proc/sys/kernel/core_pattern` is not a pipe handler, since pipe-based handlers set WCOREDUMP despite `RLIMIT_CORE=0` (core(5)); documented tier-dependent, never asserted true anywhere — amended per A1f empirical finding); `self_sigkill` (sends itself SIGKILL — `cbExternal`); `term_cooperative` (traps SIGTERM, exits 0 within grace — `cbRunner`, `oKilled`, *not* a pass); `term_ignores` (ignores SIGTERM — `escalated: true`, SIGKILL); `spawn_grandchild` (leaks a same-pgroup grandchild and exits 0 — the OBSERVABLE escapee a pgid scan can actually see: A6a/A6b's driver); `spawn_grandchild_setsid` (daemonizes via setsid — INVISIBLE to a pgid scan by construction, the same blindness §3 documents for macOS: it pins the honest `toUnobservable` label at A6a and flips to observed-and-reaped at B1); `pass_fast` (writes a completion marker file — the SIGINT E2E's synchronization point); `cpu_burn` for `SIGXCPU` (exists as `rlimit_cpu`); `fsize_overrun` (exists; consumed by A1f's `lkFileSize` cases). Windows variants (Stage D): an access-violation crasher (**D1a** — the `ekNtStatus` producer proof), a CTRL_BREAK-handler fixture, a Job-breakaway attempt, and a `DETACHED_PROCESS`/`FreeConsole` fixture (**D1b** — the only producer of `cooperativeUnavailable: true`). Grace-window fixtures are timing tests: they run under the same serial gating as `CRISOL_TIMING_TESTS`.
 
 **Interim evidence population (the honest defaults per rung — no agent invents, nothing fabricates):** until A2a-iii, `limits` fans today's aggregate `rlimitsApplied` bit uniformly over the *requested* kinds (unrequested = `lsNotRequested`); until A6a, `tree = toUnobservable` and `escapees`/`killSnapshot` empty; until A7, `killDomain = kdsProcessGroup` (the actual mechanism today, not a placeholder). Every default is the WEAKEST claim (the ord-0 rule, §2) — a result serialized or cached in any window never vouches for more than its rung can see. A1f's `cbLimit` precondition consequently runs on the aggregate approximation until A2a-iii re-pins it per-limit.
 
