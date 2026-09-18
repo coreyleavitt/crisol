@@ -5,7 +5,7 @@ title   = "RFC-0007 \u2014 Execution substrate: process contract, honest results
 state   = "implemented"
 stage   = "implement"
 review  = "deferred"
-wiring  = "unproven"
+wiring  = "proven"
 profile = "rfc-flow@3"
 blocked_by = ["0001", "0002", "0004"]
 
