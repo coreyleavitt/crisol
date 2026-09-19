@@ -417,16 +417,52 @@ proc slotIndexOf(slots: seq[Slot]; id: ChildId): int =
       return i
   -1
 
+type
+  SlotWakeInfo* = object
+    ## code-review r15: minimal pure-data view of one Slot's wake-relevant
+    ## fields, extracted so `nextDeadline`'s per-slot selection logic
+    ## (`slotWakeDeadline`) is unit-testable from outside this module
+    ## without constructing a full (private) `Slot`.
+    live*:         bool
+    forceKilled*:  bool
+    stopDeadline*: Option[MonoTime]
+    deadline*:     MonoTime
+
+proc slotWakeDeadline*(info: SlotWakeInfo; floor: MonoTime): MonoTime =
+  ## Pure per-slot contribution to `nextDeadline`'s min: returns `floor`
+  ## (the sample-tick ceiling) unless this slot is live, NOT yet
+  ## `forceKilled`, and its own grace/run deadline is earlier than
+  ## `floor`.
+  ##
+  ## code-review r15: a `forceKilled` slot is EXCLUDED here. Its
+  ## `stopDeadline` is a moment in the past (that is what triggered the
+  ## forceKill) and nothing re-arms it — so, pre-fix, it kept winning this
+  ## min against every other slot's future deadline, collapsing
+  ## `nextDeadline`'s result to that past instant forever. `next(deadline)`
+  ## then returned `weDeadline` immediately on every call: a busy-spin
+  ## (full fill-pass + sweep per iteration) that pegs a core for as long as
+  ## the child takes to actually die (unbounded against a D-state child).
+  ## A `forceKilled` slot's only legitimate next wakeup is its eventual
+  ## `weChildExited`; until then the sample tick is its floor, same as an
+  ## otherwise-idle poll.
+  if not info.live or info.forceKilled: return floor
+  let d = if info.stopDeadline.isSome: info.stopDeadline.get else: info.deadline
+  if d < floor: d else: floor
+
 proc nextDeadline(slots: seq[Slot]; now: MonoTime; sampleTickMs: int): MonoTime =
   ## §1: "the executor passes min(run deadlines, grace deadlines, sample
   ## tick)". `sampleTickMs` keeps RFC-0002's RSS-sampling cadence unchanged
   ## (§Contract impacts) — it is a CEILING, not a poll interval: `next`
-  ## still returns immediately on a real child-exit or shutdown event.
+  ## still returns immediately on a real child-exit or shutdown event. The
+  ## per-slot selection itself is `slotWakeDeadline` (extracted for unit
+  ## testability, code-review r15) — this loop only adapts each `Slot` to
+  ## its `SlotWakeInfo` view.
   result = now + initDuration(milliseconds = sampleTickMs)
   for s in slots:
-    if s.state == ssLive:
-      let d = if s.stopDeadline.isSome: s.stopDeadline.get else: s.deadline
-      if d < result: result = d
+    result = slotWakeDeadline(SlotWakeInfo(live: s.state == ssLive,
+                                            forceKilled: s.forceKilled,
+                                            stopDeadline: s.stopDeadline,
+                                            deadline: s.deadline), result)
 
 proc armExpiredTimeouts(sv: var Supervisor; slots: var seq[Slot]; now: MonoTime) =
   ## Main-loop-only half of the shared machinery: a live, not-yet-stopped
@@ -506,9 +542,12 @@ proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
   ## spawnRunDirect (the other two ChildSpec-building spawn sites).
 
 proc cleanupSlotTmp(slot: Slot)
-  ## Forward-declared: defined below (unchanged from pre-A2b) — removes
-  ## per-slot temp output files + the A4a scratch tmpdir; deliberately
-  ## narrower than cleanupSlotOnTeardown (see that proc's doc comment).
+  ## Forward-declared: defined below — removes per-slot temp output files,
+  ## the A4a scratch tmpdir, AND the tmpDir itself (code-review r14: every
+  ## finalizeSlot path that releases a slot back to ssIdle calls this proc,
+  ## making it the single choke point where the tmpDir gets removed);
+  ## deliberately narrower than cleanupSlotOnTeardown (see that proc's doc
+  ## comment) in that it never touches slotBinDir/cacheDir.
 
 proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string): bool
   ## Forward-declared: defined below, alongside spawnCompileStable (the
@@ -1404,9 +1443,22 @@ proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
 
 proc cleanupSlotTmp(slot: Slot) =
   ## Remove temp output files (compile and run output captured), the sink
-  ## file, and the A4a per-entrypoint scratch tmpdir (testScratchDir).
-  ## The per-slot tmpDir is NOT removed here — it is cleaned up by the
-  ## execute main loop AFTER the binary has been copied to the stable path.
+  ## file, the A4a per-entrypoint scratch tmpdir (testScratchDir), and the
+  ## per-slot tmpDir itself.
+  ##
+  ## code-review r14: this proc is called from every finalizeSlot path that
+  ## releases a slot back to ssIdle without going through
+  ## cleanupSlotOnTeardown — compile-own-failure, the post-compile cache
+  ## hit, run-spawn-fail, and normal run completion — making it the single
+  ## choke point where the tmpDir created by spawnCompileStable's/
+  ## spawnRunDirect's mkdtemp gets removed, so no release path can leak it.
+  ## (Previously the dir itself was left for a caller to remove and only
+  ## the shuttingDown teardown branch in `execute` actually did — every
+  ## OTHER release path leaked one crisol_slot_*/crisol_run_* dir per
+  ## entrypoint per run.) Safe to call unconditionally: the NEXT claim on
+  ## this slot (spawnCompileStable/spawnRunDirect) always mkdtemps a fresh
+  ## tmpDir before the slot goes live again, so this never races a reused
+  ## slot's new directory.
   if slot.compOut.len > 0:
     try: removeFile(slot.compOut) except: discard
   if slot.runOut.len > 0:
@@ -1416,6 +1468,8 @@ proc cleanupSlotTmp(slot: Slot) =
   # A4a: remove the per-entrypoint scratch tmpdir on all exit paths.
   if slot.testScratchDir.len > 0:
     try: removeDir(slot.testScratchDir) except: discard
+  if slot.tmpDir.len > 0:
+    try: removeDir(slot.tmpDir) except: discard
 
 # ---------------------------------------------------------------------------
 # RFC-0005 B3a: --verify-cache synthetic plan builder
@@ -1935,11 +1989,13 @@ proc execute*(
             # live completion. A slot torn down here never reaches the
             # promotion block below, so sweep what finalizeSlot's RUN-phase
             # branch leaves behind (a compile-phase kill already fully
-            # cleaned itself via cleanupSlotOnTeardown).
+            # cleaned itself via cleanupSlotOnTeardown). tmpDir is NOT
+            # swept here — code-review r14: cleanupSlotTmp (called from
+            # every finalizeSlot release path, including the RUN-phase one)
+            # is now the single choke point that removes it, so it is
+            # already gone by the time fkDone reaches this handler.
             if slotBinDir.len > 0:
               try: removeDir(slotBinDir) except: discard
-            if slots[idx].tmpDir.len > 0:
-              try: removeDir(slots[idx].tmpDir) except: discard
             finalized[completedIdx] = true
             onResult(fo.res)
           else:
@@ -2128,8 +2184,30 @@ proc execute*(
                   # Stamp the plan-time key (set for an edRunFresh miss; "" otherwise)
                   # so a consulted-but-not-stored result still reports its inputHash.
                   result[completedIdx].inputHash = inputHashes[completedIdx]
+                  # code-review r17: `shouldStore`'s generic `cdmKeyMiss` (its
+                  # "not a pass" return -- it has no way to know whether THIS
+                  # was a genuine miss or a recompute-invalidated hit) must
+                  # not clobber a plan-time `cdmRecomputeMiss`. Left alone, a
+                  # recompute-invalidated hit (plan-time `cdmRecomputeMiss`,
+                  # `lookups[completedIdx]` stamped `cvOk` just above -- see
+                  # cachedispatch.consultReal's doc at its `cdmRecomputeMiss`
+                  # return site) whose rerun FAILS would report
+                  # `cacheDecision:"keyMiss"` ("no entry was found at all")
+                  # alongside `cacheLookup:"ok"` -- an internally
+                  # contradictory wire pair. Scoped narrowly: only the
+                  # generic not-a-pass `cdmKeyMiss` is overridden, and only
+                  # when the PLAN-TIME decision was itself
+                  # `cdmRecomputeMiss` -- a genuine plan-time `cdmKeyMiss`
+                  # (no entry was ever found) keeps reporting `cdmKeyMiss`;
+                  # `verdict.decision`'s other reasons (`cdmGroupOptOut`/
+                  # `cdmPolicyDisabled`/`cdmHermeticityDeg`/`cdmFlaky`, all
+                  # already more specific than the generic collapse) are
+                  # never touched.
                   result[completedIdx].cacheDecision =
                     if verdict.store: cdmClosureUnrecorded   # else-branch ⇒ not closureRecorded
+                    elif verdict.decision == cdmKeyMiss and
+                         cacheDecisions[completedIdx] == cdmRecomputeMiss:
+                      cdmRecomputeMiss
                     else: verdict.decision
               else:
                 # Caching inactive: stamp the structural reason recorded at plan time.
