@@ -46,6 +46,7 @@ when defined(windows):
 
   let ctrlBreakBin = compileFixture("ctrl_break_handler")
   let detachBin    = compileFixture("detach_console")
+  let hangBin      = compileFixture("hang_forever")
 
   proc waitForMarker(sv: var Supervisor; markerPath: string; deadline: MonoTime) =
     ## Polls `next` on short (50ms) deadlines, ignoring whatever it returns
@@ -137,6 +138,32 @@ when defined(windows):
       check report.stop.get.escalated == false   # nothing to escalate from
 
       check outcomeFor("tests/fixtures/detach_console.nim", report) == oKilled
+
+    test "hang_forever: forceKill with NO prior stop act records escalated:false":
+      ## rfc-0007 review r48 (doc-honesty fix): `forceKill` is called here
+      ## directly, SKIPPING `requestStop` entirely — the one path production
+      ## executors never take (post-r58 they always `requestStop` first;
+      ## see `forceKill`'s doc). Pins the documented formula
+      ## (`escalated := stop.isSome AND NOT cooperativeUnavailable`) at
+      ## exactly the point it is easiest to get backwards: with no prior
+      ## stop act, there is nothing to escalate FROM, so `escalated` must be
+      ## `false` regardless of what a fresh console-deliverability probe
+      ## would separately report.
+      var sv = initSupervisor(installSignals = false)
+      let outPath = tmpOutputFile("win_coopstop_noprior_out")
+      let spec = ChildSpec(argv: @[hangBin], cwd: getCurrentDir(), env: @[],
+                            sinks: combinedSink(outPath))
+      let sr = sv.spawn(spec)
+      doAssert sr.ok, "spawn failed unexpectedly: " & (if sr.ok: "" else: sr.error)
+
+      sv.forceKill(sr.id)   # no requestStop before this
+
+      let ev = driveToExit(sv, getMonoTime() + initDuration(seconds = 10))
+      let report = sv.reap(ev.id)
+      removeFile(outPath)
+
+      check report.stop.isSome
+      check report.stop.get.escalated == false
 
   when isMainModule:
     echo "test_windows_coopstop done"

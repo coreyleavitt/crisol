@@ -256,10 +256,19 @@ type
   JOBOBJECT_ASSOCIATE_COMPLETION_PORT = object
     ## rfc-0007 D1a: SetInformationJobObject class 7. `completionKey` is
     ## echoed back verbatim in `GetQueuedCompletionStatus`'s
-    ## `lpCompletionKey` — this backend uses the Job handle's own value so a
-    ## message can be traced to which spawn's Job posted it. Since D1c the
-    ## message is decoded as an ANNOTATION (END_OF_PROCESS_TIME =>
-    ## limitKilled, see noteJobMessage) — never as a reap path.
+    ## `lpCompletionKey` — this backend uses the child's ChildId (the
+    ## `sv.children` table key: monotonic, assigned once at spawn, NEVER
+    ## reused for the Supervisor's lifetime — review r43) so a message can be
+    ## traced to which spawn posted it. NOT the Job handle's raw value: a
+    ## closed handle and a brand-new spawn's freshly-created handle CAN
+    ## collide on the same numeric value (kernel handle recycling), and if
+    ## that recycled handle's owning pid also recycles in the same narrow
+    ## window, a stale completion message could otherwise be misattributed
+    ## to the wrong (unrelated) child. A ChildId can't recycle by
+    ## construction, closing that window at the identifier level; the
+    ## per-pid guard in `noteJobMessage` remains as belt-and-suspenders.
+    ## Since D1c the message is decoded as an ANNOTATION (END_OF_PROCESS_TIME
+    ## => limitKilled, see noteJobMessage) — never as a reap path.
     completionKey: pointer              # PVOID
     completionPort: Handle              # HANDLE
 
@@ -279,6 +288,18 @@ type
     quotaNonPagedPoolUsage: uint
     pagefileUsage: uint
     peakPagefileUsage: uint
+
+  STARTUPINFOEX = object
+    ## rfc-0007 review r47: winbase.h's STARTUPINFOEXW — the wrapper
+    ## CreateProcessW requires when EXTENDED_STARTUPINFO_PRESENT is set, to
+    ## carry a PROC_THREAD_ATTRIBUTE_LIST (here: a
+    ## PROC_THREAD_ATTRIBUTE_HANDLE_LIST) alongside the plain STARTUPINFO.
+    ## Layout matches the Win32 struct exactly (`si` first, so a
+    ## `STARTUPINFOEXW*` is also validly readable as a `STARTUPINFOW*` — the
+    ## same C struct-extension trick `JobPidListHeader` above documents for
+    ## the analogous ERROR_MORE_DATA case).
+    si: STARTUPINFO
+    lpAttributeList: pointer            # LPPROC_THREAD_ATTRIBUTE_LIST
 
 const
   jicBasicAccounting = 1'i32
@@ -313,6 +334,17 @@ const
     ## ASCII "KILL", < 0xC0000000 so it lands in `ekExited` (§2's Windows
     ## exit partition) — disambiguated from a genuine same-code exit by
     ## `Cause`, not by the code itself (§2's documented heuristic).
+  EXTENDED_STARTUPINFO_PRESENT        = 0x00080000'i32
+    ## winbase.h: a CreateProcessW `dwCreationFlags` bit — review r47.
+    ## Required whenever `lpStartupInfo` actually points at a
+    ## STARTUPINFOEXW rather than a plain STARTUPINFOW.
+  PROC_THREAD_ATTRIBUTE_HANDLE_LIST   = 0x00020002'u
+    ## processthreadsapi.h: `ProcThreadAttributeValue(ProcThreadAttributeHandleList,
+    ## Thread=FALSE, Input=TRUE, Additive=FALSE)` — review r47. The
+    ## attribute id `UpdateProcThreadAttribute` takes to restrict which
+    ## open handles `CreateProcessW(..., bInheritHandles=TRUE, ...)`
+    ## actually hands to the child, instead of every inheritable handle
+    ## open anywhere in this process at spawn time.
 
 proc createJobObjectW(lpJobAttributes: ptr SECURITY_ATTRIBUTES;
                        lpName: WideCString): Handle
@@ -330,6 +362,31 @@ proc queryInformationJobObject(hJob: Handle; jobObjectInfoClass: int32;
   {.stdcall, dynlib: "kernel32", importc: "QueryInformationJobObject".}
 proc terminateJobObjectW(hJob: Handle; uExitCode: int32): WINBOOL
   {.stdcall, dynlib: "kernel32", importc: "TerminateJobObject".}
+proc initializeProcThreadAttributeList(lpAttributeList: pointer;
+    dwAttributeCount, dwFlags: int32; lpSize: ptr ULONG_PTR): WINBOOL
+  {.stdcall, dynlib: "kernel32", importc: "InitializeProcThreadAttributeList".}
+proc updateProcThreadAttribute(lpAttributeList: pointer; dwFlags: int32;
+    attribute: ULONG_PTR; lpValue: pointer; cbSize: ULONG_PTR;
+    lpPreviousValue: pointer; lpReturnSize: ptr ULONG_PTR): WINBOOL
+  {.stdcall, dynlib: "kernel32", importc: "UpdateProcThreadAttribute".}
+proc deleteProcThreadAttributeList(lpAttributeList: pointer)
+  {.stdcall, dynlib: "kernel32", importc: "DeleteProcThreadAttributeList".}
+proc createProcessExW(lpApplicationName, lpCommandLine: WideCString;
+    lpProcessAttributes, lpThreadAttributes: ptr SECURITY_ATTRIBUTES;
+    bInheritHandles: WINBOOL; dwCreationFlags: int32;
+    lpEnvironment, lpCurrentDirectory: WideCString;
+    lpStartupInfo: var STARTUPINFOEX;
+    lpProcessInformation: var PROCESS_INFORMATION): WINBOOL
+  {.stdcall, dynlib: "kernel32", importc: "CreateProcessW".}
+  ## rfc-0007 review r47: the SAME `CreateProcessW` entrypoint `createProcessW`
+  ## (std/winlean) imports, re-declared with a `STARTUPINFOEX` last-startup-
+  ## info parameter instead of `STARTUPINFO` — legal per the Win32 contract:
+  ## `lpStartupInfo` is documented as `LPSTARTUPINFOW`, and a
+  ## `STARTUPINFOEXW*` is a valid one exactly because `STARTUPINFOEXW`
+  ## starts with a `STARTUPINFOW` (the same struct-extension shape
+  ## `JobPidListHeader`/`STARTUPINFOEX` above already document). Used ONLY
+  ## when `EXTENDED_STARTUPINFO_PRESENT` is also passed in
+  ## `dwCreationFlags` — see `createProcessRestricted`.
 proc generateConsoleCtrlEvent(dwCtrlEvent, dwProcessGroupId: int32): WINBOOL
   {.stdcall, dynlib: "kernel32", importc: "GenerateConsoleCtrlEvent".}
 proc getConsoleCP(): int32
@@ -754,6 +811,15 @@ proc capabilities*(): Capabilities =
 # ---------------------------------------------------------------------------
 
 proc buildCommandLine(argv: seq[string]): string =
+  ## `quoteShellWindows`'s quoting contract is CreateProcessW's own C-runtime
+  ## argv-splitting convention (MSVC-style), which is what every ordinary
+  ## native `.exe` expects — review r46: it is NOT cmd.exe-safe. If
+  ## `argv[0]` resolves to a `.bat`/`.cmd`, CreateProcessW hands the whole
+  ## command line to `cmd.exe` for a SECOND round of parsing with its own,
+  ## different metacharacter/quoting rules, and an argument correctly quoted
+  ## for the C-runtime convention here is not guaranteed safe (or even
+  ## correctly delimited) once cmd.exe re-parses it. Batch-file entrypoints
+  ## are outside this proc's quoting contract.
   for i, a in argv:
     if i > 0: result.add(' ')
     result.add(quoteShellWindows(a))
@@ -799,6 +865,65 @@ proc computeLimitsAchieved(limits: Limits; cpuAsInstallOk: bool): LimitsAchieved
     else:
       result[lk] = lsUnsupported
 
+proc createProcessRestricted(cmdWide, envWide, wwd: WideCString; flags: int32;
+                              si: STARTUPINFO; inheritHandles: openArray[Handle];
+                              pi: var PROCESS_INFORMATION): WINBOOL =
+  ## rfc-0007 review r47: plain `bInheritHandles=TRUE` (the call this
+  ## replaces) hands the child EVERY inheritable handle open anywhere in
+  ## this process at the moment of the call, not just the stdio handles
+  ## `si` wires up. crisol's own process is clean — nothing else it opens is
+  ## inheritable — but crisol is a library: a consumer embedding it could
+  ## legitimately have its own inheritable handle open for unrelated
+  ## reasons, and that handle would silently leak into every child crisol
+  ## spawns with no way for the consumer to opt out. The real fix is
+  ## STARTUPINFOEX + PROC_THREAD_ATTRIBUTE_HANDLE_LIST: Windows filters
+  ## inheritance down to EXACTLY the handles named in `inheritHandles`,
+  ## regardless of what else is open and inheritable in the process.
+  ##
+  ## This is the primary path. Every setup step below (list-size probe,
+  ## InitializeProcThreadAttributeList, UpdateProcThreadAttribute) is
+  ## non-fatal on failure — none is expected to fail on any supported
+  ## Windows version, but this backend never assumes a Win32 call can't —
+  ## and on any of them failing this DEGRADES to the plain
+  ## `bInheritHandles=TRUE` call (no attribute list, no whitelist): the
+  ## exact leak window this proc exists to close reopens, but sinks still
+  ## reach the child correctly either way, so a spawn is never aborted over
+  ## a whitelist that could not be installed.
+  var plainSi = si
+  template plainFallback(): WINBOOL =
+    createProcessW(nil, cmdWide, nil, nil, 1'i32, flags, envWide, wwd, plainSi, pi)
+
+  var size: ULONG_PTR = 0
+  discard initializeProcThreadAttributeList(nil, 1'i32, 0'i32, addr size)
+  # The call above ALWAYS "fails" by Win32 design when `lpAttributeList` is
+  # nil — its only job is to report the required byte count into `size`.
+  # A genuine setup failure (nothing supported this call at all) leaves
+  # `size` at its 0 init value.
+  if size == 0:
+    return plainFallback()
+
+  let attrMem = alloc(size.int)
+  defer: dealloc(attrMem)
+  if initializeProcThreadAttributeList(attrMem, 1'i32, 0'i32, addr size) == 0'i32:
+    return plainFallback()
+
+  var handles = newSeq[Handle](inheritHandles.len)
+  for i, h in inheritHandles: handles[i] = h
+  let updateOk = updateProcThreadAttribute(attrMem, 0'i32,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, addr handles[0],
+    ULONG_PTR(handles.len * sizeof(Handle)), nil, nil)
+  if updateOk == 0'i32:
+    deleteProcThreadAttributeList(attrMem)
+    return plainFallback()
+
+  var siex: STARTUPINFOEX
+  siex.si = si
+  siex.si.cb = sizeof(STARTUPINFOEX).int32
+  siex.lpAttributeList = attrMem
+  result = createProcessExW(nil, cmdWide, nil, nil, 1'i32,
+    flags or EXTENDED_STARTUPINFO_PRESENT, envWide, wwd, siex, pi)
+  deleteProcThreadAttributeList(attrMem)
+
 proc spawnChild(sv: var Supervisor; spec: ChildSpec): SpawnResult =
   if spec.argv.len == 0:
     return SpawnResult(ok: false, error: "empty argv")
@@ -842,8 +967,16 @@ proc spawnChild(sv: var Supervisor; spec: ChildSpec): SpawnResult =
   let flags: int32 = CREATE_UNICODE_ENVIRONMENT or CREATE_SUSPENDED or
                       CREATE_NEW_PROCESS_GROUP
 
-  let ok = createProcessW(nil, cmdWide, nil, nil, 1'i32, flags,
-                           envWide, wwd, si, pi)
+  # review r47: restricted to exactly the two real handles behind the three
+  # stdio roles above (stdin=nullHandle; stdout/stderr both=sinkHandle) —
+  # see createProcessRestricted's doc. `sinkHandle` is named once even
+  # though `si` uses it for two StartupInfo fields: the attribute-list API
+  # rejects a duplicate VALUE appearing twice in the array itself, which is
+  # a different rule from a single handle backing two StartupInfo roles —
+  # naming it once here still leaves both `hStdOutput`/`hStdError` pointing
+  # at an inheritable, whitelisted handle.
+  let ok = createProcessRestricted(cmdWide, envWide, wwd, flags, si,
+                                    [nullHandle, sinkHandle], pi)
   discard closeHandle(sinkHandle)
   discard closeHandle(nullHandle)
   if ok == 0'i32:
@@ -909,23 +1042,32 @@ proc spawnChild(sv: var Supervisor; spec: ChildSpec): SpawnResult =
     # a failure here only degrades the requested cpu/as limits to lsFailed
     # (computeLimitsAchieved below), it never aborts the spawn.
 
+  # The ChildId this spawn will get — computed here (rather than at the
+  # bottom, where it lived before review r43) so it is available as the
+  # completion-port key below. Reserving it now and only publishing it into
+  # `sv.children` at the very end (unchanged) is safe: every remaining step
+  # from here on is non-fatal (documented at each site), so this spawn can
+  # no longer abort before the id it reserves is actually used.
+  let id = sv.nextIdVal
+  inc sv.nextIdVal
+
   # rfc-0007 D1a: associate this Job with the shared completion port so
   # `nextEvent`'s primary tier wakes on this child's exit. NON-FATAL on
   # failure (unlike KILL_ON_JOB_CLOSE above) — same discipline as
   # posixcore's per-child pidfd_open/epoll_ctl registration: the kill
   # domain (Job Object) does not depend on it, and `nextEvent`'s sweep
   # still finds this child within one poll tick (<=25ms) either way.
+  # review r43: keyed on `id` (this child's ChildId, monotonic and never
+  # reused), NOT `hJob` — see JOBOBJECT_ASSOCIATE_COMPLETION_PORT's doc.
   if sv.completionPort != 0:
     var assoc = JOBOBJECT_ASSOCIATE_COMPLETION_PORT(
-      completionKey: cast[pointer](hJob), completionPort: sv.completionPort)
+      completionKey: cast[pointer](int(id)), completionPort: sv.completionPort)
     discard setInformationJobObject(hJob, jicAssociateCompletionPort,
                                      addr assoc, int32(sizeof(assoc)))
 
   discard resumeThread(pi.hThread)
   discard closeHandle(pi.hThread)
 
-  let id = sv.nextIdVal
-  inc sv.nextIdVal
   sv.children[id] = ChildEntry(hProcess: pi.hProcess, hJob: hJob, pid: pi.dwProcessId,
                                 state: wcsSpawned, reqLimits: spec.limits,
                                 achieved: computeLimitsAchieved(spec.limits, cpuAsInstallOk))
@@ -1013,21 +1155,34 @@ proc noteJobMessage(sv: var Supervisor; msg: DWORD; key: ULONG_PTR;
   ## requested+achieved (the memoryOomKill shape). The pid guard matters:
   ## PerProcessUserTimeLimit is per PROCESS — a grandchild in the same Job
   ## exceeding it dies alone and must not annotate the direct child's reap.
+  ## `key` is matched against `id` (the `sv.children` table key, this
+  ## child's monotonic ChildId) — NOT `entry.hJob`'s raw value (review r43):
+  ## see JOBOBJECT_ASSOCIATE_COMPLETION_PORT's doc for why a handle value
+  ## can't safely stand in as the completion key. The pid check below stays
+  ## as belt-and-suspenders even though the ChildId match alone is already
+  ## unambiguous.
   if msg != JOB_OBJECT_MSG_END_OF_PROCESS_TIME:
     return
   let msgPid = uint32(cast[uint](ov) and 0xFFFFFFFF'u)
   for id, entry in sv.children.mpairs:
     if entry.state != wcsReaped and
-       cast[ULONG_PTR](entry.hJob) == key and uint32(entry.pid) == msgPid:
+       key == ULONG_PTR(id) and uint32(entry.pid) == msgPid:
       entry.limitKilled = some(lkCpu)
       return
 
 proc drainJobMessages(sv: var Supervisor) =
   ## rfc-0007 D1c: drain (timeout 0) every already-posted completion packet,
   ## decoding each as an annotation. Called after nextEvent's blocking wait
-  ## AND from reap BEFORE the report is built — the exit sweep can observe
-  ## the process handle signaled before the limit message is dequeued, so
-  ## without the reap-side drain the annotation would be lost to that race.
+  ## AND from reap BEFORE the report is built. Review r45 (claim-strength
+  ## honesty): MSDN does NOT document the relative kernel ordering between a
+  ## process handle signaling and its Job's END_OF_PROCESS_TIME message
+  ## landing in the completion queue, and this module does not assume one —
+  ## draining at both points is defensive against whichever order the
+  ## kernel actually uses. The guarantee this backend actually makes is
+  ## about FAILURE DIRECTION, not ordering: if the message is not yet
+  ## queued by the time a reap is built, `limitKilled` is honestly `none`
+  ## (a cbCpu kill reads `cbProcess`/`cbUnknown` instead) — it is never
+  ## fabricated onto the wrong child or the wrong report.
   if sv.completionPort == 0:
     return
   while true:
@@ -1339,24 +1494,32 @@ proc consoleHasPid(pid: int32): bool =
   ## A 0 return is a probe failure (undocumented reason, e.g. no console at
   ## all) — treated as "cannot prove deliverable" ⇒ false, never assumed
   ## true (§1's weakest-honest-claim rule: fail closed, not open). If the
-  ## stack buffer is too small, the call reports the TRUE required count as
-  ## its return value rather than silently truncating, so this re-queries
-  ## into an exactly-sized `seq` instead of scanning a partial buffer.
-  var buf: array[256, int32]
-  let n = getConsoleProcessList(addr buf[0], 256'i32)
-  if n <= 0'i32:
-    return false
-  if n <= 256'i32:
-    for i in 0 ..< n.int:
-      if buf[i] == pid: return true
-    return false
-  var big = newSeq[int32](n.int)
-  let n2 = getConsoleProcessList(addr big[0], n)
-  if n2 <= 0'i32:
-    return false
-  for i in 0 ..< min(n2.int, big.len):
-    if big[i] == pid: return true
-  false
+  ## buffer is too small, the call reports the TRUE required count as its
+  ## return value WITHOUT writing to the buffer at all (Win32-documented) —
+  ## review r44: a SINGLE re-query into a seq sized from that first count is
+  ## not enough, because the console's membership can keep growing between
+  ## calls (another process attaching concurrently); if the regrown buffer
+  ## is STILL too small on a later try, its contents are genuinely
+  ## undefined, so scanning it would be reading garbage rather than a
+  ## partial truth. This loops instead: regrow to the just-reported
+  ## requirement and retry, bounded, rather than ever trusting an
+  ## under-sized buffer's bytes; exhausting the bound fails closed (not
+  ## deliverable), the same honesty rule as the plain probe-failure case
+  ## above.
+  const maxGrowRetries = 5
+  var cap = 256
+  var buf = newSeq[int32](cap)
+  for _ in 0 .. maxGrowRetries:
+    let n = getConsoleProcessList(addr buf[0], int32(cap))
+    if n <= 0'i32:
+      return false
+    if n.int <= cap:
+      for i in 0 ..< n.int:
+        if buf[i] == pid: return true
+      return false
+    cap = n.int
+    buf = newSeq[int32](cap)
+  false  # bound exhausted: membership kept outgrowing every retry — fail closed
 
 proc requestStop*(sv: var Supervisor; id: ChildId; reason: KillReason) =
   ## Cooperative stop: GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) — gated on
@@ -1387,12 +1550,25 @@ proc forceKill*(sv: var Supervisor; id: ChildId) =
   ## `stop.isSome AND NOT cooperativeUnavailable` (this module's header
   ## finding): §1 says escalated is false when the cooperative step was
   ## never attempted — "nothing to escalate FROM" — and on Windows that is
-  ## reachable (unlike POSIX, where SIGTERM is always deliverable). When no
-  ## prior `requestStop` recorded a deliverability verdict, this computes
-  ## the SAME real per-child probe (`consoleHasPid`), not the D1a-era
-  ## supervisor-global bit. Refreshes `killSnapshot` (§1) — taken BEFORE
-  ## TerminateJobObject fires: a snapshot taken after would only see an
-  ## already-dying Job.
+  ## reachable (unlike POSIX, where SIGTERM is always deliverable).
+  ##
+  ## review r48 (doc-honesty): when there is NO prior `stop` at all (this
+  ## proc called directly, skipping `requestStop` — every production
+  ## executor calls `requestStop` first, so this branch is DEFENSIVE-only in
+  ## practice, exercised here only by tests that force-kill straight away),
+  ## `stop.isSome` is false at the moment this fires — that is exactly WHY
+  ## this branch was taken. Per the formula above, `escalated` is therefore
+  ## honestly `false` here UNCONDITIONALLY: there was no cooperative attempt
+  ## to escalate from, so a fresh deliverability probe's answer is
+  ## irrelevant to `escalated` (using it there, as an earlier version of
+  ## this branch did, contradicted the formula it cites — a cooperative
+  ## channel that merely HAPPENED to be deliverable, but that this proc
+  ## never actually used, is not an escalation). `cooperativeUnavailable` is
+  ## still probed and recorded here (the SAME real per-child probe,
+  ## `consoleHasPid`, not the D1a-era supervisor-global bit) purely for
+  ## diagnostic completeness — it no longer feeds `escalated`. Refreshes
+  ## `killSnapshot` (§1) — taken BEFORE TerminateJobObject fires: a snapshot
+  ## taken after would only see an already-dying Job.
   let idx = requireLive(sv, id)
   var entry = sv.children[idx]
   if entry.state == wcsExited: return   # atomic no-op
@@ -1403,7 +1579,7 @@ proc forceKill*(sv: var Supervisor; id: ChildId) =
     entry.stop = some((reason: priorReason, escalated: not entry.cooperativeUnavailable))
   else:
     entry.cooperativeUnavailable = not (sv.consoleAttached and consoleHasPid(entry.pid))
-    entry.stop = some((reason: krTimeout, escalated: not entry.cooperativeUnavailable))
+    entry.stop = some((reason: krTimeout, escalated: false))
   sv.children[idx] = entry
 
 # ---------------------------------------------------------------------------
@@ -1430,9 +1606,12 @@ proc reap*(sv: var Supervisor; id: ChildId): ReapReport =
   ## rfc-0007 §6). KILL_ON_JOB_CLOSE below still performs the actual
   ## cleanup — this does not add a kill step, only an honest OBSERVATION
   ## before that cleanup fires.
-  # rfc-0007 D1c: drain pending completion packets BEFORE reading the entry —
-  # the exit sweep can beat the limit message to the queue, and the
-  # annotation must be on the entry before the report is built.
+  # rfc-0007 D1c: drain pending completion packets BEFORE reading the entry
+  # — the kernel's relative ordering between a process handle signaling and
+  # its Job's limit message reaching the queue is not documented (review
+  # r45), so this drains defensively rather than assuming the message is
+  # always there first. If it is not there yet, the annotation is honestly
+  # absent from the report, never fabricated after the fact.
   drainJobMessages(sv)
   let idx = int32(id)
   if idx notin sv.children:
