@@ -667,11 +667,13 @@ proc finalizeSlot(
   ## exit itself, so this proc never branches on "was this a timeout or an
   ## interrupt" anywhere: krTimeout and krInterrupt reach the exact same
   ## code from here on.
-  # B1 regression fix, part B: `runPhase` is true only for the RUN child —
-  # a compile-phase reap must never engage reparented-orphan (ppid==ownPid)
-  # escapee discovery (it would catch crisol's own compile toolchain, a
-  # false positive) — see reap*'s doc comment (process/posix.nim).
-  var report  = sv.reap(slots[idx].id, slots[idx].phase == spRunning)
+  # B1 regression fix, part B; r28 re-homed onto ChildSpec.claimOrphans
+  # (process/types.nim), declared once at spawn — `spawnCompileStable`'s
+  # ChildSpec sets it false so a compile-phase reap never engages
+  # reparented-orphan (ppid==ownPid) escapee discovery (it would catch
+  # crisol's own compile toolchain, a false positive) — see reap*'s doc
+  # comment (process/posix.nim).
+  var report  = sv.reap(slots[idx].id)
   let pepIdx  = slots[idx].pepIdx
   let pep     = plan.entrypoints[pepIdx]
   let elapsed = int64((epochTime() - slots[idx].t0) * 1000)
@@ -907,7 +909,15 @@ proc teardownDiscard(sv: var Supervisor; slots: var seq[Slot]) =
     case ev.kind
     of weChildExited:
       let idx = slotIndexOf(slots, ev.id)
-      discard sv.reap(slots[idx].id, false)   # DISCARDED — no Phase, no Cause, no onResult; never authors an escapee here
+      discard sv.reap(slots[idx].id)   # DISCARDED — no Phase, no Cause, no onResult; never authors an escapee here.
+        # r28: this used to force the conservative (no orphan-claim) scan
+        # unconditionally, regardless of the slot's own phase — that
+        # per-call override no longer exists; containment intent rides the
+        # slot's own ChildSpec.claimOrphans now (false for a compiling
+        # slot, true for a running one, same as every other reap site).
+        # The report is discarded either way, so no Phase/Cause/output
+        # observes the difference; a run-phase slot torn down here now
+        # gets the same real orphan-kill cleanup a normal run reap would.
       cleanupSlotOnTeardown(slots[idx])
       slots[idx].state = ssIdle
     of weDeadline:
@@ -1262,6 +1272,11 @@ proc spawnCompileStable(
     env:    filterEnv(toSeq(envPairs()), SandboxSpec(envScrub: false), @[]),
     sinks:  combinedSink(compOut),
     limits: ptypes.Limits(),  # compile is unsandboxed — no limits requested
+    # r28: compile toolchain transients (`nim` -> `cc`/`gcc`) can
+    # transiently reparent to crisol mid-compile — never a test escapee,
+    # so this spawn is exempt from reparented-orphan claiming at reap
+    # (see ChildSpec.claimOrphans' doc comment, process/types.nim).
+    claimOrphans: false,
   )
   let sr = sv.spawn(childSpec)
   if not sr.ok:

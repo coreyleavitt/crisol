@@ -131,7 +131,8 @@ when defined(linux):
     ## unlike the pgid/ppid heuristics this can NEVER cross-attribute a
     ## different slot's descendant — structurally sound regardless of
     ## compile vs. run phase, which is why (unlike
-    ## `discoverAndReapEscapees`) this path never needs a `runPhase` guard.
+    ## `discoverAndReapEscapees`) this path never needs a `claimOrphans`
+    ## guard.
     result = @[]
     var pids: seq[int]
     try:

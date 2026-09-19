@@ -128,7 +128,10 @@ when defined(linux):
     let ev = nextEvent(core, deadline)
     if ev.kind != weChildExited:
       return (ev, ReapReport())
-    (ev, reapCore(core, ev.id, false))
+    (ev, reapCore(core, ev.id))   # r28: claimOrphans now rides ChildSpec
+                                    # (unset here -> default true); these
+                                    # fixtures fork no grandchildren, so the
+                                    # escapee scan finds nothing regardless.
 
   # ---------------------------------------------------------------------------
   # Suite 1 — cgroup tier conformance

@@ -173,6 +173,13 @@ type
                                 ## whose forced-kill write failed can no
                                 ## longer honestly vouch `kdsCgroup` — see
                                 ## `killDomainFor`.
+    claimOrphans: bool          ## rfc-0007 code-review r28: `spec.claimOrphans`
+                                ## carried forward at spawn (like `reqLimits`)
+                                ## — `reapCore` reads it back off THIS entry
+                                ## instead of taking a per-reap `runPhase`
+                                ## param; see `ChildSpec.claimOrphans`'s doc
+                                ## comment (process/types.nim) for the
+                                ## contract this replaces.
 
   PosixCore* = object
     nextIdVal: int32
@@ -872,7 +879,8 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   inc core.nextIdVal
   core.children[id] = ChildEntry(pid: childPid, state: csSpawned,
                                   reqLimits: spec.limits, achieved: achieved,
-                                  pidfd: pidfd, cgroupLeaf: cgroupLeafPath)
+                                  pidfd: pidfd, cgroupLeaf: cgroupLeafPath,
+                                  claimOrphans: spec.claimOrphans)
   inc core.liveCount
   SpawnResult(ok: true, id: ChildId(id))
 
@@ -1322,7 +1330,7 @@ proc forceKillCore*(core: var PosixCore; id: ChildId) =
 
 when defined(linux):
   proc discoverAndReapEscapees(core: PosixCore; excludeIdx: int32; pgid: Pid;
-                               caps: Capabilities; runPhase: bool): seq[ProcSnapshot] =
+                               caps: Capabilities; claimOrphans: bool): seq[ProcSnapshot] =
     ## Owning-slot escapees (§3): every /proc entry whose pgrp matches this
     ## slot's domain pgid (same-pgroup survivor, the pre-B1 case) OR whose
     ## ppid is crisol's own pid (reparented via PR_SET_CHILD_SUBREAPER —
@@ -1335,22 +1343,26 @@ when defined(linux):
     ## subreaper a reparented-orphan claim would be unfounded, and without
     ## pidfd there is no pid-reuse-safe kill handle.
     ##
-    ## B1 regression fix, part B: `runPhase` scopes the ppid==ownPid
-    ## (reparented-orphan) half of this discovery to genuine RUN-phase
-    ## reaps only. `reapCore` runs for EVERY reap, including compile-phase
-    ## ones — and crisol's own compile toolchain (`nim` -> `cc`/`gcc`, both
+    ## B1 regression fix, part B; r28 re-homed onto `ChildSpec.claimOrphans`:
+    ## `claimOrphans` (the spawning child's own declared containment
+    ## intent, read back off its `ChildEntry` by `reapCore` — see that
+    ## field's doc comment) scopes the ppid==ownPid (reparented-orphan) half
+    ## of this discovery to children that opted in. `reapCore` runs for
+    ## EVERY reap, including the runner's compile-phase ones — and crisol's
+    ## own compile toolchain (`nim` -> `cc`/`gcc`, both
     ## `# process-contract-exempt`) can transiently reparent to crisol (a
     ## subreaper) mid-compile. Without this guard that toolchain transient
     ## would be misclassified as a test escapee: a normal compile would go
     ## spuriously uncacheable and render a bogus `[ESCAPEE]` warning — test
-    ## escapees (spawn_grandchild/spawn_grandchild_setsid) are a RUN-phase
-    ## concept only. When `runPhase` is false this falls back to the exact
-    ## pre-B1 compile path: pgid-only `scanProcessGroup`, no ppid scan, no
-    ## kill. Accepted misattribution window (never unsound, per the RFC's
-    ## "named misattribution windows" posture): a concurrent toolchain
-    ## transient rarely reparenting during an ACTUAL run reap could still be
-    ## counted as that slot's escapee — conservatively uncacheable, that's
-    ## all.
+    ## escapees (spawn_grandchild/spawn_grandchild_setsid) are a run-child
+    ## concept only, and the runner's compile spawns set
+    ## `claimOrphans = false` for exactly that reason. When `claimOrphans`
+    ## is false this falls back to the exact pre-B1 compile path: pgid-only
+    ## `scanProcessGroup`, no ppid scan, no kill. Accepted misattribution
+    ## window (never unsound, per the RFC's "named misattribution windows"
+    ## posture): a concurrent toolchain transient rarely reparenting during
+    ## an ACTUAL run reap could still be counted as that slot's escapee —
+    ## conservatively uncacheable, that's all.
     ##
     ## r2 regression fix (cross-slot escapee misattribution): `livePids`
     ## below doubles as "every OTHER live slot's domain pgid" too —
@@ -1369,7 +1381,7 @@ when defined(linux):
     ## subreaper tier and is not solved here; the cgroup tier (reapCore's
     ## `usedCgroup` arm) has no such hole because it scopes by leaf
     ## membership, never by pgid/ppid heuristics.
-    if not runPhase or not (caps.subreaper and caps.pidfd):
+    if not claimOrphans or not (caps.subreaper and caps.pidfd):
       return scanProcessGroup(pgid)
     result = @[]
     var livePids: HashSet[int]
@@ -1429,19 +1441,21 @@ when defined(linux):
                               rssBytes: rss)
 else:
   proc discoverAndReapEscapees(core: PosixCore; excludeIdx: int32; pgid: Pid;
-                               caps: Capabilities; runPhase: bool): seq[ProcSnapshot] =
+                               caps: Capabilities; claimOrphans: bool): seq[ProcSnapshot] =
     scanProcessGroup(pgid)
 
 # ---------------------------------------------------------------------------
 # reap — the only place a ChildId is consumed (§1).
 # ---------------------------------------------------------------------------
 
-proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
-  ## `runPhase` (B1 regression fix, part B): true iff this reap is for a
-  ## genuine RUN-phase child (the executor's `finalizeSlot` passes
-  ## `slot.phase == spRunning`) — gates `discoverAndReapEscapees`'s
-  ## reparented-orphan (ppid==ownPid) discovery+kill so it never engages on
-  ## a compile-phase reap. See that proc's doc comment for why.
+proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
+  ## r28: containment intent is read back off THIS child's own entry
+  ## (`entry.claimOrphans`, stored at spawn from `spec.claimOrphans` — see
+  ## its doc comment, process/types.nim) rather than taken as a per-reap
+  ## param — gates `discoverAndReapEscapees`'s reparented-orphan
+  ## (ppid==ownPid) discovery+kill so it never engages on a spawn that
+  ## declared itself exempt (the runner's compile children). See that
+  ## proc's doc comment for why.
   let idx = int32(id)
   if idx notin core.children:
     doAssert false, "reap: unknown ChildId " & $id
@@ -1465,7 +1479,7 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
       # comes from the cgroup itself, not the /proc pgid/ppid heuristics
       # `discoverAndReapEscapees` uses for the subreaper tier — see
       # `cgroup.cgroupLeafSurvivors`'s doc comment for why this needs no
-      # `runPhase` guard (leaf-scoped membership cannot cross-attribute
+      # `claimOrphans` guard (leaf-scoped membership cannot cross-attribute
       # between slots the way a global pgid/ppid scan can). Read BEFORE
       # any teardown write below — `memory.events` must not race the
       # leaf's own removal. (`memory.peak` is intentionally NOT read into
@@ -1504,7 +1518,7 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
     # leader itself is already gone from /proc (pollSweepChildren's wait4
     # already consumed it), so only real survivors/descendants remain in
     # the scan.
-    escapees = discoverAndReapEscapees(core, idx, entry.pid, caps, runPhase)
+    escapees = discoverAndReapEscapees(core, idx, entry.pid, caps, entry.claimOrphans)
 
   # A7/B1/B3/r10 (§4/§3): the per-spawn ACHIEVED domain — kdsCgroup iff this
   # spawn got a real leaf AND every cgroup.kill write for it actually

@@ -1255,15 +1255,14 @@ proc forceKill*(sv: var Supervisor; id: ChildId) =
 # reap — the only place a ChildId is consumed (§1).
 # ---------------------------------------------------------------------------
 
-proc reap*(sv: var Supervisor; id: ChildId; runPhase: bool = false): ReapReport =
-  ## `runPhase` exists for POSIX-backend signature parity (posix.nim gates
-  ## subreaper-tier reparented-orphan escapee discovery on it). It is a
-  ## deliberate NO-OP here: a Job Object with KILL_ON_JOB_CLOSE and breakaway
-  ## disabled is a COMPLETE containment domain (D1b-iii) — no process can
-  ## ever LEAVE it — so there is no reparented-orphan escapee DISCOVERY to
-  ## gate (nothing to search for outside the Job). Accepted-and-ignored so
-  ## the runner's 3-arg `reap` call type-checks identically against both
-  ## backends.
+proc reap*(sv: var Supervisor; id: ChildId): ReapReport =
+  ## rfc-0007 code-review r28: the POSIX-side containment-intent concept
+  ## (`ChildSpec.claimOrphans` — process/types.nim) is legitimately IGNORED
+  ## here, not carried as a discarded parameter: a Job Object with
+  ## KILL_ON_JOB_CLOSE and breakaway disabled is a COMPLETE containment
+  ## domain (D1b-iii) — no process can ever LEAVE it — so there is no
+  ## reparented-orphan escapee DISCOVERY to gate (nothing to search for
+  ## outside the Job) regardless of what the spawning child declared.
   ##
   ## rfc-0007 review r4: `escapees` is NOT `@[]` by construction — "cannot
   ## leave" is a different claim from "nothing survived to reap time" (see
@@ -1276,7 +1275,6 @@ proc reap*(sv: var Supervisor; id: ChildId; runPhase: bool = false): ReapReport 
   ## rfc-0007 §6). KILL_ON_JOB_CLOSE below still performs the actual
   ## cleanup — this does not add a kill step, only an honest OBSERVATION
   ## before that cleanup fires.
-  discard runPhase
   # rfc-0007 D1c: drain pending completion packets BEFORE reading the entry —
   # the exit sweep can beat the limit message to the queue, and the
   # annotation must be on the entry before the report is built.

@@ -378,6 +378,32 @@ type
     env*: seq[(string, string)]  ## EXPLICIT, always (§1).
     sinks*: StdioSink
     limits*: Limits
+    claimOrphans*: bool = true  ## rfc-0007 code-review r28: the CONTAINMENT
+                             ## intent, declared once at spawn (not re-passed
+                             ## per reap). True (default): at reap, reparented
+                             ## orphans and same-pgroup survivors discovered on
+                             ## this child's account may be claimed/killed as
+                             ## its escapees (posixcore's `discoverAndReap-
+                             ## Escapees` reparented-orphan arm, Linux
+                             ## subreaper+pidfd tier only — the pgid-only scan
+                             ## always applies regardless of this flag). False:
+                             ## this child is contract-exempt from that
+                             ## claim — the runner's COMPILE spawns set it
+                             ## false (a `nim` -> `cc`/`gcc` toolchain
+                             ## transient can reparent to crisol mid-compile;
+                             ## without the exemption it would be
+                             ## misclassified as a test escapee, see that
+                             ## proc's doc comment). Replaces the old
+                             ## `reap(id, runPhase)` param the SS1 process
+                             ## contract never should have carried — `runPhase`
+                             ## named the CALLER's phase, not the mechanism it
+                             ## gated; this field names the mechanism, decided
+                             ## once, by the party (the runner) that actually
+                             ## knows which kind of child this is. Windows
+                             ## legitimately ignores it: a Job Object with
+                             ## breakaway disabled is a complete containment
+                             ## domain, nothing can leave it to be
+                             ## (mis)claimed either way.
 
   ChildId* = distinct int32   ## stable token, valid spawn..reap (§1). The
                                ## fd/HANDLE never leaves the backend.

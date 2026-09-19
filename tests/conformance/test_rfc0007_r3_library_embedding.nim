@@ -23,8 +23,8 @@
 ##      sleeper standing in for the host application's own pre-existing
 ##      worker.
 ##   2. `initSupervisor`, spawn+run+reap ONE normal quick child with
-##      `runPhase = true` — the exact condition that engages the
-##      escapee-kill scan.
+##      `ChildSpec.claimOrphans` at its default `true` — the exact
+##      condition that engages the escapee-kill scan.
 ##   3. Destroy the Supervisor (block-scope end triggers its `=destroy`).
 ##   4. Assert: the host child is still alive; this test process can still
 ##      `waitpid` it normally (no ECHILD — its exit status was never
@@ -114,9 +114,10 @@ when defined(linux):
 
         # ---------------------------------------------------------------
         # Step 2 — Supervisor lifecycle: init, spawn+run+reap ONE normal
-        # quick child with runPhase = true (the exact condition that
-        # engages the escapee-kill scan this finding is about), then let
-        # the block end so `=destroy` runs deterministically here.
+        # quick child with ChildSpec.claimOrphans at its default true (the
+        # exact condition that engages the escapee-kill scan this finding
+        # is about), then let the block end so `=destroy` runs
+        # deterministically here.
         # ---------------------------------------------------------------
         block:
           var sv = initSupervisor(installSignals = false)
@@ -130,7 +131,9 @@ when defined(linux):
           check sr.ok
           let ev = sv.next(getMonoTime() + initDuration(seconds = 5))
           check ev.kind == weChildExited
-          discard sv.reap(ev.id, runPhase = true)
+          discard sv.reap(ev.id)   # r28: ChildSpec.claimOrphans defaults true —
+                                    # same escapee-kill-scan condition `runPhase
+                                    # = true` used to name explicitly here.
           removeFile(outPath)
 
           # The host child must still be genuinely alive here — kill(pid,
