@@ -115,6 +115,66 @@ when defined(posix):
       destroyPosixCore(core)
       check currentDisposition(SIGINT) == cast[pointer](SIG_DFL)
 
+    test "r73: non-LIFO destroy of two live cores -- destroying the OLDER (non-owning) core must not clobber the disposition the NEWER core still needs":
+      ## rfc-0007 code-review r73: `destroyPosixCore` restored
+      ## `prevSigint`/`prevSigterm` guarded only by `core.installedSignals`
+      ## -- NOT by the same ownership token
+      ## (`gShutdownWriteFd == core.pipeWrite`) the write-fd clear one line
+      ## above already uses. `initPosixCore` is not a process-wide
+      ## singleton -- nothing stops two live `PosixCore`s in one process
+      ## (this codebase's supported configuration is ONE at a time, but
+      ## nothing enforces it) -- so a non-LIFO destroy (the OLDER core
+      ## torn down while a NEWER one is still live) is constructible
+      ## in-process, exactly as done here.
+      ##
+      ## Sequence: coreA installs (saving whatever was there before it --
+      ## SIG_DFL, pinned below); coreB installs next (saving whatever
+      ## coreA just installed -- crisol's OWN `shutdownSigHandler`).
+      ## `gShutdownWriteFd` now names coreB's pipe (the LAST installer
+      ## always wins that global -- see `initPosixCore`'s own comment).
+      ## Destroying coreA (the older, NON-owning core) first is the
+      ## regression scenario: pre-fix, coreA unconditionally restores
+      ## ITS OWN `prevSigint`/`prevSigterm` (SIG_DFL) -- overwriting the
+      ## disposition coreB's still-live SIGINT/SIGTERM handling depends
+      ## on with SIG_DFL, silently killing coreB's shutdown path. Fixed:
+      ## coreA is not the `gShutdownWriteFd` owner, so its restore must
+      ## be skipped entirely -- the disposition must still read as
+      ## crisol's installed handler after coreA's destroy returns.
+      installDisposition(SIGINT, cast[proc (x: cint) {.noconv.}](SIG_DFL))
+      installDisposition(SIGTERM, cast[proc (x: cint) {.noconv.}](SIG_DFL))
+
+      var coreA = initPosixCore(installSignals = true)
+      let installedByCrisol = currentDisposition(SIGINT)
+      check installedByCrisol != cast[pointer](SIG_DFL)
+
+      var coreB = initPosixCore(installSignals = true)
+      # coreB installed the SAME crisol handler over coreA's -- the
+      # observable disposition is unchanged (both install the identical
+      # `shutdownSigHandler` function pointer), so this check just pins
+      # that nothing went sideways at coreB's own init.
+      check currentDisposition(SIGINT) == installedByCrisol
+
+      # THE regression: destroy the OLDER, non-owning core first.
+      destroyPosixCore(coreA)
+      check currentDisposition(SIGINT) == installedByCrisol
+      check currentDisposition(SIGTERM) == installedByCrisol
+
+      # The NEWER core is still live and still functionally installed --
+      # destroying it (the actual `gShutdownWriteFd` owner) restores
+      # whatever WAS in effect at ITS OWN init, which is coreA's install
+      # (crisol's handler again, not the original host SIG_DFL) -- an
+      # accepted residual of stacking two cores in one process (never the
+      # supported configuration), documented here rather than silently
+      # assumed away.
+      destroyPosixCore(coreB)
+      check currentDisposition(SIGINT) == installedByCrisol
+      check currentDisposition(SIGTERM) == installedByCrisol
+
+      # Cleanup: never leave a real signal handler installed in this test
+      # process past this test.
+      installDisposition(SIGINT, cast[proc (x: cint) {.noconv.}](SIG_DFL))
+      installDisposition(SIGTERM, cast[proc (x: cint) {.noconv.}](SIG_DFL))
+
   when isMainModule:
     echo "test_rfc0007_r69_signal_restore: done"
 else:

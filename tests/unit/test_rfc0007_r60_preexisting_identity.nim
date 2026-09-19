@@ -32,6 +32,21 @@
 ## the wraparound." Pid wraparound is not reproducible in any test
 ## environment on demand.
 ##
+## rfc-0007 code-review r72 extends this file with a SECOND suite pinning
+## `preExistingSweepAction` — `sweepAdoptedOrphan`'s own guard, not just
+## the bare `isPreExistingIdentity` predicate above. Pre-r72,
+## `sweepAdoptedOrphan` treated an UNREADABLE starttime (a transient
+## `/proc` read failure — realistic under `--jobs` fd pressure) on a pid
+## THIS snapshot was protecting the SAME as a confirmed mismatch: both
+## fell through into the prune-and-reap branch, so a single bad read
+## permanently consumed and unprotected a genuine pre-existing host
+## child's zombie. `preExistingSweepAction` keeps "unreadable" and
+## "confirmed mismatch" as distinct outcomes so the sweep call site can
+## skip-without-pruning on the former — see its own doc comment
+## (posixcore.nim) for why the escapee-KILL call site
+## (`discoverAndReapEscapees`) does not need this distinction and is left
+## on the bare predicate.
+##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_rfc0007_r60_preexisting_identity.nim
@@ -82,6 +97,51 @@ when defined(posix):
       snap[100] = 0
       check isPreExistingIdentity(snap, 100, 0) == true
       check isPreExistingIdentity(snap, 100, 1) == false
+
+  suite "rfc-0007 r72 — preExistingSweepAction: sweepAdoptedOrphan's own guard, not just the bare predicate":
+
+    test "same pid, same starttime -> protect (never consume, never prune) -- matches isPreExistingIdentity's true case":
+      var snap: Table[int, int64]
+      snap[100] = 555_555
+      check preExistingSweepAction(snap, 100, 555_555) == peSweepProtect
+
+    test "pid in snapshot, starttime READS as a genuine mismatch -> prune the stale entry and fall through to normal handling":
+      var snap: Table[int, int64]
+      snap[100] = 555_555
+      check preExistingSweepAction(snap, 100, 999_999) == peSweepPruneStale
+
+    test "pid never in the snapshot -> not tracked, normal handling, nothing to prune":
+      var snap: Table[int, int64]
+      snap[100] = 555_555
+      check preExistingSweepAction(snap, 200, 555_555) == peSweepNotTracked
+
+    test "r72 (THE fix): pid in snapshot but starttime is UNREADABLE (-1, a transient /proc read failure) -> skip WITHOUT consuming or pruning":
+      ## THE regression this finding closes. `isPreExistingIdentity` alone
+      ## degrades an unreadable starttime to "not confirmed pre-existing"
+      ## (correct for the escapee-KILL path, which re-verifies via
+      ## pidfd_open before ever killing anything) — but pre-fix,
+      ## `sweepAdoptedOrphan` treated that same "not confirmed" result as
+      ## a green light to fall through into the `pid in preExisting` prune
+      ## branch and then REAP (wait4) the zombie: a transient EMFILE-class
+      ## read failure (realistic under --jobs fd pressure, per
+      ## `initPosixCore`'s own doc) silently consumed a pre-existing HOST
+      ## child's zombie and permanently pruned its protection — a single
+      ## bad read, not a real pid-reuse mismatch, was enough to do this.
+      ## The fix: pid-present + starttime-unreadable is its own outcome,
+      ## distinct from both "protect" (identity confirmed) and
+      ## "prune-stale" (identity confirmed MISMATCHED) — skip this attempt
+      ## with NO consume and NO prune, so a later retry (the WNOWAIT sweep
+      ## keeps re-finding the same unconsumed zombie every tick) gets a
+      ## fair, freshly-read identity check; genuine pid reuse still prunes
+      ## correctly the moment a READABLE mismatched starttime shows up.
+      var snap: Table[int, int64]
+      snap[100] = 555_555
+      check preExistingSweepAction(snap, 100, -1) == peSweepSkipUnreadable
+
+    test "pid never in the snapshot AND starttime unreadable -> still just not tracked (unreadable only matters for a pid we're actually protecting)":
+      var snap: Table[int, int64]
+      snap[100] = 555_555
+      check preExistingSweepAction(snap, 200, -1) == peSweepNotTracked
 
   when isMainModule:
     echo "test_rfc0007_r60_preexisting_identity: done"

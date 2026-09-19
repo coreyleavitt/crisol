@@ -87,9 +87,14 @@ proc cgroupTierUsable*(caps: Capabilities): bool =
   ## kernel that lacks `cgroup.kill` (< 5.14 — RHEL8 4.18, 5.4/5.10 LTS
   ## containers) cannot honor that PART of the tier's forced-kill
   ## guarantee even after rfc-0007 r10's `killpg` backstop (below,
-  ## `forceKillCore`/`reapCore`): the backstop only reaches PGID-VISIBLE
-  ## processes, never a setsid escapee that has left the process group —
-  ## exactly the case `cgroup.kill` alone exists to cover. So
+  ## `forceKillCore`): the backstop only reaches PGID-VISIBLE processes,
+  ## never a setsid escapee that has left the process group — exactly the
+  ## case `cgroup.kill` alone exists to cover. (`reapCore`'s OWN cgroup-arm
+  ## backstop was a DIFFERENT, raw-`killpg` mechanism r59 added and r71
+  ## deleted outright as a post-reap pid-reuse hazard — see
+  ## `cgroupEscapeeFallbackNeeded`'s doc comment; unrelated to this
+  ## predicate, which is a process-wide, spawn-time TIER selection, not a
+  ## per-reap kill mechanism.) So
   ## `cgroupDelegation` ALONE is still not sufficient to select this tier;
   ## both probed bits must hold, or the spawn must fall to the next tier
   ## (subreaper/pgid `killpg`) via the existing per-spawn leaf-creation-
@@ -133,6 +138,52 @@ proc isPreExistingIdentity*(preExisting: Table[int, int64]; pid: int;
   ## original entry is stale — see their own comments at the prune sites.
   if starttime < 0: return false
   pid in preExisting and preExisting[pid] == starttime
+
+type PreExistingSweepAction* = enum
+  peSweepProtect        ## identity CONFIRMED pre-existing — never consume, never prune.
+  peSweepPruneStale      ## pid tracked, but a READABLE starttime confirms a mismatch —
+                          ## the original pre-existing process is gone (pid reused);
+                          ## prune the stale entry, fall through to normal handling.
+  peSweepSkipUnreadable  ## rfc-0007 code-review r72: pid tracked, but starttime came
+                          ## back unreadable (-1) THIS attempt — an honest transient
+                          ## read failure, not proof of reuse; skip with no consume and
+                          ## no prune (distinct from `peSweepPruneStale` — see below).
+  peSweepNotTracked      ## pid was never in the snapshot at all — normal handling,
+                          ## nothing to prune.
+
+proc preExistingSweepAction*(preExisting: Table[int, int64]; pid: int;
+                              starttime: int64): PreExistingSweepAction =
+  ## rfc-0007 code-review r72: `sweepAdoptedOrphan`'s own guard, factored
+  ## out as a pure decision so it is unit-testable without a real
+  ## `waitid`/`/proc` round trip — see
+  ## tests/unit/test_rfc0007_r60_preexisting_identity.nim's `r72` suite.
+  ##
+  ## `isPreExistingIdentity` alone collapses "confirmed mismatch" and
+  ## "starttime unreadable" into the SAME `false` result — correct for
+  ## the escapee-KILL call site (`discoverAndReapEscapees`), which
+  ## re-verifies via `pidfd_open` immediately before ever killing
+  ## anything, so a false negative there costs nothing but a skipped
+  ## kill attempt this tick. It is NOT safe for `sweepAdoptedOrphan`:
+  ## pre-r72, that proc treated `isPreExistingIdentity == false` as
+  ## license to fall into the `pid in preExisting` prune branch and then
+  ## `wait4` (REAP) the zombie — collapsing "genuinely a different
+  ## process now" (safe to reap) and "couldn't read starttime this
+  ## attempt, e.g. EMFILE under `--jobs` fd pressure" (NOT safe to reap —
+  ## no proof the original pre-existing process is gone at all) into the
+  ## same action. A transient read failure on a REAL pre-existing host
+  ## child then permanently consumed and unprotected it: one bad read,
+  ## not a real pid-reuse event, was enough. This proc keeps those two
+  ## outcomes distinct so the sweep call site can skip the unreadable
+  ## case WITHOUT pruning — the `WNOWAIT` peek left the zombie
+  ## unconsumed, so a later tick retries free and prunes correctly the
+  ## moment a READABLE mismatched starttime actually shows up.
+  if isPreExistingIdentity(preExisting, pid, starttime):
+    peSweepProtect
+  elif pid in preExisting:
+    if starttime < 0: peSweepSkipUnreadable
+    else: peSweepPruneStale
+  else:
+    peSweepNotTracked
 
 when defined(linux):
   # -------------------------------------------------------------------------
@@ -263,10 +314,20 @@ type
                                   ## when `installedSignals` is true (same
                                   ## "only if THIS core set it" discipline
                                   ## as `subreaperSet`); `destroyPosixCore`
-                                  ## restores it under that same guard, so
-                                  ## an embedding host's own prior handler
-                                  ## (or SIG_DFL) comes back rather than
-                                  ## being silently replaced forever.
+                                  ## restores it under `installedSignals`
+                                  ## AND (r73) `gShutdownWriteFd ==
+                                  ## core.pipeWrite` — the LATTER
+                                  ## specifically because `initPosixCore`
+                                  ## is not a process-wide singleton: a
+                                  ## non-LIFO destroy of two live cores
+                                  ## must never let the OLDER (non-owning)
+                                  ## one's restore clobber the disposition
+                                  ## the NEWER one still needs — so an
+                                  ## embedding host's own prior handler (or
+                                  ## SIG_DFL) comes back rather than being
+                                  ## silently replaced forever, but ONLY
+                                  ## once the actual owning core tears
+                                  ## down.
     prevSigterm: Sigaction         ## SIGTERM's peer of `prevSigint`.
     preExisting: Table[int, int64] ## rfc-0007 code-review r3 (identity
                                   ## fixed by r60): pid -> starttime for
@@ -294,6 +355,15 @@ type
                                   ## stale entry the moment a mismatch (or
                                   ## a reap) proves the original process is
                                   ## gone — see that proc's doc comment.
+                                  ## r72: `sweepAdoptedOrphan` additionally
+                                  ## routes through `preExistingSweepAction`
+                                  ## rather than the bare predicate — an
+                                  ## UNREADABLE starttime on a tracked pid
+                                  ## is NOT the same as a confirmed
+                                  ## mismatch there (only a readable
+                                  ## mismatch prunes); see that proc's doc
+                                  ## comment for why the escapee-kill site
+                                  ## does not need the same distinction.
 
 # ---------------------------------------------------------------------------
 # Self-pipe + shutdown signal handler.
@@ -490,22 +560,44 @@ proc destroyPosixCore*(core: var PosixCore) =
   ## clears the managed collections: a custom `=destroy` on `Supervisor`
   ## replaces (not supplements) the compiler's default field-wise teardown,
   ## so this module stays responsible for its own Table/seq cleanup.
-  if core.installedSignals and gShutdownWriteFd == core.pipeWrite:
+  # rfc-0007 code-review r73: BOTH the write-fd clear and the sigaction
+  # restore below are gated on the SAME ownership token —
+  # `gShutdownWriteFd == core.pipeWrite`, true only for whichever core's
+  # `initPosixCore` call was the LAST to install (that global always
+  # names the most recent installer; see `initPosixCore`'s own comment).
+  # `initPosixCore` is not a process-wide singleton — nothing prevents two
+  # live `PosixCore`s in one process (only one at a time is the SUPPORTED
+  # configuration) — so a non-LIFO destroy (the OLDER, non-owning core
+  # torn down first) is constructible. Pre-fix, the sigaction restore
+  # below was guarded ONLY by `core.installedSignals`, not by this
+  # ownership token: the older core's destroy unconditionally restored
+  # ITS OWN saved `prevSigint`/`prevSigterm` — the disposition in effect
+  # BEFORE IT installed — clobbering whatever the newer core's install
+  # put there (crisol's live `shutdownSigHandler`) with something stale.
+  # The newer core's SIGINT/SIGTERM path then went silently dead: no
+  # crash, no error, just a handler that no longer runs. Computed once,
+  # BEFORE the fd clear below (which itself mutates `gShutdownWriteFd`),
+  # so both gates see the identical ownership decision — the windows half
+  # (windows.nim) gates its handler removal under `gShutdownEventHandle`
+  # ownership the same way.
+  let ownsShutdownSignal = core.installedSignals and gShutdownWriteFd == core.pipeWrite
+  if ownsShutdownSignal:
     gShutdownWriteFd = -1
-  if core.installedSignals:
+  if ownsShutdownSignal:
     # rfc-0007 code-review r69: restore whatever disposition was in effect
     # before THIS core installed its own SIGINT/SIGTERM handler (saved in
     # `initPosixCore` — see `prevSigint`/`prevSigterm`'s field doc
-    # comments), guarded the SAME way as `subreaperSet` below (only ever
-    # true when THIS core did the installing). Pre-fix, `destroyPosixCore`
-    # cleared `gShutdownWriteFd` above but left the handlers themselves
-    # installed forever: an embedding host's own SIGINT/SIGTERM handler
-    # was silently replaced for the rest of the process's life, and a
-    # later SIGINT only stamped `gShutdownSignum` — a global nothing reads
-    # once this Supervisor is gone. Runs on every teardown path, including
-    # exception unwind: `=destroy` (process/posix.nim) calls this
-    # unconditionally on scope exit, the same guarantee `subreaperSet`'s
-    # clear already relies on.
+    # comments). Pre-fix (r69), `destroyPosixCore` cleared
+    # `gShutdownWriteFd` above but left the handlers themselves installed
+    # forever: an embedding host's own SIGINT/SIGTERM handler was silently
+    # replaced for the rest of the process's life, and a later SIGINT only
+    # stamped `gShutdownSignum` — a global nothing reads once this
+    # Supervisor is gone. Runs on every teardown path, including exception
+    # unwind: `=destroy` (process/posix.nim) calls this unconditionally on
+    # scope exit, the same guarantee `subreaperSet`'s clear already relies
+    # on. r73: now additionally gated on `ownsShutdownSignal` (see above)
+    # — a non-owning core's destroy is a no-op on the disposition, leaving
+    # it for whichever core actually owns `gShutdownWriteFd` to restore.
     discard sigactionRaw(SIGINT, addr core.prevSigint, nil)
     discard sigactionRaw(SIGTERM, addr core.prevSigterm, nil)
   if core.pipeRead >= 0: discard posix.close(core.pipeRead)
@@ -1245,9 +1337,25 @@ when defined(linux):
     except CatchableError:
       discard   # raced by something else reading it — attribution stays
                 # honestly empty; the reap below still clears the zombie.
-    if isPreExistingIdentity(core.preExisting, orphanPid, starttime):
+    # rfc-0007 r72: routed through `preExistingSweepAction` rather than a
+    # bare `isPreExistingIdentity` check — see that proc's doc comment for
+    # why this call site specifically cannot collapse "confirmed mismatch"
+    # and "starttime unreadable" into the same fallthrough the way the
+    # escapee-KILL call site (`discoverAndReapEscapees`, unchanged) safely
+    # does.
+    case preExistingSweepAction(core.preExisting, orphanPid, starttime)
+    of peSweepProtect:
       return none(WaitEvent)
-    if orphanPid in core.preExisting:
+    of peSweepSkipUnreadable:
+      # r72: an honest transient /proc read failure on a pid THIS
+      # snapshot is protecting — NOT proof of pid reuse. Do NOT prune,
+      # do NOT reap: `WNOWAIT` left the zombie unconsumed, so returning
+      # here leaves it exactly as a later tick (or the host's own
+      # `waitpid`) will find it, same as the `peSweepProtect` case. A
+      # later tick with a READABLE starttime resolves this for real —
+      # either re-confirms protection or prunes on a genuine mismatch.
+      return none(WaitEvent)
+    of peSweepPruneStale:
       # r60: pid present in the snapshot but the starttime just read
       # mismatches it — the ORIGINAL pre-existing process is confirmed
       # gone (this pid now names a different OS process instance
@@ -1255,6 +1363,8 @@ when defined(linux):
       # silently protect some later, unrelated reuse of the same pid —
       # this orphan falls through to normal adoption handling below.
       core.preExisting.del(orphanPid)
+    of peSweepNotTracked:
+      discard
     let rss = readVmRssBytes(orphanPid)   # 0 for a zombie — honest, not fabricated
     var ownedBy = none(ChildId)
     for cid, e in core.children.pairs:
@@ -1450,20 +1560,38 @@ proc cgroupEscapeeFallbackNeeded*(leafEscapeeCount: int; stopRequested,
   ## `cgroupLeafSurvivors` has no separate "the read genuinely failed" vs.
   ## "the leaf genuinely holds nothing right now" signal (both shapes are
   ## an empty seq — the same ambiguity `killSnapshotFor`'s doc comment
-  ## already names). An empty leaf read is honest evidence of nothing
-  ## escaped ONLY on a CLEAN exit (the child terminated on its own, never
-  ## requestStop'd/forceKill'd — `stopRequested` false): it has no reason
-  ## to have migrated a descendant out of the leaf first. A NON-clean exit
-  ## (`stopRequested` true) is exactly the case a same-uid child COULD
-  ## have fled the leaf onto the process's own pgid before this reap ever
-  ## read `cgroup.procs` — still killable/observable through the pgid
-  ## scan, but invisible to the leaf-only read; so an empty read there is
-  ## NOT proof nothing survived. Independently, a `cgroup.kill` write that
-  ## failed outright (`cgroupKillWriteFailed`) means the leaf's own
-  ## teardown mechanism never even fired — the pgid scan is the only
-  ## other observation this reap has, regardless of what the leaf read
-  ## showed.
-  (leafEscapeeCount == 0 and stopRequested) or cgroupKillWriteFailed
+  ## already names).
+  ##
+  ## rfc-0007 code-review r71 (triple-lens-convergent) widened this trigger
+  ## after DELETING `reapCore`'s unconditional raw `killpg` backstop (a
+  ## pid-reuse hazard: `entry.state == csExited` always holds by the time
+  ## this runs, so the leader's pid is already recyclable — see the call
+  ## site's own comment). Pre-r71, an empty leaf read on a CLEAN exit
+  ## (`stopRequested` false) was trusted as honest evidence of nothing
+  ## escaped, on the theory that a clean exit "has no reason" to have
+  ## migrated a descendant out of the leaf first — but the r59 finding's
+  ## OWN original scenario (a leaf-evaded daemon) is reachable on exactly
+  ## such a clean exit; only the now-deleted `killpg` backstop covered it,
+  ## never this trigger. `leafEscapeeCount == 0` now triggers the fallback
+  ## UNCONDITIONALLY, independent of `stopRequested`: an empty leaf read
+  ## is never, on its own, proof nothing survived — the identity-checked
+  ## `discoverAndReapEscapees` scan is the only way left to close that
+  ## hole (accepted cost: most single-process, no-descendant spawns read
+  ## an empty leaf regardless of whether anything escaped, since the
+  ## leader itself already exited by the time this reads `cgroup.procs` —
+  ## documented residual, not solved away). `stopRequested` also now
+  ## triggers UNCONDITIONALLY, independent of leaf count: a same-uid child
+  ## fleeing the leaf onto the pgid during a forced/stopped teardown can
+  ## coexist with OTHER, unrelated processes the leaf read still shows —
+  ## a non-empty leaf is not proof it saw everything that fled. Only a
+  ## demonstrably non-empty leaf read on a clean, non-stopped exit with no
+  ## `cgroup.kill` write failure skips the extra scan — the sole surviving
+  ## fast path. Independently, a `cgroup.kill` write that failed outright
+  ## (`cgroupKillWriteFailed`) means the leaf's own teardown mechanism
+  ## never even fired — the pgid scan is the only other observation this
+  ## reap has, regardless of what the leaf read showed or whether a stop
+  ## was ever requested.
+  leafEscapeeCount == 0 or stopRequested or cgroupKillWriteFailed
 
 proc mergeEscapeesByPid*(primary, fallback: seq[ProcSnapshot]): seq[ProcSnapshot] =
   ## rfc-0007 code-review r59: dedupe-by-pid union of two escapee scans
@@ -1738,21 +1866,35 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
       # force-killed) degrades the domain below exactly the same way.
       if not killCgroupLeaf(entry.cgroupLeaf):
         cgroupKillWriteFailed = true
-      # rfc-0007 r59: `killpg` backstop, mirroring `forceKillCore`'s own
-      # r10 fix — this normal-exit reap arm had NO such backstop before:
-      # escapee accounting and the kill signal both came ONLY from the
-      # leaf mechanism, so a leaf-escaped-but-pgid-visible daemon (a
-      # same-uid child that migrated itself out of the leaf, or a
-      # `cgroup.kill` write that failed at runtime — either way, above)
-      # survived unkilled while the report still stamped `kdsCgroup`-or-
-      # degraded + `tree=toComplete` + `escapees=[]` from a scan that
-      # never even looked at it. Cheap, belt-and-suspenders, unconditional
-      # — closes the hole for any PGID-VISIBLE process regardless of the
-      # cgroup.kill write's own outcome (a setsid escapee that ALSO left
-      # the leaf remains the accepted residual, same as `forceKillCore`'s
-      # own doc comment already names).
-      discard killpg(entry.pid, SIGKILL)
-      # A SIGKILL'd escapee leaves the cgroup (kernel `do_exit()`) almost
+      # rfc-0007 code-review r59 originally added an unconditional raw
+      # `killpg(entry.pid, SIGKILL)` backstop HERE, mirroring
+      # `forceKillCore`'s own r10 fix — this normal-exit reap arm had no
+      # such backstop before, so a leaf-escaped-but-pgid-visible daemon
+      # survived unkilled while the report still stamped `escapees=[]`
+      # from a scan that never even looked at it.
+      #
+      # rfc-0007 code-review r71 (triple-lens-convergent) DELETED that
+      # backstop: by the time this arm runs, `entry.state == csExited`
+      # ALWAYS holds (`reapCore`'s own leading `doAssert` enforces it),
+      # so the leader's zombie is already `wait4`-consumed and its pid is
+      # recyclable — crisol's own `setpgid(childPid, childPid)` (spawnChild)
+      # means a wrapped pid landing on the NEXT spawned slot's child could
+      # turn this `killpg` into a kill of an unrelated sibling, or any
+      # unrelated same-uid process group entirely. The claimed symmetry
+      # with `forceKillCore`'s own `killpg` (above) is false: that one
+      # runs PRE-reap, while the child's zombie is still unconsumed and
+      # therefore still pinning the pid against reuse — this one does not
+      # have that guarantee. The invisible-survivor case this backstop
+      # used to catch now routes ONLY through `discoverAndReapEscapees`
+      # below (identity-checked: `pidfd_open` + starttime re-verify before
+      # ever killing anything — the discipline the rest of this file's
+      # kill paths already use), reached via `cgroupEscapeeFallbackNeeded`
+      # widened to trigger on this exact case — see that proc's own doc
+      # comment.
+      #
+      # Reap whatever `killCgroupLeaf`'s `cgroup.kill` write actually
+      # killed (the leaf-scoped `escapees` read above, BEFORE that write):
+      # a SIGKILL'd escapee leaves the cgroup (kernel `do_exit()`) almost
       # immediately, but it does NOT leave the process table until its
       # real OS parent wait()s it — same subreaper reparenting as the
       # non-cgroup tier (this process set PR_SET_CHILD_SUBREAPER
@@ -1763,10 +1905,11 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
       # async orphan sweep's own timing.
       for snap in escapees:
         reapBounded(Pid(snap.pid))
-      # rfc-0007 r59: an empty (or write-failed) leaf view is not proof
-      # nothing survived — see `cgroupEscapeeFallbackNeeded`'s doc comment.
-      # Whenever it fires, also run the subreaper tier's own pgid/ppid
-      # scan+kill (`discoverAndReapEscapees` — already kills and
+      # rfc-0007 r59/r71: an empty (or write-failed) leaf view is not
+      # proof nothing survived — see `cgroupEscapeeFallbackNeeded`'s doc
+      # comment for the full, r71-widened trigger. Whenever it fires,
+      # also run the subreaper tier's own pgid/ppid scan+kill
+      # (`discoverAndReapEscapees` — already kills, identity-checked, and
       # `reapBounded`s whatever it finds internally, same as the loop
       # above) and merge the two views, deduping by pid so a pid visible
       # through BOTH is never double-counted.
