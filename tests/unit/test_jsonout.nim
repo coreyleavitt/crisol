@@ -871,6 +871,37 @@ suite "jsonout - persistLastRun":
     except:
       check false   # must not propagate any exception
 
+  test "r61 (code-review): persistLastRun writes verifyFails=0 regardless of doc.verifyFails":
+    ## persistLastRun's own doc comment claims lastrun.json's `verifyFails`
+    ## is "always 0 here regardless of `doc.verifyFails`" -- but the OLD
+    ## body just forwarded `doc` straight into `toJsonString(doc)` unmodified:
+    ## the "0" was true only because `api.runTestsWith` HAPPENS to call this
+    ## proc before its own --verify-cache pass has run (an ordering fact of
+    ## THAT ONE CALLER, not a property enforced by this proc). A `doc` built
+    ## with a nonzero `verifyFails` -- exactly what this test hands in --
+    ## must still persist as 0: this proc's OWN contract, not something it
+    ## may rely on every future caller to uphold by construction order.
+    let tmpDir   = uniqueTmpDir("r61verifyfails")
+    let stateDir = ".crisol_test"
+    let cfg      = Config(
+      projectRoot:        tmpDir,
+      stateDir:           stateDir,
+      groups:             @[],
+      jobs:               1,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 60,
+      maxOutputBytes:     65536,
+    )
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary(),
+                               verifyFails: 3), cfg)
+
+    let finalPath = tmpDir / stateDir / "lastrun.json"
+    let parsed    = parseJson(readFile(finalPath))
+    check parsed["verifyFails"].getInt == 0
+
 # ---------------------------------------------------------------------------
 # stdout capture helper — shared portable implementation (tests/support/capture)
 # ---------------------------------------------------------------------------

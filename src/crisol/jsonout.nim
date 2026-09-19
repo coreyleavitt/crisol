@@ -1140,14 +1140,31 @@ proc persistLastRun*(doc: RunDocument; config: Config) =
   ##     `--verify-cache` runs strictly AFTER `persistLastRun` in
   ##     `api.runTestsWith` (an ordering fact: the real count does not exist
   ##     yet at persist time, `doc.verifyFails` is whatever zero-value the
-  ##     caller had on hand), so this sink hardcodes the "not yet known"
-  ##     posture rather than emitting a number that looks real but isn't.
+  ##     caller had on hand). r61 (code-review): this used to be true only
+  ##     because THAT ONE CALLER happens to build `doc` before its own
+  ##     --verify-cache pass runs -- an ordering fact of the caller, not a
+  ##     property this proc enforced. A `doc` with a genuinely nonzero
+  ##     `verifyFails` (a future caller, a reordered `runTestsWith`, a
+  ##     direct test) used to serialize that number straight through --
+  ##     `toJsonString(doc)` below passed `doc` verbatim, nothing zeroed it.
+  ##     Self-guarded on a LOCAL copy below, the same "this proc enforces
+  ##     its own contract" shape as the `doc.interrupted` early return
+  ##     above, rather than trusting every future caller's construction
+  ##     order to keep the "not yet known" posture honest.
   ##   - cacheStats: never emitted to lastrun.json at all (no `showCacheStats`
   ##     knob exists on this sink) -- same non-goal as before this record
   ##     existed, just no longer implicit in which params a flat signature
   ##     happened to omit.
   if doc.interrupted:
     return
+
+  # r61: zero verifyFails on a LOCAL copy -- see the doc comment above.
+  # Never mutates the caller's `doc` (a `var` param would; this proc takes
+  # `doc` by value already, so `persistedDoc` is its own copy regardless,
+  # but naming it separately makes the self-guard visible at the call site
+  # below rather than silently relying on value semantics).
+  var persistedDoc = doc
+  persistedDoc.verifyFails = 0
 
   let stateDir = stateDirOf(config)
   let finalPath = stateDir / "lastrun.json"
@@ -1176,7 +1193,7 @@ proc persistLastRun*(doc: RunDocument; config: Config) =
   # filterTag/explainMiss/showCacheStats all stay off -- lastrun.json never
   # filters by tag, never carries keyDiff, never carries cacheStats (see the
   # sink-difference note above).
-  let jsonStr = toJsonString(doc)
+  let jsonStr = toJsonString(persistedDoc)
   let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
     stderr.write("crisol: warning: could not write lastrun.json: " & err & "\n")

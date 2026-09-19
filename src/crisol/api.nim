@@ -454,46 +454,28 @@ type
   RunReport* = object
     ## Output of runTests().  Encodes ALL outcomes; never raises for expected
     ## conditions — structural problems are on .status / .error / .exitCode.
+    ##
+    ## r64 (code-review): `summary`/`results`/`memThrottledSlots`/
+    ## `lateOrphansReaped`/`interrupted`/`compileBlock`/`reuseAlerts`/
+    ## `cacheStats`/`trackedRoots` are NOT fields here. Before this they
+    ## were hand-duplicated at EVERY construction site — once as a flat
+    ## field, once inside `doc` (jsonout.RunDocument, below) — with
+    ## agreement between the two defended only by a comment ("the shape
+    ## that shipped the W3 defect"). Each now lives at exactly ONE storage
+    ## address, `doc.<field>`, and is exposed below as a read-only accessor
+    ## proc of the SAME name: Nim's dot-call syntax makes `rr.results` and
+    ## `results(rr)` identical, so every existing read site — this module's
+    ## own remaining construction sites, crisol.nim, every test — compiles
+    ## unchanged. There is nothing left to keep in sync by hand.
+    ##
+    ## `plan`/`status`/`exitCode`/`error`/`zeroRunnableReason`/
+    ## `verifyDivergences`/`verifyCouldNotReexec` stay real fields below —
+    ## `doc` carries none of them, so they are genuinely NOT duplicates.
     plan*:              PlanReport
-    summary*:           Summary
-    results*:           seq[EntrypointResult]
-    memThrottledSlots*: int   ## # entrypoints delayed >=once by mem-aware scheduling; 0 if inactive
-    lateOrphansReaped*: int   ## rfc-0007 B1 (§3): count of adopted orphans
-                              ## (reparented via PR_SET_CHILD_SUBREAPER)
-                              ## reaped via the async waitid(P_ALL, WNOWAIT)
-                              ## sweep whose owning slot had already been
-                              ## reaped/emitted, or that were unattributable
-                              ## (e.g. a setsid escape) — counted + logged
-                              ## at run level, never retro-fitted into an
-                              ## already-emitted EntrypointResult. 0 when
-                              ## nothing of the kind occurred this run.
     status*:            RunStatus
     exitCode*:          int   ## ALWAYS set: 0/1 (rsOk), 3 (rsStructural; 2 internal), 128+n (rsInterrupted)
     error*:             string ## non-empty iff status == rsStructural
-    interrupted*:       bool  ## rfc-0007 A1e-ii: true iff a SIGINT/SIGTERM cut this
-                              ## run short. CrisolInterrupted is retired — this bool
-                              ## (status == rsInterrupted, in lockstep) is the
-                              ## replacement signal; results/summary are populated
-                              ## with §2's emission set rather than left empty, and
-                              ## lastrun.json is deliberately never persisted for
-                              ## this run (an entrypoint never observed must not
-                              ## silently leave the --failed selection).
     zeroRunnableReason*: ZeroRunnableReason
-    compileBlock*:      JsonNode  ## the SAME `compile` block persisted to
-                                  ## lastrun.json (compilereport.readCompileBlock), exposed here
-                                  ## so a caller (e.g. the CLI) can print a human-readable
-                                  ## compile summary line without re-scanning the
-                                  ## ledgers. nil when opts.persist is false, or when
-                                  ## measureCompileReuse is not enabled (no telemetry).
-    reuseAlerts*:       JsonNode  ## rfc-0007 W3: the SAME reuse-check alert array
-                                  ## persisted to lastrun.json (compilereport.
-                                  ## buildReuseAlerts), exposed here so the CLI's
-                                  ## stdout run/v2 emission can carry it too --
-                                  ## same shape/nilability convention as
-                                  ## `compileBlock` above (nil when opts.persist is
-                                  ## false, or when compileBlock is nil / reuse-
-                                  ## check is disabled -- buildReuseAlerts already
-                                  ## degrades to an empty JArray in that case).
     verifyDivergences*: seq[VerifyDivergence]  ## RFC-0005 B3b: the --verify-cache
                                   ## post-run pass's findings. ALWAYS empty when
                                   ## opts.verifyCache.enabled is false. Deliberately
@@ -517,27 +499,6 @@ type
                                   ## ALWAYS empty when opts.verifyCache.enabled
                                   ## is false, same convention as
                                   ## verifyDivergences above.
-    cacheStats*: CacheStats       ## RFC-0005 B2b: `aggregateCacheStats(events, decisions)`
-                                  ## over the run's real telemetry (hit/miss/publish/
-                                  ## remote-error/verifyFail) and per-result cacheDecisions.
-                                  ## A ZERO-VALUE `CacheStats()` (same "always-present,
-                                  ## zero-value-is-honest" convention as `verifyFails`) when
-                                  ## `cfg.cacheStats` is false — no InMemorySink was ever
-                                  ## installed, so there is nothing real to report; the CLI
-                                  ## reads `rr.plan.settings.cacheStats` (not this field's
-                                  ## "is it all zero?") to decide whether to show it at all.
-    trackedRoots*: TrackedRoots   ## RFC-0009 A2: the run's real `cfg.trackedRoots` (project
-                                  ## root + every configured dep root, each root-tagged and
-                                  ## fold-probed by config.loadConfig — see types.Config).
-                                  ## Threaded straight through from the plan-phase Config,
-                                  ## unchanged; also carried on `doc.trackedRoots` below (rev
-                                  ## 25) so the emitted evidence reflects the ACTUAL run's
-                                  ## roots, not jsonout's zero-value default. A
-                                  ## structural-early-exit RunReport
-                                  ## (structuralResult/structuralResultWithPlan below) leaves
-                                  ## this at its zero value — no Config was ever built on
-                                  ## that path — same "always-present, zero-value-is-honest"
-                                  ## convention as `cacheStats` above.
     doc*: jsonout.RunDocument     ## rfc-0007 code-review r8: the SAME shared run-level
                                   ## record `runTestsWith` already assembled once to call
                                   ## `jsonout.persistLastRun` with -- carried here, by that
@@ -548,14 +509,15 @@ type
                                   ## `rr.doc` straight through instead of re-deriving the
                                   ## same ~10 facts from other RunReport fields by hand (the
                                   ## shape that shipped the W3 defect -- see jsonout.nim's own
-                                  ## rev-history note). The individual fields above
-                                  ## (`compileBlock`, `reuseAlerts`, `memThrottledSlots`, ...)
-                                  ## stay in place unchanged for library consumers who want
-                                  ## structured access without re-deriving a `RunDocument` --
-                                  ## `doc` is additive, not a replacement for them. A
-                                  ## structural-early-exit RunReport leaves this at its zero
-                                  ## value, same convention as `trackedRoots`/`cacheStats`
-                                  ## above.
+                                  ## rev-history note). r64: this is now also the SOLE storage
+                                  ## address the accessor procs below read from — a
+                                  ## structural-early-exit RunReport (structuralResult/
+                                  ## structuralResultWithPlan below) leaves this at its zero
+                                  ## value (no Config was ever built on that path), so every
+                                  ## accessor below reads its own type's honest zero value on
+                                  ## those paths too — same "always-present, zero-value-is-
+                                  ## honest" convention `cacheStats`/`trackedRoots` documented
+                                  ## individually before this refactor.
 
   VerifyDivergence* = object
     ## RFC-0005 B3b: one --verify-cache mismatch between the observation the
@@ -579,6 +541,57 @@ type
     freshRun*:        ptypes.Phase       ## the Phase the verify pass observed (pkRan)
     storedRecords*:   seq[TestRecord]
     freshRecords*:    seq[TestRecord]
+
+# ---------------------------------------------------------------------------
+# r64 (code-review) — RunReport's doc-derived accessors. Each reads its
+# field straight from `rr.doc` (jsonout.RunDocument) — the SOLE storage
+# address (see RunReport's own doc comment above) — and is named identically
+# to the flat field it replaces, so `rr.results`/`rr.summary`/etc. compile
+# unchanged at every existing call site (Nim's dot-call syntax treats
+# `rr.results` and `results(rr)` identically).
+# ---------------------------------------------------------------------------
+
+proc results*(rr: RunReport): seq[EntrypointResult] = rr.doc.results
+  ## r64: derived accessor — the SOLE storage address is `rr.doc.results`.
+proc summary*(rr: RunReport): Summary = rr.doc.summary
+  ## r64: derived accessor — the SOLE storage address is `rr.doc.summary`.
+proc memThrottledSlots*(rr: RunReport): int = rr.doc.memThrottledSlots
+  ## r64: derived accessor. # entrypoints delayed >=once by mem-aware
+  ## scheduling; 0 if inactive (same zero-value convention as before).
+proc lateOrphansReaped*(rr: RunReport): int = rr.doc.lateOrphansReaped
+  ## r64: derived accessor. rfc-0007 B1 (§3): count of adopted orphans
+  ## (reparented via PR_SET_CHILD_SUBREAPER) reaped via the async
+  ## waitid(P_ALL, WNOWAIT) sweep whose owning slot had already been
+  ## reaped/emitted, or that were unattributable (e.g. a setsid escape).
+  ## 0 when nothing of the kind occurred this run.
+proc interrupted*(rr: RunReport): bool = rr.doc.interrupted
+  ## r64: derived accessor. rfc-0007 A1e-ii: true iff a SIGINT/SIGTERM cut
+  ## this run short. CrisolInterrupted is retired — this bool
+  ## (status == rsInterrupted, in lockstep) is the replacement signal;
+  ## results/summary are populated with §2's emission set rather than left
+  ## empty, and lastrun.json is deliberately never persisted for this run
+  ## (an entrypoint never observed must not silently leave the --failed
+  ## selection).
+proc compileBlock*(rr: RunReport): JsonNode = rr.doc.compileBlock
+  ## r64: derived accessor. The SAME `compile` block persisted to
+  ## lastrun.json (compilereport.readCompileBlock) — nil when opts.persist
+  ## is false, or when measureCompileReuse is not enabled (no telemetry).
+proc reuseAlerts*(rr: RunReport): JsonNode = rr.doc.reuseAlerts
+  ## r64: derived accessor. rfc-0007 W3: the SAME reuse-check alert array
+  ## persisted to lastrun.json (compilereport.buildReuseAlerts) — same
+  ## nilability convention as `compileBlock` above.
+proc cacheStats*(rr: RunReport): CacheStats = rr.doc.cacheStats
+  ## r64: derived accessor. RFC-0005 B2b: `aggregateCacheStats(events,
+  ## decisions)` over the run's real telemetry (hit/miss/publish/remote-
+  ## error/verifyFail) and per-result cacheDecisions. A ZERO-VALUE
+  ## `CacheStats()` when `cfg.cacheStats` is false — no InMemorySink was
+  ## ever installed, so there is nothing real to report; the CLI reads
+  ## `rr.plan.settings.cacheStats` (not this accessor's "is it all zero?")
+  ## to decide whether to show it at all.
+proc trackedRoots*(rr: RunReport): TrackedRoots = rr.doc.trackedRoots
+  ## r64: derived accessor. RFC-0009 A2: the run's real `cfg.trackedRoots`
+  ## (project root + every configured dep root, each root-tagged and
+  ## fold-probed by config.loadConfig — see types.Config).
 
 # ---------------------------------------------------------------------------
 # rfc-0007 A1c: result-model digest helpers — so a library consumer doesn't
@@ -732,6 +745,53 @@ proc recordsDiverge(a, b: seq[TestRecord]): bool =
       return true
   false
 
+proc pairVerifySamples*(entrypoints: seq[PlannedEntrypoint]; indices: seq[int];
+                        verifyResults: seq[EntrypointResult]):
+    seq[tuple[storedIdx: int; fresh: EntrypointResult]] =
+  ## r63 (code-review): pure — pairs each verify sub-run RESULT back to the
+  ## STORED index it verifies (an index into the CALLER's `results`/
+  ## `entrypoints`, i.e. some `indices[j]`) by ENTRYPOINT IDENTITY
+  ## (`depgraph.entryKey`: `(display(tp), flagHash(flags))` — see
+  ## `Entrypoint`'s own doc comment, "(tp, flags) is the entrypoint's
+  ## identity"), never by POSITION.
+  ##
+  ## `execute()`'s trimmed-emission contract (rfc-0007 A1e-ii/r7 —
+  ## runner.execute's own comment, "trim `results` to the §2 emission set")
+  ## means the returned `verifyResults` is a COMPACTED subsequence of the
+  ## synthetic verify plan built from `indices`: an entry never claimed by a
+  ## slot (an interrupted, or failFast-early-exited, verify sub-run) is
+  ## OMITTED, and that omission can land in the MIDDLE of the sequence, not
+  ## only the tail. A positional zip (the OLD shape here: `indices[j]`
+  ## against `verifyResults[j]`, `break`ing once `j >= verifyResults.len`)
+  ## silently mispairs every entry AFTER the first such gap — the `break`
+  ## only ever caught a gap at the very END. Latent in production only
+  ## because `verifyCachePass`'s own sub-run always passes
+  ## `installSignals = false` and `failFast = false`, so no call has ever
+  ## actually hit a mid-sequence gap; the CONTRACT does not guarantee that,
+  ## so the pairing must not lean on it either.
+  ##
+  ## Multiple sampled entries sharing the same identity (distinct only by
+  ## GROUP — identity is `(tp, flags)`, group is not part of it) are
+  ## matched in `indices` order (first pending index in FIFO order per
+  ## identity), so a duplicate identity never double-consumes or silently
+  ## drops a pairing. An entry in `indices` with no corresponding result in
+  ## `verifyResults` at all (never finalized, e.g. an interrupted sub-run)
+  ## simply produces no pair — the caller distinguishes that case via the
+  ## sub-run's own `ExecuteReport.interrupted`, not by inferring it from a
+  ## length mismatch here.
+  var pending = initTable[tuple[path, flagHash: string], seq[int]]()
+  for i in indices:
+    let key = entryKey(entrypoints[i].ep.tp, entrypoints[i].ep.flags)
+    pending.mgetOrPut(key, @[]).add i
+  for fresh in verifyResults:
+    let key = entryKey(fresh.ep.tp, fresh.ep.flags)
+    var ids = pending.getOrDefault(key, @[])
+    if ids.len == 0: continue   # defensive: no pending stored index for this identity
+    let i = ids[0]
+    ids.delete(0)
+    pending[key] = ids
+    result.add (storedIdx: i, fresh: fresh)
+
 type
   VerifyPassResult* = tuple
     divergences:    seq[VerifyDivergence]
@@ -745,6 +805,13 @@ type
     ## (so --verify-cache-strict, which gates on `divergences.len`, must
     ## never exit 1 for it), never silent (verifyCachePass still warns
     ## on stderr for every entry landing here).
+    ##
+    ## r63 (code-review) widened this category one step further: an entry
+    ## the verify sub-run never reported a result for AT ALL (as opposed to
+    ## landing but with an unusable phase, above) — the sub-run's own
+    ## `ExecuteReport.interrupted` is what distinguishes this from ordinary
+    ## completion — lands here too, same "infrastructure gap, not a
+    ## divergence" treatment.
 
 proc verifyCachePass*(results: seq[EntrypointResult];
                      entrypoints: seq[PlannedEntrypoint];
@@ -789,15 +856,34 @@ proc verifyCachePass*(results: seq[EntrypointResult];
   ## and project `.divergences` themselves.
   if not vc.enabled: return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
 
+  # r67 (code-review): `vc.pct` may still carry `verifySample()`'s own
+  # default -1 "no override" sentinel — this proc is the ONE resolution
+  # point for it now (it already has `config` in scope). Before this fix,
+  # a BARE `verifySample()` handed straight to this PUBLIC proc (e.g. a
+  # library caller composing `verifyCachePass` directly, bypassing
+  # `runTestsWith` entirely) fell through to `sampleHitIndices`'s `pct<=0`
+  # arm unresolved — `enabled: true` but an ALWAYS-EMPTY sample: no
+  # re-execution, no warning, no error, just a silently inert verify pass.
+  # Resolving -1 here against `config.verifyCachePct` (the SAME config-file
+  # fallback `planImpl`'s merge chain, r29, already applies for the CLI/
+  # library facade — see `RunOptions.rlimits`-style precedence elsewhere in
+  # this module) means `verifyCachePass(vc = verifySample())` and
+  # `runTests(opts.verifyCache = verifySample())` now behave IDENTICALLY —
+  # covering the "unset" meaning wherever a caller asks for it, with one
+  # resolution point instead of two (`runTestsWith`'s own call site used to
+  # resolve it a second time; that has been simplified to a plain
+  # pass-through — see the comment there).
+  let effectivePct = if vc.pct < 0: config.verifyCachePct else: vc.pct
+
   let decisions = results.mapIt(it.cacheDecision)
   let seed = vc.seed.get(defaultVerifySeed())
-  let indices = sampleHitIndices(decisions, vc.pct, seed)
+  let indices = sampleHitIndices(decisions, effectivePct, seed)
   if indices.len == 0: return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
 
   let verifyPlan = buildVerifyPlan(entrypoints, indices)
-  var verifyResults: seq[EntrypointResult]
+  var execReport: ExecuteReport
   try:
-    verifyResults = execute(
+    execReport = execute(
       verifyPlan,
       config       = config,
       graph        = graph,
@@ -808,7 +894,7 @@ proc verifyCachePass*(results: seq[EntrypointResult];
       showProgress = false,
       cache        = cacheDisabled(sandboxSpec),
       recordLedger = false,
-    ).results
+    )
   except Exception as e:
     # Matches runTests' own defensive posture around the main execute() call
     # (CrisolError is-a Exception — one branch covers both): an unrelated
@@ -817,10 +903,36 @@ proc verifyCachePass*(results: seq[EntrypointResult];
     stderr.write("crisol: warning: --verify-cache pass failed: " & e.msg & "\n")
     return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
 
-  for j, i in indices:
-    if j >= verifyResults.len: break   # defensive: an interrupted verify sub-run
-    let stored = results[i]
-    let fresh  = verifyResults[j]
+  # r63 (code-review): pair by IDENTITY (pairVerifySamples), never by
+  # position — see that proc's own doc comment for why a positional zip is
+  # unsound against execute()'s trimmed-emission contract.
+  let pairs = pairVerifySamples(entrypoints, indices, execReport.results)
+
+  # r63: a sampled index with NO pairing at all (as opposed to a pairing
+  # whose fresh phase carries no observation — handled per-pair below) means
+  # the verify sub-run never reported a result for it. `execReport.
+  # interrupted` — consumed here EXPLICITLY, never inferred from a
+  # results-length mismatch (the old shape's `if j >= verifyResults.len:
+  # break`) — is the ONLY way that legitimately happens (the sub-run always
+  # passes `failFast = false`, so nothing here is ever omitted for that
+  # reason). Filed in the SAME `couldNotReexec` category as a landed-but-
+  # unobserved fresh phase (below): a verify-INFRASTRUCTURE gap, never
+  # evidence of cache nondeterminism.
+  if execReport.interrupted:
+    var pairedIdx = initHashSet[int]()
+    for p in pairs: pairedIdx.incl p.storedIdx
+    for i in indices:
+      if i notin pairedIdx:
+        result.couldNotReexec.add results[i].ep
+        stderr.write("crisol: warning: --verify-cache could not re-execute " &
+                     string(results[i].ep.tp.display()) &
+                     " (verify sub-run was interrupted before reporting a " &
+                     "result); not counted as a divergence\n")
+        try: stderr.flushFile() except CatchableError: discard
+
+  for pairEntry in pairs:
+    let stored = results[pairEntry.storedIdx]
+    let fresh  = pairEntry.fresh
     let freshExit = phaseExit(fresh.run)
 
     # RFC-0005 code-review SO4 fix: a stored `cdmHit` always has a real
@@ -1363,6 +1475,29 @@ proc productionCacheDeps*(): CacheDeps =
     configuredCache(cfg, stateDir, maxEntries, productionRegistry(), resolvedSecrets,
                     NilSink[TelemetryEvent](), trackedRoots))
 
+proc warnStderr(msg: string) =
+  ## r62 (code-review): `runTestsWith`'s documented contract is "never
+  ## raises for expected conditions" -- but a bare `stderr.write` for an
+  ## expected-condition warning is ITSELF an unguarded raise site (e.g.
+  ## `crisol run 2>&-` closes stderr; any write to it then raises IOError).
+  ## r16 already fixed the ONE call site that mattered most at the time
+  ## (persistLastRun's own warning, inside the outer try/finally below) with
+  ## this exact discard-on-CatchableError idiom; r62 found two MORE sites
+  ## reached while the advisory lock is held with no enclosing guard:
+  ##   1. the MinSafeRlimitAs warning (r18) -- BEFORE the first `try` in
+  ##      this proc, so an unguarded raise there both escapes `runTestsWith`
+  ##      AND leaks the advisory lock for the rest of the host process's
+  ##      lifetime (no `finally` covers that span at all).
+  ##   2. the unconditional per-tier error warning (the `erroredTiers` loop)
+  ##      -- inside the try/finally, so `releaseLock` still runs, but the
+  ##      raise still escapes this proc, violating the same "never raises
+  ##      for expected conditions" contract.
+  ## Named here (2+ call sites) rather than repeating the try/except at each.
+  try:
+    stderr.write(msg)
+  except CatchableError:
+    discard
+
 # ---------------------------------------------------------------------------
 # runTestsWith — full run facade; catches-and-encodes structural failures.
 # INTERNAL / documented-uncontracted (RFC-0005 A3b) — `deps` reaches into
@@ -1562,13 +1697,17 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # Reads the RESOLVED value (spec.limits, post CLI/config merge) rather than
   # cfg.rlimits.limitAs directly, so hlNone (rlimits inactive; resolveSandbox
   # returns a zero Limits) never warns about a ceiling that is never applied.
+  # r62: `warnStderr`, not a bare `stderr.write` -- this fires BEFORE this
+  # proc's first `try`, with the advisory lock already held (acquireLock,
+  # above); a bare write raising here (closed stderr) used to both escape
+  # this proc AND leak the lock for the rest of the host process's lifetime.
   let resolvedRlimitAs = spec.limits.req[ptypes.lkAddressSpace]
   if resolvedRlimitAs.isSome and resolvedRlimitAs.get < MinSafeRlimitAs:
-    stderr.write("crisol: warning: rlimit-as " & $resolvedRlimitAs.get &
-                 " is below the safe minimum for Nim/ORC test binaries (" &
-                 $MinSafeRlimitAs & " bytes / 3 GiB) -- the child may " &
-                 "SIGSEGV before main() returns, reported as a bare crash " &
-                 "with no further guidance (see sandbox.MinSafeRlimitAs)\n")
+    warnStderr("crisol: warning: rlimit-as " & $resolvedRlimitAs.get &
+               " is below the safe minimum for Nim/ORC test binaries (" &
+               $MinSafeRlimitAs & " bytes / 3 GiB) -- the child may " &
+               "SIGSEGV before main() returns, reported as a bare crash " &
+               "with no further guidance (see sandbox.MinSafeRlimitAs)\n")
   # nimcache-persistence (RFC-0006): the SAME ccVersion/nimVersion probes
   # already used by RFC-0004's SoundnessKey (via realSeams below) are reused
   # here — folded into execute()'s toolchain fingerprint, which keys the
@@ -1885,15 +2024,17 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # the round-1 `verifyCachePass*` back-compat wrapper that hid this tuple
     # behind a `seq[VerifyDivergence]`-only return is deleted (R2-D2: it had
     # no compat obligation and zero production callers).
-    # r29: opts.verifyCache.pct may still be the -1 "no override" sentinel
-    # here (verifyCachePass has no Config-merge concept of its own) — swap
-    # in the resolved cfg.verifyCachePct planImpl's merge chain already
-    # settled above before handing it off.
-    var effectiveVerifyCache = opts.verifyCache
-    effectiveVerifyCache.pct = cfg.verifyCachePct
+    # r29/r67: `opts.verifyCache.pct` may still be the -1 "no override"
+    # sentinel here — `verifyCachePass` now resolves it ITSELF against
+    # `cfg.verifyCachePct` (the ONE resolution point, r67 — see that
+    # proc's own doc comment), so this call site passes `opts.verifyCache`
+    # straight through unmodified rather than pre-resolving a second copy.
+    # `cfg.verifyCachePct` was already settled by `planImpl`'s merge chain
+    # above (an explicit CLI/library pct folded in when set, else the
+    # config-file default) before `verifyCachePass` ever sees it.
     let verifyPassResult =
-      if effectiveVerifyCache.enabled and not interrupted:
-        verifyCachePass(results, pr.entrypoints, effectiveVerifyCache, cfg, graph,
+      if opts.verifyCache.enabled and not interrupted:
+        verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
                         nimVer, ccVer, spec, cacheCtx.sink)
       else: (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
     let verifyDivergences    = verifyPassResult.divergences
@@ -1927,8 +2068,15 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # doc comment above) — this fold sees the SAME event list `cacheStats`
     # above was aggregated from, never a second, independently-collected
     # copy, so a tripped tier is reported here exactly once.
+    # r62: `warnStderr`, not a bare `stderr.write` -- this proc's contract
+    # is "never raises for expected conditions"; a closed/broken stderr
+    # must not turn an expected per-tier warning into an escaping exception
+    # (this loop IS inside the outer try/finally, so `releaseLock` would
+    # still run on a bare write's raise, but the raise would still escape
+    # `runTestsWith` itself, same class of contract violation as the
+    # MinSafeRlimitAs site above).
     for terr in erroredTiers(warnSink.events):
-      stderr.write("crisol: warning: " & tierErrorWarning(terr) & "\n")
+      warnStderr("crisol: warning: " & tierErrorWarning(terr) & "\n")
 
     # rfc-0007 code-review r8: `doc` (assembled above, before persistLastRun)
     # only just now has everything it was missing at persist time -- fill in
@@ -1942,22 +2090,20 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # normal-return path (no more early exception-driven return above) — only
     # the status/exitCode/interrupted trio differ; results/summary already
     # carry §2's honest partial emission set.
+    # r64 (code-review): summary/results/memThrottledSlots/
+    # lateOrphansReaped/compileBlock/reuseAlerts/interrupted/cacheStats/
+    # trackedRoots are no longer set here individually — `doc` (assembled
+    # above, and completed by the two assignments just above this comment)
+    # is their SOLE storage address now; the accessor procs on RunReport
+    # read straight through it. Setting them here too would just be a
+    # SECOND write to the same fact, exactly the duplication r64 removed.
     return RunReport(
       plan:              pr,
-      summary:           s,
-      results:           results,
-      memThrottledSlots: memThrottled,
-      lateOrphansReaped: lateOrphansReaped,
       status:            if interrupted: rsInterrupted else: rsOk,
       exitCode:          if interrupted: 128 + shutdownSignum
                           else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
-      compileBlock:      compileBlock,
-      reuseAlerts:       reuseAlerts,  # rfc-0007 W3
-      interrupted:       interrupted,
       verifyDivergences: verifyDivergences,
       verifyCouldNotReexec: verifyCouldNotReexec,  # RFC-0005 code-review SO4
-      cacheStats:        cacheStats,  # RFC-0005 B2b
-      trackedRoots:      cfg.trackedRoots,  # RFC-0009 A2
       doc:               doc,  # rfc-0007 code-review r8
     )
   finally:

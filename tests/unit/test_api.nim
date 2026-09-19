@@ -1028,6 +1028,156 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     check "diverged from the cached result" notin errText
 
 # ---------------------------------------------------------------------------
+# r63 (code-review) — pairVerifySamples pairs verify sub-run results back to
+# their STORED index by ENTRYPOINT IDENTITY, never by position. The OLD
+# shape zipped `indices[j]` against `verifyResults[j]` positionally, with a
+# `break` once `j >= verifyResults.len` -- sound ONLY when execute()'s
+# trimmed-emission contract (rfc-0007 A1e-ii/r7) never omits an entry
+# anywhere but the very tail. That contract makes no such promise: an
+# interrupted (or failFast-early-exited) sub-run can omit an entry from the
+# MIDDLE of the sequence, silently mispairing every entry after the gap and
+# dropping the tail outright (the `break` only ever caught a tail gap).
+# ---------------------------------------------------------------------------
+
+suite "r63 — pairVerifySamples pairs by IDENTITY, never by position (mid-sequence omission)":
+
+  test "a mid-sequence omission in the verify sub-run's results does not mispair the tail entries":
+    ## Simulates B (the middle of three sampled entries) never finalizing
+    ## in the verify sub-run (e.g. an interrupted sub-run) -- `verifyResults`
+    ## therefore carries A's and C's results only, B's gap landing in the
+    ## MIDDLE of the sequence, not the tail.
+    let epA = testEp("tests/unit/test_a.nim", group = "unit")
+    let epB = testEp("tests/unit/test_b.nim", group = "unit")
+    let epC = testEp("tests/unit/test_c.nim", group = "unit")
+    let entrypoints = @[
+      PlannedEntrypoint(ep: epA),
+      PlannedEntrypoint(ep: epB),
+      PlannedEntrypoint(ep: epC),
+    ]
+    let indices = @[0, 1, 2]   # all three sampled
+    let freshA = EntrypointResult(ep: epA)
+    let freshC = EntrypointResult(ep: epC)
+    let verifyResults = @[freshA, freshC]   # B's gap in the MIDDLE
+
+    let pairs = pairVerifySamples(entrypoints, indices, verifyResults)
+
+    # Correct (NEW, identity-based): exactly A and C paired, each to its
+    # OWN stored index -- B gets no pairing at all (never silently
+    # attributed someone else's fresh result, never silently dropped from
+    # consideration either -- the caller, verifyCachePass, is the one that
+    # turns "no pairing" into a couldNotReexec entry when the sub-run was
+    # interrupted).
+    check pairs.len == 2
+    var byStoredIdx: Table[int, Entrypoint]
+    for p in pairs: byStoredIdx[p.storedIdx] = p.fresh.ep
+    check byStoredIdx[0].tp.display() == epA.tp.display()
+    check byStoredIdx[2].tp.display() == epC.tp.display()
+    check 1 notin byStoredIdx   # B: correctly left unpaired, never mis-paired with C
+
+    # Pinning the regression this fix closes: the OLD positional-zip shape
+    # (`indices[j]`/`verifyResults[j]`, `break` once `j >= verifyResults.len`)
+    # on this EXACT same input:
+    #   j=0,i=0 -> freshA paired with stored index 0 (A)         -- correct, by luck
+    #   j=1,i=1 -> freshC WRONGLY paired with stored index 1 (B) -- MISPAIR
+    #   j=2,i=2 -> 2 >= verifyResults.len(2) -> break             -- C (index 2) DROPPED
+    # i.e. it would have compared B's STORED result against C's FRESH
+    # result, and never looked at C's own stored result at all. Reproduced
+    # here explicitly (not merely inferred from the new pairing's own
+    # correctness above) so the exact failure mode is on record.
+    var oldMispairedStoredIdx = -1
+    var oldMispairedFreshEp: Entrypoint
+    var oldDroppedIndices: seq[int]
+    for j, i in indices:
+      if j >= verifyResults.len:
+        oldDroppedIndices.add i
+        break
+      if i == 1:   # B's stored index, under the OLD positional zip
+        oldMispairedStoredIdx = i
+        oldMispairedFreshEp = verifyResults[j].ep
+    check oldMispairedStoredIdx == 1
+    check oldMispairedFreshEp.tp.display() == epC.tp.display()   # the OLD code's mispair
+    check oldDroppedIndices == @[2]                               # the OLD code's silent drop
+
+# ---------------------------------------------------------------------------
+# r67 (code-review) — verifyCachePass is PUBLIC (RFC-0005 B2a, so a test can
+# drive it directly), and `verifySample()`'s own default `pct = -1` (the "no
+# override" sentinel) is likewise public. Before this fix, a bare
+# `verifySample()` handed straight to `verifyCachePass` fell through to
+# `sampleHitIndices`'s `pct<=0` arm UNRESOLVED — `enabled: true` but an
+# ALWAYS-EMPTY sample: no re-execution, no warning, no error, a silently
+# inert verify pass. `verifyCachePass` now resolves -1 itself against
+# `config.verifyCachePct` (it already has `config` in scope) — this test
+# pins that a bare `verifySample()` genuinely samples via a NON-default
+# `config.verifyCachePct`, proven by an OBSERVABLE side effect of a real
+# subprocess re-execution (a counter file), same idiom as the SO4 suite
+# above.
+# ---------------------------------------------------------------------------
+
+suite "r67 — verifyCachePass resolves the -1 pct sentinel itself (public-facade safety)":
+
+  test "verifyCachePass(vc = verifySample()) samples via config.verifyCachePct, not silently inert":
+    let dir = getTempDir() / ("crisol_r67_pctsentinel_" & $getCurrentProcessId())
+    removeDir(dir)
+    createDir(dir)
+    defer: removeDir(dir)
+    const epRelPath = "test_pass.nim"
+    let epPath = dir / epRelPath
+    # Writes to an on-disk counter on every REAL execution (same idiom as
+    # B3b's NondeterministicFixture / the SO4 suite above) -- the only way
+    # this counter advances past "1" is a genuine second subprocess run.
+    writeFile(epPath, """
+import std/[os, strutils]
+const counterFile = "r67_counter.txt"
+var n = 0
+if fileExists(counterFile):
+  n = parseInt(readFile(counterFile).strip())
+inc n
+writeFile(counterFile, $n)
+quit(0)
+""")
+
+    let cfg = Config(projectRoot: dir, stateDir: ".crisol",
+                     compileTimeoutSecs: 120, timeoutSecs: 60,
+                     verifyCachePct: 100,   # r67: the ONLY pct verifyCachePass should ever consult
+                     trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol"))
+    let spec = sandbox.resolveSandbox(ptypes.hlIsolated)
+    var g = emptyDepGraph()
+    let rt = localOnlyCache(dir / ".crisol", maxEntries = 0)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+
+    # Run 1: live -- compiles + runs, stores.
+    let pep1 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
+                                 edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    let results1 = execute(
+      RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+    check results1.len == 1
+    check results1[0].cacheDecision == cdmStored
+    check readFile(dir / "r67_counter.txt").strip() == "1"
+
+    # Run 2: cdmHit (plan-time hit via the recorded closure) -- no fresh
+    # execution for the main run itself.
+    let pep2 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
+                                 edecision: edRunFresh, runTimeoutMs: 60_000)
+    let results2 = execute(
+      RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+    check results2.len == 1
+    check results2[0].cacheDecision == cdmHit
+
+    # r67: a BARE verifySample() (pct == -1, the "no override" sentinel) --
+    # the exact composition a library caller reaches for. The pin: it MUST
+    # genuinely sample and re-execute (the counter file -- written only by
+    # a REAL subprocess invocation -- advances to "2"); before the fix, the
+    # unresolved -1 sentinel made `sampleHitIndices` return `@[]` and
+    # `verifyCachePass` returned early, and the counter would have stayed
+    # at "1".
+    discard verifyCachePass(results2, @[pep2], verifySample(), cfg, g,
+                            "2.2.10", "gcc 13.2.0", spec)
+    check readFile(dir / "r67_counter.txt").strip() == "2"
+
+# ---------------------------------------------------------------------------
 # RFC-0005 A3b — runTestsWith / CacheDeps: the internal injection seam.
 # ---------------------------------------------------------------------------
 
@@ -2623,3 +2773,76 @@ suite "RunReport.compileBlock presence — R14-T6 end-to-end":
       ))
       checkRunOk(rr)
       check rr.compileBlock == nil
+
+# ---------------------------------------------------------------------------
+# r64 (code-review) — RunReport's doc-derived fields (results/summary/
+# memThrottledSlots/lateOrphansReaped/interrupted/compileBlock/reuseAlerts/
+# cacheStats/trackedRoots) must have exactly ONE storage address (`rr.doc`)
+# rather than a hand-duplicated flat field kept in sync only by a comment.
+# The one place the two used to visibly diverge if kept out of sync is
+# ordering-sensitive: C6 perf-check annotates `results[i].regressed` IN
+# PLACE, and `doc` is assembled from that same `results` local — this test
+# pins that a real regression-annotated run reports the SAME `regressed`
+# verdict through `rr.results` (whatever storage backs it) and through the
+# `doc`-driven stdout JSON (`toJsonString(rr.doc)`), so a future change that
+# re-introduces two independently-populated addresses (or reorders doc
+# assembly ahead of the annotation loop) cannot silently drift the two
+# apart again.
+# ---------------------------------------------------------------------------
+
+suite "r64 — RunReport.results and the doc-driven stdout JSON agree on a regression-annotated run":
+
+  test "rr.results[0].regressed and toJsonString(rr.doc)'s regressions entry agree":
+    withTempProject:
+      const epRelPath = "tests/unit/test_perf_r64.nim"
+      # Sleeps on its SECOND real invocation only (tracked via an on-disk
+      # counter, same idiom as B3b's NondeterministicFixture) -- content
+      # never changes between run 1 and run 2, so no incidental recompile
+      # muddies the measured RUN duration.
+      writeFile(projectRoot / epRelPath, """
+import std/[os, strutils]
+const counterFile = "perf_r64_counter.txt"
+var n = 0
+if fileExists(counterFile):
+  n = parseInt(readFile(counterFile).strip())
+inc n
+writeFile(counterFile, $n)
+if n > 1:
+  sleep(250)
+quit(0)
+""")
+      # sample-floor 1 / abs-floor-ms 0: a SINGLE prior ledger row is
+      # already enough to flag run 2 (MAD of one point is 0, so the
+      # threshold collapses to the baseline itself) -- cheap, no need to
+      # accumulate the default sensitivity's 10-row floor.
+      writeFile(projectRoot / "crisol.kdl", MinimalCrisolKdl & """
+perf-check {
+    sensitivity "aggressive"
+    sample-floor 1
+    abs-floor-ms 0
+}
+""")
+      let opts = RunOptions(configPath: projectRoot / "crisol.kdl", jobs: 1,
+                            noCache: true, persist: true)
+
+      # Run 1: baseline. Insufficient history (0 prior rows < sample-floor
+      # 1) -- never flagged regardless of duration.
+      let rr1 = runTests(opts)
+      checkRunOk(rr1)
+      check rr1.results.len == 1
+      check rr1.results[0].regressed == false
+
+      # Run 2: the SAME entrypoint, now sleeping ~250ms -- run 1's single
+      # ledger row is enough (sample-floor 1) to flag it.
+      let rr2 = runTests(opts)
+      checkRunOk(rr2)
+      check rr2.results.len == 1
+      check rr2.results[0].regressed == true
+      check rr2.results[0].perfBaselineUs > 0
+
+      let node = parseJson(toJsonString(rr2.doc))
+      check node["regressions"].len == 1
+      check node["regressions"][0]["path"].getStr == epRelPath
+      # The per-entrypoint flag inside the SAME doc-driven document agrees
+      # with rr2.results[0].regressed above -- both readers, one address.
+      check node["entrypoints"][0]["regressed"].getBool == true
