@@ -1343,15 +1343,15 @@ group "unit" {
 
 suite "config — rlimit-nofile (Fix 1: RLIMIT_NOFILE override plumbing)":
 
-  test "absent rlimit-nofile -> cfg.rlimitNofile == none (sandbox applies its own default)":
+  test "absent rlimit-nofile -> cfg.rlimits.limitNofile == none (sandbox applies its own default)":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitNofile == none(int64)
+    check cfg.rlimits.limitNofile == none(int64)
 
-  test "rlimit-nofile N round-trips to cfg.rlimitNofile == some(N)":
+  test "rlimit-nofile N round-trips to cfg.rlimits.limitNofile == some(N)":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = """
@@ -1362,13 +1362,13 @@ group "unit" {
 """
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitNofile == some(4096'i64)
+    check cfg.rlimits.limitNofile == some(4096'i64)
 
-  test "no config file (convention fallback) -> cfg.rlimitNofile == none":
+  test "no config file (convention fallback) -> cfg.rlimits.limitNofile == none":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let (cfg, _) = loadConfig(startDir = tmp)
-    check cfg.rlimitNofile == none(int64)
+    check cfg.rlimits.limitNofile == none(int64)
 
   test "rlimit-nofile 0 is rejected (must be >= 1)":
     let tmp = makeTmpDir()
@@ -1399,15 +1399,15 @@ group "unit" {
 
 suite "config — rlimit-cpu (W2: RLIMIT_CPU override plumbing)":
 
-  test "absent rlimit-cpu -> cfg.rlimitCpu == none":
+  test "absent rlimit-cpu -> cfg.rlimits.limitCpu == none":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitCpu == none(int64)
+    check cfg.rlimits.limitCpu == none(int64)
 
-  test "rlimit-cpu N round-trips to cfg.rlimitCpu == some(N)":
+  test "rlimit-cpu N round-trips to cfg.rlimits.limitCpu == some(N)":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = """
@@ -1418,7 +1418,7 @@ group "unit" {
 """
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitCpu == some(5'i64)
+    check cfg.rlimits.limitCpu == some(5'i64)
 
   test "rlimit-cpu 0 is rejected (must be >= 1)":
     let tmp = makeTmpDir()
@@ -1442,15 +1442,15 @@ group "unit" {
 
 suite "config — rlimit-as (W2: RLIMIT_AS override plumbing)":
 
-  test "absent rlimit-as -> cfg.rlimitAs == none":
+  test "absent rlimit-as -> cfg.rlimits.limitAs == none":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitAs == none(int64)
+    check cfg.rlimits.limitAs == none(int64)
 
-  test "rlimit-as N round-trips to cfg.rlimitAs == some(N)":
+  test "rlimit-as N round-trips to cfg.rlimits.limitAs == some(N)":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = """
@@ -1461,7 +1461,7 @@ group "unit" {
 """
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitAs == some(4294967296'i64)
+    check cfg.rlimits.limitAs == some(4294967296'i64)
 
   test "rlimit-as 0 is rejected (must be >= 1)":
     let tmp = makeTmpDir()
@@ -1485,15 +1485,15 @@ group "unit" {
 
 suite "config — rlimit-fsize (W2: RLIMIT_FSIZE override plumbing)":
 
-  test "absent rlimit-fsize -> cfg.rlimitFsize == none":
+  test "absent rlimit-fsize -> cfg.rlimits.limitFsize == none":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitFsize == none(int64)
+    check cfg.rlimits.limitFsize == none(int64)
 
-  test "rlimit-fsize N round-trips to cfg.rlimitFsize == some(N)":
+  test "rlimit-fsize N round-trips to cfg.rlimits.limitFsize == some(N)":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = """
@@ -1504,7 +1504,7 @@ group "unit" {
 """
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitFsize == some(1048576'i64)
+    check cfg.rlimits.limitFsize == some(1048576'i64)
 
   test "rlimit-fsize -1 is rejected (must be >= 0)":
     let tmp = makeTmpDir()
@@ -1528,15 +1528,15 @@ group "unit" {
 
 suite "config — rlimit-core (W2: RLIMIT_CORE override plumbing)":
 
-  test "absent rlimit-core -> cfg.rlimitCore == none":
+  test "absent rlimit-core -> cfg.rlimits.limitCore == none":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n"
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitCore == none(int64)
+    check cfg.rlimits.limitCore == none(int64)
 
-  test "rlimit-core N round-trips to cfg.rlimitCore == some(N)":
+  test "rlimit-core N round-trips to cfg.rlimits.limitCore == some(N)":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     let kdl = """
@@ -1547,7 +1547,7 @@ group "unit" {
 """
     let cfgPath = writeFile(tmp, "crisol.kdl", kdl)
     let (cfg, _) = loadConfig(configPath = cfgPath)
-    check cfg.rlimitCore == some(0'i64)
+    check cfg.rlimits.limitCore == some(0'i64)
 
   test "rlimit-core -1 is rejected (must be >= 0)":
     let tmp = makeTmpDir()

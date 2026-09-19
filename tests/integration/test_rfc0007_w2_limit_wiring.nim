@@ -93,7 +93,7 @@ suite "rfc-0007 W2 — rlimit-cpu config key reaches resolveSandbox (cbLimit/lkC
 # ---------------------------------------------------------------------------
 # Suite 1b — precedence: CLI --rlimit-cpu overrides a same-named config
 # value (mirrors --rlimit-nofile's CLI-wins-over-config idiom, api.nim
-# planImpl's `if opts.rlimitCpu.isSome: cfg.rlimitCpu = opts.rlimitCpu`).
+# planImpl's `mergeRlimitOverrides(cfg.rlimits, opts.rlimits)`, r30).
 # ---------------------------------------------------------------------------
 
 const RlimitCpuGenerousKdl = """

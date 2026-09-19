@@ -119,6 +119,17 @@ type
                                          ## Empty by default: NOTHING is pinned unless an
                                          ## operator opts in (RFC-0005 defers default pins).
 
+proc mergeRlimitOverrides*(base, overrides: RlimitOverrides): RlimitOverrides =
+  ## Per-field override merge for the rlimit-* bundle (code-review r30):
+  ## any ``some`` field in ``overrides`` replaces the corresponding ``base``
+  ## field; a ``none`` field defers to ``base`` unchanged. Generic over every
+  ## ``RlimitOverrides`` field via ``fieldPairs`` -- a new rlimit kind added
+  ## to the bundle above needs no new line here, matching this proc's own
+  ## job of collapsing what used to be five parallel `if .isSome:` merges.
+  result = base
+  for _, r, o in fieldPairs(result, overrides):
+    if o.isSome: r = o
+
 proc evidenceSatisfies*(spec: SandboxSpec; ev: ptypes.Evidence): bool =
   ## Cache gate (rfc-0007 A6a, §6): named guarantees, never enum ordinals.
   ## Replaces the old ``isFullyAchieved`` outright — ``Evidence`` (not just
@@ -438,49 +449,25 @@ type
                                 ## the unstrict (DefaultPolicy) observation. Default false:
                                 ## byte-for-byte unchanged until an operator opts in
                                 ## (`--strict-hygiene` / `strict-hygiene #true` in crisol.kdl).
-    rlimitNofile*: Option[int64]
-                                ## Config-declared override for RLIMIT_NOFILE (max open fds) in the
-                                ## hermetic sandbox. none = use sandbox.DefaultRlimitNofile (1024).
-                                ## Populated from the top-level `rlimit-nofile N` KDL node, and/or
-                                ## strengthened per-run by `RunOptions.rlimitNofile` (RunOptions wins
-                                ## when set, mirroring jobs/timeoutSecs precedence in planImpl).
-                                ## Lets a consumer with an fd-heavy workload (e.g. one eventfd per
-                                ## in-flight async call) raise the ceiling without patching crisol.
-    rlimitCpu*: Option[int64]
-                                ## rfc-0007 wiring-audit W2: config-declared override for
-                                ## RLIMIT_CPU (CPU seconds) in the hermetic sandbox. none = no
-                                ## RLIMIT_CPU requested (the RFC-0004 default -- CPU limits are
-                                ## timing-sensitive so they stay opt-in, never a built-in
-                                ## default). Populated from the top-level `rlimit-cpu N` KDL node,
-                                ## and/or strengthened per-run by `RunOptions.rlimitCpu` (RunOptions
-                                ## wins when set), exactly mirroring rlimitNofile above. Feeds
-                                ## `RlimitOverrides.limitCpu` via `api.rlimitOverridesFrom`, which
-                                ## `resolveSandbox` sets as `req[lkCpu]` -- the real producer of
-                                ## the `cbLimit(lkCpu)`/SIGXCPU attribution chain this key exists
-                                ## to make reachable from a real crisol.kdl.
-    rlimitAs*: Option[int64]
-                                ## rfc-0007 wiring-audit W2: config-declared override for
-                                ## RLIMIT_AS (virtual address space, bytes) in the hermetic
-                                ## sandbox. none = no RLIMIT_AS requested (same "opt-in, no
-                                ## built-in default" rule as rlimitCpu above -- ORC's own startup
-                                ## address-space footprint makes a low default actively dangerous;
-                                ## see sandbox.MinSafeRlimitAs). Populated from `rlimit-as N`,
-                                ## strengthened by `RunOptions.rlimitAs`. Feeds
-                                ## `RlimitOverrides.limitAs` -> `req[lkAddressSpace]`.
-    rlimitFsize*: Option[int64]
-                                ## rfc-0007 wiring-audit W2: config-declared override for
-                                ## RLIMIT_FSIZE (max file write size, bytes) in the hermetic
-                                ## sandbox. none = use sandbox.DefaultRlimitFsize (256 MiB).
-                                ## Populated from `rlimit-fsize N`, strengthened by
-                                ## `RunOptions.rlimitFsize`. Feeds `RlimitOverrides.limitFsize` ->
-                                ## `req[lkFileSize]`, exactly mirroring rlimitNofile.
-    rlimitCore*: Option[int64]
-                                ## rfc-0007 wiring-audit W2: config-declared override for
-                                ## RLIMIT_CORE (core dump size, bytes) in the hermetic sandbox.
-                                ## none = use sandbox.DefaultRlimitCore (0 -- core dumps disabled).
-                                ## Populated from `rlimit-core N`, strengthened by
-                                ## `RunOptions.rlimitCore`. Feeds `RlimitOverrides.limitCore` ->
-                                ## `req[lkCore]`, exactly mirroring rlimitNofile.
+    rlimits*: RlimitOverrides
+                                ## rfc-0007 wiring-audit W2 / code-review r30: config-declared
+                                ## overrides for the RLIMIT_NOFILE/CPU/AS/FSIZE/CORE family in the
+                                ## hermetic sandbox, carried as ONE `RlimitOverrides` bundle (the
+                                ## same type `resolveSandbox`/`api.rlimitOverridesFrom` already
+                                ## use) instead of five parallel `Option[int64]` fields -- a new
+                                ## rlimit kind is now a field added to `RlimitOverrides` (types.nim)
+                                ## plus its CLI flag / KDL key, not a new field threaded through
+                                ## Config/RunOptions/the merge chain too.
+                                ## Per field: `none` = use the built-in safe default
+                                ## (sandbox.DefaultRlimitNofile/Fsize/Core; no built-in default for
+                                ## Cpu/As -- opt-in only, see sandbox.MinSafeRlimitAs for why a low
+                                ## RLIMIT_AS default would be actively dangerous). Populated from
+                                ## the top-level `rlimit-nofile`/`rlimit-cpu`/`rlimit-as`/
+                                ## `rlimit-fsize`/`rlimit-core` N KDL nodes, and/or strengthened
+                                ## per-run by `RunOptions.rlimits` (RunOptions wins per-field when
+                                ## set, via `types.mergeRlimitOverrides`, mirroring jobs/timeoutSecs
+                                ## precedence in planImpl). Feeds `resolveSandbox`'s `rlimits` param
+                                ## directly at the api.run call site.
     limitMemory*: Option[int64]
                                 ## rfc-0007 wiring-audit W2: config-declared cgroup-tier memory
                                 ## ceiling (bytes) -- `req[lkMemory]`'s first config/CLI surface.

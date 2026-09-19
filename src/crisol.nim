@@ -1164,37 +1164,18 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     stderr.write("crisol: error: --verify-cache-strict requires --verify-cache\n")
     return ExitEnvironment
 
-  # RFC-0005 B3c: resolve the sample percentage. --verify-cache-pct (when
-  # given) always wins; otherwise fall back to the config file's
-  # `verify-cache-pct` (defaulting to config.DefaultVerifyCachePct when the
-  # KDL node itself is absent). This is a SECOND, lightweight loadConfig
-  # call, deliberately scoped to just this one field — mirrors the `clean`
-  # subcommand's own early loadConfig above, and keeps this slice's touched
-  # surface to crisol.nim/config.nim/jsonout.nim (the actual pipeline load
-  # inside runTests/planTests, below, still owns the real Config used to
-  # run). A library caller going through crisol/api directly (not this CLI)
-  # does not get this config-file fallback — verifySample()'s own default
-  # (5) applies instead; documented on VerifyCache/RunOptions in api.nim.
-  var verifyCachePctResolved = verifyCachePctFlag
-  if verifyCache and verifyCachePctFlag == 0:
-    try:
-      let (cfgPeek, _) = loadConfig(configPath = configPath)
-      verifyCachePctResolved = cfgPeek.verifyCachePct
-    except CrisolError as e:
-      case e.kind
-      of cekEnvironment:
-        writeStderr("crisol: environment error: " & e.msg)
-        return ExitEnvironment
-      of cekConfig:
-        writeStderr("crisol: config error: " & e.msg)
-        return ExitEnvironment
-      of cekInternal:
-        writeStderr("crisol: internal error: " & e.msg)
-        return ExitInternal
-
+  # RFC-0005 B3c / code-review r29: --verify-cache-pct (when given) always
+  # wins; otherwise defer to the config file's `verify-cache-pct` (defaulting
+  # to config.DefaultVerifyCachePct when the KDL node itself is absent).
+  # verifyCachePctFlag's own "not specified" sentinel is 0 (the flag itself
+  # rejects an explicit 0 above); verifySample()'s -1 is the RunOptions-level
+  # "no override" sentinel, resolved against Config.verifyCachePct in
+  # planImpl's merge chain — the SAME single loadConfig call planTests/
+  # runTests already makes, so a library caller going through crisol/api
+  # directly gets this config-file fallback too (no CLI-only second peek).
   let verifyCacheOpts =
-    if verifyCache: verifySample(pct = verifyCachePctResolved, seed = verifyCacheSeed,
-                                 strict = verifyCacheStrict)
+    if verifyCache: verifySample(pct = (if verifyCachePctFlag > 0: verifyCachePctFlag else: -1),
+                                 seed = verifyCacheSeed, strict = verifyCacheStrict)
     else: noVerify()
 
   # Build narrowing.
@@ -1231,12 +1212,13 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     order:               orderMode,     # C4: history-based prioritization
     perfCheckForce:      perfCheck,     # C6: --perf-check: force detection ON
     hermeticLevel:       hermeticLevel, # RFC-0004: --hermetic level control
-    rlimitNofile:        if rlimitNofile > 0: some(int64(rlimitNofile)) else: none(int64),
-                                         # Fix 1: --rlimit-nofile override
-    rlimitCpu:   if rlimitCpu > 0:   some(int64(rlimitCpu))   else: none(int64),  # rfc-0007 W2
-    rlimitAs:    if rlimitAs > 0:    some(int64(rlimitAs))    else: none(int64),  # rfc-0007 W2
-    rlimitFsize: if rlimitFsize > 0: some(int64(rlimitFsize)) else: none(int64),  # rfc-0007 W2
-    rlimitCore:  if rlimitCore >= 0: some(int64(rlimitCore))  else: none(int64),  # rfc-0007 W2 (-1 sentinel)
+    rlimits: RlimitOverrides(     # Fix 1 / rfc-0007 W2 / code-review r30
+      limitNofile: if rlimitNofile > 0: some(int64(rlimitNofile)) else: none(int64),
+      limitCpu:    if rlimitCpu > 0:    some(int64(rlimitCpu))    else: none(int64),
+      limitAs:     if rlimitAs > 0:     some(int64(rlimitAs))     else: none(int64),
+      limitFsize:  if rlimitFsize > 0:  some(int64(rlimitFsize))  else: none(int64),
+      limitCore:   if rlimitCore >= 0:  some(int64(rlimitCore))   else: none(int64),  # -1 sentinel
+    ),
     limitMemory: if limitMemory > 0: some(int64(limitMemory)) else: none(int64), # rfc-0007 W2
     measureCompileReuse: measureCompileReuse,  # RFC-0006: gate measurement worker into compile slot
     verifyCache:         verifyCacheOpts,  # RFC-0005 B3c: --verify-cache facade

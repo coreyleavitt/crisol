@@ -72,8 +72,8 @@ const DefaultRlimitNofile*: int64 = 1024
   ##   pools, async I/O) that a production-shaped test may exercise.
   ##
   ##   Consumers with unusual fd needs can still raise this further via
-  ##   ``Config.rlimitNofile`` (crisol.kdl `rlimit-nofile N`) or
-  ##   ``RunOptions.rlimitNofile`` without patching crisol.
+  ##   ``Config.rlimits.limitNofile`` (crisol.kdl `rlimit-nofile N`) or
+  ##   ``RunOptions.rlimits.limitNofile`` without patching crisol.
 const DefaultRlimitCore*:   int64 = 0                   # disable core dumps
 
 const MinSafeRlimitAs*: int64 = 3 * 1024 * 1024 * 1024  # 3 GiB

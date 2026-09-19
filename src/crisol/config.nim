@@ -137,8 +137,11 @@ const DefaultTimeoutSecs*        = 300
 const DefaultCompileTimeoutSecs* = 600
 const DefaultMaxOutputBytes*     = 10 * 1024 * 1024   # 10 MiB
 const DefaultStateDir*           = ".crisol"
-const DefaultVerifyCachePct*     = 5   # RFC-0005 B3c: --verify-cache-pct's default;
-                                        # matches api.verifySample's own pct default.
+const DefaultVerifyCachePct*     = 5   # RFC-0005 B3c: --verify-cache-pct's default
+                                        # when no crisol.kdl `verify-cache-pct` node
+                                        # is present (r29: api.verifySample()'s own
+                                        # default is -1, "no override" -- resolved
+                                        # against this in api.planImpl).
 
 let DefaultGroups*: seq[Group] = @[
   Group(name: "unit",        globs: @["tests/unit/test_*.nim"]),
@@ -752,15 +755,11 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # rfc-0007 A6b: OutcomePolicy.strictHygiene. Default false (same
     # strengthen-only opt-in shape as measure-compile-reuse above).
     strictHygiene: bool = false
-    # Fix 1 (RLIMIT_NOFILE plumbing): config-declared override for the
-    # sandbox's max-open-fds ceiling. none = use sandbox.DefaultRlimitNofile.
-    rlimitNofile: Option[int64] = none(int64)
-    # rfc-0007 wiring-audit W2: the remaining four rlimit-* config keys +
-    # the (non-rlimit) limit-memory key -- same shape as rlimitNofile above.
-    rlimitCpu:    Option[int64] = none(int64)
-    rlimitAs:     Option[int64] = none(int64)
-    rlimitFsize:  Option[int64] = none(int64)
-    rlimitCore:   Option[int64] = none(int64)
+    # Fix 1 (RLIMIT_NOFILE plumbing) / rfc-0007 wiring-audit W2 / code-review
+    # r30: the rlimit-* family as ONE RlimitOverrides bundle (zero-value =
+    # every field none, same "unset" meaning the five separate vars had).
+    # limitMemory stays its own var -- not an rlimit, see Config.limitMemory.
+    rlimits:      RlimitOverrides
     limitMemory:  Option[int64] = none(int64)
     # RFC-0005 B3c: --verify-cache-pct's config-file default. Always a
     # concrete value (never a sentinel) -- DefaultVerifyCachePct until the
@@ -883,25 +882,25 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       let v = requireIntArg(n, "rlimit-nofile")
       if v < 1:
         cfgErr("config: 'rlimit-nofile' must be >= 1, got " & $v)
-      rlimitNofile = some(int64(v))
+      rlimits.limitNofile = some(int64(v))
     of "rlimit-cpu":
       # rfc-0007 wiring-audit W2: RLIMIT_CPU override (CPU seconds).
       let v = requireIntArg(n, "rlimit-cpu")
       if v < 1:
         cfgErr("config: 'rlimit-cpu' must be >= 1, got " & $v)
-      rlimitCpu = some(int64(v))
+      rlimits.limitCpu = some(int64(v))
     of "rlimit-as":
       # rfc-0007 wiring-audit W2: RLIMIT_AS override (virtual address space, bytes).
       let v = requireIntArg(n, "rlimit-as")
       if v < 1:
         cfgErr("config: 'rlimit-as' must be >= 1, got " & $v)
-      rlimitAs = some(int64(v))
+      rlimits.limitAs = some(int64(v))
     of "rlimit-fsize":
       # rfc-0007 wiring-audit W2: RLIMIT_FSIZE override (max file write size, bytes).
       let v = requireIntArg(n, "rlimit-fsize")
       if v < 1:
         cfgErr("config: 'rlimit-fsize' must be >= 1, got " & $v)
-      rlimitFsize = some(int64(v))
+      rlimits.limitFsize = some(int64(v))
     of "rlimit-core":
       # rfc-0007 wiring-audit W2: RLIMIT_CORE override (core dump size, bytes).
       # Unlike the other four rlimit-* keys, 0 is a legitimate, meaningful
@@ -910,7 +909,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
       let v = requireIntArg(n, "rlimit-core")
       if v < 0:
         cfgErr("config: 'rlimit-core' must be >= 0, got " & $v)
-      rlimitCore = some(int64(v))
+      rlimits.limitCore = some(int64(v))
     of "limit-memory":
       # rfc-0007 wiring-audit W2: the cgroup memory.max ceiling (req[lkMemory]).
       # NOT an rlimit -- deliberately its own top-level key, per the RFC.
@@ -1070,11 +1069,7 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     ledgerMaxAgeDays:   ledgerMaxAgeDays,
     measureCompileReuse: measureCompileReuse,
     strictHygiene:      strictHygiene,
-    rlimitNofile:       rlimitNofile,
-    rlimitCpu:          rlimitCpu,
-    rlimitAs:           rlimitAs,
-    rlimitFsize:        rlimitFsize,
-    rlimitCore:         rlimitCore,
+    rlimits:            rlimits,
     limitMemory:        limitMemory,
     verifyCachePct:     verifyCachePct,
     explainMiss:        explainMiss,

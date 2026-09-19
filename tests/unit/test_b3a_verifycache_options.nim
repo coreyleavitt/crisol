@@ -1,7 +1,7 @@
 ## test_b3a_verifycache_options.nim — RFC-0005 B3a: VerifyCache options object.
 ##
 ## `RunOptions.verifyCache: VerifyCache` is the --verify-cache facade
-## (RFC-0005 §Stage B "Facade (round 3)"): `{enabled, pct = 5, seed, strict}`
+## (RFC-0005 §Stage B "Facade (round 3)"): `{enabled, pct = -1, seed, strict}`
 ## built via `noVerify()` / `verifySample(pct, seed, strict)` — the same
 ## RunNarrowing constructor idiom (noNarrowing/failedOnly/…) so
 ## "strict without enabled" is unconstructable through the public API.
@@ -26,13 +26,16 @@ block test_no_verify:
   assert vc.strict == false
 
 # ---------------------------------------------------------------------------
-# 2. verifySample() — defaults (pct=5, seed=none, strict=false, enabled=true)
+# 2. verifySample() — defaults (pct=-1, seed=none, strict=false, enabled=true).
+# pct=-1 is the "no override" sentinel (r29): planImpl's merge chain resolves
+# it against Config.verifyCachePct, so a bare verifySample() honors a
+# config-file `verify-cache-pct` just like the CLI's bare --verify-cache does.
 # ---------------------------------------------------------------------------
 
 block test_verify_sample_defaults:
   let vc = verifySample()
   assert vc.enabled == true
-  assert vc.pct == 5
+  assert vc.pct == -1
   assert vc.seed.isNone
   assert vc.strict == false
 

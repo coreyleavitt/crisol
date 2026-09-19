@@ -233,7 +233,7 @@ suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
     ## Proves the Config -> RlimitOverrides -> SandboxSpec wiring end to end
     ## via the same rlimitOverridesFrom() helper production code (api.runTests)
     ## uses at its resolveSandbox call site.
-    let cfg  = Config(rlimitNofile: some(4096'i64))
+    let cfg  = Config(rlimits: RlimitOverrides(limitNofile: some(4096'i64)))
     let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
     check spec.limits.req[lkOpenFiles] == some(4096'i64)
 
@@ -253,22 +253,22 @@ suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
 suite "sandbox — W2: rlimitOverridesFrom projects all five rlimit fields":
 
   test "Config.rlimitCpu round-trips through rlimitOverridesFrom into req[lkCpu]":
-    let cfg  = Config(rlimitCpu: some(7'i64))
+    let cfg  = Config(rlimits: RlimitOverrides(limitCpu: some(7'i64)))
     let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
     check spec.limits.req[lkCpu] == some(7'i64)
 
   test "Config.rlimitAs round-trips through rlimitOverridesFrom into req[lkAddressSpace]":
-    let cfg  = Config(rlimitAs: some(4294967296'i64))
+    let cfg  = Config(rlimits: RlimitOverrides(limitAs: some(4294967296'i64)))
     let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
     check spec.limits.req[lkAddressSpace] == some(4294967296'i64)
 
   test "Config.rlimitFsize round-trips through rlimitOverridesFrom into req[lkFileSize]":
-    let cfg  = Config(rlimitFsize: some(1048576'i64))
+    let cfg  = Config(rlimits: RlimitOverrides(limitFsize: some(1048576'i64)))
     let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
     check spec.limits.req[lkFileSize] == some(1048576'i64)
 
   test "Config.rlimitCore round-trips through rlimitOverridesFrom into req[lkCore]":
-    let cfg  = Config(rlimitCore: some(0'i64))
+    let cfg  = Config(rlimits: RlimitOverrides(limitCore: some(0'i64)))
     let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))
     check spec.limits.req[lkCore] == some(0'i64)
 

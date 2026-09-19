@@ -31,14 +31,16 @@
 ## ## VerifyCache constructors (RFC-0005 B3a; make strict-without-enabled unconstructable)
 ##
 ##   noVerify()                          → disabled (RunOptions.verifyCache default)
-##   verifySample(pct=5, seed=none, strict=false) → enabled; --verify-cache facade
+##   verifySample(pct=-1, seed=none, strict=false) → enabled; --verify-cache facade;
+##                                          pct=-1 defers to Config.verifyCachePct
+##                                          (r29: resolved in planImpl's merge chain)
 ##
 ## ## Public re-exports (selective — see H1)
 ##
 ## From types: GroupSelection, GroupSelectionKind, PlannedEntrypoint, Entrypoint,
 ##   Outcome (+ oPassed/oFailed/etc values), TestRecord, RecordStatus, Summary,
 ##   GatedEntry, ConfigWarning, CompileDecision, CrisolError, CrisolErrorKind,
-##   ResultCallback, EntrypointResult, isFailure, exitCode
+##   ResultCallback, EntrypointResult, isFailure, exitCode, RlimitOverrides
 ## From render: render, gateSkipMessages, pathFlagsWarnings, filterRecordsByTag,
 ##   hasZeroTagMatches, RenderOpts, defaultOpts
 ## From jsonout: toJsonString, RunSchema
@@ -110,6 +112,7 @@ export types.CrisolErrorKind
 export types.ResultCallback
 export types.EntrypointResult
 export types.HermeticLevel
+export types.RlimitOverrides  # code-review r30: RunOptions.rlimits' / Config.rlimits' type
 export types.isFailure
 export types.exitCode
 export types.outcome
@@ -225,7 +228,12 @@ type
     ## is B3c.
     enabled*: bool         ## false (default, via noVerify()) = no verify pass
     pct*:     int          ## sample percentage of the hit set; see
-                           ## types.sampleHitIndices (max(1, pct*hits/100))
+                           ## types.sampleHitIndices (max(1, pct*hits/100)).
+                           ## -1 (verifySample()'s own default) = no override;
+                           ## planImpl's merge chain (r29) resolves it against
+                           ## Config.verifyCachePct before the post-run pass
+                           ## ever sees it — vc.pct itself is always concrete
+                           ## by the time verifyCachePass reads it.
     seed*:    Option[int64] ## none() = a per-run default seed (the CALLER
                             ## reports it in the summary line, B3c); some(n)
                             ## reproduces a specific sample (--verify-cache-seed)
@@ -306,26 +314,24 @@ type
     ## scrub/rlimits entirely; hlNetwork requests net-ns isolation (currently
     ## DEGRADES — net-ns unshare is not wired — so such runs are not cached).
     hermeticLevel*:      HermeticLevel = hlIsolated
-    ## Fix 1: per-run override for RLIMIT_NOFILE (max open fds) in the hermetic
-    ## sandbox. none (default) = use Config.rlimitNofile if set, else
-    ## sandbox.DefaultRlimitNofile (1024). Set explicitly can only strengthen
-    ## a config-file value (wins when some), mirroring jobs/timeoutSecs/retries
-    ## precedence below in planImpl — lets a library caller raise the ceiling
-    ## for one run without editing crisol.kdl.
-    rlimitNofile*:       Option[int64] = none(int64)
-    ## rfc-0007 wiring-audit W2: per-run overrides for the remaining four
-    ## rlimit-* fields + the (non-rlimit) memory ceiling, same
-    ## can-only-strengthen precedence as rlimitNofile above (RunOptions wins
-    ## over a config-file value when set; none = defer to Config/built-in).
-    rlimitCpu*:          Option[int64] = none(int64)
-    rlimitAs*:           Option[int64] = none(int64)
-    rlimitFsize*:        Option[int64] = none(int64)
-    rlimitCore*:         Option[int64] = none(int64)
+    ## Fix 1 / rfc-0007 wiring-audit W2 / code-review r30: per-run overrides
+    ## for the RLIMIT_NOFILE/CPU/AS/FSIZE/CORE family in the hermetic
+    ## sandbox, as ONE `RlimitOverrides` bundle (mirrors Config.rlimits).
+    ## Per field: none (default) = defer to the matching Config.rlimits
+    ## field if set, else the sandbox built-in default (DefaultRlimitNofile/
+    ## Fsize/Core; Cpu/As have no built-in, opt-in only). A `some` field here
+    ## can only strengthen a config-file value (wins when some), mirroring
+    ## jobs/timeoutSecs/retries precedence below in planImpl — lets a
+    ## library caller raise a ceiling for one run without editing crisol.kdl.
+    rlimits*:            RlimitOverrides
+    ## rfc-0007 wiring-audit W2: the (non-rlimit) memory ceiling. Kept
+    ## outside the bundle above -- not an rlimit (no RLIMIT_* syscall backs
+    ## it), same reasoning as Config.limitMemory.
     limitMemory*:        Option[int64] = none(int64)
     ## RFC-0005 A0: per-run NAME=VALUE pins (CLI `--env-pin`, repeatable).
     ## Merged with `Config.envPins` (KDL `env-pin "NAME" "VALUE"`) in
     ## planImpl via `envPinsFrom` -- a pin here overrides a same-named
-    ## config pin (CLI wins), mirroring rlimitNofile's override precedence.
+    ## config pin (CLI wins), mirroring rlimits' per-field override precedence.
     ## Empty by default: nothing pinned unless an operator opts in.
     envPins*:            seq[(string, string)] = @[]
     ## rfc-0007 code-review r20: per-run opt-in for `SandboxSpec.
@@ -671,15 +677,21 @@ proc noVerify*(): VerifyCache =
   ## No --verify-cache pass (the default).
   VerifyCache(enabled: false, pct: 0, seed: none(int64), strict: false)
 
-proc verifySample*(pct: int = 5; seed: Option[int64] = none(int64);
+proc verifySample*(pct: int = -1; seed: Option[int64] = none(int64);
                    strict: bool = false): VerifyCache =
-  ## Enable the --verify-cache pass. `pct` (default 5, matching
-  ## --verify-cache-pct's default) is the sample percentage of the hit set;
-  ## `pct <= 0` disables sampling regardless of `enabled` (see
-  ## types.sampleHitIndices). `seed` none() = a per-run default (the caller
-  ## reports it in the summary line); some(n) reproduces one specific
-  ## sample. `strict` = a divergence set exits 1 — always paired with
-  ## enabled == true here, so "strict without enabled" never arises.
+  ## Enable the --verify-cache pass. `pct` is the sample percentage of the
+  ## hit set; default -1 = no override, so planImpl's merge chain (r29)
+  ## resolves it against Config.verifyCachePct (itself defaulting to
+  ## config.DefaultVerifyCachePct, 5, when the KDL node is absent) — a bare
+  ## `verifySample()` therefore honors a config-file `verify-cache-pct`
+  ## setting exactly like the CLI's bare `--verify-cache` does. An explicit
+  ## `pct >= 0` here always wins over the config file. `pct == 0` disables
+  ## sampling outright (see types.sampleHitIndices); this is a legitimate,
+  ## deliberate value, distinct from -1's "unset". `seed` none() = a per-run
+  ## default (the caller reports it in the summary line); some(n)
+  ## reproduces one specific sample. `strict` = a divergence set exits 1 —
+  ## always paired with enabled == true here, so "strict without enabled"
+  ## never arises.
   VerifyCache(enabled: true, pct: pct, seed: seed, strict: strict)
 
 # ---------------------------------------------------------------------------
@@ -898,21 +910,14 @@ proc shouldReportCompileBlock*(measureCompileReuse: bool): bool =
   measureCompileReuse
 
 proc rlimitOverridesFrom*(cfg: Config): RlimitOverrides =
-  ## Fix 1 / rfc-0007 wiring-audit W2: pure projection of Config's
-  ## rlimit-override fields into the RlimitOverrides bundle resolveSandbox
-  ## expects. Extracted (like shouldReportCompileBlock above) so the
-  ## Config → SandboxSpec wiring is independently unit-testable without a
-  ## real run. All five RlimitOverrides fields are now config-plumbed (W2
-  ## closed the gap Fix 1 left: limitAs/limitCpu/limitFsize/limitCore used
-  ## to stay none unconditionally here, so resolveSandbox always fell back
-  ## to its own built-in defaults for those four regardless of crisol.kdl).
-  RlimitOverrides(
-    limitAs:     cfg.rlimitAs,
-    limitCpu:    cfg.rlimitCpu,
-    limitFsize:  cfg.rlimitFsize,
-    limitNofile: cfg.rlimitNofile,
-    limitCore:   cfg.rlimitCore,
-  )
+  ## Fix 1 / rfc-0007 wiring-audit W2 / code-review r30: the RlimitOverrides
+  ## bundle resolveSandbox expects. `Config.rlimits` IS that bundle now (r30
+  ## collapsed the five separate `Config.rlimitNofile`/`rlimitCpu`/`rlimitAs`/
+  ## `rlimitFsize`/`rlimitCore` fields this used to project into ONE field of
+  ## this exact type), so this is a named accessor, kept for call-site
+  ## stability (like shouldReportCompileBlock above, independently
+  ## unit-testable without a real run) rather than a projection.
+  cfg.rlimits
 
 proc envPinsFrom*(cfg: Config; opts: RunOptions): seq[(string, string)] =
   ## RFC-0005 A0: pure projection merging `Config.envPins` (KDL) with
@@ -979,6 +984,16 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   if opts.jobs > 0:        cfg.jobs        = opts.jobs
   if opts.timeoutSecs > 0: cfg.timeoutSecs = opts.timeoutSecs
   if opts.retries >= 0:    cfg.retries     = opts.retries  # B1: -1 = use config
+  # RFC-0005 B3c code-review r29: --verify-cache-pct's config-file fallback,
+  # same "-1 = use config" sentinel shape as retries above (pct == 0 is a
+  # legitimate explicit "disable sampling" value, so it cannot double as the
+  # sentinel). Gated on enabled since a disabled VerifyCache's pct is inert.
+  # cfg.verifyCachePct is already the config-file default from loadConfig
+  # above; this is the ONLY place --verify-cache-pct is resolved now — the
+  # CLI no longer does a second loadConfig peek, so library callers get this
+  # fallback too.
+  if opts.verifyCache.enabled and opts.verifyCache.pct >= 0:
+    cfg.verifyCachePct = opts.verifyCache.pct
   # RFC-0006 M-artifact-identity PASS (b2): CLI/library --measure-compile-reuse
   # can only strengthen a config-file setting (true wins), mirroring perfCheckForce.
   if opts.measureCompileReuse: cfg.measureCompileReuse = true
@@ -994,14 +1009,12 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   # config-file `cache-stats #true` setting, same shape as explainMiss above.
   if opts.cacheStats: cfg.cacheStats = true
   if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
-  # Fix 1: RunOptions.rlimitNofile, when set, overrides Config.rlimitNofile.
-  if opts.rlimitNofile.isSome: cfg.rlimitNofile = opts.rlimitNofile
-  # rfc-0007 wiring-audit W2: same CLI/library-wins precedence for the
-  # remaining four rlimit-* fields + the (non-rlimit) memory ceiling.
-  if opts.rlimitCpu.isSome:    cfg.rlimitCpu    = opts.rlimitCpu
-  if opts.rlimitAs.isSome:     cfg.rlimitAs     = opts.rlimitAs
-  if opts.rlimitFsize.isSome:  cfg.rlimitFsize  = opts.rlimitFsize
-  if opts.rlimitCore.isSome:   cfg.rlimitCore   = opts.rlimitCore
+  # Fix 1 / rfc-0007 wiring-audit W2 / code-review r30: RunOptions.rlimits,
+  # per field when set, overrides the matching Config.rlimits field (CLI/
+  # library wins) -- collapsed from five parallel `if .isSome:` lines into
+  # one bundle merge; a new rlimit kind added to RlimitOverrides needs no
+  # new line here (see types.mergeRlimitOverrides).
+  cfg.rlimits = mergeRlimitOverrides(cfg.rlimits, opts.rlimits)
   if opts.limitMemory.isSome:  cfg.limitMemory  = opts.limitMemory
   # RFC-0005 A0: merge CLI/library --env-pin into the config-declared pins
   # (CLI wins on a name collision); resolveSandbox reads cfg.envPins below.
@@ -1547,8 +1560,8 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # and every library caller of runTests()/runTestsWith() flows through it --
   # so the check belongs here rather than duplicated at each entry point.
   # Reads the RESOLVED value (spec.limits, post CLI/config merge) rather than
-  # cfg.rlimitAs directly, so hlNone (rlimits inactive; resolveSandbox returns
-  # a zero Limits) never warns about a ceiling that is never applied.
+  # cfg.rlimits.limitAs directly, so hlNone (rlimits inactive; resolveSandbox
+  # returns a zero Limits) never warns about a ceiling that is never applied.
   let resolvedRlimitAs = spec.limits.req[ptypes.lkAddressSpace]
   if resolvedRlimitAs.isSome and resolvedRlimitAs.get < MinSafeRlimitAs:
     stderr.write("crisol: warning: rlimit-as " & $resolvedRlimitAs.get &
@@ -1872,9 +1885,15 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # the round-1 `verifyCachePass*` back-compat wrapper that hid this tuple
     # behind a `seq[VerifyDivergence]`-only return is deleted (R2-D2: it had
     # no compat obligation and zero production callers).
+    # r29: opts.verifyCache.pct may still be the -1 "no override" sentinel
+    # here (verifyCachePass has no Config-merge concept of its own) — swap
+    # in the resolved cfg.verifyCachePct planImpl's merge chain already
+    # settled above before handing it off.
+    var effectiveVerifyCache = opts.verifyCache
+    effectiveVerifyCache.pct = cfg.verifyCachePct
     let verifyPassResult =
-      if opts.verifyCache.enabled and not interrupted:
-        verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
+      if effectiveVerifyCache.enabled and not interrupted:
+        verifyCachePass(results, pr.entrypoints, effectiveVerifyCache, cfg, graph,
                         nimVer, ccVer, spec, cacheCtx.sink)
       else: (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
     let verifyDivergences    = verifyPassResult.divergences
