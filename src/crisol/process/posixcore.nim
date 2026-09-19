@@ -23,10 +23,21 @@
 ## rather than merged with anything — duplicate `importc` `var`s referencing
 ## the same C symbol are safe and idiomatic in Nim (no C definition is
 ## emitted, only a reference through the header).
+##
+## Code-review finding r27 (module split): this file used to also carry
+## cgroup-v2 leaf plumbing, the /proc(-libproc) process-table scan, and the
+## capability probes — three coherent, narrower concerns that fought this
+## file's own dependency order (forward declarations, "moved ahead of X so
+## Y can call it" section comments). They now live in
+## `process/cgroup.nim`, `process/procscan.nim`, and `process/caps.nim`
+## respectively, imported below; this file keeps exactly the Supervisor
+## core — child registry, self-pipe, spawn/wait/kill/reap.
 
-import std/[options, os, posix, sets, strutils, tables, monotimes, times]
+import std/[options, os, posix, sets, tables, monotimes, times]
 import crisol/process/types
-import crisol/ioutils
+import crisol/process/procscan
+import crisol/process/cgroup
+import crisol/process/caps
 
 # ---------------------------------------------------------------------------
 # rlimit constants missing from std/posix (same set spawn.nim importc's).
@@ -36,18 +47,6 @@ var RLIMIT_CORE   {.importc: "RLIMIT_CORE",   header: "<sys/resource.h>".}: cint
 var RLIMIT_FSIZE  {.importc: "RLIMIT_FSIZE",  header: "<sys/resource.h>".}: cint
 var RLIMIT_CPU    {.importc: "RLIMIT_CPU",    header: "<sys/resource.h>".}: cint
 var RLIMIT_AS     {.importc: "RLIMIT_AS",     header: "<sys/resource.h>".}: cint
-
-# ---------------------------------------------------------------------------
-# rfc-0007 B1 (§3): Linux-only syscall/prctl FFI, moved ahead of
-# initPosixCore/PosixCore so `initPosixCore` can set PR_SET_CHILD_SUBREAPER
-# DELIBERATELY (not merely as `probeSubreaper`'s capability-probe side
-# effect) — a Supervisor must be a subreaper by construction. Also used by
-# the escapee-kill/orphan-sweep mechanism further down this file
-# (discoverAndReapEscapees, nextEvent's orphan sweep). No Nim wrapper exists
-# for pidfd_open/pidfd_send_signal (even std/posix's own `syscall` helper is
-# `when defined(android)`-only) — importc syscall(2) directly, the same
-# duplicate-importc idiom this module's header sanctions.
-# ---------------------------------------------------------------------------
 
 proc forcePollRequested(): bool =
   ## rfc-0007 B2 checklist item 544's env knob: forces `next()` onto the
@@ -62,26 +61,6 @@ proc forcePollRequested(): bool =
   ## `when defined(linux):` block it originally lived in so macOS's kqueue
   ## tier can consult the SAME knob, not a duplicate.
   let v = getEnv("CRISOL_FORCE_POLL")
-  v.len > 0 and v != "0"
-
-proc forceNoCgroupKillRequested(): bool =
-  ## rfc-0007 wiring-audit W1's env knob — `CRISOL_FORCE_NO_CGROUP_KILL`,
-  ## the same shape/doc style as `CRISOL_FORCE_POLL` above. Consulted
-  ## INSIDE `probeCgroupV2` (below), never as a separate branch at the
-  ## spawn gate: this makes `capabilities()`/the substrate JSON honestly
-  ## report `cgroupKill: false` too, not just the gate's internal
-  ## decision — the same "attempt the mechanism, verify it worked" probe
-  ## discipline this file's capabilities section documents, just with the
-  ## verification forced negative. Two purposes, not one: (1) the test
-  ## seam this slice's conformance/unit tests need to exercise the
-  ## cgroup-tier degrade without a real broken kernel; (2) a genuine
-  ## operator escape hatch for a delegated host whose `cgroup.kill` file
-  ## exists but is known-buggy. Read fresh, same as `forcePollRequested`
-  ## — but because the caller (`cachedCapabilities`) memoises its RESULT
-  ## after the first probe, this only has effect if set before this
-  ## process's first `capabilities()`/`cachedCapabilities()` call; a
-  ## process that probed already will not re-probe on a later env change.
-  let v = getEnv("CRISOL_FORCE_NO_CGROUP_KILL")
   v.len > 0 and v != "0"
 
 proc cgroupTierUsable*(caps: Capabilities): bool =
@@ -109,18 +88,6 @@ proc cgroupTierUsable*(caps: Capabilities): bool =
   caps.cgroupDelegation and caps.cgroupKill
 
 when defined(linux):
-  proc c_syscall(number: clong): clong {.importc: "syscall", varargs,
-                                         header: "<unistd.h>".}
-  var SYS_pidfd_open {.importc: "SYS_pidfd_open", header: "<sys/syscall.h>".}: clong
-  var SYS_pidfd_send_signal {.importc: "SYS_pidfd_send_signal",
-                              header: "<sys/syscall.h>".}: clong
-
-  proc probePidfd(): bool =
-    let r = c_syscall(SYS_pidfd_open, clong(getpid()), 0.clong)
-    if r < 0: return false
-    discard posix.close(cint(r))
-    true
-
   # -------------------------------------------------------------------------
   # rfc-0007 B2 (§1/§3): pidfd + epoll-driven `next`, with timerfd deadlines.
   # `posix/epoll` (a stdlib module living under lib/posix/, not the `std/`
@@ -128,9 +95,13 @@ when defined(linux):
   # already (Nim ships it); timerfd has no stdlib wrapper at all, so it is
   # hand-rolled here with the same duplicate-importc idiom the rest of this
   # module uses for RLIMIT_*/flock/prctl. Both are Linux-only kernel
-  # mechanisms (no Darwin equivalent) — guarded the same way probePidfd/
-  # probeSubreaper are, so `nim check --os:macosx` never even parses this
-  # branch.
+  # mechanisms (no Darwin equivalent) — guarded the same way `process/caps.
+  # nim`'s `probePidfd`/`probeSubreaper` are, so `nim check --os:macosx`
+  # never even parses this branch. `probePidfd`/`SYS_pidfd_open`/
+  # `PR_SET_CHILD_SUBREAPER` etc. (used by `initPosixCore`/`spawnChild`/
+  # `discoverAndReapEscapees` below) come from `crisol/process/caps` —
+  # dual-use FFI this module needs for real, not just to probe; see that
+  # module's header note for why they live there instead of here.
   # -------------------------------------------------------------------------
   import posix/epoll
 
@@ -149,274 +120,19 @@ when defined(linux):
   var TFD_NONBLOCK {.importc, header: "<sys/timerfd.h>".}: cint
   var TFD_CLOEXEC {.importc, header: "<sys/timerfd.h>".}: cint
 
-  # PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER: unprivileged since
-  # Linux 3.4.
-  proc c_prctl(option: cint): cint {.importc: "prctl", varargs,
-                                     header: "<sys/prctl.h>".}
-  var PR_SET_CHILD_SUBREAPER {.importc, header: "<sys/prctl.h>".}: cint
-  var PR_GET_CHILD_SUBREAPER {.importc, header: "<sys/prctl.h>".}: cint
-
-  proc probeSubreaper(): bool =
-    ## Set-then-read-back is the real verification (not "the set call
-    ## returned 0, therefore assume it worked").
-    if c_prctl(PR_SET_CHILD_SUBREAPER, 1.cint) != 0: return false
-    var val: cint = -1
-    if c_prctl(PR_GET_CHILD_SUBREAPER, addr val) != 0: return false
-    val == 1
-else:
-  proc probePidfd(): bool = false
-  proc probeSubreaper(): bool = false
-
 when defined(macosx):
-  # ---------------------------------------------------------------------
   # rfc-0007 C1b (§1): the macOS backend's own mechanism — kqueue
   # EVFILT_PROC event-driven `next` (this file's peer of Linux's
-  # pidfd+epoll above) and libproc process-table forensics (macOS has no
-  # `/proc` at all). `process/darwin.nim` is a pure shell (mirrors
+  # pidfd+epoll above). `process/darwin.nim` is a pure shell (mirrors
   # `process/linux.nim` exactly) — every macOS-specific mechanism lives
   # HERE, beside the `when defined(linux):` blocks above, per this file's
-  # module-layout comment.
+  # module-layout comment; `process/caps.nim`'s `probeKqueue` imports this
+  # same stdlib module independently for its own self-contained probe.
   #
   # `posix/kqueue` (stdlib, same "lives under lib/posix/, not std/" shape
   # as `posix/epoll`) wraps kqueue()/kevent()/EV_SET()/the `KEvent` struct
   # and the EVFILT_*/EV_*/NOTE_* consts already — no hand-importc needed.
-  # libproc has no stdlib wrapper at all, so `proc_listallpids`/
-  # `proc_pidinfo` and the two `incompleteStruct` payload types are
-  # importc'd directly against the real macOS headers (named fields only —
-  # robust against padding/field-order; the C compiler lays the struct
-  # out).
-  # ---------------------------------------------------------------------
   import posix/kqueue
-
-  proc probeKqueue(): bool =
-    let kq = kqueue()
-    if kq < 0: return false
-    discard posix.close(kq)
-    true
-
-  proc proc_listallpids(buffer: pointer; buffersize: cint): cint
-    {.importc: "proc_listallpids", header: "<libproc.h>".}
-  proc proc_pidinfo(pid: cint; flavor: cint; arg: uint64; buffer: pointer;
-                     buffersize: cint): cint
-    {.importc: "proc_pidinfo", header: "<libproc.h>".}
-
-  type
-    ProcBsdInfo {.importc: "struct proc_bsdinfo", header: "<sys/proc_info.h>",
-                  incompleteStruct, pure.} = object
-      pbi_ppid {.importc: "pbi_ppid".}: uint32
-      pbi_pgid {.importc: "pbi_pgid".}: uint32
-      pbi_comm {.importc: "pbi_comm".}: array[16, char]  # MAXCOMLEN+1; may
-                                                          # truncate — fine
-                                                          # for forensics
-      pbi_start_tvsec {.importc: "pbi_start_tvsec".}: uint64
-    ProcTaskInfo {.importc: "struct proc_taskinfo", header: "<sys/proc_info.h>",
-                   incompleteStruct, pure.} = object
-      pti_resident_size {.importc: "pti_resident_size".}: uint64
-
-  const
-    PROC_PIDTBSDINFO = 3.cint   # -> ProcBsdInfo
-    PROC_PIDTASKINFO = 4.cint   # -> ProcTaskInfo
-
-# ---------------------------------------------------------------------------
-# rfc-0007 B3 (§3/§4): delegated cgroup-v2 leaf plumbing. Moved ahead of
-# `spawnChild`/`reapCore` — same reason `initPosixCore` needs
-# probeSubreaper/probePidfd this early — so both can call these directly.
-# `probeCgroupV2` (the capabilities-probe section, further down) is
-# rewritten to share `ownCgroupV2Path`/`cgroupSiblingParent` with the REAL
-# per-spawn leaf placement below, rather than duplicating the topology
-# decision in two places.
-# ---------------------------------------------------------------------------
-
-proc parseStatLine*(content: string): tuple[ppid, pgrp: int; comm: string; starttime: int64]
-  ## Forward declaration — the real proc (with its full doc comment) lives
-  ## in the "/proc forensics" section below; `cgroupLeafSurvivors` (B3,
-  ## right below) needs it this early for the same reason `initPosixCore`
-  ## needs `probeSubreaper` this early.
-proc readVmRssBytes(pid: int): int64
-  ## Forward declaration — real proc lives beside `parseStatLine` below.
-
-type
-  ProcStatInfo = object
-    ## One /proc walk's raw yield per live pid — the shared source both
-    ## `scanProcessGroup` (pgid-only, pre-B1 tier) and B1's
-    ## `discoverAndReapEscapees`/orphan sweep fold over, so the two never
-    ## drift onto separate readings of the same instant. Declared this
-    ## early (rather than beside `walkProcTable` itself, below) purely so
-    ## the forward declaration right after this needs a real type to name.
-    pid, ppid, pgrp: int
-    comm: string
-    starttime: int64
-
-proc walkProcTable(): seq[ProcStatInfo]
-  ## Forward declaration — `initPosixCore`'s r3 pre-existing-children
-  ## snapshot (rfc-0007 code-review finding r3) needs this early, the same
-  ## reason `cgroupLeafSurvivors` needs `parseStatLine` this early (see
-  ## that forward declaration's comment above). Real per-platform bodies
-  ## live below, beside the rest of the "/proc forensics" section.
-
-when defined(linux):
-  proc ownCgroupV2Path(): string =
-    ## Reads /proc/self/cgroup's unified (v2) line: "0::<path>".
-    try:
-      for line in lines("/proc/self/cgroup"):
-        if line.startsWith("0::"):
-          return line[3 .. ^1]
-    except CatchableError:
-      discard
-    ""
-
-  proc cgroupSiblingParent*(): string =
-    ## The REAL production topology, shared by the capabilities probe and
-    ## every per-spawn leaf below (and reused by the fault-injection test
-    ## to predict/collide a specific spawn's leaf path — rfc-0007 B3):
-    ## a SIBLING of this process's own cgroup residence (a child of its
-    ## PARENT), never a child of the residence itself. cgroup v2's "no
-    ## internal process" constraint forbids a cgroup from enabling
-    ## controllers in its OWN `cgroup.subtree_control` while it holds a
-    ## resident process — this process IS resident in its own cgroup right
-    ## now, so only a SIBLING (never a child of it) can inherit delegated
-    ## controllers (see `probeCgroupV2`'s longer comment, capabilities
-    ## section below, for the empirically-verified reasoning). "" when
-    ## there is nowhere to place a sibling (e.g. already at the cgroupfs
-    ## root, or /proc/self/cgroup unreadable).
-    let relPath = ownCgroupV2Path()
-    if relPath.len == 0: return ""
-    let base = "/sys/fs/cgroup" & relPath
-    let parent = base.parentDir
-    if parent.len == 0 or not parent.startsWith("/sys/fs/cgroup"): return ""
-    parent
-
-  proc cgroupSlotLeafName*(pid: Pid; id: int32): string =
-    ## Deterministic per-spawn leaf name — exported so the fault-injection
-    ## test (tests/integration/test_rfc0007_b3_cgroup.nim) can predict and
-    ## pre-collide ONE specific spawn's leaf path (a plain file where a
-    ## directory needs to go — un-creatable regardless of privilege level,
-    ## unlike a permission-based sabotage a `--privileged` CI container's
-    ## root would simply bypass).
-    "crisol-slot-" & $pid & "-" & $id
-
-  proc createCgroupLeaf(parent, name: string): string =
-    ## mkdir the leaf; returns its full path, or "" on ANY failure (already
-    ## exists as a non-directory, parent not writable, etc.) — the
-    ## per-spawn honest-degrade trigger (rfc-0007 B3): a failure here NEVER
-    ## aborts the spawn, it just leaves this one spawn off the cgroup tier.
-    let leaf = parent / name
-    try:
-      createDir(leaf)
-      leaf
-    except CatchableError:
-      ""
-
-  proc writeCgroupMemoryMax(leafPath: string; bytes: int64): bool =
-    ## cgroup `memory.max` — the tagged successor to RLIMIT_AS on this tier
-    ## (real RSS-backed enforcement + kernel OOM-kill accounting, vs.
-    ## RLIMIT_AS's virtual-address-space-only ceiling). RLIMIT_AS itself is
-    ## NOT removed (applyLimitsChildSide, unchanged) — both are attempted
-    ## when a memory ceiling is requested; this is the cgroup-specific one.
-    ## Also disables swap for the leaf (`memory.swap.max` = 0): without
-    ## this, a process that hits `memory.max` can be pushed to swap
-    ## instead of OOM-killed, defeating the ceiling's whole purpose as a
-    ## deterministic Cause(cbLimit, lkMemory) producer. Best-effort — an
-    ## environment with no swap-accounting controller at all never fails
-    ## the memory.max write itself over it.
-    try:
-      writeFile(leafPath / "memory.max", $bytes)
-      try: writeFile(leafPath / "memory.swap.max", "0")
-      except CatchableError: discard
-      true
-    except CatchableError:
-      false
-
-  proc killCgroupLeaf*(leafPath: string): bool =
-    ## Atomic, airtight teardown (rfc-0007 B3): write "1" to `cgroup.kill`
-    ## — kills every process resident in the subtree in one syscall,
-    ## including a setsid escapee the pgid-only `killpg` can never reach.
-    ## Safe to call on an EMPTY cgroup too (the normal-exit case) — a
-    ## harmless no-op write that still reports `true`.
-    ##
-    ## rfc-0007 r10: returns the write's real success/failure — this proc
-    ## itself no longer swallows it (a same-uid child migrating itself OUT
-    ## of the leaf before this write, or a runtime EACCES/ENOENT on the
-    ## write, used to be invisible: `forceKillCore` skipped `killpg`
-    ## ENTIRELY on the cgroup arm, so a write failure meant NO kill signal
-    ## of any kind was ever sent, while reap still stamped `killDomain =
-    ## kdsCgroup` — a vouch the mechanism did not honor). The caller
-    ## (`forceKillCore`/`reapCore`) is responsible for (a) backstopping with
-    ## `killpg` regardless, and (b) recording a `false` here so the spawn's
-    ## `killDomain` vouch degrades honestly — see `killDomainFor` below.
-    ## Exported (like `cgroupSiblingParent`/`cgroupSlotLeafName`) purely so
-    ## a unit test can drive a genuine write failure (a nonexistent leaf
-    ## path) without needing real cgroup-v2 delegation.
-    try:
-      writeFile(leafPath / "cgroup.kill", "1")
-      true
-    except CatchableError:
-      false
-
-  proc cgroupLeafSurvivors(leafPath: string): seq[ProcSnapshot] =
-    ## rfc-0007 B3: the cgroup-tier's OWN escapee/tree accounting — every
-    ## pid still listed in this leaf's `cgroup.procs` at reap time. No
-    ## /proc pgid/ppid scan needed (unlike the subreaper tier's
-    ## `discoverAndReapEscapees`): a process's cgroup membership is
-    ## LEAF-SCOPED by construction (each spawn gets its own leaf), so
-    ## unlike the pgid/ppid heuristics this can NEVER cross-attribute a
-    ## different slot's descendant — structurally sound regardless of
-    ## compile vs. run phase, which is why (unlike
-    ## `discoverAndReapEscapees`) this path never needs a `runPhase` guard.
-    result = @[]
-    var pids: seq[int]
-    try:
-      for line in lines(leafPath / "cgroup.procs"):
-        let s = line.strip()
-        if s.len == 0: continue
-        try: pids.add parseInt(s)
-        except ValueError: discard
-    except CatchableError:
-      discard
-    for pid in pids:
-      var ppid = 0
-      var comm = ""
-      try:
-        let parsed = parseStatLine(readFile("/proc/" & $pid & "/stat"))
-        ppid = parsed.ppid
-        comm = parsed.comm
-      except CatchableError:
-        discard
-      result.add ProcSnapshot(pid: pid, ppid: ppid, command: comm,
-                              rssBytes: readVmRssBytes(pid))
-
-  proc cgroupLeafOomKill(leafPath: string): bool =
-    ## `memory.events`' `oom_kill` counter > 0 — read BEFORE any teardown
-    ## write (killCgroupLeaf/removeCgroupLeafBounded), so a real OOM fact
-    ## is never raced by the leaf's own removal.
-    try:
-      for line in lines(leafPath / "memory.events"):
-        if line.startsWith("oom_kill "):
-          try: return parseInt(line.split(' ')[1].strip()) > 0
-          except ValueError: return false
-    except CatchableError:
-      discard
-    false
-
-  proc removeCgroupLeafBounded(leafPath: string): bool =
-    ## Never leak leaves (rfc-0007 B3), but NEVER an unbounded blocking
-    ## wait in the event-loop path either (the B1 lesson). A `cgroup.kill`
-    ## target's cgroup membership drops at the kernel's `do_exit()` —
-    ## BEFORE its parent ever wait()s it (not dependent on THIS event
-    ## loop's own future orphan-sweep iteration reaping it first, so
-    ## polling here cannot self-deadlock the loop that would otherwise
-    ## have to do that reaping) — so a short bound is safe, mirroring
-    ## `reapBounded`'s identical accepted-bound convention for the exact
-    ## same "SIGKILL is near-instant" reasoning. Gives up (leaving the
-    ## leaf, a rare pathological case) only past the budget.
-    const budgetMs = 300
-    const stepMs = 5
-    var waited = 0
-    while waited < budgetMs:
-      if posix.rmdir(leafPath.cstring) == 0: return true
-      os.sleep(stepMs)
-      waited += stepMs
-    false
 
 # ---------------------------------------------------------------------------
 # PosixCore — the shared state: child registry, self-pipe, act ledger.
@@ -751,19 +467,6 @@ proc applyLimitsChildSide(limits: Limits; achieved: var array[nLimits, uint8]) =
 # spawn — the fork/exec child window, generalized from ChildSpec.
 # ---------------------------------------------------------------------------
 
-proc cachedCapabilities*(): Capabilities
-  ## Forward declaration — the real probe/memo lives in the capabilities
-  ## section further below (this proc predates that section textually so
-  ## `spawnChild`/`reapCore` can both consult it — spawnChild for the
-  ## per-spawn cgroup-leaf decision (B3), reapCore for the achieved
-  ## killDomain).
-
-proc reapBounded(pid: Pid)
-  ## Forward declaration — spawnChild's r11 pre-exec-stall timeout path
-  ## (below) needs this early too, same reason `cachedCapabilities` is
-  ## forward-declared just above: the real proc (full doc comment) lives
-  ## with `discoverAndReapEscapees`/`reapCore` further down.
-
 const statusPipeDeadlineMs = 10_000
   ## rfc-0007 code-review r11: the TOTAL budget `readPipeBounded` (below)
   ## gets for spawnChild's two status-pipe reads. Generous relative to
@@ -828,6 +531,32 @@ proc readPipeBounded*(fd: cint; buf: var openArray[uint8]; deadlineMs: int):
       elif n == 0: return         # EOF — child died before writing
       elif errno == EINTR: continue
       else: return                # genuine read error
+
+proc reapBounded(pid: Pid) =
+  ## B1 regression fix, part A: a SIGKILL target becomes a reapable zombie
+  ## essentially immediately, but `discoverAndReapEscapees` (below) runs ON
+  ## the single-threaded event-loop thread — an unbounded blocking `wait4(
+  ## pid, 0)` here would starve the WHOLE loop (self-pipe/SIGINT wakeup
+  ## included) on any target that does not die promptly, turning a 6s
+  ## interrupt into a full wall-clock timeout downstream. Bounded,
+  ## non-blocking WNOHANG polling instead: try for up to ~300ms total (5ms
+  ## between tries), then give up WITHOUT ever blocking. The run-level
+  ## `sweepAdoptedOrphan` (nextEvent) is the honest fallback home for a
+  ## genuine straggler, not this proc — this bound only guards the
+  ## pathological case. Defined here, ahead of `spawnChild` (its r11
+  ## pre-exec-stall timeout path is the other caller), so neither call site
+  ## needs a forward declaration.
+  const budgetMs = 300
+  const stepMs = 5
+  var waited = 0
+  while waited < budgetMs:
+    var wstatus: cint
+    var ru: posix.Rusage
+    let r = wait4(pid, addr wstatus, WNOHANG, addr ru)
+    if r == pid or r < 0:
+      return   # reaped, or ECHILD (not ours to reap) — either way, done
+    os.sleep(stepMs)
+    waited += stepMs
 
 proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   if spec.argv.len == 0:
@@ -1149,147 +878,11 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
 
 # ---------------------------------------------------------------------------
 # /proc forensics — snapshotTree (kill/reap forensics) and groupRssBytes (the
-# live sampler). Same pgid-scan mechanism, two cadences/shapes (§1 §7):
-# groupRssBytes is memprobe.procGroupRssBytes' algorithm re-homed; A2b wires
-# memprobe/admission to call through the Supervisor instead of duplicating it.
+# live sampler), both thin `PosixCore`-taking wrappers over
+# `procscan.scanProcessGroup` (§1 §7): groupRssBytes is memprobe.
+# procGroupRssBytes' algorithm re-homed; A2b wires memprobe/admission to
+# call through the Supervisor instead of duplicating it.
 # ---------------------------------------------------------------------------
-
-proc parseStatLine*(content: string): tuple[ppid, pgrp: int; comm: string; starttime: int64] =
-  ## /proc/<pid>/stat: "pid (comm) state ppid pgrp ... starttime ...". comm
-  ## may itself contain spaces/parens, so split on the LAST ')' (same
-  ## technique test_pgroup.nim already uses for the same reason). Exported
-  ## (rfc-0007 B1) so its field-counting is unit-testable directly — see
-  ## tests/unit/test_rfc0007_b1_stat_parsing.nim.
-  ##
-  ## Field numbering (man proc(5), 1-indexed): 1 pid, 2 comm, 3 state,
-  ## 4 ppid, 5 pgrp, ..., 22 starttime. The post-')' remainder's tokens
-  ## start at field 3 (state), so token index `k` is field `3 + k`;
-  ## starttime (field 22) is token index 19 — the 20th token after comm.
-  let openIdx = content.find('(')
-  let closeIdx = content.rfind(')')
-  let comm = if openIdx >= 0 and closeIdx > openIdx: content[openIdx + 1 ..< closeIdx]
-             else: ""
-  var ppid = -1
-  var pgrp = -1
-  var starttime = int64(-1)
-  if closeIdx >= 0 and closeIdx + 2 < content.len:
-    let rest = content[closeIdx + 2 .. ^1]
-    let parts = rest.splitWhitespace()
-    if parts.len >= 3:
-      try: ppid = parseInt(parts[1])
-      except ValueError: discard
-      try: pgrp = parseInt(parts[2])
-      except ValueError: discard
-    if parts.len >= 20:
-      try: starttime = parseBiggestInt(parts[19])
-      except ValueError: discard
-  (ppid, pgrp, comm, starttime)
-
-when defined(macosx):
-  proc readVmRssBytes(pid: int): int64 =
-    ## rfc-0007 C1b: macOS has no `/proc` — `proc_pidinfo(PROC_PIDTASKINFO)`
-    ## is the libproc equivalent. `pti_resident_size` is already BYTES
-    ## (unlike /proc's kB), so no *1024 here. A denied/vanished pid returns
-    ## a short/failed read — 0, honest, same as a zombie's VmRSS on Linux,
-    ## never fabricated.
-    ##
-    ## A generously-sized raw buffer (never `sizeof(ProcTaskInfo)`): the
-    ## payload types are `incompleteStruct`, so Nim's `sizeof` reflects only
-    ## the FIELDS declared above, not the real C struct — passing that as
-    ## `buffersize` under-sizes the buffer and `proc_pidinfo` rejects it
-    ## (ENOSPC), which is exactly what left this empty on the first macos CI
-    ## run. The kernel writes `sizeof(struct proc_taskinfo)` bytes and
-    ## returns that count (> 0); field OFFSETS still come from the C header
-    ## via the cast, which is all `incompleteStruct` was ever needed for.
-    var buf: array[512, byte]
-    let r = proc_pidinfo(pid.cint, PROC_PIDTASKINFO, 0'u64, addr buf[0],
-                         cint(buf.len))
-    if r <= 0: return 0'i64
-    int64(cast[ptr ProcTaskInfo](addr buf[0]).pti_resident_size)
-else:
-  proc readVmRssBytes(pid: int): int64 =
-    try:
-      let content = readFile("/proc/" & $pid & "/status")
-      for line in content.splitLines():
-        if line.startsWith("VmRSS:"):
-          let parts = line.splitWhitespace()
-          if parts.len >= 2:
-            return int64(parseBiggestInt(parts[1])) * 1024
-    except CatchableError:
-      discard
-    0'i64
-
-when defined(macosx):
-  proc walkProcTable(): seq[ProcStatInfo] =
-    ## rfc-0007 C1b: the libproc equivalent of the /proc walk below.
-    ## `proc_listallpids(nil, 0)` returns a sizing hint (a pid count on some
-    ## releases, a byte size on others); allocating `hint + 64` int32 slots
-    ## over-allocates safely under BOTH readings (bytes ⇒ far more slack).
-    ## The real call returns BYTES written, so `div sizeof(int32)` yields
-    ## the live pid count — the documented two-call libproc idiom.
-    ## `pbi_pgid` is exactly the process group id `scanProcessGroup(pgid)`'s
-    ## `info.pgrp == pgid` filter needs — no change required there or in
-    ## `scanProcessGroup`/`snapshotTreeCore`/`groupRssBytesCore`, which all
-    ## fold over this proc's output as before.
-    ##
-    ## Each `proc_pidinfo` reads into a generously-sized raw buffer, NOT a
-    ## `var ProcBsdInfo` sized by `sizeof` — the type is `incompleteStruct`
-    ## so Nim's `sizeof` counts only the declared fields (~a third of the
-    ## real C struct), under-sizing the buffer and drawing an ENOSPC that
-    ## skipped every pid on the first macos CI run (empty tree, zero RSS).
-    ## The kernel returns `sizeof(struct proc_bsdinfo)` (> 0); field offsets
-    ## come from the C header through the cast.
-    result = @[]
-    let want = proc_listallpids(nil, 0.cint)
-    if want <= 0: return
-    let cap = int(want) + 64   # over-allocate: safe whether `want` is count or bytes
-    var pids = newSeq[int32](cap)
-    let gotBytes = proc_listallpids(addr pids[0], cint(cap * sizeof(int32)))
-    if gotBytes <= 0: return
-    let n = int(gotBytes div cint(sizeof(int32)))
-    var buf: array[512, byte]
-    for i in 0 ..< n:
-      let pid = pids[i]
-      if pid <= 0: continue
-      let r = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0'u64, addr buf[0],
-                           cint(buf.len))
-      if r <= 0: continue   # vanished/denied — skip, never fabricate
-      let bi = cast[ptr ProcBsdInfo](addr buf[0])
-      let comm = $cast[cstring](addr bi.pbi_comm[0])
-      result.add ProcStatInfo(pid: int(pid), ppid: int(bi.pbi_ppid),
-                              pgrp: int(bi.pbi_pgid), comm: comm,
-                              starttime: int64(bi.pbi_start_tvsec))
-else:
-  proc walkProcTable(): seq[ProcStatInfo] =
-    result = @[]
-    try:
-      for kind, path in walkDir("/proc"):
-        if kind != pcDir: continue
-        var pid: int
-        try: pid = parseInt(path.extractFilename)
-        except ValueError: continue
-        try:
-          let stat = readFile(path / "stat")
-          let (ppid, pgrp, comm, starttime) = parseStatLine(stat)
-          result.add ProcStatInfo(pid: pid, ppid: ppid, pgrp: pgrp, comm: comm,
-                                  starttime: starttime)
-        except CatchableError:
-          discard   # vanished between enumeration and read — skip it
-    except CatchableError:
-      discard         # /proc unreadable — empty snapshot, never fabricated
-
-proc scanProcessGroup*(pgid: Pid): seq[ProcSnapshot] =
-  ## Walk /proc, keep every pid whose pgrp == pgid. pgid-only tier — a
-  ## setsid escape is invisible (§3); on the (non-Linux) tier where B1's
-  ## subreaper mechanism never engages, `reapCore` reports
-  ## `tree = treeObservationFor(kdsProcessGroup)` (always `toUnobservable`)
-  ## regardless of what a given scan finds — observability is a property
-  ## of the mechanism, not the scan.
-  result = @[]
-  for info in walkProcTable():
-    if info.pgrp == int(pgid):
-      result.add ProcSnapshot(pid: info.pid, ppid: info.ppid, command: info.comm,
-                               rssBytes: readVmRssBytes(info.pid))
 
 proc snapshotTreeCore*(core: PosixCore; id: ChildId): seq[ProcSnapshot] =
   let idx = int32(id)
@@ -1329,9 +922,9 @@ proc decodeExit(wstatus: cint): Exit =
 proc maxRssBytesFrom*(raw: int64; darwin: bool): int64 =
   ## `ru_maxrss`'s unit is NOT portable across BSD-derived rusage
   ## implementations: Linux reports KILOBYTES (scale by 1024 for bytes);
-  ## Darwin reports BYTES already — the same convention `readVmRssBytes`'s
-  ## libproc arm above documents for `pti_resident_size`. Scaling
-  ## unconditionally by 1024 inflated every macOS `wait4` reap's
+  ## Darwin reports BYTES already — the same convention `procscan.
+  ## readVmRssBytes`'s libproc arm documents for `pti_resident_size`.
+  ## Scaling unconditionally by 1024 inflated every macOS `wait4` reap's
   ## maxRssBytes by 1024x (runner.nim/resultjson.nim/ledger.nim all carry
   ## it downstream as a vouched "wait4" observation). Pure and exported so
   ## BOTH platform arms are pinned by a unit test on any host — see
@@ -1621,14 +1214,15 @@ proc requireLive(core: PosixCore; id: ChildId): int32 =
 proc killSnapshotFor*(pid: Pid; cgroupLeaf: string): seq[ProcSnapshot] =
   ## rfc-0007 r12: a cgroup-tier slot's evidence snapshot must come from the
   ## SAME stronger mechanism the tier vouches for elsewhere — `reapCore`'s
-  ## escapees/tree accounting already reads `cgroupLeafSurvivors`, never
-  ## the pgid-only scan, for exactly this reason (see that call site's
-  ## doc comment). Before this fix, `requestStopCore`/`forceKillCore` used
-  ## `scanProcessGroup(entry.pid)` UNCONDITIONALLY, even when a cgroup leaf
-  ## existed: a setsid escapee the tier CAN see (`cgroupLeafSurvivors`
-  ## lists it, `cgroup.kill` kills it, reap stamps `tree=toComplete`) was
-  ## silently absent from `killSnapshot` — internally inconsistent
-  ## evidence on exactly the tier that vouches completeness.
+  ## escapees/tree accounting already reads `cgroup.cgroupLeafSurvivors`,
+  ## never the pgid-only scan, for exactly this reason (see that call
+  ## site's doc comment). Before this fix, `requestStopCore`/
+  ## `forceKillCore` used `scanProcessGroup(entry.pid)` UNCONDITIONALLY,
+  ## even when a cgroup leaf existed: a setsid escapee the tier CAN see
+  ## (`cgroupLeafSurvivors` lists it, `cgroup.kill` kills it, reap stamps
+  ## `tree=toComplete`) was silently absent from `killSnapshot` —
+  ## internally inconsistent evidence on exactly the tier that vouches
+  ## completeness.
   ##
   ## Falls back to the pgid-only scan when the leaf read comes back empty:
   ## `cgroupLeafSurvivors` has no separate "the read genuinely failed" vs.
@@ -1725,29 +1319,6 @@ proc forceKillCore*(core: var PosixCore; id: ChildId) =
 # reapCore's owning-slot discovery of LIVE + reparented descendants, killed
 # via pidfd_open + a starttime identity check (pid-reuse-safe), then reaped.
 # ---------------------------------------------------------------------------
-
-proc reapBounded(pid: Pid) =
-  ## B1 regression fix, part A: a SIGKILL target becomes a reapable zombie
-  ## essentially immediately, but `discoverAndReapEscapees` runs ON the
-  ## single-threaded event-loop thread — an unbounded blocking `wait4(pid,
-  ## 0)` here would starve the WHOLE loop (self-pipe/SIGINT wakeup included)
-  ## on any target that does not die promptly, turning a 6s interrupt into
-  ## a full wall-clock timeout downstream. Bounded, non-blocking WNOHANG
-  ## polling instead: try for up to ~300ms total (5ms between tries), then
-  ## give up WITHOUT ever blocking. The run-level `sweepAdoptedOrphan`
-  ## (nextEvent) is the honest fallback home for a genuine straggler, not
-  ## this proc — this bound only guards the pathological case.
-  const budgetMs = 300
-  const stepMs = 5
-  var waited = 0
-  while waited < budgetMs:
-    var wstatus: cint
-    var ru: posix.Rusage
-    let r = wait4(pid, addr wstatus, WNOHANG, addr ru)
-    if r == pid or r < 0:
-      return   # reaped, or ECHILD (not ours to reap) — either way, done
-    os.sleep(stepMs)
-    waited += stepMs
 
 when defined(linux):
   proc discoverAndReapEscapees(core: PosixCore; excludeIdx: int32; pgid: Pid;
@@ -1893,7 +1464,7 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
       # rfc-0007 B3: escapee/tree/memory accounting for a cgroup-tier slot
       # comes from the cgroup itself, not the /proc pgid/ppid heuristics
       # `discoverAndReapEscapees` uses for the subreaper tier — see
-      # `cgroupLeafSurvivors`'s doc comment for why this needs no
+      # `cgroup.cgroupLeafSurvivors`'s doc comment for why this needs no
       # `runPhase` guard (leaf-scoped membership cannot cross-attribute
       # between slots the way a global pgid/ppid scan can). Read BEFORE
       # any teardown write below — `memory.events` must not race the
@@ -1974,179 +1545,35 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
   core.children[idx] = ChildEntry(state: csReaped, pidfd: -1)   # tombstone: pid dropped
   dec core.liveCount
 
-# ---------------------------------------------------------------------------
-# capabilities — rfc-0007 A7 (§4): EVERY field below is a REAL, live probe
-# (attempt the mechanism, verify it worked; never an assumed/hardcoded
-# literal) — pidfd/subreaper/cgroup are Linux-only kernel features (prctl(2)
-# and pidfd_open(2) do not exist on Darwin), so they are `when defined(linux)`
-# gated; this same file is also today's macOS backend (§1 module-layout
-# comment: darwin.nim re-exports posix.nim's Supervisor, which embeds
-# PosixCore), and an unconditional importc of a Linux-only syscall constant
-# would fail `nim check --os:macosx` outright, not just report false at
-# runtime. flock/wait4 are genuinely POSIX-portable (both probed for real on
-# any posix target this file backs). kqueue (rfc-0007 C1b) is a REAL probe
-# here too, `when defined(macosx)` gated the same way — this module is
-# darwin.nim's mechanism, not a separate claim it makes itself.
-# jobObjectNesting/ctrlBreakDeliverable stay windows.nim's own fields
-# (Stage D) — always false here, never this module's claim to make.
-#
-# Probed exactly once per process (`cachedCapabilities`, ccprobe/nimprobe's
-# `cachedX` idiom) — every real probe below does actual I/O (fork+wait4,
-# flock a tempfile, mkdir+write under /sys/fs/cgroup) so re-running it on
-# every `capabilities()` call would be wasteful, not merely un-idiomatic.
-# ---------------------------------------------------------------------------
-
-when defined(linux):
-  # cgroup v2 delegation (§4): "mkdir a leaf + write cgroup.procs" is the
-  # RFC's own recipe, tried on THIS process (moved back to its original
-  # cgroup and the leaf removed afterward, on every path). A delegated
-  # 5.15 LTS host must probe green for delegation and red for the files it
-  # lacks — cgroup.kill/memory.peak are only even CHECKED inside a leaf
-  # that delegation itself proved writable; never probed independently
-  # (never "fail per-file at spawn time" — §4).
-  #
-  # `cgroupSiblingParent()` (defined above, ahead of spawnChild) is the
-  # SAME topology decision B3's real per-spawn leaf placement uses — see
-  # its doc comment for the full "why a sibling, never a child of `base`"
-  # reasoning, empirically verified against a real cgroup-v2 host.
-  proc probeCgroupV2(): tuple[delegation, kill, memoryPeak: bool] =
-    result = (delegation: false, kill: false, memoryPeak: false)
-    # Captured BEFORE the move below (moving into `leaf` changes what
-    # `ownCgroupV2Path()` would return) — this is where "move back" must
-    # restore this process to.
-    let base = "/sys/fs/cgroup" & ownCgroupV2Path()
-    let parent = cgroupSiblingParent()
-    if parent.len == 0:
-      return   # at the cgroupfs root, or /proc/self/cgroup unreadable
-    let leaf = parent / ("crisol-probe-" & $getpid())
-    try:
-      createDir(leaf)
-    except CatchableError:
-      return   # not writable here (e.g. rootless podman: read-only cgroupfs)
-    try:
-      writeFile(leaf / "cgroup.procs", $getpid() & "\n")
-      result.delegation = true
-      # rfc-0007 wiring-audit W1: the real file-existence probe, THEN the
-      # env override forced negative — never the reverse order (a real
-      # probe that never ran would make `forceNoCgroupKillRequested`
-      # meaningless as an escape hatch for a host where the file exists
-      # but is known-buggy; this order is what makes it a real override,
-      # not merely a fallback default).
-      result.kill = fileExists(leaf / "cgroup.kill") and not forceNoCgroupKillRequested()
-      result.memoryPeak = fileExists(leaf / "memory.peak")
-    except CatchableError:
-      discard   # mkdir succeeded but the move failed — honestly not delegated
-    try: writeFile(base / "cgroup.procs", $getpid() & "\n")   # move back FIRST —
-    except CatchableError: discard                             # a non-empty
-    try: removeDir(leaf)                                       # cgroup can't rmdir
-    except CatchableError: discard
-else:
-  proc probeCgroupV2(): tuple[delegation, kill, memoryPeak: bool] =
-    (delegation: false, kill: false, memoryPeak: false)
-
-# flock(2) is BSD/Linux, not POSIX, and absent from std/posix — same
-# duplicate-importc idiom lock.nim already uses (safe: no C definition is
-# emitted, only a reference through the header).
-proc c_flock(fd: cint; operation: cint): cint {.importc: "flock",
-                                                header: "<sys/file.h>".}
-var LOCK_EX {.importc, header: "<sys/file.h>".}: cint
-var LOCK_UN {.importc, header: "<sys/file.h>".}: cint
-var LOCK_NB {.importc, header: "<sys/file.h>".}: cint
-
-proc probeFlock(): bool =
-  ## rfc-0007 code-review r9: the probe file lives at an UNPREDICTABLE name,
-  ## opened via `ioutils.exclusiveCreate` (`O_CREAT|O_EXCL|O_NOFOLLOW`) —
-  ## never the old `crisol-flock-probe-<pid>` FIXED name opened with Nim's
-  ## plain `open(path, fmWrite)` (`O_CREAT|O_TRUNC`, no `O_EXCL`/
-  ## `O_NOFOLLOW`). A name predictable from the pid alone let a local
-  ## attacker in shared `/tmp` pre-plant a symlink at that exact path and
-  ## have it silently FOLLOWED and TRUNCATED as the crisol user — blocked
-  ## on default Linux by `fs.protected_symlinks`, but NOT on macOS
-  ## (`TMPDIR=/tmp` with a stripped CI/container env) or a hardened-off
-  ## Linux. This matches the repo's own posture everywhere else a
-  ## predictable-name attack matters (`ioutils.exclusiveCreate`/
-  ## `atomicPublish` already use `O_EXCL` exactly against a planted-symlink
-  ## attacker; this probe was the one holdout still using a raw `open`).
-  ##
-  ## The random suffix (`ioutils.readRandomBytes`, `/dev/urandom`) makes
-  ## the name unguessable in advance; `O_EXCL`/`O_NOFOLLOW` then make ANY
-  ## pre-existing entry at that exact name — planted, or a
-  ## vanishingly-unlikely genuine collision — fail CLOSED (probe returns
-  ## `false`) rather than following/truncating it. No retry-with-a-
-  ## different-name on collision: this is best-effort capability
-  ## detection, not correctness-critical machinery, so a false negative on
-  ## an astronomically unlikely 16-random-byte collision is an acceptable,
-  ## simpler failure mode than a retry loop.
-  try:
-    let randBytes = readRandomBytes(16)
-    if randBytes.len == 0:
-      return false   # /dev/urandom unavailable — fail closed, never fall
-                       # back to a predictable name
-    var suffix = newStringOfCap(32)
-    for b in randBytes: suffix.add toHex(b)
-    let path = getTempDir() / ("crisol-flock-probe-" & $getpid() & "-" & suffix)
-    let (fd, _, _) = exclusiveCreate(path, noFollow = true)
-    if fd < 0: return false
-    defer:
-      closeFd(fd)
-      try: removeFile(path)
-      except CatchableError: discard
-    if c_flock(fd, LOCK_EX or LOCK_NB) != 0: return false
-    discard c_flock(fd, LOCK_UN)
-    true
-  except CatchableError:
-    false
-
-proc probeWait4Rusage(): bool =
-  ## A throwaway fork+wait4 (not "wait4 is called elsewhere in this module,
-  ## therefore assume true") — some sandboxes filter wait4/rusage collection
-  ## via seccomp; this actually exercises the syscall once and checks the
-  ## real return value.
-  let pid = fork()
-  if pid == 0:
-    exitnow(0)   # async-signal-safe: no Nim runtime after fork in the child
-  elif pid > 0:
-    var status: cint
-    var ru: posix.Rusage
-    let r = wait4(pid, addr status, 0.cint, addr ru)
-    r == pid
-  else:
-    false
-
-proc probeCapabilities*(): Capabilities =
-  ## The raw, seam-free probe — real I/O, freely callable (mirrors
-  ## `ccprobe.ccVersion` / `nimprobe.nimFingerprint`: the pure-ish real
-  ## probe stays exported and un-memoised; `cachedCapabilities` below is
-  ## the memoised wrapper every production call site actually uses).
-  let cg = probeCgroupV2()
-  Capabilities(
-    pidfd: probePidfd(),
-    subreaper: probeSubreaper(),
-    cgroupDelegation: cg.delegation,
-    cgroupKill: cg.kill,
-    memoryPeak: cg.memoryPeak,
-    kqueue: (when defined(macosx): probeKqueue() else: false),
-                                # rfc-0007 C1b: THIS module's producer now —
-                                # darwin.nim re-exports posix.nim's Supervisor
-                                # unchanged (§1 module-layout comment); a real
-                                # probe, not a stub, exactly like pidfd/
-                                # subreaper/cgroup above (linux.nim doesn't
-                                # probe its own caps either — posixcore does).
-    jobObjectNesting: false,    # windows.nim's field (Stage D), never this module's
-    ctrlBreakDeliverable: false,# windows.nim's field (Stage D), never this module's
-    flock: probeFlock(),
-    wait4Rusage: probeWait4Rusage(),
-  )
-
-var capabilitiesMemo: Option[Capabilities] = none(Capabilities)
-
-proc cachedCapabilities*(): Capabilities =
-  ## Probed exactly once per process; every later caller — Supervisor-
-  ## backed (`capabilities(sv)`) or not (the plan/list CLI path, which
-  ## never spawns anything) — reads the SAME memoised value (§4).
-  if capabilitiesMemo.isNone:
-    capabilitiesMemo = some(probeCapabilities())
-  capabilitiesMemo.get
-
 proc capabilitiesCore*(core: PosixCore): Capabilities =
   cachedCapabilities()
+
+# ---------------------------------------------------------------------------
+# Re-exports (rfc-0007 code-review r27): the public contract surface this
+# file backs — `process/posix.nim`'s Supervisor delegations, and every test
+# that drives `PosixCore` directly (tests/unit/test_rfc0007_*, tests/
+# integration/test_rfc0007_b3_cgroup.nim) — must keep compiling unchanged
+# against `import crisol/process/posixcore` alone, even though the procs
+# below now live in `process/procscan.nim`/`process/cgroup.nim`/
+# `process/caps.nim`. Named re-exports only (never a whole-module `export`)
+# — exactly the symbols something outside `process/` actually reaches for
+# through this module; every other cross-module use among posixcore/
+# procscan/cgroup/caps is a plain unqualified call via the ordinary
+# `import` above, no re-export needed for that.
+# ---------------------------------------------------------------------------
+
+export procscan.parseStatLine
+export procscan.scanProcessGroup
+when defined(linux):
+  # cgroup v2 does not exist on Darwin — every proc below is itself
+  # `when defined(linux)`-gated in process/cgroup.nim, so re-exporting them
+  # unconditionally would fail `nim check --os:macosx` outright (cannot
+  # export a symbol that was never declared on that target).
+  export cgroup.cgroupSiblingParent
+  export cgroup.cgroupSlotLeafName
+  export cgroup.createCgroupLeaf
+  export cgroup.killCgroupLeaf
+  export cgroup.cgroupLeafSurvivors
+export caps.cachedCapabilities
+export caps.probeCapabilities
+export caps.probeCgroupV2
