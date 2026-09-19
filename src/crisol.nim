@@ -435,6 +435,35 @@ proc writeWarnings(ws: seq[ConfigWarning]) =
   for w in ws:
     writeStderr("warning: " & w.message)
 
+proc parseIntWithFloor(raw, flagName: string; floor: int): Option[int] =
+  ## r53 (code-review): the parse-int-with-floor body `runMain`'s flag
+  ## dispatch below used to repeat, verbatim modulo the flag name and floor
+  ## value, at ~10 call sites (`--jobs`, `--timeout`, `--retries`,
+  ## `--rlimit-nofile`/`-cpu`/`-as`/`-fsize`/`-core`, `--limit-memory`,
+  ## `--verify-cache-pct`) plus the `-j`/`-t` short-flag arms that
+  ## duplicated the `--jobs`/`--timeout` long-flag bodies again.
+  ##
+  ## Both stderr messages below are BYTE-IDENTICAL to what every call site
+  ## wrote inline before this extraction (`flagName` is always the LONG
+  ## flag name, even from a short-flag arm -- e.g. `-j` still reports
+  ## "--jobs", matching the pre-extraction `of "j":` body exactly).
+  ##
+  ## Returns `none(int)` on failure -- the caller has ALREADY written the
+  ## error to stderr and must `return ExitEnvironment` immediately. The
+  ## caller is responsible for the "no value supplied at all" (`raw == ""`)
+  ## case FIRST, before calling this -- that check's own message differs
+  ## per call site (most print `usage()`; `--verify-cache-pct` prints its
+  ## own sentence), so it stays out-of-band rather than folded in here.
+  try:
+    let v = parseInt(raw)
+    if v < floor:
+      stderr.write("crisol: --" & flagName & " must be >= " & $floor & "\n")
+      return none(int)
+    some(v)
+  except ValueError:
+    stderr.write("crisol: --" & flagName & ": invalid integer '" & raw & "'\n")
+    none(int)
+
 # ---------------------------------------------------------------------------
 # runMain — testable entry; returns the process exit code
 # ---------------------------------------------------------------------------
@@ -828,24 +857,16 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         let raw = nextVal("jobs")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          jobs = parseInt(raw)
-          if jobs < 1:
-            stderr.write("crisol: --jobs must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --jobs: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "jobs", 1)
+        if parsed.isNone: return ExitEnvironment
+        jobs = parsed.get
       of "timeout":
         let raw = nextVal("timeout")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          timeout = parseInt(raw)
-          if timeout < 1:
-            stderr.write("crisol: --timeout must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --timeout: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "timeout", 1)
+        if parsed.isNone: return ExitEnvironment
+        timeout = parsed.get
       of "fail-fast":
         failFast = true
       of "dry-run":
@@ -872,13 +893,9 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         let raw = nextVal("retries")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          retries = parseInt(raw)
-          if retries < 0:
-            stderr.write("crisol: --retries must be >= 0\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --retries: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "retries", 0)
+        if parsed.isNone: return ExitEnvironment
+        retries = parsed.get
       of "fail-on-flaky":
         failOnFlaky = true
       of "strict-hygiene":
@@ -938,68 +955,44 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         let raw = nextVal("rlimit-nofile")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          rlimitNofile = parseInt(raw)
-          if rlimitNofile < 1:
-            stderr.write("crisol: --rlimit-nofile must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --rlimit-nofile: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "rlimit-nofile", 1)
+        if parsed.isNone: return ExitEnvironment
+        rlimitNofile = parsed.get
       of "rlimit-cpu":
         let raw = nextVal("rlimit-cpu")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          rlimitCpu = parseInt(raw)
-          if rlimitCpu < 1:
-            stderr.write("crisol: --rlimit-cpu must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --rlimit-cpu: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "rlimit-cpu", 1)
+        if parsed.isNone: return ExitEnvironment
+        rlimitCpu = parsed.get
       of "rlimit-as":
         let raw = nextVal("rlimit-as")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          rlimitAs = parseInt(raw)
-          if rlimitAs < 1:
-            stderr.write("crisol: --rlimit-as must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --rlimit-as: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "rlimit-as", 1)
+        if parsed.isNone: return ExitEnvironment
+        rlimitAs = parsed.get
       of "rlimit-fsize":
         let raw = nextVal("rlimit-fsize")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          rlimitFsize = parseInt(raw)
-          if rlimitFsize < 1:
-            stderr.write("crisol: --rlimit-fsize must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --rlimit-fsize: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "rlimit-fsize", 1)
+        if parsed.isNone: return ExitEnvironment
+        rlimitFsize = parsed.get
       of "rlimit-core":
         let raw = nextVal("rlimit-core")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          rlimitCore = parseInt(raw)
-          if rlimitCore < 0:
-            stderr.write("crisol: --rlimit-core must be >= 0\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --rlimit-core: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "rlimit-core", 0)
+        if parsed.isNone: return ExitEnvironment
+        rlimitCore = parsed.get
       of "limit-memory":
         let raw = nextVal("limit-memory")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          limitMemory = parseInt(raw)
-          if limitMemory < 1:
-            stderr.write("crisol: --limit-memory must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --limit-memory: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "limit-memory", 1)
+        if parsed.isNone: return ExitEnvironment
+        limitMemory = parsed.get
       of "verify-cache":
         verifyCache = true
       of "verify-cache-pct":
@@ -1007,13 +1000,9 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         if raw == "":
           stderr.write("crisol: --verify-cache-pct requires an integer value\n")
           return ExitEnvironment
-        try:
-          verifyCachePctFlag = parseInt(raw)
-          if verifyCachePctFlag < 1:
-            stderr.write("crisol: --verify-cache-pct must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --verify-cache-pct: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "verify-cache-pct", 1)
+        if parsed.isNone: return ExitEnvironment
+        verifyCachePctFlag = parsed.get
       of "verify-cache-seed":
         let raw = nextVal("verify-cache-seed")
         if raw == "":
@@ -1084,27 +1073,23 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
         return ExitEnvironment
       case key
       of "j":
+        # r53 (code-review): shares `parseIntWithFloor` with the `--jobs`
+        # long-flag arm above -- only the value-fetch (`nextVal2`, whose
+        # own "-j requires a value" message differs from `nextVal`'s "--jobs
+        # requires a value") stays duplicated; the floor+parse body does not.
         let raw = nextVal2("j")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          jobs = parseInt(raw)
-          if jobs < 1:
-            stderr.write("crisol: --jobs must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --jobs: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "jobs", 1)
+        if parsed.isNone: return ExitEnvironment
+        jobs = parsed.get
       of "t":
         let raw = nextVal2("t")
         if raw == "":
           stderr.write(usage()); return ExitEnvironment
-        try:
-          timeout = parseInt(raw)
-          if timeout < 1:
-            stderr.write("crisol: --timeout must be >= 1\n"); return ExitEnvironment
-        except ValueError:
-          stderr.write("crisol: --timeout: invalid integer '" & raw & "'\n")
-          return ExitEnvironment
+        let parsed = parseIntWithFloor(raw, "timeout", 1)
+        if parsed.isNone: return ExitEnvironment
+        timeout = parsed.get
       else:
         stderr.write("crisol: unknown flag '-" & key & "'\n\n")
         stderr.write(usage())
@@ -1395,10 +1380,18 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
                    junitPath & "': " & e.msg)
 
   # RFC-0005 B3c: --verify-cache-strict — a divergence set is a CI-gate
-  # failure. The pass never runs on a structural/interrupted return (both
-  # already returned above), so rr.exitCode here is always the plain 0/1
-  # from types.exitCode; strict only ever STRENGTHENS 0 -> 1, never masks
-  # an already-nonzero code from an unrelated entrypoint failure.
+  # failure. r42 (code-review): the comment here used to claim "the pass
+  # never runs on a structural/interrupted return (both already returned
+  # above)" -- stale since rfc-0007 A1e-ii retired the `rsInterrupted` early
+  # return a few dozen lines up (see that retirement's own comment, above):
+  # only `rsStructural` still exits before this point; an interrupted run
+  # falls through the SAME reporting path as a normal one and reaches this
+  # check too, with `rr.exitCode` already carrying its OWN 128+n signal
+  # (RunReport.exitCode's doc) rather than the plain 0/1 an `rsOk` run
+  # reports. `return ExitTestFailure` below is UNCONDITIONAL on a
+  # divergence, regardless of what `rr.exitCode` was about to report — so
+  # on an interrupted run with divergences, strict mode overrides the 128+n
+  # signal with plain 1, same as it overrides an ordinary 0.
   if opts.verifyCache.strict and rr.verifyDivergences.len > 0:
     return ExitTestFailure
 

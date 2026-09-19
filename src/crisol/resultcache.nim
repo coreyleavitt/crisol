@@ -196,6 +196,24 @@ proc keyFilePathAt(root: string; key: SoundnessKey): string {.inline.} =
 # Payload (de)serialization — the canonical form the checksum is taken over
 # ---------------------------------------------------------------------------
 
+proc recordStatusToString*(s: RecordStatus): string =
+  ## r37 (code-review): explicit case-arm string table for the wire -- the
+  ## house rule (see `types.outcomeString`'s own precedent) is that no enum
+  ## ever reaches a persisted/wired string via a bare `$enum` stringify. A
+  ## future `RecordStatus` rename (e.g. reordering or renaming an enum
+  ## value) would otherwise silently reserialize every existing cache entry
+  ## under a NEW string with no format-version bump to signal the break --
+  ## this proc instead fails to COMPILE (a missing case arm) the moment
+  ## `RecordStatus` changes shape, forcing the rename to be deliberate here.
+  ##
+  ## Byte-identical to today's `$s` output (`parseStatus` below already
+  ## expects exactly these three literals) -- so this is NOT a format bump;
+  ## every entry ever written under the old `$s` codec still round-trips.
+  case s
+  of rsPass: "rsPass"
+  of rsFail: "rsFail"
+  of rsSkip: "rsSkip"
+
 proc payloadToJson*(res: CachedResult): JsonNode =
   ## Serialize ONLY the payload (no header, no checksum).  The checksum is an
   ## FNV-1a fold over `$payloadToJson(res)`, so this must be deterministic.
@@ -208,7 +226,7 @@ proc payloadToJson*(res: CachedResult): JsonNode =
   for r in res.records:
     let recNode = newJObject()
     recNode["name"]       = newJString(r.name)
-    recNode["status"]     = newJString($r.status)
+    recNode["status"]     = newJString(recordStatusToString(r.status))
     recNode["durationUs"] = newJInt(r.durationUs)
     if r.msg.isSome:
       recNode["msg"] = newJString(r.msg.get)

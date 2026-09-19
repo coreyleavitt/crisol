@@ -130,6 +130,19 @@ proc mergeRlimitOverrides*(base, overrides: RlimitOverrides): RlimitOverrides =
   for _, r, o in fieldPairs(result, overrides):
     if o.isSome: r = o
 
+proc hasAnyOverride*(r: RlimitOverrides): bool =
+  ## r34 (code-review): true iff at least one field of `r` is `some` --
+  ## i.e. the caller actually asked for an rlimit override. Generic over
+  ## every `RlimitOverrides` field via `fieldPairs`, same rationale as
+  ## `mergeRlimitOverrides` above: a new rlimit kind added to the bundle
+  ## needs no new line here. Used at `resolveSandbox`'s one production call
+  ## site (api.nim) to detect the "override requested but --hermetic none
+  ## drops it on the floor" case and warn loudly instead of silently
+  ## no-op'ing.
+  for _, v in fieldPairs(r):
+    if v.isSome: return true
+  false
+
 proc evidenceSatisfies*(spec: SandboxSpec; ev: ptypes.Evidence): bool =
   ## Cache gate (rfc-0007 A6a, §6): named guarantees, never enum ordinals.
   ## Replaces the old ``isFullyAchieved`` outright — ``Evidence`` (not just
@@ -812,8 +825,15 @@ type
     keyDiff*:        seq[KeyDiff]  ## RFC-0005 B1c: populated ONLY on a genuine cache-miss
                                    ## decision (cacheDecision in the "ran live due to a miss"
                                    ## set -- cdmStored/cdmKeyMiss/cdmHermeticityDeg/cdmFlaky/
-                                   ## cdmClosureUnrecorded/cdmRecomputeMiss) when the path-keyed
-                                   ## local-fs sidecar (B1b) had a prior record to diff against.
+                                   ## cdmClosureUnrecorded) when the path-keyed local-fs sidecar
+                                   ## (B1b) had a prior record to diff against. r39 (code-review):
+                                   ## cdmRecomputeMiss is deliberately EXCLUDED from that set --
+                                   ## the sidecar's `explain` is only ever populated on the seam's
+                                   ## `load` MISS branch (cachedispatch.realSeams: `if
+                                   ## result.hit.isNone and rt.localRoot.len > 0`), and
+                                   ## cdmRecomputeMiss is only ever reached from `consultReal`
+                                   ## after `l.hit.isSome` -- structurally, a cdmRecomputeMiss
+                                   ## result's `keyDiff` is always empty, never a genuine diff.
                                    ## Threaded verbatim from PlanLookup.explain (cachedispatch.
                                    ## lookupAtPlan) through the runner; empty for a hit, for a
                                    ## not-consulted result, or when no prior sidecar record

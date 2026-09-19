@@ -491,8 +491,10 @@ proc lookupAtPlan*(
   ## binary exist: see `consultPostCompile`, the runner's own caller.
   ##
   ## On an eligible entrypoint:
-  ##   - policy disabled (--no-cache) OR group cacheable #false
-  ##                                      → cdmPolicyDisabled, run live.
+  ##   - policy disabled (--no-cache)     → cdmPolicyDisabled, run live.
+  ##   - group cacheable #false           → cdmGroupOptOut, run live. (r40:
+  ##     this arm previously read "cdmPolicyDisabled" here too -- stale;
+  ##     `resolveCacheable`'s M8 split (below) reports these two distinctly.)
   ##   - cache hit, recomputed outcome oPassed → edCached, synthesize, cdmHit.
   ##   - cache hit, recomputed outcome NOT oPassed → cdmRecomputeMiss, run live.
   ##   - cache miss                       → cdmKeyMiss, run live.

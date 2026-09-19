@@ -28,8 +28,11 @@
 ##   loadLastRun*(config: Config): tuple[found: bool; failed: HashSet[tuple[path,group: string]]]
 ##     Effectful: read <projectRoot>/<stateDir>/lastrun.json and return the set
 ##     of (path, group) pairs whose outcome is a failure (not "passed" and not
-##     "noTestsRan" — specifically: "exitNonZero", "compileFailed", "timedOut",
-##     "signaled", "spawnError", "killed", "crashed").
+##     "noTestsRan" — specifically: "exitNonZero", "compileFailed", "spawnError",
+##     "killed", "crashed" — r38 (code-review): "timedOut"/"signaled" REMOVED
+##     from this list; no live Outcome value has produced either wire string
+##     since rfc-0007 A1e-ii (see `types.outcomeString`, the single source of
+##     truth, and this module's own "Outcome string values" table below).
 ##     found=false means the file is ABSENT (caller should exit 3).
 ##     A file written by the PRIOR schema ("crisol/run/v1") is ALSO treated as
 ##     found=false — cold start, no error, no partial parse.  A schema change
@@ -50,8 +53,11 @@
 ##                                   // slot's result was already emitted (or
 ##                                   // unattributable); 0 by default.
 ##     "summary": {
-##       total, counts: { passed, exitNonZero, compileFailed, timedOut,
-##                        signaled, spawnError, killed, crashed },
+##       total, counts: { passed, exitNonZero, compileFailed, spawnError,
+##                        killed, crashed },  // r38: "timedOut"/"signaled"
+##                        // REMOVED -- not valid `counts` keys (see the
+##                        // SUMMARY OBJECT migration table below, which
+##                        // already documented this correctly)
 ##       flaky, quarantined, noTestsRan, notStarted
 ##     },
 ##     "entrypoints": [

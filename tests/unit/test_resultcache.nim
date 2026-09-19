@@ -449,4 +449,40 @@ block test_store_ioerror_when_file_blocks_version_dir:
   assert not ok, "a version dir blocked by a file (IOError) must degrade to false, not crash"
   assert "could not create cache dir" in captured
 
+# ---------------------------------------------------------------------------
+# 12. r37 (code-review): `recordStatusToString` is an EXPLICIT case-arm
+#     string table (house rule: never a bare `$enum` on the wire) -- pinned
+#     literal-for-literal against today's known-good strings, so a future
+#     `RecordStatus` rename that drifts a literal (or a copy-paste swap of
+#     two arms) fails THIS test, not just "some future cache read". Also
+#     re-confirms the roundtrip through the real reader (`payloadFromJson`,
+#     the module's own parser -- the unexported `parseStatus` it delegates
+#     to already expects exactly these three literals), so the pinned
+#     strings and the reader agree by construction, not by accident.
+# ---------------------------------------------------------------------------
+
+block test_record_status_to_string_pinned_literals:
+  assert recordStatusToString(rsPass) == "rsPass"
+  assert recordStatusToString(rsFail) == "rsFail"
+  assert recordStatusToString(rsSkip) == "rsSkip"
+
+  # Round-trip through the real reader too, not just the literal pin: build
+  # a payload carrying all three statuses via the exported codec, serialize,
+  # reparse, and confirm each status survived.
+  var res = sampleResult()
+  res.records = @[
+    TestRecord(name: "a", status: rsPass, durationUs: 1, msg: none(string), tags: @[]),
+    TestRecord(name: "b", status: rsFail, durationUs: 2, msg: none(string), tags: @[]),
+    TestRecord(name: "c", status: rsSkip, durationUs: 3, msg: none(string), tags: @[]),
+  ]
+  let node = payloadToJson(res)
+  assert node["records"][0]["status"].getStr == "rsPass"
+  assert node["records"][1]["status"].getStr == "rsFail"
+  assert node["records"][2]["status"].getStr == "rsSkip"
+  let reparsed = payloadFromJson(node)
+  assert reparsed.isSome
+  assert reparsed.get.records[0].status == rsPass
+  assert reparsed.get.records[1].status == rsFail
+  assert reparsed.get.records[2].status == rsSkip
+
 echo "test_resultcache: all blocks passed"

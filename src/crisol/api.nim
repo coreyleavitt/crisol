@@ -280,8 +280,16 @@ type
                                  ## would-be pass with an observed escapee (leaked same-pgroup
                                  ## descendant, A6a) derives oFailed instead of oPassed at every
                                  ## reporting boundary (exit code, render, JSON/junit wire,
-                                 ## lastrun.json) — never at the cache's own store/read gate,
-                                 ## which stays unstrict always. Can only strengthen a config-file
+                                 ## lastrun.json) — r36 (code-review): ALSO at the cache's SERVE
+                                 ## side (cachedispatch.lookupAtPlan/consultPostCompile, via
+                                 ## consultReal), which re-derives the outcome under this SAME
+                                 ## resolved policy (RFC-0005 SO1 fix) so a strict-hygiene run
+                                 ## never serves an entry it would itself report as failed (an
+                                 ## unstrict run may still hit that same entry -- see
+                                 ## types.Config.strictHygiene's doc for the full story). The
+                                 ## STORE gate (cachedispatch.shouldStore) stays policy-
+                                 ## UNCONDITIONAL always -- publication, not serving, is what
+                                 ## stays unstrict. Can only strengthen a config-file
                                  ## `strict-hygiene #true` (true wins), mirroring
                                  ## measureCompileReuse/perfCheckForce below.
     ## Tier 2 — tuning
@@ -1541,6 +1549,82 @@ proc productionCacheDeps*(): CacheDeps =
                     NilSink[TelemetryEvent](), trackedRoots))
 
 # ---------------------------------------------------------------------------
+# annotatePerfRegressions — C6 perf-check annotation phase, extracted from
+# runTestsWith's body (code-review r52: that proc was a ~500-line god-proc;
+# this phase was the extractable chunk).
+#
+# NOT moved to `crisol/stats` (a new module was judged disproportionate
+# here): `stats.nim` is a deliberately PURE leaf -- median/mad/isRegression,
+# no I/O, no crisol types beyond plain seq[int64]/float -- shared by FOUR
+# other callers (order.nim, shard.nim, render.nim, compilereport.nim) that
+# want ONLY that math. This phase needs `EntrypointResult`/`PerfCheckConfig`
+# plumbing AND ledger I/O (`scanLedger`) on top of the pure predicate --
+# entangling `stats.nim` with that machinery would drag it along for all
+# four of its other, unrelated consumers. `order.nim`/`shard.nim` already
+# establish the house pattern for this exact shape: pair `crisol/ledger`'s
+# I/O with `crisol/stats`'s pure math AT THE CALL SITE, not inside
+# `stats.nim` itself. This proc follows that same pattern, homed in
+# `api.nim` where its caller (and `scanLedger`/`identityKey`/`isRegression`,
+# all already imported here) live.
+# ---------------------------------------------------------------------------
+
+proc annotatePerfRegressions(results: var seq[EntrypointResult];
+                             perfCheck: PerfCheckConfig; stateDir: string;
+                             trackedRoots: TrackedRoots; runStartUs: int64) =
+  ## C6: annotate each FRESH result with regression info, when perf-check is
+  ## enabled. `edCached` results are excluded (no fresh measurement; never
+  ## flag a cache hit). For each fresh result, `historyUs` = prior
+  ## `durationUs` rows from the ledger, filtering out compileFailed rows and
+  ## rows from the current run (`timestamp >= runStartUs`).
+  ##
+  ## MUTATES `results` IN PLACE. r64 (code-review): `runTestsWith`'s caller
+  ## assembles `doc` (the shared `RunDocument`) from this SAME `results`
+  ## local immediately after this call returns — ORDER MATTERS: this call
+  ## must run BEFORE that doc assembly, or `rr.results`/the doc-driven
+  ## stdout JSON would silently disagree on `regressed`. See the r64
+  ## regression test that pins this exact ordering: test_api.nim, suite
+  ## "r64 — RunReport.results and the doc-driven stdout JSON agree on a
+  ## regression-annotated run", test "rr.results[0].regressed and
+  ## toJsonString(rr.doc)'s regressions entry agree" — still green after
+  ## this extraction since the call site below preserves the same
+  ## call-then-assemble-doc order the inline loop used to have.
+  if not perfCheck.enabled:
+    return
+  for i in 0 ..< results.len:
+    let r = results[i]
+    # Skip cached results — no fresh measurement, never flag.
+    if cached(r):
+      continue
+    # Skip compile-failed — no run duration to compare.
+    if outcome(r) == oCompileFailed:
+      continue
+    # Build identity key for this entrypoint. RFC-0009 A5b-ii: routed
+    # through the Entrypoint-keyed overload (ep.tp when populated).
+    let ikey = identityKey(r.ep, trackedRoots)
+    # Scan the ledger for PRIOR rows (exclude current run by timestamp).
+    let allRows = scanLedger(stateDir, ikey)
+    var historyUs: seq[int64]
+    for row in allRows:
+      # Exclude current-run rows (appended during execute()).
+      if row.timestamp >= runStartUs:
+        continue
+      # Exclude compileFailed rows (their durationUs reflects the compiler, not the run).
+      if row.outcome.startsWith("compileFailed"):
+        continue
+      historyUs.add row.durationUs
+    # Run the pure predicate.
+    let verdict = isRegression(
+      currentUs   = r.durationMs * 1000,  # convert ms → µs for comparison
+      historyUs   = historyUs,
+      k           = perfCheck.k,
+      sampleFloor = perfCheck.sampleFloor,
+      absFloorMs  = perfCheck.absFloorMs,
+    )
+    results[i].regressed       = verdict.regressed
+    results[i].perfBaselineUs  = verdict.baselineUs
+    results[i].perfThresholdUs = verdict.thresholdUs
+
+# ---------------------------------------------------------------------------
 # runTestsWith — full run facade; catches-and-encodes structural failures.
 # INTERNAL / documented-uncontracted (RFC-0005 A3b) — `deps` reaches into
 # cache-module internals a `crisol/api` consumer should never need to import;
@@ -1750,6 +1834,25 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
                $MinSafeRlimitAs & " bytes / 3 GiB) -- the child may " &
                "SIGSEGV before main() returns, reported as a bare crash " &
                "with no further guidance (see sandbox.MinSafeRlimitAs)\n")
+  # r34 (code-review): sandbox.resolveSandbox's `hlNone` early-return
+  # (`if level == hlNone: return SandboxSpec(level: hlNone, envPins: envPins)`)
+  # is BEFORE the block that consumes `rlimits`/`memoryLimit` at all -- every
+  # --rlimit-*/--limit-memory override an operator sets is silently dropped
+  # on the floor under `--hermetic none`, with zero feedback. This does NOT
+  # change hlNone's semantics (that would be a spec change, applying limits
+  # at a hermeticity level that promises none) -- it only makes the no-op
+  # LOUD, same warnStderr precedent as the MinSafeRlimitAs check just above,
+  # at the SAME one production call site. Reads the pre-resolution inputs
+  # (`cfg.rlimits`/`cfg.limitMemory`, the exact values just passed into
+  # `resolveSandbox` above) rather than `spec.limits` -- hlNone's SandboxSpec
+  # carries a zero-value `limits` unconditionally, so there is nothing left
+  # to inspect there; `spec.level` is what tells us hlNone actually won.
+  if spec.level == hlNone and
+     (cfg.rlimits.hasAnyOverride or cfg.limitMemory.isSome):
+    warnStderr("crisol: warning: --rlimit-*/--limit-memory overrides are " &
+               "set but --hermetic none disables all resource limits -- " &
+               "these flags are inert at this hermeticity level (see " &
+               "sandbox.resolveSandbox)\n")
   # nimcache-persistence (RFC-0006): the SAME ccVersion/nimVersion probes
   # already used by RFC-0004's SoundnessKey (via realSeams below) are reused
   # here — folded into execute()'s toolchain fingerprint, which keys the
@@ -1938,44 +2041,12 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     s.notStarted = notStartedCount
 
     # C6: Annotate results with regression info (if perf-check is enabled).
-    # edCached results are excluded (no fresh measurement; never flag a cache hit).
-    # For each fresh result, historyUs = prior durationUs rows from the ledger,
-    # filtering out compileFailed rows and rows from the current run (timestamp >= runStart).
-    if effectivePerfCheck.enabled:
-      let resolvedStateDir = pr.settings.stateDir
-      for i in 0 ..< results.len:
-        let r = results[i]
-        # Skip cached results — no fresh measurement, never flag.
-        if cached(r):
-          continue
-        # Skip compile-failed — no run duration to compare.
-        if outcome(r) == oCompileFailed:
-          continue
-        # Build identity key for this entrypoint. RFC-0009 A5b-ii: routed
-        # through the Entrypoint-keyed overload (ep.tp when populated).
-        let ikey = identityKey(r.ep, cfg.trackedRoots)
-        # Scan the ledger for PRIOR rows (exclude current run by timestamp).
-        let allRows = scanLedger(resolvedStateDir, ikey)
-        var historyUs: seq[int64]
-        for row in allRows:
-          # Exclude current-run rows (appended during execute()).
-          if row.timestamp >= runStartUs:
-            continue
-          # Exclude compileFailed rows (their durationUs reflects the compiler, not the run).
-          if row.outcome.startsWith("compileFailed"):
-            continue
-          historyUs.add row.durationUs
-        # Run the pure predicate.
-        let verdict = isRegression(
-          currentUs   = r.durationMs * 1000,  # convert ms → µs for comparison
-          historyUs   = historyUs,
-          k           = effectivePerfCheck.k,
-          sampleFloor = effectivePerfCheck.sampleFloor,
-          absFloorMs  = effectivePerfCheck.absFloorMs,
-        )
-        results[i].regressed      = verdict.regressed
-        results[i].perfBaselineUs = verdict.baselineUs
-        results[i].perfThresholdUs = verdict.thresholdUs
+    # r52 (code-review): extracted to `annotatePerfRegressions` above --
+    # see its own doc comment for scope, the r64 ordering guarantee (this
+    # call must precede `doc` assembly below), and why a new module wasn't
+    # warranted.
+    annotatePerfRegressions(results, effectivePerfCheck, pr.settings.stateDir,
+                            cfg.trackedRoots, runStartUs)
 
     # Persist lastrun.json if requested.
     # rfc-0007 A1e-ii §2: NEVER on an interrupted run, regardless of
