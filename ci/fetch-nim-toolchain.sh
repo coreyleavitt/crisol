@@ -34,6 +34,10 @@ layer = m["layers"][0]
 print(layer["digest"], layer.get("annotations", {}).get("org.opencontainers.image.title", "toolchain.bin"))
 EOF
 )
+# Windows python writes CRLF even into pipes (text-mode stdout); a trailing
+# \r on TITLE makes the *.zip case arm silently miss (CI run 35475575832).
+DIGEST=${DIGEST%$'\r'}
+TITLE=${TITLE%$'\r'}
 
 echo "fetch-nim-toolchain: ${TAG} -> ${TITLE} (${DIGEST})" >&2
 curl -fsSL -H "Authorization: Bearer $TOKEN" \
