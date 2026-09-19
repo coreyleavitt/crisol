@@ -50,7 +50,8 @@ reason = "W3 landed: RunReport.reuseAlerts; stdout run/v2 carries compileStats/r
 [[item]]
 id    = "w4"
 title = "Wiring W4 (low): memory.peak probed+serialized but the s7 tagged-successor ledger accounting never landed (ledger rssMechanism successor column awaits its producer). Wire the reap-time memory.peak read into the ledger column, or park explicitly."
-state = "open"
+state = "resolved"
+reason = "wired 73423e9: cgroupLeafMemoryPeak reap-time read -> ReapReport.memoryPeakBytes -> ledgerRssObservation preference, rssMechanism=memory.peak supersedes wait4; delegated-tier proof on the CI cgroup leg (runs 35459221732, 35461104418); RFC ReapReport pin + s7 amended"
 +++
 
 # RFC-0007 — Execution substrate: process contract, honest results, platform backends
