@@ -2,7 +2,7 @@
 type    = "rfc"
 id      = "0007"
 title   = "RFC-0007 \u2014 Execution substrate: process contract, honest results, platform backends"
-state   = "implemented"
+state   = "complete"
 stage   = "implement"
 review  = "floor"
 wiring  = "proven"
