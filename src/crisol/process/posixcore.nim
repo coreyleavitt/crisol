@@ -26,6 +26,7 @@
 
 import std/[options, os, posix, sets, strutils, tables, monotimes, times]
 import crisol/process/types
+import crisol/ioutils
 
 # ---------------------------------------------------------------------------
 # rlimit constants missing from std/posix (same set spawn.nim importc's).
@@ -84,21 +85,27 @@ proc forceNoCgroupKillRequested(): bool =
   v.len > 0 and v != "0"
 
 proc cgroupTierUsable*(caps: Capabilities): bool =
-  ## rfc-0007 wiring-audit W1: the cgroup tier's ONE forced-kill mechanism
-  ## is `cgroup.kill` — `forceKillCore`'s cgroup arm writes it and skips
-  ## `killpg` ENTIRELY (not merely redundantly) when a leaf exists. A
-  ## delegated leaf on a kernel that lacks `cgroup.kill` (< 5.14 — RHEL8
-  ## 4.18, 5.4/5.10 LTS containers) therefore cannot honor the tier's
-  ## forced-kill guarantee: `killCgroupLeaf` is deliberately best-effort
-  ## and swallows that write failure, so a SIGTERM-ignoring child would
-  ## survive escalation with NO SIGKILL ever sent, while reap still
-  ## stamped `killDomain = kdsCgroup` — a vouch the mechanism could not
-  ## honor. So `cgroupDelegation` ALONE is not sufficient to select this
-  ## tier; both probed bits must hold, or the spawn must fall to the next
-  ## tier (subreaper/pgid `killpg`) via the existing per-spawn leaf-
-  ## creation-failure degrade path — this predicate is the ONE place that
-  ## decision is made, consulted at the spawn gate instead of the bare
+  ## rfc-0007 wiring-audit W1: the cgroup tier's STRONGEST forced-kill
+  ## mechanism is `cgroup.kill` — the one path that reaches a setsid
+  ## escapee `killpg` (pgid-only) can never touch. A delegated leaf on a
+  ## kernel that lacks `cgroup.kill` (< 5.14 — RHEL8 4.18, 5.4/5.10 LTS
+  ## containers) cannot honor that PART of the tier's forced-kill
+  ## guarantee even after rfc-0007 r10's `killpg` backstop (below,
+  ## `forceKillCore`/`reapCore`): the backstop only reaches PGID-VISIBLE
+  ## processes, never a setsid escapee that has left the process group —
+  ## exactly the case `cgroup.kill` alone exists to cover. So
+  ## `cgroupDelegation` ALONE is still not sufficient to select this tier;
+  ## both probed bits must hold, or the spawn must fall to the next tier
+  ## (subreaper/pgid `killpg`) via the existing per-spawn leaf-creation-
+  ## failure degrade path — this predicate is the ONE place that decision
+  ## is made, consulted at the spawn gate instead of the bare
   ## `cgroupDelegation` check it replaces.
+  ##
+  ## r10 note: even ON a tier this predicate selects, a PER-SPAWN
+  ## `cgroup.kill` write can still fail at runtime (a same-uid child
+  ## migrating itself out of the leaf, transient EACCES/ENOENT) — that
+  ## per-spawn case is handled downstream by `killDomainFor`'s honest
+  ## degrade, not by this process-wide tier-selection gate.
   caps.cgroupDelegation and caps.cgroupKill
 
 when defined(linux):
@@ -320,15 +327,31 @@ when defined(linux):
     except CatchableError:
       false
 
-  proc killCgroupLeaf(leafPath: string) =
+  proc killCgroupLeaf*(leafPath: string): bool =
     ## Atomic, airtight teardown (rfc-0007 B3): write "1" to `cgroup.kill`
     ## — kills every process resident in the subtree in one syscall,
     ## including a setsid escapee the pgid-only `killpg` can never reach.
-    ## Best-effort: a leaf whose `cgroup.kill` is already gone, or that was
-    ## never really delegated, has nothing to do here. Safe to call on an
-    ## EMPTY cgroup too (the normal-exit case) — a harmless no-op write.
-    try: writeFile(leafPath / "cgroup.kill", "1")
-    except CatchableError: discard
+    ## Safe to call on an EMPTY cgroup too (the normal-exit case) — a
+    ## harmless no-op write that still reports `true`.
+    ##
+    ## rfc-0007 r10: returns the write's real success/failure — this proc
+    ## itself no longer swallows it (a same-uid child migrating itself OUT
+    ## of the leaf before this write, or a runtime EACCES/ENOENT on the
+    ## write, used to be invisible: `forceKillCore` skipped `killpg`
+    ## ENTIRELY on the cgroup arm, so a write failure meant NO kill signal
+    ## of any kind was ever sent, while reap still stamped `killDomain =
+    ## kdsCgroup` — a vouch the mechanism did not honor). The caller
+    ## (`forceKillCore`/`reapCore`) is responsible for (a) backstopping with
+    ## `killpg` regardless, and (b) recording a `false` here so the spawn's
+    ## `killDomain` vouch degrades honestly — see `killDomainFor` below.
+    ## Exported (like `cgroupSiblingParent`/`cgroupSlotLeafName`) purely so
+    ## a unit test can drive a genuine write failure (a nonexistent leaf
+    ## path) without needing real cgroup-v2 delegation.
+    try:
+      writeFile(leafPath / "cgroup.kill", "1")
+      true
+    except CatchableError:
+      false
 
   proc cgroupLeafSurvivors(leafPath: string): seq[ProcSnapshot] =
     ## rfc-0007 B3: the cgroup-tier's OWN escapee/tree accounting — every
@@ -425,6 +448,15 @@ type
                                 ## iff killDomain for this slot is kdsCgroup
                                 ## at reap — "" is the per-spawn honest
                                 ## degrade to the pre-B3 domain.
+    cgroupKillWriteFailed: bool ## rfc-0007 r10: latched true the instant any
+                                ## `killCgroupLeaf` write for THIS spawn's
+                                ## leaf fails (set by `forceKillCore`; also
+                                ## OR'd with `reapCore`'s own final teardown
+                                ## write, which is not persisted back since
+                                ## reap is terminal). A cgroup-tier spawn
+                                ## whose forced-kill write failed can no
+                                ## longer honestly vouch `kdsCgroup` — see
+                                ## `killDomainFor`.
 
   PosixCore* = object
     nextIdVal: int32
@@ -726,6 +758,77 @@ proc cachedCapabilities*(): Capabilities
   ## per-spawn cgroup-leaf decision (B3), reapCore for the achieved
   ## killDomain).
 
+proc reapBounded(pid: Pid)
+  ## Forward declaration — spawnChild's r11 pre-exec-stall timeout path
+  ## (below) needs this early too, same reason `cachedCapabilities` is
+  ## forward-declared just above: the real proc (full doc comment) lives
+  ## with `discoverAndReapEscapees`/`reapCore` further down.
+
+const statusPipeDeadlineMs = 10_000
+  ## rfc-0007 code-review r11: the TOTAL budget `readPipeBounded` (below)
+  ## gets for spawnChild's two status-pipe reads. Generous relative to
+  ## reality — the child's pre-exec window (cgroup self-join, setpgid,
+  ## dup2, chdir, setrlimit x5, two small pipe writes) is normally
+  ## sub-millisecond, so this never false-positives under ordinary load —
+  ## but finite: an external SIGSTOP on the child, or a hung
+  ## `cgroup.procs` open, used to wedge the ENTIRE single-threaded
+  ## Supervisor loop forever on a raw blocking `read(2)` (unrecoverable by
+  ## SIGINT too, since `read(2)` restarts under the `SA_RESTART` flag
+  ## installed above — `poll(2)` does NOT restart, which is exactly why
+  ## `readPipeBounded` uses it instead).
+
+proc readPipeBounded*(fd: cint; buf: var openArray[uint8]; deadlineMs: int):
+    tuple[got: int; timedOut: bool] =
+  ## rfc-0007 code-review r11: poll(2)-bounded replacement for a raw
+  ## blocking `read(2)` loop on `fd` — used for BOTH status-pipe reads in
+  ## `spawnChild` (the achieved-bytes readback and the cgroup-join result
+  ## byte). A raw blocking read there could wedge the ENTIRE single-
+  ## threaded event loop if the child stalled in its pre-exec window
+  ## (external SIGSTOP, a hung `cgroup.procs` open); `poll(2)` is NOT
+  ## restarted by `SA_RESTART` (unlike `read(2)`, which IS), so a SIGINT
+  ## regains its normal effect even while this loop is waiting, and the
+  ## deadline bounds the wait outright regardless of signals either way.
+  ##
+  ## `deadlineMs` is the TOTAL budget across the whole call, accounted
+  ## against a monotonic clock read once at entry (never reset by EINTR or
+  ## a spurious `poll` wakeup) — an injectable parameter so a unit test can
+  ## drive this with a short bound instead of production's real deadline
+  ## (`statusPipeDeadlineMs`, above).
+  ##
+  ## Returns `(got, timedOut)`: `got` is the number of bytes actually
+  ## read — may be short on EOF, a real read error, OR a timeout, all of
+  ## which end the loop early with whatever was collected so far.
+  ## `timedOut` is true iff the deadline was reached before `buf.len`
+  ## bytes arrived; the caller distinguishes "child stalled pre-exec"
+  ## (`timedOut`, needs an active SIGKILL — see spawnChild below) from
+  ## "child died/EOF'd early" (`not timedOut`, `got < buf.len` — the
+  ## existing honest-degradation path already handles that case).
+  let deadline = getMonoTime() + initDuration(milliseconds = deadlineMs)
+  result = (got: 0, timedOut: false)
+  while result.got < buf.len:
+    let now = getMonoTime()
+    if now >= deadline:
+      result.timedOut = true
+      return
+    let remainMs = (deadline - now).inMilliseconds
+    let waitMs = cint(min(1000'i64, max(1'i64, remainMs)))
+    var pfd: TPollfd
+    pfd.fd = fd
+    pfd.events = POLLIN
+    let pr = poll(addr pfd, 1, waitMs)
+    if pr < 0:
+      if errno == EINTR: continue
+      else: return               # genuine poll error — same as a read error
+    elif pr == 0:
+      continue                    # tick expired, nothing ready — deadline
+                                   # re-checked at the top of the loop
+    else:
+      let n = posix.read(fd, addr buf[result.got], buf.len - result.got)
+      if n > 0: result.got += int(n)
+      elif n == 0: return         # EOF — child died before writing
+      elif errno == EINTR: continue
+      else: return                # genuine read error
+
 proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   if spec.argv.len == 0:
     return SpawnResult(ok: false, error: "empty argv")
@@ -946,30 +1049,47 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
           discard posix.close(candidate)   # stays -1 — WNOHANG sweep covers it
 
   var rbuf: array[nLimits, uint8]
-  var got = 0
-  while got < rbuf.len:
-    let n = posix.read(pipeRead, addr rbuf[got], rbuf.len - got)
-    if n > 0: got += int(n)
-    elif n == 0: break            # EOF — child died before writing
-    elif errno == EINTR: continue
-    else: break
+  let (got, timedOut) = readPipeBounded(pipeRead, rbuf, statusPipeDeadlineMs)
+  if timedOut:
+    # rfc-0007 r11: the child stalled in its pre-exec window (external
+    # SIGSTOP, a hung `cgroup.procs` open — see readPipeBounded's own doc
+    # comment) long enough to exhaust the whole status-pipe deadline.
+    # Never leave the loop wedged waiting on it any longer: SIGKILL its
+    # pgid (already its own — `setpgid(childPid, childPid)` ran above),
+    # reap it bounded (never blocking further), release every fd/
+    # registration this spawn made, and report a genuine spawn error
+    # naming the stall rather than fabricating a result for a child that
+    # may still be alive somewhere between fork and exec.
+    discard killpg(childPid, SIGKILL)
+    reapBounded(childPid)
+    discard posix.close(pipeRead)
+    when defined(linux):
+      if pidfd >= 0:
+        discard epoll_ctl(core.epollFd, EPOLL_CTL_DEL, pidfd, nil)
+        discard posix.close(pidfd)
+      if cgroupLeafPath.len > 0: discard posix.rmdir(cgroupLeafPath.cstring)
+    return SpawnResult(ok: false,
+      error: "spawnChild: child stalled in the pre-exec window (no " &
+             "status-pipe readback within " & $statusPipeDeadlineMs &
+             "ms) — killed")
 
   # rfc-0007 B3: the cgroup-join result byte, appended after the achieved
   # bytes above (see the child window's write side). Read regardless of
   # whether `got == rbuf.len` — a child that died before finishing the
   # achieved-bytes write will also EOF here immediately, honestly
   # resolving to "never joined" (byte stays its 0 default) rather than
-  # blocking.
+  # blocking. rfc-0007 r11: bounded the same way as the read above, but a
+  # timeout here is never treated as a fresh stall worth killing over —
+  # by construction the child only reaches this write AFTER the achieved-
+  # bytes write already fully landed (see the child window's write
+  # ordering), i.e. it is already past the risky pre-exec window; a
+  # timeout here just falls through the existing degrade path exactly
+  # like a short/failed read always has (cgroupJoinResult stays its 0
+  # default, the leaf gets rmdir'd below).
   var cgroupJoinResult: uint8 = 0
   if cgroupHasLeaf:
     var jb: array[1, uint8]
-    var got2 = 0
-    while got2 < 1:
-      let n = posix.read(pipeRead, addr jb[0], 1)
-      if n > 0: got2 += int(n)
-      elif n == 0: break
-      elif errno == EINTR: continue
-      else: break
+    let (got2, _) = readPipeBounded(pipeRead, jb, statusPipeDeadlineMs)
     if got2 == 1: cgroupJoinResult = jb[0]
   discard posix.close(pipeRead)
 
@@ -1498,6 +1618,60 @@ proc requireLive(core: PosixCore; id: ChildId): int32 =
     doAssert false, "misuse: ChildId " & $id & " is unknown or already consumed"
   idx
 
+proc killSnapshotFor*(pid: Pid; cgroupLeaf: string): seq[ProcSnapshot] =
+  ## rfc-0007 r12: a cgroup-tier slot's evidence snapshot must come from the
+  ## SAME stronger mechanism the tier vouches for elsewhere — `reapCore`'s
+  ## escapees/tree accounting already reads `cgroupLeafSurvivors`, never
+  ## the pgid-only scan, for exactly this reason (see that call site's
+  ## doc comment). Before this fix, `requestStopCore`/`forceKillCore` used
+  ## `scanProcessGroup(entry.pid)` UNCONDITIONALLY, even when a cgroup leaf
+  ## existed: a setsid escapee the tier CAN see (`cgroupLeafSurvivors`
+  ## lists it, `cgroup.kill` kills it, reap stamps `tree=toComplete`) was
+  ## silently absent from `killSnapshot` — internally inconsistent
+  ## evidence on exactly the tier that vouches completeness.
+  ##
+  ## Falls back to the pgid-only scan when the leaf read comes back empty:
+  ## `cgroupLeafSurvivors` has no separate "the read genuinely failed" vs.
+  ## "the leaf genuinely holds nothing right now" signal (both shapes are
+  ## an empty seq), but this is called only while `entry.state != csExited`
+  ## — the leaf's leader is expected to still be resident — so an empty
+  ## result here is far more likely a transient read failure than a real
+  ## empty leaf, and `scanProcessGroup(pid)` still sees at least the leader
+  ## via its pgid (a cgroup leaf is only ever taken ALONGSIDE
+  ## `setpgid(childPid, childPid)` in `spawnChild`, never instead of it) —
+  ## never silently empty when a real snapshot IS obtainable through the
+  ## other mechanism. Exported for direct unit testing (the leaf-priority
+  ## and the empty-leaf-fallback arms are both provable with a plain temp
+  ## file standing in for `cgroup.procs` — no real cgroup-v2 delegation
+  ## needed; only the CI cgroup leg proves this against a REAL delegated
+  ## leaf).
+  when defined(linux):
+    if cgroupLeaf.len > 0:
+      let leafSnap = cgroupLeafSurvivors(cgroupLeaf)
+      if leafSnap.len > 0: return leafSnap
+  scanProcessGroup(pid)
+
+proc killDomainFor*(usedCgroup, cgroupKillWriteFailed, subreaper: bool): KillDomainStrength =
+  ## rfc-0007 r10: the pure kill-domain degrade decision, extracted so the
+  ## degrade itself is unit-testable without a real cgroup (the write
+  ## failure it reacts to is only reproducible for real on the CI cgroup
+  ## leg). `usedCgroup` alone used to be sufficient for `kdsCgroup` — this
+  ## adds `cgroupKillWriteFailed`: a cgroup-tier spawn whose `cgroup.kill`
+  ## write failed (escaped-leaf migration, or a runtime EACCES/ENOENT) can
+  ## no longer honestly vouch the tier's forced-kill guarantee, so it
+  ## degrades to EXACTLY the domain this process would have reported
+  ## without a leaf at all — `kdsProcessGroupSubreaper` when this process
+  ## really is a subreaper (always true alongside a real cgroup leaf, since
+  ## `initPosixCore` sets `PR_SET_CHILD_SUBREAPER` unconditionally), else
+  ## the pre-B1 `kdsProcessGroup`. A setsid-escaped-AND-leaf-escaped child
+  ## remains unkillable at that point regardless of this domain label —
+  ## that is the accepted residual (§ "named misattribution windows"
+  ## posture), not something a domain relabel can fix; this function only
+  ## ensures the LABEL stops overclaiming when it happens.
+  if usedCgroup and not cgroupKillWriteFailed: kdsCgroup
+  elif subreaper: kdsProcessGroupSubreaper
+  else: kdsProcessGroup
+
 proc requestStopCore*(core: var PosixCore; id: ChildId; reason: KillReason) =
   let idx = requireLive(core, id)
   var entry = core.children[idx]
@@ -1505,7 +1679,7 @@ proc requestStopCore*(core: var PosixCore; id: ChildId; reason: KillReason) =
     return   # exit already observed — atomic no-op, records nothing (§1)
   if entry.stop.isSome:
     return   # first act wins
-  entry.killSnapshot = scanProcessGroup(entry.pid)   # taken at the FIRST stop act
+  entry.killSnapshot = killSnapshotFor(entry.pid, entry.cgroupLeaf)   # taken at the FIRST stop act
   entry.stop = some((reason: reason, escalated: false))
   discard killpg(entry.pid, SIGTERM)
   core.children[idx] = entry
@@ -1515,16 +1689,24 @@ proc forceKillCore*(core: var PosixCore; id: ChildId) =
   var entry = core.children[idx]
   if entry.state == csExited:
     return   # atomic no-op — same rule as requestStop
-  entry.killSnapshot = scanProcessGroup(entry.pid)   # refreshed at forced kill
+  entry.killSnapshot = killSnapshotFor(entry.pid, entry.cgroupLeaf)   # refreshed at forced kill
   when defined(linux):
     if entry.cgroupLeaf.len > 0:
-      # rfc-0007 B3: cgroup.kill is atomic and airtight — one write kills
-      # the WHOLE subtree, including a setsid escapee `killpg` (pgid-only)
-      # can never reach. The cgroup-tier slot's ONE forceKill mechanism;
-      # `killpg` below is skipped entirely, not merely redundant with it.
-      killCgroupLeaf(entry.cgroupLeaf)
-    else:
-      discard killpg(entry.pid, SIGKILL)
+      # rfc-0007 B3/r10: cgroup.kill is atomic and airtight — one write
+      # kills the WHOLE subtree, including a setsid escapee `killpg`
+      # (pgid-only) can never reach. Previously the cgroup-tier slot's ONE
+      # forceKill mechanism, with `killpg` skipped entirely below — r10
+      # closed that: a same-uid child can migrate itself OUT of the leaf
+      # (delegation's common-ancestor rule) before this write, or the write
+      # can fail at runtime (EACCES/ENOENT), and either way a
+      # SIGTERM-ignoring child would then survive with NO kill signal ever
+      # sent. `killpg` now ALWAYS runs too, belt-and-suspenders — cheap,
+      # and closes both holes for any pgid-visible process (a setsid
+      # escapee that ALSO left the leaf remains unkillable here; that
+      # residual is accepted, see `killDomainFor`'s doc comment).
+      if not killCgroupLeaf(entry.cgroupLeaf):
+        entry.cgroupKillWriteFailed = true
+    discard killpg(entry.pid, SIGKILL)
   else:
     discard killpg(entry.pid, SIGKILL)
   if entry.stop.isSome:
@@ -1700,6 +1882,11 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
   var escapees: seq[ProcSnapshot] = @[]
   var memOom = false
   var usedCgroup = false
+  var cgroupKillWriteFailed = entry.cgroupKillWriteFailed   # rfc-0007 r10:
+    ## carry forward a write failure already latched by an earlier
+    ## `forceKillCore` call on this same spawn; OR'd below with this reap's
+    ## own final teardown write (never persisted back to `core.children` —
+    ## reap is terminal, the tombstone below drops the whole entry anyway).
   when defined(linux):
     if entry.cgroupLeaf.len > 0:
       usedCgroup = true
@@ -1720,8 +1907,12 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
       # Atomic, airtight teardown: kills anything still resident (a setsid
       # escapee that outlived its own leader) in one write. Safe on an
       # already-empty leaf (the normal-exit case) — cgroup.kill on
-      # nothing is a harmless no-op write.
-      killCgroupLeaf(entry.cgroupLeaf)
+      # nothing is a harmless no-op write. rfc-0007 r10: a write failure
+      # here (vs. an earlier forceKillCore call, or this being the first
+      # and only cgroup.kill attempt for a spawn that was never explicitly
+      # force-killed) degrades the domain below exactly the same way.
+      if not killCgroupLeaf(entry.cgroupLeaf):
+        cgroupKillWriteFailed = true
       # A SIGKILL'd escapee leaves the cgroup (kernel `do_exit()`) almost
       # immediately, but it does NOT leave the process table until its
       # real OS parent wait()s it — same subreaper reparenting as the
@@ -1744,22 +1935,21 @@ proc reapCore*(core: var PosixCore; id: ChildId; runPhase: bool): ReapReport =
     # the scan.
     escapees = discoverAndReapEscapees(core, idx, entry.pid, caps, runPhase)
 
-  # A7/B1/B3 (§4/§3): the per-spawn ACHIEVED domain — kdsCgroup iff this
-  # spawn got a real leaf (checked FIRST: cgroup is strictly the stronger
-  # claim when both it and subreaper hold, which they always do together
-  # on this tier — subreaper is set unconditionally in initPosixCore);
-  # else kdsProcessGroupSubreaper iff this process is REALLY a subreaper
+  # A7/B1/B3/r10 (§4/§3): the per-spawn ACHIEVED domain — kdsCgroup iff this
+  # spawn got a real leaf AND every cgroup.kill write for it actually
+  # succeeded (checked FIRST: cgroup is strictly the stronger claim when
+  # both it and subreaper hold, which they always do together on this
+  # tier — subreaper is set unconditionally in initPosixCore); else
+  # kdsProcessGroupSubreaper iff this process is REALLY a subreaper
   # (initPosixCore sets PR_SET_CHILD_SUBREAPER deliberately; the probe's
-  # own readback confirms it); else the pre-B1 kdsProcessGroup.
-  # `treeObservationFor` (process/types.nim) ties `tree` to this by
-  # construction: both a subreaper and a cgroup leaf see the WHOLE
+  # own readback confirms it); else the pre-B1 kdsProcessGroup. See
+  # `killDomainFor`'s doc comment for the r10 write-failure degrade this
+  # now applies. `treeObservationFor` (process/types.nim) ties `tree` to
+  # this by construction: both a subreaper and a cgroup leaf see the WHOLE
   # descendant tree by construction, so `toComplete` is honest here even
   # when `escapees` is non-empty — tree completeness and "did anything
   # survive" are separate axes (§2/§6).
-  let domain =
-    if usedCgroup: kdsCgroup
-    elif caps.subreaper: kdsProcessGroupSubreaper
-    else: kdsProcessGroup
+  let domain = killDomainFor(usedCgroup, cgroupKillWriteFailed, caps.subreaper)
   result = ReapReport(
     exit: entry.exit,
     rusage: entry.rusage,
@@ -1864,14 +2054,43 @@ var LOCK_UN {.importc, header: "<sys/file.h>".}: cint
 var LOCK_NB {.importc, header: "<sys/file.h>".}: cint
 
 proc probeFlock(): bool =
-  let path = getTempDir() / ("crisol-flock-probe-" & $getpid())
+  ## rfc-0007 code-review r9: the probe file lives at an UNPREDICTABLE name,
+  ## opened via `ioutils.exclusiveCreate` (`O_CREAT|O_EXCL|O_NOFOLLOW`) —
+  ## never the old `crisol-flock-probe-<pid>` FIXED name opened with Nim's
+  ## plain `open(path, fmWrite)` (`O_CREAT|O_TRUNC`, no `O_EXCL`/
+  ## `O_NOFOLLOW`). A name predictable from the pid alone let a local
+  ## attacker in shared `/tmp` pre-plant a symlink at that exact path and
+  ## have it silently FOLLOWED and TRUNCATED as the crisol user — blocked
+  ## on default Linux by `fs.protected_symlinks`, but NOT on macOS
+  ## (`TMPDIR=/tmp` with a stripped CI/container env) or a hardened-off
+  ## Linux. This matches the repo's own posture everywhere else a
+  ## predictable-name attack matters (`ioutils.exclusiveCreate`/
+  ## `atomicPublish` already use `O_EXCL` exactly against a planted-symlink
+  ## attacker; this probe was the one holdout still using a raw `open`).
+  ##
+  ## The random suffix (`ioutils.readRandomBytes`, `/dev/urandom`) makes
+  ## the name unguessable in advance; `O_EXCL`/`O_NOFOLLOW` then make ANY
+  ## pre-existing entry at that exact name — planted, or a
+  ## vanishingly-unlikely genuine collision — fail CLOSED (probe returns
+  ## `false`) rather than following/truncating it. No retry-with-a-
+  ## different-name on collision: this is best-effort capability
+  ## detection, not correctness-critical machinery, so a false negative on
+  ## an astronomically unlikely 16-random-byte collision is an acceptable,
+  ## simpler failure mode than a retry loop.
   try:
-    let f = open(path, fmWrite)
+    let randBytes = readRandomBytes(16)
+    if randBytes.len == 0:
+      return false   # /dev/urandom unavailable — fail closed, never fall
+                       # back to a predictable name
+    var suffix = newStringOfCap(32)
+    for b in randBytes: suffix.add toHex(b)
+    let path = getTempDir() / ("crisol-flock-probe-" & $getpid() & "-" & suffix)
+    let (fd, _, _) = exclusiveCreate(path, noFollow = true)
+    if fd < 0: return false
     defer:
-      close(f)
+      closeFd(fd)
       try: removeFile(path)
       except CatchableError: discard
-    let fd = getFileHandle(f).cint
     if c_flock(fd, LOCK_EX or LOCK_NB) != 0: return false
     discard c_flock(fd, LOCK_UN)
     true

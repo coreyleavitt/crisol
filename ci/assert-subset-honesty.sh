@@ -76,6 +76,10 @@ tests/conformance/test_conformance_timing.nim
 tests/unit/test_process_capabilities.nim
 tests/unit/test_rfc0007_a6a_escapee_evidence.nim
 tests/unit/test_rfc0007_r2_cross_slot_escapee.nim
+tests/unit/test_rfc0007_r9_probe_flock.nim
+tests/unit/test_rfc0007_r10_cgroup_kill_degrade.nim
+tests/unit/test_rfc0007_r11_bounded_readback.nim
+tests/unit/test_rfc0007_r12_cgroup_killsnapshot.nim
 tests/unit/test_rfc0007_w1_cgroup_kill_gate.nim
 tests/unit/test_run_tests.nim
 tests/conformance/test_rfc0007_r3_library_embedding.nim
@@ -115,6 +119,7 @@ EOF
     # correctly skip on this leg.
     EXPECTED_SKIP="$(cat <<'EOF'
 tests/unit/test_rfc0007_r2_cross_slot_escapee.nim
+tests/unit/test_rfc0007_r12_cgroup_killsnapshot.nim
 tests/conformance/test_rfc0007_r3_library_embedding.nim
 EOF
 )"
