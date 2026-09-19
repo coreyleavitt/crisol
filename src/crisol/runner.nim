@@ -900,7 +900,7 @@ proc finalizeSlot(
         sourceIndexBuilt = true
       let rec = ctx.recordClosureFn(graph, ctx.config, pep.ep, slots[idx].cacheDir,
                               binName(pep.ep), CrisolProtocolMajor, sourceIndex,
-                              realRunIn(ctx.projectRoot))  # canon-ok: real compile subprocess cwd
+                              realRunIn(ctx.projectRoot))  # r65: real compile subprocess cwd — ctx.projectRoot, the one canonical value
       slots[idx].closureRecorded = rec.ok
       slots[idx].closureError    = rec.error
 
@@ -1091,7 +1091,7 @@ proc warnMeasureCompileReuseNoWorkerOnce() =
     warned = true
 
 proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string;
-                             config: Config): MeasurePlan =
+                             config: Config; projectRoot: string): MeasurePlan =
   ## Plan construction for the compile-slot measurement worker
   ## (`config.measureCompileReuse`).
   ##
@@ -1099,6 +1099,14 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
   ## collide with appendAttemptRow's identityKey(ep, roots) (this file,
   ## ~line 213) or ArtifactRows silently orphan from the RunLedger's
   ## IdentityKey (measureworker.nim's own documented contract).
+  ##
+  ## r65: `projectRoot` is threaded in by the caller (`ctx.projectRoot`) —
+  ## this proc has no `ExecCtx` of its own to read, but must still use the
+  ## SAME already-canonicalized value every other spawn/finalize site uses,
+  ## never re-derive its own via `config.projectRoot.absolutePath.normalizedPath`
+  ## (that re-derivation is cwd-dependent and used to silently diverge from
+  ## `ctx.projectRoot` whenever the invoking process's cwd differed from the
+  ## resolve-time cwd).
   MeasurePlan(
     # Source the entrypoint's identity from its TrackedPath, serialized to
     # the worker via the display() accessor (a deliberate string wire — the
@@ -1113,7 +1121,7 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
     groupId:           ep.group,
     configHash:        flagHash(ep.flags),
     stateDir:          stateDirOf(config),
-    projectRoot:       config.projectRoot.absolutePath.normalizedPath, # canon-ok: real spawn projectRoot
+    projectRoot:       projectRoot,
   )
 
 proc dirHasEntries(dir: string): bool =
@@ -1443,7 +1451,7 @@ proc spawnCompileStable(
   # pattern as `monolithicCompArgs` above) so the write+cleanup logic has a
   # single home.
   template writeWorkerPlan(planFilename: string; token: string): seq[string] =
-    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config)
+    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config, ctx.projectRoot)
     let planPath = tmpDir / planFilename
     try:
       writeFile(planPath, $toJson(mplan))
@@ -1489,10 +1497,12 @@ proc spawnCompileStable(
   # the library API). A root-relative compile flag (e.g. `--path:src`) is
   # resolved by `nim` against ITS OWN cwd, so this is the ONE place that
   # guarantees a `--path:src` group compiles identically no matter where
-  # crisol itself was invoked from.
+  # crisol itself was invoked from. r65: reads `ctx.projectRoot` (the ONE
+  # canonicalized value, computed once in `execute`) — never re-derives its
+  # own via `config.projectRoot.absolutePath.normalizedPath`.
   let childSpec = ChildSpec(
     argv:   compArgs,
-    cwd:    config.projectRoot.absolutePath.normalizedPath, # canon-ok: real child spawn cwd
+    cwd:    ctx.projectRoot,
     env:    filterEnv(toSeq(envPairs()), SandboxSpec(envScrub: false), @[]),
     sinks:  combinedSink(compOut),
     limits: ptypes.Limits(),  # compile is unsandboxed — no limits requested
@@ -1614,7 +1624,7 @@ proc spawnRunDirect(
   var childSpec: ChildSpec
   try:
     childSpec = buildRunChildSpec(binFull, runOut, sinkFile, spec, attempt,
-                                  config.projectRoot.absolutePath.normalizedPath, scratchDir)  # canon-ok: real run child spawn cwd
+                                  ctx.projectRoot, scratchDir)  # r65: ctx.projectRoot — the one canonical value, never re-derived
   except:
     try: removeDir(tmpDir) except: discard
     return false
@@ -1915,6 +1925,12 @@ proc execute*(
   # project root, toolchainFp/dupSlugs) built into ONE ExecCtx — see its
   # type doc. Every slot-lifecycle proc below takes this instead of its own
   # subset of the same six-to-eight params.
+  #
+  # r65: this is the SOLE derivation of the canonical project root —
+  # `absolutePath` is cwd-dependent, so resolving it exactly once here (not
+  # per-spawn) is the actual invariant `ExecCtx.projectRoot`'s doc promises.
+  # Every other site that needs it reads `ctx.projectRoot` back; none may
+  # re-derive their own `config.projectRoot.absolutePath.normalizedPath`.
   let ctx = ExecCtx(
     config:            config,
     cache:              cache,
@@ -1922,7 +1938,7 @@ proc execute*(
     plan:               p,
     maxOutputBytes:     maxOutputBytes,
     compileTimeoutMs:   compileTimeoutMs,
-    projectRoot:        config.projectRoot.absolutePath.normalizedPath, # canon-ok: real spawn/finalize projectRoot
+    projectRoot:        config.projectRoot.absolutePath.normalizedPath,
     toolchainFp:        toolchainFp,
     dupSlugs:           dupSlugs,
   )
@@ -2442,6 +2458,48 @@ proc execute*(
           if s.state == ssLive and s.pepIdx == j: return true
         false
 
+      # code-review r66: the ONE finalize path for a fill-pass spawn failure
+      # (fork/file-open failed before any process ever existed — neither
+      # `spawnRunDirect` nor `spawnCompileStable` got a child spawned).
+      # Previously each of the two call sites below hand-rolled its own
+      # finalization — unconditional `anyFailed = true`, no `decideExit`,
+      # no `isQuarantined` overlay — while the SAME event class reaching
+      # fkDone (this file's `handleChildExited` template, the `fkDone`
+      # branch) got the quarantine downgrade. Same event class, two
+      # policies. Routed through `decideExit` here for real policy parity
+      # (not a re-implementation of it): a spawn failure is never
+      # retried/promoted/stored — `oSpawnError` is excluded from retry by
+      # decideExit's B1 rule, and `compiledThisRun`/`hasCacheDir` are both
+      # false here — so only `recordAsFailure` is read back; the
+      # promote/store fields are computed but deliberately unused (there is
+      # nothing to promote or store for a process that never spawned).
+      # A template, not a proc: mutates `results`/`finalized`/`done`/
+      # `anyFailed`, the enclosing proc's own `var seq`/`var` locals — see
+      # `handleChildExited`'s doc comment above for why that rules out a
+      # nested proc/closure here.
+      template finalizeSpawnFailure(pepIdx: int; attemptNum: int; res: EntrypointResult) =
+        var spawnFailRes = res
+        spawnFailRes.quarantined = isQuarantined(p.entrypoints[pepIdx].ep, spawnFailRes,
+                                                 config.quarantine, config.quarantineTp)
+        let spawnFailDecision = decideExit(
+          completedOutcome      = outcome(spawnFailRes),
+          slotAttempt           = attemptNum,
+          maxAttempts           = p.entrypoints[pepIdx].retries + 1,
+          failFast              = failFast,
+          compiledThisRun       = false,
+          hasCacheDir           = false,
+          slotClosureRecorded   = false,
+          cacheActive           = cacheActive,
+          verdict               = StoreVerdict(),
+          planTimeCacheDecision = cacheDecisions[pepIdx],
+        )
+        results[pepIdx] = spawnFailRes
+        onResult(spawnFailRes)
+        finalized[pepIdx] = true
+        inc done
+        if spawnFailDecision.recordAsFailure:
+          anyFailed = true
+
       for i in 0 ..< nJobs:
         if shuttingDown:            continue  # rfc-0007 A2b: no new work once torn down
         if slots[i].state == ssLive: continue  # slot busy
@@ -2503,11 +2561,7 @@ proc execute*(
               res.compile = ptypes.Phase(kind: ptypes.pkSkipped)
               res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
                                 spawnError: "fork or file-open failed for skip-fresh run")
-              results[pepIdx] = res
-              onResult(res)
-              finalized[pepIdx] = true
-              anyFailed = true
-              inc done
+              finalizeSpawnFailure(pepIdx, attemptNum, res)  # r66: shared quarantine+recordAsFailure policy
             else:
               slots[i].token = tok.get  # S3: store token for onSlotFinish
           else:
@@ -2524,11 +2578,7 @@ proc execute*(
               res.compile = ptypes.Phase(kind: ptypes.pkSpawnFailed,
                                 spawnError: "fork or file-open failed before compile")
               res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
-              results[pepIdx] = res
-              onResult(res)
-              finalized[pepIdx] = true
-              anyFailed = true
-              inc done
+              finalizeSpawnFailure(pepIdx, attemptNum, res)  # r66: shared quarantine+recordAsFailure policy
               # Slot remains idle (state == ssIdle); loop continues.
             else:
               slots[i].token = tok.get  # S3: store token for onSlotFinish
@@ -2674,8 +2724,29 @@ proc execute*(
             # straight to forceKill, the same treatment a second top-level
             # weShutdown (the `else` branch below) gets once shuttingDown
             # is already true.
+            #
+            # code-review r58: unlike the top-level `else` branch below
+            # (whose live slots already carry a `krInterrupt` stop act from
+            # the FIRST weShutdown, §1 first-act-wins), a slot reaching
+            # THIS branch has never had `requestStop` called on it — this
+            # is the very first stop act any of these slots see. Both
+            # backends' "forceKill with no prior stop act recorded"
+            # fallback (posixcore.nim's `forceKillCore`, windows.nim's
+            # `forceKill`) then defaults `stop.reason` to `krTimeout` —
+            # correct for that proc's OWN documented bare-force-kill
+            # contract, but wrong here: this kill is authored by a real
+            # interrupt, not a timeout. Record the true authorship FIRST
+            # via a non-blocking `requestStop` (first-act-wins means it
+            # only sets `stop = (krInterrupt, escalated: false)` and, on
+            # POSIX, additionally sends SIGTERM — harmless, immediately
+            # superseded by the SIGKILL/TerminateJobObject below) so
+            # `forceKill`'s OWN "prior stop present" branch preserves
+            # `krInterrupt` and only flips `escalated` to true — no new
+            # grace window opens (`forceKilled = true` still marks this
+            # slot as force-killed, same as before).
             for i in 0 ..< slots.len:
               if slots[i].state == ssLive:
+                sv.requestStop(slots[i].id, ptypes.krInterrupt)
                 sv.forceKill(slots[i].id)
                 slots[i].forceKilled = true
           else:

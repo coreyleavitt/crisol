@@ -21,6 +21,26 @@
 ##  force-kill every live slot immediately, not fall through to the normal
 ##  graced requestStop path.
 ##
+##  r58 (code-review, High) — the r5(b) skip-grace branch calls
+##  `sv.forceKill` on every still-live slot with NO prior `requestStop`.
+##  Both backends' "forceKill with no prior stop act recorded" fallback
+##  (posixcore.nim's `forceKillCore`, windows.nim's `forceKill`) then
+##  records `stop = (krTimeout, escalated: true)` — a FABRICATED timeout,
+##  not the true interrupt authorship — because that fallback is meant for
+##  a genuinely bare forceKill call, not this reachable "skip-grace during a
+##  real interrupt drain" path. Consequences pinned below via the SAME r5(b)
+##  double-SIGINT harness: a RUN-phase victim (D) keeps outcome `oKilled`
+##  but its wire `Cause.reason` lies "timeout" instead of "interrupt"; a
+##  MID-COMPILE victim (new entrypoint C, slow_compile2.nim — a longer,
+##  8s `staticExec`-gated compile still genuinely live when A's shorter 3s
+##  compile triggers the double SIGINT) is misreported as `oCompileFailed`
+##  (types.nim's `outcome` maps compile-phase `cbRunner`+non-`krInterrupt`
+##  to a compile failure, never `oKilled`) with a fabricated
+##  "[compile timed out]" note (runner.nim's `finalizeSlot`, `spCompiling`
+##  branch) instead of the true `oKilled`+"[interrupted]". RED before the
+##  fix: D's `run.res.cause.reason` reads `krTimeout` and C's `outcome`
+##  reads `compileFailed`.
+##
 ## Strategy — an injected `recordClosureFn` (execute()'s R3a seam, RFC-0009
 ## A-final-ii-a) turns the razor-thin real-world race each defect depends on
 ## into a deterministic, generously-margined one:
@@ -55,6 +75,13 @@
 ##     requestStop (bug) leaves D alive until GracePeriodMs (400ms) elapses
 ##     and `escalateExpired` force-kills it (~400-450ms observed); an
 ##     immediate forceKill (fix) kills it right away (well under 250ms).
+##     r58 additionally: entrypoint C (slow_compile2.nim, an 8s
+##     `staticExec`-gated compile — still genuinely mid-compile when A's
+##     shorter 3s compile triggers the double SIGINT at ~3s) is a THIRD
+##     concurrent sibling (jobs=3), so the same skip-grace forceKill sweep
+##     also force-kills a live COMPILING child, not just D's live RUN
+##     child. Assert D's `run.res.cause.reason` and C's `outcome` (via
+##     `crisol/types.outcome`) directly off the emitted `EntrypointResult`s.
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
@@ -63,6 +90,7 @@
 when defined(posix):
   import std/[options, os, posix, strutils, times, unittest]
   import crisol/types
+  import crisol/process/types as ptypes  # r58: Cause/KillReason field access
   import crisol/depgraph
   import crisol/closure   # SourceIndex, buildSourceIndex
   import crisol/ccprobe   # RunProc
@@ -181,14 +209,23 @@ when defined(posix):
         let epA  = mkEp(fdir / "slow_compile.nim")    # A: the hook trigger — its OWN
                                                        # 3s compile floor buys D time to
                                                        # reach its run phase first.
+        let epC  = mkEp(fdir / "slow_compile2.nim")   # C: r58 — an 8s compile, still
+                                                       # genuinely mid-compile (live) when
+                                                       # A's 3s compile triggers the
+                                                       # double SIGINT — the mid-compile
+                                                       # skip-grace victim.
         let epD  = mkEp(fdir / "term_ignores.nim")    # D: live throughout, ignores
                                                        # SIGTERM — only SIGKILL kills it.
 
         var sigint2At = 0.0
         var dDoneAt   = 0.0
+        var dRes, cRes: Option[EntrypointResult]
         proc onRes(r: EntrypointResult) =
           if string(r.ep.tp.display()).endsWith("term_ignores.nim"):
             dDoneAt = epochTime()
+            dRes = some(r)
+          elif string(r.ep.tp.display()).endsWith("slow_compile2.nim"):
+            cRes = some(r)
 
         let hook = proc(graph: var DepGraph; config: Config; ep: Entrypoint;
                         nimcacheDir, binaryName: string; protocolMajor: int;
@@ -196,6 +233,7 @@ when defined(posix):
           if string(ep.tp.display()).endsWith("slow_compile.nim"):
             # D has had A's entire 3s+ compile floor to finish compiling and
             # start running (ignoring SIGTERM) — safely established by now.
+            # C (slow_compile2.nim, 8s floor) is still genuinely compiling.
             discard posix.kill(posix.getpid(), cint(SIGINT))   # first Ctrl-C
             os.sleep(30)
             sigint2At = epochTime()
@@ -209,8 +247,8 @@ when defined(posix):
                                                                  # poll sees it.
           recordClosure(graph, config, ep, nimcacheDir, binaryName, protocolMajor, index, ccRun)
 
-        let cfg = baseCfg(jobs = 2)
-        let p   = plan(cfg, @[epA, epD], emptyDepGraph())
+        let cfg = baseCfg(jobs = 3)
+        let p   = plan(cfg, @[epA, epC, epD], emptyDepGraph())
         var g   = emptyDepGraph()
         # rfc-0007 code-review r7: `interruptedOut` ptr param is gone — read
         # `.interrupted` off the returned ExecuteReport instead.
@@ -220,15 +258,29 @@ when defined(posix):
         let interrupted = execReport.interrupted
 
         let deltaMs = if sigint2At > 0.0 and dDoneAt > 0.0: (dDoneAt - sigint2At) * 1000.0 else: -1.0
-        writeFile(resultFile, $interrupted & "," & formatFloat(deltaMs, ffDecimal, 1))
+
+        # r58: D's RUN-phase kill authorship — must be the real interrupt,
+        # never the skip-grace fallback's fabricated timeout.
+        let dReason =
+          if dRes.isSome and dRes.get.run.kind == ptypes.pkRan and
+             dRes.get.run.res.cause.by == ptypes.cbRunner:
+            $dRes.get.run.res.cause.reason
+          else: "missing"
+
+        # r58: C's COMPILE-phase outcome — must be oKilled (honest interrupt),
+        # never oCompileFailed (the fabricated-timeout misclassification).
+        let cOutcome = if cRes.isSome: types.outcomeString(outcome(cRes.get)) else: "missing"
+
+        writeFile(resultFile, $interrupted & "," & formatFloat(deltaMs, ffDecimal, 1) &
+                              "," & dReason & "," & cOutcome)
         quit(0)
 
       let raw = waitChildResult(childPid, resultFile, 30.0)
       check raw.len > 0
       if raw.len > 0:
         let parts = raw.split(',')
-        check parts.len == 2
-        if parts.len == 2:
+        check parts.len == 4
+        if parts.len == 4:
           check parts[0] == "true"       # the run really was interrupted
           let deltaMs = parts[1].parseFloat
           check deltaMs >= 0.0           # D actually finished (proves it was
@@ -238,6 +290,14 @@ when defined(posix):
           # escalateExpired's poll notices the 400ms deadline has elapsed —
           # observed ~400-450ms pre-fix, comfortably above this threshold.
           check deltaMs < 250.0
+          # r58: skip-grace forceKill must not misauthor the kill reason.
+          # D's RUN-phase Cause.reason must be the real interrupt, not the
+          # forceKill-with-no-prior-stop fallback's fabricated "timeout".
+          check parts[2] == "krInterrupt"
+          # r58: C's mid-compile skip-grace kill must derive the honest
+          # oKilled outcome, never oCompileFailed (which only the fabricated
+          # timeout reason produces — see types.nim's `outcome`).
+          check parts[3] == "killed"
 else:
   when isMainModule:
     echo "CRISOL-SKIP: tests/integration/test_rfc0007_r5_drain_interrupt.nim"
