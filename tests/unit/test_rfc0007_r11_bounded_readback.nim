@@ -184,9 +184,13 @@ when defined(posix):
       ## elapsed, the remainder handed to a second call is meaningfully
       ## SMALLER than the original total — never the same constant a
       ## pre-fix second call would have received unconditionally.
-      const totalMs = 300
+      ## Budget is deliberately huge relative to the sleep so a slow or
+      ## loaded runner (macos CI overshoots os.sleep by whole seconds)
+      ## cannot exhaust it before the remainder is sampled -- the assertion
+      ## is about MONOTONIC CONSUMPTION, not the sleep's precision.
+      const totalMs = 10_000
       let readDeadline = getMonoTime() + initDuration(milliseconds = totalMs)
-      os.sleep(150)
+      os.sleep(50)
       let remainder = remainingMs(readDeadline)
       check remainder > 0
       check remainder < totalMs
