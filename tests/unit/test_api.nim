@@ -1178,6 +1178,91 @@ quit(0)
     check readFile(dir / "r67_counter.txt").strip() == "2"
 
 # ---------------------------------------------------------------------------
+# r74 (code-review) — grep-test: verifyCachePass's own body never regresses
+# to a bare `stderr.write` (see test_rfc0007_r74_verifycache_closed_stderr.nim
+# for the E2E covering ONE of the four warning sites end to end; this pins
+# ALL FOUR -- the E2E alone would not catch a future bare-write regression
+# at a site its one fixture never reaches, e.g. the interrupted-branch or
+# the execute()-raised warning).  Same grep-test shape as
+# test_rfc7_legacy_names_gone.nim's `wordAt`/`containsWord` (no std/re dep
+# in this repo).
+# ---------------------------------------------------------------------------
+
+suite "r74 — verifyCachePass never regresses to a bare stderr.write":
+
+  test "every warning site inside verifyCachePass's own body calls warnStderr, not stderr.write":
+    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "api.nim"
+    let src = readFile(apiPath)
+    let startMarker = "proc verifyCachePass*("
+    let startIdx = src.find(startMarker)
+    check startIdx >= 0
+    if startIdx >= 0:
+      # The proc body runs to the next top-level (column-0) `proc `/`#`
+      # section-comment marker after it -- verifyCachePass is followed by
+      # the "H2 — PlanReport-typed facade overloads" section header.
+      let afterStart = startIdx + startMarker.len
+      let endIdx = src.find("\n# ---", afterStart)
+      check endIdx > afterStart
+      let body = src[startIdx ..< (if endIdx > 0: endIdx else: src.len)]
+      # Exactly four warning sites are documented (r74's own finding): the
+      # execute()-raised warning, the interrupted-branch warning, the
+      # could-not-reexec warning, and the divergence warning. All four --
+      # and nothing else in this body -- must route through `warnStderr`.
+      check "stderr.write(" notin body
+      let warnStderrCalls = body.count("warnStderr(")
+      check warnStderrCalls == 4
+
+# ---------------------------------------------------------------------------
+# r74 (code-review) — grep-test: `installSignals` genuinely reaches the
+# verify sub-run's own `execute()` call, and `runTestsWith`'s call site
+# threads it from the SAME source (`opts.installSignals`) the main run's own
+# `execute()` call already uses.
+#
+# WHY a grep-test, not a live SIGINT E2E: a deterministic SIGINT-during-
+# verify-sub-run E2E needs `std/posix`'s `kill()`/`SIGINT` to signal a real
+# child `crisol` process precisely mid-verify-pass (the same shape as
+# tests/timing/test_interrupt_e2e.nim). This repo's RFC-0009 B-inventory
+# conformance test (tests/conformance/test_rfc9_bucket_inventory.nim) pins
+# EVERY test file that imports `std/posix` into a closed, frozen bucket list
+# (union.len == 85) and fails any `std/posix` import that is not already
+# bucketed -- that file is explicitly off-limits for this fix, so a NEW
+# posix-importing test file cannot be added without breaking it. Rather than
+# adding a signal-timing E2E to an unrelated already-bucketed file just to
+# dodge that classifier, this pins the WIRING (both threading points, by
+# source text) plus the r63 `pairVerifySamples` unit pins (unchanged,
+# already above) stay as the behavioral coverage for what the interrupted
+# branch actually DOES once `execReport.interrupted` is true. Honesty over
+# a synthetic E2E: the interrupted-branch's OWN logic was already exercised
+# indirectly by test_rfc0007_r74_verifycache_closed_stderr.nim's kind of
+# harness is infeasible here (no clean way to force `execReport.interrupted`
+# true without a real signal); the wiring pin below is what is actually
+# achievable and honest about that gap.
+# ---------------------------------------------------------------------------
+
+suite "r74 — installSignals wiring reaches the verify sub-run (grep pin)":
+
+  test "verifyCachePass's own execute() call threads installSignals, not a hardcoded false":
+    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "api.nim"
+    let src = readFile(apiPath)
+    let startIdx = src.find("proc verifyCachePass*(")
+    check startIdx >= 0
+    let endIdx = src.find("\n# ---", startIdx)
+    check endIdx > startIdx
+    let body = src[startIdx ..< endIdx]
+    check "installSignals = installSignals" in body
+    check "installSignals     = opts.installSignals" notin body  # not the MAIN run's own call
+
+  test "runTestsWith's verifyCachePass call site threads opts.installSignals":
+    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "api.nim"
+    let src = readFile(apiPath)
+    let callIdx = src.find("verifyCachePass(results, pr.entrypoints")
+    check callIdx >= 0
+    # The call spans a few lines to its closing paren; a generous fixed
+    # window comfortably covers it without needing a real parser.
+    let window = src[callIdx ..< min(callIdx + 400, src.len)]
+    check "installSignals = opts.installSignals" in window
+
+# ---------------------------------------------------------------------------
 # RFC-0005 A3b — runTestsWith / CacheDeps: the internal injection seam.
 # ---------------------------------------------------------------------------
 

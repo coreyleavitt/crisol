@@ -776,11 +776,45 @@ proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
   ##                        in the key.  Cross-host cache reuse is achieved by
   ##                        pinning the env, not by omitting values (cf.
   ##                        Bazel --action_env, Nix derivations).
-  ##   cwdPosture         ← ctx.spec.chdirIntoScratch (r57, CONFIRMED High):
-  ##                        the actual cwd the child is spawned with depends
-  ##                        on this boolean (`runner.buildRunChildSpec`), so
-  ##                        it must be load-bearing in the key -- see
-  ##                        `KeyInputs.cwdPosture`'s doc comment (keys.nim).
+  ##   cwdPosture         ← ctx.spec.chdirIntoScratch AND ctx.spec.tmpdir
+  ##                        (r57, CONFIRMED High; r75 (code-review) widened
+  ##                        the fold from the bare flag to the EFFECTIVE
+  ##                        posture): `runner.buildRunChildSpec`'s own `cwd`
+  ##                        computation (runner.nim, "let cwd = if
+  ##                        spec.chdirIntoScratch and outScratchDir.len > 0")
+  ##                        picks the scratch tmpdir only when BOTH hold --
+  ##                        `outScratchDir` is populated iff `spec.tmpdir`
+  ##                        (runner.nim: "if spec.tmpdir: ..." is what sets
+  ##                        it), so `chdirIntoScratch` alone was one conjunct
+  ##                        of the real posture, not the whole of it. Folding
+  ##                        only the bare flag was sound ONLY via
+  ##                        `resolveSandbox`'s own unasserted invariant that
+  ##                        every SandboxSpec it can produce already makes
+  ##                        the two conjuncts agree with the flag alone:
+  ##                        `hlNone` returns both false (its early return
+  ##                        sets neither field, so both default false), and
+  ##                        `hlIsolated`/`hlNetwork` hardcode `tmpdir: true`
+  ##                        -- so `chdirIntoScratch and tmpdir` folds to
+  ##                        EXACTLY `chdirIntoScratch` for every spec
+  ##                        `resolveSandbox` can build (sandbox.nim's only
+  ##                        two return sites; `SandboxSpec(...)` is
+  ##                        constructed nowhere else in src/ except one
+  ##                        unrelated ad-hoc `filterEnv` call in runner.nim
+  ##                        that never reaches this key path). That
+  ##                        invariant held, but nothing asserted it, and a
+  ##                        hand-built SandboxSpec (chdirIntoScratch=true,
+  ##                        tmpdir=false -- unreachable via resolveSandbox
+  ##                        today, but not unreachable BY THE TYPE) would
+  ##                        have folded true here while the child actually
+  ##                        spawns in projectRoot -- a real-vs-keyed posture
+  ##                        mismatch. Folding the conjunction directly makes
+  ##                        the key sound BY CONSTRUCTION rather than by an
+  ##                        invariant elsewhere that nothing enforces. This
+  ##                        is a NO-OP for every currently-reachable spec
+  ##                        (same folded value as before -- no cache
+  ##                        invalidation, no `resultCacheFormatVersion` bump)
+  ##                        -- see `KeyInputs.cwdPosture`'s doc comment
+  ##                        (keys.nim) for the same note on the field itself.
   ##
   ## When an entrypoint has no graph entry (closureHash empty) the inputs
   ## still derive deterministically — but such entrypoints are never
@@ -818,7 +852,7 @@ proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
       limits:             ctx.spec.limits,
       hermeticEnvHash:    ctx.hermeticEnvHash,
       protocolMajor:      ctx.protocolMajor,
-      cwdPosture:         ctx.spec.chdirIntoScratch,  # r57
+      cwdPosture:         ctx.spec.chdirIntoScratch and ctx.spec.tmpdir,  # r57/r75
     )
 
 # ---------------------------------------------------------------------------

@@ -821,6 +821,54 @@ suite "keyOfProc — cwd posture enters soundness key (r57)":
     check k1 == k2   # same posture on both sides must still hit
 
 # ---------------------------------------------------------------------------
+# keyOfProc — cwd posture folds the EFFECTIVE posture, not the bare flag (r75)
+#
+# r57 above folded `spec.chdirIntoScratch` alone. That was sound only via
+# `resolveSandbox`'s own unasserted invariant that every spec it can build
+# already makes `chdirIntoScratch` and `tmpdir` agree (`hlNone`: both
+# false; `hlIsolated`/`hlNetwork`: `tmpdir` hardcoded true) -- because the
+# REAL posture `runner.buildRunChildSpec` computes is
+# `spec.chdirIntoScratch and outScratchDir.len > 0`, and `outScratchDir` is
+# only ever populated when `spec.tmpdir` is set. `resolveSandbox` can never
+# actually produce `chdirIntoScratch=true, tmpdir=false` -- this test
+# hand-builds that combination directly (bypassing resolveSandbox) to prove
+# the fold is sound BY CONSTRUCTION now, not merely by that invariant.
+# ---------------------------------------------------------------------------
+
+suite "keyOfProc — cwd posture folds chdirIntoScratch AND tmpdir (r75)":
+
+  test "chdirIntoScratch=true, tmpdir=false (hand-built, unreachable via resolveSandbox) folds like posture-off":
+    var g = emptyDepGraph()
+    # Hand-built: resolveSandbox can never produce this combination (tmpdir
+    # is hardcoded true on every isolated level) -- start from the real
+    # chdirIntoScratch=true spec (so limits/envAllowlist/netIso all match
+    # what resolveSandbox actually resolves) and force `tmpdir` off by hand,
+    # the one field resolveSandbox itself never lets vary independently.
+    var specConjunctOff = resolveSandbox(hlIsolated, chdirIntoScratch = true)
+    specConjunctOff.tmpdir = false
+    # The genuine posture-off spec, via the real resolveSandbox path.
+    let specPostureOff = resolveSandbox(hlIsolated, chdirIntoScratch = false)
+
+    let pep = PlannedEntrypoint(
+      ep: testEp("tests/unit/test_cwdposture.nim", group = "unit", flags = @[]),
+      edecision: edRunFresh)
+
+    let ctxConjunctOff = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                                    spec = specConjunctOff, parentEnv = @[("HOME", "/root")],
+                                    protocolMajor = 1)
+    let ctxPostureOff = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                                   spec = specPostureOff, parentEnv = @[("HOME", "/root")],
+                                   protocolMajor = 1)
+
+    let kConjunctOff = soundnessKey(keyOfProc(ctxConjunctOff, addr g)(pep))
+    let kPostureOff  = soundnessKey(keyOfProc(ctxPostureOff, addr g)(pep))
+    # ...but tmpdir=false means the child never actually chdirs (no scratch
+    # dir exists to chdir into) -- the EFFECTIVE posture is off, so this
+    # must key IDENTICALLY to the genuine posture-off spec, not to the
+    # posture-on spec (which is what r57's bare-flag fold would have done).
+    check kConjunctOff == kPostureOff
+
+# ---------------------------------------------------------------------------
 # realSeams — explain-miss sidecar (RFC-0005 B1b)
 # ---------------------------------------------------------------------------
 ##

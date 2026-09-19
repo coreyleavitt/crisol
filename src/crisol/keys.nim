@@ -96,6 +96,20 @@ type KeyInputs* = object
     ## constant produced a BYTE-IDENTICAL SoundnessKey, so a relative-path
     ## test whose behavior depends on cwd could serve a cdmHit computed
     ## under the OTHER posture -- a cached false pass.
+    ##
+    ## r75 (code-review): the CALLER (cachedispatch.keyInputsFromRunPlan)
+    ## must fold `spec.chdirIntoScratch AND spec.tmpdir`, never
+    ## `chdirIntoScratch` alone -- `outScratchDir` above is populated only
+    ## when `spec.tmpdir` is set (runner.nim), so the flag alone is just one
+    ## conjunct of the real posture, not the posture itself. The two
+    ## conjuncts happen to agree for every spec `sandbox.resolveSandbox` can
+    ## build today (`hlNone`: both false; `hlIsolated`/`hlNetwork`: `tmpdir`
+    ## hardcoded true), so this field's OWN documented meaning ("the actual
+    ## cwd the child is spawned with depends on this boolean") already
+    ## implicitly meant the conjunction -- see the fold site's own comment
+    ## (cachedispatch.nim) for why binding it there, not here, keeps the
+    ## soundness invariant enforced by construction rather than by an
+    ## unasserted fact about `resolveSandbox`'s current two return shapes.
 
 # ---------------------------------------------------------------------------
 # Internal: chain a single component into a running FNV-1a state.

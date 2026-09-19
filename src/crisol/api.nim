@@ -469,8 +469,15 @@ type
     ## unchanged. There is nothing left to keep in sync by hand.
     ##
     ## `plan`/`status`/`exitCode`/`error`/`zeroRunnableReason`/
-    ## `verifyDivergences`/`verifyCouldNotReexec` stay real fields below —
-    ## `doc` carries none of them, so they are genuinely NOT duplicates.
+    ## `verifyDivergences`/`verifyCouldNotReexec` stay real fields below.
+    ## r78 (code-review): `verifyDivergences` is the ONE exception to "doc
+    ## carries none of them" — `doc.verifyFails` (jsonout.RunDocument) is
+    ## `verifyDivergences.len`, a derived int, not a second copy of the
+    ## `seq[VerifyDivergence]` itself. The single sync point is the
+    ## `doc.verifyFails = verifyDivergences.len` assignment below, in this
+    ## proc, once `verifyDivergences` is known (see the comment there) —
+    ## there is nothing else to keep in sync by hand. `verifyCouldNotReexec`
+    ## has no doc counterpart at all, so it alone is genuinely unduplicated.
     plan*:              PlanReport
     status*:            RunStatus
     exitCode*:          int   ## ALWAYS set: 0/1 (rsOk), 3 (rsStructural; 2 internal), 128+n (rsInterrupted)
@@ -792,6 +799,38 @@ proc pairVerifySamples*(entrypoints: seq[PlannedEntrypoint]; indices: seq[int];
     pending[key] = ids
     result.add (storedIdx: i, fresh: fresh)
 
+proc warnStderr(msg: string) =
+  ## r62 (code-review): `runTestsWith`'s documented contract is "never
+  ## raises for expected conditions" -- but a bare `stderr.write` for an
+  ## expected-condition warning is ITSELF an unguarded raise site (e.g.
+  ## `crisol run 2>&-` closes stderr; any write to it then raises IOError).
+  ## r16 already fixed the ONE call site that mattered most at the time
+  ## (persistLastRun's own warning, inside `runTestsWith`'s outer try/finally)
+  ## with this exact discard-on-CatchableError idiom; r62 found two MORE
+  ## sites in `runTestsWith` itself reached while the advisory lock is held
+  ## with no enclosing guard:
+  ##   1. the MinSafeRlimitAs warning (r18) -- BEFORE `runTestsWith`'s first
+  ##      `try`, so an unguarded raise there both escapes `runTestsWith` AND
+  ##      leaks the advisory lock for the rest of the host process's
+  ##      lifetime (no `finally` covers that span at all).
+  ##   2. the unconditional per-tier error warning (the `erroredTiers` loop)
+  ##      -- inside the try/finally, so `releaseLock` still runs, but the
+  ##      raise still escapes `runTestsWith`, the same "never raises for
+  ##      expected conditions" contract violation.
+  ## r74 (code-review): hoisted from just above `runTestsWith` (its original
+  ## home) to HERE, above `verifyCachePass` -- that proc's own four warning
+  ## sites (below) run with the advisory lock held for exactly the same
+  ## reason r62's two sites did (verifyCachePass is called strictly between
+  ## `persistLastRun` and `releaseLock` -- see its own doc comment), but
+  ## until now they were bare `stderr.write` calls because `warnStderr`
+  ## textually followed `verifyCachePass` in this file and so was not yet in
+  ## scope at its call sites. Named once here (6+ call sites total across
+  ## this module now) rather than repeating the try/except at each.
+  try:
+    stderr.write(msg)
+  except CatchableError:
+    discard
+
 type
   VerifyPassResult* = tuple
     divergences:    seq[VerifyDivergence]
@@ -812,13 +851,22 @@ type
     ## `ExecuteReport.interrupted` is what distinguishes this from ordinary
     ## completion — lands here too, same "infrastructure gap, not a
     ## divergence" treatment.
+    ##
+    ## r74 (code-review): this branch was DEAD from r63 until now —
+    ## `verifyCachePass`'s sub-run always called `execute()` with
+    ## `installSignals` omitted (`false` by default), so `execReport.
+    ## interrupted` could never actually become true and a Ctrl-C during a
+    ## verify pass killed the process outright instead of landing here.
+    ## r74 threads `installSignals` into the sub-run (see `verifyCachePass`'s
+    ## own doc comment) so this is now a genuinely reachable outcome.
 
 proc verifyCachePass*(results: seq[EntrypointResult];
                      entrypoints: seq[PlannedEntrypoint];
                      vc: VerifyCache; config: Config; graph: var DepGraph;
                      nimVersion, ccVersion: string;
                      sandboxSpec: SandboxSpec;
-                     sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]()
+                     sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
+                     installSignals: bool = false
                      ): VerifyPassResult =
   ## The --verify-cache determinism backstop (RFC-0005 §Stage B). Samples
   ## this run's `cdmHit` entries (seeded sampler, B3a `sampleHitIndices`),
@@ -833,6 +881,22 @@ proc verifyCachePass*(results: seq[EntrypointResult];
   ##      --order/perf-check/--shard ledger history.
   ##   3. Verify results are returned HERE, never merged into the caller's
   ##      `results` / `RunReport.results`.
+  ##
+  ## `installSignals` (r74, code-review): threaded straight into this
+  ## sub-run's OWN `execute()` call, same as `runTestsWith`'s call to
+  ## `execute()` for the main run threads `opts.installSignals` (rfc-0007
+  ## A2b: each `execute()` call owns its own per-call `Supervisor`). Before
+  ## this fix it was always omitted (`execute`'s own `installSignals: bool =
+  ## false` default), so `execReport.interrupted` below was CONSTANT false
+  ## and its whole handling branch was dead code -- by the time this pass
+  ## runs, the MAIN run's `Supervisor` has already been torn down (its
+  ## signal handlers restored), so a Ctrl-C arriving during a verify sub-run
+  ## used to kill the process outright with no report at all, rather than
+  ## landing as a graceful interrupt attributed to `couldNotReexec` like any
+  ## other verify-infrastructure gap. `runTestsWith`'s call site passes
+  ## `opts.installSignals` here -- the SAME source its own main-run `execute`
+  ## call already uses -- so a verify pass installs signals iff the run that
+  ## contains it does.
   ##
   ## Caller contract: must be invoked AFTER `persistLastRun` and BEFORE
   ## `releaseLock` — the binary precondition (`cdmHit` this run implies
@@ -864,15 +928,15 @@ proc verifyCachePass*(results: seq[EntrypointResult];
   # `runTestsWith` entirely) fell through to `sampleHitIndices`'s `pct<=0`
   # arm unresolved — `enabled: true` but an ALWAYS-EMPTY sample: no
   # re-execution, no warning, no error, just a silently inert verify pass.
-  # Resolving -1 here against `config.verifyCachePct` (the SAME config-file
-  # fallback `planImpl`'s merge chain, r29, already applies for the CLI/
-  # library facade — see `RunOptions.rlimits`-style precedence elsewhere in
-  # this module) means `verifyCachePass(vc = verifySample())` and
-  # `runTests(opts.verifyCache = verifySample())` now behave IDENTICALLY —
-  # covering the "unset" meaning wherever a caller asks for it, with one
-  # resolution point instead of two (`runTestsWith`'s own call site used to
-  # resolve it a second time; that has been simplified to a plain
-  # pass-through — see the comment there).
+  # Resolving -1 here against `config.verifyCachePct` (loadConfig's plain
+  # config-file default — r76 (code-review) deleted the second, dead
+  # resolution point `planImpl` used to write into that same field, so this
+  # is now genuinely the ONLY place --verify-cache-pct is resolved) means
+  # `verifyCachePass(vc = verifySample())` and `runTests(opts.verifyCache =
+  # verifySample())` now behave IDENTICALLY — covering the "unset" meaning
+  # wherever a caller asks for it, with exactly one resolution point
+  # (`runTestsWith`'s own call site passes `opts.verifyCache` straight
+  # through unmodified — see the comment there).
   let effectivePct = if vc.pct < 0: config.verifyCachePct else: vc.pct
 
   let decisions = results.mapIt(it.cacheDecision)
@@ -892,6 +956,7 @@ proc verifyCachePass*(results: seq[EntrypointResult];
       onResult     = noopResult,
       failFast     = false,
       showProgress = false,
+      installSignals = installSignals,  # r74
       cache        = cacheDisabled(sandboxSpec),
       recordLedger = false,
     )
@@ -900,7 +965,7 @@ proc verifyCachePass*(results: seq[EntrypointResult];
     # (CrisolError is-a Exception — one branch covers both): an unrelated
     # verify-pass failure must never take down an otherwise-successful main
     # run's real results.
-    stderr.write("crisol: warning: --verify-cache pass failed: " & e.msg & "\n")
+    warnStderr("crisol: warning: --verify-cache pass failed: " & e.msg & "\n")
     return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
 
   # r63 (code-review): pair by IDENTITY (pairVerifySamples), never by
@@ -924,7 +989,7 @@ proc verifyCachePass*(results: seq[EntrypointResult];
     for i in indices:
       if i notin pairedIdx:
         result.couldNotReexec.add results[i].ep
-        stderr.write("crisol: warning: --verify-cache could not re-execute " &
+        warnStderr("crisol: warning: --verify-cache could not re-execute " &
                      string(results[i].ep.tp.display()) &
                      " (verify sub-run was interrupted before reporting a " &
                      "result); not counted as a divergence\n")
@@ -950,7 +1015,7 @@ proc verifyCachePass*(results: seq[EntrypointResult];
     # ran, so it is reported in its own category instead.
     if freshExit.isNone:
       result.couldNotReexec.add stored.ep
-      stderr.write("crisol: warning: --verify-cache could not re-execute " &
+      warnStderr("crisol: warning: --verify-cache could not re-execute " &
                    string(stored.ep.tp.display()) & " (verify sub-run phase: " &
                    $fresh.run.kind & "); not counted as a divergence\n")
       try: stderr.flushFile() except CatchableError: discard
@@ -975,7 +1040,7 @@ proc verifyCachePass*(results: seq[EntrypointResult];
     var what: seq[string]
     if exitDiverged: what.add "exit"
     if recDiverged:  what.add "records"
-    stderr.write("crisol: warning: --verify-cache divergence for " &
+    warnStderr("crisol: warning: --verify-cache divergence for " &
                  string(stored.ep.tp.display()) & " (" & what.join(", ") &
                  " diverged from the cached result)\n")
     try: stderr.flushFile() except CatchableError: discard
@@ -1096,16 +1161,16 @@ proc planImpl(opts: RunOptions): PlanImplResult =
   if opts.jobs > 0:        cfg.jobs        = opts.jobs
   if opts.timeoutSecs > 0: cfg.timeoutSecs = opts.timeoutSecs
   if opts.retries >= 0:    cfg.retries     = opts.retries  # B1: -1 = use config
-  # RFC-0005 B3c code-review r29: --verify-cache-pct's config-file fallback,
-  # same "-1 = use config" sentinel shape as retries above (pct == 0 is a
-  # legitimate explicit "disable sampling" value, so it cannot double as the
-  # sentinel). Gated on enabled since a disabled VerifyCache's pct is inert.
-  # cfg.verifyCachePct is already the config-file default from loadConfig
-  # above; this is the ONLY place --verify-cache-pct is resolved now — the
-  # CLI no longer does a second loadConfig peek, so library callers get this
-  # fallback too.
-  if opts.verifyCache.enabled and opts.verifyCache.pct >= 0:
-    cfg.verifyCachePct = opts.verifyCache.pct
+  # RFC-0005 B3c code-review r29 (superseded by r76): this arm used to write
+  # opts.verifyCache.pct into cfg.verifyCachePct here as a SECOND resolution
+  # point for --verify-cache-pct. r76 (code-review) deleted it: grep-verified
+  # dead on arrival -- cfg.verifyCachePct's only reader is verifyCachePass's
+  # `effectivePct` (below in this module), which ignores cfg.verifyCachePct
+  # entirely whenever `vc.pct >= 0`, exactly the condition this write
+  # required to fire before it could matter. cfg.verifyCachePct now carries
+  # only loadConfig's plain config-file default all the way through; see
+  # verifyCachePass's own `effectivePct` comment for the (now genuinely
+  # single) resolution point.
   # RFC-0006 M-artifact-identity PASS (b2): CLI/library --measure-compile-reuse
   # can only strengthen a config-file setting (true wins), mirroring perfCheckForce.
   if opts.measureCompileReuse: cfg.measureCompileReuse = true
@@ -1474,29 +1539,6 @@ proc productionCacheDeps*(): CacheDeps =
                               trackedRoots: TrackedRoots): CacheRuntime =
     configuredCache(cfg, stateDir, maxEntries, productionRegistry(), resolvedSecrets,
                     NilSink[TelemetryEvent](), trackedRoots))
-
-proc warnStderr(msg: string) =
-  ## r62 (code-review): `runTestsWith`'s documented contract is "never
-  ## raises for expected conditions" -- but a bare `stderr.write` for an
-  ## expected-condition warning is ITSELF an unguarded raise site (e.g.
-  ## `crisol run 2>&-` closes stderr; any write to it then raises IOError).
-  ## r16 already fixed the ONE call site that mattered most at the time
-  ## (persistLastRun's own warning, inside the outer try/finally below) with
-  ## this exact discard-on-CatchableError idiom; r62 found two MORE sites
-  ## reached while the advisory lock is held with no enclosing guard:
-  ##   1. the MinSafeRlimitAs warning (r18) -- BEFORE the first `try` in
-  ##      this proc, so an unguarded raise there both escapes `runTestsWith`
-  ##      AND leaks the advisory lock for the rest of the host process's
-  ##      lifetime (no `finally` covers that span at all).
-  ##   2. the unconditional per-tier error warning (the `erroredTiers` loop)
-  ##      -- inside the try/finally, so `releaseLock` still runs, but the
-  ##      raise still escapes this proc, violating the same "never raises
-  ##      for expected conditions" contract.
-  ## Named here (2+ call sites) rather than repeating the try/except at each.
-  try:
-    stderr.write(msg)
-  except CatchableError:
-    discard
 
 # ---------------------------------------------------------------------------
 # runTestsWith — full run facade; catches-and-encodes structural failures.
@@ -2024,18 +2066,24 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # the round-1 `verifyCachePass*` back-compat wrapper that hid this tuple
     # behind a `seq[VerifyDivergence]`-only return is deleted (R2-D2: it had
     # no compat obligation and zero production callers).
-    # r29/r67: `opts.verifyCache.pct` may still be the -1 "no override"
-    # sentinel here — `verifyCachePass` now resolves it ITSELF against
-    # `cfg.verifyCachePct` (the ONE resolution point, r67 — see that
+    # r29/r67 (r76: comment corrected -- planImpl no longer touches
+    # cfg.verifyCachePct at all, see that arm's own deletion comment):
+    # `opts.verifyCache.pct` may still be the -1 "no override" sentinel
+    # here — `verifyCachePass` resolves it ITSELF against
+    # `cfg.verifyCachePct` (the ONE resolution point, r67/r76 — see that
     # proc's own doc comment), so this call site passes `opts.verifyCache`
     # straight through unmodified rather than pre-resolving a second copy.
-    # `cfg.verifyCachePct` was already settled by `planImpl`'s merge chain
-    # above (an explicit CLI/library pct folded in when set, else the
-    # config-file default) before `verifyCachePass` ever sees it.
+    # `cfg.verifyCachePct` carries only loadConfig's plain config-file
+    # default by the time `verifyCachePass` sees it.
+    # r74: `installSignals = opts.installSignals` -- the SAME source the
+    # main run's own `execute()` call above already threads, so a verify
+    # sub-run installs signals (and can therefore be genuinely interrupted)
+    # iff the run containing it does. See verifyCachePass's own doc comment.
     let verifyPassResult =
       if opts.verifyCache.enabled and not interrupted:
         verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
-                        nimVer, ccVer, spec, cacheCtx.sink)
+                        nimVer, ccVer, spec, cacheCtx.sink,
+                        installSignals = opts.installSignals)
       else: (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
     let verifyDivergences    = verifyPassResult.divergences
     let verifyCouldNotReexec = verifyPassResult.couldNotReexec
@@ -2083,6 +2131,10 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # the two facts that were temporally unavailable until this point (see
     # RunDocument's/persistLastRun's own doc comments for why) so `RunReport.
     # doc` below is the COMPLETE record, not the partial one persistLastRun saw.
+    # r78 (code-review): this is the SOLE sync point between `verifyDivergences`
+    # (the real field, RunReport's own doc comment above) and `doc.verifyFails`
+    # (its derived int projection) -- see that comment for why this one
+    # assignment is not a second copy of the same fact.
     doc.verifyFails = verifyDivergences.len
     doc.cacheStats  = cacheStats
 
