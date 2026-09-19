@@ -1938,7 +1938,7 @@ proc execute*(
     plan:               p,
     maxOutputBytes:     maxOutputBytes,
     compileTimeoutMs:   compileTimeoutMs,
-    projectRoot:        config.projectRoot.absolutePath.normalizedPath,
+    projectRoot:        config.projectRoot.absolutePath.normalizedPath,  # canon-ok: the run's SINGLE canonical derivation (r65) -- every other site reads ctx.projectRoot
     toolchainFp:        toolchainFp,
     dupSlugs:           dupSlugs,
   )
