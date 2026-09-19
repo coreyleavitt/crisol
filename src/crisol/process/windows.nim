@@ -363,6 +363,25 @@ proc setConsoleCtrlHandler(handlerRoutine: ConsoleCtrlHandlerProc;
 
 var gShutdownEventHandle {.global.}: Handle = 0
 var gShutdownSignum {.global.}: int32 = 0
+var gCtrlHandlerInstalled {.global.}: bool = false
+  ## r69: tracks whether `SetConsoleCtrlHandler(ctrlHandlerProc, 1)` is
+  ## CURRENTLY installed, process-wide — `ctrlHandlerProc` is a fixed
+  ## function pointer, not per-Supervisor state, so (unlike
+  ## `gShutdownEventHandle`, which changes value per instance) there is no
+  ## natural per-call token to compare against; this flag is that token.
+  ## Read/written only alongside `gShutdownEventHandle` (same
+  ## `installSignals` gate in `initSupervisor`, same ownership check in
+  ## `=destroy`) — install is idempotent (a second `initSupervisor` call
+  ## while a handler is already installed skips re-adding: Win32 does not
+  ## document repeated `TRUE` adds of the SAME function pointer as a no-op,
+  ## so guarding here avoids relying on that undocumented behavior), and
+  ## removal only fires from the Supervisor that currently "owns" the
+  ## global signal wakeup — mirrors posixcore's `subreaperSet` cleanup
+  ## rule in spirit ("clear only what THIS teardown is responsible for"),
+  ## adapted to this file's existing single-owner-token shape since
+  ## install/remove here are tied 1:1 to the SAME `gShutdownEventHandle`
+  ## ownership the ctrl handler's own callback depends on (`setEvent`
+  ## targets whatever `gShutdownEventHandle` currently is).
 
 proc ctrlHandlerProc(dwCtrlType: int32): WINBOOL {.stdcall.} =
   case dwCtrlType
@@ -429,6 +448,20 @@ proc `=destroy`*(sv: var Supervisor) =
       "Supervisor destroyed with live children — stop and reap them first (rfc-0007 §1)"
   if sv.installedSignals and gShutdownEventHandle == sv.shutdownEvent:
     gShutdownEventHandle = 0
+    # r69: remove the console ctrl handler with THIS Supervisor's shutdown
+    # wakeup — before this fix it was installed in `initSupervisor` and
+    # NEVER removed, so after every Supervisor in an embedding host's
+    # process was destroyed, `ctrlHandlerProc` stayed registered and kept
+    # returning 1 (TRUE, "handled") for CTRL_C/CTRL_BREAK forever — the
+    # host's own Ctrl+C stopped terminating the process at all, since a
+    # handler that returns TRUE tells the OS no further handler (including
+    # the default one) runs. Guarded on the SAME ownership check as
+    # `gShutdownEventHandle` above (only the currently-owning Supervisor's
+    # destroy removes it) and on `gCtrlHandlerInstalled` (idempotent-safe:
+    # a no-op if nothing is currently installed).
+    if gCtrlHandlerInstalled:
+      discard setConsoleCtrlHandler(ctrlHandlerProc, 0'i32)
+      gCtrlHandlerInstalled = false
   if sv.shutdownEvent != 0:
     discard closeHandle(sv.shutdownEvent)
   if sv.completionPort != 0:
@@ -441,7 +474,23 @@ proc `=destroy`*(sv: var Supervisor) =
 # required to be present").
 # ---------------------------------------------------------------------------
 
-proc probeJobObjectNesting(): bool =
+proc forceJobNestingIndeterminate(): bool =
+  ## r68 test seam — `CRISOL_FORCE_JOBNESTING_INDETERMINATE`, same shape/doc
+  ## style as caps.nim's `forceNoCgroupKillRequested`
+  ## (`CRISOL_FORCE_NO_CGROUP_KILL`): forces `probeJobObjectNesting` to
+  ## report a machinery failure WITHOUT doing any real I/O, so the
+  ## memo-healing logic below (`cachedCapabilities`) can be exercised
+  ## in-process — a genuine transient `CreateProcessW`/`CreateJobObjectW`
+  ## failure is not reproducible on demand (it needs real commit pressure
+  ## or a broken COMSPEC), but the "never memoise an indeterminate result"
+  ## contract is a pure function of what this probe RETURNS, not of how it
+  ## failed. Read fresh on every call — same as `forcePollRequested` —
+  ## intended to be set before the FIRST `capabilities()`/
+  ## `cachedCapabilities()` call in a process, same caveat as that knob.
+  let v = getEnv("CRISOL_FORCE_JOBNESTING_INDETERMINATE")
+  v.len > 0 and v != "0"
+
+proc probeJobObjectNesting(): Option[bool] =
   ## A REAL, side-effect-contained functional probe: nested Job Objects (a
   ## process already in one Job being assigned to a second) are rejected
   ## pre-Windows-8/Server-2012 and allowed from Windows 8/Server 2012
@@ -450,9 +499,19 @@ proc probeJobObjectNesting(): bool =
   ## process — never this process itself: assigning our own runner process
   ## to a Job we then close would risk killing OURSELVES via
   ## KILL_ON_JOB_CLOSE — and attempt the double-assign. Every handle is
-  ## closed and the child terminated before returning, on every path;
-  ## any unexpected failure degrades to `false`, never raises.
-  result = false
+  ## closed and the child terminated before returning, on every path.
+  ##
+  ## r68: returns a TRI-STATE, not a plain bool — `none` means the probe
+  ## MACHINERY itself failed (CreateProcessW/CreateJobObjectW/the FIRST
+  ## AssignProcessToJobObject — a transient failure under commit pressure,
+  ## a broken COMSPEC, etc.) and says NOTHING about nesting support; the
+  ## caller (`cachedCapabilities`) must NEVER memoise this permanently.
+  ## `some(bool)` means the SECOND AssignProcessToJobObject — the actual
+  ## nesting test — ran and got a genuine, determinate answer (host fact,
+  ## safe to memoise for the process's lifetime): `some(true)` it
+  ## succeeded (nesting supported), `some(false)` it was rejected (the
+  ## real pre-Windows-8-shaped refusal).
+  if forceJobNestingIndeterminate(): return none(bool)
   try:
     let comspec = getEnv("COMSPEC", "cmd.exe")
     var si: STARTUPINFO
@@ -462,21 +521,27 @@ proc probeJobObjectNesting(): bool =
     let flags: int32 = CREATE_SUSPENDED or CREATE_NO_WINDOW
     let ok = createProcessW(nil, cmdWide, nil, nil, 0'i32, flags,
                              nil, nil, si, pi)
-    if ok == 0'i32: return false
+    if ok == 0'i32: return none(bool)          # machinery failure
     defer:
       discard terminateProcess(pi.hProcess, 0)
       discard closeHandle(pi.hThread)
       discard closeHandle(pi.hProcess)
     let job1 = createJobObjectW(nil, nil)
-    if job1 == 0: return false
+    if job1 == 0: return none(bool)            # machinery failure
     defer: discard closeHandle(job1)
-    if assignProcessToJobObject(job1, pi.hProcess) == 0'i32: return false
+    if assignProcessToJobObject(job1, pi.hProcess) == 0'i32:
+      return none(bool)                        # machinery failure (the
+                                                # FIRST assign, to a fresh,
+                                                # not-yet-nested child,
+                                                # should always succeed)
     let job2 = createJobObjectW(nil, nil)
-    if job2 == 0: return false
+    if job2 == 0: return none(bool)            # machinery failure
     defer: discard closeHandle(job2)
-    result = assignProcessToJobObject(job2, pi.hProcess) != 0'i32
+    # THIS is the real nesting test — success or failure here is a
+    # genuine, determinate answer, never machinery noise.
+    some(assignProcessToJobObject(job2, pi.hProcess) != 0'i32)
   except CatchableError:
-    result = false
+    none(bool)   # unexpected exception: machinery failure, indeterminate
 
 proc globalShutdownSignal*(): Option[ShutdownSignal] =
   ## Process-global, level-triggered view of the last shutdown signal the
@@ -489,17 +554,28 @@ proc globalShutdownSignal*(): Option[ShutdownSignal] =
   if s != 0: some(ShutdownSignal(signum: int(s)))
   else: none(ShutdownSignal)
 
-proc probeCapabilities*(): Capabilities =
+proc probeCapabilities*(nesting: Option[bool] = probeJobObjectNesting()): Capabilities =
   ## The raw, seam-free probe — real I/O (a throwaway suspended-process
   ## spawn for `jobObjectNesting`, `GetConsoleCP` for
   ## `ctrlBreakDeliverable`), freely callable, mirrors posixcore.nim's
   ## `probeCapabilities`/`cachedCapabilities` split exactly (r26): the raw
   ## probe stays exported and un-memoised; `cachedCapabilities` below is
   ## the memoised wrapper every production call site actually uses.
+  ##
+  ## r68: `nesting` takes the ALREADY-TRI-STATED `probeJobObjectNesting`
+  ## result rather than a plain bool. The default argument (a fresh
+  ## `probeJobObjectNesting()` call) is re-evaluated on every call that
+  ## omits it, so a bare `probeCapabilities()` still does a genuinely
+  ## fresh, un-memoised nesting probe like before this fix — the parameter
+  ## exists so `cachedCapabilities` can pass in a tri-state result it
+  ## already computed instead of spawning the throwaway process twice.
+  ## `.get(false)` is the field's honest weakest claim on a
+  ## machinery-indeterminate result (`nesting.isNone`): "no capability
+  ## proven", never a raise, never a hidden true.
   Capabilities(
     pidfd: false, subreaper: false, cgroupDelegation: false, cgroupKill: false,
     memoryPeak: false, kqueue: false,
-    jobObjectNesting: probeJobObjectNesting(),   # real probe
+    jobObjectNesting: nesting.get(false),
     ctrlBreakDeliverable: getConsoleCP() != 0'i32,  # real probe
     flock: false,       # POSIX-named mechanism; Windows uses LockFileEx (A4/D2)
     wait4Rusage: false, # POSIX-named mechanism; this backend gets rusage via
@@ -508,20 +584,60 @@ proc probeCapabilities*(): Capabilities =
   )
 
 var capabilitiesMemo: Option[Capabilities] = none(Capabilities)
+var jobNestingMemo: Option[bool] = none(bool)
+  ## r68: a SEPARATE, tri-state-aware memo for `jobObjectNesting` alone.
+  ## `capabilitiesMemo` freezes the WHOLE record after the first probe —
+  ## correct for every other field, but wrong for this one: before this
+  ## fix, a single transient probe-machinery failure (a `CreateProcessW`
+  ## that failed under commit pressure, a broken COMSPEC — says nothing
+  ## about nesting) got baked into `capabilitiesMemo` as a permanent
+  ## `false`, and r22's `initSupervisor` gate then raised
+  ## `OSError("host cannot create nested Job Objects")` for the rest of
+  ## the process's life in an embedded host, even once the transient
+  ## condition cleared — pre-r26, every call re-probed and healed; the
+  ## whole-record memo silently regressed that healing.
+  ##
+  ## `none` here means "no GENUINE determination yet" — covers both
+  ## "never probed" and "every attempt so far was machinery-indeterminate"
+  ## — and `cachedCapabilities` re-probes ONLY this field, on every call,
+  ## until a genuine `some(true)`/`some(false)` lands; once it does, it is
+  ## a host/OS-version fact that cannot change mid-process, so it freezes
+  ## forever, exactly like `capabilitiesMemo` does for everything else.
 
 proc cachedCapabilities*(): Capabilities =
-  ## Probed exactly once per process (r26 — mirrors posixcore's
-  ## `cachedCapabilities` idiom): before this fix, `capabilities()` built a
-  ## throwaway Supervisor (CreateEvent + IOCP + the real cmd.exe nesting
-  ## probe) on EVERY call, and `initSupervisor` re-probed eagerly on top of
-  ## that — a normal `crisol run --json` calls `process.capabilities()` at
-  ## least twice (api.nim's `persistLastRun` + the CLI's own emission), so
-  ## the probe (a real process spawn) ran at least 3 times per invocation.
-  ## Every later caller — Supervisor-backed (`initSupervisor`) or not (the
-  ## plan/list CLI path, which never spawns anything) — now reads the SAME
-  ## memoised value.
+  ## Probed exactly once per process for every field EXCEPT
+  ## `jobObjectNesting` (r26 — mirrors posixcore's `cachedCapabilities`
+  ## idiom; r68 carved out the one exception below): before r26,
+  ## `capabilities()` built a throwaway Supervisor (CreateEvent + IOCP +
+  ## the real cmd.exe nesting probe) on EVERY call, and `initSupervisor`
+  ## re-probed eagerly on top of that — a normal `crisol run --json` calls
+  ## `process.capabilities()` at least twice (api.nim's `persistLastRun` +
+  ## the CLI's own emission), so the probe (a real process spawn) ran at
+  ## least 3 times per invocation. Every later caller — Supervisor-backed
+  ## (`initSupervisor`) or not (the plan/list CLI path, which never spawns
+  ## anything) — now reads the SAME memoised value.
+  ##
+  ## r68: `jobObjectNesting` alone is re-probed on every call UNTIL a
+  ## genuine (non-machinery-indeterminate) result lands — see
+  ## `jobNestingMemo`'s comment. Once genuine, it is frozen into
+  ## `capabilitiesMemo` right alongside everything else and this healing
+  ## branch never runs again; the extra probe cost only exists while the
+  ## host is genuinely stuck returning machinery failures, i.e. exactly
+  ## when re-probing (not freezing) is the correct behavior.
   if capabilitiesMemo.isNone:
-    capabilitiesMemo = some(probeCapabilities())
+    let tri = probeJobObjectNesting()
+    if tri.isSome: jobNestingMemo = tri
+    capabilitiesMemo = some(probeCapabilities(tri))
+  elif jobNestingMemo.isNone:
+    let tri = probeJobObjectNesting()
+    if tri.isSome:
+      jobNestingMemo = tri
+      var caps = capabilitiesMemo.get
+      caps.jobObjectNesting = tri.get
+      capabilitiesMemo = some(caps)
+    # else: still machinery-indeterminate — the memoised record's
+    # `jobObjectNesting` already carries the honest-false weakest claim
+    # from the previous attempt; nothing to update, try again next call.
   capabilitiesMemo.get
 
 proc capabilities*(sv: Supervisor): Capabilities =
@@ -557,6 +673,16 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
   ## undiagnosed `oSpawnError` — the exact shape as the closed w1 finding
   ## (the cgroupKill gate): the probe already knew up front, but nothing
   ## consulted it.
+  ##
+  ## r68: this raise fires on a machinery-indeterminate nesting probe too
+  ## (honest weakest claim — `cachedCapabilities()` cannot tell THIS
+  ## caller "try again", only report what it currently knows), but it is
+  ## no longer a life-sentence for the process: `jobNestingMemo` only
+  ## freezes a GENUINE determination, so a later `initSupervisor` call,
+  ## after the transient condition (commit pressure, a broken COMSPEC)
+  ## clears, re-probes and can succeed — restoring the pre-r26 healing
+  ## behavior this finding's header describes, without reintroducing r26's
+  ## per-call probe cost once nesting is genuinely resolved.
   var ev: Handle = 0
   if installSignals:
     ev = createEvent(nil, 1'i32, 0'i32, nil)
@@ -566,7 +692,8 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
   if iocp == 0:
     if ev != 0: discard closeHandle(ev)
     raise newException(OSError, "initSupervisor: CreateIoCompletionPort failed")
-  let caps = cachedCapabilities()   # r26: probed once per process
+  let caps = cachedCapabilities()   # r26: probed once per process (r68: except
+                                     # `jobObjectNesting`, healed until genuine)
   if not caps.jobObjectNesting:
     if ev != 0: discard closeHandle(ev)
     discard closeHandle(iocp)
@@ -579,7 +706,18 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
                        consoleAttached: consoleAttached)
   if installSignals:
     gShutdownEventHandle = ev
-    discard setConsoleCtrlHandler(ctrlHandlerProc, 1'i32)
+    # r69: idempotent-safe — if a handler is already installed (a second
+    # `initSupervisor(installSignals = true)` call in the same process,
+    # e.g. a prior Supervisor still alive, or destroyed without ever
+    # clearing this in a build predating r69's `=destroy` fix), skip the
+    # add. Win32 does not document repeated `TRUE` adds of the SAME
+    # function pointer as a no-op (each may register a SEPARATE list
+    # entry, needing a matching number of `FALSE` removes to fully clear)
+    # — guarding here avoids relying on that undocumented behavior rather
+    # than trying to rely on it.
+    if not gCtrlHandlerInstalled:
+      discard setConsoleCtrlHandler(ctrlHandlerProc, 1'i32)
+      gCtrlHandlerInstalled = true
   result.capsCache = caps
 
 proc capabilities*(): Capabilities =
