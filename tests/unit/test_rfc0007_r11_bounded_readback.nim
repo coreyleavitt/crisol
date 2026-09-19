@@ -23,12 +23,45 @@
 ##      injected deadline, `timedOut == true`, WITHOUT blocking past it —
 ##      proven by an upper-bound wall-clock assertion around the call.
 ##
+## rfc-0007 code-review finding r70 extends this file (per the finding's
+## own instruction: "extend the existing r11 injected-deadline test"):
+## `spawnChild`'s two status-pipe reads (this achieved-bytes readback, and
+## the cgroup-join byte read that follows it) used to each pass
+## `readPipeBounded` a FRESH `statusPipeDeadlineMs` — a doubled budget (up
+## to 2x the documented bound before a doubly-stalled child was ever
+## killed), even though the ORIGINAL r11 doc comment already claimed a
+## single combined total. The fix shares ONE `readDeadline` (computed once
+## before the first read) across both calls via `remainingMs(deadline)`
+## (posixcore.nim, exported for exactly this test) — proven below at the
+## SAME `readPipeBounded`-level seam this file already uses, by simulating
+## spawnChild's own two-call, one-shared-deadline pattern directly (no real
+## fork/exec needed — the property under test is the ARITHMETIC/SHARING,
+## which does not depend on what is on the other end of the pipe).
+##
+## What this file does NOT and cannot prove: `spawnChild`'s actual
+## second-read-timeout KILL behavior (r70 point (c) — a child stalled
+## BETWEEN the two status-pipe writes is now killed via
+## `killStalledPreExecChild`, the exact same teardown the first-read
+## timeout already used, and already NOT independently tested here or
+## anywhere else in this suite even for the first-read case — see the
+## module doc comment above: no pre-fix test exercises `spawnChild`'s live
+## kill path at all, only `readPipeBounded` directly). Reproducing it for
+## real needs an external SIGSTOP delivered to the freshly-forked child
+## strictly between its two pipe writes, which requires a pid this
+## single-threaded caller cannot observe until `spawnChild` itself
+## returns — no seam exists for it short of adding a new injectable-
+## deadline parameter to `spawnChild`'s own public signature (out of
+## scope here). Honestly unpinned at the live-spawn level; covered only by
+## the STRUCTURAL fact that both timeout arms in `spawnChild` now call the
+## exact same `killStalledPreExecChild`, so a fix proven for one arm's
+## code path is definitionally the same code for the other.
+##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_rfc0007_r11_bounded_readback.nim
 
 when defined(posix):
-  import std/[posix, unittest, monotimes, times]
+  import std/[os, posix, unittest, monotimes, times]
   import crisol/process/posixcore
 
   suite "rfc-0007 r11 — readPipeBounded: a normal fast write still succeeds":
@@ -97,6 +130,70 @@ when defined(posix):
       # anywhere close to forever — the old raw `read(2)` loop this
       # replaces would still be blocked here indefinitely.
       check elapsedMs < deadlineMs * 10
+
+  suite "rfc-0007 r70 — spawnChild's shared-budget pattern: two stalled reads share ONE deadline, not two":
+
+    test "both status-pipe reads stalled: total elapsed stays near ONE combined budget, not 2x":
+      ## Mirrors `spawnChild`'s own r70 pattern exactly: ONE `readDeadline`
+      ## computed before the first read, `remainingMs(readDeadline)` (not
+      ## a fresh constant) passed to EACH call. Two independent pipes
+      ## stand in for the two status-pipe reads `spawnChild` actually
+      ## makes on the SAME fd — using two fds here (rather than
+      ## sequencing two reads on one) keeps this test's own plumbing
+      ## simple without changing what's under test: `readPipeBounded`
+      ## does not care which fd it is bounding, only how much budget it
+      ## is handed.
+      var fds1: array[2, cint]
+      var fds2: array[2, cint]
+      doAssert posix.pipe(fds1) == 0
+      doAssert posix.pipe(fds2) == 0
+      let (readFd1, writeFd1) = (fds1[0], fds1[1])
+      let (readFd2, writeFd2) = (fds2[0], fds2[1])
+      defer:
+        discard posix.close(readFd1)
+        discard posix.close(writeFd1)
+        discard posix.close(readFd2)
+        discard posix.close(writeFd2)
+
+      const deadlineMs = 300
+      let readDeadline = getMonoTime() + initDuration(milliseconds = deadlineMs)
+      let start = getMonoTime()
+
+      var buf1: array[5, uint8]
+      let (got1, timedOut1) = readPipeBounded(readFd1, buf1, remainingMs(readDeadline))
+      check timedOut1 == true
+      check got1 == 0
+
+      var buf2: array[1, uint8]
+      let (got2, timedOut2) = readPipeBounded(readFd2, buf2, remainingMs(readDeadline))
+      check timedOut2 == true
+      check got2 == 0
+
+      let elapsedMs = (getMonoTime() - start).inMilliseconds
+      # r70: the fix under test — ONE combined budget across both reads.
+      # The pre-fix shape (each call handed a FRESH `statusPipeDeadlineMs`
+      # constant instead of `remainingMs(readDeadline)`) would take ~2x
+      # `deadlineMs` here. 1.5x leaves headroom for scheduling jitter
+      # while still firmly separating the fixed (~1x) shape from the
+      # doubled-budget bug this closes — the finding's own suggested bound.
+      check elapsedMs < (deadlineMs * 3) div 2
+
+    test "the second call's budget is the REMAINDER of the shared deadline, not a fresh full one":
+      ## Proves `remainingMs` directly, isolated from any actual `poll`/
+      ## `read` timing: after part of the combined budget has already
+      ## elapsed, the remainder handed to a second call is meaningfully
+      ## SMALLER than the original total — never the same constant a
+      ## pre-fix second call would have received unconditionally.
+      const totalMs = 300
+      let readDeadline = getMonoTime() + initDuration(milliseconds = totalMs)
+      os.sleep(150)
+      let remainder = remainingMs(readDeadline)
+      check remainder > 0
+      check remainder < totalMs
+
+    test "remainingMs on an already-passed deadline clamps to 0, never negative":
+      let pastDeadline = getMonoTime() - initDuration(milliseconds = 50)
+      check remainingMs(pastDeadline) == 0
 
   when isMainModule:
     echo "test_rfc0007_r11_bounded_readback: done"
