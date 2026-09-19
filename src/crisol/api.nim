@@ -1651,220 +1651,244 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     releaseLock(lockHandle)
     return structuralResultWithPlan("unexpected error during execute: " & e.msg, 2, pr)
 
-  # RFC-0005 B0/A3c-ii: flush queued remote puts at the end-of-run join
-  # point — after the poll loop drains (execute() just returned), before
-  # persistLastRun (RFC "Deferred remote puts"). `rt.pending` is empty for
-  # the common single-tier (no remote configured) run — `realSeams.store`
-  # only ever queues an entry when a remote tier actually exists — so this
-  # is a no-op there, never touching `drainPending` at all. `rt` is nil only
-  # when `opts.noCache` is set, in which case `rt.pending` is unreachable
-  # (guarded by the same condition here).
-  #
-  # RFC-0005 code-review SO2: `not interrupted` mirrors the `persistLastRun`
-  # gate further down this proc verbatim — an interrupted run's `results`
-  # is an honest PARTIAL set (§2), so queuing MORE network I/O for entries
-  # this run never even finished observing is the wrong thing to do on the
-  # way out, exactly like persisting would be. `abandoned` covers the
-  # OTHER half of SO2: a shutdown signal that arrives DURING this drain
-  # itself, on an otherwise-uninterrupted run (`interrupted == false` —
-  # execute() already returned normally) — `signals.shutdownRequested()` is
-  # the SAME process-global, level-triggered query the plan-time
-  # prefetch/consult loops already use for exactly this "abandon more I/O
-  # on a pending shutdown" purpose (cachetier.nim's own doc comment).
-  # RFC-0009 D4: same construction gate as `rt` above — a degraded run never
-  # built `rt`, so this must stay in lockstep or `rt.pending` dereferences a
-  # nil ref.
-  if not opts.noCache and not cfg.trackedRoots.degraded and not interrupted and rt.pending.len > 0:
-    let flushVerdicts = rt.cache.drainPending(rt.pending, DefaultDeferredPutBudget,
-      abandoned = proc(): bool = signals.shutdownRequested().isSome)
-    for v in flushVerdicts:
-      # Tier "l1" was already accounted for synchronously at finalize
-      # (cachedispatch.realSeams.store's own tekPublish/tekRemoteErr) —
-      # drainPending's full fan-out re-puts to it too (idempotent — last-
-      # writer-wins among validly-attested entries is sound, RFC
-      # "Integrity") but must not be double-counted in telemetry here.
-      if v.tier == "l1": continue
-      if v.verdict == cvOk:
-        rt.sink.emit(TelemetryEvent(kind: tekPublish, publishedTo: v.tier))
-      elif v.verdict in transportVerdicts:
-        rt.sink.emit(TelemetryEvent(kind: tekRemoteErr, putTier: v.tier,
-                                    putVerdict: v.verdict))
-    rt.pending.setLen(0)
+  try:
+    # RFC-0005 B0/A3c-ii: flush queued remote puts at the end-of-run join
+    # point — after the poll loop drains (execute() just returned), before
+    # persistLastRun (RFC "Deferred remote puts"). `rt.pending` is empty for
+    # the common single-tier (no remote configured) run — `realSeams.store`
+    # only ever queues an entry when a remote tier actually exists — so this
+    # is a no-op there, never touching `drainPending` at all. `rt` is nil only
+    # when `opts.noCache` is set, in which case `rt.pending` is unreachable
+    # (guarded by the same condition here).
+    #
+    # RFC-0005 code-review SO2: `not interrupted` mirrors the `persistLastRun`
+    # gate further down this proc verbatim — an interrupted run's `results`
+    # is an honest PARTIAL set (§2), so queuing MORE network I/O for entries
+    # this run never even finished observing is the wrong thing to do on the
+    # way out, exactly like persisting would be. `abandoned` covers the
+    # OTHER half of SO2: a shutdown signal that arrives DURING this drain
+    # itself, on an otherwise-uninterrupted run (`interrupted == false` —
+    # execute() already returned normally) — `signals.shutdownRequested()` is
+    # the SAME process-global, level-triggered query the plan-time
+    # prefetch/consult loops already use for exactly this "abandon more I/O
+    # on a pending shutdown" purpose (cachetier.nim's own doc comment).
+    # RFC-0009 D4: same construction gate as `rt` above — a degraded run never
+    # built `rt`, so this must stay in lockstep or `rt.pending` dereferences a
+    # nil ref.
+    if not opts.noCache and not cfg.trackedRoots.degraded and not interrupted and rt.pending.len > 0:
+      let flushVerdicts = rt.cache.drainPending(rt.pending, DefaultDeferredPutBudget,
+        abandoned = proc(): bool = signals.shutdownRequested().isSome)
+      for v in flushVerdicts:
+        # Tier "l1" was already accounted for synchronously at finalize
+        # (cachedispatch.realSeams.store's own tekPublish/tekRemoteErr) —
+        # drainPending's full fan-out re-puts to it too (idempotent — last-
+        # writer-wins among validly-attested entries is sound, RFC
+        # "Integrity") but must not be double-counted in telemetry here.
+        if v.tier == "l1": continue
+        if v.verdict == cvOk:
+          rt.sink.emit(TelemetryEvent(kind: tekPublish, publishedTo: v.tier))
+        elif v.verdict in transportVerdicts:
+          rt.sink.emit(TelemetryEvent(kind: tekRemoteErr, putTier: v.tier,
+                                      putVerdict: v.verdict))
+      rt.pending.setLen(0)
 
-  # rfc-0007 A6b: the ONE resolved OutcomePolicy for this run, built from
-  # cfg.strictHygiene (CLI flag OR config-file, already merged by planImpl
-  # above) — recomputed at every REPORTING trust boundary from here on
-  # (summarize -> exit code; render/JSON/junit/lastrun.json below via
-  # rr.plan.settings.strictHygiene). RFC-0005 SO1 fix: the cache's SERVE-side
-  # recompute (cachedispatch.lookupAtPlan/consultPostCompile) ALSO reads this
-  # same resolved value now — see the `cacheEnabled(..., outcomePolicy = ...)`
-  # call further up this proc, which builds an equal `OutcomePolicy` from the
-  # same `cfg.strictHygiene` BEFORE `execute()` runs (this `policy` local is
-  # built too late for that call site, hence the duplicate construction, not
-  # a second independent resolution). The STORE gate
-  # (cachedispatch.shouldStore) and live scheduling decisions (retry
-  # eligibility, quarantine matching, ledger rows) still deliberately never
-  # see it — they stay DefaultPolicy (unstrict), matching the cache's
-  # "publishes unstrict" rule (RFC-0007 §2).
-  let policy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene)
-  var s = summarize(results, policy)
-  # rfc-0007 A1e-ii §2: notStarted is bookkeeping about entries OMITTED from
-  # `results` (never a fold over `results` itself), so it is stamped on here
-  # rather than inside summarize().
-  s.notStarted = notStartedCount
+    # rfc-0007 A6b: the ONE resolved OutcomePolicy for this run, built from
+    # cfg.strictHygiene (CLI flag OR config-file, already merged by planImpl
+    # above) — recomputed at every REPORTING trust boundary from here on
+    # (summarize -> exit code; render/JSON/junit/lastrun.json below via
+    # rr.plan.settings.strictHygiene). RFC-0005 SO1 fix: the cache's SERVE-side
+    # recompute (cachedispatch.lookupAtPlan/consultPostCompile) ALSO reads this
+    # same resolved value now — see the `cacheEnabled(..., outcomePolicy = ...)`
+    # call further up this proc, which builds an equal `OutcomePolicy` from the
+    # same `cfg.strictHygiene` BEFORE `execute()` runs (this `policy` local is
+    # built too late for that call site, hence the duplicate construction, not
+    # a second independent resolution). The STORE gate
+    # (cachedispatch.shouldStore) and live scheduling decisions (retry
+    # eligibility, quarantine matching, ledger rows) still deliberately never
+    # see it — they stay DefaultPolicy (unstrict), matching the cache's
+    # "publishes unstrict" rule (RFC-0007 §2).
+    let policy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene)
+    var s = summarize(results, policy)
+    # rfc-0007 A1e-ii §2: notStarted is bookkeeping about entries OMITTED from
+    # `results` (never a fold over `results` itself), so it is stamped on here
+    # rather than inside summarize().
+    s.notStarted = notStartedCount
 
-  # C6: Annotate results with regression info (if perf-check is enabled).
-  # edCached results are excluded (no fresh measurement; never flag a cache hit).
-  # For each fresh result, historyUs = prior durationUs rows from the ledger,
-  # filtering out compileFailed rows and rows from the current run (timestamp >= runStart).
-  if effectivePerfCheck.enabled:
-    let resolvedStateDir = pr.settings.stateDir
-    for i in 0 ..< results.len:
-      let r = results[i]
-      # Skip cached results — no fresh measurement, never flag.
-      if cached(r):
-        continue
-      # Skip compile-failed — no run duration to compare.
-      if outcome(r) == oCompileFailed:
-        continue
-      # Build identity key for this entrypoint. RFC-0009 A5b-ii: routed
-      # through the Entrypoint-keyed overload (ep.tp when populated).
-      let ikey = identityKey(r.ep, cfg.trackedRoots)
-      # Scan the ledger for PRIOR rows (exclude current run by timestamp).
-      let allRows = scanLedger(resolvedStateDir, ikey)
-      var historyUs: seq[int64]
-      for row in allRows:
-        # Exclude current-run rows (appended during execute()).
-        if row.timestamp >= runStartUs:
+    # C6: Annotate results with regression info (if perf-check is enabled).
+    # edCached results are excluded (no fresh measurement; never flag a cache hit).
+    # For each fresh result, historyUs = prior durationUs rows from the ledger,
+    # filtering out compileFailed rows and rows from the current run (timestamp >= runStart).
+    if effectivePerfCheck.enabled:
+      let resolvedStateDir = pr.settings.stateDir
+      for i in 0 ..< results.len:
+        let r = results[i]
+        # Skip cached results — no fresh measurement, never flag.
+        if cached(r):
           continue
-        # Exclude compileFailed rows (their durationUs reflects the compiler, not the run).
-        if row.outcome.startsWith("compileFailed"):
+        # Skip compile-failed — no run duration to compare.
+        if outcome(r) == oCompileFailed:
           continue
-        historyUs.add row.durationUs
-      # Run the pure predicate.
-      let verdict = isRegression(
-        currentUs   = r.durationMs * 1000,  # convert ms → µs for comparison
-        historyUs   = historyUs,
-        k           = effectivePerfCheck.k,
-        sampleFloor = effectivePerfCheck.sampleFloor,
-        absFloorMs  = effectivePerfCheck.absFloorMs,
-      )
-      results[i].regressed      = verdict.regressed
-      results[i].perfBaselineUs = verdict.baselineUs
-      results[i].perfThresholdUs = verdict.thresholdUs
+        # Build identity key for this entrypoint. RFC-0009 A5b-ii: routed
+        # through the Entrypoint-keyed overload (ep.tp when populated).
+        let ikey = identityKey(r.ep, cfg.trackedRoots)
+        # Scan the ledger for PRIOR rows (exclude current run by timestamp).
+        let allRows = scanLedger(resolvedStateDir, ikey)
+        var historyUs: seq[int64]
+        for row in allRows:
+          # Exclude current-run rows (appended during execute()).
+          if row.timestamp >= runStartUs:
+            continue
+          # Exclude compileFailed rows (their durationUs reflects the compiler, not the run).
+          if row.outcome.startsWith("compileFailed"):
+            continue
+          historyUs.add row.durationUs
+        # Run the pure predicate.
+        let verdict = isRegression(
+          currentUs   = r.durationMs * 1000,  # convert ms → µs for comparison
+          historyUs   = historyUs,
+          k           = effectivePerfCheck.k,
+          sampleFloor = effectivePerfCheck.sampleFloor,
+          absFloorMs  = effectivePerfCheck.absFloorMs,
+        )
+        results[i].regressed      = verdict.regressed
+        results[i].perfBaselineUs = verdict.baselineUs
+        results[i].perfThresholdUs = verdict.thresholdUs
 
-  # Persist lastrun.json if requested.
-  # rfc-0007 A1e-ii §2: NEVER on an interrupted run, regardless of
-  # opts.persist (the CLI always passes persist:true) — an entrypoint that
-  # was never observed this run must not silently leave the --failed
-  # selection, so the last COMPLETE run stays the anchor.
-  var compileBlock: JsonNode = nil
-  var reuseAlerts: JsonNode = nil
-  if opts.persist and not interrupted:
-    # RFC-0006 M-report pass (a): the segmented `compile` block
-    # only carries data when the telemetry stream was actually written
-    # this run -- avoids a needless ledger disk scan on every ordinary
-    # (measurement-off) run.
-    compileBlock =
-      if shouldReportCompileBlock(cfg.measureCompileReuse):
-        # M-report PASS (b2): thread the SAME runStartUs perf-check captured
-        # above (before execute() appended this run's rows) into the
-        # compile-cost stream's own current/history split.
-        compilereport.readCompileBlock(pr.settings.stateDir, runStartUs)
-      else: nil
-    # M-report pass (b1): reuse-check alerting is a SEPARATE, default-OFF
-    # surface from the (unconditional) `compile` measurement block itself --
-    # buildReuseAlerts naturally yields an empty array when cfg.reuseCheck is
-    # disabled or compileBlock is nil (measurement off / no telemetry yet).
-    # rfc-0007 W3: hoisted to the outer `reuseAlerts` local (rather than a
-    # block-scoped `let`) so it also reaches RunReport below -- the CLI's
-    # stdout emission needs the exact same value persistLastRun gets.
-    reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
-    persistLastRun(results, s, cfg, warnings = pr.warnings,
-                   memThrottledSlots = memThrottled,
-                   lateOrphansReaped = lateOrphansReaped,
-                   compileBlock = compileBlock,
-                   reuseAlerts = reuseAlerts, policy = policy,
-                   substrate = process.capabilities(),  # rfc-0007 W3
-                   trackedRoots = cfg.trackedRoots)      # rfc-0007 W3
+    # Persist lastrun.json if requested.
+    # rfc-0007 A1e-ii §2: NEVER on an interrupted run, regardless of
+    # opts.persist (the CLI always passes persist:true) — an entrypoint that
+    # was never observed this run must not silently leave the --failed
+    # selection, so the last COMPLETE run stays the anchor.
+    var compileBlock: JsonNode = nil
+    var reuseAlerts: JsonNode = nil
+    if opts.persist and not interrupted:
+      # RFC-0006 M-report pass (a): the segmented `compile` block
+      # only carries data when the telemetry stream was actually written
+      # this run -- avoids a needless ledger disk scan on every ordinary
+      # (measurement-off) run.
+      compileBlock =
+        if shouldReportCompileBlock(cfg.measureCompileReuse):
+          # M-report PASS (b2): thread the SAME runStartUs perf-check captured
+          # above (before execute() appended this run's rows) into the
+          # compile-cost stream's own current/history split.
+          compilereport.readCompileBlock(pr.settings.stateDir, runStartUs)
+        else: nil
+      # M-report pass (b1): reuse-check alerting is a SEPARATE, default-OFF
+      # surface from the (unconditional) `compile` measurement block itself --
+      # buildReuseAlerts naturally yields an empty array when cfg.reuseCheck is
+      # disabled or compileBlock is nil (measurement off / no telemetry yet).
+      # rfc-0007 W3: hoisted to the outer `reuseAlerts` local (rather than a
+      # block-scoped `let`) so it also reaches RunReport below -- the CLI's
+      # stdout emission needs the exact same value persistLastRun gets.
+      reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
+      # rfc-0007 code-review r16: persistLastRun's own documented contract
+      # (jsonout.nim) is "on any failure: prints a warning to stderr and
+      # returns -- never raises" -- but that contract has exactly one gap:
+      # its OWN warning-write can itself raise (e.g. a closed/broken stderr)
+      # at the moment it tries to report an unwritable persist target (full
+      # disk, read-only state dir, a file sitting where lastrun.json's
+      # directory is expected). This proc's own contract ("never raises for
+      # expected conditions... structural problems are encoded in
+      # RunReport.status/.error") means an environmental persist failure
+      # must not escape as a raw exception and blow up an otherwise-complete
+      # run report -- the lock-release half of that guarantee is the outer
+      # `finally` below; this is the "don't raise" half. Best-effort,
+      # matching the discard-on-CatchableError idiom already used for
+      # stderr writes elsewhere in this module (verifyCachePass's own
+      # warnings, above) -- the run still finishes and reports rsOk with
+      # whatever it produced; only the lastrun.json ARTIFACT is missing,
+      # never the run itself.
+      try:
+        persistLastRun(results, s, cfg, warnings = pr.warnings,
+                       memThrottledSlots = memThrottled,
+                       lateOrphansReaped = lateOrphansReaped,
+                       compileBlock = compileBlock,
+                       reuseAlerts = reuseAlerts, policy = policy,
+                       substrate = process.capabilities(),  # rfc-0007 W3
+                       trackedRoots = cfg.trackedRoots)      # rfc-0007 W3
+      except CatchableError as e:
+        try:
+          stderr.write("crisol: warning: could not persist lastrun.json: " & e.msg & "\n")
+        except CatchableError:
+          discard
 
-  # RFC-0005 B3b: the --verify-cache post-run pass. Placement is load-
-  # bearing (RFC "Binary precondition... the pass runs before releaseLock,
-  # after persistLastRun") — strictly AFTER persistLastRun above (so
-  # lastrun.json reflects the main run only; --failed narrowing reads it)
-  # and strictly BEFORE releaseLock below (the stateDir lock is still held,
-  # so `clean` cannot remove the stable binary a sampled `cdmHit` entry's
-  # synthetic plan depends on). Never runs on an interrupted run: a partial
-  # `results`/`pr.entrypoints` pairing would break the index alignment
-  # `buildVerifyPlan`/sampling relies on.
-  # RFC-0005 code-review SO4/R2-D2: calls `verifyCachePass` for its FULL
-  # `VerifyPassResult` (not just `.divergences`) so `couldNotReexec` is
-  # available to thread onto `RunReport` below, alongside `divergences` —
-  # the round-1 `verifyCachePass*` back-compat wrapper that hid this tuple
-  # behind a `seq[VerifyDivergence]`-only return is deleted (R2-D2: it had
-  # no compat obligation and zero production callers).
-  let verifyPassResult =
-    if opts.verifyCache.enabled and not interrupted:
-      verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
-                      nimVer, ccVer, spec, cacheCtx.sink)
-    else: (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
-  let verifyDivergences    = verifyPassResult.divergences
-  let verifyCouldNotReexec = verifyPassResult.couldNotReexec
+    # RFC-0005 B3b: the --verify-cache post-run pass. Placement is load-
+    # bearing (RFC "Binary precondition... the pass runs before releaseLock,
+    # after persistLastRun") — strictly AFTER persistLastRun above (so
+    # lastrun.json reflects the main run only; --failed narrowing reads it)
+    # and strictly BEFORE releaseLock below (the stateDir lock is still held,
+    # so `clean` cannot remove the stable binary a sampled `cdmHit` entry's
+    # synthetic plan depends on). Never runs on an interrupted run: a partial
+    # `results`/`pr.entrypoints` pairing would break the index alignment
+    # `buildVerifyPlan`/sampling relies on.
+    # RFC-0005 code-review SO4/R2-D2: calls `verifyCachePass` for its FULL
+    # `VerifyPassResult` (not just `.divergences`) so `couldNotReexec` is
+    # available to thread onto `RunReport` below, alongside `divergences` —
+    # the round-1 `verifyCachePass*` back-compat wrapper that hid this tuple
+    # behind a `seq[VerifyDivergence]`-only return is deleted (R2-D2: it had
+    # no compat obligation and zero production callers).
+    let verifyPassResult =
+      if opts.verifyCache.enabled and not interrupted:
+        verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
+                        nimVer, ccVer, spec, cacheCtx.sink)
+      else: (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
+    let verifyDivergences    = verifyPassResult.divergences
+    let verifyCouldNotReexec = verifyPassResult.couldNotReexec
 
-  # RFC-0005 B2b: aggregate the run's real telemetry (hit/miss/publish/
-  # remote-error events, PLUS verifyCachePass's tekVerifyFail above, since
-  # both were emitted through the SAME statsSink) against this run's actual
-  # per-result cacheDecisions. A zero-value CacheStats() when statsSink was
-  # never installed (`cfg.cacheStats == false`) -- nothing was collected.
-  # RFC-0005 C-dep rider: paired with cacheTier so the fold can be
-  # tier-granular (l1Hits vs remoteHits) instead of folding every hit into
-  # l1Hits -- see cachetelemetry.DecisionTier / aggregateCacheStats.
-  let cacheStats =
-    if statsSink != nil:
-      aggregateCacheStats(statsSink.events,
-                          results.mapIt((decision: it.cacheDecision, tier: it.cacheTier)))
-    else: CacheStats()
+    # RFC-0005 B2b: aggregate the run's real telemetry (hit/miss/publish/
+    # remote-error events, PLUS verifyCachePass's tekVerifyFail above, since
+    # both were emitted through the SAME statsSink) against this run's actual
+    # per-result cacheDecisions. A zero-value CacheStats() when statsSink was
+    # never installed (`cfg.cacheStats == false`) -- nothing was collected.
+    # RFC-0005 C-dep rider: paired with cacheTier so the fold can be
+    # tier-granular (l1Hits vs remoteHits) instead of folding every hit into
+    # l1Hits -- see cachetelemetry.DecisionTier / aggregateCacheStats.
+    let cacheStats =
+      if statsSink != nil:
+        aggregateCacheStats(statsSink.events,
+                            results.mapIt((decision: it.cacheDecision, tier: it.cacheTier)))
+      else: CacheStats()
 
-  # RFC-0005 B2b/L2: "crisol additionally writes a stderr warning when a
-  # configured remote tier errored on every call in a run" (RFC "Hit-rate
-  # telemetry") is UNCONDITIONAL, per the RFC's own wording -- not gated on
-  # --cache-stats. `warnSink` (built above) always has real events
-  # regardless of `cfg.cacheStats`, so this loop is no longer conditional
-  # on `statsSink`. Unconditional stderr like every other warning in this
-  # codebase (no --quiet exists) — writes to stderr in BOTH --json and
-  # human modes (run/v2 owns stdout in --json mode). See
-  # cachetelemetry.erroredTiers's doc for the scope note on "remote" vs.
-  # today's single "l1" tier. When --cache-stats IS on, `warnSink` and
-  # `statsSink` are the SAME `InMemorySink` instance (see `warnSink`'s own
-  # doc comment above) — this fold sees the SAME event list `cacheStats`
-  # above was aggregated from, never a second, independently-collected
-  # copy, so a tripped tier is reported here exactly once.
-  for terr in erroredTiers(warnSink.events):
-    stderr.write("crisol: warning: " & tierErrorWarning(terr) & "\n")
+    # RFC-0005 B2b/L2: "crisol additionally writes a stderr warning when a
+    # configured remote tier errored on every call in a run" (RFC "Hit-rate
+    # telemetry") is UNCONDITIONAL, per the RFC's own wording -- not gated on
+    # --cache-stats. `warnSink` (built above) always has real events
+    # regardless of `cfg.cacheStats`, so this loop is no longer conditional
+    # on `statsSink`. Unconditional stderr like every other warning in this
+    # codebase (no --quiet exists) — writes to stderr in BOTH --json and
+    # human modes (run/v2 owns stdout in --json mode). See
+    # cachetelemetry.erroredTiers's doc for the scope note on "remote" vs.
+    # today's single "l1" tier. When --cache-stats IS on, `warnSink` and
+    # `statsSink` are the SAME `InMemorySink` instance (see `warnSink`'s own
+    # doc comment above) — this fold sees the SAME event list `cacheStats`
+    # above was aggregated from, never a second, independently-collected
+    # copy, so a tripped tier is reported here exactly once.
+    for terr in erroredTiers(warnSink.events):
+      stderr.write("crisol: warning: " & tierErrorWarning(terr) & "\n")
 
-  releaseLock(lockHandle)
-
-  # rfc-0007 A1e-ii: an interrupted run still returns through this ONE
-  # normal-return path (no more early exception-driven return above) — only
-  # the status/exitCode/interrupted trio differ; results/summary already
-  # carry §2's honest partial emission set.
-  RunReport(
-    plan:              pr,
-    summary:           s,
-    results:           results,
-    memThrottledSlots: memThrottled,
-    lateOrphansReaped: lateOrphansReaped,
-    status:            if interrupted: rsInterrupted else: rsOk,
-    exitCode:          if interrupted: 128 + shutdownSignum
-                        else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
-    compileBlock:      compileBlock,
-    reuseAlerts:       reuseAlerts,  # rfc-0007 W3
-    interrupted:       interrupted,
-    verifyDivergences: verifyDivergences,
-    verifyCouldNotReexec: verifyCouldNotReexec,  # RFC-0005 code-review SO4
-    cacheStats:        cacheStats,  # RFC-0005 B2b
-    trackedRoots:      cfg.trackedRoots,  # RFC-0009 A2
-  )
+    # rfc-0007 A1e-ii: an interrupted run still returns through this ONE
+    # normal-return path (no more early exception-driven return above) — only
+    # the status/exitCode/interrupted trio differ; results/summary already
+    # carry §2's honest partial emission set.
+    return RunReport(
+      plan:              pr,
+      summary:           s,
+      results:           results,
+      memThrottledSlots: memThrottled,
+      lateOrphansReaped: lateOrphansReaped,
+      status:            if interrupted: rsInterrupted else: rsOk,
+      exitCode:          if interrupted: 128 + shutdownSignum
+                          else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
+      compileBlock:      compileBlock,
+      reuseAlerts:       reuseAlerts,  # rfc-0007 W3
+      interrupted:       interrupted,
+      verifyDivergences: verifyDivergences,
+      verifyCouldNotReexec: verifyCouldNotReexec,  # RFC-0005 code-review SO4
+      cacheStats:        cacheStats,  # RFC-0005 B2b
+      trackedRoots:      cfg.trackedRoots,  # RFC-0009 A2
+    )
+  finally:
+    releaseLock(lockHandle)
 
 # ---------------------------------------------------------------------------
 # runTests — the public, opts-only facade (RFC-0005 A3b)
