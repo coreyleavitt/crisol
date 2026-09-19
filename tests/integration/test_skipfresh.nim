@@ -80,7 +80,7 @@ suite "skip-fresh — compile avoidance integration":
 
     let results = execute(p, config = cfg, graph = graph,
                           nimVersion = "",
-                          showProgress = false)
+                          showProgress = false).results
     check results.len == 1
     check results[0].outcome == oPassed
     check results[0].compileSkipped == false
@@ -105,7 +105,7 @@ suite "skip-fresh — compile avoidance integration":
     let p1 = plan(cfg, @[ep], graph1, "", false)
     let results1 = execute(p1, config = cfg, graph = graph1,
                            nimVersion = "",
-                           showProgress = false)
+                           showProgress = false).results
     check results1.len == 1
     check results1[0].outcome == oPassed
 
@@ -121,7 +121,7 @@ suite "skip-fresh — compile avoidance integration":
 
     let results2 = execute(p2, config = cfg, graph = graph2Mut,
                            nimVersion = "",
-                           showProgress = false)
+                           showProgress = false).results
     check results2.len == 1
     check results2[0].outcome == oPassed
     check results2[0].compileSkipped == true
@@ -139,7 +139,7 @@ suite "skip-fresh — compile avoidance integration":
     let p1 = plan(cfg, @[ep], graph1, "", false)
     let results1 = execute(p1, config = cfg, graph = graph1,
                            nimVersion = "",
-                           showProgress = false)
+                           showProgress = false).results
     check results1[0].outcome == oPassed
 
     # Run 2 with forceCompile=true: must be cdStale (not cdSkipFresh).
@@ -151,7 +151,7 @@ suite "skip-fresh — compile avoidance integration":
 
     let results2 = execute(p2, config = cfg, graph = graph2Mut,
                            nimVersion = "",
-                           showProgress = false)
+                           showProgress = false).results
     check results2.len == 1
     check results2[0].outcome == oPassed
     check results2[0].compileSkipped == false
@@ -173,7 +173,7 @@ suite "skip-fresh — compile avoidance integration":
     var graph1 = initDepGraph("")
     let p1 = plan(cfg, @[ep1], graph1, "", false)
     let r1 = execute(p1, config = cfg, graph = graph1,
-                     nimVersion = "", showProgress = false)
+                     nimVersion = "", showProgress = false).results
     check r1[0].outcome == oPassed
 
     # Run 2: ep1 should be fresh, ep2 should be never-built.
@@ -184,7 +184,7 @@ suite "skip-fresh — compile avoidance integration":
     check p2.entrypoints[1].edecision == edNeverBuilt
 
     let r2 = execute(p2, config = cfg, graph = graph2Mut,
-                     nimVersion = "", showProgress = false)
+                     nimVersion = "", showProgress = false).results
     check r2.len == 2
     check r2[0].outcome == oPassed
     check r2[0].compileSkipped == true

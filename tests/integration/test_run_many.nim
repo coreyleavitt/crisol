@@ -128,7 +128,7 @@ suite "execute — continue-on-failure aggregation":
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g)
+    let results = execute(p, config = cfg, graph = g).results
     check results.len == 2
     for r in results:
       check outcome(r) == oPassed
@@ -155,7 +155,7 @@ suite "execute — continue-on-failure aggregation":
     proc onR(r: EntrypointResult) = inc callbackFired
 
     var g = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g, onResult = onR)
+    let results = execute(p, config = cfg, graph = g, onResult = onR).results
 
     # All three entrypoints must have produced a result — continue-on-failure.
     check results.len == 3
@@ -189,7 +189,7 @@ suite "execute — continue-on-failure aggregation":
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g)
+    let results = execute(p, config = cfg, graph = g).results
     check results.len == 2
     let s = summarize(results)
     check s.total  == 2

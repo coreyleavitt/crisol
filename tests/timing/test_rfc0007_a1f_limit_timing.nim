@@ -65,7 +65,7 @@ when defined(posix):
       var g = emptyDepGraph()
       let spec = resolveSandbox(level = hlIsolated,
         rlimits = RlimitOverrides(limitCpu: some(1'i64)))
-      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec))
+      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec)).results
 
       check results.len == 1
       check results[0].run.kind == ptypes.pkRan
@@ -107,9 +107,11 @@ when defined(posix):
         discard kill(myPid, SIGINT)
         exitnow(0)
 
-      var interrupted = false
-      let results = execute(p, config = cfg, graph = g, interruptedOut = addr interrupted,
-                            installSignals = true)
+      # rfc-0007 code-review r7: `interruptedOut` ptr param is gone — read
+      # `.interrupted`/`.results` off the returned ExecuteReport instead.
+      let execReport = execute(p, config = cfg, graph = g, installSignals = true)
+      let interrupted = execReport.interrupted
+      let results     = execReport.results
 
       var ws: cint = 0
       discard waitpid(watcherPid, ws, 0)

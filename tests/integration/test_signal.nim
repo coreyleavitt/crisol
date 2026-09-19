@@ -118,18 +118,19 @@ when defined(posix):
         try:
           var g = emptyDepGraph()
           # rfc-0007 A1e-ii: CrisolInterrupted is retired — execute() returns
-          # NORMALLY on SIGINT/SIGTERM now; `interruptedOut` is the real signal.
+          # NORMALLY on SIGINT/SIGTERM now; `.interrupted` on the returned
+          # ExecuteReport is the real signal.
           # rfc-0007 A2b: `installSignals = true` makes THIS execute() call's
           # own Supervisor own SIGINT/SIGTERM installation for its duration —
           # replacing the old crisol/signals.installSignalHandlers() ceremony
-          # this test used to run itself; `shutdownSignalOut` carries the real
+          # this test used to run itself; `.shutdownSignal` carries the real
           # signum, replacing signals.pendingSignal().
-          var interrupted = false
-          var shutdownSignum = 0
-          discard execute(p, config = cfg, graph = g, cache = cacheDisabled(hangSpec),
-                          interruptedOut = addr interrupted,
-                          shutdownSignalOut = addr shutdownSignum,
-                          installSignals = true)
+          # rfc-0007 code-review r7: `interruptedOut`/`shutdownSignalOut` ptr
+          # params are gone — read straight off the returned ExecuteReport.
+          let execReport = execute(p, config = cfg, graph = g, cache = cacheDisabled(hangSpec),
+                                   installSignals = true)
+          let interrupted    = execReport.interrupted
+          let shutdownSignum = execReport.shutdownSignal
           if interrupted:
             # Correct path: exit 128 + signum so parent can verify.
             exitnow(cint(128 + shutdownSignum))
@@ -210,7 +211,7 @@ when defined(posix):
 
       var g = emptyDepGraph()
       # rfc-0007 A1e-ii: no CrisolInterrupted to catch any more — a plain call.
-      let results = execute(p, config = cfg, graph = g, installSignals = true)
+      let results = execute(p, config = cfg, graph = g, installSignals = true).results
 
       check results.len == 1
       check results[0].outcome == oPassed
@@ -227,7 +228,7 @@ when defined(posix):
       let p    = plan(cfg, eps, emptyDepGraph())
 
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g, installSignals = true)
+      let results = execute(p, config = cfg, graph = g, installSignals = true).results
 
       check results.len == 1
       check results[0].outcome == oFailed

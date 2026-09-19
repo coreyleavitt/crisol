@@ -52,7 +52,7 @@ proc makeIsolatedConfig(root: string): Config =
 # Suite
 # ---------------------------------------------------------------------------
 
-suite "B3a — execute(recordLedger) ledger knob":
+suite "B3a — execute(recordLedger).results ledger knob":
 
   test "recordLedger default (true): a live attempt appends a ledger row":
     let tmpRoot = getTempDir() / "crisol_b3a_ledger_default"
@@ -86,7 +86,7 @@ suite "B3a — execute(recordLedger) ledger knob":
     let p = plan(cfg, @[ep], graph, "", false)
 
     let results = execute(p, config = cfg, graph = graph, nimVersion = "",
-                          showProgress = false, recordLedger = false)
+                          showProgress = false, recordLedger = false).results
     check results.len == 1
     check results[0].outcome == oPassed  # the run itself is unaffected
 

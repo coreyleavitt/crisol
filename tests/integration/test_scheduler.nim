@@ -51,7 +51,7 @@ proc runPlan(eps: seq[Entrypoint]; jobs: int;
   )
   let p   = plan(cfg, eps, emptyDepGraph())
   var g   = emptyDepGraph()
-  execute(p, config = cfg, graph = g)
+  execute(p, config = cfg, graph = g).results
 
 # ---------------------------------------------------------------------------
 # Suites

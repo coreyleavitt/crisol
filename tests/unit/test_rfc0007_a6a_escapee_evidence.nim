@@ -80,7 +80,7 @@ when defined(posix):
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheDisabled(isoSpec))
+      cache = cacheDisabled(isoSpec)).results
     check results.len == 1
     results[0]
 

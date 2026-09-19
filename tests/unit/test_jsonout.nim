@@ -625,7 +625,8 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     ## at all -- there is no "notStarted" placeholder entry on the wire, only
     ## the scalar summary.notStarted count. This mirrors exactly what
     ## runner.execute()'s post-loop trim does: `results` already excludes
-    ## them, `notStartedOut` carries the count separately.
+    ## them, the returned ExecuteReport's `.notStarted` carries the count
+    ## separately (code-review r7: no longer a `notStartedOut` ptr param).
     let passed = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
                                   compile: okPhase(), run: okPhase(), durationMs: 5)
     let killed = killedByInterruptDuringRun()

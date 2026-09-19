@@ -130,7 +130,7 @@ proc runDeterminismBody(root: string) =
     check pep.edecision == edNeverBuilt
 
   let results = execute(p, config = cfg, graph = graph, nimVersion = "",
-                        showProgress = false)
+                        showProgress = false).results
   check results.len == 2
   for r in results:
     check r.outcome == oPassed

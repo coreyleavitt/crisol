@@ -142,14 +142,14 @@ when defined(posix):
         let cfg = baseCfg(jobs = 2)
         let p   = plan(cfg, @[epA, epB], emptyDepGraph())
         var g   = emptyDepGraph()
-        var interrupted = false
-        var notStarted  = 0
-
-        discard execute(p, config = cfg, graph = g, onResult = onRes,
-                        showProgress = false, progressIntervalMs = 30_000,
-                        installSignals = true, recordClosureFn = hook,
-                        interruptedOut = addr interrupted,
-                        notStartedOut = addr notStarted)
+        # rfc-0007 code-review r7: `interruptedOut`/`notStartedOut` ptr params
+        # are gone — read `.interrupted`/`.notStarted` off the returned
+        # ExecuteReport instead.
+        let execReport = execute(p, config = cfg, graph = g, onResult = onRes,
+                                 showProgress = false, progressIntervalMs = 30_000,
+                                 installSignals = true, recordClosureFn = hook)
+        let interrupted = execReport.interrupted
+        let notStarted  = execReport.notStarted
 
         writeFile(resultFile, $interrupted & "," & $notStarted & "," & $bFinalized)
         quit(0)
@@ -212,12 +212,12 @@ when defined(posix):
         let cfg = baseCfg(jobs = 2)
         let p   = plan(cfg, @[epA, epD], emptyDepGraph())
         var g   = emptyDepGraph()
-        var interrupted = false
-
-        discard execute(p, config = cfg, graph = g, onResult = onRes,
-                        showProgress = false, progressIntervalMs = 30_000,
-                        installSignals = true, recordClosureFn = hook,
-                        interruptedOut = addr interrupted)
+        # rfc-0007 code-review r7: `interruptedOut` ptr param is gone — read
+        # `.interrupted` off the returned ExecuteReport instead.
+        let execReport = execute(p, config = cfg, graph = g, onResult = onRes,
+                                 showProgress = false, progressIntervalMs = 30_000,
+                                 installSignals = true, recordClosureFn = hook)
+        let interrupted = execReport.interrupted
 
         let deltaMs = if sigint2At > 0.0 and dDoneAt > 0.0: (dDoneAt - sigint2At) * 1000.0 else: -1.0
         writeFile(resultFile, $interrupted & "," & formatFloat(deltaMs, ffDecimal, 1))

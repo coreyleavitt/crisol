@@ -274,7 +274,7 @@ proc testFailFastDrains() =
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
   let results = execute(p, config = cfg, graph = g,
-                        failFast = true, showProgress = false, cache = cacheDisabled(overlapSpec))
+                        failFast = true, showProgress = false, cache = cacheDisabled(overlapSpec)).results
   let elapsed = epochTime() - t0
   delEnv("CRISOL_TEST_OVERLAP_FILE")
 
@@ -344,7 +344,7 @@ proc testPerGroupTimeoutInComposedRun() =
   let t0 = epochTime()
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
-  let results = execute(p, config = cfg, graph = g, showProgress = false)
+  let results = execute(p, config = cfg, graph = g, showProgress = false).results
   let elapsed = epochTime() - t0
 
   check results.len == 2

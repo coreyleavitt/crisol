@@ -106,7 +106,7 @@ suite "nimcache-persistence — REUSE (real compile)":
 
     let results1 = execute(plan1, config = cfg, graph = graph,
                            nimVersion = "nim-test-v1", ccVersion = "cc-test-v1",
-                           showProgress = false)
+                           showProgress = false).results
     check results1.len == 1
     check results1[0].outcome == oPassed
 
@@ -147,7 +147,7 @@ suite "nimcache-persistence — REUSE (real compile)":
 
     let results2 = execute(plan2, config = cfg, graph = graph,
                            nimVersion = "nim-test-v1", ccVersion = "cc-test-v1",
-                           showProgress = false)
+                           showProgress = false).results
     check results2.len == 1
     check results2[0].outcome == oPassed
 
@@ -193,7 +193,7 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     let plan1 = plan(cfg, @[ep], graph, nimVersion = "nim-v1")
     let results1 = execute(plan1, config = cfg, graph = graph,
                            nimVersion = "nim-v1", ccVersion = "cc-OLD",
-                           showProgress = false)
+                           showProgress = false).results
     check results1[0].outcome == oPassed
     check dirExists(oldCacheDir)
 
@@ -212,7 +212,7 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     let plan2 = plan(cfg, @[ep], graph, nimVersion = "nim-v1", forceCompile = true)
     let results2 = execute(plan2, config = cfg, graph = graph,
                            nimVersion = "nim-v1", ccVersion = "cc-NEW",
-                           showProgress = false)
+                           showProgress = false).results
     check results2[0].outcome == oPassed
 
     # The new compile used a DIFFERENT, COLD directory:
@@ -245,7 +245,7 @@ suite "nimcache-persistence — STABLE ACROSS PLAN POSITION (the --changed fix)"
     let planA = plan(cfg, @[ep], graph, nimVersion = "nim-v1")
     let resultsA = execute(planA, config = cfg, graph = graph,
                            nimVersion = "nim-v1", ccVersion = "cc-v1",
-                           showProgress = false)
+                           showProgress = false).results
     check resultsA[0].outcome == oPassed
     check dirExists(expectedCacheDir)
 
@@ -261,7 +261,7 @@ suite "nimcache-persistence — STABLE ACROSS PLAN POSITION (the --changed fix)"
     check planB.entrypoints[1].ep.tp.display() == ep.tp.display()
     let resultsB = execute(planB, config = cfg, graph = graph,
                            nimVersion = "nim-v1", ccVersion = "cc-v1",
-                           showProgress = false)
+                           showProgress = false).results
     check resultsB.len == 2
     check resultsB[1].outcome == oPassed  # ep's result, at its plan index (1)
 
@@ -294,7 +294,7 @@ suite "nimcache-persistence — a failed compile does not leave a corrupt persis
     let planA = plan(cfg, @[ep], graph, nimVersion = "nim-v1")
     let resultsA = execute(planA, config = cfg, graph = graph,
                            nimVersion = "nim-v1", ccVersion = "cc-v1",
-                           showProgress = false)
+                           showProgress = false).results
     check resultsA[0].outcome == oCompileFailed
     check not dirExists(expectedCacheDir)  ## M15: wiped on genuine compile failure
 
@@ -327,7 +327,7 @@ suite "nimcache-persistence — rare same-entrypoint-twice-in-plan duplicate":
 
     let results = execute(planDup, config = cfg2Jobs, graph = graph,
                           nimVersion = "nim-v1", ccVersion = "cc-v1",
-                          showProgress = false)
+                          showProgress = false).results
     check results.len == 2
     check results[0].outcome == oPassed
     check results[1].outcome == oPassed

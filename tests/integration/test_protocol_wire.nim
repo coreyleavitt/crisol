@@ -61,7 +61,7 @@ suite "R1 — protocol wired: OR-rule and records populated":
     let cfg = makeCfg()
     let p   = plan(cfg, @[ep], emptyDepGraph())
     var g   = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g)
+    let results = execute(p, config = cfg, graph = g).results
     check results.len == 1
     let r = results[0]
     # OR-rule: rsFail record takes precedence over exit 0.
@@ -80,7 +80,7 @@ suite "R1 — protocol wired: OR-rule and records populated":
     let cfg = makeCfg()
     let p   = plan(cfg, @[ep], emptyDepGraph())
     var g   = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g)
+    let results = execute(p, config = cfg, graph = g).results
     check results.len == 1
     check results[0].records.len > 0
 
@@ -94,7 +94,7 @@ suite "R1 — protocol wired: OR-rule and records populated":
     let cfg = makeCfg()
     let p   = plan(cfg, @[ep], emptyDepGraph())
     var g   = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g)
+    let results = execute(p, config = cfg, graph = g).results
     check results.len == 1
     check results[0].outcome == oPassed
 
@@ -106,7 +106,7 @@ suite "R1 — protocol wired: OR-rule and records populated":
     let cfg = makeCfg()
     let p   = plan(cfg, @[ep], emptyDepGraph())
     var g   = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g)
+    let results = execute(p, config = cfg, graph = g).results
     check results.len == 1
     check results[0].outcome == oFailed
     # No records for opaque fallback.

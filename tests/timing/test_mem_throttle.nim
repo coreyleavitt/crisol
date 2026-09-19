@@ -119,7 +119,9 @@ proc runWithMemConfigThrottled(eps: seq[Entrypoint];
                                jobs: int;
                                throttledOut: var int): seq[EntrypointResult] =
   ## Run eps under execute() with the given memory config.
-  ## Writes ac.memThrottledSlots into throttledOut via the memThrottledOut seam.
+  ## rfc-0007 code-review r7: `execute()` no longer takes a `memThrottledOut`
+  ## ptr param — `throttledOut` is filled from the returned ExecuteReport's
+  ## `.memThrottled` field instead.
   let cfg = Config(
     groups:             @[],
     jobs:               jobs,
@@ -134,9 +136,10 @@ proc runWithMemConfigThrottled(eps: seq[Entrypoint];
   )
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
-  result = execute(p, config = cfg, graph = g, showProgress = false,
-                   cache = cacheDisabled(overlapSpec),
-                   memThrottledOut = addr throttledOut)
+  let execReport = execute(p, config = cfg, graph = g, showProgress = false,
+                           cache = cacheDisabled(overlapSpec))
+  throttledOut = execReport.memThrottled
+  result = execReport.results
 
 # ---------------------------------------------------------------------------
 # Suite

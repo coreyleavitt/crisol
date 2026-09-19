@@ -90,7 +90,7 @@ switch("path", thisDir())
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -143,7 +143,7 @@ doAssert xValue() == 5
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -203,7 +203,7 @@ doAssert depValue() == 7
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -264,7 +264,7 @@ doAssert depValue() == 7
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -339,7 +339,7 @@ doAssert libValue() == 9
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -394,7 +394,7 @@ doAssert helperValue() == 11
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -449,7 +449,7 @@ doAssert fooValue() == 42
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -502,7 +502,7 @@ doAssert sibValue() == 7
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -569,7 +569,7 @@ doAssert depValue() == 7
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -627,7 +627,7 @@ doAssert depValue() == 7
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:

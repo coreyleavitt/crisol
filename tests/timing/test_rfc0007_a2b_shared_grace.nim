@@ -80,11 +80,13 @@ when defined(posix):
         discard kill(myPid, SIGINT)
         exitnow(0)
 
-      var interrupted = false
       let t0 = getMonoTime()
-      let results = execute(p, config = cfg, graph = g,
-                            interruptedOut = addr interrupted,
-                            installSignals = true)
+      # rfc-0007 code-review r7: `interruptedOut` ptr param is gone — read
+      # `.interrupted`/`.results` off the returned ExecuteReport instead.
+      let execReport = execute(p, config = cfg, graph = g,
+                               installSignals = true)
+      let interrupted = execReport.interrupted
+      let results     = execReport.results
       let elapsed = getMonoTime() - t0
 
       var ws: cint = 0

@@ -168,7 +168,7 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, "", false)
-    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false)
+    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -200,7 +200,7 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, "", false)
     let t0 = epochTime()
-    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false)
+    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false).results
     let elapsed = epochTime() - t0
 
     check results.len == 1
@@ -226,7 +226,7 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
 
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, "", false)
-    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false)
+    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false).results
 
     check results.len == 1
     check results[0].outcome == oPassed

@@ -125,7 +125,7 @@ when defined(posix):
       # RFC bullet's coreDumped claim is about; the expected VALUE is verified
       # against the live kernel core_pattern rather than assumed — see
       # expectCoreDumped()'s doc.
-      let results = execute(p, config = cfg, graph = g)
+      let results = execute(p, config = cfg, graph = g).results
 
       check results.len == 1
       check results[0].outcome == oCrashed
@@ -143,7 +143,7 @@ when defined(posix):
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g)
+      let results = execute(p, config = cfg, graph = g).results
 
       check results.len == 1
       check results[0].outcome == oCrashed
@@ -165,7 +165,7 @@ when defined(posix):
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))  # short: force the kill
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g)
+      let results = execute(p, config = cfg, graph = g).results
 
       check results.len == 1
       check results[0].outcome == oKilled       # NEVER oPassed
@@ -190,7 +190,7 @@ when defined(posix):
       var g = emptyDepGraph()
       let spec = resolveSandbox(level = hlIsolated,
         rlimits = RlimitOverrides(limitFsize: some(4096'i64)))
-      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec))
+      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec)).results
 
       check results.len == 1
       check results[0].run.kind == ptypes.pkRan
@@ -232,7 +232,7 @@ when defined(posix):
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p   = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec))
+      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec)).results
 
       var ws: cint = 0
       discard waitpid(watcherPid, ws, 0)
@@ -273,7 +273,7 @@ when defined(posix):
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p   = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec))
+      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec)).results
 
       var ws: cint = 0
       discard waitpid(watcherPid, ws, 0)

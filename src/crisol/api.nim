@@ -67,7 +67,8 @@ import crisol/process
 # longer needed to drive `interrupted` — `runner.execute`'s OWN Supervisor
 # now owns SIGINT/SIGTERM installation for the duration of the call
 # (`installSignals` param, threaded from `opts.installSignals` below) and
-# reports the real signum it observed via `shutdownSignalOut`, superseding
+# reports the real signum it observed via the returned ExecuteReport's
+# `.shutdownSignal` field (code-review r7), superseding
 # `installSignalHandlers`/`clearSignal`/`pendingSignal`. RFC-0005 code-
 # review SO2 reintroduces ONE narrow use: `shutdownRequested()` as the
 # `abandoned` predicate for the end-of-run deferred-put drain below, the
@@ -775,7 +776,7 @@ proc verifyCachePass*(results: seq[EntrypointResult];
       showProgress = false,
       cache        = cacheDisabled(sandboxSpec),
       recordLedger = false,
-    )
+    ).results
   except Exception as e:
     # Matches runTests' own defensive posture around the main execute() call
     # (CrisolError is-a Exception — one branch covers both): an unrelated
@@ -1615,15 +1616,22 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
         outcomePolicy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene))
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
-  # are written by execute() itself (via ptr out-params) rather than caught as
-  # an exception; a SIGINT/SIGTERM no longer unwinds this call at all.
+  # come off execute()'s returned ExecuteReport (code-review r7: no longer
+  # ptr out-params) rather than being caught as an exception; a SIGINT/
+  # SIGTERM no longer unwinds this call at all.
   var interrupted     = false
   var notStartedCount = 0
   var shutdownSignum  = 0  # rfc-0007 A2b: the real signum execute()'s own Supervisor observed
-  var lateOrphansReaped = 0  # rfc-0007 B1: written by execute() via its own ptr out-param
+  var lateOrphansReaped = 0  # rfc-0007 B1: from execute()'s ExecuteReport
 
   try:
-    results = execute(
+    # rfc-0007 code-review r7: ONE `execute()` call, ONE local (`execReport`)
+    # holding every fact it reported — `results`/`memThrottled`/`interrupted`/
+    # `notStartedCount`/`shutdownSignum`/`lateOrphansReaped` are all read off
+    # it right below, in one place, rather than pre-declaring a local per
+    # fact and passing `addr` of each (the old shape r7 flags: a caller that
+    # forgot one silently lost it — see r33, fixed on the `execute()` side).
+    let execReport = execute(
       pv.plan,
       config             = cfg,
       graph              = graph,
@@ -1633,16 +1641,17 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       failFast           = opts.failFast,
       showProgress       = opts.showProgress,
       progressIntervalMs = opts.progressIntervalMs,
-      memThrottledOut    = addr memThrottled,
-      interruptedOut     = addr interrupted,
-      notStartedOut      = addr notStartedCount,
-      lateOrphansReapedOut = addr lateOrphansReaped,
-      shutdownSignalOut  = addr shutdownSignum,
       installSignals     = opts.installSignals,
       cache              = cacheCtx,
       explainMiss        = cfg.explainMiss,  # RFC-0005 B1c: resolved (CLI OR config,
                                               # already merged by planImpl above)
     )
+    results           = execReport.results
+    memThrottled      = execReport.memThrottled
+    interrupted       = execReport.interrupted
+    notStartedCount   = execReport.notStarted
+    shutdownSignum    = execReport.shutdownSignal
+    lateOrphansReaped = execReport.lateOrphansReaped
   except CrisolError as e:
     releaseLock(lockHandle)
     let code = if e.kind == cekInternal: 2 else: 3

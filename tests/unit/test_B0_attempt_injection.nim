@@ -82,7 +82,7 @@ suite "B0 — CRISOL_ATTEMPT injection":
     let spec = resolveSandbox(level = hlNone)
 
     let results = execute(p, cfg, graph, "", "", cb, false, false, 30_000,
-                          cache = cacheDisabled(spec))
+                          cache = cacheDisabled(spec)).results
 
     require results.len == 1
     doAssert results[0].outcome == oPassed,

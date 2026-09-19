@@ -76,7 +76,7 @@ suite "rfc-0007 A2c — compile child cwd is projectRoot regardless of the invok
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false)
+                          nimVersion = "", showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:

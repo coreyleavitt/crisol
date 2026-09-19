@@ -75,7 +75,7 @@ proc runWithTimeouts(ep: Entrypoint;
   )
   let p = plan(cfg, @[ep], emptyDepGraph())
   var g = emptyDepGraph()
-  let results = execute(p, config = cfg, graph = g, showProgress = false)
+  let results = execute(p, config = cfg, graph = g, showProgress = false).results
   if results.len > 0: results[0]
   else: EntrypointResult(ep: ep)
 

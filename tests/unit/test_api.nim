@@ -971,7 +971,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     check pep1.ep.tp.display().len > 0   # sanity: a real tag-0 tp
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
     check results1.len == 1
     check results1[0].cacheDecision == cdmStored
 
@@ -982,7 +982,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
     check results2.len == 1
     check results2[0].cacheDecision == cdmHit
 

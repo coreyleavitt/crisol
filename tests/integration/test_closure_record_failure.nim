@@ -110,7 +110,7 @@ suite "closure recording failure after a successful compile (issue #5)":
     check plan1.entrypoints[0].edecision == edNeverBuilt
     let r1 = execute(plan1, config = cfg, graph = graph,
                      nimVersion = "", showProgress = false,
-                     recordClosureFn = failingRecordClosure)
+                     recordClosureFn = failingRecordClosure).results
     check r1.len == 1
     check r1[0].outcome == oPassed            # compile + run succeeded
 
@@ -171,7 +171,7 @@ suite "closure recording failure blocks the result-cache store (issue #5, R9)":
                              mockStoreOnlySeams(ms))
     let r1 = execute(plan1, config = cfg, graph = graph,
                      nimVersion = "", showProgress = false, cache = cache,
-                     recordClosureFn = failingRecordClosure)
+                     recordClosureFn = failingRecordClosure).results
 
     check r1.len == 1
     check r1[0].outcome == oPassed          # compile + run still succeeded

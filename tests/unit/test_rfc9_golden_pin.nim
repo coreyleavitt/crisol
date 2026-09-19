@@ -325,7 +325,7 @@ suite "rfc9_golden_pin — one fixture run's actual on-disk cache slugs":
     var graph = initDepGraph("")
     let p = plan(cfg, @[ep], graph, nimVersion = "")
     let results = execute(p, config = cfg, graph = graph, nimVersion = "",
-                          showProgress = false)
+                          showProgress = false).results
 
     check results.len == 1
     if results[0].outcome != oPassed:

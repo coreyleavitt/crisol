@@ -577,6 +577,48 @@ type
     ## `discover`). `execute*`'s `recordClosureFn` param defaults to the
     ## real `recordClosure` — zero production behavior change.
 
+type
+  ExecuteReport* = object
+    ## rfc-0007 code-review r7: `execute()`'s single return value — replaces
+    ## the FIVE raw `ptr` out-params (`memThrottledOut`, `interruptedOut`,
+    ## `notStartedOut`, `shutdownSignalOut`, `lateOrphansReapedOut`) it used
+    ## to write run-level facts through. Those pointers made "forgot to pass
+    ## one" a silent data loss rather than a compile error — which is
+    ## exactly what happened (code-review r33): the failFast early-exit
+    ## path `return`ed from inside `execute()`'s own try/while before the
+    ## epilogue that wrote them, so `notStartedOut`/`shutdownSignalOut`/
+    ## `lateOrphansReapedOut`/`interruptedOut` all silently stayed at the
+    ## caller's zero-value locals on a failFast run.
+    ##
+    ## `execute()` now builds exactly ONE `ExecuteReport` at its single
+    ## normal-exit construction point (the very end of the proc body); the
+    ## former failFast early-`return` is gone (§ the `break` at the
+    ## fail-fast early-exit site below) so EVERY normal-completion path
+    ## funnels through that one construction — a future fact this object
+    ## grows cannot be dropped by a return path that forgets to populate it,
+    ## because there is only the one path left to forget it in, and it is
+    ## exercised by every existing test. (An exception unwinding out of
+    ## `execute()` still short-circuits this — same as the old ptr-out-param
+    ## design, where an exception path also never returned a value; the
+    ## `finally` block's teardown/cleanup work is unaffected either way.)
+    results*:           seq[EntrypointResult]
+    memThrottled*:       int   ## S6b: ac.memThrottledSlots on return.
+    interrupted*:        bool  ## rfc-0007 A1e-ii: true iff a SIGINT/SIGTERM
+                                ## cut this run short (§2).
+    notStarted*:         int   ## rfc-0007 A1e-ii: count of entries OMITTED
+                                ## from `results` because their next phase
+                                ## never started (§2's emission-set rule; also
+                                ## covers the failFast "remaining entrypoints
+                                ## never dispatched" case, r33). 0 on a normal,
+                                ## non-early-exited completion.
+    shutdownSignal*:     int   ## rfc-0007 A2b: the SIGINT/SIGTERM signum this
+                                ## call's own Supervisor observed (0 when not
+                                ## interrupted).
+    lateOrphansReaped*:  int   ## rfc-0007 B1: count of adopted orphans reaped
+                                ## via the async waitid(P_ALL, WNOWAIT) sweep
+                                ## after their owning slot's result had
+                                ## already been emitted (or unattributable).
+
 proc finalizeSlot(
   sv:               var Supervisor;
   slots:            var seq[Slot];
@@ -1548,25 +1590,6 @@ proc execute*(
   failFast:         bool = false;
   showProgress:     bool = true;
   progressIntervalMs: int = 30_000;
-  memThrottledOut:  ptr int = nil;  ## S6b: if non-nil, written with ac.memThrottledSlots on return
-  interruptedOut:   ptr bool = nil;  ## rfc-0007 A1e-ii: if non-nil, written true iff
-                                    ## a SIGINT/SIGTERM cut this run short (§2) —
-                                    ## CrisolInterrupted is retired; this is its
-                                    ## replacement signal. The raw signal number is
-                                    ## written to `shutdownSignalOut` (below), not
-                                    ## readable via signals.pendingSignal() any more
-                                    ## (rfc-0007 A2b: the Supervisor owns shutdown-
-                                    ## signal capture for the duration of this call).
-  notStartedOut:    ptr int = nil;  ## rfc-0007 A1e-ii: if non-nil, written with the
-                                    ## count of entries OMITTED from the returned
-                                    ## seq because their next phase never started
-                                    ## (§2's emission-set rule) — 0 on a normal
-                                    ## (non-interrupted) completion.
-  shutdownSignalOut: ptr int = nil;  ## rfc-0007 A2b: if non-nil, written with the
-                                    ## SIGINT/SIGTERM signum this call's own
-                                    ## Supervisor observed (0 when not interrupted)
-                                    ## — RFC-0003's 128+n needs `n`; §1's
-                                    ## ShutdownSignal carries exactly this value.
   installSignals:   bool = false;  ## rfc-0007 A2b: this call's OWN Supervisor owns
                                     ## SIGINT/SIGTERM installation for its duration
                                     ## (`initSupervisor(installSignals)`, §1) — the
@@ -1587,18 +1610,6 @@ proc execute*(
                                   ## per-process shard, per the RFC's
                                   ## `ledger.nim` shardSeq note); only the
                                   ## per-attempt row write is gated.
-  lateOrphansReapedOut: ptr int = nil;  ## rfc-0007 B1: if non-nil, written
-                                  ## with the count of adopted orphans
-                                  ## (reparented via PR_SET_CHILD_SUBREAPER)
-                                  ## reaped via the async waitid(P_ALL,
-                                  ## WNOWAIT) sweep AFTER their owning slot's
-                                  ## result had already been emitted (or
-                                  ## whose pgid matched no still-live slot at
-                                  ## all — an unattributable orphan, e.g. a
-                                  ## setsid escape). Counted + logged at RUN
-                                  ## level, never retro-fitted into an
-                                  ## already-emitted EntrypointResult (§3). 0
-                                  ## when nothing of the kind occurred.
   explainMiss:      bool = false;  ## RFC-0005 B1c: resolved --explain-miss
                                   ## (CLI OR config, already merged by
                                   ## api.planImpl into cfg.explainMiss before
@@ -1621,7 +1632,7 @@ proc execute*(
                                   ## without a genuinely-outside-every-root
                                   ## Entrypoint (production entrypoints are
                                   ## ALWAYS tag-0).
-): seq[EntrypointResult] =
+): ExecuteReport =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
   ## scheduler honouring p.jobs (A4).  At most p.jobs child processes alive at
   ## once; continue-on-failure: one failure never stops the pool.
@@ -1644,11 +1655,19 @@ proc execute*(
   ## failFast=true: once any completed entrypoint has a failure outcome, no NEW
   ## entrypoints are dispatched.  In-flight entrypoints drain to completion.
   ##
-  ## Results are returned in deterministic plan order (index == pepIdx) — EXCEPT
-  ## on an interrupted run (rfc-0007 A1e-ii, §2): entries whose next phase never
-  ## started are OMITTED entirely (counted in `notStartedOut` instead), so the
-  ## returned seq is shorter than `p.entrypoints` and no longer index-aligned
-  ## to it; relative order among the entries that ARE returned is preserved.
+  ## rfc-0007 code-review r7: the return value is a single `ExecuteReport`
+  ## (see its type doc above) — `.results` plus every run-level fact this
+  ## call observed (`interrupted`, `notStarted`, `shutdownSignal`,
+  ## `lateOrphansReaped`, `memThrottled`). The five `ptr ... Out` params this
+  ## proc used to take are gone; a caller reads fields off the returned
+  ## object instead of pre-declaring locals and passing `addr` of each.
+  ##
+  ## `.results` is returned in deterministic plan order (index == pepIdx) —
+  ## EXCEPT on an interrupted OR failFast-early-exited run (rfc-0007 A1e-ii,
+  ## §2; r33): entries whose next phase never started are OMITTED entirely
+  ## (counted in `.notStarted` instead), so the returned seq is shorter than
+  ## `p.entrypoints` and no longer index-aligned to it; relative order among
+  ## the entries that ARE returned is preserved.
 
   # M1: derive timeouts from config, applying defaults for zero values.
   let compileTimeoutMs =
@@ -1665,7 +1684,7 @@ proc execute*(
   let nJobs = max(1, p.jobs)
 
   if n == 0:
-    return @[]
+    return ExecuteReport()  # nothing to run — every fact is legitimately its zero value
 
   # issue #8: the source index used to resolve @p/@n closure entries is a
   # pure function of the source tree (config.projectRoot + config.depRoots),
@@ -1693,7 +1712,7 @@ proc execute*(
   let dupSlugs    = duplicateSlugs(p, config.trackedRoots)
 
   # Pre-allocate result slots so we can fill them by index (plan order).
-  result = newSeq[EntrypointResult](n)
+  var results = newSeq[EntrypointResult](n)
 
   # B2: open the ledger shard for this invocation (if stateDir is set).
   # Guards on empty stateDir — some callers (e.g. runEntrypoint) leave it "".
@@ -1835,7 +1854,7 @@ proc execute*(
       # always passes (only passing results are stored), so the B4 per-test
       # rule naturally no-ops here; the B3 path rule still applies.
       synth.quarantined = isQuarantined(p.entrypoints[i].ep, synth, config.quarantine, config.quarantineTp)
-      result[i] = synth
+      results[i] = synth
       finalized[i] = true    # B1: mark finalized — edCached never retried
       inc done
       onResult(synth)
@@ -1860,11 +1879,12 @@ proc execute*(
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — an interrupt is no longer
   # an exception, it is a HONEST PARTIAL RESULT (§2).  `wasInterrupted` is
-  # reported to the caller via `interruptedOut`.
+  # reported to the caller via the returned ExecuteReport's `.interrupted`
+  # field (code-review r7 — folded into the single construction point below).
   var wasInterrupted = false
-  var shutdownSignum = 0  # rfc-0007 A2b: the real signum, for shutdownSignalOut
+  var shutdownSignum = 0  # rfc-0007 A2b: the real signum, for ExecuteReport.shutdownSignal
 
-  # rfc-0007 B1 (§3): the run-level late-orphan count (lateOrphansReapedOut)
+  # rfc-0007 B1 (§3): the run-level late-orphan count (ExecuteReport.lateOrphansReaped)
   # and the per-slot pending-escapee staging table. An adopted orphan
   # discovered via `sv.next`'s async waitid(P_ALL, WNOWAIT) sweep whose
   # `ownedBy` names a slot that is STILL LIVE (not yet reaped/emitted) is
@@ -1890,10 +1910,10 @@ proc execute*(
         ## gotten around to noticing yet BEFORE committing remaining live slots
         ## to interrupt teardown — see the drain loop in the weShutdown case.
         ## A TEMPLATE, not a proc: a nested proc capturing the enclosing
-        ## proc's implicit `result` (or a `var seq` parameter, same issue
-        ## hit earlier with `slots`) trips Nim's memory-safety capture
-        ## check at codegen; a template inlines at each call site instead,
-        ## sidestepping capture entirely.
+        ## proc's `var seq` locals (`results`, or `slots`, same issue hit
+        ## earlier) trips Nim's memory-safety capture check at codegen; a
+        ## template inlines at each call site instead, sidestepping capture
+        ## entirely.
         ##
         ## rfc-0007 code-review r5(a): `blockTransition` — true ONLY for the
         ## weShutdown handler's own pre-`shuttingDown` drain loop below.
@@ -1975,13 +1995,13 @@ proc execute*(
           var res = fo.res
           res.quarantined = isQuarantined(p.entrypoints[completedIdx].ep, res,
                                           config.quarantine, config.quarantineTp)
-          result[completedIdx] = res
+          results[completedIdx] = res
           finalized[completedIdx] = true
           inc done
           onResult(res)
         of fkDone:
           ac.onSlotFinish(slotToken, finishRss)  # S6b: feed real RSS so estJobPeak adapts
-          result[completedIdx] = fo.res
+          results[completedIdx] = fo.res
 
           if shuttingDown:
             # rfc-0007 §2: interrupt-killed finals bypass retry/ledger/cache/
@@ -2001,7 +2021,7 @@ proc execute*(
           else:
             # rfc-0007 §2: retry/flaky/quarantine decisions read the pure
             # derivation — there is no stored legacy field to read instead.
-            let completedOutcome = outcome(result[completedIdx])
+            let completedOutcome = outcome(results[completedIdx])
             let maxAttempts = p.entrypoints[completedIdx].retries + 1  # B1
 
             # B2: append one ledger row per live attempt — including intermediate
@@ -2012,7 +2032,7 @@ proc execute*(
             # (consistent: the build identity is the same across all attempts).
             if ledgerActive and recordLedger:
               appendAttemptRow(led, p.entrypoints[completedIdx].ep, slotAttempt,
-                               result[completedIdx], inputHashes[completedIdx],
+                               results[completedIdx], inputHashes[completedIdx],
                                slots[idx].peakRssBytes, config.trackedRoots)
 
             # B1: retry decision — re-dispatch if the result is a failure AND we
@@ -2039,13 +2059,13 @@ proc execute*(
 
               # B1: stamp attempts onto the final result; flaky is derived
               # from attempts (A1e-i: `flaky(r, policy)`, no field to stamp).
-              result[completedIdx].attempts = slotAttempt
+              results[completedIdx].attempts = slotAttempt
               # B3/B4: apply quarantine overlay — pure reporting, not cache or execution logic.
               # At the live-finalize site, result[completedIdx] carries the final records
               # (protocol or empty), so the B4 per-test rule has full information.
-              result[completedIdx].quarantined =
+              results[completedIdx].quarantined =
                 isQuarantined(p.entrypoints[completedIdx].ep,
-                              result[completedIdx],
+                              results[completedIdx],
                               config.quarantine, config.quarantineTp)
 
               # Track whether any failure has been recorded (for failFast).
@@ -2140,7 +2160,7 @@ proc execute*(
                 # whether THIS run's result ends up stored (`explains[completedIdx]`
                 # is unconditional — the sidecar diff belongs to the fact that this
                 # index was a plan-time miss, not to the store outcome below).
-                result[completedIdx].keyDiff = explains[completedIdx]
+                results[completedIdx].keyDiff = explains[completedIdx]
                 # RFC-0005 A3b: the LIVE stamp -- same unconditional-of-store-
                 # outcome reasoning as keyDiff just above: this index's
                 # plan-time lookup verdict (cvMiss / a trust code / cvOk on a
@@ -2148,8 +2168,8 @@ proc execute*(
                 # consulted, not to whether the fresh result ends up stored.
                 # cacheTier stays "" (its zero value) -- a live-run result was
                 # never served from a tier, whatever the reason.
-                result[completedIdx].cacheLookup = lookups[completedIdx]
-                let verdict = shouldStore(result[completedIdx], cache.spec,
+                results[completedIdx].cacheLookup = lookups[completedIdx]
+                let verdict = shouldStore(results[completedIdx], cache.spec,
                                           slotAttempt, cache.policy,
                                           p.entrypoints[completedIdx].cacheable)
                 # R9: a store is permitted only when BOTH the policy verdict AND
@@ -2162,18 +2182,18 @@ proc execute*(
                   # Re-derive the key from the NOW-updated graph (closureHash fresh)
                   # so a later run's lookup-key matches this store-key.
                   let d   = derive(cache.seams, p.entrypoints[completedIdx])
-                  let cr  = toCachedResult(result[completedIdx], epochTime().int64)
+                  let cr  = toCachedResult(results[completedIdx], epochTime().int64)
                   let stored = cache.seams.store(p.entrypoints[completedIdx], d, cr)
                   # A8: the store-key is the authoritative inputHash for this live run
                   # (the plan-time lookup key was derived before this compile updated
                   # the graph; for an edStale/edNeverBuilt entry there was no plan-time
                   # key at all).  Stamp the freshly-derived key string.
-                  result[completedIdx].inputHash = $d.key
+                  results[completedIdx].inputHash = $d.key
                   # M8: cdmStored = fresh run on a miss where the result WAS written.
                   # cdmKeyMiss = fresh run on a miss where the result was NOT stored.
                   # A run/v1 consumer can tell from cacheDecision alone whether a store
                   # happened, without inferring from inputHash presence.
-                  result[completedIdx].cacheDecision =
+                  results[completedIdx].cacheDecision =
                     if stored: cdmStored else: cdmKeyMiss
                 else:
                   # Not stored: either the verdict carries the structural reason, or
@@ -2183,7 +2203,7 @@ proc execute*(
                   # this collapsing into the generic cdmKeyMiss.
                   # Stamp the plan-time key (set for an edRunFresh miss; "" otherwise)
                   # so a consulted-but-not-stored result still reports its inputHash.
-                  result[completedIdx].inputHash = inputHashes[completedIdx]
+                  results[completedIdx].inputHash = inputHashes[completedIdx]
                   # code-review r17: `shouldStore`'s generic `cdmKeyMiss` (its
                   # "not a pass" return -- it has no way to know whether THIS
                   # was a genuine miss or a recompute-invalidated hit) must
@@ -2203,7 +2223,7 @@ proc execute*(
                   # `cdmPolicyDisabled`/`cdmHermeticityDeg`/`cdmFlaky`, all
                   # already more specific than the generic collapse) are
                   # never touched.
-                  result[completedIdx].cacheDecision =
+                  results[completedIdx].cacheDecision =
                     if verdict.store: cdmClosureUnrecorded   # else-branch ⇒ not closureRecorded
                     elif verdict.decision == cdmKeyMiss and
                          cacheDecisions[completedIdx] == cdmRecomputeMiss:
@@ -2211,10 +2231,10 @@ proc execute*(
                     else: verdict.decision
               else:
                 # Caching inactive: stamp the structural reason recorded at plan time.
-                result[completedIdx].cacheDecision = cacheDecisions[completedIdx]
+                results[completedIdx].cacheDecision = cacheDecisions[completedIdx]
 
               # Fire onResult ONCE with the final result (B1 contract).
-              onResult(result[completedIdx])
+              onResult(results[completedIdx])
 
 
   # ---------------------------------------------------------------------------
@@ -2309,7 +2329,7 @@ proc execute*(
               res.compile = ptypes.Phase(kind: ptypes.pkSkipped)
               res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
                                 spawnError: "fork or file-open failed for skip-fresh run")
-              result[pepIdx] = res
+              results[pepIdx] = res
               onResult(res)
               finalized[pepIdx] = true
               anyFailed = true
@@ -2332,7 +2352,7 @@ proc execute*(
               res.compile = ptypes.Phase(kind: ptypes.pkSpawnFailed,
                                 spawnError: "fork or file-open failed before compile")
               res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
-              result[pepIdx] = res
+              results[pepIdx] = res
               onResult(res)
               finalized[pepIdx] = true
               anyFailed = true
@@ -2524,18 +2544,22 @@ proc execute*(
       # -----------------------------------------------------------------------
       # failFast early-exit: if no slots are live and we would not dispatch any
       # more work, break now — remaining entrypoints were never started.
-      # Return only entries from finalized[] so summarize sees only ran
-      # entrypoints (non-contiguous with skip-ahead).
+      #
+      # rfc-0007 code-review r33/r7: this used to `return` directly from here
+      # (after hand-filtering to `finalized[]` entries itself, H1) — which
+      # skipped the epilogue below the while/finally entirely, silently
+      # dropping `notStarted`/`shutdownSignal`/`lateOrphansReaped`/
+      # `interrupted` from the caller's ExecuteReport on every failFast run.
+      # A plain `break` instead falls through to that SAME epilogue (below
+      # the `finally`), which already does exactly this "emit only
+      # `finalized[]` entries, count the rest as `notStarted`" trim (§2's
+      # emission-set rule covers a failFast early exit exactly as well as an
+      # interrupt — both are "some entries' next phase never started") — so
+      # the hand-rolled filter here is now redundant and deleted, and every
+      # fact the epilogue populates is populated on this path too.
       # -----------------------------------------------------------------------
       if not shuttingDown and failFast and anyFailed and not anyLiveSlot(slots):
-        # H1: with skip-ahead, finalized indices may be non-contiguous; emit only
-        # entries actually completed (never-dispatched entries are omitted).
-        var ran: seq[EntrypointResult]
-        for j in 0 ..< n:
-          if finalized[j]:
-            ran.add(result[j])
-        result = ran
-        return
+        break
 
   finally:
     # M12/M6/rfc-0007 A2b: handles the exception path (e.g. an onResult
@@ -2546,38 +2570,62 @@ proc execute*(
     # next machinery, before the loop condition let it exit). `teardownDiscard`
     # is the "exception teardown records NOTHING" half of the shared
     # machinery (§2) — never attributes, never fires onResult.
-    # S6b: always write memThrottledSlots (normal, early-return, and exception paths).
     # B2: close the ledger shard on all exit paths (normal, early-return, exception).
+    #
+    # rfc-0007 code-review r7: this used to ALSO write `memThrottledOut`
+    # here (S6b: "always write memThrottledSlots ... including the
+    # exception path") — the one fact of the five that ever reached a
+    # caller on an exception unwind, because a `ptr` write survives past
+    # the pointee's own stack frame while a return value cannot. Now that
+    # every fact travels home as ONE returned `ExecuteReport`, that
+    # exception-path delivery is gone for ALL five facts uniformly (an
+    # exception unwinding out of `execute()` never produces a return value,
+    # same as it never did for `interrupted`/`notStarted`/`shutdownSignal`/
+    # `lateOrphansReaped` even under the old ptr design — only
+    # `memThrottledOut` was special-cased). No caller (production or test)
+    # ever read `memThrottled` after catching an exception from `execute()`
+    # — grep confirms zero such use sites — so this is a real but unused
+    # capability being retired, not a behavior change any caller depends on.
+    # `ac` is declared above the try/while (in this proc's own scope, not
+    # the try block's), so `ac.memThrottledSlots` is still readable below,
+    # on the normal-return path, without needing the finally-time capture.
     teardownDiscard(sv, slots)
     if ledgerActive:
       closeLedger(led)
-    if memThrottledOut != nil:
-      memThrottledOut[] = ac.memThrottledSlots
 
-  # rfc-0007 A1e-ii: trim `result` to the §2 emission set — entries whose
+  # rfc-0007 A1e-ii: trim `results` to the §2 emission set — entries whose
   # last-started phase is pkRan/pkCached/pkSpawnFailed, i.e. `finalized`.
-  # On a normal (non-interrupted) completion `done == n` is the while loop's
-  # only exit condition, and `done` only ever advances alongside
-  # `finalized[i] = true`, so every index is finalized here and this is a
-  # transparent reshuffle. On an interrupted run, entries never claimed by a
-  # slot (queued, or the RFC's "compile-done-run-unstarted" corner) stay
-  # unfinalized and are OMITTED here rather than emitted as a fabricated
-  # "run never started" lie — counted in notStartedOut instead.
+  # On a normal (non-interrupted, non-failFast-early-exited) completion
+  # `done == n` is the while loop's only exit condition, and `done` only
+  # ever advances alongside `finalized[i] = true`, so every index is
+  # finalized here and this is a transparent reshuffle. On an interrupted
+  # run, or a failFast run that broke out early (r33 — see the `break`
+  # above), entries never claimed by a slot (queued, or the RFC's
+  # "compile-done-run-unstarted" corner) stay unfinalized and are OMITTED
+  # here rather than emitted as a fabricated "run never started" lie —
+  # counted in `notStarted` instead.
   var notStarted = 0
   var emitted: seq[EntrypointResult]
   for i in 0 ..< n:
-    if finalized[i]: emitted.add result[i]
+    if finalized[i]: emitted.add results[i]
     else: inc notStarted
-  result = emitted
 
-  if interruptedOut != nil:
-    interruptedOut[] = wasInterrupted
-  if notStartedOut != nil:
-    notStartedOut[] = notStarted
-  if shutdownSignalOut != nil:
-    shutdownSignalOut[] = shutdownSignum
-  if lateOrphansReapedOut != nil:
-    lateOrphansReapedOut[] = lateOrphansReaped
+  # rfc-0007 code-review r7: the SINGLE construction point for this call's
+  # `ExecuteReport` — every normal-completion exit from the while loop above
+  # (full drain, interrupt-drain, and the failFast early-exit `break`) falls
+  # through to exactly here, so every fact below is populated on every one
+  # of those paths; there is no other `return` in this proc past the n==0
+  # guard that could forget one (r33's bug — a second, earlier construction
+  # site that only some paths reached — cannot recur because there is only
+  # this one site left).
+  result = ExecuteReport(
+    results:           emitted,
+    memThrottled:      ac.memThrottledSlots,
+    interrupted:       wasInterrupted,
+    notStarted:        notStarted,
+    shutdownSignal:    shutdownSignum,
+    lateOrphansReaped: lateOrphansReaped,
+  )
 
 # ---------------------------------------------------------------------------
 # runEntrypoint — compile + run ONE entrypoint (M6: thin wrapper)
@@ -2612,7 +2660,7 @@ proc runEntrypoint*(
   let results = execute(p, config = cfg, graph = g, onResult = noopResult,
                         failFast = false, showProgress = false,
                         progressIntervalMs = 30_000,
-                        cache = cacheDisabled(resolveSandbox()))
+                        cache = cacheDisabled(resolveSandbox())).results
   if results.len > 0:
     result = results[0]
   else:

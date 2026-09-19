@@ -1274,7 +1274,7 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
     check pep1.ep.tp.display().len > 0   # sanity: a real tag-0 tp
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
     check results1.len == 1
     check results1[0].cacheDecision == cdmStored
     check readFile(dir / "verify_counter.txt").strip() == "1"
@@ -1285,7 +1285,7 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)))
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
     check results2.len == 1
     check results2[0].cacheDecision == cdmHit
     check readFile(dir / "verify_counter.txt").strip() == "1"   # unchanged: served from cache

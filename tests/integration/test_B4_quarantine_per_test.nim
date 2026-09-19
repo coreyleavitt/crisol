@@ -55,7 +55,7 @@ proc runFixture(fixturePath: string;
                        tp: classify(fixturePath, cfg.trackedRoots).tp)
   let p   = plan(cfg, @[ep], emptyDepGraph())
   var g   = emptyDepGraph()
-  execute(p, config = cfg, graph = g)
+  execute(p, config = cfg, graph = g).results
 
 const RecA = "known flaky test A"
 const RecB = "known flaky test B"

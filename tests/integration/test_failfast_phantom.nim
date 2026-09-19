@@ -116,7 +116,7 @@ suite "H1/fail-fast — no phantom entry under non-contiguous dispatch":
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let results = execute(p, config = cfg, graph = g,
-                          failFast = true, showProgress = false)
+                          failFast = true, showProgress = false).results
 
     # --- Core assertion: no phantom entries ---
     # Every returned result must correspond to an entry that actually ran.
@@ -131,6 +131,77 @@ suite "H1/fail-fast — no phantom entry under non-contiguous dispatch":
     # The failure must be present.
     let failCount = results.filterIt(it.outcome.isFailure).len
     check failCount >= 1
+
+  test "fail-fast early-exit: notStarted honestly counts the never-dispatched entry (r33)":
+    ## rfc-0007 code-review r7/r33: `execute()` used to report `notStarted`
+    ## (and `interrupted`/`shutdownSignal`/`lateOrphansReaped`) through raw
+    ## `ptr` out-params, written only in the epilogue AFTER the while/finally.
+    ## The failFast early-exit above used to `return` directly from INSIDE
+    ## the while loop, before that epilogue ever ran — silently leaving the
+    ## caller's `notStartedOut` at its zero-value default even though an
+    ## entry genuinely never started (r33). `execute()` now returns a single
+    ## `ExecuteReport`, and the failFast early-exit is a plain `break` that
+    ## falls through to the SAME one epilogue every other exit path uses —
+    ## so `notStarted` is populated here exactly like it always was on an
+    ## interrupted run.
+    ##
+    ## Same scenario as the test above (`mkEpInGroup` idx 1 is cap-blocked
+    ## and never dispatched): the cheapest observable epilogue fact to pin.
+    let fdir = fixtureDir()
+    let failFix = fdir / "fail_always.nim"
+    let passFix = fdir / "pass_always.nim"
+
+    let serialGroup = Group(
+      name:        "serial",
+      globs:       @[],
+      flags:       @[],
+      optIn:       false,
+      gate:        none(Gate),
+      timeoutSecs: 0,
+      maxJobs:     some(1),
+    )
+    let freeGroup = Group(
+      name:        "free",
+      globs:       @[],
+      flags:       @[],
+      optIn:       false,
+      gate:        none(Gate),
+      timeoutSecs: 0,
+      maxJobs:     none(int),
+    )
+    let cfg = Config(
+      groups:             @[serialGroup, freeGroup],
+      jobs:               2,
+      timeoutSecs:        30,
+      compileTimeoutSecs: 120,
+      maxOutputBytes:     10 * 1024 * 1024,
+      stateDir:           ".crisol",
+      projectRoot:        getCurrentDir(),
+      trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
+      memAware:           some(false),
+    )
+    let eps = @[
+      mkEpInGroup(failFix, "serial"),   # idx 0: fails → anyFailed
+      mkEpInGroup(passFix, "serial"),   # idx 1: blocked by cap; never dispatched
+      mkEpInGroup(passFix, "free"),     # idx 2: skip-ahead admits this
+    ]
+
+    let p = plan(cfg, eps, emptyDepGraph())
+    var g = emptyDepGraph()
+    let execReport = execute(p, config = cfg, graph = g,
+                             failFast = true, showProgress = false)
+
+    # RED on pre-refactor runner.nim/api.nim (verified against a scratch
+    # copy of git HEAD's runner.nim/api.nim under the exact same scenario):
+    # notStarted comes back 0 there -- the epilogue that computes/writes it
+    # is skipped entirely by the failFast early `return`. GREEN here: idx 1
+    # was genuinely never dispatched, and now IS counted.
+    check execReport.notStarted == 1
+    check execReport.results.len == 2
+    # Not interrupted -- this is an ordinary failFast completion, not a
+    # SIGINT/SIGTERM cut-short; only notStarted should be non-zero.
+    check execReport.interrupted == false
+    check execReport.shutdownSignal == 0
 
 when isMainModule:
   echo "Fail-fast phantom entry regression test done."
