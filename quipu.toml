@@ -9,3 +9,15 @@ globs = ["docs/rfc/*.md"]
 # the fork stays open for ratification.
 [roadmap]
 review_cap = 3
+
+# RFC 0005 `deployment-cutover` (quipu 2026-09-17): where this repository's
+# pre-push / post-merge / post-rewrite hooks send their ingest payload, and
+# under what slug. The hub no longer mounts this checkout -- it has no git
+# at all -- so this table is the only thing that keeps its page current.
+# Loopback because this host's stub resolver does not serve *.leavitt.dev
+# and the stack publishes 127.0.0.1:8001 for same-host hooks; a checkout on
+# any other machine wants https://quipu.leavitt.dev instead. The token is
+# not here: it lives in .git/quipu-token (untracked, mode 600).
+[hub]
+url = "http://127.0.0.1:8001"
+slug = "crisol"
