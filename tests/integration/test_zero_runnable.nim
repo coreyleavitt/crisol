@@ -184,7 +184,7 @@ suite "crisol zero-runnable — branch 2: --failed no prior failures":
         ep:      testEp("tests/unit/test_a.nim", group = "unit", flags = @[]), durationMs: 10, records: @[],
         compile: okPhase(), run: okPhase()),
     ]
-    persistLastRun(results, Summary(total: 1, passed: 1), cfg)
+    persistLastRun(RunDocument(results: results, summary: Summary(total: 1, passed: 1)), cfg)
 
     let oldCwd = getCurrentDir()
     setCurrentDir(repo)

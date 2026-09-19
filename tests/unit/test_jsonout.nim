@@ -329,7 +329,7 @@ suite "jsonout - toJson schema":
     check ep["compile"]["durationUs"].kind == JInt
 
   test "toJsonString produces valid parseable JSON":
-    let s      = toJsonString(syntheticResults(), syntheticSummary())
+    let s      = toJsonString(RunDocument(results: syntheticResults(), summary: syntheticSummary()))
     check s.len > 0
     let parsed = parseJson(s)   # throws if invalid
     check parsed["schema"].getStr == "crisol/run/v2"
@@ -408,7 +408,7 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     check node["interrupted"].getBool == true
 
   test "toJsonString also threads interrupted through":
-    let s = toJsonString(syntheticResults(), syntheticSummary(), interrupted = true)
+    let s = toJsonString(RunDocument(results: syntheticResults(), summary: syntheticSummary(), interrupted: true))
     check parseJson(s)["interrupted"].getBool == true
 
   test "RFC-0005 B3c: verifyFails defaults to 0 and is always present":
@@ -419,7 +419,7 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
   test "RFC-0005 B3c: verifyFails threads through explicitly, toJson and toJsonString both":
     let node = toJson(syntheticResults(), syntheticSummary(), verifyFails = 3)
     check node["verifyFails"].getInt == 3
-    let s = toJsonString(syntheticResults(), syntheticSummary(), verifyFails = 3)
+    let s = toJsonString(RunDocument(results: syntheticResults(), summary: syntheticSummary(), verifyFails: 3))
     check parseJson(s)["verifyFails"].getInt == 3
 
   test "RFC-0005 B1c: keyDiff is ABSENT on every entrypoint when explainMiss is false (default)":
@@ -462,7 +462,7 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
                              compile: okPhase(), run: okPhase(), durationMs: 1,
                              cacheDecision: cdmStored)
     r.keyDiff = @[KeyDiff(component: kcClosure, prev: "1111", curr: "2222")]
-    let s = toJsonString(@[r], summarize(@[r]), explainMiss = true)
+    let s = toJsonString(RunDocument(results: @[r], summary: summarize(@[r])), explainMiss = true)
     let parsed = parseJson(s)  # must not raise -- stdout stays parseable JSON
     check parsed["entrypoints"][0]["keyDiff"][0]["component"].getStr == "kcClosure"
 
@@ -511,7 +511,7 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
                              compile: okPhase(), run: okPhase(), durationMs: 1,
                              cacheDecision: cdmHit, cacheTier: "l1", cacheLookup: cvOk)
-    let s = toJsonString(@[r], summarize(@[r]))
+    let s = toJsonString(RunDocument(results: @[r], summary: summarize(@[r])))
     let parsed = parseJson(s)
     check parsed["entrypoints"][0]["cacheTier"].getStr == "l1"
     check parsed["entrypoints"][0]["cacheLookup"].getStr == "ok"
@@ -574,8 +574,8 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
       total: 17, notConsulted: 19, hitPct: 23.5, wallSavedMs: 29'i64,
       published: 31, verifyFails: 37, trustRejects: 41, corruptReads: 43,
     )
-    let s = toJsonString(syntheticResults(), syntheticSummary(),
-                         cacheStats = stats, showCacheStats = true)
+    let s = toJsonString(RunDocument(results: syntheticResults(), summary: syntheticSummary(),
+                                     cacheStats: stats), showCacheStats = true)
     let cs = parseJson(s)["cacheStats"]
     check cs["l1Hits"].getInt       == 3
     check cs["remoteHits"].getInt   == 5
@@ -767,7 +767,7 @@ suite "jsonout - persistLastRun":
     createDir(tmpDir)
     defer: removeDir(tmpDir)
 
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary()), cfg)
 
     let finalPath = tmpDir / stateDir / "lastrun.json"
     check fileExists(finalPath)
@@ -788,7 +788,7 @@ suite "jsonout - persistLastRun":
     createDir(tmpDir)
     defer: removeDir(tmpDir)
 
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary()), cfg)
 
     let finalPath = tmpDir / stateDir / "lastrun.json"
     let raw       = readFile(finalPath)
@@ -813,7 +813,7 @@ suite "jsonout - persistLastRun":
 
     let results = syntheticResults()
     let summary = syntheticSummary()
-    persistLastRun(results, summary, cfg)
+    persistLastRun(RunDocument(results: results, summary: summary), cfg)
 
     let finalPath  = tmpDir / stateDir / "lastrun.json"
     let fromFile   = parseJson(readFile(finalPath))
@@ -844,7 +844,7 @@ suite "jsonout - persistLastRun":
     defer: removeDir(tmpDir)
     # Do NOT create stateDir -- persistLastRun must create it.
 
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary()), cfg)
     check fileExists(tmpDir / stateDir / "lastrun.json")
 
   test "persistLastRun does not crash when projectRoot is unwritable":
@@ -867,7 +867,7 @@ suite "jsonout - persistLastRun":
     )
     # Should not raise; just warns to stderr.
     try:
-      persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+      persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary()), cfg)
     except:
       check false   # must not propagate any exception
 
@@ -1223,8 +1223,8 @@ suite "jsonout - loadLastRun (B7)":
       key:     "max-retries",
       message: "unknown config key 'max-retries' in integration (ignored)",
     )
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg,
-                   warnings = @[warn], memThrottledSlots = 0)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary(),
+                               warnings: @[warn], memThrottledSlots: 0), cfg)
 
     let parsed = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
     check parsed.hasKey("warnings")
@@ -1250,8 +1250,8 @@ suite "jsonout - loadLastRun (B7)":
     createDir(tmpDir)
     defer: removeDir(tmpDir)
 
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg,
-                   warnings = @[], memThrottledSlots = 7)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary(),
+                               warnings: @[], memThrottledSlots: 7), cfg)
 
     let parsed = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
     check parsed.hasKey("memThrottledSlots")
@@ -1283,12 +1283,12 @@ suite "jsonout - loadLastRun (B7)":
     )
     let results = syntheticResults()
     let summary = syntheticSummary()
-    persistLastRun(results, summary, cfg, warnings = @[warn], memThrottledSlots = 3)
+    persistLastRun(RunDocument(results: results, summary: summary, warnings: @[warn], memThrottledSlots: 3), cfg)
 
     let fromFile   = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
-    let fromStdout = parseJson(toJsonString(results, summary,
-                                            warnings = @[warn],
-                                            memThrottledSlots = 3))
+    let fromStdout = parseJson(toJsonString(RunDocument(results: results, summary: summary,
+                                                         warnings: @[warn],
+                                                         memThrottledSlots: 3)))
 
     check fromFile["warnings"].len          == fromStdout["warnings"].len
     check fromFile["memThrottledSlots"].getInt == fromStdout["memThrottledSlots"].getInt
@@ -1355,7 +1355,7 @@ suite "jsonout - loadLastRun (B7)":
     let summary = Summary(total: 2, passed: 1, failed: 1)
     let cfg = makeCfg(tmpDir, stateDir)
 
-    persistLastRun(results, summary, cfg)
+    persistLastRun(RunDocument(results: results, summary: summary), cfg)
     let lr = loadLastRun(cfg)
 
     check lr.found == true
@@ -1450,7 +1450,7 @@ suite "jsonout - P3 symlink-safe temp write":
     )
 
     # This must not crash. Whether it succeeds or warns, the sentinel must be intact.
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary()), cfg)
 
     # The sentinel file must NOT have been overwritten with JSON.
     let sentinelContent = readFile(sentinel)
@@ -1476,7 +1476,7 @@ suite "jsonout - P3 symlink-safe temp write":
 
     let results = syntheticResults()
     let summary = syntheticSummary()
-    persistLastRun(results, summary, cfg)
+    persistLastRun(RunDocument(results: results, summary: summary), cfg)
     let lr = loadLastRun(cfg)
 
     check lr.found == true
@@ -1519,7 +1519,7 @@ suite "jsonout M-report (a) — compile block threading":
   test "toJsonString threads compileBlock through to the serialized string":
     var blk = newJObject()
     blk["segments"] = newJArray()
-    let str = toJsonString(syntheticResults(), syntheticSummary(), compileBlock = blk)
+    let str = toJsonString(RunDocument(results: syntheticResults(), summary: syntheticSummary(), compileBlock: blk))
     let node = parseJson(str)
     check node.hasKey("compileStats")
     check node["compileStats"]["segments"].len == 0
@@ -1549,7 +1549,7 @@ suite "jsonout M-report (a) — compile block threading":
     segments.add seg
     blk["segments"] = segments
 
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg, compileBlock = blk)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary(), compileBlock: blk), cfg)
 
     let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
     check persisted.hasKey("compileStats")
@@ -1571,7 +1571,7 @@ suite "jsonout M-report (a) — compile block threading":
       maxOutputBytes:     65536,
     )
 
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary()), cfg)
 
     let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
     check not persisted.hasKey("compileStats")
@@ -1620,7 +1620,7 @@ suite "jsonout M-report (b1) — reuseAlerts threading":
     a["alertBelow"] = newJFloat(0.5)
     alerts.add a
 
-    let str = toJsonString(syntheticResults(), syntheticSummary(), reuseAlerts = alerts)
+    let str = toJsonString(RunDocument(results: syntheticResults(), summary: syntheticSummary(), reuseAlerts: alerts))
     let node = parseJson(str)
     check node["reuseAlerts"].len == 1
 
@@ -1648,7 +1648,7 @@ suite "jsonout M-report (b1) — reuseAlerts threading":
     a["alertBelow"] = newJFloat(0.5)
     alerts.add a
 
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg, reuseAlerts = alerts)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary(), reuseAlerts: alerts), cfg)
 
     let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
     check persisted.hasKey("reuseAlerts")
@@ -1670,7 +1670,7 @@ suite "jsonout M-report (b1) — reuseAlerts threading":
       maxOutputBytes:     65536,
     )
 
-    persistLastRun(syntheticResults(), syntheticSummary(), cfg)
+    persistLastRun(RunDocument(results: syntheticResults(), summary: syntheticSummary()), cfg)
 
     let persisted = parseJson(readFile(tmpDir / stateDir / "lastrun.json"))
     check persisted.hasKey("reuseAlerts")
@@ -1877,7 +1877,7 @@ suite "jsonout - RFC-0009 A2: top-level trackedRoots evidence":
   test "toJsonString threads trackedRoots through identically to toJson":
     let roots = initTrackedRoots("/tmp/rfc9-a2-jsonout-project2", @[], "",
       proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(fpAsciiLower))
-    let s = toJsonString(syntheticResults(), syntheticSummary(), trackedRoots = roots)
+    let s = toJsonString(RunDocument(results: syntheticResults(), summary: syntheticSummary(), trackedRoots: roots))
     let node = parseJson(s)
     check node["trackedRoots"][0]["foldPolicy"].getStr == "asciiLower"
 
@@ -1903,6 +1903,6 @@ suite "jsonout - RFC-0009 A-degraded D6: top-level degraded evidence":
     var roots = default(TrackedRoots)
     roots.degraded = true
     roots.degradedReason = "fold-policy probe failed for root 'dep' (/tmp/dep)"
-    let s = toJsonString(syntheticResults(), syntheticSummary(), trackedRoots = roots)
+    let s = toJsonString(RunDocument(results: syntheticResults(), summary: syntheticSummary(), trackedRoots: roots))
     let node = parseJson(s)
     check node["degraded"]["reason"].getStr == roots.degradedReason

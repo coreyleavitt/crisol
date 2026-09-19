@@ -283,7 +283,7 @@ suite "crisol D5 — --failed --changed union":
         compile: okPhase(), run: okPhase()),
     ]
     let summary = Summary(total: 2, passed: 1, failed: 1)
-    persistLastRun(results, summary, cfg)
+    persistLastRun(RunDocument(results: results, summary: summary), cfg)
 
     let oldCwd = getCurrentDir()
     setCurrentDir(repo)

@@ -906,8 +906,7 @@ suite "RFC-0005 code-review D1 — local (l1) put failures count as localErrors,
 
       # Wire-level assertion (not just the in-process struct): the run/v2
       # JSON `cacheStats` object under --cache-stats.
-      let node = parseJson(toJsonString(rr.results, rr.summary,
-                                        cacheStats = rr.cacheStats, showCacheStats = true))
+      let node = parseJson(toJsonString(rr.doc, showCacheStats = true))
       check node["cacheStats"]["localErrors"].getInt == 1
       check node["cacheStats"]["remoteErrors"].getInt == 0
 
@@ -1216,7 +1215,7 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
 
       # Wire-level assertion (RFC's own DoD wording, verbatim): the run/v2
       # render, not just the in-process EntrypointResult.
-      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let node = parseJson(toJsonString(rr2.doc))
       let epNode = node["entrypoints"][0]
       check epNode["cacheLookup"].getStr == "trustBadSignature"
       check epNode["cacheDecision"].getStr == "stored"
@@ -1350,7 +1349,7 @@ remote-cache "mirror" {
       # Wire-level assertion: the run/v2 render, not just the in-process
       # EntrypointResult -- proves configuredCache's wiring reaches the
       # actual JSON provenance, not merely an in-memory field.
-      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let node = parseJson(toJsonString(rr2.doc))
       let epNode = node["entrypoints"][0]
       check epNode["cacheTier"].getStr == "mirror"
       check epNode["cacheDecision"].getStr == "hit"
@@ -1467,7 +1466,7 @@ cache-trust {
 
       # Wire-level assertion (RFC's own DoD wording, verbatim): the run/v2
       # render, not just the in-process EntrypointResult.
-      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let node = parseJson(toJsonString(rr2.doc))
       let epNode = node["entrypoints"][0]
       check epNode["cacheLookup"].getStr == "trustBadSignature"
       check epNode["cacheDecision"].getStr == "stored"
@@ -1639,7 +1638,7 @@ cache-trust {
 
       # Wire-level assertion (RFC's own DoD wording, verbatim): the run/v2
       # render, not just the in-process EntrypointResult.
-      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let node = parseJson(toJsonString(rr2.doc))
       let epNode = node["entrypoints"][0]
       check epNode["cacheTier"].getStr == "mirror"
       check epNode["cacheDecision"].getStr == "hit"
@@ -1767,7 +1766,7 @@ cache-trust {
 
       # Wire-level assertion (RFC's own DoD wording, verbatim): the run/v2
       # render, not just the in-process EntrypointResult.
-      let node = parseJson(toJsonString(rr2.results, rr2.summary))
+      let node = parseJson(toJsonString(rr2.doc))
       let epNode = node["entrypoints"][0]
       check epNode["cacheLookup"].getStr == "trustUnpinnedSigner"
       check epNode["cacheDecision"].getStr == "stored"
@@ -1855,7 +1854,7 @@ suite "RFC-0005 A2c-ii — post-compile consult: a genuinely cold project hits a
 
     # Wire-level assertion: the run/v2 render, not just the in-process
     # EntrypointResult.
-    let node = parseJson(toJsonString(rr2.results, rr2.summary))
+    let node = parseJson(toJsonString(rr2.doc))
     let epNode = node["entrypoints"][0]
     check epNode["cacheTier"].getStr == "mirror"
     check epNode["cacheDecision"].getStr == "hit"
@@ -1956,8 +1955,7 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     # EntrypointResult. Threading cacheStats through the SAME render path
     # `crisol run --json` uses proves the rider's fix is visible on the
     # wire, not just in the in-process CacheStats struct.
-    let node2 = parseJson(toJsonString(rr2.results, rr2.summary,
-                                       cacheStats = rr2.cacheStats, showCacheStats = true))
+    let node2 = parseJson(toJsonString(rr2.doc, showCacheStats = true))
     let epNode2 = node2["entrypoints"][0]
     check epNode2["cacheTier"].getStr == "mirror"
     check epNode2["cacheDecision"].getStr == "hit"
@@ -1978,8 +1976,7 @@ suite "RFC-0005 A2c-iii — E2E-1: the cold-host three-run sequence (+ secondary
     check rr3.cacheStats.l1Hits == 1
     check rr3.cacheStats.remoteHits == 0
 
-    let node3 = parseJson(toJsonString(rr3.results, rr3.summary,
-                                       cacheStats = rr3.cacheStats, showCacheStats = true))
+    let node3 = parseJson(toJsonString(rr3.doc, showCacheStats = true))
     let epNode3 = node3["entrypoints"][0]
     check epNode3["cacheTier"].getStr == "l1"
     check epNode3["cacheDecision"].getStr == "hit"

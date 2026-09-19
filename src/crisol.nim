@@ -1371,18 +1371,19 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     # `cacheStats` field below instead.
     if cacheStatsResolved:
       stderr.write("crisol: " & renderCacheStats(rr.cacheStats) & "\n")
-    stdout.write(toJsonString(rr.results, rr.summary, filterTag, rr.plan.warnings,
-                              rr.memThrottledSlots,
-                              lateOrphansReaped = rr.lateOrphansReaped,
-                              compileBlock = rr.compileBlock,   # rfc-0007 W3
-                              reuseAlerts = rr.reuseAlerts,     # rfc-0007 W3
-                              interrupted = rr.interrupted,
-                              policy = policy, substrate = process.capabilities(),
-                              verifyFails = rr.verifyDivergences.len,
+    # rfc-0007 code-review r8: rr.doc is the ONE shared run-level record
+    # runTestsWith already assembled (jsonout.RunDocument) -- results,
+    # summary, warnings, memThrottledSlots, lateOrphansReaped, compileBlock,
+    # reuseAlerts, interrupted, policy, substrate, verifyFails, cacheStats,
+    # trackedRoots all thread through it now instead of being individually
+    # re-listed here from rr.* (the shape that shipped the W3 defect -- a
+    # call site that forgets to list one silently emits a wrong-but-valid
+    # document). filterTag/explainMiss/showCacheStats stay direct params --
+    # genuinely per-sink knobs, not per-run facts (see RunDocument's own doc
+    # comment in jsonout.nim).
+    stdout.write(toJsonString(rr.doc, filterTag,
                               explainMiss = explainMissResolved,
-                              cacheStats = rr.cacheStats,
-                              showCacheStats = cacheStatsResolved,
-                              trackedRoots = rr.trackedRoots))
+                              showCacheStats = cacheStatsResolved))
     stdout.write("\n")
   else:
     let ropts = RenderOpts(color: colorEnabled, slowestN: 5,

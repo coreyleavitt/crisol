@@ -331,7 +331,7 @@ suite "crisol CLI — B7 --failed":
     if hadOld:
       oldContent = readFile(lrPath)
 
-    persistLastRun(results, summary, cfg)
+    persistLastRun(RunDocument(results: results, summary: summary), cfg)
     defer:
       if hadOld: writeFile(lrPath, oldContent)
       else: (try: removeFile(lrPath) except: discard)
@@ -378,7 +378,7 @@ suite "crisol CLI — B7 --failed":
     var oldContent = ""
     let hadOld = fileExists(lrPath)
     if hadOld: oldContent = readFile(lrPath)
-    persistLastRun(results, summary, cfg)
+    persistLastRun(RunDocument(results: results, summary: summary), cfg)
     defer:
       if hadOld: writeFile(lrPath, oldContent)
       else: (try: removeFile(lrPath) except: discard)

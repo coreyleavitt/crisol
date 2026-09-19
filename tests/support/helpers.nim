@@ -154,4 +154,4 @@ proc seedLastRun*(projectRoot: string; results: seq[EntrypointResult];
     stateDir:    DefaultStateDir,
     timeoutSecs: DefaultTimeoutSecs,
   )
-  persistLastRun(results, summary, cfg)
+  persistLastRun(RunDocument(results: results, summary: summary), cfg)

@@ -222,7 +222,7 @@ suite "S6b — mem-aware probe: serialization via tiny mem-budget-mb":
 
     # The JSON output must carry the non-zero count.
     let summary = summarize(results)
-    let jsonStr = toJsonString(results, summary, memThrottledSlots = throttled)
+    let jsonStr = toJsonString(RunDocument(results: results, summary: summary, memThrottledSlots: throttled))
     let parsed  = parseJson(jsonStr)
     check parsed.hasKey("memThrottledSlots")
     check parsed["memThrottledSlots"].getInt > 0
@@ -248,7 +248,7 @@ suite "S6b — mem-aware probe: serialization via tiny mem-budget-mb":
     check throttled == 0  # kill switch → gate inert → no throttle events
 
     let summary = summarize(results)
-    let jsonStr = toJsonString(results, summary, memThrottledSlots = throttled)
+    let jsonStr = toJsonString(RunDocument(results: results, summary: summary, memThrottledSlots: throttled))
     let parsed  = parseJson(jsonStr)
     check parsed["memThrottledSlots"].getInt == 0
 

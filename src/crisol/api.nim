@@ -143,8 +143,10 @@ export render.RenderOpts
 export render.defaultOpts
 export render.renderClosure
 
-# From jsonout — schema constant + toJsonString only (NOT persistLastRun, loadLastRun)
+# From jsonout — schema constant + toJsonString + RunDocument only (NOT
+# persistLastRun, loadLastRun)
 export jsonout.toJsonString
+export jsonout.RunDocument  # rfc-0007 r8: RunReport.doc's type
 export jsonout.RunSchema
 export cachetelemetry.CacheStats  # RFC-0005 B2b: RunReport.cacheStats's type
 export jsonout.closureToJsonString
@@ -522,14 +524,32 @@ type
                                   ## root + every configured dep root, each root-tagged and
                                   ## fold-probed by config.loadConfig — see types.Config).
                                   ## Threaded straight through from the plan-phase Config,
-                                  ## unchanged; the CLI passes this into jsonout.toJsonString's
-                                  ## `trackedRoots` param (rev 25) so the emitted evidence
-                                  ## reflects the ACTUAL run's roots, not jsonout's zero-value
-                                  ## default. A structural-early-exit RunReport
+                                  ## unchanged; also carried on `doc.trackedRoots` below (rev
+                                  ## 25) so the emitted evidence reflects the ACTUAL run's
+                                  ## roots, not jsonout's zero-value default. A
+                                  ## structural-early-exit RunReport
                                   ## (structuralResult/structuralResultWithPlan below) leaves
                                   ## this at its zero value — no Config was ever built on
                                   ## that path — same "always-present, zero-value-is-honest"
                                   ## convention as `cacheStats` above.
+    doc*: jsonout.RunDocument     ## rfc-0007 code-review r8: the SAME shared run-level
+                                  ## record `runTestsWith` already assembled once to call
+                                  ## `jsonout.persistLastRun` with -- carried here, by that
+                                  ## point fully populated (verifyFails/cacheStats filled in
+                                  ## after the verify-cache pass and telemetry aggregation
+                                  ## below, which both run after the persist call), so the
+                                  ## CLI's stdout `jsonout.toJsonString` call site can pass
+                                  ## `rr.doc` straight through instead of re-deriving the
+                                  ## same ~10 facts from other RunReport fields by hand (the
+                                  ## shape that shipped the W3 defect -- see jsonout.nim's own
+                                  ## rev-history note). The individual fields above
+                                  ## (`compileBlock`, `reuseAlerts`, `memThrottledSlots`, ...)
+                                  ## stay in place unchanged for library consumers who want
+                                  ## structured access without re-deriving a `RunDocument` --
+                                  ## `doc` is additive, not a replacement for them. A
+                                  ## structural-early-exit RunReport leaves this at its zero
+                                  ## value, same convention as `trackedRoots`/`cacheStats`
+                                  ## above.
 
   VerifyDivergence* = object
     ## RFC-0005 B3b: one --verify-cache mismatch between the observation the
@@ -1770,6 +1790,26 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     # selection, so the last COMPLETE run stays the anchor.
     var compileBlock: JsonNode = nil
     var reuseAlerts: JsonNode = nil
+    # rfc-0007 code-review r8: the ONE shared run-level record (jsonout.
+    # RunDocument) -- assembled here, where every fact this proc has
+    # computed so far is in scope, and reused for BOTH `persistLastRun`
+    # below (verifyFails/cacheStats not filled in yet -- not known this
+    # early, see RunDocument's and persistLastRun's own doc comments) and
+    # the final `RunReport.doc` further down (verifyFails/cacheStats filled
+    # in once the verify-cache pass and telemetry aggregation below produce
+    # them) -- so the CLI's stdout emission (crisol.nim) needs only
+    # `rr.doc`, not a second hand-threaded argument list duplicating this one.
+    var doc = RunDocument(
+      results:           results,
+      summary:           s,
+      warnings:          pr.warnings,
+      memThrottledSlots: memThrottled,
+      lateOrphansReaped: lateOrphansReaped,
+      interrupted:       interrupted,
+      policy:            policy,
+      substrate:         process.capabilities(),  # rfc-0007 W3
+      trackedRoots:      cfg.trackedRoots,         # rfc-0007 W3
+    )
     if opts.persist and not interrupted:
       # RFC-0006 M-report pass (a): the segmented `compile` block
       # only carries data when the telemetry stream was actually written
@@ -1790,6 +1830,8 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       # block-scoped `let`) so it also reaches RunReport below -- the CLI's
       # stdout emission needs the exact same value persistLastRun gets.
       reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
+      doc.compileBlock = compileBlock
+      doc.reuseAlerts  = reuseAlerts
       # rfc-0007 code-review r16: persistLastRun's own documented contract
       # (jsonout.nim) is "on any failure: prints a warning to stderr and
       # returns -- never raises" -- but that contract has exactly one gap:
@@ -1808,13 +1850,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       # whatever it produced; only the lastrun.json ARTIFACT is missing,
       # never the run itself.
       try:
-        persistLastRun(results, s, cfg, warnings = pr.warnings,
-                       memThrottledSlots = memThrottled,
-                       lateOrphansReaped = lateOrphansReaped,
-                       compileBlock = compileBlock,
-                       reuseAlerts = reuseAlerts, policy = policy,
-                       substrate = process.capabilities(),  # rfc-0007 W3
-                       trackedRoots = cfg.trackedRoots)      # rfc-0007 W3
+        persistLastRun(doc, cfg)
       except CatchableError as e:
         try:
           stderr.write("crisol: warning: could not persist lastrun.json: " & e.msg & "\n")
@@ -1875,6 +1911,14 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
     for terr in erroredTiers(warnSink.events):
       stderr.write("crisol: warning: " & tierErrorWarning(terr) & "\n")
 
+    # rfc-0007 code-review r8: `doc` (assembled above, before persistLastRun)
+    # only just now has everything it was missing at persist time -- fill in
+    # the two facts that were temporally unavailable until this point (see
+    # RunDocument's/persistLastRun's own doc comments for why) so `RunReport.
+    # doc` below is the COMPLETE record, not the partial one persistLastRun saw.
+    doc.verifyFails = verifyDivergences.len
+    doc.cacheStats  = cacheStats
+
     # rfc-0007 A1e-ii: an interrupted run still returns through this ONE
     # normal-return path (no more early exception-driven return above) — only
     # the status/exitCode/interrupted trio differ; results/summary already
@@ -1895,6 +1939,7 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
       verifyCouldNotReexec: verifyCouldNotReexec,  # RFC-0005 code-review SO4
       cacheStats:        cacheStats,  # RFC-0005 B2b
       trackedRoots:      cfg.trackedRoots,  # RFC-0009 A2
+      doc:               doc,  # rfc-0007 code-review r8
     )
   finally:
     releaseLock(lockHandle)

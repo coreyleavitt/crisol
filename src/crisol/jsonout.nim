@@ -13,14 +13,17 @@
 ##     The summary object is always the FULL-RUN summary (never re-counted
 ##     from filtered records) so the JSON verdict is not distorted.
 ##
-##   toJsonString*(results: seq[EntrypointResult]; summary: Summary;
-##                 filterTag: string = ""): string
+##   toJsonString*(doc: RunDocument; filterTag: string = ""): string
 ##     Pure: compact JSON string (calls `$` on the JsonNode).
+##     rfc-0007 r8: `doc` is the shared run-level record (see `RunDocument`'s
+##     own doc comment) -- assembled once by `api.runTestsWith` and passed to
+##     both this proc and `persistLastRun` below.
 ##
-##   persistLastRun*(results: seq[EntrypointResult]; summary: Summary; config: Config)
+##   persistLastRun*(doc: RunDocument; config: Config)
 ##     Effectful: write <config.projectRoot>/<config.stateDir>/lastrun.json
 ##     atomically (temp file + rename).  Creates the state dir if absent.
 ##     On any write failure: warns to stderr and continues -- never crashes.
+##     Never writes at all when doc.interrupted (see its own doc comment).
 ##
 ##   loadLastRun*(config: Config): tuple[found: bool; failed: HashSet[tuple[path,group: string]]]
 ##     Effectful: read <projectRoot>/<stateDir>/lastrun.json and return the set
@@ -1051,72 +1054,101 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     cs["corruptReads"] = newJInt(cacheStats.corruptReads)  # rev 23 (RFC-0005 code-review R2-T8b)
     result["cacheStats"] = cs
 
-proc toJsonString*(results: seq[EntrypointResult]; summary: Summary;
-                   filterTag: string = "";
-                   warnings: seq[ConfigWarning] = @[];
-                   memThrottledSlots: int = 0;
-                   lateOrphansReaped: int = 0;
-                   compileBlock: JsonNode = nil;
-                   reuseAlerts: JsonNode = nil;
-                   interrupted: bool = false;
-                   policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
-                   substrate: ptypes.Capabilities = ptypes.Capabilities();
-                   verifyFails: int = 0;
+type
+  RunDocument* = object
+    ## rfc-0007 code-review r8: the single run-level emission-input record
+    ## shared by `toJsonString` (stdout) and `persistLastRun` (lastrun.json).
+    ## Assembled ONCE in `api.runTestsWith` -- the one place that has every
+    ## fact -- and passed to both sinks below, instead of each sink's own
+    ## caller hand-listing an overlapping subset of the same ~15 facts (the
+    ## shape that shipped the W3 defect: see this file's rev-history note
+    ## above -- a caller forgot to thread `compileBlock`/`reuseAlerts` on
+    ## one call site and `substrate`/`trackedRoots` on the other, and both
+    ## compiled clean because every dropped fact has an honest-looking zero
+    ## default). Field semantics are documented on `toJson*`'s own params
+    ## above (same names) -- not repeated here.
+    ##
+    ## Deliberately NOT included: `filterTag`, `explainMiss`,
+    ## `showCacheStats` -- these are genuinely per-SINK knobs (a CLI flag
+    ## that means something different, or nothing at all, to each sink),
+    ## never per-RUN facts, so they stay direct params on `toJson`/
+    ## `toJsonString` rather than living on the shared record. The
+    ## documented sink DIFFERENCES over the fields that DO live here --
+    ## lastrun.json never carries `cacheStats`, `verifyFails` is always 0
+    ## there (--verify-cache runs after persistLastRun in
+    ## `api.runTestsWith` -- an ordering fact, not a caller choice), and a
+    ## run is never persisted at all when `interrupted` -- are `persistLastRun`
+    ## body logic (see there), not a param this record omits.
+    results*:           seq[EntrypointResult]
+    summary*:           Summary
+    warnings*:          seq[ConfigWarning]
+    memThrottledSlots*: int
+    lateOrphansReaped*: int
+    compileBlock*:      JsonNode
+    reuseAlerts*:       JsonNode
+    interrupted*:       bool
+    policy*:            ptypes.OutcomePolicy
+    substrate*:         ptypes.Capabilities
+    verifyFails*:       int
+    cacheStats*:        CacheStats
+    trackedRoots*:      TrackedRoots
+
+proc toJsonString*(doc: RunDocument; filterTag: string = "";
                    explainMiss: bool = false;
-                   cacheStats: CacheStats = CacheStats();
-                   showCacheStats: bool = false;
-                   trackedRoots: TrackedRoots = default(TrackedRoots)): string =
+                   showCacheStats: bool = false): string =
   ## Pure: compact JSON string of the crisol/run/v2 document.
-  ## C3: filterTag threads through to toJson.
-  ## policy: rfc-0007 A6b — threads through to toJson unchanged (see there).
-  ## substrate: rfc-0007 A7 — threads through to toJson unchanged (see there).
-  ## verifyFails: RFC-0005 B3c — threads through to toJson unchanged (see there).
-  ## explainMiss: RFC-0005 B1c (rev 20) — threads through to toJson unchanged.
-  ## cacheStats/showCacheStats: RFC-0005 B2b (rev 21) — threads through to
-  ## toJson unchanged.
-  ## lateOrphansReaped: rfc-0007 B1 (rev 24) — threads through to toJson unchanged.
-  ## trackedRoots: RFC-0009 A2 (rev 25) — threads through to toJson unchanged.
-  $toJson(results, summary, filterTag, warnings, memThrottledSlots, lateOrphansReaped,
-         compileBlock, reuseAlerts, interrupted, policy, substrate, verifyFails,
-         explainMiss, cacheStats, showCacheStats, trackedRoots)
+  ## doc: rfc-0007 r8 -- the shared run-level record (see `RunDocument`);
+  ## every field there threads straight through to `toJson` unchanged.
+  ## filterTag/explainMiss/showCacheStats: genuinely per-sink knobs (see
+  ## `RunDocument`'s own doc comment) -- stay direct params, not on the record.
+  $toJson(doc.results, doc.summary, filterTag, doc.warnings,
+         doc.memThrottledSlots, doc.lateOrphansReaped,
+         doc.compileBlock, doc.reuseAlerts, doc.interrupted, doc.policy,
+         doc.substrate, doc.verifyFails, explainMiss, doc.cacheStats,
+         showCacheStats, doc.trackedRoots)
 
 # ---------------------------------------------------------------------------
 # persistLastRun -- effectful
 # ---------------------------------------------------------------------------
 
-proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
-                     config: Config;
-                     warnings: seq[ConfigWarning] = @[];
-                     memThrottledSlots: int = 0;
-                     lateOrphansReaped: int = 0;
-                     compileBlock: JsonNode = nil;
-                     reuseAlerts: JsonNode = nil;
-                     policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy;
-                     substrate: ptypes.Capabilities = ptypes.Capabilities();
-                     trackedRoots: TrackedRoots = default(TrackedRoots)) =
+proc persistLastRun*(doc: RunDocument; config: Config) =
   ## Write lastrun.json atomically to <projectRoot>/<stateDir>/lastrun.json.
   ## Creates the state directory if it does not exist.
   ## On any failure: prints a warning to stderr and returns -- never raises.
   ##
-  ## warnings and memThrottledSlots are threaded through to toJsonString so
-  ## the persisted file matches the stdout JSON path exactly (M3 fix) — rfc-
-  ## 0007 A6b's `policy` extends that same invariant: lastrun.json's per-
-  ## entrypoint `outcome` must agree with the stdout JSON this same run
-  ## already emitted, so a `--strict-hygiene` failure does not silently drop
-  ## off the `--failed` selection on the NEXT run. Defaults to DefaultPolicy
-  ## (unstrict) for callers that never opted in.
-  ## compileBlock: M-report pass (a) segmented compile block, or nil (default)
-  ## when there is no telemetry to report -- threads through unchanged.
-  ## reuseAlerts: M-report pass (b1) alert array, or nil (default; persisted
-  ## as an empty array) -- threads through unchanged.
-  ## substrate/trackedRoots: rfc-0007 W3 — the SAME `process.capabilities()`/
-  ## `cfg.trackedRoots` values the CLI's stdout run/v2 emission carries for
-  ## this run. Before this param pair existed, lastrun.json always rendered
-  ## toJson's zero-value defaults (an all-false `Capabilities()`, a project-
-  ## only `TrackedRoots`) no matter what the SAME run's stdout reported —
-  ## silently contradicting this proc's own "matches the stdout JSON path
-  ## exactly" claim above. Default to the zero values for any caller that
-  ## never opted in (tests, etc.) — same posture as `policy` above.
+  ## doc: rfc-0007 r8 -- the shared run-level record (see `RunDocument`'s own
+  ## doc comment), assembled once by `api.runTestsWith` and passed here
+  ## verbatim -- `warnings`/`memThrottledSlots`/`policy`/`substrate`/
+  ## `trackedRoots`/`compileBlock`/`reuseAlerts` all thread through to
+  ## `toJsonString` unchanged, so the persisted file matches the stdout
+  ## JSON path exactly (M3 fix; rfc-0007 A6b/W3 extend that same invariant
+  ## to `policy`/`substrate`/`trackedRoots` — lastrun.json's per-entrypoint
+  ## `outcome` must agree with the stdout JSON this same run already
+  ## emitted, so a `--strict-hygiene` failure does not silently drop off
+  ## the `--failed` selection on the next run).
+  ##
+  ## `doc.interrupted`/`doc.verifyFails`/`doc.cacheStats` are carried on the
+  ## record but NEVER reach the persisted file -- these are this sink's
+  ## documented differences from the stdout path, now expressed as code
+  ## here rather than left to caller discipline:
+  ##   - interrupted: an interrupted run is never persisted at all (guard
+  ##     below) -- an entrypoint never observed must not silently leave the
+  ##     `--failed` selection; `api.runTestsWith` already gates this call on
+  ##     `not interrupted`, this is defense in depth against a future caller
+  ##     that forgets to.
+  ##   - verifyFails: always 0 here regardless of `doc.verifyFails` --
+  ##     `--verify-cache` runs strictly AFTER `persistLastRun` in
+  ##     `api.runTestsWith` (an ordering fact: the real count does not exist
+  ##     yet at persist time, `doc.verifyFails` is whatever zero-value the
+  ##     caller had on hand), so this sink hardcodes the "not yet known"
+  ##     posture rather than emitting a number that looks real but isn't.
+  ##   - cacheStats: never emitted to lastrun.json at all (no `showCacheStats`
+  ##     knob exists on this sink) -- same non-goal as before this record
+  ##     existed, just no longer implicit in which params a flat signature
+  ##     happened to omit.
+  if doc.interrupted:
+    return
+
   let stateDir = stateDirOf(config)
   let finalPath = stateDir / "lastrun.json"
 
@@ -1141,14 +1173,10 @@ proc persistLastRun*(results: seq[EntrypointResult]; summary: Summary;
   # attacker-chosen path), writeAllFd (EINTR-safe, short-write-retry loop),
   # then rename(2) into place. A stale temp file from a previous crashed run
   # in THIS process is removed first.
-  let jsonStr = toJsonString(results, summary, warnings = warnings,
-                             memThrottledSlots = memThrottledSlots,
-                             lateOrphansReaped = lateOrphansReaped,
-                             compileBlock = compileBlock,
-                             reuseAlerts = reuseAlerts,
-                             policy = policy,
-                             substrate = substrate,
-                             trackedRoots = trackedRoots)
+  # filterTag/explainMiss/showCacheStats all stay off -- lastrun.json never
+  # filters by tag, never carries keyDiff, never carries cacheStats (see the
+  # sink-difference note above).
+  let jsonStr = toJsonString(doc)
   let (ok, err) = atomicPublish(finalPath, jsonStr)
   if not ok:
     stderr.write("crisol: warning: could not write lastrun.json: " & err & "\n")
