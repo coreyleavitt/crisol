@@ -1,7 +1,7 @@
 # RFC-0007 — Execution substrate — handoff
 
 - **Stage:** **CLOSED — RFC-0007 COMPLETE** (2026-09-19). 0007/state = complete (cdbacd3), review = floor (5 rounds, 0c5b02b), wiring = proven, 7/7 item rows done — w4 wired as the final act (73423e9; resolved b30144a with evidence). Every close-out push CI-green; final run 35463183875.
-- **Resume:** nothing — RFC-0007 is complete. Next up per sequencing: RFC-0005 build (blocked on FORK-2, owed by Corey).
+- **Resume:** nothing — RFC-0007 is complete (fence: complete/floor/proven, 7/7 rows; final CI 35463183875). No state has changed since close; post-close session covered w4 + windows-status Q&A only. Next up per sequencing: RFC-0005 build (blocked on FORK-2, owed by Corey).
 - **Build history:** BUILD COMPLETE 2026-09-10 (Stages A–C prior; Stage D grind: D1a/D1b/D2a); D2b closed via RFC-0009 B4b (CI 35170572732, 2026-09-16); D1c closed 2026-09-18 (05a90cb, CI 35353539907). RFC checklist: 32 checked, 0 unchecked. Both 2026-09-10 follow-ups closed: cbLimit attribution = D1c; RFC-0009 sequencing = done. Sub-slice briefs: scratchpad/D2a-*-brief.md, scratchpad/D1b-design-notes.md.
 - **Sequencing (decided 2026-08-22):** #18 landed first → **0007 Stage A** (A0 CI baseline → result model + contract + seam, Linux, folds #1/#17) → **RFC-0005 build** (its `StoredEntry` wire freezes on A1's shape; the A7-gate re-baselines the 0005 doc+handoff first; FORK-2 still owed by Corey) → 0007 Stages B / C / D → RFC-0008 / RFC-0009. RFC-0006 parked (negative benchmark).
 
