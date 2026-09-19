@@ -404,15 +404,16 @@ type
                                   ## stale entry the moment a mismatch (or
                                   ## a reap) proves the original process is
                                   ## gone — see that proc's doc comment.
-                                  ## r72: `sweepAdoptedOrphan` additionally
-                                  ## routes through `preExistingSweepAction`
-                                  ## rather than the bare predicate — an
-                                  ## UNREADABLE starttime on a tracked pid
-                                  ## is NOT the same as a confirmed
-                                  ## mismatch there (only a readable
-                                  ## mismatch prunes); see that proc's doc
-                                  ## comment for why the escapee-kill site
-                                  ## does not need the same distinction.
+                                  ## r72/r81: BOTH consult sites
+                                  ## (`sweepAdoptedOrphan` and the
+                                  ## escapee-kill scan) route through
+                                  ## `preExistingSweepAction` rather than
+                                  ## the bare predicate — an UNREADABLE
+                                  ## starttime on a tracked pid is NOT a
+                                  ## confirmed mismatch at either site
+                                  ## (only a readable mismatch prunes),
+                                  ## and the kill additionally requires
+                                  ## `escapeeKillIdentityConfirmed`.
 
 # ---------------------------------------------------------------------------
 # Self-pipe + shutdown signal handler.
@@ -1422,12 +1423,14 @@ when defined(linux):
     except CatchableError:
       discard   # raced by something else reading it — attribution stays
                 # honestly empty; the reap below still clears the zombie.
-    # rfc-0007 r72: routed through `preExistingSweepAction` rather than a
-    # bare `isPreExistingIdentity` check — see that proc's doc comment for
-    # why this call site specifically cannot collapse "confirmed mismatch"
-    # and "starttime unreadable" into the same fallthrough the way the
-    # escapee-KILL call site (`discoverAndReapEscapees`, unchanged) safely
-    # does.
+    # rfc-0007 r72/r81: routed through `preExistingSweepAction` rather
+    # than a bare `isPreExistingIdentity` check — "confirmed mismatch" and
+    # "starttime unreadable" must never collapse into the same fallthrough
+    # here (only a readable mismatch may prune). Since r81 the escapee-KILL
+    # call site (`discoverAndReapEscapees`) routes through the SAME action
+    # dispatch and additionally gates its kill on
+    # `escapeeKillIdentityConfirmed` — both sites now share the direction
+    # rule; see `preExistingSweepAction`'s doc comment.
     case preExistingSweepAction(core.preExisting, orphanPid, starttime)
     of peSweepProtect:
       return none(WaitEvent)
