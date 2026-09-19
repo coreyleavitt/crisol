@@ -120,6 +120,84 @@ proc isNoLimit(value: int64): bool =
   ## True when the cgroup value represents "unlimited".
   value == CgroupNoLimitSentinel
 
+proc parseOwnCgroupV2Path*(content: string): string =
+  ## rfc-0007 code-review r50: pure parse of /proc/self/cgroup's unified
+  ## (v2) line ("0::<path>") — the same slicing
+  ## `process/cgroup.ownCgroupV2Path` does against the real filesystem, but
+  ## seam-testable here against injected content (mirrors this module's own
+  ## `read`-seam convention rather than importing that Linux-only module,
+  ## which would tie memprobe's cross-platform build to a `when
+  ## defined(linux)` re-export just for one string parse). Returns "" when
+  ## no "0::" line is present (unreadable file, or a genuinely non-cgroup-v2
+  ## host) — `cgroupV2MinAlongPath` below treats that identically to "at
+  ## the cgroupfs root", which degrades to exactly the pre-r50 root-only
+  ## read.
+  for line in content.splitLines():
+    if line.startsWith("0::"):
+      return line[3 .. ^1]
+  ""
+
+proc cgroupV2AncestorChain*(ownPath: string): seq[string] =
+  ## rfc-0007 code-review r50: pure — the process's own cgroup-v2 leaf
+  ## directory, then each ancestor up to (and including) the cgroupfs
+  ## root, most-specific first. `ownPath == ""` (root, or unresolved)
+  ## degenerates to the single-element `@["/sys/fs/cgroup"]` chain, i.e.
+  ## the exact pre-r50 root-only behaviour.
+  result = @[]
+  let normalized = if ownPath == "/": "" else: ownPath
+  var cur = "/sys/fs/cgroup" & normalized
+  while true:
+    result.add cur
+    if cur == "/sys/fs/cgroup": break
+    let p = cur.parentDir
+    if p.len == 0 or not (p == "/sys/fs/cgroup" or p.startsWith("/sys/fs/cgroup/")):
+      break   # defensive: never climb above the cgroupfs root
+    cur = p
+
+proc cgroupV2MinAlongPath(read: proc(p: string): string):
+    tuple[limit: Option[int64], present: bool, ownDir: string] =
+  ## rfc-0007 code-review r50: `cgroupBudget`'s old v2 arm read the
+  ## cgroupfs ROOT `memory.max` only — a systemd-slice `MemoryMax` set on
+  ## an ANCESTOR between the process's own leaf and the root (the common
+  ## delegated/systemd-managed case) is invisible to a root-only read, even
+  ## though `ownCgroupV2Path` (process/cgroup.nim) already existed to
+  ## resolve exactly the path needed to see it — just never wired to this
+  ## admission-facing probe. Resolves the process's own leaf via
+  ## /proc/self/cgroup, walks the chain from there up to the root, and
+  ## takes the MINIMUM real (non-"max"/non-sentinel) `memory.max` seen
+  ## along the way — "max" at any one level means only THAT level is
+  ## unlimited, not the whole chain. `present` tracks whether ANY level's
+  ## `memory.max` was readable at all, so the caller can still distinguish
+  ## "v2 active but unlimited everywhere" (present, limit none — never
+  ## fall through to v1) from "v2 not mounted at all" (not present — fall
+  ## through to v1), exactly the distinction the old root-only code made
+  ## with a single read. `ownDir` is the chain's own (most-specific) entry
+  ## — the caller reads `memory.current` there, not at an ancestor or the
+  ## root, since usage must be measured at the process's own residency.
+  var ownPath = ""
+  try:
+    ownPath = parseOwnCgroupV2Path(read("/proc/self/cgroup"))
+  except CatchableError:
+    discard   # unreadable (non-Linux, or genuinely absent) — ownPath stays
+              # "", and the chain below degrades to the root-only read.
+  let chain = cgroupV2AncestorChain(ownPath)
+  var minLimit = none(int64)
+  var present = false
+  for dir in chain:
+    try:
+      let raw = read(dir / "memory.max").strip()
+      present = true   # this level's memory.max file exists — v2 is active
+      if raw == "max": continue
+      let v = int64(parseBiggestInt(raw))
+      if isNoLimit(v): continue
+      if minLimit.isNone or v < minLimit.get:
+        minLimit = some(v)
+    except CatchableError:
+      discard   # this level's file absent/unreadable — skip it, not proof
+                # v2 is absent overall (an ancestor further up may still
+                # be readable)
+  (limit: minLimit, present: present, ownDir: chain[0])
+
 proc readInt64(path: string; read: proc(p: string): string): Option[int64] =
   ## Read a file via the seam and parse its content as int64.
   ## Returns none on IOError or parse failure.
@@ -138,27 +216,35 @@ proc cgroupBudget(read: proc(p: string): string): Option[int64] =
   ## Returns none when no cgroup path yields a real limit.
 
   # --- Try cgroup v2 first ---
-  # We need to distinguish "file absent" (v2 not present, fall through to v1)
-  # from "file present but value is sentinel/max" (v2 present but unlimited).
-  # Read memory.max exactly once; catch IOError to detect file absence.
+  # rfc-0007 code-review r50: `cgroupV2MinAlongPath` resolves the process's
+  # OWN cgroup-v2 leaf (via /proc/self/cgroup) and walks UP to the root,
+  # taking the MINIMUM real memory.max along the chain — a systemd-slice
+  # MemoryMax set on an ancestor is now visible, not just a root-level
+  # limit. When own-path resolution fails (non-Linux, unreadable, or
+  # genuinely at the root) the chain degenerates to the single-element
+  # root-only read, i.e. the exact pre-r50 behaviour — no separate
+  # fallback branch needed. `present` preserves the original "file absent
+  # → fall through to v1" vs. "file present but unlimited → stop, no v1"
+  # distinction the old single-read code made.
   try:
-    let raw = read(CgroupV2Max).strip()
-    # v2 file is present.
-    if raw == "max":
-      # v2 present but unlimited — no cgroup constraint; skip v1, return none.
-      return none(int64)
-    let limitVal = parseBiggestInt(raw)
-    let limit = int64(limitVal)
-    if isNoLimit(limit):
-      return none(int64)
-    # Limit is real — read current usage.
-    let currentOpt = readInt64(CgroupV2Current, read)
-    if currentOpt.isSome:
-      let budget = limit - currentOpt.get
-      return some(max(0'i64, budget))
-    else:
-      # Current unreadable but limit is known; return limit as conservative budget.
-      return some(limit)
+    let v2 = cgroupV2MinAlongPath(read)
+    if v2.present:
+      if v2.limit.isNone:
+        # v2 active, but every level walked reported "max"/sentinel —
+        # no cgroup constraint anywhere in the chain; skip v1, return none.
+        return none(int64)
+      let limit = v2.limit.get
+      # Limit is real — read current usage at the process's OWN leaf (not
+      # an ancestor, not the root): usage must be measured where this
+      # process actually resides.
+      let currentOpt = readInt64(v2.ownDir / "memory.current", read)
+      if currentOpt.isSome:
+        return some(max(0'i64, limit - currentOpt.get))
+      else:
+        # Current unreadable but limit is known; return limit as conservative budget.
+        return some(limit)
+    # v2.present == false: memory.max was unreadable at EVERY level in the
+    # chain (most commonly: v2 not mounted at all) — fall through to v1.
   except CatchableError:
     discard  # v2 absent or unreadable — fall through to v1
 

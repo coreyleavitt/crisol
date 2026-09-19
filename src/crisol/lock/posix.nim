@@ -38,6 +38,7 @@
 import std/os
 import std/posix
 import crisol/types   # CrisolError, CrisolErrorKind, newCrisolError
+import crisol/process/caps   # cachedCapabilities — rfc-0007 code-review r31
 
 type
   LockHandle* = object
@@ -88,6 +89,17 @@ proc acquireLock*(stateDir: string): LockHandle =
       raise newCrisolError(cekEnvironment,
         "another crisol run is in progress for this project — " &
         "wait for it to finish or check for stale processes (exit 3)")
+    elif not cachedCapabilities().flock:
+      # rfc-0007 code-review r31: the flock(2) capability probe
+      # (process/caps.nim's `probeFlock`) already failed for this
+      # environment — a non-EAGAIN failure here is consistent with
+      # flock(2) simply not being a supported mechanism on this
+      # filesystem/host (e.g. some network filesystems, or a sandbox that
+      # filters the syscall), not a generic, unexplained failure. Say so.
+      raise newCrisolError(cekEnvironment,
+        "flock(2) is not supported on this filesystem/host (capability " &
+        "probe failed) — cannot acquire the crisol lock at '" & lockPath &
+        "': errno " & $e)
     else:
       raise newCrisolError(cekEnvironment,
         "flock LOCK_EX failed on '" & lockPath & "': errno " & $e)

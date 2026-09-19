@@ -166,13 +166,23 @@ when defined(posix):
           break
       check declIdx == -1
 
-    test "the discoverAndReapEscapees + mergeEscapeesByPid call in reapCore's cgroup arm is NOT guarded by an `if`":
+    test "the discoverAndReapEscapees + mergeEscapeesByPid call in reapCore's cgroup arm is NOT guarded by any conditional (if/when/case)":
       ## Structural pin: locate the fallback-scan call line and walk
       ## backward over blank/comment lines to the nearest real statement
       ## — pre-r79 that statement was
       ## `if cgroupEscapeeFallbackNeeded(escapees.len, entry.stop.isSome, cgroupKillWriteFailed):`;
       ## post-r79 it must be the unrelated `reapBounded` loop above it (or
-      ## any other non-`if` statement), never an `if` gating the call.
+      ## any other non-conditional statement), never a re-gate.
+      ##
+      ## rfc-0007 code-review r59-pin nit: the original version of this pin
+      ## only rejected an `if `/`if(`-prefixed nearest statement — a re-gate
+      ## via `when cond:` (same shape, different keyword) or `case ...: of
+      ## ...:` (whose NEAREST preceding statement, walking backward, is the
+      ## `of` branch label, not the `case` keyword itself) would both
+      ## evade it silently. Hardened to reject every conditional shape that
+      ## could stand immediately before this call: `if`/`elif`/`when`
+      ## headers directly, and `of` (a case-branch label) to catch a `case`
+      ## re-gate via its nearest branch line.
       let lines = posixCoreLines()
       let callIdx = firstIndexContaining(lines,
         "discoverAndReapEscapees(core, idx, entry.pid, caps, entry.claimOrphans)")
@@ -191,8 +201,10 @@ when defined(posix):
         dec j
       require j >= 0
       let nearestStatement = lines[j].strip
-      check not nearestStatement.startsWith("if ")
-      check not nearestStatement.startsWith("if(")
+      const conditionalPrefixes = ["if ", "if(", "elif ", "elif(",
+                                    "when ", "when(", "case ", "case(", "of "]
+      for prefix in conditionalPrefixes:
+        check not nearestStatement.startsWith(prefix)
 
   when defined(linux):
     suite "rfc-0007 r59/r79 — cgroupLeafSurvivors feeding the now-unconditional merge (fake leaf, r12's pattern)":

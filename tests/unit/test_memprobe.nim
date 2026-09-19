@@ -91,6 +91,191 @@ when defined(linux):
       check r.get == 4_000_000'i64 * 1024
 
   # ---------------------------------------------------------------------------
+  # Suite 2b: rfc-0007 code-review r50 — own-cgroup-v2-path min-along-path walk
+  # ---------------------------------------------------------------------------
+  #
+  # Pre-r50, cgroupBudget read the cgroupfs ROOT memory.max only — a
+  # systemd-slice MemoryMax set on an ancestor BETWEEN the process's own
+  # leaf and the root (the common delegated/systemd-managed case) was
+  # invisible. `cgroupV2MinAlongPath` resolves the process's own leaf via
+  # /proc/self/cgroup and walks the chain to the root, taking the MINIMUM
+  # real memory.max seen along the way.
+
+  suite "cgroupBudget — r50 own-path min-along-path walk (fake cgroupfs tree)":
+
+    test "a MemoryMax on an ancestor is visible even when the own leaf reports 'max'":
+      ## Fake tree: /sys/fs/cgroup (root, unlimited) ->
+      ##            /sys/fs/cgroup/user.slice (systemd MemoryMax = 4 GiB) ->
+      ##            /sys/fs/cgroup/user.slice/session.scope (own leaf, no
+      ##            explicit limit of its own — reports "max").
+      let ancestorLimit = 4'i64 * 1024 * 1024 * 1024   # 4 GiB (systemd slice)
+      let ownCurrent    = 1'i64 * 1024 * 1024 * 1024   # 1 GiB used
+      let files = {
+        "/proc/meminfo":
+          "MemAvailable:   32000000 kB\n",   # far larger than the cgroup budget
+        "/proc/self/cgroup":
+          "0::/user.slice/session.scope\n",
+        "/sys/fs/cgroup/memory.max":
+          "max\n",
+        "/sys/fs/cgroup/user.slice/memory.max":
+          $ancestorLimit & "\n",
+        "/sys/fs/cgroup/user.slice/session.scope/memory.max":
+          "max\n",
+        "/sys/fs/cgroup/user.slice/session.scope/memory.current":
+          $ownCurrent & "\n",
+      }.toTable
+      let r = availableMemBytes(makeReader(files))
+      check r.isSome
+      check r.get == ancestorLimit - ownCurrent   # 3 GiB — the ancestor limit wins
+
+    test "the MINIMUM along the chain wins, not the first or last level read":
+      ## Own leaf reports a TIGHTER limit than its ancestor — own leaf must win.
+      let ancestorLimit = 8'i64 * 1024 * 1024 * 1024   # 8 GiB
+      let ownLimit      = 2'i64 * 1024 * 1024 * 1024   # 2 GiB (tighter)
+      let ownCurrent    = 512'i64 * 1024 * 1024        # 512 MiB
+      let files = {
+        "/proc/meminfo":
+          "MemAvailable:   32000000 kB\n",
+        "/proc/self/cgroup":
+          "0::/user.slice/session.scope\n",
+        "/sys/fs/cgroup/memory.max":
+          "max\n",
+        "/sys/fs/cgroup/user.slice/memory.max":
+          $ancestorLimit & "\n",
+        "/sys/fs/cgroup/user.slice/session.scope/memory.max":
+          $ownLimit & "\n",
+        "/sys/fs/cgroup/user.slice/session.scope/memory.current":
+          $ownCurrent & "\n",
+      }.toTable
+      let r = availableMemBytes(makeReader(files))
+      check r.isSome
+      check r.get == ownLimit - ownCurrent   # own leaf's tighter limit wins
+
+    test "'max' at every level in the chain → none, never falls through to v1":
+      let files = {
+        "/proc/meminfo":
+          "MemAvailable:   4000000 kB\n",
+        "/proc/self/cgroup":
+          "0::/user.slice/session.scope\n",
+        "/sys/fs/cgroup/memory.max":
+          "max\n",
+        "/sys/fs/cgroup/user.slice/memory.max":
+          "max\n",
+        "/sys/fs/cgroup/user.slice/session.scope/memory.max":
+          "max\n",
+        # A v1 path IS present here — if this were consulted it would win.
+        # It must NOT be: v2 is honestly "present but unlimited everywhere",
+        # which must stop at v2, exactly like the pre-r50 single-read case.
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes":
+          "1073741824\n",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes":
+          "0\n",
+      }.toTable
+      let r = availableMemBytes(makeReader(files))
+      check r.isSome
+      check r.get == 4_000_000'i64 * 1024   # MemAvailable wins — v2 present, unlimited
+
+    test "own-path resolution failure (unreadable /proc/self/cgroup) falls back to the root-only read":
+      ## No "/proc/self/cgroup" entry at all — makeReader raises IOError,
+      ## caught by cgroupV2MinAlongPath, ownPath stays "" — the chain
+      ## degenerates to root-only, i.e. the exact pre-r50 behaviour.
+      let cgMax     = 2'i64 * 1024 * 1024 * 1024
+      let cgCurrent = 512'i64 * 1024 * 1024
+      let files = {
+        "/proc/meminfo":
+          "MemAvailable:   32000000 kB\n",
+        "/sys/fs/cgroup/memory.max":
+          $cgMax & "\n",
+        "/sys/fs/cgroup/memory.current":
+          $cgCurrent & "\n",
+      }.toTable
+      let r = availableMemBytes(makeReader(files))
+      check r.isSome
+      check r.get == cgMax - cgCurrent
+
+    test "own-path resolution failure (malformed /proc/self/cgroup, no '0::' line) also falls back to root-only":
+      let cgMax     = 3'i64 * 1024 * 1024 * 1024
+      let cgCurrent = 1'i64 * 1024 * 1024 * 1024
+      let files = {
+        "/proc/meminfo":
+          "MemAvailable:   32000000 kB\n",
+        "/proc/self/cgroup":
+          "1:memory:/some/cgroup-v1-only-line\n",   # no "0::" line at all
+        "/sys/fs/cgroup/memory.max":
+          $cgMax & "\n",
+        "/sys/fs/cgroup/memory.current":
+          $cgCurrent & "\n",
+      }.toTable
+      let r = availableMemBytes(makeReader(files))
+      check r.isSome
+      check r.get == cgMax - cgCurrent
+
+    test "memory.current is read at the OWN leaf, never at an ancestor or the root":
+      ## Root and ancestor memory.current are both deliberately WRONG
+      ## (absurdly large) — if either were mistakenly consulted the budget
+      ## would come out negative-clamped-to-zero instead of the correct
+      ## positive value computed from the own leaf's real current usage.
+      let ownLimit   = 4'i64 * 1024 * 1024 * 1024
+      let ownCurrent = 1'i64 * 1024 * 1024 * 1024
+      let files = {
+        "/proc/meminfo":
+          "MemAvailable:   32000000 kB\n",
+        "/proc/self/cgroup":
+          "0::/user.slice/session.scope\n",
+        "/sys/fs/cgroup/memory.max":
+          "max\n",
+        "/sys/fs/cgroup/memory.current":
+          "999999999999\n",   # deliberately absurd — must NOT be read
+        "/sys/fs/cgroup/user.slice/memory.max":
+          "max\n",
+        "/sys/fs/cgroup/user.slice/memory.current":
+          "999999999999\n",   # deliberately absurd — must NOT be read
+        "/sys/fs/cgroup/user.slice/session.scope/memory.max":
+          $ownLimit & "\n",
+        "/sys/fs/cgroup/user.slice/session.scope/memory.current":
+          $ownCurrent & "\n",
+      }.toTable
+      let r = availableMemBytes(makeReader(files))
+      check r.isSome
+      check r.get == ownLimit - ownCurrent
+
+  suite "parseOwnCgroupV2Path — pure":
+
+    test "extracts the path after a '0::' unified line":
+      check parseOwnCgroupV2Path("12:pids:/x\n0::/user.slice/session.scope\n") ==
+        "/user.slice/session.scope"
+
+    test "no '0::' line → empty string":
+      check parseOwnCgroupV2Path("1:memory:/legacy\n") == ""
+
+    test "empty content → empty string":
+      check parseOwnCgroupV2Path("") == ""
+
+    test "root residence ('0::' with nothing after) → empty string":
+      check parseOwnCgroupV2Path("0::\n") == ""
+
+  suite "cgroupV2AncestorChain — pure":
+
+    test "multi-segment path yields most-specific-first chain ending at the root":
+      check cgroupV2AncestorChain("/user.slice/session.scope") == @[
+        "/sys/fs/cgroup/user.slice/session.scope",
+        "/sys/fs/cgroup/user.slice",
+        "/sys/fs/cgroup",
+      ]
+
+    test "single-segment path":
+      check cgroupV2AncestorChain("/user.slice") == @[
+        "/sys/fs/cgroup/user.slice",
+        "/sys/fs/cgroup",
+      ]
+
+    test "empty path (root) → single-element chain":
+      check cgroupV2AncestorChain("") == @["/sys/fs/cgroup"]
+
+    test "bare '/' path (root) → single-element chain":
+      check cgroupV2AncestorChain("/") == @["/sys/fs/cgroup"]
+
+  # ---------------------------------------------------------------------------
   # Suite 3: cgroup v1 fallback when v2 paths are absent
   # ---------------------------------------------------------------------------
 

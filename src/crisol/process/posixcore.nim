@@ -827,31 +827,54 @@ proc readPipeBounded*(fd: cint; buf: var openArray[uint8]; deadlineMs: int):
       elif errno == EINTR: continue
       else: return                # genuine read error
 
-proc reapBounded(pid: Pid) =
-  ## B1 regression fix, part A: a SIGKILL target becomes a reapable zombie
-  ## essentially immediately, but `discoverAndReapEscapees` (below) runs ON
-  ## the single-threaded event-loop thread — an unbounded blocking `wait4(
-  ## pid, 0)` here would starve the WHOLE loop (self-pipe/SIGINT wakeup
-  ## included) on any target that does not die promptly, turning a 6s
-  ## interrupt into a full wall-clock timeout downstream. Bounded,
-  ## non-blocking WNOHANG polling instead: try for up to ~300ms total (5ms
-  ## between tries), then give up WITHOUT ever blocking. The run-level
-  ## `sweepAdoptedOrphan` (nextEvent) is the honest fallback home for a
-  ## genuine straggler, not this proc — this bound only guards the
-  ## pathological case. Defined here, ahead of `spawnChild` (its r11
-  ## pre-exec-stall timeout path is the other caller), so neither call site
-  ## needs a forward declaration.
-  const budgetMs = 300
-  const stepMs = 5
-  var waited = 0
-  while waited < budgetMs:
-    var wstatus: cint
-    var ru: posix.Rusage
-    let r = wait4(pid, addr wstatus, WNOHANG, addr ru)
-    if r == pid or r < 0:
-      return   # reaped, or ECHILD (not ours to reap) — either way, done
-    os.sleep(stepMs)
-    waited += stepMs
+proc wait4UnsupportedErrno*(e: cint): bool =
+  ## rfc-0007 code-review r31: pure classification of a FAILED wait4(2)
+  ## call's errno. ECHILD ("not our child"/already reaped) and EINTR
+  ## (signal-interrupted — safe to just retry the same wait4 next tick) are
+  ## both genuine wait4-specific outcomes every call site already handles
+  ## on its own, with no fallback needed. ENOSYS (no wait4 syscall at all
+  ## — vanishingly rare today) and EPERM (a seccomp filter denying the
+  ## wait4 syscall itself, not this particular call's arguments) are
+  ## different in kind: no retry of wait4 will EVER succeed for either, so
+  ## this is the one class `reapWait4` (below) must fall back to waitpid(2)
+  ## for — otherwise every child in a wait4-filtering sandbox would wedge
+  ## the event loop's reap path (weDeadline) forever. Exported and pure so
+  ## the errno truth table is unit-testable with no real syscall involved.
+  e == ENOSYS or e == EPERM
+
+var wait4Unsupported = false
+  ## rfc-0007 code-review r31: lazy first-failure latch, process-global
+  ## (mirrors `capabilitiesMemo`'s memoise-once idiom, process/caps.nim).
+  ## Once ANY `reapWait4` call observes `wait4UnsupportedErrno`, every
+  ## LATER reap in this process skips straight to waitpid without re-
+  ## paying a doomed wait4 syscall each time. Simpler than plumbing
+  ## `Capabilities.wait4Rusage` (process/caps.nim's `probeWait4Rusage`)
+  ## through every wait4 call site — `pollSweepChildren`/
+  ## `sweepAdoptedOrphan`/`reapBounded` all currently take no `caps`
+  ## parameter, and the probe result and this latch answer the exact same
+  ## question ("is wait4 usable here") — wiring both would be redundant,
+  ## not more honest.
+
+proc reapWait4*(pid: Pid; wstatus: var cint; options: cint;
+                ru: var posix.Rusage): tuple[r: Pid, rusageValid: bool] =
+  ## rfc-0007 code-review r31: the ONE place every reap call site in this
+  ## file goes through. Tries wait4 first (real rusage collection); on
+  ## ENOSYS/EPERM falls back to waitpid (POSIX-guaranteed, no rusage) so
+  ## reaping keeps working even when a sandbox blocks wait4 outright — the
+  ## honest cost is an ABSENT rusage observation (`rusageValid = false`),
+  ## never a fabricated one. Every OTHER wait4 failure (ECHILD/EINTR/
+  ## anything else) is returned as-is via `r` — callers already have their
+  ## own per-errno handling for those (a zombie already reaped by someone
+  ## else, a signal-interrupted call to retry, etc.) and `rusageValid` is
+  ## `false` for those too, since `ru` was never populated.
+  if not wait4Unsupported:
+    let r = wait4(pid, addr wstatus, options, addr ru)
+    if r >= 0:
+      return (r, true)
+    if not wait4UnsupportedErrno(errno):
+      return (r, false)   # ECHILD/EINTR/other — caller's existing handling
+    wait4Unsupported = true   # ENOSYS/EPERM — latch, fall through below
+  (waitpid(pid, wstatus, options), false)   # waitpid never populates `ru`
 
 proc remainingMs*(deadline: MonoTime): int =
   ## rfc-0007 code-review r70: converts an ABSOLUTE deadline into the
@@ -867,9 +890,64 @@ proc remainingMs*(deadline: MonoTime): int =
   ## before ever touching `poll`/`read`). Exported so the combined-budget
   ## SHARING pattern itself is directly unit-testable — see
   ## tests/unit/test_rfc0007_r11_bounded_readback.nim's r70 extension.
+  ##
+  ## Moved above `reapBoundedUntil` (r51): that proc reuses this SAME
+  ## idiom for an aggregate cross-item deadline, so it needs `remainingMs`
+  ## defined ahead of it — Nim has no forward-reference for top-level procs.
   let now = getMonoTime()
   if now >= deadline: 0
   else: int((deadline - now).inMilliseconds)
+
+proc reapBoundedUntil(pid: Pid; deadline: MonoTime) =
+  ## rfc-0007 code-review r51: the same bounded, non-blocking WNOHANG
+  ## polling `reapBounded` (below) does, but bounded against a CALLER-
+  ## SUPPLIED absolute deadline instead of always budgeting a fresh
+  ## ~300ms. `reapCore`'s cgroup-tier survivor loop (posixcore.nim) used to
+  ## call plain `reapBounded` once per leaf-escaped survivor — each call
+  ## privately re-budgeting its own ~300ms, so N stuck survivors cost N *
+  ## 300ms of event-loop starvation in aggregate, not the ~300ms the
+  ## per-item bound looks like it promises. That loop now computes ONE
+  ## deadline before iterating and passes THIS proc `remainingMs(deadline)`
+  ## worth of budget on every iteration (the r70 combined-budget idiom, see
+  ## `remainingMs`'s own doc comment) — N stuck survivors now cost one
+  ## shared ~300ms total, with items past the deadline getting only the
+  ## non-blocking `reapWait4` attempt already made below before returning
+  ## immediately, never an additional sleep.
+  const stepMs = 5
+  while true:
+    var wstatus: cint
+    var ru: posix.Rusage
+    let (r, _) = reapWait4(pid, wstatus, WNOHANG, ru)
+    if r == pid or r < 0:
+      return   # reaped, or ECHILD (not ours to reap) — either way, done
+    let remain = remainingMs(deadline)
+    if remain <= 0:
+      return   # aggregate budget exhausted — the non-blocking attempt
+                # above is the last one this item gets
+    os.sleep(min(stepMs, remain))
+
+proc reapBounded(pid: Pid) =
+  ## B1 regression fix, part A: a SIGKILL target becomes a reapable zombie
+  ## essentially immediately, but `discoverAndReapEscapees` (below) runs ON
+  ## the single-threaded event-loop thread — an unbounded blocking `wait4(
+  ## pid, 0)` here would starve the WHOLE loop (self-pipe/SIGINT wakeup
+  ## included) on any target that does not die promptly, turning a 6s
+  ## interrupt into a full wall-clock timeout downstream. Bounded,
+  ## non-blocking WNOHANG polling instead: try for up to ~300ms total (5ms
+  ## between tries), then give up WITHOUT ever blocking. The run-level
+  ## `sweepAdoptedOrphan` (nextEvent) is the honest fallback home for a
+  ## genuine straggler, not this proc — this bound only guards the
+  ## pathological case. Defined here, ahead of `spawnChild` (its r11
+  ## pre-exec-stall timeout path is the other caller), so neither call site
+  ## needs a forward declaration.
+  ##
+  ## rfc-0007 code-review r51: a thin single-item wrapper over
+  ## `reapBoundedUntil` now — a fresh ~300ms deadline computed here, same
+  ## budget as always for every EXISTING single-item caller. The cgroup
+  ## survivor loop (reapCore) calls `reapBoundedUntil` directly with ONE
+  ## shared deadline instead of this wrapper — see that proc's doc comment.
+  const budgetMs = 300
+  reapBoundedUntil(pid, getMonoTime() + initDuration(milliseconds = budgetMs))
 
 proc killStalledPreExecChild(core: PosixCore; childPid: Pid; pipeRead: cint;
                               pidfd: cint; cgroupLeafPath: string; stage: string):
@@ -1309,10 +1387,14 @@ proc pollSweepChildren(core: var PosixCore): Option[int32] =
     if entry.state != csSpawned: continue
     var wstatus: cint = 0
     var ru: posix.Rusage
-    let r = wait4(entry.pid, addr wstatus, WNOHANG, addr ru)
+    let (r, rusageValid) = reapWait4(entry.pid, wstatus, WNOHANG, ru)
     if r == entry.pid:
       entry.exit = decodeExit(wstatus)
-      entry.rusage = some(decodeRusage(ru))
+      # r31: rusage is only a real observation on the wait4 arm — the
+      # waitpid(ENOSYS/EPERM) fallback never touches `ru`, and a decoded
+      # `some` off it would be a fabricated ledger rssMechanism, not an
+      # absent one.
+      entry.rusage = if rusageValid: some(decodeRusage(ru)) else: none(types.Rusage)
       entry.state = csExited
       return some(id)
   none(int32)
@@ -1377,10 +1459,24 @@ when defined(linux):
       if e.state == csSpawned and int(e.pid) == orphanPid:
         var wstatus: cint
         var ru: posix.Rusage
-        discard wait4(Pid(orphanPid), addr wstatus, 0.cint, addr ru)  # the real reap
+        # rfc-0007 code-review r31/r32: the real reap — routed through
+        # `reapWait4` (r31: waitpid fallback on ENOSYS/EPERM) and its
+        # return CHECKED before decoding (r32: pre-fix this `discard`d the
+        # result and unconditionally ran `decodeExit`/`decodeRusage` on
+        # whatever `wstatus`/`ru` happened to hold, including uninitialized
+        # garbage on a failed reap). `WNOWAIT` above already confirmed this
+        # exact pid is exited-and-waitable, so failure here should never
+        # happen in practice — but "should never happen" still must not
+        # decode garbage: on failure this leaves `e` untouched (still
+        # `csSpawned`) and reports no event this tick, honestly retryable
+        # on the next `sweepAdoptedOrphan` call rather than fabricating an
+        # exit.
+        let (rw, rusageValid) = reapWait4(Pid(orphanPid), wstatus, 0.cint, ru)
+        if rw != Pid(orphanPid):
+          return none(WaitEvent)
         var updated = e
         updated.exit = decodeExit(wstatus)
-        updated.rusage = some(decodeRusage(ru))
+        updated.rusage = if rusageValid: some(decodeRusage(ru)) else: none(types.Rusage)
         updated.state = csExited
         core.children[cid] = updated
         return some(WaitEvent(kind: weChildExited, id: ChildId(cid)))
@@ -1461,7 +1557,11 @@ when defined(linux):
         break
     var wstatus: cint
     var ru: posix.Rusage
-    discard wait4(Pid(orphanPid), addr wstatus, 0.cint, addr ru)  # the real reap
+    # r31: routed through reapWait4 (waitpid fallback on ENOSYS/EPERM) —
+    # neither `wstatus` nor `ru` is decoded into anything below (ProcSnapshot
+    # carries no exit/rusage fields), so r32's "never decode on failure"
+    # concern does not apply to this call site.
+    discard reapWait4(Pid(orphanPid), wstatus, 0.cint, ru)  # the real reap
     let snap = ProcSnapshot(pid: orphanPid, ppid: ppid, command: comm, rssBytes: rss)
     return some(WaitEvent(kind: weOrphanReaped, orphan: snap, ownedBy: ownedBy))
 else:
@@ -1973,12 +2073,22 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
       # real OS parent wait()s it — same subreaper reparenting as the
       # non-cgroup tier (this process set PR_SET_CHILD_SUBREAPER
       # unconditionally in initPosixCore), so it is as reapable here as
-      # `discoverAndReapEscapees`'s own kills are. Reap each one the exact
-      # same bounded, non-blocking way (`reapBounded`, B1's own
-      # convention) — never leaked as an unreaped zombie waiting on the
-      # async orphan sweep's own timing.
+      # `discoverAndReapEscapees`'s own kills are. Reap each one bounded,
+      # non-blocking (B1's own convention) — never leaked as an unreaped
+      # zombie waiting on the async orphan sweep's own timing.
+      #
+      # rfc-0007 code-review r51: ONE aggregate ~300ms deadline across the
+      # WHOLE survivor loop, computed once before iterating — not a fresh
+      # ~300ms budget per `reapBounded` call. Pre-fix, N stuck survivors
+      # (a pathological leaf with several unreapable escapees) cost N *
+      # 300ms of single-threaded event-loop starvation; `reapBoundedUntil`
+      # (see its own doc comment) plus the r70 `remainingMs` idiom cap the
+      # WHOLE loop at ~300ms total instead — a survivor reached after the
+      # deadline is already exhausted still gets its one non-blocking
+      # `reapWait4` attempt, just no more sleep-and-retry budget.
+      let survivorDeadline = getMonoTime() + initDuration(milliseconds = 300)
       for snap in escapees:
-        reapBounded(Pid(snap.pid))
+        reapBoundedUntil(Pid(snap.pid), survivorDeadline)
       # rfc-0007 code-review r79: an empty, non-empty, write-failed, OR
       # demonstrably-clean-and-non-empty leaf view is EQUALLY not proof
       # nothing survived — `discoverAndReapEscapees` (the identity-checked

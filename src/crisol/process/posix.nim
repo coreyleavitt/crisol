@@ -84,6 +84,18 @@ proc requestStop*(sv: var Supervisor; id: ChildId; reason: KillReason) =
 proc forceKill*(sv: var Supervisor; id: ChildId) =
   ## Forced kill (SIGKILL to the process group). Non-blocking, idempotent,
   ## same atomic no-op rule as requestStop (§1).
+  ##
+  ## Callable standalone (no `requestStop` required first) — but doing so
+  ## has an authorship cost worth knowing (rfc-0007 code-review r54): the
+  ## RFC's `KillReason` enum has no "forced with no prior stop act" value,
+  ## so a `forceKill` reaching a slot with no recorded stop act records
+  ## `krTimeout` as a defensive default (posixcore.nim's `forceKillCore`) —
+  ## fabricated authorship if the real cause was neither a timeout nor an
+  ## interrupt. Every current call site (crisol/runner.nim) calls
+  ## `requestStop` immediately before any `forceKill`, specifically to keep
+  ## that authorship honest; callers who skip straight to `forceKill`
+  ## should do the same (call `requestStop` with the real `KillReason`
+  ## first) whenever accurate authorship in the eventual `Cause` matters.
   forceKillCore(sv.core, id)
 
 proc reap*(sv: var Supervisor; id: ChildId): ReapReport =
