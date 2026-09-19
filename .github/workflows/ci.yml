@@ -283,7 +283,9 @@ jobs:
   # the runner on the contract). No docker here: docker-for-tooling is a
   # Linux pattern (the `test`/`timing` jobs above use a Linux container
   # regardless of runner OS); windows-latest/macos-latest run Nim NATIVELY
-  # via jiro4989/setup-nim-action, per this RFC's §1 promise that each
+  # from the same patched-toolchain artifact channel (ghcr.io/coreyleavitt/
+  # nim OCI artifacts, fetched by ci/fetch-nim-toolchain.sh; windows uses
+  # the MSVC backend), per this RFC's §1 promise that each
   # backend is "checkable per platform from any host" — the checkABLE part
   # is the `./dev run nim check --os:...` step a contributor runs locally
   # from Linux; these two legs are where it actually EXECUTES.
@@ -297,10 +299,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: '2.2.10'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # Patched-toolchain parity with the Linux legs (which run inside
+      # ghcr.io/coreyleavitt/nim:2.2.10): this leg previously installed
+      # STOCK upstream 2.2.10 via setup-nim-action, silently dropping the
+      # backport patch set (incl. the 26017 bigchunk-freelist and 26110
+      # memregion allocator fixes) and running the mingw/gcc backend. Now
+      # it pulls the native toolchain artifact and compiles with MSVC:
+      # cc = vcc is appended to the toolchain's own config so crisol's
+      # CHILD nim compiles (the runner spawns nim per entrypoint) inherit
+      # it too, not just the top-level suite builds; vccexe.exe ships in
+      # the artifact and resolves cl.exe via vswhere on windows-latest.
+      - name: Install patched Nim toolchain (MSVC)
+        run: |
+          BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-windows-x64 "$RUNNER_TEMP/nimtc" | tail -1)
+          printf '\n@if windows:\n  cc = vcc\n@end\n' >> "$(dirname "$BIN")/config/nim.cfg"
+          echo "$BIN" >> "$GITHUB_PATH"
+
+      - name: Toolchain sanity (patched build, vcc backend)
+        run: |
+          nim --version
+          nim --version 2>&1 | grep -qi "2.2.10" || { echo "wrong nim version" >&2; exit 1; }
 
       - name: Fetch vendored deps (milpa.lock)
         run: bash ci/fetch-deps.sh
@@ -503,10 +521,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: '2.2.10'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # Patched-toolchain parity with the Linux legs -- see the windows
+      # leg's comment; same artifact channel, arm64 payload (macos-latest
+      # runners are Apple Silicon), clang backend as before.
+      - name: Install patched Nim toolchain
+        run: |
+          BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-macos-arm64 "$RUNNER_TEMP/nimtc" | tail -1)
+          echo "$BIN" >> "$GITHUB_PATH"
 
       - name: Fetch vendored deps (milpa.lock)
         run: bash ci/fetch-deps.sh
