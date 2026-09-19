@@ -6,6 +6,27 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### BREAKING CHANGE — result-cache format 4: the soundness key now folds cwd posture; one-time cache discard (r57 code-review, CONFIRMED High)
+
+**Prior behaviour:** `SandboxSpec.chdirIntoScratch` (rfc-0007 code-review
+r20: KDL `chdir-into-scratch` / CLI `--chdir-into-scratch`) changes the
+child's actual working directory (`runner.buildRunChildSpec`: the scratch
+tmpdir when set and available, `projectRoot` otherwise), but the
+soundness key (`keys.KeyInputs`/`cachedispatch.keyOfProc`) never read it.
+Toggling the flag with every other input held constant (same closure,
+flags, env, limits) produced a byte-identical `SoundnessKey`, so a
+relative-path test whose behavior depends on cwd could serve a cached
+result observed under the OTHER posture — a cached false pass.
+
+**New behaviour:** `KeyInputs` gains a 10th component, `cwdPosture` (=
+`ctx.spec.chdirIntoScratch`), folded into `soundnessKey` and diffed by
+`explainMiss` as `kcCwdPosture`. `resultCacheFormatVersion` 3 → 4 and
+(per the version-coupling assert in `cachewire.nim`) `storageFormatVersion`
+1 → 2. Existing cached results are discarded on upgrade
+(version-partitioned directory + header mismatch = miss); budget one full
+rerun of previously cached entrypoints. Compile avoidance and the depgraph
+are unaffected.
+
 ### BREAKING CHANGE — dependency graph format 8: `{.compile.}`d-external source/header spellings are now portable, never a machine-local absolute path; one-time full recompile (RFC-0009 wiring-audit F13)
 
 **Prior behaviour:** RFC-0009 moved closure-member path identity onto

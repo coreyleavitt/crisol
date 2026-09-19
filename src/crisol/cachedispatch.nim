@@ -776,6 +776,11 @@ proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
   ##                        in the key.  Cross-host cache reuse is achieved by
   ##                        pinning the env, not by omitting values (cf.
   ##                        Bazel --action_env, Nix derivations).
+  ##   cwdPosture         ← ctx.spec.chdirIntoScratch (r57, CONFIRMED High):
+  ##                        the actual cwd the child is spawned with depends
+  ##                        on this boolean (`runner.buildRunChildSpec`), so
+  ##                        it must be load-bearing in the key -- see
+  ##                        `KeyInputs.cwdPosture`'s doc comment (keys.nim).
   ##
   ## When an entrypoint has no graph entry (closureHash empty) the inputs
   ## still derive deterministically — but such entrypoints are never
@@ -813,6 +818,7 @@ proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
       limits:             ctx.spec.limits,
       hermeticEnvHash:    ctx.hermeticEnvHash,
       protocolMajor:      ctx.protocolMajor,
+      cwdPosture:         ctx.spec.chdirIntoScratch,  # r57
     )
 
 # ---------------------------------------------------------------------------

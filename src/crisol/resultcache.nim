@@ -83,7 +83,7 @@ import crisol/process/resultjson  # the ONE ProcessResult<->JSON owner (§2)
 # Constants
 # ---------------------------------------------------------------------------
 
-const resultCacheFormatVersion* = 3
+const resultCacheFormatVersion* = 4
   ## Increment when the cache JSON schema changes incompatibly.  A loaded file
   ## with a different formatVersion is treated as a MISS (discard-on-mismatch).
   ## Note: the version is part of the on-disk *path* (`cache/v<fmt>/`) AND the
@@ -104,6 +104,19 @@ const resultCacheFormatVersion* = 3
   ## entry's key can never match a freshly-derived v3 key even for an
   ## unchanged config, and must MISS rather than alias a differently-shaped
   ## fold input to a coincidentally-equal-looking string.
+  ##
+  ## r57 code-review (CONFIRMED High): bumped 3 -> 4.  The SoundnessKey's
+  ## fold-input shape changed again — `keys.KeyInputs` grew a 10th
+  ## component, `cwdPosture` (= `SandboxSpec.chdirIntoScratch`), closing a
+  ## cwd-posture-blind soundness gap: `chdirIntoScratch` (rfc-0007 r20)
+  ## changes the child's actual cwd but was previously absent from the key,
+  ## so toggling it with every other input held constant produced a
+  ## byte-identical key — a relative-path test whose behavior depends on
+  ## cwd could serve a cached false pass. A stored v3 entry's key never
+  ## folded `cwdPosture` at all, so it can never match a freshly-derived v4
+  ## key even for an unchanged posture, and must MISS rather than alias a
+  ## differently-shaped fold input to a coincidentally-equal-looking string
+  ## — same discard-on-mismatch contract as the 2 -> 3 bump above.
 
 const DefaultMaxCacheEntries* = 10_000
   ## Interim soft cap on distinct cache entries (RFC-0004 F1, round 2).

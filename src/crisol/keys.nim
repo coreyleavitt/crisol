@@ -7,12 +7,14 @@
 ##
 ## Key designs:
 ##   IdentityKey  = fnv1a64 chain over (path, flagHash); stable locator.
-##   SoundnessKey = chained FNV-1a fold over 9 components in fixed order with
+##   SoundnessKey = chained FNV-1a fold over 10 components in fixed order with
 ##                  NUL separator between components, and each variable-length
 ##                  component placed LAST within its own per-component fnv1a64
 ##                  call (RFC-0004 round-2 rule: prevents embedded NUL bytes in
 ##                  binary fixture content from aliasing the inter-component NUL
-##                  separator).
+##                  separator).  (r57, CONFIRMED High: the 10th component,
+##                  `cwdPosture`, was added to close a cwd-posture-blind
+##                  soundness gap -- see `KeyInputs.cwdPosture` below.)
 
 import std/options
 import std/strutils
@@ -40,10 +42,12 @@ const EmptyFixtureSentinel* = "crisol:empty-fixtures:v1"
   ## content" cannot collide.
 
 # ---------------------------------------------------------------------------
-# KeyInputs — the single record bundling all 9 soundness inputs.
+# KeyInputs — the single record bundling all 10 soundness inputs.
 #
-# Passing a record (not 9 positional args) is cleaner at the call site and
-# makes adding a 10th input a non-breaking change at every call site.
+# Passing a record (not positional args) is cleaner at the call site and
+# makes adding a new input a non-breaking change at every call site (r57
+# added `cwdPosture`, the 10th, exactly this way -- append-only, no call
+# site needed to change its positional shape).
 # ---------------------------------------------------------------------------
 
 type KeyInputs* = object
@@ -79,6 +83,19 @@ type KeyInputs* = object
     ## requires it in the key.  (RFC-0004 §Keys; cf. Bazel --action_env.)
   protocolMajor*:      int
     ## NDJSON protocol major version.
+  cwdPosture*:         bool
+    ## r57 (CONFIRMED High): the boolean the child is actually spawned with
+    ## -- `ctx.spec.chdirIntoScratch` (`runner.buildRunChildSpec`'s `cwd`
+    ## computation: `spec.chdirIntoScratch and outScratchDir.len > 0` picks
+    ## the scratch tmpdir over `projectRoot`). NOT the scratch path itself
+    ## (per-run random via `makeTmpDir`; folding it would kill caching for
+    ## every chdir-into-scratch run) -- only the POSTURE, i.e. whether a
+    ## relative-path test observes `projectRoot` or its own scratch dir as
+    ## cwd. Before this field existed, toggling the KDL `chdir-into-scratch`
+    ## flag (or CLI `--chdir-into-scratch`) with every other input held
+    ## constant produced a BYTE-IDENTICAL SoundnessKey, so a relative-path
+    ## test whose behavior depends on cwd could serve a cdmHit computed
+    ## under the OTHER posture -- a cached false pass.
 
 # ---------------------------------------------------------------------------
 # Internal: chain a single component into a running FNV-1a state.
@@ -155,7 +172,7 @@ proc identityKey*(ep: Entrypoint; roots: TrackedRoots): IdentityKey =
 proc soundnessKey*(inp: KeyInputs): SoundnessKey =
   ## Derive the soundness (cache) key for a test entrypoint.
   ##
-  ## All 9 components are folded in FIXED ORDER via chained FNV-1a.  Each
+  ## All 10 components are folded in FIXED ORDER via chained FNV-1a.  Each
   ## component is wrapped in its own per-component fnv1a64 call before being
   ## mixed into the running chain (RFC-0004 round-2 NUL-aliasing guard).
   ##
@@ -192,6 +209,8 @@ proc soundnessKey*(inp: KeyInputs): SoundnessKey =
   running = chainComponent(running, inp.hermeticEnvHash)
   # 9. protocolMajor
   running = chainComponent(running, $inp.protocolMajor)
+  # 10. cwdPosture (r57)
+  running = chainComponent(running, $inp.cwdPosture)
 
   result = SoundnessKey(toHex16(running))
 
@@ -271,3 +290,5 @@ proc explainMiss*(prev, curr: KeyInputs;
                         envNames: diffEnvNames(prevEnv, currEnv))
 
   addSimple(kcProtocol, $prev.protocolMajor, $curr.protocolMajor)
+
+  addSimple(kcCwdPosture, $prev.cwdPosture, $curr.cwdPosture)

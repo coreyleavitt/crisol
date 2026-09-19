@@ -670,15 +670,18 @@ type
                            ## from cdmKeyMiss (no entry was found at all).
 
   KeyComponent* = enum
-    ## RFC-0005 B1a/B1c: names WHICH of the 9 `KeyInputs` soundness
+    ## RFC-0005 B1a/B1c: names WHICH of the 10 `KeyInputs` soundness
     ## components differs between a prior recorded attempt and the current
     ## one, one arm per `KeyInputs` field, in field order.  Homed here
     ## (not in keys.nim, which DEFINES the diff) because `KeyDiff` rides on
     ## `EntrypointResult.keyDiff` (below) and `keys.nim` imports `types.nim`
     ## -- the reverse import would cycle. `keys.nim`'s `explainMiss` uses
     ## these unqualified via its existing `import crisol/types`.
+    ##
+    ## `kcCwdPosture` (r57): `KeyInputs.cwdPosture`, added to close a
+    ## cwd-posture-blind soundness gap -- see keys.nim's doc comment.
     kcClosure, kcFlags, kcNimVersion, kcCcVersion, kcFixtures, kcArgv,
-    kcLimits, kcHermeticEnv, kcProtocol
+    kcLimits, kcHermeticEnv, kcProtocol, kcCwdPosture
 
   CacheVerdict* = enum
     ## RFC-0005 A1: get/put/verify all speak this ONE vocabulary

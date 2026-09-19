@@ -63,15 +63,19 @@ import crisol/process/types as ptypes
 # Version coupling (RFC-0005 "Integrity vs. trust", point 3).
 # ---------------------------------------------------------------------------
 
-const storageFormatVersion* = 1
+const storageFormatVersion* = 2
   ## `StoredEntry` ENVELOPE schema version — independent of, but coupled to,
   ## `resultCacheFormatVersion` (`resultcache.nim`), the PAYLOAD's own
   ## schema version. Covers the envelope shape only (which optional keys
   ## exist and how they are shaped) — never the payload's own schema, which
   ## `resultCacheFormatVersion`/`header.formatVersion` alone governs.
+  ##
+  ## r57 code-review (CONFIRMED High): bumped 1 -> 2 in lockstep with
+  ## `resultCacheFormatVersion`'s 3 -> 4 bump (`keys.KeyInputs` grew the
+  ## `cwdPosture` component) — required by the static coupling assert below.
 
 static:
-  doAssert resultCacheFormatVersion == 3 and storageFormatVersion == 1,
+  doAssert resultCacheFormatVersion == 4 and storageFormatVersion == 2,
     "RFC-0005 version coupling (cachewire.nim): any resultCacheFormatVersion " &
     "bump MUST bump storageFormatVersion in the SAME change. The key/URL " &
     "carries only storageVersion (SoundnessKey excludes schema by design), " &
@@ -242,6 +246,7 @@ proc keyInputsToJson*(inp: KeyInputs): JsonNode =
   result["limits"]            = limitsToJson(inp.limits)
   result["hermeticEnvHash"]   = newJString(inp.hermeticEnvHash)
   result["protocolMajor"]     = newJInt(inp.protocolMajor)
+  result["cwdPosture"]        = newJBool(inp.cwdPosture)  # r57
 
 proc keyInputsFromJson*(node: JsonNode): Option[KeyInputs] =
   if node == nil or node.kind != JObject: return
@@ -254,6 +259,7 @@ proc keyInputsFromJson*(node: JsonNode): Option[KeyInputs] =
   let limitsN  = node{"limits"}
   let envN     = node{"hermeticEnvHash"}
   let protoN   = node{"protocolMajor"}
+  let cwdN     = node{"cwdPosture"}  # r57
   if closureN == nil or closureN.kind != JString: return
   if flagN == nil or flagN.kind != JString: return
   if nimN == nil or nimN.kind != JString: return
@@ -268,6 +274,7 @@ proc keyInputsFromJson*(node: JsonNode): Option[KeyInputs] =
   if limits.isNone: return
   if envN == nil or envN.kind != JString: return
   if protoN == nil or protoN.kind != JInt: return
+  if cwdN == nil or cwdN.kind != JBool: return
   some(KeyInputs(
     closureContentHash: closureN.getStr,
     flagHash:           flagN.getStr,
@@ -278,6 +285,7 @@ proc keyInputsFromJson*(node: JsonNode): Option[KeyInputs] =
     limits:             limits.get,
     hermeticEnvHash:    envN.getStr,
     protocolMajor:      protoN.getInt,
+    cwdPosture:         cwdN.getBool,  # r57
   ))
 
 # ---------------------------------------------------------------------------

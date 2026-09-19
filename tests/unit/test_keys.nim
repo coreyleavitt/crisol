@@ -7,7 +7,8 @@
 ##   - IdentityKey stability: same (path, flagHash) → same key.
 ##   - IdentityKey discrimination: different path or flagHash → different key.
 ##   - SoundnessKey determinism: identical KeyInputs → identical key.
-##   - Each of the 9 components is load-bearing: mutating any one changes the key.
+##   - Each of the 10 components is load-bearing: mutating any one changes the key
+##     (RFC-0004's original 9 plus r57's `cwdPosture`).
 ##   - XOR-cancellation negative: swapping two components must change the key
 ##     (XOR is commutative; chained-FNV must not be).
 ##   - NUL-in-fixture aliasing negative: embedded NUL bytes in a component cannot
@@ -44,6 +45,7 @@ proc baseInputs(): KeyInputs =
     limits:             Limits(),
     hermeticEnvHash:    "1122334455667788",
     protocolMajor:      1,
+    cwdPosture:         false,
   )
 
 # ---------------------------------------------------------------------------
@@ -129,6 +131,11 @@ block test_soundness_key_each_component_matters:
   inp.protocolMajor = 2
   assert soundnessKey(inp) != kBase, "protocolMajor must be load-bearing"
 
+  # 10. cwdPosture (r57)
+  inp = base
+  inp.cwdPosture = true
+  assert soundnessKey(inp) != kBase, "cwdPosture must be load-bearing"
+
 # ---------------------------------------------------------------------------
 # XOR-cancellation NEGATIVE: order-sensitivity (chained-FNV is not commutative)
 #
@@ -212,14 +219,15 @@ block test_soundness_key_empty_fixture_differs_from_real:
     "empty-fixture sentinel must differ from a real fixtureHash"
 
 # ---------------------------------------------------------------------------
-# Structural tripwire: KeyInputs has exactly the 9 documented RFC-0004
-# components, none shaped like a compile-cache/object-cache signal.
+# Structural tripwire: KeyInputs has exactly the 10 documented soundness
+# components (RFC-0004's original 9 plus r57's `cwdPosture`), none shaped
+# like a compile-cache/object-cache signal.
 #
 # Preserved from the now-deleted RFC-0006 objcache-independence guard
 # (test_soundness_key_objcache_independence.nim, removed with Stage R):
 # object/compile-cache reuse must stay OUTSIDE the result-soundness key.
 # Enumerated at runtime via `fieldPairs` (not a hardcoded copy of keys.nim's
-# field list) so a future PR that adds a 10th field trips this test red,
+# field list) so a future PR that adds an 11th field trips this test red,
 # forcing the change to be reviewed rather than silently landing.
 # ---------------------------------------------------------------------------
 
@@ -233,9 +241,10 @@ const ExpectedRfc0004Fields = [
   "limits",
   "hermeticEnvHash",
   "protocolMajor",
+  "cwdPosture",
 ]
-  ## The 9 components documented in keys.nim's module doc, in KeyInputs
-  ## declaration order.
+  ## RFC-0004's original 9 components plus r57's `cwdPosture`, in
+  ## KeyInputs declaration order.
 
 const CacheShapedSubstrings = ["obj", "compilecache", "objcache"]
   ## Case-insensitive substrings that would flag a field name as a
@@ -382,6 +391,17 @@ block test_explain_miss_component_protocol:
   assert diffs[0].component == kcProtocol
   assert diffs[0].prev == "1"
   assert diffs[0].curr == "2"
+
+block test_explain_miss_component_cwd_posture:
+  ## r57: cwdPosture flipping must explain to exactly kcCwdPosture.
+  let base = baseInputs()
+  var curr = base
+  curr.cwdPosture = true
+  let diffs = explainMiss(base, curr, NoEnv, NoEnv)
+  assert diffs.len == 1
+  assert diffs[0].component == kcCwdPosture
+  assert diffs[0].prev == "false"
+  assert diffs[0].curr == "true"
 
 # ---------------------------------------------------------------------------
 # Flag-change vector — the common deliberate miss (RFC-0005 B1a bullet,

@@ -766,6 +766,61 @@ suite "realSeams — env values enter soundness key (RFC-0004 §Keys)":
     check k1 == k2   # TMPDIR value must NOT enter the key (per-run noise)
 
 # ---------------------------------------------------------------------------
+# keyOfProc — cwd posture enters soundness key (r57, CONFIRMED High)
+#
+# `SandboxSpec.chdirIntoScratch` (rfc-0007 code-review r20: KDL
+# `chdir-into-scratch` / CLI `--chdir-into-scratch`) changes the child's
+# actual cwd (runner.buildRunChildSpec: `projectRoot` vs the scratch tmpdir)
+# but `keyOfProc` never read it -- toggling the flag with everything else
+# held constant produced a BYTE-IDENTICAL soundness key, so flipping the
+# posture could serve a cached result observed under the OTHER cwd (cdmHit
+# on a relative-path test whose behavior changed = a cached false pass).
+# ---------------------------------------------------------------------------
+
+suite "keyOfProc — cwd posture enters soundness key (r57)":
+
+  test "same everything, only chdirIntoScratch differs → DIFFERENT soundness keys":
+    var g = emptyDepGraph()
+    let specOff = resolveSandbox(hlIsolated, chdirIntoScratch = false)
+    let specOn  = resolveSandbox(hlIsolated, chdirIntoScratch = true)
+
+    let pep = PlannedEntrypoint(
+      ep: testEp("tests/unit/test_cwdposture.nim", group = "unit", flags = @[]),
+      edecision: edRunFresh)
+
+    let ctxOff = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                            spec = specOff, parentEnv = @[("HOME", "/root")],
+                            protocolMajor = 1)
+    let ctxOn = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                           spec = specOn, parentEnv = @[("HOME", "/root")],
+                           protocolMajor = 1)
+    let keyOffFn = keyOfProc(ctxOff, addr g)
+    let keyOnFn  = keyOfProc(ctxOn, addr g)
+
+    let kOff = soundnessKey(keyOffFn(pep))
+    let kOn  = soundnessKey(keyOnFn(pep))
+    check kOff != kOn   # soundness: cwd posture must be load-bearing in the key
+
+  test "same chdirIntoScratch posture on both sides → SAME soundness key":
+    var g = emptyDepGraph()
+    let spec1 = resolveSandbox(hlIsolated, chdirIntoScratch = true)
+    let spec2 = resolveSandbox(hlIsolated, chdirIntoScratch = true)
+
+    let pep = PlannedEntrypoint(
+      ep: testEp("tests/unit/test_cwdposture.nim", group = "unit", flags = @[]),
+      edecision: edRunFresh)
+
+    let ctx1 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                          spec = spec1, parentEnv = @[("HOME", "/root")],
+                          protocolMajor = 1)
+    let ctx2 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0",
+                          spec = spec2, parentEnv = @[("HOME", "/root")],
+                          protocolMajor = 1)
+    let k1 = soundnessKey(keyOfProc(ctx1, addr g)(pep))
+    let k2 = soundnessKey(keyOfProc(ctx2, addr g)(pep))
+    check k1 == k2   # same posture on both sides must still hit
+
+# ---------------------------------------------------------------------------
 # realSeams — explain-miss sidecar (RFC-0005 B1b)
 # ---------------------------------------------------------------------------
 ##

@@ -148,12 +148,12 @@ suite "rfc9_golden_pin — cachelocalfs.sidecarPath literal byte-pins":
   test "simple":
     let simpleTp = fromCanonical(simplePath, testRoots).get
     check sidecarPath("state-root", keyBytes(simpleTp, testRoots)) ==
-      "state-root/v3/inputs/e8559c40017309d9.json"
+      "state-root/v4/inputs/e8559c40017309d9.json"
 
   test "maxdepth":
     let deepTp = fromCanonical(deepPath, testRoots).get
     check sidecarPath("state-root", keyBytes(deepTp, testRoots)) ==
-      "state-root/v3/inputs/56b57a6a7f7a269c.json"
+      "state-root/v4/inputs/56b57a6a7f7a269c.json"
 
 # ===========================================================================
 # 4. fnv.chainedContentHash — literal byte-pins over REAL committed
@@ -173,8 +173,13 @@ suite "rfc9_golden_pin — fnv.chainedContentHash literal byte-pins":
 # ===========================================================================
 # 5. soundnessKey — literal byte-pin over SYNTHETIC, fixed component
 #    values (nimVersion/ccVersion are made-up strings, never probed —
-#    see module doc comment). Proves the 9-component fold order/shape is
+#    see module doc comment). Proves the 10-component fold order/shape is
 #    unchanged; says nothing about any real run's actual key.
+#
+#    r57 code-review (CONFIRMED High): the pin was recomputed when
+#    `KeyInputs` grew its 10th component, `cwdPosture` — a deliberate
+#    fold-input shape change (see resultcache.nim's 3 -> 4 version-history
+#    bullet), not drift.
 # ===========================================================================
 
 suite "rfc9_golden_pin — soundnessKey literal byte-pin (synthetic inputs)":
@@ -190,8 +195,9 @@ suite "rfc9_golden_pin — soundnessKey literal byte-pin (synthetic inputs)":
       limits:              ptypes.Limits(),
       hermeticEnvHash:     "rfc9-golden-hermetic-env",
       protocolMajor:       1,
+      cwdPosture:          false,
     )
-    check $soundnessKey(inp) == "1d5ba6892b56015d"
+    check $soundnessKey(inp) == "f7375e661f1a272e"
 
 # ===========================================================================
 # 6. depRoot vector — literal byte-pins (RFC-0009 A5a flipped this from the

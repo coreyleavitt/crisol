@@ -394,7 +394,7 @@ proc renderKeyDiffLines*(d: KeyDiff; verbose: bool): seq[string] =
   of kcHermeticEnv: @[renderHermeticEnvLine(d, verbose)]
   of kcLimits:     renderLimitsLines(d, verbose)
   of kcArgv:       @["kcArgv: " & d.prev & " → " & d.curr]
-  of kcClosure, kcFlags, kcFixtures, kcProtocol:
+  of kcClosure, kcFlags, kcFixtures, kcProtocol, kcCwdPosture:
     @[renderOpaqueChanged($d.component, d.prev, d.curr, verbose)]
 
 proc explainMissLines*(diffs: seq[KeyDiff]; verbose: bool): seq[string] =
