@@ -953,8 +953,14 @@ proc toJson*(results: seq[EntrypointResult]; summary: Summary;
     # rev 20's keyDiff/rev 21's cacheStats field-presence gating, but keyed
     # off cacheDecision rather than a CLI flag (there is no flag here: this
     # is unconditional per-result data, gated only by whether it MEANS
-    # anything for this result).
-    if r.cacheDecision notin notConsultedDecisions:
+    # anything for this result). r41: the decision class alone is not
+    # enough -- a retried entry finalizes under cdmFlaky/cdmKeyMiss with
+    # attempt 1's consult discarded (SO3: only attempt 1 consults), so the
+    # gate ALSO requires inputHash, the module-wide "a consult really
+    # backed this result" signal (same signal the runner stamps by; "" is
+    # the honest zero). Presence now means exactly: a consult produced
+    # this verdict.
+    if r.cacheDecision notin notConsultedDecisions and r.inputHash.len > 0:
       epNode["cacheLookup"] = newJString(cacheVerdictString(r.cacheLookup))
     # B1 (rev 3, rev 16): per-entrypoint retry observability.  `flaky` is the
     # DERIVED value (flaky(r): outcome(r)==oPassed and attempts>1), not a

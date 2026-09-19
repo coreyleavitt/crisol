@@ -499,18 +499,36 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
       (cdmStored, cvTrustBadSignature, "trustBadSignature"),  # E2E-A-trust's own case
     ]
     for (dec, verdict, expected) in cases:
+      # r41: presence additionally requires the really-consulted signal
+      # (inputHash) -- these fixtures model results a consult actually
+      # backed, so they carry one.
       var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
                                compile: okPhase(), run: okPhase(), durationMs: 1,
-                               cacheDecision: dec, cacheLookup: verdict)
+                               cacheDecision: dec, cacheLookup: verdict,
+                               inputHash: "deadbeefdeadbeef")
       let node = toJson(@[r], summarize(@[r]))
       let ep = node["entrypoints"][0]
       check ep.hasKey("cacheLookup")
       check ep["cacheLookup"].getStr == expected
 
+  test "r41: cacheLookup is ABSENT for a consulted-class decision with no backing consult (retried entry)":
+    # SO3: only attempt 1 consults; a retried entry finalizes under
+    # cdmFlaky (or cdmKeyMiss on retry-exhausted failure) with attempt 1's
+    # consult discarded -- inputHash is the honest "" and the bare
+    # cacheLookup:"ok" the old gate emitted was exactly the ambiguity the
+    # presence convention exists to prevent.
+    for dec in [cdmFlaky, cdmKeyMiss]:
+      var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
+                               compile: okPhase(), run: okPhase(), durationMs: 1,
+                               cacheDecision: dec)
+      let node = toJson(@[r], summarize(@[r]))
+      check not node["entrypoints"][0].hasKey("cacheLookup")
+
   test "RFC-0005 A3b: toJsonString threads cacheTier/cacheLookup through unchanged, stdout stays parseable":
     var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
                              compile: okPhase(), run: okPhase(), durationMs: 1,
-                             cacheDecision: cdmHit, cacheTier: "l1", cacheLookup: cvOk)
+                             cacheDecision: cdmHit, cacheTier: "l1", cacheLookup: cvOk,
+                             inputHash: "deadbeefdeadbeef")
     let s = toJsonString(RunDocument(results: @[r], summary: summarize(@[r])))
     let parsed = parseJson(s)
     check parsed["entrypoints"][0]["cacheTier"].getStr == "l1"
