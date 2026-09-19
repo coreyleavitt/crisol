@@ -30,7 +30,7 @@
 ## Audited 2026-09-14 (RFC-0009 A-final-ii follow-on). The counts below
 ## supersede the RFC's informal estimates (B1 ~3, B2 52, B3a ≤16, B3b ~3):
 ## classifying by the literal dominant posix API — reading past comments,
-## docstrings, and test-name strings — yields 13/23/38/1 at the B4 audit; rfc-0007 review round 1 (2026-09-18) added five B2 files (r2/r3/r5 tests + reparented-helper fixtures) -> 13/28/38/1; wave-2 fixes added four more B2 unit tests (r9-r12) -> 13/32/38/1 (test_conformance_timing.nim moved B1->B2 during B1: it uses SIGKILL/SIGINT, not getpid-only). The two large
+## docstrings, and test-name strings — yields 13/23/38/1 at the B4 audit; rfc-0007 review round 1 (2026-09-18) added five B2 files (r2/r3/r5 tests + reparented-helper fixtures) -> 13/28/38/1; wave-2 fixes added four more B2 unit tests (r9-r12) -> 13/32/38/1; round-2 fix r69 added the signal-restore unit test (std/posix Sigaction) -> 13/33/38/1 (test_conformance_timing.nim moved B1->B2 during B1: it uses SIGKILL/SIGINT, not getpid-only). The two large
 ## shifts are real: `getpid`-only tests (B1) and the `captureBoth` FD-capture
 ## idiom (B3a) are each far more common than the thematic estimate assumed,
 ## and NO test in-tree calls `setrlimit` directly (limits flow through
@@ -64,7 +64,7 @@ const B1 = [
   "tests/fixtures/hang_with_pid.nim",
 ]
 
-# --- B2: process-control + signal → when defined(posix) gate (32) ----------
+# --- B2: process-control + signal → when defined(posix) gate (33) ----------
 const B2 = [
   "tests/fixtures/self_sigkill.nim",
   "tests/fixtures/spawn_grandchild.nim",
@@ -94,6 +94,7 @@ const B2 = [
   "tests/unit/test_rfc0007_r10_cgroup_kill_degrade.nim",
   "tests/unit/test_rfc0007_r11_bounded_readback.nim",
   "tests/unit/test_rfc0007_r12_cgroup_killsnapshot.nim",
+  "tests/unit/test_rfc0007_r69_signal_restore.nim",
   "tests/unit/test_run_tests.nim",
   "tests/unit/test_process_capabilities.nim",
   "tests/conformance/test_conformance_timing.nim",
@@ -188,9 +189,9 @@ suite "RFC-0009 B-inventory — posix-bucket work order":
       for f in uniq:
         if seen.count(f) > 1: echo "  DUPLICATE across buckets: " & f
 
-  test "bucket sizes match the audited inventory (13 / 32 / 38 / 1)":
+  test "bucket sizes match the audited inventory (13 / 33 / 38 / 1)":
     check B1.len == 13
-    check B2.len == 32
+    check B2.len == 33
     check B3a.len == 38
     check B3b.len == 1
 
@@ -218,8 +219,8 @@ suite "RFC-0009 B-inventory — posix-bucket work order":
     # (tests/support/ is kept posix-free by test_conformance_import_purity.nim,
     # RFC-0009 B-inventory's extension of the existing import-purity meta-test.)
 
-  test "the audited inventory total is frozen at 84 (13 + 32 + 38 + 1)":
-    check allBucketed().len == 84
+  test "the audited inventory total is frozen at 85 (13 + 33 + 38 + 1)":
+    check allBucketed().len == 85
 
 when isMainModule:
   echo "test_rfc9_bucket_inventory done"
