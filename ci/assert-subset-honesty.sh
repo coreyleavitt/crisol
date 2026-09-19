@@ -81,6 +81,7 @@ tests/unit/test_rfc0007_r10_cgroup_kill_degrade.nim
 tests/unit/test_rfc0007_r11_bounded_readback.nim
 tests/unit/test_rfc0007_r12_cgroup_killsnapshot.nim
 tests/unit/test_rfc0007_r59_cgroup_reap_backstop.nim
+tests/unit/test_rfc0007_w4_cgroup_memory_peak.nim
 tests/unit/test_rfc0007_r60_preexisting_identity.nim
 tests/unit/test_rfc0007_r69_signal_restore.nim
 tests/unit/test_rfc0007_w1_cgroup_kill_gate.nim
@@ -123,6 +124,7 @@ EOF
     EXPECTED_SKIP="$(cat <<'EOF'
 tests/unit/test_rfc0007_r2_cross_slot_escapee.nim
 tests/unit/test_rfc0007_r12_cgroup_killsnapshot.nim
+tests/unit/test_rfc0007_w4_cgroup_memory_peak.nim
 tests/conformance/test_rfc0007_r3_library_embedding.nim
 EOF
 )"
