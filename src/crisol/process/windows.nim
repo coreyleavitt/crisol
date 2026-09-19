@@ -584,13 +584,25 @@ proc probeCapabilities*(nesting: Option[bool] = probeJobObjectNesting()): Capabi
   )
 
 var capabilitiesMemo: Option[Capabilities] = none(Capabilities)
+  ## r77: holds only the STABLE fields — every field probed once and never
+  ## re-probed. `jobObjectNesting` inside this stored record is the inert
+  ## placeholder `false` from `probeCapabilities`'s `none(bool)` default
+  ## (built with the nesting arg suppressed, see `cachedCapabilities`
+  ## below) and is NEVER read back out of this memo; the returned
+  ## `Capabilities.jobObjectNesting` is composed fresh on every
+  ## `cachedCapabilities` call from `jobNestingMemo` instead. Before r77,
+  ## this record and `jobNestingMemo` each stored the same fact and
+  ## `cachedCapabilities` hand-synced them across two branches — a future
+  ## edit touching one branch and not the other could resurrect the r68
+  ## permanent-refusal bug. One storage address per fact now: this memo
+  ## owns the stable fields, `jobNestingMemo` owns nesting, and neither is
+  ## patched from the other.
 var jobNestingMemo: Option[bool] = none(bool)
-  ## r68: a SEPARATE, tri-state-aware memo for `jobObjectNesting` alone.
-  ## `capabilitiesMemo` freezes the WHOLE record after the first probe —
-  ## correct for every other field, but wrong for this one: before this
-  ## fix, a single transient probe-machinery failure (a `CreateProcessW`
-  ## that failed under commit pressure, a broken COMSPEC — says nothing
-  ## about nesting) got baked into `capabilitiesMemo` as a permanent
+  ## r68: a SEPARATE, tri-state-aware memo for `jobObjectNesting` alone —
+  ## the ONLY place that fact is stored (r77). Before r68, a single
+  ## transient probe-machinery failure (a `CreateProcessW` that failed
+  ## under commit pressure, a broken COMSPEC — says nothing about nesting)
+  ## got baked into the whole-record capabilities memo as a permanent
   ## `false`, and r22's `initSupervisor` gate then raised
   ## `OSError("host cannot create nested Job Objects")` for the rest of
   ## the process's life in an embedded host, even once the transient
@@ -619,26 +631,31 @@ proc cachedCapabilities*(): Capabilities =
   ##
   ## r68: `jobObjectNesting` alone is re-probed on every call UNTIL a
   ## genuine (non-machinery-indeterminate) result lands — see
-  ## `jobNestingMemo`'s comment. Once genuine, it is frozen into
-  ## `capabilitiesMemo` right alongside everything else and this healing
-  ## branch never runs again; the extra probe cost only exists while the
-  ## host is genuinely stuck returning machinery failures, i.e. exactly
-  ## when re-probing (not freezing) is the correct behavior.
+  ## `jobNestingMemo`'s comment. Once genuine, `jobNestingMemo` freezes and
+  ## this healing branch never runs again; the extra probe cost only
+  ## exists while the host is genuinely stuck returning machinery
+  ## failures, i.e. exactly when re-probing (not freezing) is correct.
+  ##
+  ## r77: DERIVES the result instead of patching a frozen record in place.
+  ## `capabilitiesMemo` (the stable fields) and `jobNestingMemo` (the
+  ## nesting tri-state) are two independently-owned memos, each written by
+  ## exactly one code path below; every call COMPOSES the return value
+  ## from both, so there is no second address a field's true value could
+  ## drift out of sync with. While nesting is still machinery-indeterminate,
+  ## this call's own fresh probe result is used for THIS return value only
+  ## and is never stored (matches the pre-r77 honest-false weakest-claim
+  ## behavior without writing it anywhere).
   if capabilitiesMemo.isNone:
+    capabilitiesMemo = some(probeCapabilities(none(bool)))
+  var nesting: bool
+  if jobNestingMemo.isSome:
+    nesting = jobNestingMemo.get
+  else:
     let tri = probeJobObjectNesting()
     if tri.isSome: jobNestingMemo = tri
-    capabilitiesMemo = some(probeCapabilities(tri))
-  elif jobNestingMemo.isNone:
-    let tri = probeJobObjectNesting()
-    if tri.isSome:
-      jobNestingMemo = tri
-      var caps = capabilitiesMemo.get
-      caps.jobObjectNesting = tri.get
-      capabilitiesMemo = some(caps)
-    # else: still machinery-indeterminate — the memoised record's
-    # `jobObjectNesting` already carries the honest-false weakest claim
-    # from the previous attempt; nothing to update, try again next call.
-  capabilitiesMemo.get
+    nesting = tri.get(false)
+  result = capabilitiesMemo.get
+  result.jobObjectNesting = nesting
 
 proc capabilities*(sv: Supervisor): Capabilities =
   ## Probed once, memoised (§4) — `sv.capsCache` is populated from the SAME
