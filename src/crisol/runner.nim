@@ -177,6 +177,111 @@ proc isQuarantined*(ep: Entrypoint; res: EntrypointResult;
   result = failCount > 0
 
 # ---------------------------------------------------------------------------
+# code-review r23: decideExit — pure retry/promotion/store-gate decision
+# ---------------------------------------------------------------------------
+
+type
+  ExitDecision* = object
+    ## code-review r23: `decideExit`'s pure output. `execute()`'s live-
+    ## completion handler (part of the `handleChildExited` template) used to
+    ## inline this policy — retry eligibility, whether a freshly-compiled
+    ## binary should be promoted (and discarded again if its closure never
+    ## recorded), and the cache-store gate — directly into the event loop,
+    ## interleaved with the I/O (ledger append, filesystem copy/remove,
+    ## `cache.seams.store`, `onResult`) that acts on it. Splitting the
+    ## DECISION out from the ACTION means this value is unit-testable
+    ## without a Supervisor, a compile, or a subprocess: build the observed
+    ## facts, call `decideExit`, assert on the result.
+    retry*:                     bool  ## re-dispatch instead of finalizing (B1).
+    recordAsFailure*:           bool  ## failFast should latch anyFailed — only
+                                       ## true on a genuine FINAL failure, never
+                                       ## on an attempt still eligible for retry.
+    promoteBinary*:              bool  ## this attempt's compile produced a
+                                       ## binary worth copying to the stable
+                                       ## slug-keyed path.
+    discardOnUnrecordedClosure*: bool  ## promoteBinary AND the closure failed
+                                       ## to record — the stable binary just
+                                       ## promoted must be discarded right back
+                                       ## out (issue #13.3).
+    stampCacheKeyInfo*:          bool  ## cache is active and this attempt is
+                                       ## finalizing — the executor should
+                                       ## stamp keyDiff/cacheLookup onto the
+                                       ## live result.
+    attemptStore*:               bool  ## the executor should call
+                                       ## `cache.seams.store` — policy,
+                                       ## hermeticity, AND closure recording
+                                       ## all agree. The FINAL cacheDecision
+                                       ## (cdmStored vs cdmKeyMiss) still
+                                       ## depends on that call's own outcome,
+                                       ## so it is resolved by the executor,
+                                       ## not here.
+    cacheDecisionIfNotStored*:   CacheDecision  ## what to stamp when
+                                       ## `attemptStore` is false — covers
+                                       ## cache-inactive (the plan-time
+                                       ## structural reason), a store-gate
+                                       ## refusal, and the R17 recompute-miss
+                                       ## passthrough. Computed correctly on
+                                       ## its own terms regardless of
+                                       ## `attemptStore`/`retry` (simply
+                                       ## unread by the executor when either
+                                       ## is true, never wrong-but-unread).
+
+proc decideExit*(
+  completedOutcome:      Outcome;
+  slotAttempt, maxAttempts: int;
+  failFast:               bool;
+  compiledThisRun:        bool;
+  hasCacheDir:            bool;
+  slotClosureRecorded:    bool;
+  cacheActive:            bool;
+  verdict:                StoreVerdict;
+  planTimeCacheDecision:  CacheDecision;
+): ExitDecision =
+  ## Pure: no I/O, no Supervisor, no filesystem access — every input is a
+  ## plain value the caller already holds at the point `finalizeSlot` has
+  ## just returned `fkDone` for a slot that is NOT mid-shutdown. Mirrors
+  ## execute()'s pre-extraction inline logic field-for-field (see the call
+  ## site in the `fkDone` handler) so this refactor changes WHERE the policy
+  ## lives, never WHAT it decides.
+  ##
+  ## B1: "failure eligible for retry" = outcome is NOT oPassed AND NOT
+  ## oCompileFailed AND NOT oSpawnError (retrying either is useless — a
+  ## compile failure or a fork failure is not transient noise), AND there
+  ## are attempts left.  oKilled/oCrashed ARE retried (transient
+  ## infrastructure noise).
+  result.retry = completedOutcome notin {oPassed, oCompileFailed, oSpawnError} and
+                 slotAttempt < maxAttempts
+  result.recordAsFailure = not result.retry and failFast and completedOutcome.isFailure
+
+  # R9: promotion (and therefore the closure-recorded reading) only applies
+  # once an attempt is finalizing — a still-retryable attempt never reaches
+  # this policy at all, matching the pre-extraction control flow where all
+  # of this lived inside the `else: # Finalize` branch.
+  result.promoteBinary = not result.retry and compiledThisRun and hasCacheDir and
+                         completedOutcome notin {oCompileFailed, oSpawnError}
+  let closureRecorded = if result.promoteBinary: slotClosureRecorded else: true
+  result.discardOnUnrecordedClosure = result.promoteBinary and not closureRecorded
+
+  result.stampCacheKeyInfo = not result.retry and cacheActive
+  result.attemptStore = result.stampCacheKeyInfo and verdict.store and closureRecorded
+  # `cacheDecisionIfNotStored` stays correct on its own terms regardless of
+  # `attemptStore` (never leans on "it's unused in that case" for
+  # correctness) — the `not closureRecorded` guard on the middle arm is what
+  # makes that true: without it, a genuine pass (verdict.store AND
+  # closureRecorded, i.e. `attemptStore` true) would compute the WRONG
+  # cdmClosureUnrecorded here, merely happening to go unread.
+  result.cacheDecisionIfNotStored =
+    if not cacheActive: planTimeCacheDecision
+    elif verdict.store and not closureRecorded: cdmClosureUnrecorded  # gate
+                                               # said store, but the closure
+                                               # never recorded (R9)
+    elif verdict.decision == cdmKeyMiss and planTimeCacheDecision == cdmRecomputeMiss:
+      cdmRecomputeMiss  # code-review r17: a recompute-invalidated hit whose
+                         # rerun failed keeps reporting cdmRecomputeMiss, not
+                         # the generic "no entry was ever found" cdmKeyMiss.
+    else: verdict.decision
+
+# ---------------------------------------------------------------------------
 # ResultCallback (defined in types.nim) and noopResult
 # ---------------------------------------------------------------------------
 
@@ -302,7 +407,8 @@ type
                                    # at compile-spawn so the compile→run transition
                                    # (transitionToRun) can route through buildRunChildSpec.
     token:           SlotToken     # S3: admission token; released on finish or spawn failure
-    attempt:         int          # B0/B1: current attempt number (1-indexed); set at dispatch
+    attempt:         int          # B0/B1: current attempt number (1-indexed); set by
+                                   # claimSlot at slot claim (see its doc comment)
     peakRssBytes:    int64        # C5: running max of procGroupRssBytes across all polls
                                    # while this slot's run phase is live.  Reset to 0 when
                                    # the slot is claimed (before compile or run spawned).
@@ -511,6 +617,44 @@ proc cleanupSlotOnTeardown(slot: Slot) =
     try: removeDir(slot.cacheDir) except: discard
 
 type
+  RecordClosureProc* = proc(graph: var DepGraph; config: Config; ep: Entrypoint;
+                            nimcacheDir, binaryName: string;
+                            protocolMajor: int; index: SourceIndex;
+                            ccRun: RunProc): tuple[ok: bool, error: string]
+    ## R3a (RFC-0009 A-final-ii-a): injectable seam matching `depgraph.
+    ## recordClosure`'s signature, so a test can substitute a synthetic
+    ## failure without constructing a genuinely-outside-every-root
+    ## Entrypoint (production entrypoints are ALWAYS tag-0 — see
+    ## `discover`). `execute*`'s `recordClosureFn` param defaults to the
+    ## real `recordClosure` — zero production behavior change.
+
+  ExecCtx* = object
+    ## code-review r24: the run-lifetime invariants that finalizeSlot,
+    ## spawnCompileStable, spawnRunDirect, and transitionToRun all need but
+    ## none of them ever change WITHIN one execute() call — config, the
+    ## cache bundle, the injected recordClosure seam, the plan itself, the
+    ## derived output-byte cap and compile timeout, the resolved project
+    ## root, and the two nimcache-persistence invariants (RFC-0006)
+    ## execute() computes once up front (toolchainFp/dupSlugs). Built ONCE
+    ## in execute() and passed as a single param instead of each proc
+    ## re-threading its own subset of these by hand (the param-list growth
+    ## this was written to close). Deliberately NOT a god-object: anything
+    ## that varies call-to-call or is mutated in place — sv, slots, idx,
+    ## graph, sourceIndex/sourceIndexBuilt, pendingEscapees, attempt,
+    ## allowTransition, runTimeoutMs — stays an explicit param at every call
+    ## site below; only what is genuinely constant for the life of one
+    ## execute() call lives here.
+    config*:            Config
+    cache*:              CacheContext
+    recordClosureFn*:    RecordClosureProc
+    plan*:               RunPlan
+    maxOutputBytes*:     int
+    compileTimeoutMs*:   int
+    projectRoot*:        string
+    toolchainFp*:        string
+    dupSlugs*:           HashSet[string]
+
+type
   FinalizeKind = enum
     fkTransitioned  ## compile succeeded, no stop act — now running; the
                     ## slot stays live (under a NEW ChildId).
@@ -537,7 +681,7 @@ type
     of fkTransitioned, fkOmitted: discard
 
 proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
-                     attempt: int; projectRoot: string): bool
+                     attempt: int; ctx: ExecCtx): bool
   ## Forward-declared: defined below, alongside spawnCompileStable/
   ## spawnRunDirect (the other two ChildSpec-building spawn sites).
 
@@ -564,18 +708,6 @@ proc classifyRunResult(
   ## Forward-declared: defined below (unchanged from pre-A2b) — the plain
   ## opaque-fallback EntrypointResult construction for a normal run end
   ## with no protocol records.
-
-type
-  RecordClosureProc* = proc(graph: var DepGraph; config: Config; ep: Entrypoint;
-                            nimcacheDir, binaryName: string;
-                            protocolMajor: int; index: SourceIndex;
-                            ccRun: RunProc): tuple[ok: bool, error: string]
-    ## R3a (RFC-0009 A-final-ii-a): injectable seam matching `depgraph.
-    ## recordClosure`'s signature, so a test can substitute a synthetic
-    ## failure without constructing a genuinely-outside-every-root
-    ## Entrypoint (production entrypoints are ALWAYS tag-0 — see
-    ## `discover`). `execute*`'s `recordClosureFn` param defaults to the
-    ## real `recordClosure` — zero production behavior change.
 
 type
   ExecuteReport* = object
@@ -623,17 +755,12 @@ proc finalizeSlot(
   sv:               var Supervisor;
   slots:            var seq[Slot];
   idx:              int;
-  plan:             RunPlan;
-  maxOutputBytes:   int;
   allowTransition:  bool;
-  projectRoot:      string;
   graph:            var DepGraph;
-  config:           Config;
   sourceIndex:      var SourceIndex;
   sourceIndexBuilt: var bool;
-  cache:            CacheContext;
   pendingEscapees:  var Table[int32, seq[ptypes.ProcSnapshot]];
-  recordClosureFn:  RecordClosureProc;
+  ctx:              ExecCtx;
 ): FinalizeOutcome =
   ## Called once `next` has reported weChildExited for `slots[idx].id`.
   ## Reaps it (the only place a ChildId is consumed, §1) and either
@@ -644,16 +771,25 @@ proc finalizeSlot(
   ## EntrypointResult after a run/kill/spawn-failure (fkDone / fkOmitted).
   ## `allowTransition` is false only during interrupt teardown.
   ##
-  ## rfc-0005 A2c-ii: `cache` is the SAME `CacheContext` `execute()` resolves
-  ## once for the whole run — passed through so the post-compile consult can
-  ## run at exactly the point the closure/graph are fresh, before deciding
-  ## whether to spawn the run child at all (see the consult block below).
+  ## code-review r24: `plan`/`maxOutputBytes`/`projectRoot`/`config`/`cache`/
+  ## `recordClosureFn` — the run-lifetime invariants this proc needs but
+  ## never mutates and that never change across a single execute() call —
+  ## now arrive together as `ctx: ExecCtx` (see its type doc) instead of six
+  ## separate params. Everything else below (`sv`/`slots`/`idx`/
+  ## `allowTransition`/`graph`/`sourceIndex`/`sourceIndexBuilt`/
+  ## `pendingEscapees`) is per-call or mutated in place and stays explicit.
   ##
-  ## rfc-0005 A2c-i: `graph`/`config`/`sourceIndex`/`sourceIndexBuilt` exist
-  ## solely so a successfully-compiled slot can have its closure extracted
-  ## and its dependency-graph entry updated RIGHT HERE — before the run
-  ## child is spawned — instead of after the entire run completes (the
-  ## pre-existing site, now just a reader of `slot.closureRecorded`/
+  ## rfc-0005 A2c-ii: `ctx.cache` is the SAME `CacheContext` `execute()`
+  ## resolves once for the whole run — passed through so the post-compile
+  ## consult can run at exactly the point the closure/graph are fresh,
+  ## before deciding whether to spawn the run child at all (see the consult
+  ## block below).
+  ##
+  ## rfc-0005 A2c-i: `graph`/`ctx.config`/`sourceIndex`/`sourceIndexBuilt`
+  ## exist solely so a successfully-compiled slot can have its closure
+  ## extracted and its dependency-graph entry updated RIGHT HERE — before
+  ## the run child is spawned — instead of after the entire run completes
+  ## (the pre-existing site, now just a reader of `slot.closureRecorded`/
   ## `.closureError`). `sourceIndex`/`sourceIndexBuilt` are `execute`'s own
   ## locals threaded through by `var` so the "built at most once per
   ## `execute` call, only when something actually compiles" invariant
@@ -675,7 +811,7 @@ proc finalizeSlot(
   # comment (process/posix.nim).
   var report  = sv.reap(slots[idx].id)
   let pepIdx  = slots[idx].pepIdx
-  let pep     = plan.entrypoints[pepIdx]
+  let pep     = ctx.plan.entrypoints[pepIdx]
   let elapsed = int64((epochTime() - slots[idx].t0) * 1000)
 
   # rfc-0007 B1 (§3): splice in any orphan the async waitid sweep staged
@@ -696,7 +832,7 @@ proc finalizeSlot(
       let suffix = case report.stop.get.reason
                    of ptypes.krTimeout:   "\n[compile timed out]"
                    of ptypes.krInterrupt: "\n[interrupted]"
-      let output = readCapped(slots[idx].compOut, maxOutputBytes) & suffix
+      let output = readCapped(slots[idx].compOut, ctx.maxOutputBytes) & suffix
       var res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed,
                                  compileSkipped: slots[idx].compileSkipped,
                                  attempts: slots[idx].attempt)
@@ -708,7 +844,7 @@ proc finalizeSlot(
       return FinalizeOutcome(kind: fkDone, res: res)
     elif not report.exit.isSuccess:
       # Compile failed on its own — not killed.
-      let output = readCapped(slots[idx].compOut, maxOutputBytes)
+      let output = readCapped(slots[idx].compOut, ctx.maxOutputBytes)
       var res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed)
       # M15: clean up per-slot cache and bin dirs on an actual compile
       # failure — nim's own output may be partial/corrupt.
@@ -760,11 +896,11 @@ proc finalizeSlot(
       # `closureError` back off the slot rather than calling
       # `recordClosure` itself; the WHAT is unchanged, only the WHEN moved.
       if not sourceIndexBuilt:
-        sourceIndex = buildSourceIndex(config)
+        sourceIndex = buildSourceIndex(ctx.config)
         sourceIndexBuilt = true
-      let rec = recordClosureFn(graph, config, pep.ep, slots[idx].cacheDir,
+      let rec = ctx.recordClosureFn(graph, ctx.config, pep.ep, slots[idx].cacheDir,
                               binName(pep.ep), CrisolProtocolMajor, sourceIndex,
-                              realRunIn(config.projectRoot.absolutePath.normalizedPath))  # canon-ok: real compile subprocess cwd
+                              realRunIn(ctx.projectRoot))  # canon-ok: real compile subprocess cwd
       slots[idx].closureRecorded = rec.ok
       slots[idx].closureError    = rec.error
 
@@ -790,11 +926,11 @@ proc finalizeSlot(
       # local failure. On attempt > 1 the consult is skipped entirely: the
       # compile result falls straight through to `transitionToRun` below,
       # a real run every time, exactly like a cache-inactive run.
-      if rec.ok and cache.isActive() and slots[idx].attempt == 1:
-        let look = consultPostCompile(pep, cache.policy, cache.seams, cache.sink,
-                                      cache.spec, cache.outcomePolicy)
+      if rec.ok and ctx.cache.isActive() and slots[idx].attempt == 1:
+        let look = consultPostCompile(pep, ctx.cache.policy, ctx.cache.seams, ctx.cache.sink,
+                                      ctx.cache.spec, ctx.cache.outcomePolicy)
         if look.decision == edCached and look.synthesized.isSome:
-          if promoteCompiledBinary(pep.ep, config, slots[idx].binCompiled):
+          if promoteCompiledBinary(pep.ep, ctx.config, slots[idx].binCompiled):
             # Genuine post-compile hit: the compile really ran (compile =
             # pkRan, replacing synthesize's default pkSkipped — the compile
             # ProcessResult was captured just above onto the slot) while the
@@ -827,7 +963,7 @@ proc finalizeSlot(
         slots[idx].postCompileExplain   = look.explain
 
       let ok = transitionToRun(sv, slots[idx], slots[idx].runTimeoutMs, slots[idx].attempt,
-                               projectRoot)
+                               ctx)
       if not ok:
         var res = EntrypointResult(ep: pep.ep, output: "fork failed during run phase",
                                    durationMs: elapsed)
@@ -855,19 +991,19 @@ proc finalizeSlot(
       # Killed mid-run (timeout or interrupt) — output only; sink
       # reconciliation for a runner-initiated kill is unchanged/out of
       # scope for this slice (pre-existing behavior).
-      let output = readCapped(slots[idx].runOut, maxOutputBytes)
+      let output = readCapped(slots[idx].runOut, ctx.maxOutputBytes)
       res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed,
                              compileSkipped: slots[idx].compileSkipped,
                              attempts: slots[idx].attempt)
     elif report.exit.kind == ptypes.ekSignaled:
-      let output   = readCapped(slots[idx].runOut, maxOutputBytes)
-      let sinkData = readSink(slots[idx].sinkPath, maxOutputBytes)
+      let output   = readCapped(slots[idx].runOut, ctx.maxOutputBytes)
+      let sinkData = readSink(slots[idx].sinkPath, ctx.maxOutputBytes)
       res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed,
                              compileSkipped: slots[idx].compileSkipped,
                              records: sinkData.records)
     else:
-      let output   = readCapped(slots[idx].runOut, maxOutputBytes)
-      let sinkData = readSink(slots[idx].sinkPath, maxOutputBytes)
+      let output   = readCapped(slots[idx].runOut, ctx.maxOutputBytes)
+      let sinkData = readSink(slots[idx].sinkPath, ctx.maxOutputBytes)
       if sinkData.hasProtocol:
         res = EntrypointResult(ep: pep.ep, output: output, durationMs: elapsed,
                                compileSkipped: slots[idx].compileSkipped,
@@ -1084,19 +1220,102 @@ proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string):
     try: removeFile(stableBin) except CatchableError: discard
     false
 
+proc enterLive(slot: var Slot; id: ChildId; phase: SlotPhase; deadline: MonoTime) =
+  ## code-review r25: the "entering a live phase" bookkeeping every site
+  ## that puts a slot's child-identity/deadline into effect needs — a new
+  ## ChildId, this phase's own deadline, and clean stop/kill state for it.
+  ## Shared by `claimSlot` (below, for a genuinely NEW occupant) AND
+  ## `transitionToRun`'s in-place compile→run handoff, which calls this
+  ## directly and must NOT touch anything else on the slot — pepIdx, paths,
+  ## spec, and every compile-bookkeeping field all carry over from the SAME
+  ## occupant's just-finished compile phase.
+  ## rfc-0007 code-review r6: `t0` resets HERE, at every phase entry — a run
+  ## phase's `t0` must be the run's own spawn instant, not an inherited
+  ## compile-spawn instant (the bug this closed: `finalizeSlot`'s `elapsed`,
+  ## derived from `t0`, was silently folding compile time into every
+  ## recompiled run's reported duration before `transitionToRun` reset it).
+  slot.id           = id
+  slot.phase        = phase
+  slot.deadline     = deadline
+  slot.stopDeadline = none(MonoTime)
+  slot.forceKilled  = false
+  slot.t0           = epochTime()
+
+proc claimSlot(
+  id:              ChildId; pepIdx, attempt: int; phase: SlotPhase; deadline: MonoTime;
+  runTimeoutMs:    int;
+  tmpDir, testScratchDir, compOut, runOut, sinkPath,
+  binCompiled, binFull, cacheDir, slotBinDir: string;
+  compiledThisRun, compileSkipped: bool;
+  spec:            SandboxSpec;
+): Slot =
+  ## code-review r25: the ONE place a physical slot is claimed by a brand
+  ## new occupant — `spawnCompileStable` (a compiling entrypoint) and
+  ## `spawnRunDirect` (cdSkipFresh) both build their slot state through
+  ## this constructor instead of each hand-assigning the same ~20 fields
+  ## (a prior version of this file had exactly that: three near-identical
+  ## reset blocks, one per slot-claim site, kept in sync only by hand). A
+  ## field added to `Slot` in the future defaults correctly at every claim
+  ## site by construction — there is only one place left to forget it.
+  ##
+  ## Every per-occupant field a new claim must NOT inherit from whatever
+  ## entrypoint previously lived in this physical slot is named here,
+  ## explicitly — including `binCompiled`/`cacheDir` for a cdSkipFresh
+  ## claim (spawnRunDirect passes ""), which the pre-refactor code silently
+  ## left at the PREVIOUS occupant's values; harmless only because every
+  ## downstream reader happens to gate on `compiledThisRun` first, an
+  ## accidental-not-structural safety this constructor now makes explicit.
+  ##
+  ## `attempt`/`peakRssBytes` are part of the claim (not the dispatch
+  ## loop's own side channel): every claim starts attempt-numbered and with
+  ## a freshly-zeroed RSS peak, by construction. `token` is deliberately
+  ## left at its zero value — S3's admission token is stamped by the
+  ## dispatch loop only once the spawn this claim represents has actually
+  ## succeeded (see execute()'s fill pass), same as before this refactor.
+  result.state           = ssLive
+  result.pepIdx          = pepIdx
+  result.attempt         = attempt
+  result.peakRssBytes    = 0
+  result.runTimeoutMs    = runTimeoutMs
+  result.tmpDir          = tmpDir
+  result.testScratchDir  = testScratchDir
+  result.compOut         = compOut
+  result.runOut          = runOut
+  result.sinkPath        = sinkPath
+  result.binCompiled     = binCompiled
+  result.binFull         = binFull
+  result.cacheDir        = cacheDir
+  result.slotBinDir      = slotBinDir
+  result.compiledThisRun = compiledThisRun
+  result.compileSkipped  = compileSkipped
+  result.spec            = spec
+  result.compileProcRes  = none(ptypes.ProcessResult)
+  result.closureRecorded = false
+  result.closureError    = ""
+  result.postCompileConsulted = false
+  result.postCompileInputHash = ""
+  result.postCompileLookup    = cvOk
+  result.postCompileExplain   = @[]
+  enterLive(result, id, phase, deadline)
+
 proc spawnCompileStable(
   sv:               var Supervisor;
   slot:             var Slot;
-  pepIdx:           int;
+  pepIdx, attempt:  int;
   pep:              PlannedEntrypoint;
-  config:           Config;
   graph:            DepGraph;
-  compileTimeoutMs: int;
-  spec:             SandboxSpec;
-  toolchainFp:      string;
-  dupSlugs:         HashSet[string];
+  ctx:              ExecCtx;
 ): bool =
   ## Fill slot with a compile child.
+  ##
+  ## code-review r24: `config`/`compileTimeoutMs`/`spec`/`toolchainFp`/
+  ## `dupSlugs` — every run-lifetime invariant this proc used to take as
+  ## its own param — now arrive together as `ctx: ExecCtx` (see its type
+  ## doc); `spec` is `ctx.cache.spec`, the same SandboxSpec the whole run
+  ## resolves once. `pepIdx`/`attempt`/`pep`/`graph` are per-call and stay
+  ## explicit — `graph` in particular is READ here (bustStaleExternalObjects)
+  ## but mutated only inside `finalizeSlot`'s closure-recording step, so a
+  ## stale snapshot here would be a real bug, not a style nit.
   ##
   ## nimcache (RFC-0006 nimcache-persistence): the COMMON case (this
   ## entrypoint's slug appears exactly once in the plan) uses the STABLE,
@@ -1133,6 +1352,11 @@ proc spawnCompileStable(
   ## process actually ran and failed/timed out — never on a pre-compile setup
   ## failure or a post-compile run-spawn failure, both of which leave a prior
   ## persistent nimcache untouched-and-valid).
+  let config           = ctx.config
+  let spec             = ctx.cache.spec
+  let toolchainFp      = ctx.toolchainFp
+  let dupSlugs         = ctx.dupSlugs
+  let compileTimeoutMs = ctx.compileTimeoutMs
 
   let ep = pep.ep
   # R3: resolve entrypoint to absolute path before passing to nim c.
@@ -1286,41 +1510,24 @@ proc spawnCompileStable(
     try: removeDir(binDirSlot) except: discard
     return false
 
-  slot.state           = ssLive
-  slot.id              = sr.id
-  slot.pepIdx          = pepIdx
-  slot.phase           = spCompiling
-  slot.deadline        = getMonoTime() + initDuration(milliseconds = compileTimeoutMs)
-  slot.stopDeadline    = none(MonoTime)
-  slot.forceKilled     = false
-  slot.t0              = epochTime()
-  slot.runTimeoutMs    = effectiveRunTimeoutMs(ep, config)  # S2b: per-entrypoint run budget
-  slot.tmpDir          = tmpDir        # M8: temp dir holding output files
-  slot.testScratchDir  = ""            # A4a: populated when spec.tmpdir=true (spec-from-config slice)
-  slot.compOut         = compOut
-  slot.runOut          = runOut
-  slot.sinkPath        = sinkFile      # R1: sink file path for the run phase
-  slot.binCompiled     = binCompiled   # per-slot binary (compile output)
-  slot.binFull         = binCompiled   # run uses the per-slot binary
-  slot.cacheDir        = cacheDir
-  slot.slotBinDir      = binDirSlot    # M15: for cleanup on all paths
-  slot.compiledThisRun = true
-  slot.compileSkipped  = false
-  slot.spec            = spec          # A6: stored for the compile→run transition (transitionToRun)
-  slot.compileProcRes  = none(ptypes.ProcessResult)  # rfc-0007 A1b: reset on every claim
-                                        # so a reused slot never leaks a prior occupant's
-                                        # compile observation; finalizeSlot sets this for
-                                        # real once THIS compile is reaped.
-  slot.closureRecorded = false         # rfc-0005 A2c-i: reset on every claim; finalizeSlot
-                                        # sets this for real once THIS compile succeeds and
-                                        # transitions to its run phase.
-  slot.closureError    = ""
-  slot.postCompileConsulted = false    # rfc-0005 A2c-ii: reset on every claim; finalizeSlot
-                                        # sets these for real only when THIS compile's
-                                        # post-compile consult falls through to a real run.
-  slot.postCompileInputHash = ""
-  slot.postCompileLookup    = cvOk
-  slot.postCompileExplain   = @[]
+  # code-review r25: ONE constructor builds the entire fresh slot state —
+  # see claimSlot's doc comment for why the ~20 fields below are no longer
+  # hand-assigned at this (or any other) claim site. testScratchDir is ""
+  # here (populated only when spec.tmpdir=true, on the run-phase side of a
+  # later transitionToRun); binCompiled/binFull are both the per-slot
+  # compile output — the execute() main loop copies it to the stable
+  # slug-keyed path once the run completes.
+  slot = claimSlot(
+    id = sr.id, pepIdx = pepIdx, attempt = attempt, phase = spCompiling,
+    deadline = getMonoTime() + initDuration(milliseconds = compileTimeoutMs),
+    runTimeoutMs = effectiveRunTimeoutMs(ep, config),  # S2b: per-entrypoint run budget
+    tmpDir = tmpDir, testScratchDir = "",
+    compOut = compOut, runOut = runOut, sinkPath = sinkFile,
+    binCompiled = binCompiled, binFull = binCompiled,
+    cacheDir = cacheDir, slotBinDir = binDirSlot,
+    compiledThisRun = true, compileSkipped = false,
+    spec = spec,
+  )
   result = true
 
 proc buildRunChildSpec(
@@ -1365,9 +1572,8 @@ proc spawnRunDirect(
   slot:         var Slot;
   pepIdx:       int;
   pep:          PlannedEntrypoint;
-  config:       Config;
-  spec:         SandboxSpec;
   attempt:      int;
+  ctx:          ExecCtx;
 ): bool =
   ## Fill slot directly with a run child (cdSkipFresh: compile skipped).
   ## Returns false on resource allocation failure.
@@ -1380,6 +1586,10 @@ proc spawnRunDirect(
   ## delivered in ReapReport at reap time (finalizeSlot), not here.
   ## M8: uses mkdtemp for temp output files.
   ## S2b: run deadline set from effectiveRunTimeoutMs(ep, config).
+  ## code-review r24: `config`/`spec` arrive via `ctx: ExecCtx` now (see its
+  ## type doc) — `pepIdx`/`pep`/`attempt` are per-call and stay explicit.
+  let config = ctx.config
+  let spec   = ctx.cache.spec
 
   let ep = pep.ep
   # RFC-0009 B4a: the stable binary's real on-disk name (with the platform
@@ -1416,42 +1626,29 @@ proc spawnRunDirect(
       try: removeDir(scratchDir) except: discard
     return false
 
-  slot.state           = ssLive
-  slot.id              = sr.id
-  slot.pepIdx          = pepIdx
-  slot.phase           = spRunning
-  slot.deadline        = getMonoTime() + initDuration(milliseconds = rtMs)
-  slot.stopDeadline    = none(MonoTime)
-  slot.forceKilled     = false
-  slot.t0              = epochTime()
-  slot.runTimeoutMs    = rtMs           # S2b: stored for reference (deadline already set)
-  slot.tmpDir          = tmpDir        # M8: temp dir to clean up
-  slot.testScratchDir  = scratchDir    # A4a/A6: per-entrypoint scratch tmpdir (cleaned everywhere)
-  slot.compOut         = ""
-  slot.runOut          = runOut
-  slot.sinkPath        = sinkFile      # R1: sink file path
-  slot.binFull         = binFull
-  slot.slotBinDir      = ""
-  slot.compiledThisRun = false
-  slot.compileSkipped  = true
-  slot.spec            = spec          # A2b: carried so groupRssBytes callers and a
-                                        # later kill have the same spec context
-  slot.compileProcRes  = none(ptypes.ProcessResult)  # rfc-0007 A1b: cdSkipFresh —
-                                        # no compile happened this run; reset so a
-                                        # reused slot never leaks a prior occupant's
-                                        # compile observation.
-  slot.closureRecorded = false         # rfc-0005 A2c-i: cdSkipFresh — no compile,
-                                        # so no closure recording either; reset for hygiene.
-  slot.closureError    = ""
-  slot.postCompileConsulted = false    # rfc-0005 A2c-ii: cdSkipFresh — no compile, so no
-                                        # post-compile consult either; reset for hygiene.
-  slot.postCompileInputHash = ""
-  slot.postCompileLookup    = cvOk
-  slot.postCompileExplain   = @[]
+  # code-review r25: same constructor as spawnCompileStable's claim — see
+  # claimSlot's doc comment. binCompiled/cacheDir are explicitly "" here (a
+  # cdSkipFresh claim has neither): before this fix they were simply never
+  # assigned in this proc, silently leaving whatever a PREVIOUS occupant of
+  # this physical slot had left there — harmless only by accident, because
+  # every downstream reader happens to gate on compiledThisRun (false here)
+  # before ever looking at them.
+  slot = claimSlot(
+    id = sr.id, pepIdx = pepIdx, attempt = attempt, phase = spRunning,
+    deadline = getMonoTime() + initDuration(milliseconds = rtMs),
+    runTimeoutMs = rtMs,  # S2b: stored for reference (deadline already set)
+    tmpDir = tmpDir, testScratchDir = scratchDir,
+    compOut = "", runOut = runOut, sinkPath = sinkFile,
+    binCompiled = "", binFull = binFull,
+    cacheDir = "", slotBinDir = "",
+    compiledThisRun = false, compileSkipped = true,
+    spec = spec,  # A2b: carried so groupRssBytes callers and a later kill
+                  # have the same spec context
+  )
   result = true
 
 proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
-                     attempt: int; projectRoot: string): bool =
+                     attempt: int; ctx: ExecCtx): bool =
   ## rfc-0007 A2b: transition a compile-succeeded, un-stopped slot into its
   ## running phase — spawns the compiled binary as a NEW child (a fresh
   ## ChildId; the compile child's id was already consumed by `reap` before
@@ -1459,12 +1656,19 @@ proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
   ## oSpawnError. Formerly `spawnRun`.
   ## R1: injects CRISOL_SINK into the child's environment.
   ## B0: injects CRISOL_ATTEMPT=attempt (1-indexed) into the child environment.
+  ## code-review r24: `projectRoot` arrives via `ctx: ExecCtx` now.
+  ## code-review r25: this is the THIRD slot-claim site, but a DELIBERATELY
+  ## PARTIAL one — the same occupant's compile phase already set pepIdx/
+  ## paths/spec/compile-bookkeeping just above (finalizeSlot), and those
+  ## must carry over untouched into the run phase; only `enterLive`'s
+  ## shared "entering a live phase" subset applies here, never `claimSlot`
+  ## (which would wrongly wipe them as though a NEW occupant had arrived).
 
   var scratchDir: string
   var childSpec: ChildSpec
   try:
     childSpec = buildRunChildSpec(slot.binFull, slot.runOut, slot.sinkPath,
-                                  slot.spec, attempt, projectRoot, scratchDir)
+                                  slot.spec, attempt, ctx.projectRoot, scratchDir)
   except:
     return false
 
@@ -1474,27 +1678,7 @@ proc transitionToRun(sv: var Supervisor; slot: var Slot; runTimeoutMs: int;
       try: removeDir(scratchDir) except: discard
     return false
 
-  slot.id              = sr.id
-  slot.phase           = spRunning
-  slot.deadline        = getMonoTime() + initDuration(milliseconds = runTimeoutMs)
-  slot.stopDeadline    = none(MonoTime)
-  slot.forceKilled     = false
-  slot.t0              = epochTime()  # rfc-0007 code-review r6: run wall-clock
-                                       # starts HERE, at run spawn — not back at
-                                       # the compile spawn (spawnCompileStable's
-                                       # `slot.t0`, never reset by this proc
-                                       # before this fix). finalizeSlot's
-                                       # `elapsed` (computed from `slot.t0`) is
-                                       # stamped as the RUN phase's durationUs;
-                                       # leaving t0 at its compile-spawn value
-                                       # silently folded compile time into every
-                                       # edRunFresh-adjacent (recompiled) run's
-                                       # reported duration — contaminating
-                                       # cache stores, hit-replay durationMs,
-                                       # wallSavedMs telemetry, and shard-balance
-                                       # history. `spawnRunDirect` (cdSkipFresh)
-                                       # already sets t0 fresh; this brings the
-                                       # recompiled path in line with it.
+  enterLive(slot, sr.id, spRunning, getMonoTime() + initDuration(milliseconds = runTimeoutMs))
   slot.testScratchDir  = scratchDir   # A4a/A6: cleaned on all exit paths
   result = true
 
@@ -1725,6 +1909,23 @@ proc execute*(
   #     to avoid two concurrent slots racing on one nimcache write.
   let toolchainFp = toolchainFingerprint(nimVersion, ccVersion)
   let dupSlugs    = duplicateSlugs(p, config.trackedRoots)
+
+  # code-review r24: the run-lifetime invariants above (config, cache,
+  # recordClosureFn, the plan, the derived timeout/output-cap, the resolved
+  # project root, toolchainFp/dupSlugs) built into ONE ExecCtx — see its
+  # type doc. Every slot-lifecycle proc below takes this instead of its own
+  # subset of the same six-to-eight params.
+  let ctx = ExecCtx(
+    config:            config,
+    cache:              cache,
+    recordClosureFn:    recordClosureFn,
+    plan:               p,
+    maxOutputBytes:     maxOutputBytes,
+    compileTimeoutMs:   compileTimeoutMs,
+    projectRoot:        config.projectRoot.absolutePath.normalizedPath, # canon-ok: real spawn/finalize projectRoot
+    toolchainFp:        toolchainFp,
+    dupSlugs:           dupSlugs,
+  )
 
   # Pre-allocate result slots so we can fill them by index (plan order).
   var results = newSeq[EntrypointResult](n)
@@ -1975,15 +2176,13 @@ proc execute*(
         # have gone idle (fkDone/fkOmitted), harmless to compute otherwise.
         let finishRss = sv.groupRssBytes(slots[idx].id)
 
-        let fo = finalizeSlot(sv, slots, idx, p, maxOutputBytes,
+        let fo = finalizeSlot(sv, slots, idx,
                               allowTransition = (not shuttingDown) and not blockTransition,
-                              projectRoot = config.projectRoot.absolutePath.normalizedPath, # canon-ok: real finalize spawn projectRoot
-                              graph = graph, config = config,
+                              graph = graph,
                               sourceIndex = sourceIndex,
                               sourceIndexBuilt = sourceIndexBuilt,
-                              cache = cache,
                               pendingEscapees = pendingEscapees,
-                              recordClosureFn = recordClosureFn)
+                              ctx = ctx)
 
         case fo.kind
         of fkTransitioned:
@@ -2050,19 +2249,37 @@ proc execute*(
                                results[completedIdx], inputHashes[completedIdx],
                                slots[idx].peakRssBytes, config.trackedRoots)
 
-            # B1: retry decision — re-dispatch if the result is a failure AND we
-            # have remaining attempts.  Compile failures and spawn errors are NOT
-            # retried (retrying a compile failure is useless; only run failures
-            # benefit from retry).  oKilled and oCrashed ARE retried (transient
-            # infrastructure noise).
-            #
-            # "Failure eligible for retry" = outcome is NOT oPassed AND NOT
-            # oCompileFailed AND NOT oSpawnError, AND attempts[completedIdx] < maxAttempts.
-            let retryEligible =
-              completedOutcome notin {oPassed, oCompileFailed, oSpawnError} and
-              slotAttempt < maxAttempts
+            # A6/A7: the store gate itself (`shouldStore`) is pure and cheap
+            # — call it unconditionally so `decideExit` always has a real
+            # `StoreVerdict` to reason about. When caching is inactive its
+            # result is never actually consulted (`decideExit`'s
+            # `cacheDecisionIfNotStored` short-circuits on `cacheActive`
+            # before looking at it), so this changes no observable behavior.
+            let verdict =
+              if cacheActive:
+                shouldStore(results[completedIdx], cache.spec, slotAttempt,
+                           cache.policy, p.entrypoints[completedIdx].cacheable)
+              else:
+                StoreVerdict()
 
-            if retryEligible:
+            # code-review r23: the retry/promotion/store-gate POLICY itself
+            # now lives in `decideExit` (pure, unit-tested directly — see
+            # tests/unit/test_rfc0007_r23_exit_decision.nim); everything
+            # below is the ACTION side applying its decision.
+            let decision = decideExit(
+              completedOutcome      = completedOutcome,
+              slotAttempt           = slotAttempt,
+              maxAttempts           = maxAttempts,
+              failFast              = failFast,
+              compiledThisRun       = compiledThisRun,
+              hasCacheDir           = slotCacheDir.len > 0,
+              slotClosureRecorded   = slotClosureRecorded,
+              cacheActive           = cacheActive,
+              verdict               = verdict,
+              planTimeCacheDecision = cacheDecisions[completedIdx],
+            )
+
+            if decision.retry:
               # Re-dispatch: the slot is now idle; the fill scan will pick it up.
               # Do NOT inc done; do NOT call onResult (not final yet).
               discard  # slot cleared above; fill scan will re-dispatch
@@ -2084,7 +2301,7 @@ proc execute*(
                               config.quarantine, config.quarantineTp)
 
               # Track whether any failure has been recorded (for failFast).
-              if failFast and completedOutcome.isFailure:
+              if decision.recordAsFailure:
                 anyFailed = true
 
               # After run completes for a compiled-this-run slot: copy the binary
@@ -2093,57 +2310,46 @@ proc execute*(
               # A2c-i: `finalizeSlot` calls `recordClosure` itself, right after
               # compile finishes and before the run child is spawned — this site
               # only reads `slotClosureRecorded`/`slotClosureError` back).
-              # Binary is valid (compile succeeded) whenever outcome is not
-              # oCompileFailed or oSpawnError.
-              # R9: default true — only a compiled-this-run entry whose closure
-              # recording actually failed sets this false; every other path
-              # (cache hit, edSkipFresh, etc.) is unaffected by this gate.
-              var closureRecorded = true
-              if compiledThisRun and slotCacheDir.len > 0:
-                if completedOutcome notin {oCompileFailed, oSpawnError}:
-                  let ep = p.entrypoints[completedIdx].ep
-                  # RFC-0009 B4a: `stableBinPath` (not `binPath / binName`)
-                  # so this warning/discard path names the SAME file
-                  # `promoteCompiledBinary` just wrote — see its doc comment.
-                  let stableBin    = stableBinPath(ep, config)
-                  # Invariant on exit from this block: either (the depgraph
-                  # entry on disk matches the stable binary at `stableBin`) or
-                  # (no stable binary exists at `stableBin`) — NEVER a binary
-                  # whose provenance the on-disk depgraph does not describe
-                  # (issue #13.3). A promotion or persist failure below always
-                  # resolves toward "no stable binary" rather than leaving a
-                  # binary paired with a stale or absent depgraph entry.
-                  #
-                  # Copy per-slot binary to the stable slug-keyed location.
-                  # The stable binary is what decideCompile checks on future
-                  # runs. `promoteCompiledBinary` (shared with finalizeSlot's
-                  # post-compile cache-hit branch, RFC-0005 A2c-ii) already
-                  # no-ops when `slotBinCompiled` is empty or already equals
-                  # `stableBin`, and already warns + discards any partial
-                  # `stableBin` on failure — this site's return value is
-                  # intentionally unused, matching the pre-extraction
-                  # behavior exactly (a promotion failure here does not, by
-                  # itself, block a store; only `closureRecorded` below does).
-                  discard promoteCompiledBinary(ep, config, slotBinCompiled)
+              if decision.promoteBinary:
+                let ep = p.entrypoints[completedIdx].ep
+                # RFC-0009 B4a: `stableBinPath` (not `binPath / binName`)
+                # so this warning/discard path names the SAME file
+                # `promoteCompiledBinary` just wrote — see its doc comment.
+                let stableBin = stableBinPath(ep, config)
+                # Invariant on exit from this block: either (the depgraph
+                # entry on disk matches the stable binary at `stableBin`) or
+                # (no stable binary exists at `stableBin`) — NEVER a binary
+                # whose provenance the on-disk depgraph does not describe
+                # (issue #13.3). A promotion or persist failure below always
+                # resolves toward "no stable binary" rather than leaving a
+                # binary paired with a stale or absent depgraph entry.
+                #
+                # Copy per-slot binary to the stable slug-keyed location.
+                # The stable binary is what decideCompile checks on future
+                # runs. `promoteCompiledBinary` (shared with finalizeSlot's
+                # post-compile cache-hit branch, RFC-0005 A2c-ii) already
+                # no-ops when `slotBinCompiled` is empty or already equals
+                # `stableBin`, and already warns + discards any partial
+                # `stableBin` on failure — this site's return value is
+                # intentionally unused, matching the pre-extraction
+                # behavior exactly (a promotion failure here does not, by
+                # itself, block a store; only `discardOnUnrecordedClosure`
+                # below does).
+                discard promoteCompiledBinary(ep, config, slotBinCompiled)
 
-                  # Closure recording itself already happened in `finalizeSlot`,
-                  # right after this compile succeeded (rfc-0005 A2c-i) — recovery
-                  # policy still lives beside the invariant it protects, in
-                  # `recordClosure` (depgraph.nim); this reads its outcome back.
-                  closureRecorded = slotClosureRecorded
-                  if not closureRecorded:
-                    # The depgraph entry for this compile is either invalidated
-                    # or (on a persist failure) not reliably reflected on disk
-                    # at all — either way, the stable binary just promoted
-                    # above must not survive to be served by a future run
-                    # whose decideCompile can no longer be trusted to agree
-                    # with it (issue #13.3).
-                    try: removeFile(stableBin) except CatchableError: discard
-                    stderr.write("crisol: warning: " & string(ep.tp.display()) & ": could not record its " &
-                                 "source closure (" & slotClosureError & "); dependency record " &
-                                 "invalidated and its binary was discarded — it will be " &
-                                 "recompiled and force-selected next run\n")
-                    try: stderr.flushFile() except CatchableError: discard
+                if decision.discardOnUnrecordedClosure:
+                  # The depgraph entry for this compile is either invalidated
+                  # or (on a persist failure) not reliably reflected on disk
+                  # at all — either way, the stable binary just promoted
+                  # above must not survive to be served by a future run
+                  # whose decideCompile can no longer be trusted to agree
+                  # with it (issue #13.3).
+                  try: removeFile(stableBin) except CatchableError: discard
+                  stderr.write("crisol: warning: " & string(ep.tp.display()) & ": could not record its " &
+                               "source closure (" & slotClosureError & "); dependency record " &
+                               "invalidated and its binary was discarded — it will be " &
+                               "recompiled and force-selected next run\n")
+                  try: stderr.flushFile() except CatchableError: discard
 
               # Clean up the per-slot bin dir after stable copy (M15).
               # finalizeSlot already cleaned this on compile-fail; only clean here on success.
@@ -2163,39 +2369,20 @@ proc execute*(
                 lookups[completedIdx]     = slotPostCompileLookup
                 explains[completedIdx]    = slotPostCompileExplain
 
-              # ---------------------------------------------------------------
-              # A6/A7: cache-store gate for a freshly-RUN (not cached) result.
-              # Store ONLY when (a) policy permits, (b) hermeticity was achieved,
-              # and (c) it passed on attempt 1 (not a flaky-pass — never cache
-              # flaky: it would freeze the result as PASS forever).
-              # ALWAYS stamp the live result's CacheDecision for reporting (A8).
-              # ---------------------------------------------------------------
-              if cacheActive:
-                # RFC-0005 B1c: stamp the plan-time miss explanation regardless of
-                # whether THIS run's result ends up stored (`explains[completedIdx]`
-                # is unconditional — the sidecar diff belongs to the fact that this
-                # index was a plan-time miss, not to the store outcome below).
-                results[completedIdx].keyDiff = explains[completedIdx]
-                # RFC-0005 A3b: the LIVE stamp -- same unconditional-of-store-
-                # outcome reasoning as keyDiff just above: this index's
-                # plan-time lookup verdict (cvMiss / a trust code / cvOk on a
-                # recompute-invalidated hit) belongs to the fact that it was
-                # consulted, not to whether the fresh result ends up stored.
-                # cacheTier stays "" (its zero value) -- a live-run result was
-                # never served from a tier, whatever the reason.
+              # A6/A7: apply the store-gate decision. ALWAYS stamp the live
+              # result's CacheDecision for reporting (A8), whichever arm fires.
+              if decision.stampCacheKeyInfo:
+                # RFC-0005 B1c/A3b: stamp the plan-time miss explanation and
+                # lookup verdict regardless of whether THIS run's result ends
+                # up stored — both belong to the fact that this index was
+                # CONSULTED, not to the store outcome below. cacheTier stays
+                # "" (its zero value) -- a live-run result was never served
+                # from a tier, whatever the reason.
+                results[completedIdx].keyDiff     = explains[completedIdx]
                 results[completedIdx].cacheLookup = lookups[completedIdx]
-                let verdict = shouldStore(results[completedIdx], cache.spec,
-                                          slotAttempt, cache.policy,
-                                          p.entrypoints[completedIdx].cacheable)
-                # R9: a store is permitted only when BOTH the policy verdict AND
-                # the closure recording (above) agree. A result whose closure
-                # failed to record must never be stored: keyOf would derive the
-                # SoundnessKey from an empty closureContentHash, and the entry
-                # could never be looked up again (lookup needs edRunFresh, which
-                # needs a depgraph entry) — a permanently dead cache write.
-                if verdict.store and closureRecorded:
-                  # Re-derive the key from the NOW-updated graph (closureHash fresh)
-                  # so a later run's lookup-key matches this store-key.
+                if decision.attemptStore:
+                  # Re-derive the key from the NOW-updated graph (closureHash
+                  # fresh) so a later run's lookup-key matches this store-key.
                   let d   = derive(cache.seams, p.entrypoints[completedIdx])
                   let cr  = toCachedResult(results[completedIdx], epochTime().int64)
                   let stored = cache.seams.store(p.entrypoints[completedIdx], d, cr)
@@ -2211,42 +2398,13 @@ proc execute*(
                   results[completedIdx].cacheDecision =
                     if stored: cdmStored else: cdmKeyMiss
                 else:
-                  # Not stored: either the verdict carries the structural reason, or
-                  # (R9) the verdict said store but the closure wasn't recorded — in
-                  # which case stamp cdmClosureUnrecorded, a dedicated variant so a
-                  # `--json` reader can tell WHY the store didn't happen instead of
-                  # this collapsing into the generic cdmKeyMiss.
                   # Stamp the plan-time key (set for an edRunFresh miss; "" otherwise)
                   # so a consulted-but-not-stored result still reports its inputHash.
                   results[completedIdx].inputHash = inputHashes[completedIdx]
-                  # code-review r17: `shouldStore`'s generic `cdmKeyMiss` (its
-                  # "not a pass" return -- it has no way to know whether THIS
-                  # was a genuine miss or a recompute-invalidated hit) must
-                  # not clobber a plan-time `cdmRecomputeMiss`. Left alone, a
-                  # recompute-invalidated hit (plan-time `cdmRecomputeMiss`,
-                  # `lookups[completedIdx]` stamped `cvOk` just above -- see
-                  # cachedispatch.consultReal's doc at its `cdmRecomputeMiss`
-                  # return site) whose rerun FAILS would report
-                  # `cacheDecision:"keyMiss"` ("no entry was found at all")
-                  # alongside `cacheLookup:"ok"` -- an internally
-                  # contradictory wire pair. Scoped narrowly: only the
-                  # generic not-a-pass `cdmKeyMiss` is overridden, and only
-                  # when the PLAN-TIME decision was itself
-                  # `cdmRecomputeMiss` -- a genuine plan-time `cdmKeyMiss`
-                  # (no entry was ever found) keeps reporting `cdmKeyMiss`;
-                  # `verdict.decision`'s other reasons (`cdmGroupOptOut`/
-                  # `cdmPolicyDisabled`/`cdmHermeticityDeg`/`cdmFlaky`, all
-                  # already more specific than the generic collapse) are
-                  # never touched.
-                  results[completedIdx].cacheDecision =
-                    if verdict.store: cdmClosureUnrecorded   # else-branch ⇒ not closureRecorded
-                    elif verdict.decision == cdmKeyMiss and
-                         cacheDecisions[completedIdx] == cdmRecomputeMiss:
-                      cdmRecomputeMiss
-                    else: verdict.decision
+                  results[completedIdx].cacheDecision = decision.cacheDecisionIfNotStored
               else:
                 # Caching inactive: stamp the structural reason recorded at plan time.
-                results[completedIdx].cacheDecision = cacheDecisions[completedIdx]
+                results[completedIdx].cacheDecision = decision.cacheDecisionIfNotStored
 
               # Fire onResult ONCE with the final result (B1 contract).
               onResult(results[completedIdx])
@@ -2325,14 +2483,15 @@ proc execute*(
           dispatchedThisPass = true  # M4: progress was made this pass
 
           let pep = candidate
-          let attemptNum = attempts[j]  # B0: current attempt (1-indexed)
-          slots[i].attempt = attemptNum # B0: store on slot so spawnRun can read it
-          slots[i].peakRssBytes = 0    # C5: reset peak at slot claim (fresh attempt)
+          let attemptNum = attempts[j]  # B0: current attempt (1-indexed); claimSlot
+                                         # (inside spawnRunDirect/spawnCompileStable) is
+                                         # what actually stores this on the slot the
+                                         # moment the child spawns — see claimSlot's doc.
 
           if pep.edecision == edRunFresh:
             # Skip compile: spawn run directly with the existing stable binary.
             # S2b: runTimeoutMs is resolved inside spawnRunDirect from effectiveRunTimeoutMs.
-            let ok = spawnRunDirect(sv, slots[i], pepIdx, pep, config, cache.spec, attemptNum)
+            let ok = spawnRunDirect(sv, slots[i], pepIdx, pep, attemptNum, ctx)
             if not ok:
               ac.release(tok.get)  # S3: rollback admission on spawn failure
               var res = EntrypointResult(ep: pep.ep,
@@ -2353,9 +2512,7 @@ proc execute*(
               slots[i].token = tok.get  # S3: store token for onSlotFinish
           else:
             # Normal compile + run using stable slug-keyed paths.
-            let ok = spawnCompileStable(sv, slots[i], pepIdx, pep, config, graph,
-                                        compileTimeoutMs, cache.spec, toolchainFp,
-                                        dupSlugs)
+            let ok = spawnCompileStable(sv, slots[i], pepIdx, attemptNum, pep, graph, ctx)
             if not ok:
               ac.release(tok.get)  # S3: rollback admission on spawn failure
               # Fork/resource failure: record oSpawnError immediately.
