@@ -2286,7 +2286,48 @@ proc execute*(
             if slotBinDir.len > 0:
               try: removeDir(slotBinDir) except: discard
             finalized[completedIdx] = true
-            onResult(fo.res)
+
+            # r35: an interrupted final bypasses retry/ledger/cache/promotion
+            # (above), but it must NOT bypass the facts the runner already
+            # honestly knows — only the actions (store/ledger-append/retry)
+            # are skipped, never the reporting. Three facts this branch used
+            # to leave at their zero value even when real ones were in hand:
+            #
+            # (a) cache: if this index just compiled and consulted post-
+            #     compile (attempt 1 only — SO3), that real consult
+            #     supersedes the plan-time placeholder, exactly like the
+            #     live-finalize path does a few lines below (2423-2426).
+            #     Then stamp cacheDecision/inputHash/keyDiff from the (now-
+            #     current) plan-time-or-post-compile facts — never re-
+            #     derive, never store. `cacheLookup` rides the same "really
+            #     consulted" gate r41 uses just below (inputHash non-empty)
+            #     so an interrupted final can't leak the same bare
+            #     cacheLookup:"ok" ambiguity r41 fixes for a retried entry.
+            if slotPostCompileConsulted:
+              inputHashes[completedIdx] = slotPostCompileInputHash
+              lookups[completedIdx]     = slotPostCompileLookup
+              explains[completedIdx]    = slotPostCompileExplain
+            results[completedIdx].cacheDecision = cacheDecisions[completedIdx]
+            results[completedIdx].inputHash     = inputHashes[completedIdx]
+            results[completedIdx].keyDiff       = explains[completedIdx]
+            if inputHashes[completedIdx].len > 0:
+              results[completedIdx].cacheLookup = lookups[completedIdx]
+            # (b) attempts: the real attempt number this slot was on.
+            # finalizeSlot's RUN-phase branch only stamps `attempts` on the
+            # `report.stop.isSome` (killed) arm — a child that raced the
+            # interrupt and exited/signaled on its own just before its stop
+            # act landed falls through finalizeSlot's other two arms, which
+            # never set `attempts` at all (it stays the field's zero value).
+            results[completedIdx].attempts = slotAttempt
+            # (c) quarantine: the same reporting overlay the live-finalize
+            # path applies before onResult (2354-2357 below) — an
+            # interrupted final must not report an unquarantined
+            # failure/pass merely because it took the teardown branch.
+            results[completedIdx].quarantined =
+              isQuarantined(p.entrypoints[completedIdx].ep, results[completedIdx],
+                            config.quarantine, config.quarantineTp)
+
+            onResult(results[completedIdx])
           else:
             # rfc-0007 §2: retry/flaky/quarantine decisions read the pure
             # derivation — there is no stored legacy field to read instead.
@@ -2428,14 +2469,44 @@ proc execute*(
               # A6/A7: apply the store-gate decision. ALWAYS stamp the live
               # result's CacheDecision for reporting (A8), whichever arm fires.
               if decision.stampCacheKeyInfo:
-                # RFC-0005 B1c/A3b: stamp the plan-time miss explanation and
-                # lookup verdict regardless of whether THIS run's result ends
-                # up stored — both belong to the fact that this index was
-                # CONSULTED, not to the store outcome below. cacheTier stays
-                # "" (its zero value) -- a live-run result was never served
-                # from a tier, whatever the reason.
-                results[completedIdx].keyDiff     = explains[completedIdx]
-                results[completedIdx].cacheLookup = lookups[completedIdx]
+                # RFC-0005 B1c/A3b: stamp the plan-time (or post-compile,
+                # 2423-2426 above) miss explanation regardless of whether
+                # THIS run's result ends up stored — `keyDiff` has its own,
+                # separate legitimacy gate (its own doc comment: populated
+                # only for a miss-set `cacheDecision` when a prior sidecar
+                # record existed to diff against; degrades to empty on its
+                # own otherwise, including the `explainDiag` plan-time-only
+                # path for a compiling entry, which never touches
+                # `inputHash`/`lookup` at all) — unconditional here, exactly
+                # as before.
+                results[completedIdx].keyDiff = explains[completedIdx]
+                # r41: `cacheLookup`, unlike `keyDiff`, is ONLY ever
+                # meaningful when a REAL `TieredCache` verdict backs THIS
+                # attempt — and `inputHash`/`lookup` are always derived
+                # TOGETHER by the same real consult call (`consultReal`/
+                # `consultPostCompile`), never one without the other. But
+                # `stampCacheKeyInfo` is true for every FINALIZING attempt
+                # whenever caching is active, NOT only a consulted one: a
+                # retried compiling entry's second-and-later attempt never
+                # re-consults (SO3 — `consultPostCompile` above only runs on
+                # `slots[idx].attempt == 1`), so `lookups` at this index can
+                # still hold nothing but its plan-time zero value (`cvOk`)
+                # for a compiling entrypoint. Stamping that zero value here
+                # would read on the wire as a genuine hit (`cacheLookup:
+                # "ok"`) right next to a "consulted"-looking final
+                # `cacheDecision` (e.g. cdmFlaky from
+                # `cacheDecisionIfNotStored` below) — exactly the
+                # cacheDecision/cacheLookup incoherence the presence gate
+                # (jsonout.nim, keyed off cacheDecision alone) exists to
+                # prevent, just reintroduced from the runner side.
+                # `inputHashes[completedIdx].len > 0` is the SAME "a real
+                # consult backed this" signal `inputHash`'s own doc comment
+                # already pins (types.nim: "" only when caching was not
+                # consulted at all) — reuse it rather than invent a second
+                # one. cacheTier stays "" (its zero value) -- a live-run
+                # result was never served from a tier, whatever the reason.
+                if inputHashes[completedIdx].len > 0:
+                  results[completedIdx].cacheLookup = lookups[completedIdx]
                 if decision.attemptStore:
                   # Re-derive the key from the NOW-updated graph (closureHash
                   # fresh) so a later run's lookup-key matches this store-key.

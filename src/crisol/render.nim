@@ -134,6 +134,95 @@ proc col*(text: string; code: string; enabled: bool): string {.inline.} =
   if enabled: code & text & Ansi_Reset else: text
 
 # ---------------------------------------------------------------------------
+# r49: raw child-output sanitization
+# ---------------------------------------------------------------------------
+
+proc sanitizeChildOutput*(s: string): string =
+  ## r49: `r.output` (a compile/run child's captured stdout+stderr) is
+  ## untrusted-origin text exactly like the protocol-record fields
+  ## `ioutils.sanitizeControlBytes` already sanitizes just above/below this
+  ## in the report body (issue #14) — a test binary under test is as
+  ## capable of emitting a spoofed CI-log/terminal escape sequence as a
+  ## malformed record name is. It used to reach the terminal completely
+  ## unsanitized (the stale comment above claimed this was deliberate, "may
+  ## legitimately be colored") while the adjacent record lines were fully
+  ## stripped of ALL escape sequences on the SAME rendered block — an
+  ## inconsistent policy, and the unsanitized side is the ANSI/control-
+  ## injection surface.
+  ##
+  ## This does NOT simply reuse `ioutils.sanitizeControlBytes`: that
+  ## sanitizer strips every C0 byte (including ESC), so routing raw output
+  ## through it verbatim would also kill the one thing that comment was
+  ## trying to preserve — a test runner's own SGR color output (green
+  ## PASS / red FAIL, common and wanted in a captured test binary's output).
+  ## Instead this proc applies a NARROWER, render-specific policy: strip
+  ## only the DANGEROUS escape classes and keep SGR —
+  ##
+  ##   - CSI (`ESC '[' params intermediates final`): the final byte decides.
+  ##     `m` (SGR — color/style) is passed through VERBATIM. Every other
+  ##     final byte (cursor positioning/movement, screen/line erase, scroll,
+  ##     save/restore cursor, etc.) drops the WHOLE sequence — none of that
+  ##     belongs in a CI log or this report's own layout.
+  ##   - OSC (`ESC ']' ... BEL` or `... ESC '\'`): dropped whole — window/
+  ##     tab-title spoofing, hyperlinks, clipboard writes.
+  ##   - Any other ESC-led two-byte-or-more sequence (DCS/PM/APC, or a bare
+  ##     7-bit C1-style short form like cursor save `ESC 7`): only the ESC
+  ##     byte itself is dropped (falls through to the plain-control-byte
+  ##     case below); whatever ASCII byte followed it survives as inert text.
+  ##   - The UTF-8 ENCODING of a C1 control code point (`0xC2` followed by
+  ##     `0x80..0x9F`, e.g. `0xC2 0x9B` == U+009B == CSI, which a UTF-8
+  ##     terminal treats exactly like the 7-bit CSI introducer): both bytes
+  ##     dropped — same threat `ioutils.sanitizeControlBytes` neutralizes,
+  ##     for the same reason (bare C1 bytes are left alone: in a UTF-8
+  ##     stream they only ever appear as continuation bytes of unrelated
+  ##     multibyte characters, so touching them in isolation would corrupt
+  ##     legitimate non-ASCII text).
+  ##   - Every other C0 control byte (`< 0x20`) and DEL (`0x7F`) is dropped,
+  ##     EXCEPT `\n`, `\t`, `\r` — a test binary's output is legitimately
+  ##     multi-line/tabular and none of those three can themselves move a
+  ##     cursor or open a further escape sequence.
+  ##
+  ## Bytes are DROPPED, not replaced with `?` — unlike
+  ## `ioutils.sanitizeControlBytes` (which marks the byte's former presence
+  ## for config/manifest diagnostic text where every stripped byte is
+  ## itself suspicious), a color/movement escape sequence in a test
+  ## binary's own stdout is routine, expected noise; leaving a visible `?`
+  ## per stripped byte would litter ordinary colored output with junk.
+  result = newStringOfCap(s.len)
+  var i = 0
+  while i < s.len:
+    let b = byte(s[i])
+    if b == 0x1B and i + 1 < s.len and s[i + 1] == '[':
+      # CSI: ESC '[' <params 0x30-0x3F>* <intermediates 0x20-0x2F>* <final 0x40-0x7E>
+      var j = i + 2
+      while j < s.len and byte(s[j]) in 0x30'u8 .. 0x3F'u8: inc j
+      while j < s.len and byte(s[j]) in 0x20'u8 .. 0x2F'u8: inc j
+      if j < s.len and byte(s[j]) in 0x40'u8 .. 0x7E'u8:
+        if s[j] == 'm':
+          result.add s[i .. j]  # SGR — preserve verbatim
+        i = j + 1               # any other final byte — drop the whole sequence
+      else:
+        i = i + 2                # unterminated (e.g. output-cap truncation) — drop the introducer only
+    elif b == 0x1B and i + 1 < s.len and s[i + 1] == ']':
+      # OSC: ESC ']' ... terminated by BEL (0x07) or ST (ESC '\')
+      var j = i + 2
+      while j < s.len and s[j] != '\a' and
+            not (byte(s[j]) == 0x1B and j + 1 < s.len and s[j + 1] == '\\'):
+        inc j
+      if j < s.len and s[j] == '\a': i = j + 1
+      elif j + 1 < s.len:           i = j + 2
+      else:                          i = s.len  # unterminated — drop to end
+    elif b == 0xC2 and i + 1 < s.len and byte(s[i + 1]) in 0x80'u8 .. 0x9F'u8:
+      i = i + 2  # UTF-8 encoding of a C1 control code point (e.g. U+009B == CSI)
+    elif b < 0x20 and s[i] notin {'\n', '\t', '\r'}:
+      inc i      # any other C0 byte, including a bare ESC not starting CSI/OSC
+    elif b == 0x7F:
+      inc i      # DEL
+    else:
+      result.add s[i]
+      inc i
+
+# ---------------------------------------------------------------------------
 # formatProgressLine — PURE (M4: memThrottled signal)
 # ---------------------------------------------------------------------------
 
@@ -530,9 +619,11 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
     # Issue #14: entrypoint paths (config/disk-origin) and protocol record
     # names/messages (test-binary-origin) are one-line identifiers headed for
     # a terminal or CI log — sanitize each at the render layer (the stdout
-    # sink must pass crisol's own ANSI color codes through).  The raw
-    # captured `output` tail is deliberately NOT sanitized: it is the
-    # binary's own output and may legitimately be colored.
+    # sink must pass crisol's own ANSI color codes through).  r49: the raw
+    # captured `output` tail is untrusted the same way — it goes through
+    # `sanitizeChildOutput` (below, at each of its render sites) rather than
+    # `sanitizeControlBytes`, which would also strip the binary's own SGR
+    # color codes; see that proc's doc comment for the unified policy.
     let epPath    = sanitizeControlBytes(string(r.ep.tp.display()))
 
     # C3: apply filter to the records used for display and counts.
@@ -624,19 +715,24 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
         # Suppress raw output when tag-filtering (tag filter only applies to
         # structured records; raw output is not tag-aware, so we omit it to
         # avoid confusion).
+        # r49: sanitize BEFORE truncating — an unterminated escape sequence
+        # left dangling right at the truncation boundary is exactly the
+        # malformed-input case `sanitizeChildOutput` already handles safely.
+        let sanitized = sanitizeChildOutput(r.output)
         let maxDisplay = 2000
-        let outText = if r.output.len > maxDisplay:
-                        r.output[0..<maxDisplay] & "\n[...truncated...]"
-                      else: r.output
+        let outText = if sanitized.len > maxDisplay:
+                        sanitized[0..<maxDisplay] & "\n[...truncated...]"
+                      else: sanitized
         for line in outText.splitLines:
           buf.add "           " & line & "\n"
 
     of oCompileFailed:
       if r.output.len > 0:
+        let sanitized = sanitizeChildOutput(r.output)  # r49
         let maxDisplay = 2000
-        let outText = if r.output.len > maxDisplay:
-                        r.output[0..<maxDisplay] & "\n[...truncated...]"
-                      else: r.output
+        let outText = if sanitized.len > maxDisplay:
+                        sanitized[0..<maxDisplay] & "\n[...truncated...]"
+                      else: sanitized
         buf.add "           " & col("Compiler output:", Ansi_Yellow, color) & "\n"
         for line in outText.splitLines:
           if line.len > 0:
@@ -666,14 +762,15 @@ proc render*(results: seq[EntrypointResult]; summary: Summary;
 
     of oSpawnError:
       if r.output.len > 0:
-        buf.add "           " & r.output & "\n"
+        buf.add "           " & sanitizeChildOutput(r.output) & "\n"  # r49
 
     of oCrashed:
       if r.output.len > 0:
+        let sanitized = sanitizeChildOutput(r.output)  # r49
         let maxDisplay = 1000
-        let outText = if r.output.len > maxDisplay:
-                        r.output[0..<maxDisplay] & "\n[...truncated...]"
-                      else: r.output
+        let outText = if sanitized.len > maxDisplay:
+                        sanitized[0..<maxDisplay] & "\n[...truncated...]"
+                      else: sanitized
         for line in outText.splitLines:
           if line.len > 0:
             buf.add "           " & line & "\n"

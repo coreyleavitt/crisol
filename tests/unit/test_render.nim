@@ -517,6 +517,51 @@ suite "render — issue #14: report bodies carry no raw control bytes":
     check "tests/unit/test_?x.nim  [g?r?[2Jp]  0123456789abcdef  recorded  (2 files)" in rendered
     check "  lib/de?p.nim" in rendered
 
+suite "render — r49: sanitizeChildOutput strips dangerous escapes, preserves SGR color":
+
+  test "CSI final byte 'm' (SGR) survives verbatim; every other CSI final byte is dropped whole":
+    check sanitizeChildOutput("\e[31mred\e[0m") == "\e[31mred\e[0m"          # color — kept
+    check sanitizeChildOutput("a\e[10;20Hb") == "ab"                          # cursor position — dropped
+    check sanitizeChildOutput("a\e[2Jb") == "ab"                              # screen erase — dropped
+    check sanitizeChildOutput("a\e[Ab") == "ab"                               # cursor up — dropped
+    check sanitizeChildOutput("a\e[?25lb") == "ab"                            # private-mode (cursor hide) — dropped
+
+  test "OSC (title-set etc.) is dropped whole, BEL- or ST-terminated":
+    check sanitizeChildOutput("a\e]0;evil title\ab") == "ab"                  # BEL-terminated
+    check sanitizeChildOutput("a\e]0;evil title\e\\b") == "ab"                # ST-terminated
+
+  test "an unterminated CSI/OSC at the end of a (possibly output-cap-truncated) buffer is dropped safely, never hangs or corrupts the rest":
+    # Truncated CSI: only the ESC '[' introducer is dropped (no final byte
+    # ever arrived to say whether this would have been safe SGR or a
+    # dangerous sequence) — the plain digits that follow are inert text and
+    # survive, same as any other bare printable characters.
+    check sanitizeChildOutput("plain\e[31") == "plain31"
+    check sanitizeChildOutput("plain\e]0;no term") == "plain"  # truncated OSC: dropped to end
+
+  test "the UTF-8 encoding of a C1 control code point (e.g. U+009B == CSI) is dropped, both bytes":
+    check sanitizeChildOutput("a" & "\xC2\x9B" & "b") == "ab"
+
+  test "other C0 control bytes and DEL are dropped; newline/tab/CR survive":
+    check sanitizeChildOutput("a\x01\x02b") == "ab"
+    check sanitizeChildOutput("a\x7fb") == "ab"
+    check sanitizeChildOutput("a\nb\tc\rd") == "a\nb\tc\rd"
+
+  test "combined pin: OSC title-set + cursor-jump + SGR color in one buffer — dangerous stripped, color preserved":
+    let raw = "\e]0;evil title\a" & "before " & "\e[10;20H" & "middle " &
+              "\e[31mRED\e[0m" & " after"
+    let cleaned = sanitizeChildOutput(raw)
+    check cleaned == "before middle \e[31mRED\e[0m after"
+
+  test "integration: an opaque failed binary's raw output is sanitized in the rendered report, color preserved":
+    let raw = "\e]0;evil title\a" & "line1\n" & "\e[10;20H" & "\e[31mFAIL\e[0m line2"
+    let results = @[failedResult("tests/unit/test_hostile.nim", output = raw)]
+    let rendered = render(results, summarize(results), noColorOpts())
+    check "\e]0;" notin rendered           # OSC gone
+    check "\e[10;20H" notin rendered       # cursor-jump gone
+    check "\e[31mFAIL\e[0m" in rendered    # SGR color survives
+    check "line1" in rendered
+    check "line2" in rendered
+
 suite "render — renderClosure":
 
   test "renders path, group, flagHash, closure files, and a distinct recorded/unrecorded marker":

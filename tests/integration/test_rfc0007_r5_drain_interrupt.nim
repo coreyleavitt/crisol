@@ -88,14 +88,18 @@
 ##         tests/integration/test_rfc0007_r5_drain_interrupt.nim
 
 when defined(posix):
-  import std/[options, os, posix, strutils, times, unittest]
+  import std/[options, os, posix, sets, strutils, times, unittest]
   import crisol/types
   import crisol/process/types as ptypes  # r58: Cause/KillReason field access
   import crisol/depgraph
   import crisol/closure   # SourceIndex, buildSourceIndex
   import crisol/ccprobe   # RunProc
   import crisol/runner
+  import crisol/cachedispatch  # r35: cacheEnabled/defaultCachePolicy/CacheSeams
+  import crisol/sandbox        # r35: resolveSandbox/hlIsolated
+  import crisol/resultcache    # r35: CachedResult
   import "../support/testep"
+  import "../support/helpers"  # r35: legacySeams
 
   proc fixtureDir(): string =
     let thisFile = currentSourcePath()
@@ -298,6 +302,146 @@ when defined(posix):
           # oKilled outcome, never oCompileFailed (which only the fabricated
           # timeout reason produces — see types.nim's `outcome`).
           check parts[3] == "killed"
+
+  suite "r35 — an interrupted RUN-phase final carries the same already-known facts as a live finalize":
+    ## code-review r35 (Low): the `handleChildExited` template's `shuttingDown`
+    ## branch (runner.nim, the `fkDone` case) fires `onResult` for an
+    ## interrupt-killed final WITHOUT ever running the retry/ledger/cache/
+    ## promotion machinery below it (§2 pins that: an interrupted final is
+    ## never ledgered or persisted). Pre-fix, it ALSO never stamped the
+    ## reporting-only facts that machinery would otherwise apply — leaving a
+    ## genuinely-consulted result reading as "cache not eligible"/"not
+    ## quarantined" purely because it happened to die mid-run rather than
+    ## finish. This suite proves those three facts (cacheDecision/inputHash,
+    ## attempts, quarantined) now survive onto the emitted victim.
+    ##
+    ## Strategy: build a REAL edRunFresh entrypoint (a first pass whose run
+    ## phase deliberately times out — the compile still succeeds, so the
+    ## closure records and the binary still promotes to the stable path,
+    ## exactly like a genuine timeout would in production) so the SECOND
+    ## pass's plan-time cache consult is the real `lookupAtPlan` path (a
+    ## cache MISS — cdmKeyMiss + a real inputHash), not the structural
+    ## `cdmNotEligible` a still-compiling entry gets. A background signaler
+    ## process (a second `fork()`, independent of the compile-hook trick the
+    ## r5(a)/r5(b) suites use above — an edRunFresh dispatch never compiles,
+    ## so there is no compile hook to fire from) delivers the real SIGINT a
+    ## fixed, generously-margined delay after the second pass starts, well
+    ## inside its `hang.nim` run child's lifetime.
+
+    test "SIGINT mid-run on an edRunFresh entry stamps the real plan-time cacheDecision/inputHash and quarantine overlay":
+      let tag        = "crisol_r35_" & $getpid()
+      let resultFile = getTempDir() / (tag & "_result")
+      if fileExists(resultFile): removeFile(resultFile)
+      defer: (try: removeFile(resultFile) except: discard)
+
+      let childPid = fork()
+      check childPid >= 0
+
+      if childPid == 0:
+        let root = getTempDir() / ("crisol_r35_root_" & $getpid())
+        createDir(root)
+        createDir(root / ".crisol")
+        writeFile(root / "hang.nim", "import os\nwhile true:\n  os.sleep(1000)\n")
+        let ep = testEp("hang.nim", group = "default", flags = @[])
+
+        var graph = initDepGraph("")
+        doAssert saveDepGraph(graph, Config(projectRoot: root, stateDir: ".crisol"))
+
+        let trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), "")
+
+        # Pass 1: a short run timeout so `hang.nim`'s run child is killed by
+        # the ordinary timeout path — compile succeeds either way, so the
+        # closure records and the binary promotes to the stable path exactly
+        # as decideExit's `promoteBinary` (oKilled is NOT in its exclusion
+        # set) already documents.
+        let cfg1 = Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
+                          timeoutSecs: 1, compileTimeoutSecs: 60,
+                          maxOutputBytes: 65_536, trackedRoots: trackedRoots)
+        let plan1 = plan(cfg1, @[ep], graph, nimVersion = "")
+        check plan1.entrypoints[0].edecision == edNeverBuilt
+        discard execute(plan1, config = cfg1, graph = graph, nimVersion = "",
+                        showProgress = false)
+
+        # Pass 2 must now see a stable binary + matching closure: edRunFresh.
+        let plan2 = plan(cfg1, @[ep], graph, nimVersion = "")
+        check plan2.entrypoints[0].edecision == edRunFresh
+
+        # A real, active cache — `load` always misses, so `lookupAtPlan`
+        # takes the genuine `cdmKeyMiss` branch (a real consult, a real
+        # inputHash) rather than any zero-value placeholder.
+        let cache = cacheEnabled(resolveSandbox(hlIsolated), defaultCachePolicy(),
+          legacySeams(
+            keyOf = proc(pep: PlannedEntrypoint): SoundnessKey =
+                     SoundnessKey("r35key-" & string(pep.ep.tp.display())),
+            load  = proc(key: SoundnessKey): Option[CachedResult] = none(CachedResult),
+            store = proc(key: SoundnessKey; res: CachedResult): bool = true,
+          ))
+
+        # B3 whole-binary quarantine, keyed directly off this entrypoint's
+        # own TrackedPath — the same identity `isQuarantined` matches against.
+        let cfg2 = Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
+                          timeoutSecs: 30, compileTimeoutSecs: 60,
+                          maxOutputBytes: 65_536, trackedRoots: trackedRoots,
+                          quarantineTp: [ep.tp].toHashSet)
+
+        var victim: Option[EntrypointResult]
+        proc onRes(r: EntrypointResult) =
+          if string(r.ep.tp.display()).endsWith("hang.nim"):
+            victim = some(r)
+
+        # Independent signaler: an edRunFresh dispatch never compiles, so
+        # there is no compile-success hook to fire the interrupt from (unlike
+        # r5(a)/r5(b) above) — a second, unrelated `fork()` sleeps past the
+        # point pass 2's single run child is genuinely live, then signals
+        # THIS process (captured before forking) directly.
+        let selfPid   = posix.getpid()
+        let sigPid    = fork()
+        check sigPid >= 0
+        if sigPid == 0:
+          os.sleep(800)
+          discard posix.kill(selfPid, cint(SIGINT))
+          quit(0)
+
+        let execReport = execute(plan2, config = cfg2, graph = graph, nimVersion = "",
+                                 onResult = onRes, showProgress = false,
+                                 progressIntervalMs = 30_000, installSignals = true,
+                                 cache = cache)
+        # Reap the signaler so it doesn't linger as a zombie past this quit(0).
+        var wstatus: cint = 0
+        discard waitpid(sigPid, wstatus, 0)
+
+        let interrupted = execReport.interrupted
+        let hasVictim   = victim.isSome
+        let cacheOk     = hasVictim and victim.get.cacheDecision == cdmKeyMiss
+        let hashOk      = hasVictim and victim.get.inputHash.len > 0
+        let attemptsOk  = hasVictim and victim.get.attempts == 1
+        let quarOk      = hasVictim and victim.get.quarantined
+
+        writeFile(resultFile, $interrupted & "," & $hasVictim & "," & $cacheOk &
+                              "," & $hashOk & "," & $attemptsOk & "," & $quarOk)
+        removeDir(root)
+        quit(0)
+
+      let raw = waitChildResult(childPid, resultFile, 30.0)
+      check raw.len > 0
+      if raw.len > 0:
+        let parts = raw.split(',')
+        check parts.len == 6
+        if parts.len == 6:
+          check parts[0] == "true"   # the run really was interrupted
+          check parts[1] == "true"   # the victim was actually emitted (never ledgered — just observed via onResult)
+          # r35(a): the real plan-time cacheDecision/inputHash survive onto
+          # the interrupted final — never left at the cdmNotEligible/""
+          # not-consulted zero value despite the genuine consult above.
+          check parts[2] == "true"
+          check parts[3] == "true"
+          # r35(b): the real attempt number (1 — no retry involved here)
+          # survives onto the interrupted final.
+          check parts[4] == "true"
+          # r35(c): the quarantine overlay is applied before onResult fires,
+          # exactly like the live-finalize path.
+          check parts[5] == "true"
+
 else:
   when isMainModule:
     echo "CRISOL-SKIP: tests/integration/test_rfc0007_r5_drain_interrupt.nim"

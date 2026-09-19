@@ -16,6 +16,8 @@
 
 import std/[os, unittest]
 import crisol/api
+import crisol/types            # r41: CacheDecision/cvOk
+import crisol/cachetelemetry   # r41: notConsultedDecisions — documents the wire-level gap
 
 import "../support/helpers"
 
@@ -147,6 +149,64 @@ suite "B1 — fail_always with default retries=0: exactly 1 attempt":
       check rr.results[0].outcome  == oFailed
       check rr.results[0].attempts == 1   # no retry
       check rr.summary.failed == 1
+
+# ---------------------------------------------------------------------------
+# Suite 6: r41 — a retried compiling entry's finalizing attempt never itself
+# re-consults; the runner-side cache fields it stamps must stay honest, and
+# the residual wire-level ambiguity this pins is a documented BLOCKER (the
+# coherent close requires jsonout.nim/cachetelemetry.nim, owned elsewhere).
+# ---------------------------------------------------------------------------
+
+suite "r41 — a retried compiling entry stamps honest (not fabricated) cache fields":
+
+  test "flaky_once passes on attempt 2: inputHash/cacheLookup stay at their honest zero value, never a stale/fabricated one":
+    withTempProject:
+      # Caching is ACTIVE by default (api.RunOptions.noCache defaults false).
+      let src = fixtureDir / "flaky_once.nim"
+      let dst = projectRoot / "tests" / "unit" / "test_flaky_once.nim"
+      copyFile(src, dst)
+
+      let rr = runTests(baseOpts(projectRoot, retries = 1))
+      check rr.status == rsOk
+      require rr.results.len == 1
+      check rr.results[0].attempts == 2   # failed attempt 1, passed attempt 2
+
+      # SO3 (runner.nim finalizeSlot): `consultPostCompile` only runs on
+      # `attempt == 1` — attempt 1's real consult is discarded (never copied
+      # into the reporting arrays) because attempt 1 was a RETRY, not a
+      # finalize; attempt 2 (the one that actually finalizes) never consults
+      # at all. So the honest state for the FINALIZING attempt is "not
+      # really consulted": inputHash stays "", and (r41 fix, runner.nim's
+      # `handleChildExited`) `cacheLookup` is only ever stamped from the
+      # `lookups[]` array when `inputHash` backs it — here it does not, so
+      # `cacheLookup` is left at its Nim zero value `cvOk`, never a
+      # leftover/fabricated verdict.
+      check rr.results[0].inputHash == ""
+      check rr.results[0].cacheLookup == cvOk
+      # `cacheDecision` still honestly reports WHY this pass wasn't cached
+      # (cdmFlaky: RFC-0004 F3's own M8 distinction, real/intended
+      # information this fix must NOT destroy) — the runner-side fields are
+      # each individually honest.
+      check rr.results[0].cacheDecision == cdmFlaky
+
+      # r41 BLOCKER (documented, not fixed here): `cdmFlaky` is NOT in
+      # `notConsultedDecisions` (jsonout.nim's presence gate is keyed
+      # SOLELY on `cacheDecision` membership in that set — see its own
+      # comment, "cacheLookup: PRESENT only when the cache was actually
+      # consulted (cacheDecision not in notConsultedDecisions)"), so the
+      # `--json` wire output for THIS exact result still emits a bare
+      # `"cacheLookup": "ok"` (cvOk's wire string) next to `"cacheDecision":
+      # "flaky"` — indistinguishable on the wire from a genuine hit, even
+      # though runner.nim now provably never fabricates the in-memory
+      # value. This assertion pins the ROOT CAUSE precisely: cdmFlaky (and,
+      # by the same reasoning, a retry-exhausted cdmKeyMiss) can be reached
+      # with zero backing consult, which `notConsultedDecisions`'s three-
+      # member set does not account for. Closing this for real means either
+      # widening `notConsultedDecisions` (cachetelemetry.nim) or gating
+      # jsonout's presence check on more than `cacheDecision` alone
+      # (jsonout.nim) — both outside runner.nim/render.nim's remit; see the
+      # r41 blocker note in this fix's handoff.
+      check cdmFlaky notin cachetelemetry.notConsultedDecisions
 
 when isMainModule:
   echo "test_B1_retry done"
