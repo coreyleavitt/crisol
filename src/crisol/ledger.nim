@@ -49,7 +49,7 @@
 ## - Header-version mismatch: whole shard discarded with a warning (consistent
 ##   with resultcache whole-file discard).
 
-import std/[algorithm, json, os, sequtils, sets, strutils, tables, times]
+import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, times]
 import crisol/types
 import crisol/ioutils
 import crisol/outcomestrings  # for passedOutcomeString
@@ -106,6 +106,30 @@ type
     shardPath*: string   ## absolute path to this process's shard file
     fd*:        cint     ## open file descriptor (O_APPEND | O_CREAT | O_WRONLY)
     closed*:    bool
+
+# ---------------------------------------------------------------------------
+# rfc-0007 w4: the ONE site the maxRssBytes/rssMechanism preference is
+# decided — pure, unit-testable, called by runner.nim's appendAttemptRow.
+# ---------------------------------------------------------------------------
+
+proc ledgerRssObservation*(memoryPeak: Option[int64];
+                           wait4: tuple[bytes: int64, mechanism: string]):
+                           tuple[bytes: int64, mechanism: string] =
+  ## cgroup `memory.peak` (leaf-wide, sees grandchildren wait4's
+  ## single-process `ru_maxrss` misses) supersedes wait4 EXPLICITLY, by
+  ## writing its own tagged mechanism string — never silently (the
+  ## `rssMechanism` field's own doc comment above, rfc-0007 A5 §7).
+  ## `some(0)` is a REAL observation (a leaf that genuinely peaked at 0
+  ## bytes) and still wins + tags "memory.peak" — `isSome` is the only
+  ## test, never "is the value truthy". Falls back to `wait4` verbatim
+  ## (already ("", 0) when the run phase had no rusage to report — see
+  ## `wait4MaxRss`'s own doc comment, runner.nim) when `memoryPeak` is
+  ## `none` — off the cgroup tier, or when the leaf's `memory.peak` read
+  ## itself failed (`cgroupLeafMemoryPeak`, process/cgroup.nim).
+  if memoryPeak.isSome:
+    (bytes: memoryPeak.get, mechanism: "memory.peak")
+  else:
+    wait4
 
 # ---------------------------------------------------------------------------
 # bootId — read once, degrade cleanly if unavailable

@@ -14,8 +14,12 @@
 ##   7. concurrent-invocation (no torn rows): two Ledger handles appending
 ##      interleaved rows both survive intact — the per-shard design precludes
 ##      cross-shard contention.
+##   8. rfc-0007 w4: `ledgerRssObservation` — the pure preference helper
+##      deciding maxRssBytes/rssMechanism between cgroup memory.peak (wins,
+##      tagged "memory.peak") and wait4 (fallback, tagged "wait4"), full
+##      truth table.
 
-import std/[os, sequtils, strutils]
+import std/[options, os, sequtils, strutils]
 import crisol/types
 import crisol/ledger
 
@@ -266,3 +270,37 @@ block test_concurrent_no_torn_rows:
   # Verify no cross-contamination: identA rows have identA, identB rows have identB.
   for r in rowsA: assert r.identity == identA, "concurrent: cross-contamination in A"
   for r in rowsB: assert r.identity == identB, "concurrent: cross-contamination in B"
+
+# ---------------------------------------------------------------------------
+# 8. rfc-0007 w4 — ledgerRssObservation: the pure maxRssBytes/rssMechanism
+#    preference helper, full truth table (memory.peak wins when present,
+#    tagged explicitly; wait4 falls back, tagged explicitly; neither ->
+#    honest 0/"" — never a fabricated value, same house rule as every
+#    other Evidence-adjacent field).
+# ---------------------------------------------------------------------------
+
+block test_rss_observation_memory_peak_wins:
+  let obs = ledgerRssObservation(some(999'i64), (bytes: 111'i64, mechanism: "wait4"))
+  assert obs.bytes == 999, "memory.peak present: bytes must be the peak value, not wait4's"
+  assert obs.mechanism == "memory.peak",
+    "memory.peak present: mechanism must be tagged \"memory.peak\", never silently reused"
+
+block test_rss_observation_wait4_fallback:
+  let obs = ledgerRssObservation(none(int64), (bytes: 222'i64, mechanism: "wait4"))
+  assert obs.bytes == 222, "no memory.peak: must fall back to wait4's bytes"
+  assert obs.mechanism == "wait4", "no memory.peak: must fall back to wait4's tag"
+
+block test_rss_observation_neither_present:
+  let obs = ledgerRssObservation(none(int64), (bytes: 0'i64, mechanism: ""))
+  assert obs.bytes == 0, "neither mechanism observed: bytes must be the honest 0, never fabricated"
+  assert obs.mechanism == "", "neither mechanism observed: mechanism must be the honest \"\" sentinel"
+
+block test_rss_observation_memory_peak_zero_still_wins:
+  ## A real leaf that genuinely peaked at 0 bytes RSS (degenerate but
+  ## possible — e.g. a child that forked and exited before ever touching
+  ## memory) is still a REAL observation, distinct from "no observation at
+  ## all": `some(0)` must win and tag "memory.peak", never silently fall
+  ## through to wait4 just because the peak value happens to be zero.
+  let obs = ledgerRssObservation(some(0'i64), (bytes: 333'i64, mechanism: "wait4"))
+  assert obs.bytes == 0, "some(0) is a real peak observation and must be used verbatim"
+  assert obs.mechanism == "memory.peak", "some(0) must still tag \"memory.peak\", not fall back"

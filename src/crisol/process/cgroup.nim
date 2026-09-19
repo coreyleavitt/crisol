@@ -1,8 +1,9 @@
 ## process/cgroup.nim — rfc-0007 B3/§4 delegated cgroup-v2 leaf plumbing,
 ## split out of posixcore.nim (code-review finding r27): topology
 ## (`ownCgroupV2Path`/`cgroupSiblingParent`), leaf lifecycle
-## (create/join-is-the-child's-job/kill/remove), and the two per-leaf
-## readers (`cgroup.procs` survivors, `memory.events` oom_kill).
+## (create/join-is-the-child's-job/kill/remove), and the three per-leaf
+## readers (`cgroup.procs` survivors, `memory.events` oom_kill, and —
+## rfc-0007 w4 — `memory.peak` leaf-wide peak RSS).
 ##
 ## Linux-only (cgroup v2 does not exist on Darwin) — every proc below is
 ## `when defined(linux)`-gated, with an inert `else` stub only where a
@@ -16,7 +17,7 @@
 ## injection and unit tests can drive them directly — see each proc's own
 ## doc comment for the specific test that needs it.
 
-import std/[os, posix, strutils]
+import std/[options, os, posix, strutils]
 import crisol/process/types
 import crisol/process/procscan
 
@@ -167,6 +168,24 @@ when defined(linux):
     except CatchableError:
       discard
     false
+
+  proc cgroupLeafMemoryPeak*(leafPath: string): Option[int64] =
+    ## rfc-0007 w4: `memory.peak` — the leaf-wide kernel-maintained peak RSS
+    ## (unlike `memory.events`, a single unadorned integer, not `key value`
+    ## lines) — read BEFORE any teardown write (killCgroupLeaf/
+    ## removeCgroupLeafBounded), same placement rule as `cgroupLeafOomKill`
+    ## right above: a real peak fact must never race the leaf's own
+    ## removal. `none` on ANY failure — file absent (pre-5.19 kernel: the
+    ## file itself does not exist; caps.probeCgroupV2's `memoryPeak` bit
+    ## already reports this honestly at the capabilities level), unreadable,
+    ## or malformed content — never a fabricated 0 (the same house rule
+    ## `ReapReport.memoryPeakBytes`'s own doc comment states).
+    try:
+      let raw = readFile(leafPath / "memory.peak").strip()
+      try: return some(parseBiggestInt(raw))
+      except ValueError: return none(int64)
+    except CatchableError:
+      return none(int64)
 
   proc removeCgroupLeafBounded*(leafPath: string): bool =
     ## Never leak leaves (rfc-0007 B3), but NEVER an unbounded blocking

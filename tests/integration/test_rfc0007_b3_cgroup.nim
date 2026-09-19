@@ -18,7 +18,14 @@
 ##
 ## Covered here (RFC checklist item 545 / B3-brief.md "Tests"):
 ##   1. cgroup tier conformance: killDomain=kdsCgroup, tree=toComplete, no
-##      escapees for a clean pass_always run.
+##      escapees for a clean pass_always run. rfc-0007 w4: this suite also
+##      asserts `report.memoryPeakBytes.isSome` and `> 0` — the real
+##      kernel-maintained `memory.peak` reap-time read against a genuine
+##      delegated leaf (the ledger-row-level proof that this producer
+##      reaches `rssMechanism == "memory.peak"` lives in
+##      tests/integration/test_rfc0007_a5_ledger_maxrss.nim's cgroup-tier
+##      suite instead, since that needs the full runner/ledger pipeline
+##      this file deliberately bypasses — see the module header above).
 ##   2. Fault injection (load-bearing): a green probe + a leaf that fails
 ##      to materialize for ONE spawn ⇒ that spawn's killDomain honestly
 ##      degrades to the pre-B3 achieved domain (kdsProcessGroupSubreaper on
@@ -155,6 +162,17 @@ when defined(linux):
         check report.killDomain == kdsCgroup
         check report.tree == toComplete
         check report.escapees.len == 0
+        # rfc-0007 w4: real kernel-maintained `memory.peak` readback —
+        # `some`, never `none`, on the ONE tier where the leaf (and
+        # therefore the file) genuinely exists; a real process that just
+        # ran has a nonzero peak RSS. Proves the reap-time read
+        # (posixcore.reapCore's cgroup arm -> cgroupLeafMemoryPeak) against
+        # a REAL delegated leaf — the unit-level fake-leaf coverage
+        # (tests/unit/test_rfc0007_w4_cgroup_memory_peak.nim) only proves
+        # the plain-text-file parsing, not that production actually calls
+        # it on this tier.
+        check report.memoryPeakBytes.isSome
+        check report.memoryPeakBytes.get > 0
         removeFile(outPath)
 
   # ---------------------------------------------------------------------------

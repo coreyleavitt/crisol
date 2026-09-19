@@ -463,6 +463,20 @@ type
                                  ## END_OF_PROCESS_TIME => some(lkCpu)).
                                  ## Always none on POSIX (default, zero value
                                  ## — the same house rule).
+    memoryPeakBytes*: Option[int64]  ## rfc-0007 w4: the cgroup tier's own
+                                 ## `memory.peak` readback — the leaf-wide
+                                 ## kernel-maintained peak RSS (sees
+                                 ## grandchildren wait4's single-process
+                                 ## `ru_maxrss` misses). FORENSICS only —
+                                 ## the ledger's tagged-successor producer
+                                 ## for `maxRssBytes`/`rssMechanism` (see
+                                 ## ledger.nim); never consumed by admission
+                                 ## (memprobe's sampled group-sum stays the
+                                 ## admission quantity, unchanged). `none`
+                                 ## off the cgroup tier, or when the leaf's
+                                 ## `memory.peak` file could not be read —
+                                 ## same house rule as every other Evidence
+                                 ## field: absent, never fabricated as 0.
 
   Capabilities* = object      ## §4 — probed once, memoised, reported. A flat
     pidfd*: bool               ## object of per-mechanism booleans;

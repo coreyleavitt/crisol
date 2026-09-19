@@ -304,12 +304,16 @@ proc wait4MaxRss(res: EntrypointResult): tuple[bytes: int64; mechanism: string] 
   ## spawn failure, or a skipped phase) or the platform/attempt genuinely
   ## had no rusage to report — never a fabricated non-zero value.
   ##
-  ## rfc-0007 B3 note: cgroup `memory.peak` is a tree-accounted figure
+  ## rfc-0007 B3/w4 note: cgroup `memory.peak` is a tree-accounted figure
   ## wait4 (single-reaped-process only) cannot produce, and is the
-  ## documented FUTURE successor to this column — but only additively (a
-  ## new, separately-tagged column), never by silently replacing this
-  ## wait4 quantity or its "wait4" mechanism tag. Not wired yet; this proc
-  ## is unchanged and unconditional across every tier.
+  ## documented successor to this column — but only additively (a new,
+  ## separately-tagged column), never by silently replacing this wait4
+  ## quantity or its "wait4" mechanism tag. w4 wires the producer
+  ## (`slots[idx].memoryPeakBytes`, runner.nim's finalizeSlot) and the
+  ## preference (`ledgerRssObservation`, ledger.nim) at `appendAttemptRow`'s
+  ## call site below; this proc itself stays unchanged and unconditional
+  ## across every tier — it is still the honest wait4-only observation,
+  ## exactly what `ledgerRssObservation`'s `wait4` fallback argument needs.
   if res.run.kind in {ptypes.pkRan, ptypes.pkCached} and res.run.res.rusage.isSome:
     (res.run.res.rusage.get.maxRssBytes, "wait4")
   else:
@@ -318,7 +322,8 @@ proc wait4MaxRss(res: EntrypointResult): tuple[bytes: int64; mechanism: string] 
 proc appendAttemptRow(led: var Ledger; ep: Entrypoint; attemptNum: int;
                       res: EntrypointResult; inputHash: string;
                       peakRssBytes: int64 = 0;
-                      roots: TrackedRoots = TrackedRoots()) =
+                      roots: TrackedRoots = TrackedRoots();
+                      memoryPeakBytes: Option[int64] = none(int64)) =
   ## Append one LedgerRow for a completed live attempt.
   ## Converts durationMs→durationUs; peakRssBytes is the per-slot running max
   ## sampled across poll ticks while the run phase was live (C5).
@@ -326,8 +331,17 @@ proc appendAttemptRow(led: var Ledger; ep: Entrypoint; attemptNum: int;
   ## `roots` (RFC-0009 A5b-ii): additive, defaults to the zero `TrackedRoots`
   ## — harmless for every entrypoint (always tag-0); the sole caller
   ## threads `config.trackedRoots`.
+  ##
+  ## `memoryPeakBytes` (rfc-0007 w4): additive, defaults to `none` (every
+  ## pre-w4 caller — there is only the one production call site below, but
+  ## the default keeps this proc callable without it, same convention as
+  ## `roots`). The sole caller threads `slots[idx].memoryPeakBytes`,
+  ## captured off this attempt's own reap (finalizeSlot). Combined with
+  ## `wait4MaxRss(res)` through `ledgerRssObservation` (ledger.nim) — the
+  ## ONE site the maxRssBytes/rssMechanism preference is decided — this is
+  ## purely a threading site, not a decision site.
   let iKey = identityKey(ep, roots)
-  let (maxRss, mechanism) = wait4MaxRss(res)  # rfc-0007 A5
+  let (maxRss, mechanism) = ledgerRssObservation(memoryPeakBytes, wait4MaxRss(res))  # rfc-0007 A5/w4
   let row = LedgerRow(
     identity:   iKey,
     timestamp:  int64(epochTime() * 1_000_000),  # unix epoch microseconds
@@ -336,8 +350,13 @@ proc appendAttemptRow(led: var Ledger; ep: Entrypoint; attemptNum: int;
     attempt:    attemptNum,
     durationUs: res.durationMs * 1000,
     rssBytes:   peakRssBytes,  # C5: peak RSS bytes for this attempt
-    maxRssBytes:  maxRss,      # rfc-0007 A5: wait4's per-process max, mechanism-tagged
+    maxRssBytes:  maxRss,      # rfc-0007 A5/w4: wait4 OR memory.peak, mechanism-tagged
     rssMechanism: mechanism,
+    # rfc-0007 w4: no rowVersion bump — additive NDJSON, same as A5's own
+    # maxRssBytes/rssMechanism columns (ledger.nim header comment / A5
+    # ledger.LedgerRow doc). `rssMechanism` merely gains a second possible
+    # tag value ("memory.peak"), which a reader already treats as an
+    # opaque string — no wire-shape change at all.
     rowVersion: currentRowVersion,
   )
   append(led, row)
@@ -414,6 +433,18 @@ type
                                    # the slot is claimed (before compile or run spawned).
                                    # Updated each poll tick for run-phase (spRunning) slots.
                                    # Read at finalize; threaded into ledger row + EntrypointResult.
+    memoryPeakBytes: Option[int64] # rfc-0007 w4: `report.memoryPeakBytes` off
+                                   # the run phase's own reap, captured verbatim
+                                   # in finalizeSlot's spRunning arm (the ONE
+                                   # place `report`, the raw ReapReport, is in
+                                   # scope) — mirrors `peakRssBytes` above's
+                                   # threading pattern (Slot field -> read once
+                                   # more at the ledger-append call site) rather
+                                   # than riding ProcessResult/Evidence, which
+                                   # the rfc-0007 §2 pin does not extend to this
+                                   # forensics-only quantity. `none` when this
+                                   # slot never ran on the cgroup tier (default;
+                                   # reset at every claim).
     compileProcRes:  Option[ptypes.ProcessResult]  # rfc-0007 A1b: the compile phase's
                                    # captured Exit/Cause/rusage, set the moment a
                                    # this-run compile is reaped successfully so the
@@ -1012,6 +1043,12 @@ proc finalizeSlot(
         res = classifyRunResult(pep.ep, output, elapsed, slots[idx].compileSkipped)
     let runRes = toProcessResult(report, slots[idx].spec.limits, elapsed * 1000,
                                  slots[idx].spec.level)  # rfc-0007 A6b
+    # rfc-0007 w4: captured HERE, straight off this run phase's own raw
+    # `report` — the one place it is in scope in this proc — rather than
+    # riding `runRes`/`ProcessResult` (which the §2 pin does not extend to
+    # this forensics-only quantity, unlike `rusage`). Read at the ledger-
+    # append call site below `slots[idx].peakRssBytes`'s own precedent.
+    slots[idx].memoryPeakBytes = report.memoryPeakBytes
     cleanupSlotTmp(slots[idx])
     res.compile = compilePhase
     res.run     = ptypes.Phase(kind: ptypes.pkRan, res: runRes)
@@ -1274,16 +1311,18 @@ proc claimSlot(
   ## downstream reader happens to gate on `compiledThisRun` first, an
   ## accidental-not-structural safety this constructor now makes explicit.
   ##
-  ## `attempt`/`peakRssBytes` are part of the claim (not the dispatch
-  ## loop's own side channel): every claim starts attempt-numbered and with
-  ## a freshly-zeroed RSS peak, by construction. `token` is deliberately
-  ## left at its zero value — S3's admission token is stamped by the
+  ## `attempt`/`peakRssBytes`/`memoryPeakBytes` are part of the claim (not
+  ## the dispatch loop's own side channel): every claim starts
+  ## attempt-numbered and with a freshly-zeroed RSS peak (and no cgroup
+  ## memory.peak observation yet — rfc-0007 w4), by construction. `token` is
+  ## deliberately left at its zero value — S3's admission token is stamped by the
   ## dispatch loop only once the spawn this claim represents has actually
   ## succeeded (see execute()'s fill pass), same as before this refactor.
   result.state           = ssLive
   result.pepIdx          = pepIdx
   result.attempt         = attempt
   result.peakRssBytes    = 0
+  result.memoryPeakBytes = none(int64)  # rfc-0007 w4
   result.runTimeoutMs    = runTimeoutMs
   result.tmpDir          = tmpDir
   result.testScratchDir  = testScratchDir
@@ -2263,7 +2302,8 @@ proc execute*(
             if ledgerActive and recordLedger:
               appendAttemptRow(led, p.entrypoints[completedIdx].ep, slotAttempt,
                                results[completedIdx], inputHashes[completedIdx],
-                               slots[idx].peakRssBytes, config.trackedRoots)
+                               slots[idx].peakRssBytes, config.trackedRoots,
+                               slots[idx].memoryPeakBytes)  # rfc-0007 w4
 
             # A6/A7: the store gate itself (`shouldStore`) is pure and cheap
             # — call it unconditionally so `decideExit` always has a real

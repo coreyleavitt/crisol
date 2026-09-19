@@ -1901,6 +1901,10 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
 
   var escapees: seq[ProcSnapshot] = @[]
   var memOom = false
+  var memoryPeak = none(int64)  # rfc-0007 w4: `none` off the cgroup tier,
+    ## or when the leaf's `memory.peak` file was absent/unreadable —
+    ## `ReapReport.memoryPeakBytes`'s own doc comment states the same
+    ## house rule (absent, never fabricated as 0).
   var usedCgroup = false
   var cgroupKillWriteFailed = entry.cgroupKillWriteFailed   # rfc-0007 r10:
     ## carry forward a write failure already latched by an earlier
@@ -1916,14 +1920,19 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
       # `cgroup.cgroupLeafSurvivors`'s doc comment for why this needs no
       # `claimOrphans` guard (leaf-scoped membership cannot cross-attribute
       # between slots the way a global pgid/ppid scan can). Read BEFORE
-      # any teardown write below — `memory.events` must not race the
-      # leaf's own removal. (`memory.peak` is intentionally NOT read into
-      # `rusage.maxRssBytes` here — the A5 ledger's wait4-sourced
-      # maxRssBytes/rssMechanism quantity is never replaced, only ever
-      # additively superseded by a NEW tagged column; that column is a
-      # future increment, out of scope for this producer.)
+      # any teardown write below — `memory.events`/`memory.peak` must not
+      # race the leaf's own removal. (rfc-0007 w4: `memory.peak` IS now
+      # read, into `ReapReport.memoryPeakBytes` — a NEW, additively tagged
+      # quantity, never folded into `rusage.maxRssBytes`. That field stays
+      # exactly what wait4 reaped, untouched; `memoryPeakBytes` is the
+      # leaf-wide kernel peak — forensics only, consumed solely by the
+      # ledger's `maxRssBytes`/`rssMechanism` preference
+      # (`ledgerRssObservation`, ledger.nim), which supersedes wait4 by
+      # EXPLICIT tag when this is `some`. Admission is unaffected — memprobe's
+      # sampled group-sum stays the admission quantity, §7 unchanged.)
       escapees = cgroupLeafSurvivors(entry.cgroupLeaf)
       memOom = cgroupLeafOomKill(entry.cgroupLeaf)
+      memoryPeak = cgroupLeafMemoryPeak(entry.cgroupLeaf)
       # Atomic, airtight teardown: kills anything still resident (a setsid
       # escapee that outlived its own leader) in one write. Safe on an
       # already-empty leaf (the normal-exit case) — cgroup.kill on
@@ -2067,6 +2076,7 @@ proc reapCore*(core: var PosixCore; id: ChildId): ReapReport =
     escapees: escapees,
     cooperativeUnavailable: false,   # POSIX: SIGTERM is always deliverable (§3)
     memoryOomKill: memOom,
+    memoryPeakBytes: memoryPeak,   # rfc-0007 w4
   )
   when defined(linux):
     # rfc-0007 B2: reap is the ONLY place a ChildId is consumed (§1) — so it
@@ -2109,6 +2119,7 @@ when defined(linux):
   export cgroup.createCgroupLeaf
   export cgroup.killCgroupLeaf
   export cgroup.cgroupLeafSurvivors
+  export cgroup.cgroupLeafMemoryPeak
 export caps.cachedCapabilities
 export caps.probeCapabilities
 export caps.probeCgroupV2
