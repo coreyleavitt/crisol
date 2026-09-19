@@ -42,10 +42,32 @@
 ## permanently consumed and unprotected a genuine pre-existing host
 ## child's zombie. `preExistingSweepAction` keeps "unreadable" and
 ## "confirmed mismatch" as distinct outcomes so the sweep call site can
-## skip-without-pruning on the former — see its own doc comment
-## (posixcore.nim) for why the escapee-KILL call site
-## (`discoverAndReapEscapees`) does not need this distinction and is left
-## on the bare predicate.
+## skip-without-pruning on the former.
+##
+## r72's own doc comment originally claimed the escapee-KILL call site
+## (`discoverAndReapEscapees`) did NOT need this distinction and was
+## correctly left on the bare `isPreExistingIdentity` predicate — rfc-0007
+## code-review r81 found that claim false: that call site ALSO
+## unconditionally pruned on an unreadable starttime, permanently losing
+## protection off one transient read race, the identical hazard this
+## suite already pins for `sweepAdoptedOrphan` below. r81 re-routes
+## `discoverAndReapEscapees`'s own prune decision through THIS SAME
+## `preExistingSweepAction` predicate (see posixcore.nim's call site) —
+## the `peSweepSkipUnreadable` row already pinned below now also proves
+## that call site's fix; no separate suite is needed for it, since both
+## call sites now share one predicate and one truth table.
+##
+## rfc-0007 code-review r81 additionally extends this file with a THIRD
+## suite pinning `escapeeKillIdentityConfirmed` — the pure pre-kill
+## identity check `discoverAndReapEscapees` uses immediately before ever
+## signalling a candidate escapee. Pre-r81, that call site compared
+## `curStarttime != info.starttime` directly: when the /proc walk's OWN
+## starttime read had ALREADY failed (`info.starttime == -1`) and the
+## pre-kill re-read ALSO failed (`curStarttime == -1`), `-1 == -1` passed
+## as a "match" and the process was killed with no starttime evidence at
+## all — the exact guarantee this identity discipline exists to provide.
+## `escapeeKillIdentityConfirmed` additionally requires the snapshot
+## starttime to be genuinely readable (`>= 0`).
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
@@ -118,22 +140,29 @@ when defined(posix):
     test "r72 (THE fix): pid in snapshot but starttime is UNREADABLE (-1, a transient /proc read failure) -> skip WITHOUT consuming or pruning":
       ## THE regression this finding closes. `isPreExistingIdentity` alone
       ## degrades an unreadable starttime to "not confirmed pre-existing"
-      ## (correct for the escapee-KILL path, which re-verifies via
-      ## pidfd_open before ever killing anything) — but pre-fix,
-      ## `sweepAdoptedOrphan` treated that same "not confirmed" result as
-      ## a green light to fall through into the `pid in preExisting` prune
-      ## branch and then REAP (wait4) the zombie: a transient EMFILE-class
-      ## read failure (realistic under --jobs fd pressure, per
-      ## `initPosixCore`'s own doc) silently consumed a pre-existing HOST
-      ## child's zombie and permanently pruned its protection — a single
-      ## bad read, not a real pid-reuse mismatch, was enough to do this.
-      ## The fix: pid-present + starttime-unreadable is its own outcome,
-      ## distinct from both "protect" (identity confirmed) and
-      ## "prune-stale" (identity confirmed MISMATCHED) — skip this attempt
-      ## with NO consume and NO prune, so a later retry (the WNOWAIT sweep
-      ## keeps re-finding the same unconsumed zombie every tick) gets a
-      ## fair, freshly-read identity check; genuine pid reuse still prunes
-      ## correctly the moment a READABLE mismatched starttime shows up.
+      ## — pre-fix, `sweepAdoptedOrphan` treated that "not confirmed"
+      ## result as a green light to fall through into the
+      ## `pid in preExisting` prune branch and then REAP (wait4) the
+      ## zombie: a transient EMFILE-class read failure (realistic under
+      ## --jobs fd pressure, per `initPosixCore`'s own doc) silently
+      ## consumed a pre-existing HOST child's zombie and permanently
+      ## pruned its protection — a single bad read, not a real pid-reuse
+      ## mismatch, was enough to do this. The fix: pid-present +
+      ## starttime-unreadable is its own outcome, distinct from both
+      ## "protect" (identity confirmed) and "prune-stale" (identity
+      ## confirmed MISMATCHED) — skip this attempt with NO consume and NO
+      ## prune, so a later retry (the WNOWAIT sweep keeps re-finding the
+      ## same unconsumed zombie every tick) gets a fair, freshly-read
+      ## identity check; genuine pid reuse still prunes correctly the
+      ## moment a READABLE mismatched starttime shows up.
+      ##
+      ## rfc-0007 code-review r81: this row now ALSO pins
+      ## `discoverAndReapEscapees`'s own prune decision (posixcore.nim),
+      ## which r81 re-routed from a direct `isPreExistingIdentity` call
+      ## (which had exactly the same permanent-prune-on-unreadable-read
+      ## bug this suite already caught here for `sweepAdoptedOrphan`) onto
+      ## this same `preExistingSweepAction` predicate — see the call
+      ## site's own comment for the full finding.
       var snap: Table[int, int64]
       snap[100] = 555_555
       check preExistingSweepAction(snap, 100, -1) == peSweepSkipUnreadable
@@ -142,6 +171,39 @@ when defined(posix):
       var snap: Table[int, int64]
       snap[100] = 555_555
       check preExistingSweepAction(snap, 200, -1) == peSweepNotTracked
+
+  suite "rfc-0007 r81 — escapeeKillIdentityConfirmed: discoverAndReapEscapees's pre-kill identity check":
+
+    test "same, genuinely readable starttime on both reads -> confirmed (the true-positive case)":
+      check escapeeKillIdentityConfirmed(555_555, 555_555) == true
+
+    test "different starttimes (a genuine mismatch -- pid reused or vanished) -> NOT confirmed":
+      check escapeeKillIdentityConfirmed(555_555, 999_999) == false
+
+    test "r81 (THE fix): BOTH reads unreadable (-1 == -1) -> NOT confirmed -- the regression this finding closes":
+      ## Pre-fix, the call site compared `curStarttime != info.starttime`
+      ## directly: two independently-failed reads compare EQUAL (-1 ==
+      ## -1) under plain inequality, so this exact case fell through as a
+      ## "match" and the target was signalled with SIGKILL despite there
+      ## being no starttime evidence identifying it at all -- the one
+      ## thing this whole pidfd_open + starttime re-read discipline exists
+      ## to provide (see the call site's own §3 comment). Requiring the
+      ## SNAPSHOT read to be genuinely readable (`>= 0`) closes it: an
+      ## unreadable snapshot starttime can never be "confirmed", no matter
+      ## what the current read shows.
+      check escapeeKillIdentityConfirmed(-1, -1) == false
+
+    test "snapshot starttime unreadable, current read succeeds -> NOT confirmed":
+      check escapeeKillIdentityConfirmed(-1, 555_555) == false
+
+    test "snapshot starttime readable, current read fails (-1) -> NOT confirmed":
+      check escapeeKillIdentityConfirmed(555_555, -1) == false
+
+    test "starttime of exactly 0 (a real, valid starttime value) still confirms when both reads agree":
+      ## Same off-by-one guard as isPreExistingIdentity's own 0-starttime
+      ## row above -- only a NEGATIVE starttime is the honest-failure
+      ## sentinel; 0 is a legitimate value.
+      check escapeeKillIdentityConfirmed(0, 0) == true
 
   when isMainModule:
     echo "test_rfc0007_r60_preexisting_identity: done"

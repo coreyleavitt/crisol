@@ -24,6 +24,39 @@
 ## half (`SetConsoleCtrlHandler`, windows.nim) is a DIFFERENT agent's and
 ## is not touched or tested here.
 ##
+## rfc-0007 code-review r73 extended this file with a non-LIFO destroy
+## test: `destroyPosixCore`'s restore was gated only by
+## `core.installedSignals`, not by ownership of `gShutdownWriteFd`, so
+## destroying an OLDER, non-owning core first (while a NEWER core was
+## still live) clobbered the newer core's live disposition. r73 fixed it
+## by gating the restore on `gShutdownWriteFd == core.pipeWrite`
+## ownership.
+##
+## rfc-0007 code-review r80 found that r73's OWN fix regressed the
+## complementary LIFO order: with core A installing then core B
+## installing while A is still live, B's `initPosixCore` call saves
+## whatever is CURRENTLY installed as ITS OWN `prevSigint`/`prevSigterm`
+## — crisol's own `shutdownSigHandler` (A's install), never the host's
+## true original disposition. Destroying in LIFO order (B, the owner,
+## then A) then leaves crisol's handler installed FOREVER: B's destroy
+## "restores" what it saved (crisol's own handler again), and A's
+## subsequent destroy is a no-op (A is not the `gShutdownWriteFd` owner).
+## `gShutdownWriteFd` is a single last-installer slot — it cannot express
+## a prev-chain across more than one live installer, so there is no
+## destroy ORDER that makes both cores' non-LIFO AND LIFO cases correct
+## at once. r80's fix is structural instead: `initPosixCore` now RAISES
+## `OSError` when `installSignals` is requested while another live core
+## already owns signal delivery (`gShutdownWriteFd != -1`) — refusing the
+## SECOND concurrent install outright, mirroring `initSupervisor`'s
+## (windows.nim) `jobObjectNesting` precedent (a fatal, no-half-loop
+## `OSError` at init time). The old r73 non-LIFO test below is REPLACED
+## (a non-LIFO destroy of two concurrently-live cores is no longer a
+## constructible scenario at all — the second `initPosixCore` call never
+## returns a core to destroy non-LIFO) by: a pin that the second
+## concurrent install RAISES, and a pin that ordinary SEQUENTIAL reuse
+## (install, destroy, install again, destroy again — e.g. api.nim's r74
+## main-run-then-verify-sub-run flow) is entirely unaffected.
+##
 ## Runs the whole init/destroy/query cycle directly in THIS test process
 ## (never forked) — deliberate, matching
 ## tests/conformance/test_rfc0007_r3_library_embedding.nim's own
@@ -115,31 +148,17 @@ when defined(posix):
       destroyPosixCore(core)
       check currentDisposition(SIGINT) == cast[pointer](SIG_DFL)
 
-    test "r73: non-LIFO destroy of two live cores -- destroying the OLDER (non-owning) core must not clobber the disposition the NEWER core still needs":
-      ## rfc-0007 code-review r73: `destroyPosixCore` restored
-      ## `prevSigint`/`prevSigterm` guarded only by `core.installedSignals`
-      ## -- NOT by the same ownership token
-      ## (`gShutdownWriteFd == core.pipeWrite`) the write-fd clear one line
-      ## above already uses. `initPosixCore` is not a process-wide
-      ## singleton -- nothing stops two live `PosixCore`s in one process
-      ## (this codebase's supported configuration is ONE at a time, but
-      ## nothing enforces it) -- so a non-LIFO destroy (the OLDER core
-      ## torn down while a NEWER one is still live) is constructible
-      ## in-process, exactly as done here.
-      ##
-      ## Sequence: coreA installs (saving whatever was there before it --
-      ## SIG_DFL, pinned below); coreB installs next (saving whatever
-      ## coreA just installed -- crisol's OWN `shutdownSigHandler`).
-      ## `gShutdownWriteFd` now names coreB's pipe (the LAST installer
-      ## always wins that global -- see `initPosixCore`'s own comment).
-      ## Destroying coreA (the older, NON-owning core) first is the
-      ## regression scenario: pre-fix, coreA unconditionally restores
-      ## ITS OWN `prevSigint`/`prevSigterm` (SIG_DFL) -- overwriting the
-      ## disposition coreB's still-live SIGINT/SIGTERM handling depends
-      ## on with SIG_DFL, silently killing coreB's shutdown path. Fixed:
-      ## coreA is not the `gShutdownWriteFd` owner, so its restore must
-      ## be skipped entirely -- the disposition must still read as
-      ## crisol's installed handler after coreA's destroy returns.
+    test "r80: a concurrent second signal-installing core is REFUSED -- initPosixCore raises OSError while another live core still owns signal delivery":
+      ## rfc-0007 code-review r80 (THE fix this row pins, RED against
+      ## pre-r80 code): `initPosixCore(installSignals = true)` must raise
+      ## `OSError` when `gShutdownWriteFd != -1` -- i.e. another live core
+      ## already owns signal delivery. Pre-fix, this silently SUCCEEDED
+      ## (coreB installed over coreA without complaint); see this file's
+      ## header comment for why that silent success is the root of the
+      ## r73/r80 LIFO-vs-non-LIFO bind that no destroy-order fix can
+      ## resolve for BOTH orders at once. coreA itself must be entirely
+      ## unaffected by the refused second install: still live, still
+      ## installed, and still cleanly destroyable afterward.
       installDisposition(SIGINT, cast[proc (x: cint) {.noconv.}](SIG_DFL))
       installDisposition(SIGTERM, cast[proc (x: cint) {.noconv.}](SIG_DFL))
 
@@ -147,33 +166,38 @@ when defined(posix):
       let installedByCrisol = currentDisposition(SIGINT)
       check installedByCrisol != cast[pointer](SIG_DFL)
 
-      var coreB = initPosixCore(installSignals = true)
-      # coreB installed the SAME crisol handler over coreA's -- the
-      # observable disposition is unchanged (both install the identical
-      # `shutdownSigHandler` function pointer), so this check just pins
-      # that nothing went sideways at coreB's own init.
+      expect OSError:
+        discard initPosixCore(installSignals = true)
+
+      # coreA is untouched by the refused attempt.
       check currentDisposition(SIGINT) == installedByCrisol
 
-      # THE regression: destroy the OLDER, non-owning core first.
       destroyPosixCore(coreA)
-      check currentDisposition(SIGINT) == installedByCrisol
-      check currentDisposition(SIGTERM) == installedByCrisol
+      check currentDisposition(SIGINT) == cast[pointer](SIG_DFL)
+      check currentDisposition(SIGTERM) == cast[pointer](SIG_DFL)
 
-      # The NEWER core is still live and still functionally installed --
-      # destroying it (the actual `gShutdownWriteFd` owner) restores
-      # whatever WAS in effect at ITS OWN init, which is coreA's install
-      # (crisol's handler again, not the original host SIG_DFL) -- an
-      # accepted residual of stacking two cores in one process (never the
-      # supported configuration), documented here rather than silently
-      # assumed away.
-      destroyPosixCore(coreB)
-      check currentDisposition(SIGINT) == installedByCrisol
-      check currentDisposition(SIGTERM) == installedByCrisol
-
-      # Cleanup: never leave a real signal handler installed in this test
-      # process past this test.
+    test "r80: sequential install-destroy-install-destroy is entirely unaffected -- both restores correct":
+      ## Ordinary sequential reuse (e.g. api.nim's r74 main-run-then-
+      ## verify-sub-run flow: one core installs, tears down completely,
+      ## THEN a later core installs) never has two live installers at
+      ## once, so r80's concurrency refusal never engages -- each
+      ## `initPosixCore` call here sees `gShutdownWriteFd == -1` (the
+      ## prior core's `destroyPosixCore` cleared it) and proceeds
+      ## normally, exactly as before r80.
       installDisposition(SIGINT, cast[proc (x: cint) {.noconv.}](SIG_DFL))
       installDisposition(SIGTERM, cast[proc (x: cint) {.noconv.}](SIG_DFL))
+
+      var coreA = initPosixCore(installSignals = true)
+      check currentDisposition(SIGINT) != cast[pointer](SIG_DFL)
+      destroyPosixCore(coreA)
+      check currentDisposition(SIGINT) == cast[pointer](SIG_DFL)
+      check currentDisposition(SIGTERM) == cast[pointer](SIG_DFL)
+
+      var coreB = initPosixCore(installSignals = true)
+      check currentDisposition(SIGINT) != cast[pointer](SIG_DFL)
+      destroyPosixCore(coreB)
+      check currentDisposition(SIGINT) == cast[pointer](SIG_DFL)
+      check currentDisposition(SIGTERM) == cast[pointer](SIG_DFL)
 
   when isMainModule:
     echo "test_rfc0007_r69_signal_restore: done"
