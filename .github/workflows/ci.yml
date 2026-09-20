@@ -413,6 +413,31 @@ jobs:
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_spike_import_case.nim
 
+      # issue #22 — the two capture-completeness tests, pinned as per-file
+      # steps because this leg's suite step sweeps tests/unit:tests/conformance
+      # and these live under tests/integration. That placement is not
+      # incidental: the defect they cover (streams.readAll stopping at a
+      # child's first flush; a separate-stderr pipe never drained) can ONLY
+      # fail on Windows — POSIX osproc hands back a buffered FILE* whose fread
+      # loops to EOF, so both files pass on the Linux and macOS legs no matter
+      # what the code does. Without these steps the fix has no CI producer on
+      # the only platform that can regress it.
+      #
+      # test_issue22_capture: two-burst child through ccprobe.realRun (the
+      # dependency probe's own seam) and icbaseline.realIcRun, plus a
+      # 256 KB-stderr child that must not wedge the probe.
+      # test_issue22_changed_completeness: the user-visible one — a `git`
+      # whose diff arrives in two bursts must still yield every changed name
+      # to `--changed` selection, and a git whose stderr overruns the pipe
+      # buffer must neither wedge nor be truncated.
+      - name: "issue #22 — child-output capture completeness (ccprobe/icbaseline)"
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue22_capture.nim
+
+      - name: "issue #22 — --changed sees every changed file (gitdiff)"
+        if: always()
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue22_changed_completeness.nim
+
       - name: rfc-0009 A1 — fold-probe real-volume runtime evidence
         if: always()
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_fold_probe.nim

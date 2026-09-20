@@ -52,6 +52,7 @@
 ## `--mm:orc --incremental`, captured in `errorMsg`.
 
 import std/[monotimes, os, osproc, streams, strutils, times]  # process-contract-exempt: icbaseline is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
+import crisol/toolexec  # drainBoth/drainToEof -- the capture primitives (issue #22)
 
 # ---------------------------------------------------------------------------
 # Seam types
@@ -87,7 +88,7 @@ proc realIcRun*(args: seq[string]): tuple[exitCode: int, output: string] =
     let p = startProcess(args[0], args = args[1..^1],
                          options = {poUsePath, poStdErrToStdOut})
     defer: p.close()
-    let output = p.outputStream.readAll()
+    let output = drainToEof(p.outputStream)
     let exitCode = p.waitForExit()
     result = (exitCode: exitCode, output: output)
   except CatchableError as e:

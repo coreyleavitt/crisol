@@ -54,6 +54,15 @@ const AllowedPosixFiles = [
     # else: import std/posix` branch (the posix leg of the SO_RCVTIMEO/
     # SO_SNDTIMEO timeval-vs-DWORD split) — one proc's worth of direct
     # posix use, same rationale as the other allow-listed files here.
+  "crisol/toolexec.nim",
+    # issue #22: `drainBoth` must consume a child's stdout and stderr pipes
+    # CONCURRENTLY or a tool that fills either one deadlocks. The direct
+    # `std/posix` use is `poll(2)` on the two subprocess pipe fds -- a
+    # READINESS query, not raw file I/O, so it is outside `ioutils`'s remit
+    # (open/write/close/atomic publish), the same rationale as
+    # `lock/posix.nim`'s `flock` and `paths.nim`'s `pathconf` below. The
+    # reads themselves are the only way to drain a pipe without threads,
+    # which `src/` deliberately does not use.
   "crisol/paths.nim",
     # RFC-0009 A1: `probeFoldPolicy`'s OS-query step (macOS `pathconf`
     # _PC_CASE_SENSITIVE) is a CAPABILITY QUERY, not raw file I/O — outside

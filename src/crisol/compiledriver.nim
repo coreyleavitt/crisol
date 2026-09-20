@@ -60,6 +60,7 @@
 ## failure still reports real codegen/cc spans).
 
 import std/[monotimes, os, osproc, sequtils, streams, tables, times]  # process-contract-exempt: measure-mode realCompileOnly/cc/link, aligned at A2c — not the entrypoint compile/run children (RFC-0007 §Scope)
+import crisol/toolexec  # drainBoth/drainToEof -- the capture primitives (issue #22)
 import crisol/closure
 
 # ---------------------------------------------------------------------------
@@ -186,7 +187,7 @@ proc runCompileOnly(entrypoint: string; flags: seq[string];
     let p = startProcess("nim", workingDir = workingDir, args = args,
                          options = {poUsePath, poStdErrToStdOut})
     defer: p.close()
-    let output = p.outputStream.readAll()
+    let output = drainToEof(p.outputStream)
     let exitCode = p.waitForExit()
     result = (ok: exitCode == 0, output: output)
   except CatchableError as e:
@@ -267,7 +268,7 @@ proc realLink*(linkCmd: string): tuple[ok: bool; output: string] =
   try:
     let p = startProcess(linkCmd, options = {poEvalCommand, poStdErrToStdOut, poUsePath})
     defer: p.close()
-    let output = p.outputStream.readAll()
+    let output = drainToEof(p.outputStream)
     let exitCode = p.waitForExit()
     result = (ok: exitCode == 0, output: output)
   except CatchableError as e:

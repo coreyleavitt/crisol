@@ -59,7 +59,8 @@
 ## caller that does `import crisol/artifactid` and calls them unqualified
 ## keeps compiling unchanged.
 
-import std/[osproc, streams, strutils]  # process-contract-exempt: cc/nim probes are short-lived tool invocations, not compile/run children (RFC-0007 §Scope)
+import std/[osproc, strutils]  # process-contract-exempt: cc/nim probes are short-lived tool invocations, not compile/run children (RFC-0007 §Scope)
+import crisol/toolexec  # drainBoth/drainToEof -- the capture primitives (issue #22)
 
 # ---------------------------------------------------------------------------
 # Sentinels
@@ -85,8 +86,11 @@ proc runViaOsproc(cmd: string; args: openArray[string]; workingDir: string):
   ## Shared body for `realRun`/`realRunIn` — an explicit argv array, no
   ## shell interpretation. Uses startProcess with poUsePath so bare command
   ## names (e.g. "cc", "ldd") resolve via PATH. poEvalCommand is
-  ## intentionally NOT used (that is the shell path). Captures stdout;
-  ## stderr is not captured. Never raises; failure (command not found,
+  ## intentionally NOT used (that is the shell path). Captures stdout; the
+  ## child's stderr is DRAINED but not returned -- draining it is not
+  ## optional even when the bytes are unwanted, because an undrained stderr
+  ## pipe wedges any tool that fills it (issue #22; see
+  ## `toolexec.drainBoth`). Never raises; failure (command not found,
   ## non-zero exit, OSError) surfaces as ok=false. `workingDir = ""` means
   ## "inherit the calling process's cwd" (osproc's own default).
   try:
@@ -94,8 +98,8 @@ proc runViaOsproc(cmd: string; args: openArray[string]; workingDir: string):
     for i, a in args: argSeq[i] = a
     let p = startProcess(cmd, workingDir = workingDir, args = argSeq,
                          options = {poUsePath})
-    defer: p.close()   # R2-b: close on every exit path (readAll/waitForExit may raise)
-    let output = p.outputStream.readAll()
+    defer: p.close()   # R2-b: close on every exit path (the drain/waitForExit may raise)
+    let (output, _) = drainBoth(p)
     let exitCode = p.waitForExit()
     result = (output: output, ok: exitCode == 0)
   except CatchableError:

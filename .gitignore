@@ -51,3 +51,6 @@ tests/fixtures/tmp/
 # compiled module-shadowing binaries (review r55): never track
 src/crisol/api
 src/crisol/runner
+# Local nimcache for MSVC-container test runs (issue #22 cycles run in the
+# windows container; a persisted nimcache in the bind mount keeps them fast).
+.wincache/

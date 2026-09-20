@@ -46,8 +46,8 @@
 ## raised.  The CLI maps that to exit 3, consistent with every other
 ## environment failure.
 
-import std/[options, os, osproc, sets, streams, strutils]  # process-contract-exempt: git is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
-import crisol/types
+import std/[options, os, osproc, sets, strutils]  # process-contract-exempt: git is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
+import crisol/[toolexec, types]
 
 # ---------------------------------------------------------------------------
 # Internal helper: run git without a shell
@@ -66,16 +66,20 @@ proc runGit(args: seq[string]; workingDir: string):
   ## is surfaced only in error messages. Returns (stdout, stderr, exitCode);
   ## raises OSError if git cannot be exec'd at all.
   ##
-  ## stdout is drained fully first (streaming, so an arbitrarily large diff
-  ## never blocks); git's stderr here is bounded to a few short warning lines
-  ## that comfortably fit the OS pipe buffer, so reading it after stdout EOF
-  ## cannot deadlock in practice.
+  ## Both pipes are drained CONCURRENTLY (`toolexec.drainBoth`), never one
+  ## after the other. The previous shape -- stdout to EOF, then stderr --
+  ## rested on the claim that "git's stderr here is bounded to a few short
+  ## warning lines that comfortably fit the OS pipe buffer". That was wrong,
+  ## and issue #22 pins it: the very warning it cited, `core.autocrlf`'s "LF
+  ## will be replaced by CRLF", is emitted PER FILE, so a large checkout runs
+  ## far past the pipe budget (~4 KB on Windows). git then blocks inside its
+  ## own stderr `write`, never finishes stdout, never exits -- and the stdout
+  ## read never returns.
   let p = startProcess("git", workingDir = workingDir, args = args,
                         options = {poUsePath})
   defer: close(p)
-  let output = p.outputStream.readAll()
-  let code   = waitForExit(p)
-  let errOut = p.errorStream.readAll()
+  let (output, errOut) = drainBoth(p)
+  let code = waitForExit(p)
   result = (output: output, errOutput: errOut, exitCode: code)
 
 proc splitNul(output: string): seq[string] =
