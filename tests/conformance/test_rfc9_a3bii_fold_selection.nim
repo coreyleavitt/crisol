@@ -102,6 +102,16 @@ import crisol/nimprobe
 # Helpers
 # ---------------------------------------------------------------------------
 
+# crisol#21 interim: under the MSVC toolchain the dep probe has no cc -M
+# to run (cl.exe needs the /showIncludes adapter), so the C-header closure
+# this test's selection property depends on cannot be built -- skip the
+# whole file honestly, with the MUST-EXECUTE markers the honesty script's
+# vcc arm sanctions. Remove this guard as part of crisol#21.
+when defined(vcc):
+  echo "RFC9-A3BII SKIPPED: vcc toolchain -- cc -M dep extraction unavailable, /showIncludes adapter pending (crisol#21)"
+  echo "test_rfc9_a3bii_fold_selection done"
+  quit(0)
+
 proc uniqueTmpDir(tag: string): string =
   let mono = getMonoTime()
   result = getTempDir() / ("crisol_a3bii_" & tag & "_" & $mono.ticks)

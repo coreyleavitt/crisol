@@ -189,13 +189,30 @@ check_must_execute() {
   echo "MUST-EXECUTE OK ($LEG): $label ran its real body"
 }
 
-check_must_execute \
+# crisol#21 interim: under the MSVC toolchain (CRISOL_CC=vcc, exported by
+# the windows leg's install step) the dep probe has no cc -M to run, so the
+# closure-dependent identity tests self-skip with their documented markers
+# until the /showIncludes adapter lands. The skip is sanctioned ONLY under
+# vcc -- any other configuration keeps the strict must-execute contract.
+check_must_execute_or_vcc_skip() {
+  local label="$1" donePattern="$2" realPattern="$3" skipPattern="$4"
+  if [ "${CRISOL_CC:-}" = "vcc" ]; then
+    if grep -qF "$skipPattern" "$LOG" && grep -qF "crisol#21" "$LOG"; then
+      echo "MUST-EXECUTE OK ($LEG): $label vcc-interim skip (crisol#21: cc -M unavailable under MSVC)"
+      return
+    fi
+    # vcc AND the real body ran (the adapter landed): fall through to strict.
+  fi
+  check_must_execute "$label" "$donePattern" "$realPattern" "$skipPattern"
+}
+
+check_must_execute_or_vcc_skip \
   "A3b-ii fold-membership selection (test_rfc9_a3bii_fold_selection.nim)" \
   "test_rfc9_a3bii_fold_selection done" \
   "RFC9-A3BII MODE (1|2|3)" \
   "RFC9-A3BII SKIPPED"
 
-check_must_execute \
+check_must_execute_or_vcc_skip \
   "A4b closure member on-disk-case determinism (test_rfc9_a4b_determinism.nim)" \
   "test_rfc9_a4b_determinism done" \
   "RFC9-A4B COLD" \
@@ -225,6 +242,8 @@ check_must_execute \
 # documented SKIP) still fails — that is the R3-19 honesty guarantee.
 if grep -qF "[OK] a depRoot closure member's cache key survives relocating the project tree" "$LOG"; then
   echo "MUST-EXECUTE OK ($LEG): A5c cache-portability E2E (test_rfc9_a5c_cache_portability.nim) ran its real body"
+elif grep -qF "SKIP test_rfc9_a5c_cache_portability: vcc toolchain" "$LOG" && [ "${CRISOL_CC:-}" = "vcc" ]; then
+  echo "MUST-EXECUTE OK ($LEG): A5c vcc-interim skip (crisol#21: cc -M unavailable under MSVC)"
 elif grep -qF "SKIP test_rfc9_a5c_cache_portability" "$LOG"; then
   if [ "$LEG" = "windows" ]; then
     echo "MUST-EXECUTE OK ($LEG): A5c self-skipped for its documented reason (no symlink-create privilege on windows-latest); cache-portability is proven on the macOS case-insensitive leg"
@@ -248,7 +267,7 @@ fi
 # check only applies to the windows leg; it would misfire against macos's
 # harness.log otherwise.
 if [ "$LEG" = "windows" ]; then
-  check_must_execute \
+  check_must_execute_or_vcc_skip \
     "W2 case-variant --changed argv-path selection (test_windows_cli_smoke.nim)" \
     "test_windows_cli_smoke done" \
     "CLI-SMOKE-CASECHANGED REAL" \

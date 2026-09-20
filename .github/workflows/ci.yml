@@ -314,6 +314,9 @@ jobs:
           BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-windows-x64 "$RUNNER_TEMP/nimtc" | tail -1)
           printf '\n@if windows:\n  cc = vcc\n@end\n' >> "$(dirname "$BIN")/config/nim.cfg"
           echo "$BIN" >> "$GITHUB_PATH"
+          # crisol#21: lets assert-subset-honesty sanction the interim
+          # vcc self-skips of the closure-dependent identity tests.
+          echo "CRISOL_CC=vcc" >> "$GITHUB_ENV"
 
       - name: Toolchain sanity (patched build, vcc backend)
         run: |

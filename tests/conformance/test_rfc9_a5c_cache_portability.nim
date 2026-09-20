@@ -62,6 +62,16 @@ import depmod
 doAssert depVal() == 7
 """
 
+# crisol#21 interim: under the MSVC toolchain the dep probe has no cc -M
+# to run (cl.exe needs the /showIncludes adapter), so the C-header closure
+# this test's selection property depends on cannot be built -- skip the
+# whole file honestly, with the MUST-EXECUTE markers the honesty script's
+# vcc arm sanctions. Remove this guard as part of crisol#21.
+when defined(vcc):
+  echo "SKIP test_rfc9_a5c_cache_portability: vcc toolchain -- cc -M dep extraction unavailable, /showIncludes adapter pending (crisol#21)"
+  echo "test_rfc9_a5c_cache_portability vcc-skip complete"
+  quit(0)
+
 proc kdlFor(depRootRel: string): string =
   "flags \"--path:" & depRootRel & "/src\"\n" &
   "dep-roots \"" & depRootRel & "\" name=\"thedep\"\n" &

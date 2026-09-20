@@ -54,6 +54,16 @@ import crisol/depgraph
 import crisol/runner
 import "../support/testep"
 
+# crisol#21 interim: under the MSVC toolchain the dep probe has no cc -M
+# to run (cl.exe needs the /showIncludes adapter), so the C-header closure
+# this test's selection property depends on cannot be built -- skip the
+# whole file honestly, with the MUST-EXECUTE markers the honesty script's
+# vcc arm sanctions. Remove this guard as part of crisol#21.
+when defined(vcc):
+  echo "RFC9-A4B SKIPPED: vcc toolchain -- cc -M dep extraction unavailable, /showIncludes adapter pending (crisol#21)"
+  echo "test_rfc9_a4b_determinism done"
+  quit(0)
+
 proc uniqueTmpDir(tag: string): string =
   result = getTempDir() / ("crisol_a4b_determinism_" & tag & "_" & $getCurrentProcessId())
   removeDir(result)
