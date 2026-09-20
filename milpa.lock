@@ -46,7 +46,7 @@ dep "sello" {
     source {
         kind "git"
         url (url)"https://github.com/coreyleavitt/sello"
-        ref "88998ddab216d2cb5c982a23de7320f26382d0f5"
+        ref "vcc-ct-barrier"
     }
     identity "dag-sha256:bb1765fd275c64ea5b59305d6050eafc63ec2bd1fe9c18aab3da88b669c4fb15"
     version "0.5.0"
@@ -57,7 +57,7 @@ dep "sello" {
         origin "observed"
         kind "git"
         url "https://github.com/coreyleavitt/sello.git"
-        ref "88998ddab216d2cb5c982a23de7320f26382d0f5"
+        ref "vcc-ct-barrier"
         commit_sha "88998ddab216d2cb5c982a23de7320f26382d0f5"
     }
 }

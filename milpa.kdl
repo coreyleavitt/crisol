@@ -6,7 +6,7 @@ src_dir "src"
 
 deps {
     "nkdl" git=(url)"ssh://git@github.com/coreyleavitt/nkdl.git" ref="v0.1.0"
-    "sello" git=(url)"https://github.com/coreyleavitt/sello.git" ref="88998ddab216d2cb5c982a23de7320f26382d0f5"
+    "sello" git=(url)"https://github.com/coreyleavitt/sello.git" ref="vcc-ct-barrier"
     "nimcrypto" git=(url)"https://github.com/cheatfate/nimcrypto.git" ref="v0.7.3"
 }
 
