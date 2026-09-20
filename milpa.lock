@@ -46,18 +46,18 @@ dep "sello" {
     source {
         kind "git"
         url (url)"https://github.com/coreyleavitt/sello"
-        ref "v0.4.0"
+        ref "88998ddab216d2cb5c982a23de7320f26382d0f5"
     }
-    identity "dag-sha256:06d0b32546a609fc75318b28915b220183d74d10e6e412a20c60f8f593e93937"
-    version "0.4.0"
+    identity "dag-sha256:bb1765fd275c64ea5b59305d6050eafc63ec2bd1fe9c18aab3da88b669c4fb15"
+    version "0.5.0"
     declared_version_source "manifest"
     src_dir "src"
-    requires "nimcrypto"
+    requires
     provenance {
         origin "observed"
         kind "git"
         url "https://github.com/coreyleavitt/sello.git"
-        ref "v0.4.0"
-        commit_sha "4281dff44986db98220ccc8ee5987791a29d08d1"
+        ref "88998ddab216d2cb5c982a23de7320f26382d0f5"
+        commit_sha "88998ddab216d2cb5c982a23de7320f26382d0f5"
     }
 }
