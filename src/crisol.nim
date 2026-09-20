@@ -47,7 +47,13 @@ import crisol/process  # rfc-0007 A7: capabilities() -- the real substrate node 
 # `std/posix` module dependency) — same pattern runner.nim already uses for
 # `mkdtemp` (RFC-0007 A2b), kept here rather than moved to `ioutils` because
 # it is process-exit, not file I/O.
-proc exitnow(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+when defined(windows):
+  # MSVC's CRT declares _exit in <stdlib.h>; <unistd.h> is POSIX-only
+  # (mingw happens to ship one, which is why the stock-mingw CI era never
+  # caught this -- cl.exe has no unistd.h at all).
+  proc exitnow(code: cint) {.importc: "_exit", header: "<stdlib.h>", noreturn.}
+else:
+  proc exitnow(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 
 # ---------------------------------------------------------------------------
 # Exit codes (RFC §CLI Surface)
