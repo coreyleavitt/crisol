@@ -464,9 +464,6 @@ jobs:
           grep -q '^  cc = vcc$' "$CFG" || {
             echo "W2: 'cc = vcc' did not land in $CFG" >&2; exit 1; }
           echo "$BIN" >> "$GITHUB_PATH"
-          # crisol#21: lets assert-subset-honesty sanction the interim
-          # vcc self-skips of the closure-dependent identity tests.
-          echo "CRISOL_CC=vcc" >> "$GITHUB_ENV"
 
       # Default success() gate, and the `id` every later step keys on: this
       # step can only run after `toolchain` succeeded, so `steps.sanity.outcome
