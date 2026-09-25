@@ -7,8 +7,9 @@
 ## "allowed" to touch `std/posix`/`std/osproc` directly), invisible to the
 ## compiler, so only a scan of the text itself can catch a violation:
 ##
-##   1. `std/posix` import count outside `crisol/process/*`, `ioutils.nim`,
-##      `lock/posix.nim`, `httpraw.nim` is zero — the A3 bullet's own
+##   1. `std/posix` import count outside `crisol/process/*` and
+##      `AllowedPosixFiles` below (`ioutils.nim`, `lock/posix.nim`,
+##      `httpraw.nim`, `toolexec.nim`, `paths.nim`) is zero — the A3 bullet's own
 ##      acceptance test (A4 drops
 ##      `signals.nim` from this allow-list: it delegates onto
 ##      `crisol/process.globalShutdownSignal()` instead of installing its own

@@ -190,18 +190,26 @@ import crisol/paths    # RFC-0009 A4a: classify/TrackedPath/PathClass/display/to
                         # nativePath conversion) — hence `std/options` above,
                         # for `Option[TrackedPath]`'s `isSome`/`isNone`/`get`.
 import crisol/config   # for stateDirOf — the source-index walk prunes it
-import crisol/ccprobe  # for RunProc/realRun/deriveCcMInvocation/ccIncludeHeaders
-                        # (issue #16) — a true leaf module (std-only), so this
+import crisol/ccprobe  # for deriveDepInvocation/depIncludeHeaders/classifyGnuOutputFlag
+                        # (issue #16) — a near-leaf module (its only crisol
+                        # import is crisol/paths, CR10), so this
                         # creates no cycle. NOTE: this module deliberately does
                         # NOT import crisol/depgraph (which imports THIS module
                         # for extractClosure/SourceIndex) — importing it here
-                        # would close a cycle.
+                        # would close a cycle. CR7: RunProc/realRun/realRunIn/
+                        # lastProbeStderr moved to crisol/toolrun (below) — this
+                        # module needs ccprobe.nim ONLY for its dependency-
+                        # probing derivation procs now, never cc identity.
+import crisol/toolrun   # CR7: RunProc/realRun/realRunIn/lastProbeStderr — the
+                        # process-execution seam, its own module now; a leaf
+                        # (imports only crisol/toolexec), same no-cycle shape
+                        # as the ccprobe import above.
 import crisol/fnv       # for chainedContentHash — the same leaf `crisol/depgraph`
                         # imports for its own hash primitives; used below for
                         # ExternalSource.headersHash (issue #16).
-export ccprobe.RunProc
-export ccprobe.realRun
-export ccprobe.realRunIn
+export toolrun.RunProc
+export toolrun.realRun
+export toolrun.realRunIn
 
 # ---------------------------------------------------------------------------
 # SourceIndex — once-per-run basename -> absolute-paths index (issue #8)
@@ -263,7 +271,22 @@ proc tracked*(index: SourceIndex; native: string): PathClass =
   ## single identity entry point for closure resolution (`nativeCanonicalize`
   ## + project + dep + realAbs matching all happen inside `classify`). Hot
   ## call sites thread only the index, not index-and-roots both.
+  ##
+  ## TRUSTED overload — the overwhelming majority of candidates here are
+  ## crisol's own (`buildSourceIndex`'s `walkDir`, Nim's mangled nimcache
+  ## names). CR10: provenance used to be a defaulted `spelling:
+  ## CandidateSpelling = csTrusted` parameter here; it is now the argument's
+  ## TYPE instead — a candidate that came out of a FOREIGN tool's report
+  ## must be a `paths.ReportedPath`, which selects the overload immediately
+  ## below, not a bare `string` with a value a caller had to remember to
+  ## pass (see `extractCompileInputs`' header loop).
   classify(native, index.trackedRoots)
+
+proc tracked*(index: SourceIndex; reported: ReportedPath): PathClass =
+  ## `tracked`'s REPORTED overload — see the `string` overload just above
+  ## for the CR10 rationale, and `paths.classify`'s own `ReportedPath`
+  ## overload for what this resolves and why.
+  classify(reported, index.trackedRoots)
 
 proc addToIndex(index: var SourceIndex; lexical: string; real: string) =
   let base = lexical.extractFilename
@@ -628,6 +651,34 @@ proc decodeBody(raw: string): string =
     .replace("@h", "#")      # @h → hash
     .replace("\x00", "@")    # restore literal @
 
+const ObjectExtensions* = [".o", ".obj"]
+  ## The object-file extensions a nimcache `link` entry can carry.
+  ##
+  ## The extension belongs to the TOOLCHAIN THAT PRODUCED the nimcache, never
+  ## to the crisol process reading it: every POSIX cc and mingw-gcc emit `.o`,
+  ## cl/vccexe emit `.obj`. Both are accepted unconditionally rather than
+  ## selected by `defined(vcc)` or by the host OS, for the same reason the
+  ## dependency-probe family is classified from the manifest's own driver
+  ## token (issue #21): a gcc-built crisol must be able to read a cl-produced
+  ## nimcache, and vice versa.
+  ##
+  ## Neither spelling is a suffix of the other (`"x.obj".endsWith(".o")` is
+  ## false), so the two can be matched in any order without ambiguity.
+
+proc objectExtOf(base: string): string =
+  ## The object extension `base` ends with, or `""` if it ends with none.
+  for ext in ObjectExtensions:
+    if base.endsWith(ext): return ext
+  ""
+
+proc hasObjectExt*(basename: string): bool =
+  ## True iff `basename` carries an object-file extension this toolchain
+  ## family could have produced. Exported for `runner.bustStaleExternalObjects`,
+  ## which sweeps a nimcache directory by filename and must not hardcode `.o`
+  ## (doing so made its warm-nimcache rule a silent no-op under MSVC, where
+  ## every object is `.obj` — issue #21 slice 1a).
+  objectExtOf(basename).len > 0
+
 proc moduleMangledNameOf(objPath: string): string =
   ## Maps one `link` object-file path to the mangled module name
   ## `resolveMangledAll` expects (the compile-unit basename with the backend
@@ -635,21 +686,26 @@ proc moduleMangledNameOf(objPath: string): string =
   ## `""` if `objPath` names no Nim module.
   ##
   ## Contract (the single place it is stated): a Nim MODULE object's
-  ## basename is `<mangled>.nim.{c,cpp,m}.o` — `.nim.c.o` for an ordinary
-  ## module, `.nim.cpp.o` for a module with `{.importcpp.}` symbols
+  ## basename is `<mangled>.nim.{c,cpp,m}<objext>` — `.nim.c` for an ordinary
+  ## module, `.nim.cpp` for a module with `{.importcpp.}` symbols
   ## (sfCompileToCpp — Nim 2.2.10 cgen's `getCFile` picks this per-module,
-  ## even under plain `nim c`), `.nim.m.o` for `{.importobjc.}` symbols.
-  ## Strip `.o` and the backend extension — what remains, `<mangled>.nim`,
-  ## is the module name `resolveMangledAll` decodes. An external (a
-  ## `{.compile.}`d C/C++ file, a foreign `.o`/`.a`) may ALSO be `@m`- or
-  ## `@p`-mangled (e.g. `@mfixture.c.o` for `{.compile: "fixture.c".}`), but
-  ## never carries the `.nim` component before the backend extension, so it
-  ## never satisfies this filter — checking the `@m`/`@p` prefix alone is
-  ## NOT sufficient to identify a module object.
+  ## even under plain `nim c`), `.nim.m` for `{.importobjc.}` symbols, each
+  ## followed by one of `ObjectExtensions` (`.o`, or `.obj` under MSVC).
+  ## Strip the object extension and the backend extension — what remains,
+  ## `<mangled>.nim`, is the module name `resolveMangledAll` decodes. An
+  ## external (a `{.compile.}`d C/C++ file, a foreign object/archive) may
+  ## ALSO be `@m`- or `@p`-mangled (e.g. `@mfixture.c.o` for
+  ## `{.compile: "fixture.c".}`), but never carries the `.nim` component
+  ## before the backend extension, so it never satisfies this filter —
+  ## checking the `@m`/`@p` prefix alone is NOT sufficient to identify a
+  ## module object.
   let base = objPath.extractFilename
-  for suffix in [".nim.c.o", ".nim.cpp.o", ".nim.m.o"]:
-    if base.endsWith(suffix):
-      return base[0 ..< base.len - (suffix.len - 4)]   # keep through ".nim"
+  let objExt = objectExtOf(base)
+  if objExt.len == 0: return ""
+  let stem = base[0 ..< base.len - objExt.len]        # drop the object extension
+  for backend in [".nim.c", ".nim.cpp", ".nim.m"]:
+    if stem.endsWith(backend):
+      return stem[0 ..< stem.len - (backend.len - 4)]  # keep through ".nim"
   ""
 
 proc isModuleObjectName*(basename: string): bool =
@@ -671,14 +727,16 @@ proc externalMangledNameOf(objPath: string): string =
   ## single-path (`@m`/`@p`/`@n`) form (D3c, issue #11), or `""` if `objPath`
   ## does not fit that shape.
   ##
-  ## Contract: such an external's basename is `<@m|@p|@n><mangled-path>.o` —
-  ## Nim's `mangleModuleName` result for the external's OWN source path
-  ## (e.g. `native/add.c`), plus the single `.o` the linker consumes, and NO
-  ## `.nim` component (`moduleMangledNameOf` already ruled that shape out).
-  ## Stripping exactly the trailing `.o` — never a backend extension too,
-  ## unlike `moduleMangledNameOf`'s module case, since an external's own
-  ## extension (`.c`, `.cpp`, …) IS part of its real filename, not a
-  ## synthetic `.nim.c` suffix — leaves `<@m|@p|@n><mangled-path>`: the same
+  ## Contract: such an external's basename is
+  ## `<@m|@p|@n><mangled-path><objext>` — Nim's `mangleModuleName` result for
+  ## the external's OWN source path (e.g. `native/add.c`), plus the single
+  ## object extension the linker consumes (`ObjectExtensions`: `.o`, or
+  ## `.obj` under MSVC), and NO `.nim` component (`moduleMangledNameOf`
+  ## already ruled that shape out). Stripping exactly that object extension —
+  ## never a backend extension too, unlike `moduleMangledNameOf`'s module
+  ## case, since an external's own extension (`.c`, `.cpp`, …) IS part of its
+  ## real filename, not a synthetic `.nim.c` suffix — leaves
+  ## `<@m|@p|@n><mangled-path>`: the same
   ## `"<@m|@p|@n><body>"` shape `resolveMangledAll` already decodes for
   ## module objects, so it is resolved by the identical proc.
   ##
@@ -690,9 +748,10 @@ proc externalMangledNameOf(objPath: string): string =
   let base = objPath.extractFilename
   if not (base.startsWith("@m") or base.startsWith("@p") or base.startsWith("@n")):
     return ""
-  if not base.endsWith(".o"):
+  let objExt = objectExtOf(base)
+  if objExt.len == 0:
     return ""
-  base[0 ..< base.len - 2]                             # strip trailing ".o"
+  base[0 ..< base.len - objExt.len]            # strip the object extension
 
 type
   ForeignLinkKind = enum
@@ -1139,29 +1198,73 @@ proc parseCompileManifest*(jsonPath: string):
   result = (compile: pairs, link: link, linkcmd: jnode{"linkcmd"}.getStr(""),
            depfiles: depfiles, hasDepfiles: hasDepfiles)
 
-proc ccCmdOutputObj(ccCmd: string): tuple[obj: string; ok: bool] =
-  ## Extract the `-o <obj>` (or fused `-o<obj>`) value from a manifest
-  ## `ccCmd` string — the mirror image of `ccprobe.deriveCcMInvocation`'s own
-  ## recognition of the same two forms (that proc DROPS the output flag to
-  ## build a `-M` probe invocation; this one CAPTURES its value instead, to
-  ## match a `compile` array entry to its `link` object EXACTLY — see
-  ## `analyzeManifest`'s external-matching comment below for why this must be
-  ## exact-value matching, never a basename heuristic). `ok = false` when the
-  ## command cannot be cleanly tokenized or carries no `-o` flag.
+proc ccCmdOutputObj*(ccCmd: string): tuple[obj: string; ok: bool] =
+  ## Extract the output-object value from a manifest `ccCmd` string.
+  ##
+  ## Spelled per family, classified from the command's own driver token
+  ## (`ccprobe.ccFamilyOfDriver`), never from `defined(vcc)`:
+  ##
+  ## - GNU: `-o <obj>` (separated) or `-o<obj>` (fused) — classified by
+  ##   `ccprobe.classifyGnuOutputFlag`, the SAME predicate
+  ##   `ccprobe.deriveDepInvocation`'s GNU arm uses to STRIP this flag
+  ##   (this proc CAPTURES its value instead, to match a `compile` array
+  ##   entry to its `link` object EXACTLY — see `analyzeManifest`'s
+  ##   external-matching comment below for why this must be exact-value
+  ##   matching, never a basename heuristic). One shared grammar, two
+  ##   consumers, so the two can no longer drift apart silently (CR9) —
+  ##   before the shared predicate existed, each proc hard-coded its own
+  ##   copy of the same `-o` recognition with no test exercising both
+  ##   against the same `ccCmd`.
+  ## - MSVC: `/Fo<obj>` — always fused; cl has no separated form. `-Fo<obj>`
+  ##   is accepted because cl takes `-` as a flag prefix interchangeably with
+  ##   `/`, and a leading `:` after the flag is stripped (`/Fo:<obj>`).
+  ##   This spelling is NOT shared with `deriveDepInvocation`: verified
+  ##   while fixing CR9, that proc's MSVC arm is a blanket verbatim replay
+  ##   of the whole command that never mentions `/Fo` at all (its MSVC arm
+  ##   strips nothing — `/Zs` dominates both `/c` and `/Fo<obj>`, so both
+  ##   survive the replay unmodified). `/Fo` recognition therefore stays
+  ##   here, the only place that needs it.
+  ##
+  ## Recognising only the GNU spelling is what silently broke MSVC impact
+  ## selection (issue #21): `/Fo<obj>` matched nothing, so NO `compile` entry
+  ## was ever paired with its `link` object, every external looked like one
+  ## Nim had served from its own object cache, and `extractCompileInputs`
+  ## fell through to the carried-forward branch and failed closed on every
+  ## cold compile.
+  ##
+  ## `ok = false` when the command cannot be cleanly tokenized or carries no
+  ## output flag in its family's spelling.
   let (toks, splitOk) = shellSplit(ccCmd)
   if not splitOk or toks.len < 2:
     return (obj: "", ok: false)
-  var idx = 1
-  while idx < toks.len:
-    let t = toks[idx]
-    if t == "-o":
-      if idx + 1 < toks.len:
-        return (obj: toks[idx + 1], ok: true)
-      return (obj: "", ok: false)
-    if t.startsWith("-o") and t.len > 2:
-      return (obj: t[2 .. ^1], ok: true)
-    inc idx
-  (obj: "", ok: false)
+
+  case ccFamilyOfDriver(toks[0])
+  of ccfMsvc:
+    for idx in 1 ..< toks.len:
+      let t = toks[idx]
+      for prefix in ["/Fo", "-Fo"]:
+        if t.len > prefix.len and t.startsWith(prefix):
+          var value = t[prefix.len .. ^1]
+          if value.startsWith(":"):
+            value = value[1 .. ^1]
+          if value.len > 0:
+            return (obj: value, ok: true)
+    (obj: "", ok: false)
+  of ccfGnuMake:
+    var idx = 1
+    while idx < toks.len:
+      let t = toks[idx]
+      case classifyGnuOutputFlag(t)   # CR9: the one shared grammar
+      of gofSeparated:
+        if idx + 1 < toks.len:
+          return (obj: toks[idx + 1], ok: true)
+        return (obj: "", ok: false)
+      of gofFused:
+        return (obj: gnuFusedOutputValue(t), ok: true)
+      of gofNone:
+        discard
+      inc idx
+    (obj: "", ok: false)
 
 proc analyzeManifest(nimcacheDir: string;
                      binaryName: string;
@@ -1467,10 +1570,13 @@ proc extractCompileInputs*(nimcacheDir: string;
   ##
   ## - `hasCcCmd` (the manifest's `compile` array has a matching entry — Nim
   ##   actually compiled this unit THIS round): derive a `cc -M` invocation
-  ##   from its exact `ccCmd` (`ccprobe.deriveCcMInvocation` — REPLICATES the
+  ##   from its exact `ccCmd` (`ccprobe.deriveDepInvocation` — REPLICATES the
   ##   real command, never an allow-list; see that proc's doc comment), run
   ##   it through the injectable `ccRun` seam, and parse the header set
-  ##   (`ccprobe.ccIncludeHeaders`). A derivation or probe failure raises
+  ##   (`ccprobe.depIncludeHeaders`). A derivation failure, a probe failure,
+  ##   an unusable dependency report, OR (W9j) an MSVC `/sourceDependencies`
+  ##   document whose own `Data.Source` names a DIFFERENT translation unit
+  ##   than the one probed (stale/misattributed) all raise
   ##   `CrisolError(cekEnvironment)` — fail closed, exactly like every other
   ##   closure-extraction failure (`recordClosure` invalidates the entry and
   ##   discards the stable binary; see its doc comment).
@@ -1494,7 +1600,7 @@ proc extractCompileInputs*(nimcacheDir: string;
   ## issue #17) — NEVER `getCurrentDir()`, the crisol process's own cwd,
   ## which need not be projectRoot (a subdirectory reached via
   ## `--config ../crisol.kdl`, or an unrelated cwd through the library
-  ## API). The default `ccRun` (`ccprobe.realRunIn(config.projectRoot)`)
+  ## API). The default `ccRun` (`toolrun.realRunIn(config.projectRoot)`)
   ## actually RUNS `cc -M` from that same directory — the same directory
   ## the real `nim c`/`cc` invocation before it ran in (runner.nim's
   ## ChildSpec.cwd, also projectRoot) — so a relative header path means the
@@ -1525,27 +1631,70 @@ proc extractCompileInputs*(nimcacheDir: string;
     var headers: seq[string]
 
     if ext.hasCcCmd:
-      let inv = deriveCcMInvocation(ext.ccCmd)
+      let inv = deriveDepInvocation(ext.ccCmd)
       if not inv.ok:
         raise newCrisolError(cekEnvironment,
-          "cannot derive a 'cc -M' header probe for '" & ext.source &
+          "cannot derive a header probe for '" & ext.source &
           "': its compile command in the nimcache manifest could not be " &
           "cleanly tokenized")
       let (output, ranOk) = ccRun(inv.cmd, inv.args)
+      # W9a: `lastProbeStderr()` is read IMMEDIATELY after `ccRun` on every
+      # failure path below -- it is a side channel keyed on "the most recent
+      # non-merged RunProc call", so it must be captured before any further
+      # `RunProc` call could overwrite it. `ccRun`'s default is
+      # `toolrun.realRunIn`, which populates it; a caller-injected fake
+      # `ccRun` (every test in this file) leaves it at "", so `diagSuffix`
+      # is silently "" there too -- these error paths degrade exactly as
+      # they did before W9a whenever the real driver's stderr isn't available.
+      let diagSuffix = block:
+        let diag = lastProbeStderr().strip()
+        if diag.len > 0: " -- driver said: " & diag else: ""
       if not ranOk:
         raise newCrisolError(cekEnvironment,
-          "'cc -M' header probe failed for '" & ext.source & "'" &
-          " (command: " & inv.cmd & ")")
+          "header probe failed for '" & ext.source & "'" &
+          " (command: " & inv.cmd & ")" & diagSuffix)
+      let probed = depIncludeHeaders(inv.family, output, inv.sourceFile)
+      if probed.err != dpeNone:
+        raise newCrisolError(cekEnvironment,
+          "header probe for '" & ext.source & "' produced no usable " &
+          "dependency report (" & $probed.err & "; driver: " & inv.cmd &
+          ")" & diagSuffix)
+      if probed.sourceCheck == dscMismatch:
+        # W9j: `parseMsvcSourceDeps` has always extracted `Data.Source`;
+        # until this fix nothing compared it against the source actually
+        # probed, so a stale or misattributed `/sourceDependencies` document
+        # (left behind by an earlier, unrelated probe) would have passed
+        # silently as this external's header set. Fail exactly as loudly as
+        # `probed.err != dpeNone` above -- this is the same class of failure,
+        # just detected one check later.
+        raise newCrisolError(cekEnvironment,
+          "header probe for '" & ext.source & "' returned a " &
+          "/sourceDependencies document for a DIFFERENT translation unit " &
+          "than the one probed (stale or misattributed document; driver: " &
+          inv.cmd & ")" & diagSuffix)
 
       var keptTp: seq[TrackedPath] = @[]
       var seen = initHashSet[TrackedPath]()
         ## RFC-0009 A4a (D4): the header-dedup set, retyped to TrackedPath —
         ## same classify gate as every other soundness check in this module.
-      for h in ccIncludeHeaders(output, inv.sourceFile):
+      for h in probed.headers:
+        # `h` is a `paths.ReportedPath` (CR10): these paths came out of the
+        # C compiler's own dependency report, not out of crisol. `cl
+        # /sourceDependencies` lowercases every one of them and gcc `-M`
+        # echoes the `#include` directive's literal spelling, so their case
+        # must be resolved against the disk before `rel` — the cache-key
+        # material — is sliced out of them (wiring-audit W1). The
+        # `string(h)` unwrap below is ONLY to make the candidate absolute
+        # (joining against `prAbs`, or normalizing an already-absolute
+        # spelling) — the result is immediately rewrapped as a
+        # `ReportedPath` so it still reaches `index.tracked` through the
+        # REPORTED overload, never the trusted one, all the way to
+        # resolution.
+        let hs = string(h)
         let habs =
-          if h.isAbsolute: h.normalizedPath  # canon-ok: header path branch, fold-routed via index.tracked below
-          else: (prAbs / h).normalizedPath  # canon-ok: header path branch, fold-routed via index.tracked below
-        let pcH = index.tracked(habs)
+          if hs.isAbsolute: hs.normalizedPath  # canon-ok: header path branch, fold-routed via index.tracked below
+          else: (prAbs / hs).normalizedPath  # canon-ok: header path branch, fold-routed via index.tracked below
+        let pcH = index.tracked(ReportedPath(habs))
         if pcH.kind != pcTracked: continue    # system header, etc. — excluded
         let tpH = pcH.tp
         if tpH notin seen:
@@ -1568,7 +1717,7 @@ proc extractCompileInputs*(nimcacheDir: string;
           "cannot determine the header set for '" & ext.source &
           "': its object was served from Nim's own external-object cache " &
           "this compile (no matching 'compile' entry in the nimcache " &
-          "manifest to derive a 'cc -M' probe from), and no carried-forward " &
+          "manifest to derive a header probe from), and no carried-forward " &
           "header record exists for it from a previous run")
       headers = carriedBySource[ext.source].headers
 

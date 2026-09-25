@@ -22,6 +22,13 @@ when defined(posix):
   import crisol/depgraph
   import crisol/sandbox
   import "../support/testep"
+  import "../support/statedir"
+
+  # R8-D3: this process's own crisol state dir -- never the repo root's shared
+  # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+  # run in the same tree would race (slot binaries / nimcache JSON deleted
+  # mid-compile).
+  let testStateDir = processStateDir("signal")
 
   # A6: live run path is hermetic by default; allowlist HANG_PID_FILE so the
   # hang_with_pid fixture can announce its grandchild PID to the parent.
@@ -111,7 +118,7 @@ when defined(posix):
         let fdir = fixtureDir()
         let eps  = @[mkEp(fdir / "hang_with_pid.nim")]
         let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60,
-                          projectRoot: getCurrentDir(),
+                          projectRoot: getCurrentDir(), stateDir: testStateDir,
                           trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
         let p    = plan(cfg, eps, emptyDepGraph())
 
@@ -205,7 +212,7 @@ when defined(posix):
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "pass_always.nim")]
       let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30,
-                        projectRoot: getCurrentDir(),
+                        projectRoot: getCurrentDir(), stateDir: testStateDir,
                         trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p    = plan(cfg, eps, emptyDepGraph())
 
@@ -223,7 +230,7 @@ when defined(posix):
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "fail_always.nim")]
       let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 30,
-                        projectRoot: getCurrentDir(),
+                        projectRoot: getCurrentDir(), stateDir: testStateDir,
                         trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p    = plan(cfg, eps, emptyDepGraph())
 

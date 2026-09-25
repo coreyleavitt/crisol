@@ -39,6 +39,12 @@ when defined(posix):
   import crisol/process/types as ptypes
   import crisol         # imports runMain
   import "../support/testep"
+  import "../support/statedir"
+
+  # R8-D3: this process's own crisol state dir for the execute() suite --
+  # never the repo root's shared state, which a concurrent run in the same
+  # tree would race (oSpawnError mid-compile).
+  let testStateDir = processStateDir("a1f")
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -94,13 +100,33 @@ when defined(posix):
     let savedFd: cint = posix_mod.dup(1.cint)
     discard posix_mod.dup2(fileFd, 1.cint)
     f.close()
+    # R8-D3: `run` with no --config roots at the repo and would take
+    # <repo>/.crisol/lock -- a concurrent run in the same tree then turns this
+    # into exit 3 ("another crisol run is in progress"). Give each call its
+    # own state dir via CRISOL_STATE_DIR.
+    let sd = freshStateDir("a1f_cli")
+    let saved = redirectStateDir(sd)
     let code = runMain(args)
+    restoreStateDir(saved)
+    removeDir(sd)
     flushFile(stdout)
     discard posix_mod.dup2(savedFd, 1.cint)
     discard posix_mod.close(savedFd)
     let text = readFile(outPath)
     removeFile(outPath)
     (code: code, output: text)
+
+  proc phaseDiag(r: EntrypointResult): string =
+    ## R8-D9: the context a non-pkRan run phase needs. Reading `run.res` on a
+    ## pkSpawnFailed/pkSkipped phase raises FieldDefect, which buried the real
+    ## cause (the spawn error) under a field-access crash -- so every test
+    ## below `require`s pkRan first, with this checkpointed.
+    result = "compile=" & $r.compile.kind & " run=" & $r.run.kind
+    if r.compile.kind == ptypes.pkSpawnFailed:
+      result.add " compile.spawnError=" & r.compile.spawnError
+    if r.run.kind == ptypes.pkSpawnFailed:
+      result.add " run.spawnError=" & r.run.spawnError
+    result.add " output=" & r.output
 
   proc firstEntrypoint(jsonText: string): JsonNode =
     let doc = parseJson(jsonText)
@@ -117,7 +143,7 @@ when defined(posix):
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "crash_segv.nim")]
       let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10,
-                    projectRoot: getCurrentDir(),
+                    projectRoot: getCurrentDir(), stateDir: testStateDir,
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
@@ -127,9 +153,10 @@ when defined(posix):
       # expectCoreDumped()'s doc.
       let results = execute(p, config = cfg, graph = g).results
 
-      check results.len == 1
+      require results.len == 1
+      checkpoint phaseDiag(results[0])
       check results[0].outcome == oCrashed
-      check results[0].run.kind == ptypes.pkRan
+      require results[0].run.kind == ptypes.pkRan
       check results[0].run.res.cause.by == ptypes.cbProcess
       check results[0].run.res.exit.kind == ptypes.ekSignaled
       check results[0].run.res.exit.sig == int(SIGSEGV)
@@ -139,15 +166,16 @@ when defined(posix):
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "self_sigkill.nim")]
       let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10,
-                    projectRoot: getCurrentDir(),
+                    projectRoot: getCurrentDir(), stateDir: testStateDir,
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
       let results = execute(p, config = cfg, graph = g).results
 
-      check results.len == 1
+      require results.len == 1
+      checkpoint phaseDiag(results[0])
       check results[0].outcome == oCrashed
-      check results[0].run.kind == ptypes.pkRan
+      require results[0].run.kind == ptypes.pkRan
       check results[0].run.res.cause.by == ptypes.cbExternal
       check results[0].run.res.exit.kind == ptypes.ekSignaled
       check results[0].run.res.exit.sig == int(SIGKILL)
@@ -161,15 +189,16 @@ when defined(posix):
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "term_cooperative.nim")]
       let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 1,
-                    projectRoot: getCurrentDir(),
+                    projectRoot: getCurrentDir(), stateDir: testStateDir,
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))  # short: force the kill
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
       let results = execute(p, config = cfg, graph = g).results
 
-      check results.len == 1
+      require results.len == 1
+      checkpoint phaseDiag(results[0])
       check results[0].outcome == oKilled       # NEVER oPassed
-      check results[0].run.kind == ptypes.pkRan
+      require results[0].run.kind == ptypes.pkRan
       check results[0].run.res.cause.by == ptypes.cbRunner
       check results[0].run.res.cause.reason == ptypes.krTimeout
       check results[0].run.res.cause.escalated == false
@@ -184,7 +213,7 @@ when defined(posix):
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "rlimit_fsize.nim")]
       let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10,
-                    projectRoot: getCurrentDir(),
+                    projectRoot: getCurrentDir(), stateDir: testStateDir,
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
@@ -192,8 +221,9 @@ when defined(posix):
         rlimits = RlimitOverrides(limitFsize: some(4096'i64)))
       let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec)).results
 
-      check results.len == 1
-      check results[0].run.kind == ptypes.pkRan
+      require results.len == 1
+      checkpoint phaseDiag(results[0])
+      require results[0].run.kind == ptypes.pkRan
       check results[0].run.res.exit.kind == ptypes.ekSignaled
       check results[0].run.res.exit.sig == int(SIGXFSZ)
       check results[0].run.res.cause.by == ptypes.cbLimit
@@ -228,7 +258,7 @@ when defined(posix):
 
       let eps = @[mkEp(fdir / "hang_with_pid.nim")]
       let cfg = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 20,
-                    projectRoot: getCurrentDir(),
+                    projectRoot: getCurrentDir(), stateDir: testStateDir,
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p   = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
@@ -237,8 +267,9 @@ when defined(posix):
       var ws: cint = 0
       discard waitpid(watcherPid, ws, 0)
 
-      check results.len == 1
-      check results[0].run.kind == ptypes.pkRan
+      require results.len == 1
+      checkpoint phaseDiag(results[0])
+      require results[0].run.kind == ptypes.pkRan
       check results[0].run.res.exit.kind == ptypes.ekSignaled
       check results[0].run.res.exit.sig == int(SIGXCPU)
       check results[0].run.res.cause.by == ptypes.cbExternal
@@ -269,7 +300,7 @@ when defined(posix):
 
       let eps = @[mkEp(fdir / "hang_with_pid.nim")]
       let cfg = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 20,
-                    projectRoot: getCurrentDir(),
+                    projectRoot: getCurrentDir(), stateDir: testStateDir,
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p   = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
@@ -278,8 +309,9 @@ when defined(posix):
       var ws: cint = 0
       discard waitpid(watcherPid, ws, 0)
 
-      check results.len == 1
-      check results[0].run.kind == ptypes.pkRan
+      require results.len == 1
+      checkpoint phaseDiag(results[0])
+      require results[0].run.kind == ptypes.pkRan
       check results[0].run.res.exit.kind == ptypes.ekSignaled
       check results[0].run.res.exit.sig == int(SIGXFSZ)
       check results[0].run.res.cause.by == ptypes.cbExternal

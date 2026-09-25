@@ -97,7 +97,7 @@ type KeyInputs* = object
     ## test whose behavior depends on cwd could serve a cdmHit computed
     ## under the OTHER posture -- a cached false pass.
     ##
-    ## r75 (code-review): the CALLER (cachedispatch.keyInputsFromRunPlan)
+    ## r75 (code-review): the CALLER (cachedispatch.keyOfProc)
     ## must fold `spec.chdirIntoScratch AND spec.tmpdir`, never
     ## `chdirIntoScratch` alone -- `outScratchDir` above is populated only
     ## when `spec.tmpdir` is set (runner.nim), so the flag alone is just one

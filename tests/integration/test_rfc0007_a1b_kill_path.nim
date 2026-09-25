@@ -27,6 +27,7 @@
 
 import std/[json, os, unittest]
 import ../support/capture
+import ../support/statedir
 import crisol         # imports runMain
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,18 @@ proc firstEntrypoint(jsonText: string): JsonNode =
 # ---------------------------------------------------------------------------
 
 suite "rfc-0007 A1b — honest kill-path producer (crisol run --json)":
+
+  # R8-D3: `run` with no --config roots at the repo, so its state (bin/,
+  # cache/, depgraph, lastrun.json) and its lock would be <repo>/.crisol --
+  # shared with any concurrent crisol run in the same tree, which then races
+  # this suite's compiles or turns it into exit 3 ("another crisol run is in
+  # progress"). CRISOL_STATE_DIR moves all of it to a per-test temp dir.
+  setup:
+    let isoState = freshStateDir("a1b")
+    let savedStateEnv = redirectStateDir(isoState)
+  teardown:
+    restoreStateDir(savedStateEnv)
+    removeDir(isoState)
 
   test "hang_forever: outcome killed + honest run.cause/run.exit (SIGTERM, not escalated)":
     let fd = fixtureDir()

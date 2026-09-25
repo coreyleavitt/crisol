@@ -17,11 +17,15 @@
 ## injection and unit tests can drive them directly — see each proc's own
 ## doc comment for the specific test that needs it.
 
-import std/[options, os, posix, strutils]
-import crisol/process/types
-import crisol/process/procscan
-
 when defined(linux):
+  # R5-2: the imports live INSIDE the guard, like everything else in this
+  # module. On a non-Linux target the whole body below compiles away, so an
+  # unconditional import block here is six real unused imports -- fatal under
+  # --warningAsError:UnusedImport, which a consumer (amoxtli) builds with.
+  import std/[options, os, posix, strutils]
+  import crisol/process/types
+  import crisol/process/procscan
+
   proc ownCgroupV2Path*(): string =
     ## Reads /proc/self/cgroup's unified (v2) line: "0::<path>".
     try:
@@ -111,9 +115,11 @@ when defined(linux):
     ## of any kind was ever sent, while reap still stamped `killDomain =
     ## kdsCgroup` — a vouch the mechanism did not honor). The caller
     ## (`forceKillCore`/`reapCore`, both posixcore.nim) is responsible for
-    ## (a) backstopping with `killpg` regardless, and (b) recording a
-    ## `false` here so the spawn's `killDomain` vouch degrades honestly —
-    ## see `killDomainFor` (posixcore.nim). Exported (like
+    ## (a) a backstop — `forceKillCore` runs `killpg` regardless; `reapCore`
+    ## runs post-reap, where r71 deleted its raw `killpg` as a pid-reuse
+    ## hazard, so it relies on `discoverAndReapEscapees` instead — and (b)
+    ## recording a `false` here so the spawn's `killDomain` vouch degrades
+    ## honestly — see `killDomainFor` (posixcore.nim). Exported (like
     ## `cgroupSiblingParent`/`cgroupSlotLeafName`) purely so a unit test can
     ## drive a genuine write failure (a nonexistent leaf path) without
     ## needing real cgroup-v2 delegation.

@@ -614,7 +614,7 @@ proc globalShutdownSignal*(): Option[ShutdownSignal] =
 proc probeCapabilities*(nesting: Option[bool] = probeJobObjectNesting()): Capabilities =
   ## The raw, seam-free probe — real I/O (a throwaway suspended-process
   ## spawn for `jobObjectNesting`, `GetConsoleCP` for
-  ## `ctrlBreakDeliverable`), freely callable, mirrors posixcore.nim's
+  ## `ctrlBreakDeliverable`), freely callable, mirrors process/caps.nim's
   ## `probeCapabilities`/`cachedCapabilities` split exactly (r26): the raw
   ## probe stays exported and un-memoised; `cachedCapabilities` below is
   ## the memoised wrapper every production call site actually uses.
@@ -675,7 +675,7 @@ var jobNestingMemo: Option[bool] = none(bool)
 
 proc cachedCapabilities*(): Capabilities =
   ## Probed exactly once per process for every field EXCEPT
-  ## `jobObjectNesting` (r26 — mirrors posixcore's `cachedCapabilities`
+  ## `jobObjectNesting` (r26 — mirrors process/caps.nim's `cachedCapabilities`
   ## idiom; r68 carved out the one exception below): before r26,
   ## `capabilities()` built a throwaway Supervisor (CreateEvent + IOCP +
   ## the real cmd.exe nesting probe) on EVERY call, and `initSupervisor`

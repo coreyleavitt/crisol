@@ -10,7 +10,7 @@
 
 ## Slice progress (26 active slices; A1c deferred to after C5)
 Order: A2-pre → A3 → A5 → A2 → A1a → A1b → A4a → A4b → A4c → A4d → **A6 ✓ → A7 ✓** → A8 → A9 → B0 → B1 → B2 → B3 → B4 → C0 → C1 → C2 → C3 → C4 → C5 → C6.
-- [x] **A2-pre** — `ccprobe.nim` (cc/libc version probe, injectable RunProc seam, sentinels for missing cc/ldd). 13 tests. `tests/unit/test_ccprobe.nim`.
+- [x] **A2-pre** — `ccprobe.nim` (cc/libc version probe, injectable RunProc seam, sentinels for missing cc/ldd). 13 tests. `tests/unit/test_ccprobe.nim`. **[Amended, issue #23, 2026-09-20: superseded by the #23 rewrite. The probe no longer reads `cc --version`/`ldd --version`; `ccprobe.nim` now carries a per-platform driver-candidate list, merged stdout+stderr capture, content-selected banner extraction and a link-time runtime probe, behind three injectable seams (`RunProc`, `BinHashProc`, `LinkProbeProc`). The sentinel set changed with it: `LddSentinel` ("this platform has no runtime probe") is RETIRED, `CcSentinel` remains, and `RuntimeSentinel` / `FileHashSentinel` distinguish "nothing identified the runtime" from "named but unreadable". 13 unit tests → 34, plus the end-to-end `tests/integration/test_issue23_cc_identity.nim` on both CI legs. See RFC-0004 component 4 as amended and `docs/handoff/msvc-selection-layer.md`.]**
 - [x] **A3** — `sandbox.nim` + types (`HermeticLevel`, `RlimitConfig`, `SandboxSpec`, `SandboxAchieved`, `isFullyAchieved`, `resolveSandbox`, published `DefaultEnvAllowlist`+`DefaultEnvAllowlistPrefixes`). 18 tests. `tests/unit/test_sandbox.nim`. Pure resolution only — spawn/config/CLI wiring deferred to A5/A4/A9.
 - [x] **A5** — `sandbox.filterEnv` + `hermeticEnvHash` (FNV, excludes TMPDIR value); new `forkExecEnv(...,spec)` overload in spawn.nim; fixture `env_probe.nim`. 12 tests (`test_envscrub.nim` + `test_env_scrub_integration.nim`). NOTE: spec-driven overload exists but NOT yet threaded into the live run path — wiring lands in A4a/A6.
 - [x] **A2** — `keys.nim`: `identityKey(path,flagHash)` + `soundnessKey(KeyInputs)` chained-FNV (9 components, NUL-sep, per-component fnv1a64-last). `IdentityKey`/`SoundnessKey` distinct strings in types.nim. XOR-swap + NUL-alias negative cases PASS. Fixed stale depgraph.nim XOR docstrings (lines 21, 73). `test_keys.nim`.
@@ -129,7 +129,7 @@ NOTE: A7 (store-on-attempt-1-pass; real run-twice→cached) is the natural compl
 - **Codebase nit for /tdd:** depgraph.nim:73 docstring still says "XOR" though code is chained-FNV — fix when A2 touches it.
 
 ## Round 1 fixes applied (summary)
-- **Keys split:** identity key `(path,flagHash)` for ledger vs soundness key (cache); schema-version OUT of key (file header). Chained FNV not XOR (self-cancel bug). Added ccVersion/libc, testDataHash (fixtures), argvHash, rlimitHash to soundness key; TMPDIR value excluded from envHash.
+- **Keys split:** identity key `(path,flagHash)` for ledger vs soundness key (cache); schema-version OUT of key (file header). Chained FNV not XOR (self-cancel bug). Added ccVersion/libc, testDataHash (fixtures), argvHash, rlimitHash to soundness key; TMPDIR value excluded from envHash. **[Amended, issue #23, 2026-09-20: `ccVersion`/libc kept its slot and its position in the fold, but changed CONTENT — text ⊕ content hash, not version strings. See RFC-0004 component 4 as amended.]**
 - **rlimits = config constants only** (not admission estimate; RLIMIT_AS default unset — 512MiB SIGSEGVs ORC).
 - **F1 split:** ExecutionCache (per-key files) + RunLedger (O_APPEND lines). Multi-invocation concurrency model + checksum + .tmp cleanup + lock-guarded GC.
 - **ExecutionDecision enum** (edRun/edCached) — `cdCached` removed from CompileDecision; admission bypass for edCached.
@@ -140,6 +140,82 @@ NOTE: A7 (store-on-attempt-1-pass; real run-twice→cached) is the natural compl
 - **Slices resequenced/split:** A3→A5→A2→A1a→A1b→A4a→A4b→A4c→A6→A7→A8→A9; added B0 (CRISOL_ATTEMPT), C0 (clean ext), deferred A1c (GC); fixture inventory added.
 - **Fork 3 RESOLVED:** input-hash (reuse closureHash + ccVersion), not binary-bytes.
 - **Scope:** candidates #1 (caching), #2 (hermeticity), #3-clean (retry/quarantine), #5 (JUnit/shard/prioritize), #6 (telemetry/perf-regression). **#4 (per-test coverage selection) EXCLUDED** — layer-2-crossing, see [[boundary-granularity-discriminator]]. One staged RFC-0004 (Corey picked "one staged RFC" over split).
+
+## Source-soundness gate — relocated archaeology (round 5, R5-12)
+
+Four passages lived as comments in `dev`'s `check)` arm and in the matching
+`ci.yml` step, where they described states that no longer exist or argued about
+decisions already made. R5-12 recorded the ratio that resulted — 62 comment lines
+to 11 executable in `dev` — and the arm is now 12:4, with the live substance
+(flags, closure/target reachability, the `{.push warning[Deprecated]: off.}`
+remedy, the `export a.f` vs `export a` Nim fact) moved into
+`ci/source-soundness-gate.sh`'s header. These four are kept here because they are
+history rather than instruction: **nothing below is a statement about the current
+tree.**
+
+**1. The removed `icbaseline` exclusion** — a state that no longer exists. Verbatim
+from `dev`:
+
+> "All four out-of-closure modules are listed. `icbaseline` was excluded when this
+> gate was written, because it still had a dead `std/streams` import of its own --
+> the same class as the one fixed in compiledriver.nim, and a gate that fails on
+> day one gets disabled rather than fixed. That import was dropped in the same
+> round (R4-6), so the exclusion is gone and the gate now covers every module in
+> `src/`, with no standing exemption for anything to hide behind."
+
+`ci.yml` carried its own paraphrase, also deleted:
+
+> "All four out-of-closure modules are gated. `icbaseline` was excluded when this
+> step was written (it still had a dead `std/streams` import of its own, and a gate
+> that fails the build on day one gets disabled rather than fixed); that import was
+> dropped in the same round, R4-6, so the exclusion is gone and no module in `src/`
+> is exempt."
+
+Both closing claims were **false when written** and R5-2 is why: the gate was
+Linux-only, so three modules under `src/crisol/process/` were in no gate at all
+the replacement script, and it is true because the script now *measures* it on
+every run (R5-26) rather than asserting it. The figures this paragraph first
+quoted — union 76 of 76 tracked `src/**.nim`, per-target reach 69/64/68 — were
+themselves corrected by that machine check, to **78 of 78 on disk** with reach
+71/66/70: `ccidentity.nim` and `toolrun.nim` are real, compiled and untracked.
+Current figures live in the gate script's own header, which is re-derived every
+run; do not quote a number out of this history section.
+
+**2. The `cacheEnabled` incident log.** Verbatim:
+
+> "It happened once already: `cacheEnabled` gained its R4-4 companion and
+> `runner.nim`'s `export cachedispatch.cacheEnabled` started failing this gate."
+
+This is the R4-10 hazard's one observed instance: Nim charges a `{.deprecated.}`
+warning to whatever *names* the symbol, so a qualified `export mod.symbol` trips
+where an unqualified `export mod` does not. The remedy in the tree is a
+`{.push warning[Deprecated]: off.}` / `{.pop.}` pair proved exactly one statement
+wide.
+
+**3. The gate arguing for its own shape** — why the re-export hazard is not itself
+grepped in `ci/`. Verbatim:
+
+> "Deliberately NOT enforced by a grep in `ci/`: doing it correctly means resolving
+> each exported symbol to its module and asking whether that proc carries a
+> deprecated companion, which is more machinery than the hazard warrants for its
+> one live instance -- and the failure mode is a LOUD build error, not a silent
+> pass, so the real risk is a contributor misreading it. That risk is addressed by
+> this comment being where they will be looking."
+
+The last sentence is the part that did not survive: a comment justifying its own
+placement is the shape R5-12 was about.
+
+**4. The re-export snapshot inventory.** Verbatim:
+
+> "`planner`, `depgraph`, `clean` and `pipeline` are re-exported wholesale;
+> `cachedispatch` is the only module whose symbols are exported individually"
+
+R5-18: the second clause is false as stated — **9** modules use the qualified
+per-symbol form, `api.nim` alone 57 times. What holds is the narrow claim, which
+is what the script now says: *among the modules carrying a deprecated companion*
+(cachedispatch, clean, depgraph, pipeline, planner), only `cachedispatch`'s symbols
+are re-exported one at a time (`runner.nim:74/75/87/89`). An inventory written as a
+snapshot and read as an invariant is the same class as R5-6/R5-25.
 
 ## Spine / key design decisions (this session)
 - **The insight:** crisol already computes `closureHash` (FNV over imported-source *contents*) and spends it only on compile-avoidance. RFC-0004 spends it on execution → incremental engine (nextest/Bazel/go-test class), staying a layer-3 binary-opaque runner.

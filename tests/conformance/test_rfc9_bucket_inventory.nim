@@ -30,7 +30,7 @@
 ## Audited 2026-09-14 (RFC-0009 A-final-ii follow-on). The counts below
 ## supersede the RFC's informal estimates (B1 ~3, B2 52, B3a ≤16, B3b ~3):
 ## classifying by the literal dominant posix API — reading past comments,
-## docstrings, and test-name strings — yields 13/23/38/1 at the B4 audit; rfc-0007 review round 1 (2026-09-18) added five B2 files (r2/r3/r5 tests + reparented-helper fixtures) -> 13/28/38/1; wave-2 fixes added four more B2 unit tests (r9-r12) -> 13/32/38/1; round-2 fix r69 added the signal-restore unit test (std/posix Sigaction) -> 13/33/38/1 (test_conformance_timing.nim moved B1->B2 during B1: it uses SIGKILL/SIGINT, not getpid-only). The two large
+## docstrings, and test-name strings — yields 13/23/38/1 at the B4 audit; rfc-0007 review round 1 (2026-09-18) added five B2 files (r2/r3/r5 tests + reparented-helper fixtures) -> 13/28/38/1; wave-2 fixes added four more B2 unit tests (r9-r12) -> 13/32/38/1; round-2 fix r69 added the signal-restore unit test (std/posix Sigaction) -> 13/33/38/1; code-review round 3 (2026-09-24, R3-3) added the SIGTERM-ignoring tool fixture (std/posix SIG_IGN) -> 13/34/38/1 (test_conformance_timing.nim moved B1->B2 during B1: it uses SIGKILL/SIGINT, not getpid-only). The two large
 ## shifts are real: `getpid`-only tests (B1) and the `captureBoth` FD-capture
 ## idiom (B3a) are each far more common than the thematic estimate assumed,
 ## and NO test in-tree calls `setrlimit` directly (limits flow through
@@ -64,7 +64,7 @@ const B1 = [
   "tests/fixtures/hang_with_pid.nim",
 ]
 
-# --- B2: process-control + signal → when defined(posix) gate (33) ----------
+# --- B2: process-control + signal → when defined(posix) gate (34) ----------
 const B2 = [
   "tests/fixtures/self_sigkill.nim",
   "tests/fixtures/spawn_grandchild.nim",
@@ -99,6 +99,11 @@ const B2 = [
   "tests/unit/test_process_capabilities.nim",
   "tests/conformance/test_conformance_timing.nim",
   "tests/conformance/test_rfc0007_r3_library_embedding.nim",
+  # R3-3 (code-review round 3, 2026-09-24): SIG_IGN on SIGTERM, to prove the
+  # tool deadline escalates to SIGKILL. Pure Category-B signal use, already
+  # whole-file `when defined(posix)`-gated, so it is B2 by the same rule as
+  # the r69 signal-restore test — no Stage-B conversion is owed.
+  "tests/fixtures/hang_ignores_term.nim",
 ]
 
 # --- B3a: filesystem / FD plumbing → std/os,syncio (or gate) (38) ----------
@@ -189,9 +194,9 @@ suite "RFC-0009 B-inventory — posix-bucket work order":
       for f in uniq:
         if seen.count(f) > 1: echo "  DUPLICATE across buckets: " & f
 
-  test "bucket sizes match the audited inventory (13 / 33 / 38 / 1)":
+  test "bucket sizes match the audited inventory (13 / 34 / 38 / 1)":
     check B1.len == 13
-    check B2.len == 33
+    check B2.len == 34
     check B3a.len == 38
     check B3b.len == 1
 
@@ -205,7 +210,10 @@ suite "RFC-0009 B-inventory — posix-bucket work order":
     # B-inventory time; the durable invariant is `live ⊆ union`: no test may
     # import std/posix without being in the inventory. A newly-added posix
     # import therefore fails this test until it is triaged into a bucket, and
-    # the frozen `union.len == 75` pin below catches a mangled bucket const.
+    # the frozen total pin below catches a mangled bucket const. (That pin tracks
+    # the audit and so moves with each triage — this sentence deliberately does
+    # not restate its value, which is how it came to read 75 against an 85-file
+    # inventory.)
     let union = allBucketed()
     let live = posixImporters()
     var untracked: seq[string]
@@ -219,8 +227,8 @@ suite "RFC-0009 B-inventory — posix-bucket work order":
     # (tests/support/ is kept posix-free by test_conformance_import_purity.nim,
     # RFC-0009 B-inventory's extension of the existing import-purity meta-test.)
 
-  test "the audited inventory total is frozen at 85 (13 + 33 + 38 + 1)":
-    check allBucketed().len == 85
+  test "the audited inventory total is frozen at 86 (13 + 34 + 38 + 1)":
+    check allBucketed().len == 86
 
 when isMainModule:
   echo "test_rfc9_bucket_inventory done"

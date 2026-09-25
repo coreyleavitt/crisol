@@ -39,6 +39,13 @@ let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
 
 import crisol/config
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race (slot binaries / nimcache JSON deleted
+# mid-compile).
+let testStateDir = processStateDir("headofline")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,7 +108,7 @@ proc makeConfig(jobs: int): Config =
     timeoutSecs:        30,
     compileTimeoutSecs: 120,
     maxOutputBytes:     10 * 1024 * 1024,
-    stateDir:           ".crisol",
+    stateDir:           testStateDir,
     projectRoot:        getCurrentDir(),
     # RFC-0009 A3c-ii: the dep-graph closure is HashSet[TrackedPath], and
     # recordClosure/decideCompile classify+resolve every member against

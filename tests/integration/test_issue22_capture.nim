@@ -7,7 +7,7 @@
 ## code. Nothing in the returned value distinguishes that from a child that
 ## genuinely said little.
 ##
-## These tests drive PRODUCTION capture seams (`ccprobe.realRun` is the default
+## These tests drive PRODUCTION capture seams (`toolrun.realRun` is the default
 ## `RunProc` every dependency probe runs through), not a test-local copy of the
 ## spawn code — the point is that the shipped path is complete, not that a
 ## drain loop written for the test is.
@@ -20,7 +20,7 @@
 ## guarantees — the payload size only has to make the loss unmistakable.
 
 import std/[os, osproc, strutils, unittest]
-import crisol/[ccprobe, icbaseline]
+import crisol/[toolrun, icbaseline]
 import ../fixtures/two_burst_output
 import ../support/deadline
 

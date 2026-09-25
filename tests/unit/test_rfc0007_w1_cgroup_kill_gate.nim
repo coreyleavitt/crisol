@@ -36,8 +36,8 @@
 ## `CRISOL_FORCE_NO_CGROUP_KILL` is set at the very top of this file,
 ## before ANY `capabilities()`/`cachedCapabilities()` call in this
 ## process — required because `cachedCapabilities()` memoises its result
-## after the first probe (same rule `CRISOL_FORCE_POLL` documents at its
-## own definition, posixcore.nim's `forcePollRequested`); this test file
+## after the first probe (unlike `CRISOL_FORCE_POLL`, which posixcore.nim's
+## `forcePollRequested` reads fresh on every `initPosixCore` call); this test file
 ## never calls the memoised entry points at all (it uses the unmemoised
 ## `probeCapabilities()` directly), but sets it early anyway so the
 ## contract is demonstrated honestly rather than sidestepped.

@@ -11,6 +11,11 @@
 ## {
 ##   "header": {
 ##     "nimVersion":     "<string>",   -- e.g. "2.2.10"
+##     "ccVersion":      "<string>",   -- W3: C toolchain fingerprint, e.g.
+##                                     -- "gcc 13.2.0|ldd 2.39" (ccidentity.
+##                                     -- ccVersion's shape). OPTIONAL on read
+##                                     -- (absent -> ""; see DepGraphHeader.
+##                                     -- ccVersion's doc) -- always written.
 ##     "formatVersion":  <int>,        -- DepGraphFormatVersion
 ##     "roots": [                      -- RFC-0009 A3c-i: this file's OWN local
 ##       {                             -- name/foldPolicy table, in TrackedRoots
@@ -53,6 +58,15 @@
 ## - **Nim-version mismatch** (header): whole graph → empty (treat as absent).
 ##   This is a FRESHNESS judgment, not a fact about the stored file — see
 ##   "Two loaders" below for who applies it.
+## - **Cc-version mismatch** (header, W3): the SAME treatment as a Nim-version
+##   mismatch, for `header.ccVersion` (the C toolchain fingerprint) — whole
+##   graph → empty (treat as absent), `loadDepGraph`-only, checked right
+##   after the Nim-version check. This loader is the ONLY place the comparison
+##   happens: `planner.decideCompile` carried an identical one until round 5
+##   (R3-8) removed it as unreachable, since a graph that reaches
+##   `decideCompile` has already been through this discard and had its header
+##   re-stamped. Before this field existed, a C toolchain upgrade with an
+##   unchanged Nim version was invisible — the defect this field closes.
 ## - **Missing file** in closure: `isEntryStale` returns true.
 ## - **Absent entry**: `isEntryStale` returns true.
 ## - **Deleted-entrypoint GC**: `gcDeletedEntrypoints` drops keys absent from the
@@ -77,16 +91,21 @@
 ## on-disk-tamper guard to closure paths. A missing file loads as an empty
 ## graph with header nimVersion `""`.
 ##
-## `loadDepGraph*(config; nimVersion; discarded)` is `loadStoredDepGraph`
-## PLUS a freshness view: if the stored header's `nimVersion` disagrees with
-## the caller's `nimVersion` (and that disagreement is observable — an inert
-## `""`-header graph with zero entries, e.g. "no file yet", never counts),
-## the graph is treated as absent (`dgdNimVersion`) and an empty graph
-## stamped with the REQUESTED `nimVersion` is returned instead.
+## `loadDepGraph*(config; nimVersion; discarded; ccVersion)` is
+## `loadStoredDepGraph` PLUS a freshness view: if the stored header's
+## `nimVersion` disagrees with the caller's `nimVersion` (and that
+## disagreement is observable — an inert `""`-header graph with zero
+## entries, e.g. "no file yet", never counts), the graph is treated as
+## absent (`dgdNimVersion`) and an empty graph stamped with the REQUESTED
+## `nimVersion`/`ccVersion` is returned instead. The SAME check then runs
+## for `ccVersion` (W3) against `header.ccVersion`, `dgdCcVersion` on an
+## observable mismatch — checked only once the nimVersion check has already
+## passed, so a simultaneous nim+cc change is always reported as
+## `dgdNimVersion`.
 ##
 ## Callers that make staleness/compile-avoidance decisions (`run`,
 ## `closure`, `list`, ...) MUST use `loadDepGraph` — a graph recorded by a
-## different compiler cannot be trusted for those decisions.
+## different compiler OR C toolchain cannot be trusted for those decisions.
 ##
 ## `crisol clean` MUST use `loadStoredDepGraph` instead: it only GCs the
 ## on-disk entry set against the discovered entrypoints and re-saves. Using
@@ -117,8 +136,8 @@ import crisol/types
 import crisol/config   # for stateDirOf
 import crisol/closure  # for extractClosure/extractCompileInputs/SourceIndex/
                         # ExternalSource (recordClosure); no cycle — closure.nim
-                        # imports crisol/types, crisol/config, and crisol/ccprobe
-                        # (a leaf) — never crisol/depgraph (see closure.nim's
+                        # imports crisol/types, paths, config, ccprobe, toolrun
+                        # and fnv — never crisol/depgraph (see closure.nim's
                         # import comment for why: this module importing
                         # crisol/artifactid would have closed that cycle,
                         # issue #16).
@@ -126,7 +145,12 @@ import crisol/paths     # RFC-0009 A3c-ii: TrackedPath/TrackedRoots/classify/
                         # fromCanonical/cmpKeyBytes/display/toNative/
                         # PathClass/pcTracked/pcOutside for DepGraphEntry.
                         # closure's TrackedPath retype.
-import crisol/ccprobe   # for RunProc/realRun (recordClosure's ccRun param)
+import crisol/toolrun   # for RunProc/realRunIn (recordClosure's ccRun param).
+                        # CR7: this module needs only the process-execution
+                        # seam, neither cc-identity nor cc-dependency-probing
+                        # symbols, so it imports the seam's own module
+                        # directly rather than reaching through either half
+                        # of the old ccprobe.nim.
 import crisol/ioutils  # sanitizeControlBytes (the shared control/ANSI-byte
                         # sanitization primitive — bottom of the dep graph, no
                         # cycle) and atomicPublish (saveDepGraph's writer,
@@ -142,7 +166,7 @@ export fnv
 # Constants
 # ---------------------------------------------------------------------------
 
-const DepGraphFormatVersion* = 8
+const DepGraphFormatVersion* = 9
   ## Increment this when the JSON schema changes in an incompatible way.
   ## A loaded file with a different formatVersion is treated as absent.
   ##
@@ -169,6 +193,37 @@ const DepGraphFormatVersion* = 8
   ## the first place, so there is nothing for a bump to protect.
   ##
   ## History:
+  ##   9 — W3 (wiring-audit finding, re-verified 2026-09-21): `decideCompile`
+  ##       was blind to the C toolchain while its `nimVersion` sibling was
+  ##       fully wired -- upgrading cc without changing Nim left
+  ##       `decideCompile` returning `cdSkipFresh`, silently serving a stable
+  ##       binary linked by the OLD cc under the NEW toolchain's soundness
+  ##       key (cross-host cache poisoning by under-invalidation -- see W3's
+  ##       handoff note). `DepGraphHeader` gains `ccVersion` -- the
+  ##       depgraph-header sibling of `nimVersion` -- and `loadDepGraph`
+  ##       gains the matching `dgdCcVersion` freshness discard.
+  ##
+  ##       Bump direction: DISCARD, not silent misparse. A v8 file has no
+  ##       `ccVersion` field at all; `fromJson` treats it as OPTIONAL at the
+  ##       shape-validation layer (absent -> "", mirroring `roots`' v6
+  ##       precedent above -- NOT `nimVersion`/`formatVersion`'s required
+  ##       treatment), so a v8 file would in principle still PARSE under a
+  ##       v9 reader without this bump. The bump is taken anyway, for the
+  ##       same reason v6 took one for `roots`: a v8 file was written by a
+  ##       pipeline that never probed cc at all, so every one of its entries
+  ##       is permanently exempt from the new cc-version freshness check
+  ##       (an absent header field reads back as `ccVersion == ""`, which
+  ##       only ever matches a caller that ALSO passes `ccVersion == ""` --
+  ##       i.e. a caller with no real probe, exactly the "" = disable-this-
+  ##       check convention this loader already uses for `nimVersion` -- the
+  ##       convention was `decideCompile`'s too until R3-8 removed its arms) -- a REAL pre-W3 file, reused verbatim post-fix,
+  ##       would need its very next `crisol run` (which DOES pass a real
+  ##       probed `ccVersion`) to observe a "" -> real mismatch and discard
+  ##       it anyway, so the bump merely makes that one-time discard happen
+  ##       at load instead of via a freshness comparison one run later --
+  ##       a one-time full recompile either way, never a silent misparse:
+  ##       decode of an old (v8) graph under the v9 reader fails cleanly via
+  ##       `dgdFormatVersion`, exactly like every prior bump.
   ##   8 — RFC-0009 F13 (wiring-audit finding): `entry.externals[].source`
   ##       and `.headers[]` are now serialized in their `paths.keyBytes`
   ##       spelling (`closure.closureMemberSpelling`), the SAME portable
@@ -249,6 +304,36 @@ type
   DepGraphHeader* = object
     nimVersion*:    string  ## Nim version string (e.g. "2.2.10")
     formatVersion*: int     ## DepGraphFormatVersion
+    ccVersion*:     string
+      ## W3: the depgraph-header sibling of `nimVersion` -- the C toolchain
+      ## fingerprint (`ccidentity.ccVersion`'s shape: "<cc version line>|
+      ## <runtime identity>") in effect the last time this graph's entries
+      ## were recorded. Compared by `loadDepGraph` against the caller's
+      ## CURRENT cc fingerprint exactly like `nimVersion` (`dgdCcVersion` on
+      ## mismatch). `planner.decideCompile` compared it too until round 5
+      ## (R3-8) removed that arm as unreachable -- by the time a graph reaches
+      ## `decideCompile` this loader has already discarded a mismatched one and
+      ## re-stamped the header, so the comparison could never fire. A cc
+      ## upgrade with an unchanged Nim version must discard/recompile exactly
+      ## as a Nim upgrade already does; before this field existed nothing could
+      ## see a cc change at all (the W3 defect: a stable binary linked by an
+      ## OLD cc would be served as fresh under a NEW toolchain's soundness
+      ## key).
+      ##
+      ## OPTIONAL at parse time (`fromJson`, below): absent -> "" (mirrors
+      ## `roots`' v6 leniency for a hand-built pre-this-field fixture, NOT
+      ## `nimVersion`/`formatVersion`'s required treatment -- see
+      ## `DepGraphFormatVersion`'s v9 history entry for why the bump alone
+      ## already makes this leniency safe in production: `saveDepGraph`
+      ## always writes it, exactly like `nimVersion`).
+      ##
+      ## Both inputs empty (`nimVersion == "" and ccVersion == ""`) is the
+      ## same "no probe available -- test/cold-start caller" sentinel
+      ## `nimVersion == ""` alone already was; a caller with a real
+      ## `nimVersion` but no cc probe is not a supported combination in
+      ## production (the api boundary probes both together, see
+      ## `toolchainFingerprint`'s doc) and is treated the same as any other
+      ## observable mismatch.
     roots*: seq[tuple[name: string; foldPolicy: FoldPolicy]]
       ## RFC-0009 A3c-i: this FILE's own local name/foldPolicy table, one
       ## record per root tracked when the graph was last saved — project
@@ -318,6 +403,10 @@ type
     ## Why `loadDepGraph` discarded a persisted graph.
     dgdNone           ## no file, or loaded cleanly
     dgdNimVersion     ## header.nimVersion != current compiler fingerprint
+    dgdCcVersion      ## W3: header.ccVersion != current C toolchain
+                      ## fingerprint -- the cc-version sibling of
+                      ## dgdNimVersion, checked the same way (never compared
+                      ## when the nimVersion check already discarded first).
     dgdFormatVersion  ## header.formatVersion != DepGraphFormatVersion
     dgdMalformed      ## file present but unreadable, unparseable, or an unexpected shape
     dgdRootUnknown    ## RFC-0009 A3c-i: a persisted header root NAME does not
@@ -391,16 +480,31 @@ proc sanitizeHeaderField(s: string; pipeAware: bool = false): string =
   ## different fingerprints apart.
   ##
   ## `pipeAware` gates the '|'-tail rendering below — it must be true ONLY
-  ## for dgdNimVersion's `stored`/`current` (the Nim fingerprint, whose
-  ## shape is documented above and genuinely ends in `|<hash>`). Every
-  ## other caller (dgdFormatVersion, dgdMalformed) passes the default
-  ## `false`: those values are arbitrary text — a dgdMalformed reason can be
-  ## a filesystem path, and a path containing a literal '|' must render
-  ## intact rather than being mangled by a heuristic meant for a completely
-  ## different value shape (see the "F3" test below for the fingerprint
-  ## case this heuristic exists for, and test_depgraph_guard.nim's
-  ## "'|' hash heuristic" test for the dgdMalformed case it must NOT apply
-  ## to).
+  ## for dgdNimVersion's `stored`/`current` (the Nim fingerprint, whose shape
+  ## is documented above), where the text after the FINAL '|' really is a
+  ## bare binary hash and reducing it to 12 characters loses nothing.
+  ##
+  ## It must NOT be used for the cc fingerprint. An earlier revision of this
+  ## proc claimed the same rule was "a harmless no-op truncation" for
+  ## `ccidentity.ccVersion` — that was wrong, and observably so: ccVersion is
+  ## "<cc text> #<digest>|<runtime text> #<digest>", so the text after the
+  ## final '|' is the RUNTIME IDENTITY, not a hash. Truncating it to 12
+  ## characters rendered a real discard as
+  ##   `... current toolchain is cc (SUSE Linux) 16.2.0 #b0dd4cd034d13600|390a4be6deb6`
+  ## — the entire `ldd (GNU libc) 2.43 #542b` half erased. That destroys the
+  ## one thing the message exists to say on the path RFC-0004 component 4
+  ## added it for: WHICH half of the toolchain moved. A glibc rebuild at an
+  ## unchanged version string — precisely the case issue #23 exists to catch
+  ## — would report only twelve anonymous hex digits.
+  ## `sanitizeCcFingerprintField` below renders that shape correctly.
+  ## Every other caller (dgdFormatVersion,
+  ## dgdMalformed) passes the default `false`: those values are arbitrary
+  ## text — a dgdMalformed reason can be a filesystem path, and a path
+  ## containing a literal '|' must render intact rather than being mangled
+  ## by a heuristic meant for a completely different value shape (see the
+  ## "F3" test below for the fingerprint case this heuristic exists for,
+  ## and test_depgraph_guard.nim's "'|' hash heuristic" test for the
+  ## dgdMalformed case it must NOT apply to).
   ##
   ## When `pipeAware` and the value contains '|', it is treated as
   ## `<multi-line version text>|<binary hash>`: the part before the FINAL
@@ -428,6 +532,45 @@ proc sanitizeHeaderField(s: string; pipeAware: bool = false): string =
   let firstLine = if nlPos >= 0: s[0 ..< nlPos] else: s
   sanitizeOneSegment(firstLine)
 
+const NewlineChar = char(10)
+
+proc abbreviateDigest(seg: string): string =
+  ## Reduce a trailing ` #<hex>` digest to its last 12 characters, leaving the
+  ## legible text before it intact. Enough hash to tell two builds at an
+  ## identical version string apart, without reproducing all 16 digits.
+  let hashPos = seg.rfind(" #")
+  if hashPos < 0: return seg
+  let text = seg[0 ..< hashPos]
+  let digest = seg[hashPos + 2 .. ^1]
+  if digest.len <= 12: return seg
+  text & " #" & digest[^12 .. ^1]
+
+proc sanitizeCcFingerprintField(s: string): string =
+  ## Render a `ccidentity.ccVersion` value for a discard diagnostic.
+  ##
+  ## The shape is TWO halves split on the FIRST '|' — compiler and runtime —
+  ## each `<legible text> #<digest>` (the digest is absent on the Windows
+  ## profile, which is `cdVersionOnly` by decision). Both halves' text is
+  ## load-bearing: the message's whole job is to say which half moved. So
+  ## each half keeps its first line and abbreviates only its own digest,
+  ## and each is capped independently so a long compiler banner cannot eat
+  ## the runtime half's budget.
+  ##
+  ## Deliberately NOT `sanitizeHeaderField(pipeAware = true)`: that splits on
+  ## the FINAL '|' and treats everything after it as a hash, which is right
+  ## for the Nim fingerprint and wrong here (see that proc's doc).
+  let pipePos = s.find('|')
+  if pipePos < 0:
+    let nl = s.find(NewlineChar)
+    return sanitizeOneSegment(abbreviateDigest(if nl >= 0: s[0 ..< nl] else: s))
+  proc firstLine(x: string): string =
+    let nl = x.find(NewlineChar)
+    if nl >= 0: x[0 ..< nl] else: x
+  let ccSeg = firstLine(s[0 ..< pipePos])
+  let rtSeg = firstLine(s[pipePos + 1 .. ^1])
+  sanitizeOneSegment(abbreviateDigest(ccSeg)) & "|" &
+    sanitizeOneSegment(abbreviateDigest(rtSeg))
+
 proc key*(d: DepGraphDiscard): string =
   ## ConfigWarning `key` for a discard: "nimVersion" / "formatVersion" /
   ## "malformed" / "rootUnknown" / "foldMismatch" / "" (dgdNone). The single
@@ -435,6 +578,7 @@ proc key*(d: DepGraphDiscard): string =
   case d.kind
   of dgdNone:          ""
   of dgdNimVersion:    "nimVersion"
+  of dgdCcVersion:     "ccVersion"
   of dgdFormatVersion: "formatVersion"
   of dgdMalformed:     "malformed"
   of dgdRootUnknown:   "rootUnknown"
@@ -452,6 +596,11 @@ proc message*(d: DepGraphDiscard): string =
   of dgdNimVersion:
     "depgraph discarded: recorded for Nim " & sanitizeHeaderField(d.stored, pipeAware = true) &
     ", current compiler is " & sanitizeHeaderField(d.current, pipeAware = true) &
+    " -- the recorded graph is treated as empty (run recompiles and " &
+    "force-selects every entrypoint)"
+  of dgdCcVersion:
+    "depgraph discarded: recorded for cc toolchain " & sanitizeCcFingerprintField(d.stored) &
+    ", current toolchain is " & sanitizeCcFingerprintField(d.current) &
     " -- the recorded graph is treated as empty (run recompiles and " &
     "force-selects every entrypoint)"
   of dgdFormatVersion:
@@ -561,13 +710,38 @@ proc closureHashInputs*(closure: HashSet[TrackedPath];
 # Public: constructors
 # ---------------------------------------------------------------------------
 
-proc initDepGraph*(nimVersion: string): DepGraph =
-  ## Construct a new, empty DepGraph with the given Nim version in the header.
+# SOUNDNESS-PARAMETER WARNING (round-2 review R2-7; ENFORCED round 3, R3-7;
+# text corrected round 4, R4-5, 2026-09-24): `ccVersion` below is a soundness
+# parameter of the shape that produced defect L1 -- it is the C-toolchain half
+# of the header every later freshness comparison is made against, so a graph
+# stamped without it is indistinguishable from one built by the current
+# toolchain. It no longer carries a default: the compiler now says so at the
+# call site, via the deprecated compatibility overload below (a hard error
+# under `dev check`'s `--warningAsError:Deprecated:on`). Pass it EXPLICITLY,
+# including "" when you mean "no probe available". Full rationale on that
+# overload, on `planner.cachePath`'s, and at R2-7/R3-7 in
+# docs/handoff/msvc-selection-layer.md.
+proc initDepGraph*(nimVersion: string; ccVersion: string): DepGraph =
+  ## Construct a new, empty DepGraph with the given Nim/cc versions in the
+  ## header.
+  ##
+  ## PASS `ccVersion` EXPLICITLY (R3-7), including `""` when there is no probe
+  ## — see the deprecated overload below for why the default was removed.
   result = DepGraph(
     header:  DepGraphHeader(nimVersion: nimVersion,
+                            ccVersion: ccVersion,
                             formatVersion: DepGraphFormatVersion),
     entries: initTable[(string, string), DepGraphEntry]()
   )
+
+proc initDepGraph*(nimVersion: string): DepGraph
+    {.deprecated: "R3-7: pass ccVersion explicitly (\"\" when no probe is available) — omitting it silently stamps the header with no C-toolchain identity".} =
+  ## Deprecated compatibility overload. `ccVersion` used to default to "" (W3:
+  ## mirroring `nimVersion`'s "no probe available — test/cold-start caller"
+  ## convention) so every pre-W3 call site kept compiling unchanged; that
+  ## default is what made the omission invisible. Full rationale on
+  ## `planner.cachePath`'s deprecated overload (R3-7).
+  initDepGraph(nimVersion, "")
 
 # ---------------------------------------------------------------------------
 # Public: mutation
@@ -729,6 +903,7 @@ proc toJson(graph: DepGraph; roots: TrackedRoots): JsonNode =
   ## the member came from on the read side (the defect this bump fixes).
   let headerNode = newJObject()
   headerNode["nimVersion"]    = newJString(graph.header.nimVersion)
+  headerNode["ccVersion"]     = newJString(graph.header.ccVersion)
   headerNode["formatVersion"] = newJInt(graph.header.formatVersion)
 
   let rootsArr = newJArray()
@@ -806,7 +981,7 @@ proc fromJson(node: JsonNode; roots: TrackedRoots; discarded: var DepGraphDiscar
   ## (missing/wrong-typed header fields, non-object root, non-array
   ## entries, ...) so a present-but-unusable file is never silently
   ## indistinguishable from dgdNone's "never ran".
-  result = initDepGraph("")
+  result = initDepGraph("", "")
   discarded = DepGraphDiscard(kind: dgdNone)
 
   if node.kind != JObject:
@@ -845,6 +1020,22 @@ proc fromJson(node: JsonNode; roots: TrackedRoots; discarded: var DepGraphDiscar
   # current Nim version" here (see the proc doc above).
   result.header.nimVersion    = storedNimVerStr
   result.header.formatVersion = DepGraphFormatVersion
+
+  # Parse header.ccVersion (W3). OPTIONAL at this shape-validation layer,
+  # unlike nimVersion/formatVersion above -- absent (a hand-built fixture
+  # predating this field) parses as "" (see DepGraphHeader.ccVersion's doc
+  # for why this leniency, mirroring `roots`' v6 precedent, costs nothing in
+  # production: the v9 formatVersion bump already discards every REAL v8
+  # file above, and every REAL v9+ file, `saveDepGraph`'s the sole producer,
+  # always writes this field). If PRESENT, it must be a string -- a
+  # non-string value is a fact about the stored bytes (dgdMalformed), not
+  # something a freshness judgment should paper over.
+  let storedCcVerNode = headerNode{"ccVersion"}
+  if storedCcVerNode != nil:
+    if storedCcVerNode.kind != JString:
+      discarded = DepGraphDiscard(kind: dgdMalformed, stored: "ccVersion not a string")
+      return
+    result.header.ccVersion = storedCcVerNode.getStr("")
 
   # Parse header.roots (RFC-0009 A3c-i; no `tag` column since W1 -- nothing
   # ever read it back, see DepGraphHeader.roots' doc). OPTIONAL at this
@@ -1096,7 +1287,7 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## of any single compile).
   ##
   ## `ccRun` — the `cc -M` header-probe seam (issue #16), threaded through to
-  ## `closure.extractCompileInputs`; defaults to `ccprobe.realRunIn(config.
+  ## `closure.extractCompileInputs`; defaults to `toolrun.realRunIn(config.
   ## projectRoot)` (rfc-0007 A2c, issue #17) — replays `cc -M` from
   ## projectRoot, the SAME directory the real compile ran `cc` from,
   ## regardless of the crisol process's own cwd. Tests inject a synthetic
@@ -1223,7 +1414,7 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
     # attached to unblock `open()` on the FIFO's other end). Accepted: doing
     # so requires write access to crisol's own state dir, at which point an
     # attacker already has far more direct ways to disrupt this process.
-    return initDepGraph("")
+    return initDepGraph("", "")
 
   var raw: string
   try:
@@ -1240,17 +1431,17 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
     let e = getCurrentException()
     discarded = DepGraphDiscard(kind: dgdMalformed,
                                 stored: "unreadable: " & e.msg)
-    return initDepGraph("")
+    return initDepGraph("", "")
 
   var node: JsonNode
   try:
     node = parseJson(raw)
   except JsonParsingError as e:
     discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
-    return initDepGraph("")
+    return initDepGraph("", "")
   except Exception as e:
     discarded = DepGraphDiscard(kind: dgdMalformed, stored: e.msg)
-    return initDepGraph("")
+    return initDepGraph("", "")
 
   result = fromJson(node, config.trackedRoots, discarded)
 
@@ -1375,43 +1566,76 @@ proc loadStoredDepGraph*(config: Config; discarded: var DepGraphDiscard): DepGra
       continue
     entry.externals = filteredExternals
     result.entries[key] = entry
+# SOUNDNESS-PARAMETER WARNING (round-2 review R2-7; ENFORCED round 3, R3-7;
+# text corrected round 4, R4-5, 2026-09-24): `ccVersion` below is a soundness
+# parameter of the shape that produced defect L1 -- it is the C-toolchain half
+# of the FRESHNESS view, so the value it carries decides whether a graph
+# recorded under a DIFFERENT C toolchain is discarded as stale or accepted as
+# fresh. It no longer carries a default: the compiler now says so at the call
+# site, via the deprecated compatibility overloads in the R3-7 section below
+# (a hard error under `dev check`'s `--warningAsError:Deprecated:on`). Pass it
+# EXPLICITLY, including "" when you mean "no probe available". Full rationale
+# on those overloads, on `planner.cachePath`'s, and at R2-7/R3-7 in
+# docs/handoff/msvc-selection-layer.md.
 
-proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDiscard): DepGraph =
-  ## Load the graph and apply the FRESHNESS view for `nimVersion` (the
-  ## caller's notion of "the current Nim version" — normally
-  ## `nimprobe.cachedNimFingerprint()`): loads the graph as persisted via
-  ## `loadStoredDepGraph`, then, if its header nimVersion does not match
-  ## `nimVersion`, discards it as stale and returns an empty graph stamped
-  ## with `nimVersion` instead of the stored value.
+proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDiscard;
+                   ccVersion: string): DepGraph =
+  ## Load the graph and apply the FRESHNESS view for `nimVersion`/`ccVersion`
+  ## (the caller's notion of "the current Nim compiler / C toolchain" —
+  ## normally `nimprobe.cachedNimFingerprint()`/`ccidentity.ccVersion()`): loads
+  ## the graph as persisted via `loadStoredDepGraph`, then, if its header
+  ## nimVersion OR ccVersion does not match, discards it as stale and
+  ## returns an empty graph stamped with the REQUESTED `nimVersion`/
+  ## `ccVersion` instead of the stored values.
+  ##
+  ## `ccVersion` (W3) HAS NO DEFAULT (R3-7; this paragraph corrected in round 4,
+  ## R4-5, 2026-09-24 — it previously described a `""` default that had already
+  ## been removed, contradicting both the signature above and the R3-7 section
+  ## below). Passing `""` is still the "no probe available — test/cold-start
+  ## caller" convention `nimVersion` uses, and it still behaves exactly as
+  ## before: a stored header stamped `""` then matches and is accepted with no
+  ## C-toolchain check, while one stamped with a real cc identity mismatches
+  ## and is discarded (`ccMismatch` below). But it has to be said out loud —
+  ## `loadDepGraph(cfg, nimVersion, discarded, "")`. The pre-W3 3-arg shape
+  ## `loadDepGraph(cfg, nimVersion, discarded)` still compiles, via a
+  ## `{.deprecated.}` overload (R3-7 section below), so that choosing to
+  ## run without a cc probe appears in the diff that chooses it
+  ## instead of in whether the author knew the parameter existed.
   ##
   ## This is the loader every consumer OTHER than `clean` must use (the
   ## compile-avoidance/impact-analysis pipeline: `run`, `closure`, `list`,
-  ## ...) — a graph recorded under a different Nim compiler cannot be
-  ## trusted for staleness decisions, so it must be treated as absent.
-  ## `clean` uses `loadStoredDepGraph` directly instead (see its doc):
-  ## GCing the on-disk entry set must not depend on, or silently overwrite,
-  ## the recorded fingerprint.
+  ## ...) — a graph recorded under a different Nim compiler OR C toolchain
+  ## cannot be trusted for staleness decisions, so it must be treated as
+  ## absent. `clean` uses `loadStoredDepGraph` directly instead (see its
+  ## doc): GCing the on-disk entry set must not depend on, or silently
+  ## overwrite, the recorded fingerprints.
   ##
   ## discarded reports WHY a persisted graph was discarded at load (dgdNone
   ## when nothing was discarded); see `loadStoredDepGraph` for the
   ## dgdMalformed/dgdFormatVersion/missing-file cases, all unchanged here.
   ## On top of those, this proc adds:
   ## - Stored nimVersion present (non-"") and different from `nimVersion` →
-  ##   empty graph stamped with `nimVersion`; dgdNimVersion(stored, current).
+  ##   empty graph stamped with `nimVersion`/`ccVersion`; dgdNimVersion(stored, current).
   ## - Stored nimVersion "" with a NON-empty entries table (the
   ##   loadStoredDepGraph missing-file/malformed/format-mismatch paths
   ##   already return "" with zero entries, so this only fires for a
   ##   genuinely-stored empty-string header — legacy/test data) and
   ##   `nimVersion` also differs from "" → same treatment: dgdNimVersion.
-  ## - Otherwise (stored nimVersion == nimVersion, including "" == "") →
-  ##   loaded cleanly; whatever `loadStoredDepGraph` reported stands.
+  ## - Otherwise, the SAME two checks against `ccVersion` (W3):
+  ##   stored ccVersion observably different from `ccVersion` → empty graph
+  ##   stamped with `nimVersion`/`ccVersion`; dgdCcVersion(stored, current).
+  ##   Checked only once the nimVersion check above has already passed (a
+  ##   nimVersion mismatch is reported as dgdNimVersion, never masked by a
+  ##   simultaneous cc mismatch).
+  ## - Otherwise (stored versions == requested versions, including "" == "")
+  ##   → loaded cleanly; whatever `loadStoredDepGraph` reported stands.
   var stored = loadStoredDepGraph(config, discarded)
   if discarded.kind != dgdNone:
     # Already discarded by loadStoredDepGraph (missing file / malformed /
-    # format mismatch) — re-stamp the header with the REQUESTED version so
-    # the caller's "empty graph" carries the version it will compare
+    # format mismatch) — re-stamp the header with the REQUESTED versions so
+    # the caller's "empty graph" carries the versions it will compare
     # against on the next write, exactly as before this refactor.
-    return initDepGraph(nimVersion)
+    return initDepGraph(nimVersion, ccVersion)
 
   # A mismatch is flagged only when it is OBSERVABLE: an inert empty-string
   # header with zero entries is indistinguishable from "no file" (that is
@@ -1424,7 +1648,23 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
     discarded = DepGraphDiscard(kind: dgdNimVersion,
                                 stored: stored.header.nimVersion,
                                 current: nimVersion)
-    return initDepGraph(nimVersion)
+    return initDepGraph(nimVersion, ccVersion)
+
+  # W3: the cc-version sibling of the nimVersion check above, same
+  # observability guard (an inert "" header with zero entries never trips
+  # this on a cold-start/no-probe caller). Checked AFTER the nimVersion
+  # check has already passed, so a simultaneous nim+cc change is always
+  # reported as dgdNimVersion (nimVersion is the higher-priority signal).
+  # This ordering was inherited from decideCompile's own two arms, which round 5
+  # (R3-8) removed; it is pinned here now, by test_depgraph.nim's
+  # `test_both_versions_changed_reported_as_nim`.
+  let ccMismatch = stored.header.ccVersion != ccVersion and
+                   (stored.entries.len > 0 or stored.header.ccVersion != "")
+  if ccMismatch:
+    discarded = DepGraphDiscard(kind: dgdCcVersion,
+                                stored: stored.header.ccVersion,
+                                current: ccVersion)
+    return initDepGraph(nimVersion, ccVersion)
 
   # RFC-0009 A3c-i: depgraph-header validity for the root descriptor —
   # NEVER a cache/ledger version concern (§4), so this lives only in the
@@ -1445,18 +1685,62 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
     let cur = currentFoldPolicy(r.name, resolved)
     if not resolved:
       discarded = DepGraphDiscard(kind: dgdRootUnknown, stored: r.name)
-      return initDepGraph(nimVersion)
+      return initDepGraph(nimVersion, ccVersion)
     if cur != r.foldPolicy:
       discarded = DepGraphDiscard(kind: dgdFoldMismatch,
                                   stored: $r.foldPolicy, current: $cur)
-      return initDepGraph(nimVersion)
+      return initDepGraph(nimVersion, ccVersion)
 
   stored.header.nimVersion = nimVersion
+  stored.header.ccVersion  = ccVersion
   result = stored
 
-proc loadDepGraph*(config: Config; nimVersion: string): DepGraph =
-  ## Load the graph, discarding load provenance. See the 3-arg overload
-  ## (with the `discard: var DepGraphDiscard` out-parameter) for the full
+# SOUNDNESS-PARAMETER WARNING (round-2 review R2-7; ENFORCED round 3, R3-7;
+# text corrected round 4, R4-5, 2026-09-24): `ccVersion` below is a soundness
+# parameter of the shape that produced defect L1, for the same reason as on the
+# 4-arg overload above -- it decides whether a graph recorded under a DIFFERENT
+# C toolchain is discarded as stale or accepted as fresh. It no longer carries a
+# default: the compiler now says so at the call site, via the deprecated
+# compatibility overloads in the R3-7 section below (a hard error under `dev
+# check`'s `--warningAsError:Deprecated:on`). Pass it EXPLICITLY, including ""
+# when you mean "no probe available". Full rationale on those overloads, on
+# `planner.cachePath`'s, and at R2-7/R3-7 in
+# docs/handoff/msvc-selection-layer.md.
+proc loadDepGraph*(config: Config; nimVersion: string; ccVersion: string): DepGraph =
+  ## Load the graph, discarding load provenance. See the 4-arg overload
+  ## (with the `discarded: var DepGraphDiscard` out-parameter) for the full
   ## behavior and for observing WHY a persisted graph was discarded.
   var d: DepGraphDiscard
-  result = loadDepGraph(config, nimVersion, d)
+  result = loadDepGraph(config, nimVersion, d, ccVersion)
+
+# ---------------------------------------------------------------------------
+# R3-7 — deprecated compatibility overloads for loadDepGraph
+# ---------------------------------------------------------------------------
+##
+## `ccVersion` on both `loadDepGraph` overloads above no longer defaults to "".
+## It is the C-toolchain half of the FRESHNESS view: passing "" compares the
+## stored header against "". A graph stamped with a real cc identity trips
+## `ccMismatch` in `loadDepGraph`, which discards it and returns
+## `initDepGraph(nimVersion, "")` -- an EMPTY graph now stamped "" (a one-time
+## over-invalidation, not a per-load one). Once the caller saves that graph,
+## every later "" load finds a ""-stamped header and accepts it with no
+## C-toolchain check at all, whatever toolchain built its entries (the
+## unsound half). That is a soundness parameter with a
+## convenient default — the shape R2-7 catalogued and defect L1 was caused by —
+## and the default is exactly what made an omission invisible in review.
+##
+## These two keep every existing call site compiling (63 were measured, nearly
+## all in tests) while the compiler names the omission at the caller's own
+## file:line. Full rationale on `planner.cachePath`'s deprecated overload
+## (R3-7). No ambiguity between the two 3-arg shapes: the deprecated one's
+## third parameter is `var DepGraphDiscard`, the full one's is `ccVersion:
+## string`.
+
+proc loadDepGraph*(config: Config; nimVersion: string;
+                   discarded: var DepGraphDiscard): DepGraph
+    {.deprecated: "R3-7: pass ccVersion explicitly (\"\" when no probe is available) — omitting it checks the stored header against \"\": a graph stamped with a real C-toolchain identity is discarded, the rebuilt graph the caller then saves is stamped \"\", and a \"\"-stamped graph is accepted by every later \"\" load with no C-toolchain check, whatever toolchain built it".} =
+  loadDepGraph(config, nimVersion, discarded, "")
+
+proc loadDepGraph*(config: Config; nimVersion: string): DepGraph
+    {.deprecated: "R3-7: pass ccVersion explicitly (\"\" when no probe is available) — omitting it checks the stored header against \"\": a graph stamped with a real C-toolchain identity is discarded, the rebuilt graph the caller then saves is stamped \"\", and a \"\"-stamped graph is accepted by every later \"\" load with no C-toolchain check, whatever toolchain built it".} =
+  loadDepGraph(config, nimVersion, "")

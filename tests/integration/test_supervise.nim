@@ -32,7 +32,9 @@ proc fixtureDir(): string =
 proc ep(path: string): Entrypoint =
   ## `path` is always an absolute fixtureDir()-rooted path; relativize to
   ## repo root so testEp derives a real tag-0 tp -- runEntrypoint's own
-  ## Config resolves projectRoot to getCurrentDir() (runner.nim).
+  ## Config resolves projectRoot to getCurrentDir() (runner.nim). Its STATE
+  ## (bin/, cache/) goes to a private per-call temp dir, not the repo (R8-D3),
+  ## so concurrent runs of this suite in one tree cannot collide.
   testEp(path.relativePath(getCurrentDir()), group = "test", flags = @[])
 
 # ---------------------------------------------------------------------------
@@ -46,6 +48,13 @@ suite "runEntrypoint — A2b/A3 supervised compile+run":
     check fileExists(src)
     let o = runEntrypoint(ep(src), compileTimeoutMs = 30_000, runTimeoutMs = 10_000)
     check outcome(o) == oPassed
+    # R8-D9: on pkSpawnFailed/pkSkipped, reading `o.run.res` raises FieldDefect
+    # and hides the real cause -- surface the spawn error, then require pkRan.
+    checkpoint "compile=" & $o.compile.kind & " run=" & $o.run.kind &
+               (if o.run.kind == ptypes.pkSpawnFailed: " run.spawnError=" & o.run.spawnError else: "") &
+               (if o.compile.kind == ptypes.pkSpawnFailed: " compile.spawnError=" & o.compile.spawnError else: "") &
+               " output=" & o.output
+    require o.run.kind == ptypes.pkRan
     check o.run.res.exit.kind == ptypes.ekExited
     check o.run.res.exit.code == 0
 

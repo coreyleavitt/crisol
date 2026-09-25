@@ -55,9 +55,11 @@ proc isCaseInsensitiveVolume(dir: string): bool =
   removeFile(lowerPath)
 
 proc decodeMangledBody(raw: string): string =
-  ## The same decode `crisol/closure.nim`'s `decodeBody` performs on a
-  ## mangled manifest basename, duplicated here on purpose (std-only file).
-  ## `@s` -> path separator, `@@` -> literal `@` (protected first).
+  ## A SUBSET of the decode `crisol/closure.nim`'s `decodeBody` performs on
+  ## a mangled manifest basename, duplicated here on purpose (std-only file).
+  ## `@s` -> path separator, `@@` -> literal `@` (protected first) only --
+  ## production also decodes `@c` -> `:` and `@h` -> `#`, which these
+  ## fixture paths never contain.
   raw
     .replace("@@", "\x00")
     .replace("@s", $DirSep)

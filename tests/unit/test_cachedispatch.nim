@@ -26,6 +26,7 @@ import crisol/cachememory    # RFC-0005 A3b: memory() -- tekBackfillErr live-emi
 import crisol/cachetelemetry # RFC-0005 B2a: TelemetryEvent/InMemorySink
 import crisol/runner          # execute() -- drives a real run directly (no planner)
 import crisol/api             # verifyCachePass/VerifyCache/verifySample/VerifyDivergence
+import crisol/ccidentity      # W4 full fix: CcFingerprint/CcHalf/toolchainUnsound
 import "../support/helpers"  # legacySeams
 import "../support/testep"
 
@@ -695,6 +696,213 @@ suite "shouldStore — cache-write gate":
     let v = shouldStore(passResult(ev), isoSpec, 1, defaultCachePolicy())
     check v.store
 
+  test "toolchain unidentified → no store, cdmToolchainUnidentified":
+    ## W4 full fix: a fully/partially degraded `CcFingerprint` folds the
+    ## soundness key's cc component to a sentinel constant shared by every
+    ## host in the same degraded state — publishing under it is cross-host
+    ## cache poisoning by under-invalidation (see `cachedispatch.nim`'s own
+    ## W4 note in `shouldStore`, and RFC-0005 §trust). Modelled directly on
+    ## the `cdmHermeticityDeg` precedent just above: an otherwise-perfect
+    ## pass (full evidence, attempt 1) is STILL refused once the caller
+    ## reports the toolchain as unidentified.
+    let v = shouldStore(passResult(fullEvidence), isoSpec, 1, defaultCachePolicy(),
+                        toolchainUnidentified = true)
+    check not v.store
+    check v.decision == cdmToolchainUnidentified
+
+  test "toolchain identified (default) → the other gates still decide, unaffected":
+    ## `toolchainUnidentified` has no default since R4-4: omitting it binds
+    ## the deprecated 5-argument overload, which forwards `false` -- so a
+    ## call that omits it (as most tests in this suite do) is
+    ## unaffected by this gate.
+    let v = shouldStore(passResult(fullEvidence), isoSpec, 1, defaultCachePolicy())
+    check v.store
+    check v.decision == cdmKeyMiss
+
+# ---------------------------------------------------------------------------
+# ccidentity.toolchainUnsound — the exact trigger for shouldStore's new gate
+# ---------------------------------------------------------------------------
+#
+# W4 full fix: the trigger is NOT limited to `isFullyDegraded` (both halves
+# `cfsUnavailable`). A single degraded half is argued to be the MORE likely
+# real-world poisoning vector: many hosts sharing one common, correctly-
+# identified compiler (e.g. the same distro gcc package) whose runtime probe
+# independently fails on some subset of them (missing `ldd`, a sandboxed
+# link step, etc.) all fold that RUNTIME half to the SAME `RuntimeSentinel`
+# constant -- so two of those hosts, running genuinely different C runtimes
+# underneath, collide on the same soundness key. That is the identical
+# failure class `isFullyDegraded` was written to catch, just gated on one
+# axis instead of two, and arguably reached MORE often in practice (a
+# fleet-wide compiler match is common; total probe blindness is not).
+# `cdkNone` (a legitimately-known half with no CONTENT DIGEST -- e.g. the
+# Windows `cdVersionOnly` profile) is a different axis entirely and must
+# NOT trip this predicate -- refusing there would break every Windows
+# publish, which the task explicitly rules out.
+
+suite "ccidentity.toolchainUnsound — trigger for the store-gate refusal":
+
+  proc knownHalf(text = "gcc 13.2.0"): CcHalf =
+    CcHalf(state: cfsKnown, text: text, digest: CcDigest(kind: cdkKnown, hex: "deadbeefcafef00d"))
+
+  proc knownHalfNoDigest(text = "cl 19.44.35228"): CcHalf =
+    ## The Windows `cdVersionOnly` shape: known text, `cdkNone` digest. The
+    ## full three-component build number, as a real `cl` prints it: since R6
+    ## (round-6 review 2026-09-24) `namesCompilerVersion` requires three
+    ## components, so a two-component `cl 19.44` is itself refused.
+    CcHalf(state: cfsKnown, text: text, digest: CcDigest(kind: cdkNone))
+
+  proc unavailableHalf(): CcHalf = CcHalf(state: cfsUnavailable)
+
+  test "both halves unavailable (fully blind host) → unsound":
+    let fp = CcFingerprint(compiler: unavailableHalf(), runtime: unavailableHalf())
+    check isFullyDegraded(fp)
+    check toolchainUnsound(fp)
+
+  test "compiler known, runtime unavailable → unsound":
+    let fp = CcFingerprint(compiler: knownHalf(), runtime: unavailableHalf())
+    check not isFullyDegraded(fp)
+    check toolchainUnsound(fp)
+
+  test "compiler unavailable, runtime known → unsound":
+    let fp = CcFingerprint(compiler: unavailableHalf(), runtime: knownHalf("glibc 2.38"))
+    check not isFullyDegraded(fp)
+    check toolchainUnsound(fp)
+
+  test "both halves known → sound":
+    let fp = CcFingerprint(compiler: knownHalf(), runtime: knownHalf("glibc 2.38"))
+    check not toolchainUnsound(fp)
+
+  test "known half with no content digest (Windows cdVersionOnly) → still sound":
+    ## The digest-only gap `cdkNone` names is a DIFFERENT, already-accepted
+    ## degradation (RFC-0006 Windows profile) -- never conflated with
+    ## `cfsUnavailable`, which means the whole half's IDENTITY, not merely
+    ## its digest, could not be established.
+    let fp = CcFingerprint(compiler: knownHalfNoDigest(), runtime: knownHalf("msvcrt #abc123"))
+    check not toolchainUnsound(fp)
+
+  # -------------------------------------------------------------------------
+  # R3-2 (round-3 review): the THIRD disjunct, added in round 2 (R2-1), had no
+  # test producer anywhere -- deleting it left every suite in the tree green,
+  # and this suite's only `cdkNone` case (`knownHalfNoDigest`, then text
+  # "cl 19.44") carries a dotted token, so it asserted the pre-R2-1 EXEMPTION
+  # and never the new trigger. These four cases pin the predicate over the
+  # axis that actually decides it. `toolchainUnsound` is a pure predicate over
+  # `CcHalf`, so its input space is testable directly; after R3-1 moved the
+  # real enforcement to the producer (`ccidentity.ccIdentity`, which under
+  # `cdVersionOnly` now degrades the whole half when an answering candidate
+  # names no compiler version -- R4-1, tightened by R5-4/R6), this backstop is NOT
+  # reachable from production, which is exactly why it must be pinned here
+  # instead of through one.
+  # -------------------------------------------------------------------------
+
+  test "known digest-less half whose text has NO version token → unsound":
+    ## The fallback-`versionLine` shape: a driver exited 0 and printed
+    ## something, but nothing established that the something describes a
+    ## compiler. Two hosts with two different such drivers fold to one
+    ## `cfsKnown` half with no digest to tell them apart.
+    let fp = CcFingerprint(compiler: knownHalfNoDigest(text = "unit.c"),
+                           runtime: knownHalf("msvcrt #abc123"))
+    check not isFullyDegraded(fp)
+    check toolchainUnsound(fp)
+
+  test "the same text WITH a version token → sound (the exemption still holds)":
+    ## Differential against the case above: text is the only thing that
+    ## differs, so a regression that stops consulting it cannot hide here.
+    let fp = CcFingerprint(compiler: knownHalfNoDigest(text = "cl 19.44.35228"),
+                           runtime: knownHalf("msvcrt #abc123"))
+    check not toolchainUnsound(fp)
+
+  test "no version token but a REAL content digest → sound (POSIX shape)":
+    ## The disjunct is guarded on `digest.kind != cdkKnown` for a reason: a
+    ## content hash of the driver binary identifies it regardless of what its
+    ## banner says, so unversioned text behind a real digest is not this
+    ## defect. Pins that POSIX cannot be made unsound by banner text alone.
+    let fp = CcFingerprint(compiler: knownHalf(text = "cc"),
+                           runtime: knownHalf("glibc 2.38"))
+    check not toolchainUnsound(fp)
+
+  # R7-S3/D7 (round-7 review): `cfsNotProbed` is the ZERO VALUE of `CcHalf`,
+  # and `CcFingerprintProbe` (R5-10) makes a zero value reachable from outside
+  # `ccidentity`. "We never looked" identifies nothing, so it must fail closed
+  # exactly like `cfsUnavailable` -- it used to read as SOUND on either half.
+
+  test "the zero-value fingerprint (both halves cfsNotProbed) → unsound":
+    check toolchainUnsound(CcFingerprint())
+    check toolchainUnsoundReason(CcFingerprint()) == turBlind
+
+  test "compiler cfsNotProbed, runtime known → unsound":
+    let fp = CcFingerprint(compiler: CcHalf(state: cfsNotProbed),
+                           runtime: knownHalf("glibc 2.38"))
+    check toolchainUnsound(fp)
+    check toolchainUnsoundReason(fp) == turHalfMissing
+
+  test "compiler known, runtime cfsNotProbed → unsound":
+    let fp = CcFingerprint(compiler: knownHalf(),
+                           runtime: CcHalf(state: cfsNotProbed))
+    check toolchainUnsound(fp)
+    check toolchainUnsoundReason(fp) == turHalfMissing
+
+  test "the RUNTIME half's text is never version-checked":
+    ## Scoping pin: a runtime half is a library basename set
+    ## (`msvcRuntimeIdentity`) or a libc line, with no dotted-version
+    ## convention of its own -- applying the compiler-half rule to it would be
+    ## a category error, and would refuse every legitimate MSVC publish.
+    let fp = CcFingerprint(compiler: knownHalfNoDigest(text = "cl 19.44.35228"),
+                           runtime: CcHalf(state: cfsKnown,
+                                           text: "kernel32+libcmt+libucrt",
+                                           digest: CcDigest(kind: cdkNone)))
+    check not toolchainUnsound(fp)
+
+# ---------------------------------------------------------------------------
+# W4 full fix — end to end: a degraded run must not persist an entry at all
+# ---------------------------------------------------------------------------
+
+suite "execute — toolchain-unidentified run never reaches the cache":
+
+  test "a fully-passing run with toolchainUnidentified=true stores nothing (proven by a follow-up miss)":
+    ## Proves the refusal at the STORE layer, not merely in the reported
+    ## `cacheDecision` -- a second run against the SAME real cache root
+    ## (`rt`) and the SAME derived key must still come up a miss, because
+    ## nothing was ever written for it.
+    let dir = getTempDir() / ("crisol_w4_toolchain_" & $getCurrentProcessId())
+    removeDir(dir); createDir(dir)
+    defer: removeDir(dir)
+    let fixt = dir / "test_w4_pass.nim"
+    writeFile(fixt, "quit(0)\n")
+
+    var cfg = Config(projectRoot: dir, stateDir: ".crisol",
+                     compileTimeoutSecs: 120, timeoutSecs: 60)
+    cfg.trackedRoots = initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")
+    let spec = resolveSandbox(hlIsolated)
+    var g = emptyDepGraph()
+    let rt = localOnlyCache(dir / ".crisol", maxEntries = 0)
+    let ctx = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                         parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+
+    let epRelPath = "test_w4_pass.nim"
+    let pep1 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
+                                 edecision: edNeverBuilt, runTimeoutMs: 60_000)
+    let results1 = execute(
+      RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt),
+                           toolchainUnidentified = true)).results
+    check results1.len == 1
+    check results1[0].outcome == oPassed              # the run itself still succeeds
+    check not results1[0].cached                      # never served from cache (nothing to serve)
+    check results1[0].cacheDecision == cdmToolchainUnidentified
+
+    # Run 2: same key inputs, toolchain now reported identified. If run 1
+    # actually stored under the degraded/constant-folded key, this would
+    # come back cdmHit. It must instead run live again -- a genuine miss.
+    let pep2 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
+                                 edecision: edRunFresh, runTimeoutMs: 60_000)
+    let results2 = execute(
+      RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+    check results2.len == 1
+    check results2[0].cacheDecision != cdmHit
+    check results2[0].cacheDecision == cdmStored       # this time it DOES publish
+
 # ---------------------------------------------------------------------------
 # realSeams env-value soundness: RFC-0004 §Keys requires names+values in key.
 # ---------------------------------------------------------------------------
@@ -1321,6 +1529,81 @@ suite "RFC-0005 A3b — telemetry: realSeams.load (tekBackfillErr goes live)":
     check look.hit.isSome
     for ev in mem.events:
       check ev.kind != tekBackfillErr
+
+# ---------------------------------------------------------------------------
+# W6 (wiring-audit) / RFC-0005 :391 -- backfill-on-hit seeds the local
+# sidecar, so a LATER miss on that path is explainable.
+#
+# `StoredEntry.keyInputs` is written on every store (cachedispatch.nim,
+# cachewire.nim's encoder) and, before this fix, was read by nothing: the
+# backfill path (cachetier.nim's `lookup`, the `for j in 0 ..< idx` loop)
+# re-stores the fetched remote entry into tier "l1" via `btier.backend.put`,
+# and nothing called `writeSidecar` for it -- the explain-miss sidecar was
+# written ONLY by `realSeams.store` (a live result), never by a backfilled
+# hit. RFC-0005 :391 and its ticked checklist item :574 both described
+# "backfill seeds the sidecar" as already landed; it was not. The fix lives
+# in cachedispatch.nim's lookup adapter (`writeSidecarFor`, reached when
+# `backfilledLocal` holds), not in cachetier.nim.
+# ---------------------------------------------------------------------------
+
+suite "RFC-0005 :391 -- backfill-on-hit seeds the local sidecar":
+
+  test "a remote-tier hit that backfills l1 also seeds l1's sidecar, so a later miss is explainable":
+    let sd = freshStateDir("backfillsidecar")
+    let localRoot = sd / "cache"
+    let l1backend = localFsBackend(root = localRoot, autoCreate = true, maxEntries = 0)
+    let l2 = memory()  # the "remote" tier -- serves the genuine hit
+    var g = emptyDepGraph()
+    let spec = resolveSandbox(hlIsolated)
+    let ctx1 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 13.2.0", spec = spec,
+                          parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let rt = CacheRuntime(
+      cache: TieredCache(
+        tiers: @[
+          Tier(name: "l1", backend: l1backend, backfillOnHit: true, verifyTrust: false),
+          Tier(name: "l2", backend: l2, backfillOnHit: false, verifyTrust: false),
+        ],
+        trust: nonePolicy(),
+      ),
+      sink: NilSink[TelemetryEvent](),
+      localRoot: localRoot,
+    )
+    let pep = pepAt("tests/unit/test_backfillsidecar.nim")
+    let seams1 = realSeams(ctx1, addr g, rt)
+    let d1 = derive(seams1, pep)
+
+    # Seed l2 directly -- as if some OTHER host already published this exact
+    # key -- bypassing seams.store (which would put straight to l1 via the
+    # put rule, never exercising backfill at all).
+    discard l2.put(StoredEntry(key: d1.key, keyInputs: some(d1.inputs),
+                               result: samplePassResult(), storageVersion: storageFormatVersion))
+
+    # No sidecar exists yet: nothing has stored or backfilled locally.
+    check not fileExists(sidecarPath(localRoot, keyBytes(pep.ep.tp, testRoots)))
+
+    let look = seams1.load(pep, d1)
+    check look.hit.isSome
+    check look.hit.get.tier == "l2"
+    check look.backfillVerdicts == @[(tier: "l1", verdict: cvOk)]
+    check l1backend.get(d1.key).verdict == cvOk  # sanity: it really did backfill to l1
+
+    # RFC-0005 :391 -- a backfill-on-hit must seed the local sidecar so a
+    # LATER miss on this same path is explainable, not "no prior inputs
+    # recorded".
+    check fileExists(sidecarPath(localRoot, keyBytes(pep.ep.tp, testRoots)))
+
+    # And the sidecar must actually be USABLE for explain-miss: a later run
+    # on a DIFFERENT toolchain (the cross-host case issue #23 exists to
+    # create) misses on this path, and the miss must name kcCcVersion -- not
+    # degrade to "no prior inputs recorded" for lack of a sidecar.
+    let ctx2 = keyContext(nimVersion = "2.2.10", ccVersion = "gcc 14.0.0", spec = spec,
+                          parentEnv = @[("HOME", "/root")], protocolMajor = 1)
+    let seams2 = realSeams(ctx2, addr g, rt)
+    let d2 = derive(seams2, pep)
+    check d2.key != d1.key   # sanity: the toolchain change really does change the key
+    let look2 = seams2.load(pep, d2)
+    check look2.hit.isNone
+    check look2.explain.anyIt(it.component == kcCcVersion)
 
 # ---------------------------------------------------------------------------
 # RFC-0005 B2a — telemetry: tekVerifyFail (through the landed B3 machinery)

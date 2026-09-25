@@ -106,13 +106,13 @@ suite "rfc-0007 W1 — cgroup tier gated on cgroupKill, not delegation alone":
       var ev = sv.next(getMonoTime() + initDuration(milliseconds = 300))
       check ev.kind == weDeadline   # grace exhausted; still alive, ignoring SIGTERM
       sv.forceKill(sr.id)
-      # THE assertion: this must observe weChildExited within the deadline —
-      # i.e. killpg (the subreaper/pgid tier's mechanism) actually fired.
-      # With the W1 gate absent, this spawn would have taken a cgroup leaf
-      # anyway, forceKillCore's cgroup arm would have skipped killpg
-      # ENTIRELY, and killCgroupLeaf's write to the (forced-)absent
-      # cgroup.kill would have silently no-op'd — the child would still be
-      # alive when this deadline expires.
+      # This must observe weChildExited within the deadline — i.e. killpg
+      # (the subreaper/pgid tier's mechanism) actually fired. With the W1
+      # gate absent, this spawn would have taken a cgroup leaf anyway
+      # (killDomain kdsCgroup, asserted against below). Pre-r10,
+      # forceKillCore's cgroup arm also skipped killpg entirely, so the
+      # child would have outlived this deadline; it now always runs killpg
+      # too, so this liveness check alone no longer distinguishes the tiers.
       ev = sv.next(getMonoTime() + initDuration(seconds = 5))
       check ev.kind == weChildExited
       let report = sv.reap(ev.id)

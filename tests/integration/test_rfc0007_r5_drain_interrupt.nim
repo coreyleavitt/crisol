@@ -25,7 +25,8 @@
 ##  `sv.forceKill` on every still-live slot with NO prior `requestStop`.
 ##  Both backends' "forceKill with no prior stop act recorded" fallback
 ##  (posixcore.nim's `forceKillCore`, windows.nim's `forceKill`) then
-##  records `stop = (krTimeout, escalated: true)` — a FABRICATED timeout,
+##  records `stop = (krTimeout, …)` (posixcore: `escalated: true`; windows:
+##  `escalated: false`, per r48) — a FABRICATED timeout,
 ##  not the true interrupt authorship — because that fallback is meant for
 ##  a genuinely bare forceKill call, not this reachable "skip-grace during a
 ##  real interrupt drain" path. Consequences pinned below via the SAME r5(b)
@@ -93,13 +94,20 @@ when defined(posix):
   import crisol/process/types as ptypes  # r58: Cause/KillReason field access
   import crisol/depgraph
   import crisol/closure   # SourceIndex, buildSourceIndex
-  import crisol/ccprobe   # RunProc
+  import crisol/toolrun   # RunProc
   import crisol/runner
   import crisol/cachedispatch  # r35: cacheEnabled/defaultCachePolicy/CacheSeams
   import crisol/sandbox        # r35: resolveSandbox/hlIsolated
   import crisol/resultcache    # r35: CachedResult
   import "../support/testep"
   import "../support/helpers"  # r35: legacySeams
+  import "../support/statedir"
+
+  # R8-D3: this process's own crisol state dir -- never the repo root's shared
+  # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+  # run in the same tree would race (slot binaries / nimcache JSON deleted
+  # mid-compile).
+  let testStateDir = processStateDir("r5drain")
 
   proc fixtureDir(): string =
     let thisFile = currentSourcePath()
@@ -114,6 +122,7 @@ when defined(posix):
       compileTimeoutSecs: 60,
       timeoutSecs:        30,
       projectRoot:        getCurrentDir(),
+      stateDir:           testStateDir,
       trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
     )
 

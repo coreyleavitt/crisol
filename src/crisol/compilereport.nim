@@ -69,7 +69,18 @@ import crisol/artifactid
 import crisol/stats       # for median/mad/isRegression — M-report PASS (b2)
 
 type
-  SegmentKey = tuple[groupId, configHash: string]
+  SegmentKey = tuple[groupId, configHash, toolchainFp: string]
+    ## W9l: `toolchainFp` joined the segment key alongside `groupId`/
+    ## `configHash` -- PARTITION, not refuse (see module doc). Rows from two
+    ## different toolchains for the same (groupId, configHash) now land in
+    ## two DIFFERENT segments instead of being pooled into one rTime/rSize
+    ## that can't tell "code got slower" from "the compiler changed". A
+    ## toolchain upgrade shows up as a brand-new segment (0 history) rather
+    ## than silently distorting the old one's running numbers -- exactly
+    ## `groupId`/`configHash`'s own existing precedent (a config change
+    ## already starts a fresh segment, never blends into the old config's
+    ## ratio). Pre-W9l rows (`toolchainFp == ""`) form their own
+    ## "unknown toolchain" segment rather than crashing or guessing.
   UnitKey = tuple[identity, basename: string]
 
 const TopUnitsLimit = 10
@@ -140,14 +151,15 @@ proc toArtifactRecord(row: ArtifactRow): ArtifactRecord =
     ccTimeUs:           row.ccTimeUs,
   )
 
-proc segKeyOf(groupId, configHash: string): SegmentKey {.inline.} =
-  (groupId: groupId, configHash: configHash)
+proc segKeyOf(groupId, configHash, toolchainFp: string): SegmentKey {.inline.} =
+  (groupId: groupId, configHash: configHash, toolchainFp: toolchainFp)
 
 proc sortedSegmentKeys(keys: HashSet[SegmentKey]): seq[SegmentKey] =
   for k in keys: result.add k
   result.sort(proc(a, b: SegmentKey): int =
     if a.groupId != b.groupId: cmp(a.groupId, b.groupId)
-    else: cmp(a.configHash, b.configHash))
+    elif a.configHash != b.configHash: cmp(a.configHash, b.configHash)
+    else: cmp(a.toolchainFp, b.toolchainFp))
 
 proc countArtifactsShared(segArtifacts: seq[ArtifactRow]): int =
   ## Count of reusable-unit ROWS (mirroring `artifactsTotal`'s own row-count
@@ -255,6 +267,19 @@ proc computeCompileRegressions*(costRows: seq[CompileCostRow];
   ## threshold, or with insufficient history (< sampleFloor prior rows),
   ## are absent. Deterministic order: entrypointIdentity string ascending.
   ##
+  ## W9l: history is additionally restricted to rows whose `toolchainFp`
+  ## MATCHES the current row's — this is the concrete failure mode the
+  ## defect names ("a slower new compiler reads as a code regression"). A
+  ## prior-toolchain row is simply not counted toward `sampleFloor`/the
+  ## baseline for an entrypoint that just crossed a toolchain upgrade — the
+  ## first `sampleFloor` compiles under the NEW toolchain build up a fresh
+  ## baseline from scratch, exactly like an entrypoint with no history at
+  ## all, rather than comparing against numbers measured under a different
+  ## compiler. `toolchainFp == ""` (pre-W9l rows, or a caller that never
+  ## sets it) matches ONLY other `""` rows — no worse than the ungated
+  ## behavior for callers that don't populate the field, and no silent
+  ## cross-toolchain pooling for callers that do.
+  ##
   ## ALWAYS returns a JArray (present-but-possibly-empty) — mirrors the
   ## top-level `regressions` array's convention — never nil.
   result = newJArray()
@@ -267,8 +292,19 @@ proc computeCompileRegressions*(costRows: seq[CompileCostRow];
     if row.timestamp >= currentRunStartUs:
       if ik notin currentByIdentity or row.timestamp > currentByIdentity[ik].timestamp:
         currentByIdentity[ik] = row
-    else:
-      historyByIdentity.mgetOrPut(ik, newSeq[int64]()).add compileTotalUs(row)
+
+  for row in costRows:
+    let ik = $row.entrypointIdentity
+    if row.timestamp >= currentRunStartUs:
+      continue
+    # W9l: only count this prior row toward ik's baseline if it was measured
+    # under the SAME toolchain as ik's current-run row (or ik has no
+    # current-run row at all, in which case this history is never read —
+    # see the `identities` loop below, which only ever looks up
+    # `currentByIdentity`).
+    if ik in currentByIdentity and row.toolchainFp != currentByIdentity[ik].toolchainFp:
+      continue
+    historyByIdentity.mgetOrPut(ik, newSeq[int64]()).add compileTotalUs(row)
 
   var identities: seq[string]
   for ik in currentByIdentity.keys: identities.add ik
@@ -354,22 +390,20 @@ proc buildCompileBlock*(artifactRows: seq[ArtifactRow];
   if artifactRows.len == 0 and costRows.len == 0:
     return nil
 
-  # Reuse ratios — delegated entirely to artifactid.reuseRatios.
-  var records = newSeq[ArtifactRecord](artifactRows.len)
-  for i, row in artifactRows:
-    records[i] = toArtifactRecord(row)
-  let ratiosBySegment = reuseRatios(records)
-
   # Group each stream's raw rows by segment (independent segmentation —
-  # a segment may appear in only one of the two tables below).
+  # a segment may appear in only one of the two tables below). W9l:
+  # `toolchainFp` is now part of the segment key (see SegmentKey's doc) —
+  # partitioned here, BEFORE anything computes a ratio, so two toolchains'
+  # rows for the same (groupId, configHash) never reach the same
+  # `reuseRatios` call.
   var artifactsBySegment: Table[SegmentKey, seq[ArtifactRow]]
   for row in artifactRows:
-    artifactsBySegment.mgetOrPut(segKeyOf(row.groupId, row.configHash),
+    artifactsBySegment.mgetOrPut(segKeyOf(row.groupId, row.configHash, row.toolchainFp),
                                   newSeq[ArtifactRow]()).add row
 
   var costsBySegment: Table[SegmentKey, seq[CompileCostRow]]
   for row in costRows:
-    costsBySegment.mgetOrPut(segKeyOf(row.groupId, row.configHash),
+    costsBySegment.mgetOrPut(segKeyOf(row.groupId, row.configHash, row.toolchainFp),
                               newSeq[CompileCostRow]()).add row
 
   var allKeys: HashSet[SegmentKey]
@@ -380,7 +414,22 @@ proc buildCompileBlock*(artifactRows: seq[ArtifactRow];
   for key in sortedSegmentKeys(allKeys):
     let segArtifacts = artifactsBySegment.getOrDefault(key, newSeq[ArtifactRow]())
     let segCosts = costsBySegment.getOrDefault(key, newSeq[CompileCostRow]())
-    let ratios = ratiosBySegment.getOrDefault(key, ReuseRatios())
+
+    # Reuse ratios — delegated entirely to artifactid.reuseRatios, called
+    # PER SEGMENT (never globally): `segArtifacts` is already scoped to this
+    # exact (groupId, configHash, toolchainFp) triple, so `reuseRatios`
+    # (which groups by (groupId, configHash) alone — it has no toolchain
+    # concept of its own) yields at most the ONE entry for THIS segment's
+    # (groupId, configHash) pair; a different toolchain's same-(groupId,
+    # configHash) rows were already routed to a different `segArtifacts`
+    # slice above and never enter this call.
+    let ratios =
+      if segArtifacts.len == 0: ReuseRatios()
+      else:
+        var records = newSeq[ArtifactRecord](segArtifacts.len)
+        for i, row in segArtifacts: records[i] = toArtifactRecord(row)
+        reuseRatios(records).getOrDefault(
+          (groupId: key.groupId, configHash: key.configHash), ReuseRatios())
 
     var codegenSum, ccSum, linkSum: int64
     for c in segCosts:
@@ -397,6 +446,7 @@ proc buildCompileBlock*(artifactRows: seq[ArtifactRow];
     let segNode = newJObject()
     segNode["groupId"]         = newJString(key.groupId)
     segNode["configHash"]      = newJString(key.configHash)
+    segNode["toolchainFp"]     = newJString(key.toolchainFp)  # W9l
     segNode["rTime"]           = newJFloat(ratios.rTime)
     segNode["rSize"]           = newJFloat(ratios.rSize)
     segNode["ccPct"]           = newJFloat(ccPct)

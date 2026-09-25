@@ -16,6 +16,7 @@
 
 import std/[json, monotimes, options, os, sequtils, sets, strutils, times, unittest]
 import ../support/capture
+import ../support/statedir
 import crisol/types
 import crisol/jsonout
 import crisol/paths
@@ -497,6 +498,7 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
       (cdmClosureUnrecorded, cvMiss, "miss"),
       (cdmRecomputeMiss, cvOk, "ok"),
       (cdmStored, cvTrustBadSignature, "trustBadSignature"),  # E2E-A-trust's own case
+      (cdmToolchainUnidentified, cvMiss, "miss"),  # W4 full fix: consulted, refused to store
     ]
     for (dec, verdict, expected) in cases:
       # r41: presence additionally requires the really-consulted signal
@@ -725,16 +727,18 @@ suite "jsonout A8 — cache reporting fields":
     ## M8 rev 6: cdmStored and cdmGroupOptOut added.
     ## R9: cdmClosureUnrecorded added; all 9 variants covered.
     ## rfc-0007 A1d-ii (rev 17): cdmRecomputeMiss added; 10 variants covered.
-    check cacheDecisionString(cdmNotEligible)       == "notEligible"
-    check cacheDecisionString(cdmHit)               == "hit"
-    check cacheDecisionString(cdmStored)            == "stored"
-    check cacheDecisionString(cdmKeyMiss)           == "keyMiss"
-    check cacheDecisionString(cdmHermeticityDeg)    == "hermeticityDegraded"
-    check cacheDecisionString(cdmGroupOptOut)       == "groupOptOut"
-    check cacheDecisionString(cdmPolicyDisabled)    == "policyDisabled"
-    check cacheDecisionString(cdmFlaky)             == "flaky"
-    check cacheDecisionString(cdmClosureUnrecorded) == "closureUnrecorded"
-    check cacheDecisionString(cdmRecomputeMiss)     == "recomputeMiss"
+    ## W4 full fix: cdmToolchainUnidentified added; 11 variants covered.
+    check cacheDecisionString(cdmNotEligible)           == "notEligible"
+    check cacheDecisionString(cdmHit)                   == "hit"
+    check cacheDecisionString(cdmStored)                == "stored"
+    check cacheDecisionString(cdmKeyMiss)                == "keyMiss"
+    check cacheDecisionString(cdmHermeticityDeg)        == "hermeticityDegraded"
+    check cacheDecisionString(cdmGroupOptOut)           == "groupOptOut"
+    check cacheDecisionString(cdmPolicyDisabled)        == "policyDisabled"
+    check cacheDecisionString(cdmFlaky)                 == "flaky"
+    check cacheDecisionString(cdmClosureUnrecorded)     == "closureUnrecorded"
+    check cacheDecisionString(cdmRecomputeMiss)         == "recomputeMiss"
+    check cacheDecisionString(cdmToolchainUnidentified) == "toolchainUnidentified"
 
   test "default-constructed result reports notEligible cacheDecision":
     let node = toJson(syntheticResults(), syntheticSummary())
@@ -965,6 +969,17 @@ template withFreshCrisolStateDir(tag: string, body: untyped) =
 
 suite "jsonout - --json CLI flag":
 
+  # R8-D3: every `run` below has no --config and so roots at the repo; without
+  # this its state (bin/, cache/, depgraph, lastrun.json) and lock would be
+  # <repo>/.crisol, shared with -- and raced by -- any concurrent crisol run in
+  # the same tree. (The two Issue-2 tests nest their own fresh dir inside.)
+  setup:
+    let isoState = freshStateDir("jsonout_cli")
+    let savedStateEnv = redirectStateDir(isoState)
+  teardown:
+    restoreStateDir(savedStateEnv)
+    removeDir(isoState)
+
   proc fixtureDir(): string =
     let thisFile = currentSourcePath()
     let testsDir = thisFile.parentDir.parentDir
@@ -1064,12 +1079,13 @@ suite "jsonout - --json CLI flag":
     let parsed = parseJson(readFile(outPath).strip())
     check parsed["schema"].getStr == "crisol/run/v2"
 
-  test "without --json: lastrun.json is written to .crisol/":
-    ## runMain uses loadConfig() which roots at getCurrentDir().
-    ## Verify lastrun.json is created after a normal (non-json) run.
+  test "without --json: lastrun.json is written to the state dir":
+    ## Verify lastrun.json is created after a normal (non-json) run. The
+    ## state dir is the suite's isolated one (CRISOL_STATE_DIR, see setup),
+    ## which starts empty -- so the file can only come from this run.
     let fd        = fixtureDir()
-    let statePath = getCurrentDir() / ".crisol" / "lastrun.json"
-    try: removeFile(statePath) except: discard
+    let statePath = isoState / "lastrun.json"
+    check not fileExists(statePath)
 
     # Suppress human-render stdout so test output stays clean.
     let outPath = getTempDir() / "crisol_nojson_stdout.txt"

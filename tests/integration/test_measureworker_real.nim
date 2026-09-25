@@ -19,6 +19,9 @@
 ##      artifactid.artifactKeyHash over the same inputs; sizeBytes is
 ##      positive and matches the real file size; ccTimeUs is positive;
 ##      groupId/configHash are carried through from the plan.
+##   3b. Every ArtifactRow AND the CompileCostRow carry the plan's
+##      toolchainFp verbatim (W9l / L1: the worker's hop of the toolchain
+##      fingerprint producer chain).
 ##   4. An unwritable stateDir (a FILE sitting where the ledger needs a
 ##      directory) does NOT fail the compile: exit 0, binary still built,
 ##      zero rows recorded, a warning on stderr.
@@ -35,6 +38,8 @@ import crisol/artifactledger
 import crisol/compilecost
 import crisol/artifactid
 import crisol/closure
+import crisol/paths      # CR3: TrackedRoots, to recompute the same way the
+                          # real worker's `measureworker.planRoots` does
 
 let projectRoot = currentSourcePath().parentDir.parentDir.parentDir
   # test is at tests/integration/; go up 2 -> project root (mirrors
@@ -61,6 +66,9 @@ proc buildPlan(workDir: string): MeasurePlan =
     configHash:        "test-config-hash",
     stateDir:          workDir / "state",
     projectRoot:       projectRoot,
+    # W9l / L1: a distinctive value the worker cannot produce on its own --
+    # it must copy this through onto every row, never re-probe or blank it.
+    toolchainFp:       "f00dfacecafebeef",
   )
 
 proc writePlan(plan: MeasurePlan; workDir: string): string =
@@ -120,6 +128,13 @@ suite "crisol --internal-measure-compile — real worker end-to-end (pass_always
     let manifest = parseCompileManifest(manifestPath)
     let entryBasename = "@mpass_always.nim.c"
     let knownStrings = @[plan.nimcacheDir, plan.outputBinPath.parentDir()]
+    # CR3: the real worker's `recordArtifactRows` now threads a real
+    # project-only `TrackedRoots` into `ccIncludeClosure` (`measureworker.
+    # planRoots(plan)`) — recompute the SAME way here, or this independent
+    # recomputation would silently diverge from what was actually recorded.
+    let roots = initTrackedRoots(plan.projectRoot,
+                                 newSeq[tuple[name, native: string]](),
+                                 plan.stateDir)
 
     var ccCmdByBasename: Table[string, string]
     var cPathByBasename: Table[string, string]
@@ -132,6 +147,7 @@ suite "crisol --internal-measure-compile — real worker end-to-end (pass_always
     for r in rows:
       check r.groupId == plan.groupId
       check r.configHash == plan.configHash
+      check r.toolchainFp == plan.toolchainFp   # L1: threaded, not re-derived
       check r.sizeBytes > 0
       check r.ccTimeUs > 0
       check r.sizeBytes == getFileSize(cPathByBasename[r.artifactBasename])
@@ -143,7 +159,8 @@ suite "crisol --internal-measure-compile — real worker end-to-end (pass_always
       let rawContent = readFile(cPathByBasename[r.artifactBasename])
       let normalized = normalize(rawContent, knownStrings)
       let normalizedCcCmd = normalize(ccCmdByBasename[r.artifactBasename], knownStrings)
-      let closureRes = ccIncludeClosure(ccCmdByBasename[r.artifactBasename])
+      let closureRes = ccIncludeClosure(ccCmdByBasename[r.artifactBasename],
+                                        roots = roots)
       check closureRes.ok
       let expectedKeyHash = artifactKeyHash(normalized, closureRes.contentHash, normalizedCcCmd)
       check r.keyHash == expectedKeyHash
@@ -170,6 +187,7 @@ suite "crisol --internal-measure-compile — real worker end-to-end (pass_always
     check row.codegenUs + row.ccUs + row.linkUs > 0   # a real compile took SOME time
     check row.groupId == plan.groupId
     check row.configHash == plan.configHash
+    check row.toolchainFp == plan.toolchainFp   # L1: same contract as ArtifactRow
     check row.rowVersion == currentCompileCostRowVersion
 
     # Identity must match every ArtifactRow's identity for the SAME compile.

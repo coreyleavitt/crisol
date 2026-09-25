@@ -16,6 +16,9 @@ import crisol/types
 import crisol/jsonout
 import crisol/depgraph
 import crisol/nimprobe  # for cachedNimFingerprint (the fingerprint runMain seeds/reads with)
+import crisol/ccidentity  # W3: for cachedCcVersion (runMain now also threads this into
+                        # loadDepGraph via api.nim's planImpl -- see the seed graph
+                        # comment below)
 import crisol/planner  # for CrisolProtocolMajor
 
 import crisol/process/types as ptypes
@@ -84,9 +87,18 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
     ## We seed the dep graph manually before calling runMain.  The seed graph
     ## MUST use cachedNimFingerprint() — the same runtime fingerprint runMain
     ## now threads into loadDepGraph (via api.nim's cachedNimFingerprint(),
-    ## not the compile-time crisolNimVersion string) — or the graph is
-    ## treated as version-mismatched (cold-start empty), the precise closure
-    ## is lost, and the ep is force-run instead of narrowed away.
+    ## not the compile-time crisolNimVersion string) — AND, since the W3
+    ## liveness fix (api.nim's planImpl now threads a real `$ccProbe()` into
+    ## buildRunPlan instead of silently defaulting to ""; `ccProbe` defaults
+    ## to ccidentity.cachedCcFingerprint, and cachedCcVersion() is exactly
+    ## `$cachedCcFingerprint()`), it must ALSO use cachedCcVersion() — or the
+    ## graph is treated as toolchain-mismatched (dgdCcVersion, same
+    ## "cold-start empty" treatment nimVersion mismatch already got), the
+    ## precise closure is lost, and the ep is force-run instead of narrowed
+    ## away. Both probes are memoized per process (the C toolchain in
+    ## ccidentity.nim's cachedCcFingerprint, Nim in nimprobe.nim's
+    ## cachedNimFingerprint), so calling them here and letting runMain's own
+    ## planImpl probe again below observes the SAME values.
     ##
     ## With a precise graph + empty changedSet, narrowByDiff excludes the ep
     ## (closure ∩ {} = ∅) → runnable == 0 → useChanged branch → exit 0.
@@ -101,8 +113,9 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
       "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n")
 
     # Seed the dep graph: one entry for test_a.nim, closure = {test_a.nim}.
-    # nimVersion=cachedNimFingerprint() matches what runMain passes to
-    # loadDepGraph, so the seeded graph is read back as a precise (non-stale) match.
+    # nimVersion=cachedNimFingerprint()/ccVersion=cachedCcVersion() match what
+    # runMain passes to loadDepGraph, so the seeded graph is read back as a
+    # precise (non-stale) match.
     let epPath = "tests/unit/test_a.nim"
     let fHash  = flagHash(@[])
     var cfg = Config(
@@ -123,7 +136,7 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
     cfg.trackedRoots = initTrackedRoots(repo, @[], "")
     let closureSet = [fromCanonical(epPath, cfg.trackedRoots).get].toHashSet
     let cHash  = closureContentHash(@[(key: epPath, nativePath: repo / epPath)])
-    var graph  = initDepGraph(cachedNimFingerprint())
+    var graph  = initDepGraph(cachedNimFingerprint(), cachedCcVersion())
     graph.updateEntry(
       epPath, fHash, closureSet,
       closureHash   = cHash,

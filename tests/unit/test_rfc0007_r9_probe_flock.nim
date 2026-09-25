@@ -1,5 +1,5 @@
 ## test_rfc0007_r9_probe_flock.nim — rfc-0007 code-review finding r9:
-## `probeFlock` (process/posixcore.nim) opened a FULLY PREDICTABLE path —
+## `probeFlock` (process/caps.nim) opened a FULLY PREDICTABLE path —
 ## `getTempDir() / "crisol-flock-probe-<pid>"` — with Nim's plain
 ## `open(path, fmWrite)` (`O_CREAT|O_TRUNC`, no `O_EXCL`/`O_NOFOLLOW`). A
 ## local attacker in shared `/tmp` could pre-plant ANYTHING at that exact

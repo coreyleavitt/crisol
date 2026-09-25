@@ -7,11 +7,14 @@
 ##   - Atomic/valid: after save, on-disk file is valid JSON.
 ##   - (path,flagHash) keying: same path, two flagHashes → two distinct entries.
 ##   - Nim-version mismatch → empty: different nim version → empty graph.
+##   - Toolchain-staleness gate (R3-8): nim/cc mismatch → the right discard
+##     reason and a replacement header stamped with the REQUESTED versions;
+##     nim-before-cc priority; success-path header re-stamp.
 ##   - Missing-file trigger: isEntryStale with absent closure file → true.
 ##   - Deleted-entrypoint GC: gcDeletedEntrypoints drops unlisted keys.
 ##   - Missing file → empty graph: loadDepGraph on missing depgraph → empty, no raise.
 
-import std/[options, os, sets, json, tables]
+import std/[options, os, sets, json, tables, strutils]
 import crisol/types
 import crisol/depgraph
 import ../support/symlinkprobe
@@ -203,6 +206,179 @@ block test_nim_version_match_entries_present:
   assert g2.entries.len == 1, "expected 1 entry on nim-version match"
 
 # ---------------------------------------------------------------------------
+# Test: cc-version mismatch → empty graph (W3, nimVersion's sibling check)
+# ---------------------------------------------------------------------------
+
+block test_cc_version_mismatch_empty:
+  let root = getTempDir() / "crisol_depgraph_ccversion"
+  createDir(root)
+  defer: removeDir(root)
+  ensureStateDirExists(root)
+
+  let cfg = makeTmpConfig(root)
+  var g = initDepGraph("2.2.10", "cc-OLD")
+  let fh = flagHash(@[])
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
+  doAssert saveDepGraph(g, cfg)
+
+  # Same nim version, DIFFERENT cc version → should get empty graph.
+  let g2 = loadDepGraph(cfg, "2.2.10", "cc-NEW")
+  assert g2.entries.len == 0,
+    "expected empty graph on cc-version mismatch, got " & $g2.entries.len & " entries"
+
+block test_cc_version_match_entries_present:
+  let root = getTempDir() / "crisol_depgraph_ccversion2"
+  createDir(root)
+  defer: removeDir(root)
+  ensureStateDirExists(root)
+
+  let cfg = makeTmpConfig(root)
+  var g = initDepGraph("2.2.10", "cc-OLD")
+  let fh = flagHash(@[])
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
+  doAssert saveDepGraph(g, cfg)
+
+  let g2 = loadDepGraph(cfg, "2.2.10", "cc-OLD")
+  assert g2.entries.len == 1, "expected 1 entry on cc-version match"
+  assert g2.header.ccVersion == "cc-OLD", "loaded header cc version mismatch: " & g2.header.ccVersion
+
+# ---------------------------------------------------------------------------
+# Test: the toolchain-staleness gate is HERE, and nowhere else
+#
+# R3-8, round 5, 2026-09-24. `planner.decideCompile` used to carry two arms of
+# its own -- `graph.header.nimVersion != nimVersion` and its ccVersion twin,
+# each returning cdStale -- with two cases in tests/unit/test_freshness.nim
+# hand-building a mismatched-header graph to reach them. Those arms could never
+# fire on a graph that came through `loadDepGraph` (it discards a mismatched
+# graph, and re-stamps the header on the success path), so they were removed
+# along with the parameters they read, and their coverage moved HERE, to the
+# mechanism that is genuinely live.
+#
+# The two blocks above already prove the entries-are-dropped half. These add
+# what the moved cases were really asserting and what the two above leave
+# implicit: the discard REASON that the caller surfaces as a ConfigWarning, the
+# REQUESTED-not-stored header stamp on the discarded-graph replacement, the
+# nim-before-cc priority when both moved, and the success-path re-stamp that is
+# the whole reason `decideCompile` can trust `graph.header`.
+# ---------------------------------------------------------------------------
+
+block test_nim_version_mismatch_reason_and_stamp:
+  let root = getTempDir() / "crisol_depgraph_nimver_reason"
+  createDir(root)
+  defer: removeDir(root)
+  ensureStateDirExists(root)
+
+  let cfg = makeTmpConfig(root)
+  var g = initDepGraph("2.2.10", "cc-OLD")
+  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"))
+  doAssert saveDepGraph(g, cfg)
+
+  var discarded = DepGraphDiscard(kind: dgdNone)
+  let g2 = loadDepGraph(cfg, "2.4.0", discarded, "cc-OLD")
+
+  doAssert discarded.kind == dgdNimVersion,
+    "nim-version mismatch must be reported as dgdNimVersion, got " & $discarded.kind
+  doAssert discarded.stored == "2.2.10",
+    "discard provenance lost the STORED nim version: " & discarded.stored
+  doAssert discarded.current == "2.4.0",
+    "discard provenance lost the CURRENT nim version: " & discarded.current
+  doAssert g2.entries.len == 0,
+    "expected empty graph on nim-version mismatch, got " & $g2.entries.len & " entries"
+
+  # The replacement graph is stamped with the REQUESTED versions, never the
+  # stored ones -- this is what makes `header.X == X` an invariant for every
+  # downstream reader of the returned graph (planner.decideCompile among them).
+  doAssert g2.header.nimVersion == "2.4.0",
+    "replacement header kept the STORED nim version: " & g2.header.nimVersion
+  doAssert g2.header.ccVersion == "cc-OLD",
+    "replacement header lost the requested cc version: " & g2.header.ccVersion
+
+block test_cc_version_mismatch_reason_and_stamp:
+  let root = getTempDir() / "crisol_depgraph_ccver_reason"
+  createDir(root)
+  defer: removeDir(root)
+  ensureStateDirExists(root)
+
+  let cfg = makeTmpConfig(root)
+  var g = initDepGraph("2.2.10", "cc-OLD")
+  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"))
+  doAssert saveDepGraph(g, cfg)
+
+  # Same nim version, DIFFERENT cc version: the cc-only change that W3 exists
+  # for, and the one an unchanged `nimVersion` used to hide entirely.
+  var discarded = DepGraphDiscard(kind: dgdNone)
+  let g2 = loadDepGraph(cfg, "2.2.10", discarded, "cc-NEW")
+
+  doAssert discarded.kind == dgdCcVersion,
+    "cc-version mismatch must be reported as dgdCcVersion, got " & $discarded.kind
+  doAssert discarded.stored == "cc-OLD",
+    "discard provenance lost the STORED cc version: " & discarded.stored
+  doAssert discarded.current == "cc-NEW",
+    "discard provenance lost the CURRENT cc version: " & discarded.current
+  doAssert g2.entries.len == 0,
+    "expected empty graph on cc-version mismatch, got " & $g2.entries.len & " entries"
+  doAssert g2.header.ccVersion == "cc-NEW",
+    "replacement header kept the STORED cc version: " & g2.header.ccVersion
+  doAssert g2.header.nimVersion == "2.2.10",
+    "replacement header lost the requested nim version: " & g2.header.nimVersion
+
+block test_both_versions_changed_reported_as_nim:
+  ## A simultaneous nim+cc move is ONE discard, reported as dgdNimVersion:
+  ## nimVersion is the higher-priority signal, and the cc arm is only reached
+  ## once the nim arm has passed. Asserted so the priority is a test, not just
+  ## a sentence in `loadDepGraph`'s doc.
+  let root = getTempDir() / "crisol_depgraph_bothver"
+  createDir(root)
+  defer: removeDir(root)
+  ensureStateDirExists(root)
+
+  let cfg = makeTmpConfig(root)
+  var g = initDepGraph("2.2.10", "cc-OLD")
+  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"))
+  doAssert saveDepGraph(g, cfg)
+
+  var discarded = DepGraphDiscard(kind: dgdNone)
+  let g2 = loadDepGraph(cfg, "2.4.0", discarded, "cc-NEW")
+
+  doAssert discarded.kind == dgdNimVersion,
+    "a simultaneous nim+cc move must report dgdNimVersion, got " & $discarded.kind
+  doAssert g2.entries.len == 0, "expected empty graph when both versions moved"
+  doAssert g2.header.nimVersion == "2.4.0" and g2.header.ccVersion == "cc-NEW",
+    "replacement header not stamped with BOTH requested versions: " &
+    g2.header.nimVersion & " / " & g2.header.ccVersion
+
+block test_success_path_restamps_header_to_live_versions:
+  ## The invariant `planner.decideCompile` relies on (R3-8): on the NON-discard
+  ## path the loader still overwrites the header with the requested versions, so
+  ## no caller downstream of `loadDepGraph` can ever observe a header that
+  ## disagrees with the live toolchain.
+  ##
+  ## An inert `""`/`""` header with zero entries is the one shape that reaches
+  ## the success path while differing from the requested values: it is
+  ## indistinguishable from "no file", so the observability guards leave it
+  ## dgdNone (see `loadDepGraph`'s doc) -- which makes it the only way to watch
+  ## the re-stamp actually happen rather than coincide with the stored values.
+  let root = getTempDir() / "crisol_depgraph_restamp"
+  createDir(root)
+  defer: removeDir(root)
+  ensureStateDirExists(root)
+
+  let cfg = makeTmpConfig(root)
+  doAssert saveDepGraph(initDepGraph("", ""), cfg)
+
+  var discarded = DepGraphDiscard(kind: dgdNone)
+  let g2 = loadDepGraph(cfg, "2.2.10", discarded, "cc-NEW")
+
+  doAssert discarded.kind == dgdNone,
+    "an inert empty header must not be reported as a discard, got " & $discarded.kind
+  doAssert g2.header.nimVersion == "2.2.10",
+    "success path did not re-stamp header.nimVersion: " & g2.header.nimVersion
+  doAssert g2.header.ccVersion == "cc-NEW",
+    "success path did not re-stamp header.ccVersion: " & g2.header.ccVersion
+
+echo "test_depgraph: toolchain-staleness gate (R3-8 moved coverage)"
+
+# ---------------------------------------------------------------------------
 # Test: missing-file trigger — isEntryStale
 # ---------------------------------------------------------------------------
 
@@ -380,7 +556,18 @@ echo "PASS test_depgraph"
 # ---------------------------------------------------------------------------
 
 block test_format_version_pin:
-  ## DepGraphFormatVersion is 8 as of RFC-0009 F13 (wiring-audit finding):
+  ## DepGraphFormatVersion is 9 as of W3 (wiring-audit finding, re-verified
+  ## 2026-09-21): the header gains `ccVersion` -- the depgraph-header sibling
+  ## of `nimVersion` -- so `loadDepGraph` can finally see a C toolchain change
+  ## and discard a cc-mismatched graph (`dgdCcVersion`). W3 also wired it into
+  ## `decideCompile`, previously blind to cc; R3-8 (round 5) later deleted both
+  ## of `decideCompile`'s staleness arms, so `loadDepGraph`'s discard is now
+  ## the only toolchain gate. See DepGraphFormatVersion's own
+  ## History doc (depgraph.nim) for why the bump is taken (discard, not
+  ## silent misparse) even though `ccVersion` is parsed leniently (absent ->
+  ## "", mirroring `roots`' v6 precedent).
+  ##
+  ## DepGraphFormatVersion was 8 as of RFC-0009 F13 (wiring-audit finding):
   ## `entry.externals[].source`/`.headers` are now serialized in the SAME
   ## portable `paths.keyBytes` spelling `entry.closure` members already use
   ## (`dep:<name>/<rel>` for a dep-root source/header) instead of a
@@ -405,8 +592,8 @@ block test_format_version_pin:
   ## tracked compile inputs recorded per-external in `externals`.)
   ## Bump this pin only together with a History entry in depgraph.nim and a
   ## CHANGELOG "BREAKING CHANGE — dependency graph format N" section.
-  assert DepGraphFormatVersion == 8,
-    "DepGraphFormatVersion pin: expected 8 (RFC-0009 F13), got " & $DepGraphFormatVersion
+  assert DepGraphFormatVersion == 9,
+    "DepGraphFormatVersion pin: expected 9 (W3), got " & $DepGraphFormatVersion
 
   # A v4 graph on disk is treated as absent (discarded, not migrated).
   let root = getTempDir() / ("crisol_depgraph_v4pin_" & $getCurrentProcessId())
@@ -504,3 +691,61 @@ block test_deproot_closure_member_round_trip:
     if tp.display() == "src/foo.nim":
       doAssert not tp.isProject,
         "dep-root member came back as a phantom tag-0 project path"
+
+# -----------------------------------------------------------------------------
+# Code review 2026-09-21: the dgdCcVersion discard message must name BOTH halves
+#
+# W3 added the cc-toolchain discard arm and rendered it with
+# `sanitizeHeaderField(pipeAware = true)`, whose doc asserted that rule was
+# "a harmless no-op truncation" for a cc fingerprint. It is not. That rule
+# splits on the FINAL '|' and keeps only the last 12 characters after it --
+# correct for the Nim fingerprint, whose tail really is a bare binary hash,
+# and destructive for ccVersion, whose tail is the RUNTIME IDENTITY.
+#
+# Observed before the fix, in test_zero_runnable.nim's own output:
+#   current toolchain is cc (SUSE Linux) 16.2.0 #b0dd4cd034d13600|390a4be6deb6
+# The entire `ldd (GNU libc) 2.43 #542b` half erased -- on the one message
+# whose job is to say WHICH half of the toolchain moved. A glibc rebuild at an
+# unchanged version string (exactly what issue #23 exists to catch) would have
+# reported twelve anonymous hex digits and nothing else.
+# -----------------------------------------------------------------------------
+block ccVersionDiscardMessageNamesBothHalves:
+  const
+    ccText = "cc (SUSE Linux) 16.2.0"
+    rtOld  = "ldd (GNU libc) 2.37"
+    rtNew  = "ldd (GNU libc) 2.43"
+    stored  = ccText & " #aaaaaaaaaaaaaaaa|" & rtOld & " #1111111111111111"
+    current = ccText & " #aaaaaaaaaaaaaaaa|" & rtNew & " #542b390a4be6deb6"
+  let m = DepGraphDiscard(kind: dgdCcVersion, stored: stored,
+                          current: current).message()
+
+  # Both halves of BOTH fingerprints keep their legible text. This is the
+  # assertion the old rendering failed.
+  doAssert rtOld in m, "stored runtime half erased from the message: " & m
+  doAssert rtNew in m, "current runtime half erased from the message: " & m
+  doAssert ccText in m, "compiler half erased from the message: " & m
+
+  # The half that actually moved is distinguishable from the half that did not.
+  doAssert m.count(rtOld) == 1 and m.count(rtNew) == 1,
+    "the runtime change is not legible in the message: " & m
+
+  # Digests are abbreviated, not dropped -- enough to separate two builds at an
+  # identical version string, which is the case the digest was added for.
+  doAssert "390a4be6deb6" in m, "current runtime digest missing: " & m
+  doAssert "542b390a4be6deb6" notin m, "digest not abbreviated: " & m
+
+  # Still one line: this text is written raw to stderr.
+  doAssert m.find(char(10)) < 0, "discard message is multi-line: " & m
+
+  # A Windows-shaped value (compiler half carries NO digest -- cdVersionOnly by
+  # decision) must render both halves just the same.
+  let win = DepGraphDiscard(
+    kind: dgdCcVersion,
+    stored:  "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64|" &
+             "kernel32+libcmt+libucrt #0d8cab78a8b5d998",
+    current: "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64|" &
+             "kernel32+libcmt+libucrt #ffffffffffffffff").message()
+  doAssert "kernel32+libcmt+libucrt" in win,
+    "windows runtime half erased from the message: " & win
+
+echo "test_depgraph: dgdCcVersion message names both halves"

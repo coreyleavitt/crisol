@@ -21,6 +21,13 @@ import crisol/types
 import crisol/runner     # plan, emptyDepGraph
 import crisol/planview   # decisionStringEd, planToJson
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: plan() stats `binPath(ep, config)`, which needs a resolvable state
+# dir. A bare `Config()` has no projectRoot, so stateDirOf now refuses it
+# rather than resolving bin/ against the process cwd -- give these plans an
+# explicit, absolute, per-process state dir instead.
+let testStateDir = processStateDir("m3view")
 
 # ---------------------------------------------------------------------------
 # (b) compileView accessor agreement with edecision
@@ -69,7 +76,7 @@ suite "M3 (c) — plan() edecision is authoritative (no shadow decision field)":
 
   test "plan with empty graph → edNeverBuilt, compileView → cdNeverBuilt":
     let ep = testEp("tests/unit/test_foo.nim", group = "unit", flags = @[])
-    let p = plan(Config(), @[ep], emptyDepGraph())
+    let p = plan(Config(stateDir: testStateDir), @[ep], emptyDepGraph())
     check p.entrypoints.len == 1
     let pep = p.entrypoints[0]
     check pep.edecision == edNeverBuilt
@@ -79,7 +86,7 @@ suite "M3 (c) — plan() edecision is authoritative (no shadow decision field)":
     ## plan() derives edecision from (CompileDecision → toEntrypointDecision).
     ## compileView reverses this derivation.  They must be consistent.
     let ep = testEp("tests/unit/test_foo.nim", group = "unit", flags = @[])
-    let p = plan(Config(), @[ep], emptyDepGraph())
+    let p = plan(Config(stateDir: testStateDir), @[ep], emptyDepGraph())
     let pep = p.entrypoints[0]
     # With empty graph/no binary, decideCompile returns cdNeverBuilt.
     # compileView must match.

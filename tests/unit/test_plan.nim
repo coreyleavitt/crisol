@@ -15,6 +15,13 @@ import std/unittest
 import crisol/types
 import crisol/runner
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: plan() stats `binPath(ep, config)`, which needs a resolvable state
+# dir. A bare `Config()` has no projectRoot, so stateDirOf now refuses it
+# rather than resolving bin/ against the process cwd -- give these plans an
+# explicit, absolute, per-process state dir instead.
+let testStateDir = processStateDir("plan")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,12 +37,12 @@ proc mkEp(path: string; group = "unit"; flags: seq[string] = @[]): Entrypoint =
 suite "plan() — pure compile-decision annotation":
 
   test "empty entrypoint list produces empty plan":
-    let p = plan(Config(), @[], emptyDepGraph())
+    let p = plan(Config(stateDir: testStateDir), @[], emptyDepGraph())
     check p.entrypoints.len == 0
 
   test "single entrypoint → edNeverBuilt with empty graph":
     let eps = @[mkEp("tests/unit/test_foo.nim")]
-    let p = plan(Config(), eps, emptyDepGraph())
+    let p = plan(Config(stateDir: testStateDir), eps, emptyDepGraph())
     check p.entrypoints.len == 1
     check p.entrypoints[0].edecision == edNeverBuilt
     check compileView(p.entrypoints[0]) == cdNeverBuilt  # M3: derived accessor
@@ -47,7 +54,7 @@ suite "plan() — pure compile-decision annotation":
       mkEp("tests/unit/test_b.nim"),
       mkEp("tests/integration/test_c.nim", group = "integration"),
     ]
-    let p = plan(Config(), eps, emptyDepGraph())
+    let p = plan(Config(stateDir: testStateDir), eps, emptyDepGraph())
     check p.entrypoints.len == 3
     for pep in p.entrypoints:
       check pep.edecision == edNeverBuilt
@@ -55,18 +62,18 @@ suite "plan() — pure compile-decision annotation":
 
   test "entrypoint identity is preserved (path, group, flags)":
     let ep = mkEp("tests/unit/test_x.nim", group = "mygroup", flags = @["-d:foo"])
-    let p = plan(Config(), @[ep], emptyDepGraph())
+    let p = plan(Config(stateDir: testStateDir), @[ep], emptyDepGraph())
     let pep = p.entrypoints[0]
     check pep.ep.tp.display()  == "tests/unit/test_x.nim"
     check pep.ep.group == "mygroup"
     check pep.ep.flags == @["-d:foo"]
 
   test "jobs=0 resolved to at least 1 (A4: max(1, cpu-2))":
-    let p = plan(Config(jobs: 0), @[], emptyDepGraph())
+    let p = plan(Config(jobs: 0, stateDir: testStateDir), @[], emptyDepGraph())
     check p.jobs >= 1
 
   test "jobs>0 preserved":
-    let p = plan(Config(jobs: 8), @[], emptyDepGraph())
+    let p = plan(Config(jobs: 8, stateDir: testStateDir), @[], emptyDepGraph())
     check p.jobs == 8
 
   test "plan is pure: synthetic (non-existent) paths do not raise":
@@ -79,12 +86,12 @@ suite "plan() — pure compile-decision annotation":
     ]
     var raised = false
     try:
-      let p = plan(Config(), eps, emptyDepGraph())
+      let p = plan(Config(stateDir: testStateDir), eps, emptyDepGraph())
       check p.entrypoints.len == 3
     except:
       raised = true
     check not raised
 
   test "reason field is non-empty for cdNeverBuilt":
-    let p = plan(Config(), @[mkEp("x.nim")], emptyDepGraph())
+    let p = plan(Config(stateDir: testStateDir), @[mkEp("x.nim")], emptyDepGraph())
     check p.entrypoints[0].reason.len > 0

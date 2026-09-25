@@ -68,5 +68,15 @@ when defined(linux):
       check after <= before + 2
       removeFile(outPath)
 
-when isMainModule:
-  echo "test_rfc0007_b2_fd_leak: done"
+  when isMainModule:
+    echo "test_rfc0007_b2_fd_leak: done"
+else:
+  when isMainModule:
+    # RFC-0009 S5 wiring-audit convention (W5c): this `done` line used to
+    # sit at column 0, OUTSIDE the `when defined(linux):` gate above -- so
+    # on any non-Linux leg it printed a success line despite the whole file
+    # asserting nothing. It must live INSIDE the gate, paired with an honest
+    # CRISOL-SKIP marker in the `else` arm -- see
+    # ci/assert-subset-honesty.sh's EXPECTED_SKIP manifest.
+    echo "CRISOL-SKIP: tests/unit/test_rfc0007_b2_fd_leak.nim"
+    echo "test_rfc0007_b2_fd_leak: skipped (Linux-only pidfd/epoll fd-leak probe; /proc/self/fd introspection has no portable equivalent)"

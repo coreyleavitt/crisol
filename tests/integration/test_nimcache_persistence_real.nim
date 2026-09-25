@@ -189,28 +189,73 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     let newCacheDir = cachePath(ep, cfg, toolchainFingerprint("nim-v1", "cc-NEW"))
     check oldCacheDir != newCacheDir  ## precondition: the fingerprint really changes the path
 
-    var graph = emptyDepGraph()
-    let plan1 = plan(cfg, @[ep], graph, nimVersion = "nim-v1")
+    # LINEAGE (cite by grep anchor -- line numbers in this repo rot within a
+    # single review round). This case used to prove its staleness through
+    # `decideCompile`'s `graph.header.ccVersion != ccVersion` arm (and, before
+    # that, through a `forceCompile = true` workaround that bypassed the
+    # decision entirely). Round 5's R3-8 DELETED that arm as unreachable in
+    # production -- see `grep -n "R3-8, RESOLVED round 5" src/crisol/planner.nim`
+    # -- because "the toolchain moved" is decided once, by `loadDepGraph`
+    # (`grep -n "let ccMismatch" src/crisol/depgraph.nim`), which discards a
+    # header-mismatched graph and hands back an EMPTY one. So this case now
+    # routes through the loader: that is the production path, and step 2 of
+    # `decideCompile` ("entry absent") is how a toolchain change actually
+    # becomes a recompile.
+
+    # The graph header carries the REAL toolchain in effect for the first
+    # compile (nimVersion + ccVersion, mirroring how a real
+    # loadDepGraph-sourced graph would) -- not `emptyDepGraph()`'s "" -- so
+    # the reload below observes a genuine ccVersion mismatch rather than a
+    # coincidental nimVersion one.
+    var graph = initDepGraph("nim-v1", "cc-OLD")
+    let plan1 = plan(cfg, @[ep], graph, nimVersion = "nim-v1", ccVersion = "cc-OLD")
     let results1 = execute(plan1, config = cfg, graph = graph,
                            nimVersion = "nim-v1", ccVersion = "cc-OLD",
                            showProgress = false).results
     check results1[0].outcome == oPassed
     check dirExists(oldCacheDir)
 
+    # Run 1's `recordClosure` PERSISTED the graph, stamped with the cc-OLD
+    # header. Confirm the setup before relying on it: reloaded under the SAME
+    # toolchain the entry is present and nothing is discarded, so the discard
+    # below can only be the cc change.
+    let key = (string(ep.tp.display()), flagHash(ep.flags))
+    var sameToolchainDiscard: DepGraphDiscard
+    let sameToolchain = loadDepGraph(cfg, "nim-v1", sameToolchainDiscard, "cc-OLD")
+    check sameToolchainDiscard.kind == dgdNone
+    check key in sameToolchain.entries
+
     # Sentinel marks this as "the old toolchain's object". If the new
     # (post-upgrade) compile ever reused this directory or its contents,
-    # the sentinel would be visible from the new dir's perspective too —
+    # the sentinel would be visible from the new dir's perspective too --
     # it is not, because the two dirs are disjoint by construction.
     let sentinelPath = oldCacheDir / "SENTINEL_OLD_TOOLCHAIN.marker"
     writeFile(sentinelPath, "built-by-cc-OLD")
 
     # Simulate a toolchain upgrade: same source, same nimVersion, DIFFERENT
-    # ccVersion. Force the recompile (decideCompile does not itself gate on
-    # ccVersion — the nimcache-persistence fix's job is only to make sure a
-    # compile that DOES happen under a new toolchain never reuses the old
-    # object; the compile-skip decision is orthogonal and untouched here).
-    let plan2 = plan(cfg, @[ep], graph, nimVersion = "nim-v1", forceCompile = true)
-    let results2 = execute(plan2, config = cfg, graph = graph,
+    # ccVersion -- arriving the way it arrives in production, through the
+    # loader. `loadDepGraph` must DISCARD the stored cc-OLD graph as
+    # dgdCcVersion and hand back an empty graph stamped with the REQUESTED
+    # toolchain (cc-NEW).
+    var upgradeDiscard: DepGraphDiscard
+    var graph2 = loadDepGraph(cfg, "nim-v1", upgradeDiscard, "cc-NEW")
+    check upgradeDiscard.kind == dgdCcVersion      ## not dgdNimVersion, not dgdNone
+    check upgradeDiscard.stored == "cc-OLD"
+    check upgradeDiscard.current == "cc-NEW"
+    check graph2.entries.len == 0                  ## discarded, not merely re-stamped
+    check key notin graph2.entries
+    check graph2.header.ccVersion == "cc-NEW"      ## stamped with the LIVE toolchain
+    check graph2.header.nimVersion == "nim-v1"
+
+    # ...and planning against that emptied graph is a REBUILD. The value is
+    # `edStale`, not `edNeverBuilt`: `decideCompile` step 1 (binary absent)
+    # does not fire, because `stableBinPath` is keyed on (path, flags) only --
+    # `grep -n "proc binPath\*" src/crisol/planner.nim` -- so run 1's stable
+    # binary is still there; it is step 2, "no closure record in dep graph"
+    # (cdStale -> edStale), that the emptied graph lands on.
+    let plan2 = plan(cfg, @[ep], graph2, nimVersion = "nim-v1", ccVersion = "cc-NEW")
+    check plan2.entrypoints[0].edecision == edStale
+    let results2 = execute(plan2, config = cfg, graph = graph2,
                            nimVersion = "nim-v1", ccVersion = "cc-NEW",
                            showProgress = false).results
     check results2[0].outcome == oPassed

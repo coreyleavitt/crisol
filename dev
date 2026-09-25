@@ -6,7 +6,7 @@
 #
 # Usage:
 #   ./dev image          (re)build the dev image
-#   ./dev check          nim check (fast type/syntax verification)
+#   ./dev check          source soundness gate (ci/source-soundness-gate.sh)
 #   ./dev test           nimble test (serial bootstrap suite; excludes
 #                        tests/timing — see `./dev timing`); also re-runs
 #                        tests/conformance forced onto the poll(2) fallback
@@ -53,6 +53,21 @@ milpa_mount() {
 # populate this array before calling podman_run. Empty by default.
 EXTRA_ENV=()
 
+# Extra `podman run` FLAGS (not --env) forwarded by podman_run, e.g.
+# EXTRA_RUN_ARGS=(--network=none). Same populate-before-calling contract as
+# EXTRA_ENV above; empty by default.
+#
+# --network=none is the documented workaround for a wedged podman-machine
+# network on a dev host: when netavark/nftables is broken (`netavark … nftables
+# error: "nft" did not return successfully`) EVERY networked container run dies,
+# so an arm that needs no network must say so explicitly to be runnable at all.
+# See docs/handoff/msvc-selection-layer.md's environment notes, which drive the
+# base image the same way. It is opt-in per arm rather than a podman_run
+# default on purpose: `test`/`build` shell out to nimble, which reaches the
+# network (that handoff records `ci/run-tests.sh` failing under --network=none),
+# whereas `nim check` never does.
+EXTRA_RUN_ARGS=()
+
 # Rootless podman maps the host user to root-in-container by default, so we do
 # NOT pass --user; files created in the bind mount come back owned by the host
 # user via the userns mapping. HOME points at a mounted dir so nimble/choosenim
@@ -61,6 +76,7 @@ podman_run() {
     ensure_docker_home
     mapfile -t _milpa < <(milpa_mount)
     podman run --rm \
+        "${EXTRA_RUN_ARGS[@]}" \
         --volume "${PROJECT_DIR}:${PROJECT_DIR}" \
         --volume "${PROJECT_DIR}:/workspace" \
         --volume "${DOCKER_HOME}:/dockerhome" \
@@ -79,7 +95,25 @@ case "${cmd}" in
         podman build --tag "${IMAGE}" "${PROJECT_DIR}"
         ;;
     check)
-        podman_run nim check --hints:off src/crisol.nim
+        # THE gate lives in ci/source-soundness-gate.sh -- ONE copy, shared
+        # with ci.yml's "Source soundness gate" step (R5-11). Its header is the
+        # reference for both --warningAsError flags, why the gate needs several
+        # invocations across three --os targets, and the
+        # `{.push warning[Deprecated]: off.}` remedy for an export line that
+        # starts failing it. Deliberately not restated here.
+        #
+        # --network=none: `nim check` reaches no network (see EXTRA_RUN_ARGS'
+        # comment above) -- and a gate nobody can run is not a gate.
+        #
+        # R5-12: this arm's former review archaeology now lives in
+        # docs/rfc/0004-incremental-hermetic-execution.handoff.md, section
+        # "Source-soundness gate -- relocated archaeology". Four passages: the
+        # removed `icbaseline` exclusion, the `cacheEnabled`/R4-4 export-line
+        # incident, the no-grep-in-ci/ rationale, and the re-export snapshot
+        # inventory (whose broad clause R5-18 found false). It is history, not
+        # instruction -- none of it describes the current tree.
+        EXTRA_RUN_ARGS=(--network=none)
+        podman_run bash ci/source-soundness-gate.sh
         ;;
     test)
         # ci/run-tests.sh, not bare `nimble test`: nimble's custom-task exit
@@ -145,6 +179,10 @@ case "${cmd}" in
         rm -rf "${PROJECT_DIR}/nimcache" "${PROJECT_DIR}/bin" "${PROJECT_DIR}/.crisol"
         ;;
     help|*)
-        sed -n '4,20p' "$0"
+        # Lines 2..23: the title line through the last usage entry. Both bounds
+        # are load-bearing -- it was '4,20p', which started mid-sentence at line
+        # 4 AND stopped three entries short, hiding `shell`, `clean` and `help`
+        # (R5-2, found in passing). If you add a usage line, move the 23.
+        sed -n '2,23p' "$0"
         ;;
 esac

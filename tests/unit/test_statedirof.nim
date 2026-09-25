@@ -4,7 +4,11 @@
 ##   1. CRISOL_STATE_DIR set to an absolute path → stateDirOf returns exactly that
 ##      (overriding cfg.stateDir).
 ##   2. env unset → stateDirOf == absolutePath(cfg.projectRoot / cfg.stateDir)
-##   3. env unset + cfg.stateDir == "" → returns ""
+##   3. env unset + cfg.stateDir == "" → the CLI's default,
+##      absolutePath(cfg.projectRoot / DefaultStateDir) -- never "" (R8-D3:
+##      "" made every bin/cache/depgraph path cwd-relative)
+##   3b. env unset + relative/empty cfg.projectRoot → CrisolError(cekConfig),
+##      never a silent join against the process cwd (R8-D3)
 ##   4. RFC-0009 A2 (R3-25): CRISOL_STATE_DIR set to a RELATIVE/odd value is
 ##      routed through paths.nativeCanonicalize against cfg.projectRoot as the
 ##      explicit base -- NEVER against the process cwd (config.nim:108's old
@@ -49,7 +53,7 @@ suite "stateDirOf — CRISOL_STATE_DIR env override":
     delEnv("CRISOL_STATE_DIR")
     check stateDirOf(cfg) == absolutePath(cfg.projectRoot / cfg.stateDir)
 
-  test "env unset + stateDir empty → returns empty string":
+  test "R8-D3: env unset + stateDir empty → <projectRoot>/.crisol (the CLI default), never cwd":
     let tmp = makeTmpDir()
     defer: removeDir(tmp)
     # Build a Config directly with stateDir="" to exercise that branch.
@@ -61,8 +65,31 @@ suite "stateDirOf — CRISOL_STATE_DIR env override":
       compileTimeoutSecs: 600,
       maxOutputBytes: 10 * 1024 * 1024,
     )
+    # A cwd that is DELIBERATELY not cfg.projectRoot: pre-R8-D3 this branch
+    # returned "", and every consumer's `"" / "bin"` resolved against it.
+    let otherCwd = makeTmpDir()
+    defer: removeDir(otherCwd)
+    let origCwd = getCurrentDir()
+    setCurrentDir(otherCwd)
+    defer: setCurrentDir(origCwd)
     delEnv("CRISOL_STATE_DIR")
-    check stateDirOf(cfg) == ""
+    check stateDirOf(cfg) == absolutePath(tmp / DefaultStateDir)
+    check stateDirOf(cfg).isAbsolute
+    # Same answer the config loader gives a crisol.kdl with no state-dir node.
+    let loaded = loadKdl(tmp, "")
+    check stateDirOf(loaded) == stateDirOf(cfg)
+
+  test "R8-D3: env unset + relative or empty projectRoot → CrisolError, never a cwd join":
+    delEnv("CRISOL_STATE_DIR")
+    for root in ["", "relative/root"]:
+      for sd in ["", ".crisol"]:
+        let cfg = Config(projectRoot: root, stateDir: sd)
+        expect CrisolError:
+          discard stateDirOf(cfg)
+    # An ABSOLUTE stateDir needs no base, so it still resolves.
+    let tmp = makeTmpDir()
+    defer: removeDir(tmp)
+    check stateDirOf(Config(projectRoot: "", stateDir: tmp)) == tmp
 
   test "RFC-0009 A2: relative CRISOL_STATE_DIR resolves against cfg.projectRoot, never cwd":
     let tmp = makeTmpDir()

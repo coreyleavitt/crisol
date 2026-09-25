@@ -20,10 +20,10 @@
 ##
 ## PASS (b1) scope originally covered only direct/test invocation against a
 ## hand-authored `plan.json`. Wiring it as a slot's compile CHILD —
-## `runner.nim`'s `spCompiling`→`spRunning` transition spawning THIS worker
-## via the existing argv-array `forkExec`, measurement-mode-gated — landed in
-## PASS (b2): `runner.nim` now authors `plan.json` and dispatches this
-## measurement worker.
+## `runner.nim`'s `spawnCompileStable` launching THIS worker (in place of a
+## direct `nim c`) as the slot's one Supervisor-spawned argv-array compile
+## child, measurement-mode-gated — landed in PASS (b2): `runner.nim` now
+## authors `plan.json` and dispatches this measurement worker.
 ##
 ## Split out of the original fused measureworker.nim (RFC-0006 review R8,
 ## structural-only — no behavior change): this module owns the measure-mode
@@ -91,8 +91,29 @@ import crisol/compilecost
 import crisol/workerplan
 
 # ---------------------------------------------------------------------------
-# measurePlanIdentity — RFC-0009 A5b-ii: reconstruct the IdentityKey
+# planRoots — the wire plan's own project-only TrackedRoots, shared by every
+# consumer in this worker that needs one (RFC-0009 A5b-ii's `measurePlanIdentity`
+# and CR3's `recordArtifactRows` header-case resolution alike).
 # ---------------------------------------------------------------------------
+
+proc planRoots(plan: MeasurePlan): TrackedRoots =
+  ## `initTrackedRoots(plan.projectRoot, @[], plan.stateDir)` — a
+  ## PROJECT-ONLY `TrackedRoots`. `MeasurePlan`'s wire format
+  ## (`workerplan.nim`) carries `projectRoot` but no configured dep-root
+  ## specs at all, so a dep root can never be reconstructed here: a header
+  ## reported under a dep root resolves `pcOutside` (CR3:
+  ## `artifactid.resolveReportedHeaderPath`'s untracked arm — kept, merely
+  ## canonicalized, never case-corrected) rather than `pcTracked`. This is a
+  ## PRE-EXISTING wire-format gap, not something this proc papers over — see
+  ## `measurePlanIdentity`'s own doc for why a dep-root spec was never needed
+  ## for THAT caller either (no dep-root path is ever an entrypoint); CR3's
+  ## `recordArtifactRows` caller is the first one for which the gap actually
+  ## costs something (a project WITH configured dep roots gets the case-
+  ## resolution fix only for project-root headers until `MeasurePlan` is
+  ## widened to carry dep-root specs too — flagged, not fixed, here).
+  initTrackedRoots(plan.projectRoot,
+                    newSeq[tuple[name, native: string]](),
+                    plan.stateDir)
 
 proc measurePlanIdentity(plan: MeasurePlan): IdentityKey =
   ## Derive this plan's entrypoint `IdentityKey` via the `TrackedPath`
@@ -108,19 +129,17 @@ proc measurePlanIdentity(plan: MeasurePlan): IdentityKey =
   ## `MeasurePlan.projectRoot` — which the wire format already carries — is
   ## sufficient to reconstruct it; no dep-root specs need to cross the wire
   ## for this (a dep-root member would need them, but no dep-root path is
-  ## ever an entrypoint). `initTrackedRoots(plan.projectRoot, @[],
-  ## plan.stateDir)` builds a project-only `TrackedRoots` (the probed fold
-  ## policy is irrelevant to `keyBytes`, which never folds); `fromCanonical`
-  ## then validates `plan.entrypointPath`'s shape and tags it rootTag 0.
+  ## ever an entrypoint). `planRoots(plan)` builds the project-only
+  ## `TrackedRoots` (the probed fold policy is irrelevant to `keyBytes`,
+  ## which never folds); `fromCanonical` then validates
+  ## `plan.entrypointPath`'s shape and tags it rootTag 0.
   ##
   ## `fromCanonical` rejecting the wire path is a malformed-wire invariant
   ## violation — never a case to paper over: `runner.buildCompileWorkerPlan`
   ## always emits a canonical `tp.display()`, so a valid parent-produced
   ## tag-0 wire path ALWAYS succeeds here. Fail loud, mirroring
   ## `parseMeasurePlan`'s malformed-plan `CrisolError(cekEnvironment)` idiom.
-  let roots = initTrackedRoots(plan.projectRoot,
-                                newSeq[tuple[name, native: string]](),
-                                plan.stateDir)
+  let roots = planRoots(plan)
   let tpOpt = fromCanonical(plan.entrypointPath, roots)
   if tpOpt.isSome:
     identityKey(tpOpt.get, roots, plan.configHash)
@@ -150,6 +169,14 @@ proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
   let entryBasename = entryUnitBasename(plan.entrypointAbsPath)
   let knownStrings = @[plan.nimcacheDir, plan.outputBinPath.parentDir()]
   let identity = measurePlanIdentity(plan)
+  let roots = planRoots(plan)
+    ## CR3: threaded into `ccIncludeClosure` below so a reported header's
+    ## case is resolved against real on-disk spelling BEFORE it becomes
+    ## `keyHash` material — this is the ONE production call site; see
+    ## `artifactid.ccIncludeClosure`'s own doc for why every OTHER call site
+    ## (this module's/artifactid's own unit tests) deliberately passes an
+    ## explicit, unpopulated `TrackedRoots()` instead -- `roots` has had no
+    ## default since CR10.
   let nowUs = int64(epochTime() * 1_000_000)
 
   var led = openArtifactLedger(plan.stateDir)
@@ -170,10 +197,14 @@ proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
 
     let normalized = normalize(rawContent, knownStrings)
     let normalizedCcCmd = normalize(pair.ccCmd, knownStrings)
-    let closureRes = ccIncludeClosure(pair.ccCmd)
+    let closureRes = ccIncludeClosure(pair.ccCmd, roots = roots)
     if not closureRes.ok:
-      stderr.write("crisol: warning: measure-compile: cc -M include-closure " &
-                   "probe failed for '" & basename & "'; skipping\n")
+      # CR3/W9c: names the ACTUAL probe family and the specific
+      # `ClosureProbeError` arm — never a hard-coded "cc -M" (wrong for an
+      # MSVC unit) collapsing three distinct MSVC failure shapes into one
+      # indistinguishable message.
+      stderr.write("crisol: warning: measure-compile: " & closureRes.errMsg &
+                   " for '" & basename & "'; skipping\n")
       continue
 
     var sizeBytes: int64 = 0
@@ -192,6 +223,10 @@ proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
       keyHash:            artifactKeyHash(normalized, closureRes.contentHash, normalizedCcCmd),
       sizeBytes:          sizeBytes,
       ccTimeUs:           spans.ccUnitTimesUs.getOrDefault(basename, 0),
+      # W9l: passed IN from the plan, never re-probed here -- see
+      # workerplan.MeasurePlan.toolchainFp's doc for why this worker must
+      # not import ccidentity/call cachedCcVersion() itself.
+      toolchainFp:        plan.toolchainFp,
       timestamp:          nowUs,
       rowVersion:         currentArtifactRowVersion,
     )
@@ -222,6 +257,8 @@ proc recordCompileCostRow(plan: MeasurePlan; spans: CompileSpans) =
     codegenUs:          spans.codegenSpanUs,
     ccUs:               spans.ccSpanUs,
     linkUs:             spans.linkSpanUs,
+    # W9l: same passed-in-not-reprobed contract as recordArtifactRows above.
+    toolchainFp:        plan.toolchainFp,
     timestamp:          nowUs,
     rowVersion:         currentCompileCostRowVersion,
   )

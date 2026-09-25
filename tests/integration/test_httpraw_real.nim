@@ -53,8 +53,8 @@
 ##      this slice fixes; see httpraw.nim's `hasContentLength`/
 ##      `contentLengthValid` split).
 ##   6. A lying `Content-Length` (declares more than the peer actually
-##      sends, then closes) -- `toUnreachable` (httpraw.nim:529's
-##      truncation rule).
+##      sends, then closes) -- `toUnreachable` (httpraw.nim's bounded-
+##      `Content-Length` "closed before the declared length arrived" rule).
 ##   7. A garbage status line (not an HTTP response at all) -- the
 ##      `parseStatusAndHeaders`-rejects-it -> `toUnreachable` branch.
 ##
@@ -122,8 +122,8 @@ proc serverThreadProc(args: ServerArgs) {.thread.} =
       clientSocket.send(resp)
     of ssLyingContentLength:
       # T1a: declares 100 bytes of body, sends 40, then closes -- must map to
-      # `toUnreachable` (httpraw.nim:529's claimed "closed before the
-      # declared length arrived" rule), never a served (truncated) body.
+      # `toUnreachable` (httpraw.nim's bounded-Content-Length "closed before
+      # the declared length arrived" rule), never a served (truncated) body.
       let resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" & "x".repeat(40)
       clientSocket.send(resp)
     of ssGarbageStatusLine:
@@ -330,7 +330,8 @@ block test_garbage_content_length_is_transport_error:
 
 # ---------------------------------------------------------------------------
 # T1a: a lying Content-Length (declares more than the peer actually sends,
-# then closes) -- the truncation rule httpraw.nim:529 already claims,
+# then closes) -- the truncation rule httpraw.nim already claims (grep
+# "closed before the declared length arrived"),
 # asserted here for the first time.
 # ---------------------------------------------------------------------------
 

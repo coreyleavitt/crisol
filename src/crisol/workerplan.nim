@@ -16,11 +16,13 @@
 ##
 ##     Two entrypoint-path fields are DELIBERATE, not redundant:
 ##
-##       `entrypointPath`    — `ep.path`, project-root-relative (see
-##                              discover.nim `path: relPath`). This is the
-##                              SAME string `runner.appendAttemptRow` feeds
+##       `entrypointPath`    — `ep.tp.display()`, project-root-relative
+##                              (entrypoints are always tag-0 — see
+##                              `types.Entrypoint.tp`). This is the SAME
+##                              path `runner.appendAttemptRow` feeds
 ##                              `identityKey` for `LedgerRow`, so
-##                              `entrypointIdentity` (both workers) is
+##                              `entrypointIdentity` (the measurement
+##                              worker's `measurePlanIdentity`) is
 ##                              genuinely "the same IdentityKey RunLedger
 ##                              rows carry" (artifactledger.nim's own doc
 ##                              promise) — it must NOT be the per-slot
@@ -33,7 +35,8 @@
 ##
 ##     The remaining fields are the plan's compile/ledger/segmentation
 ##     inputs: `flags` (ep.flags, appended verbatim — mirrors
-##     runner.nim:382-384), `nimcacheDir` (the private per-slot nimcache
+##     `compiledriver.nimCompileArgs`, which runner.nim's `spawnCompileStable`
+##     uses for the monolithic `nim c` argv), `nimcacheDir` (the private per-slot nimcache
 ##     dir — runner.nim's `cacheDir`), `outputBinPath` (the `-o:` path —
 ##     runner.nim's `binCompiled`), `groupId` (`ep.group`), `configHash`
 ##     (`flagHash(ep.flags)` rendered — artifactledger.nim's own doc says
@@ -104,6 +107,21 @@ type
     projectRoot*:        string      ## rfc-0007 A2c (#17): resolved absolute
                                       ## config.projectRoot — the worker's own
                                       ## `nim --compileOnly` cwd
+    toolchainFp*:        string      ## W9l: planner.toolchainFingerprint(nimVersion,
+                                      ## ccVersion), computed ONCE by the parent
+                                      ## (runner.execute's ExecCtx.toolchainFp) and
+                                      ## passed down — the worker must NEVER re-probe
+                                      ## ccVersion itself (ccidentity.cachedCcVersion() is
+                                      ## deliberately not imported/called here; see
+                                      ## runner.buildCompileWorkerPlan's W9l doc: the
+                                      ## value is the SAME one execute() already keys
+                                      ## the persistent nimcache with). Threaded
+                                      ## straight through into the ArtifactRow/
+                                      ## CompileCostRow rows the worker records, so
+                                      ## `--measure-compile-reuse` aggregation can tell
+                                      ## a toolchain upgrade apart from a code change.
+                                      ## OPTIONAL on read (defaults to "") for the same
+                                      ## back-compat reason `groupId`/`configHash` are.
 
 proc toJson*(plan: MeasurePlan): JsonNode =
   ## Serialize a MeasurePlan to plan.json's JSON shape. Exported so the
@@ -122,6 +140,7 @@ proc toJson*(plan: MeasurePlan): JsonNode =
   result["configHash"]    = newJString(plan.configHash)
   result["stateDir"]      = newJString(plan.stateDir)
   result["projectRoot"]   = newJString(plan.projectRoot)
+  result["toolchainFp"]   = newJString(plan.toolchainFp)
 
 proc parseMeasurePlan*(jsonPath: string): MeasurePlan =
   ## Parse `jsonPath` into a MeasurePlan. Mirrors `closure.
@@ -161,6 +180,10 @@ proc parseMeasurePlan*(jsonPath: string): MeasurePlan =
   result.projectRoot       = reqStr("projectRoot")
   result.groupId    = node{"groupId"}.getStr("")
   result.configHash = node{"configHash"}.getStr("")
+  # W9l: OPTIONAL -- a plan.json authored before this field existed (or a
+  # hand-built test fixture) parses with toolchainFp == "" rather than
+  # failing required-field validation.
+  result.toolchainFp = node{"toolchainFp"}.getStr("")
 
   result.flags = @[]
   let flagsNode = node{"flags"}

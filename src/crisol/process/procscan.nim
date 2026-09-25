@@ -18,7 +18,14 @@
 ## `PosixCore` or `Capabilities` — a pure scan of whatever `/proc`(-like)
 ## state the OS exposes right now.
 
-import std/[os, posix, strutils]
+import std/[posix, strutils]
+when not defined(macosx):
+  # R5-2: `walkDir`/`extractFilename`/`/` are used ONLY by the `/proc` arm of
+  # `walkProcTable`/`readVmRssBytes` below. The macOS arm goes through libproc
+  # and touches no filesystem path at all, so an unconditional import here is
+  # a genuine unused import on that target -- fatal under
+  # --warningAsError:UnusedImport, which a consumer (amoxtli) builds with.
+  import std/os
 import crisol/process/types
 
 type

@@ -23,6 +23,7 @@
 
 import std/[unittest, options, os, osproc, strutils, json]
 import crisol/paths
+import crisol/narrow
 import ../support/symlinkprobe
 
 proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): Option[FoldPolicy] =
@@ -287,6 +288,7 @@ suite "classify — symlinked dep root (NativeRoot.realAbs)":
       # directory reparse point vs. this fixture's assumption -- undiagnosed
       # without a native Windows box to repro against. Flagged for a
       # Windows-repro follow-up rather than gated blindly forever.
+      echo "CRISOL-SKIP-TEST: tests/unit/test_paths.nim#classify_symlinked_deproot_realabs_windows_known_divergence"
       skip()
     else:
       let rawBase = getTempDir() / ("crisol_test_paths_symlink_" & $getCurrentProcessId())
@@ -309,6 +311,7 @@ suite "classify — symlinked dep root (NativeRoot.realAbs)":
         try: removeDir(base)
         except OSError: discard
       if not symlinksAvailable():
+        echo "CRISOL-SKIP-TEST: tests/unit/test_paths.nim#classify_symlinked_deproot_realabs_no_symlink_privilege"
         skip()   # symlink privilege unavailable in this environment
       else:
         createSymlink(realDir, linkDir)
@@ -360,7 +363,7 @@ suite "classify — F18 candidate-side 8.3 expansion (injected expandCandidate)"
     # long form -- the wiring this test proves, not the real Windows call.
     proc fakeExpand(p: string): string =
       p.replace("RUNNER~1", "runneradmin")
-    let pc = classify("C:/Users/RUNNER~1/project/foo.nim", roots, fakeExpand)
+    let pc = classify("C:/Users/RUNNER~1/project/foo.nim", roots, expandCandidate = fakeExpand)
     check pc.kind == pcTracked
     check pc.tp.isProject
     check pc.tp.display == "foo.nim"
@@ -370,7 +373,7 @@ suite "classify — F18 candidate-side 8.3 expansion (injected expandCandidate)"
                            @[("mydep", "C:/Users/runneradmin/depsrc")])
     proc fakeExpand(p: string): string =
       p.replace("RUNNER~1", "runneradmin")
-    let pc = classify("C:/Users/RUNNER~1/depsrc/foo.nim", roots, fakeExpand)
+    let pc = classify("C:/Users/RUNNER~1/depsrc/foo.nim", roots, expandCandidate = fakeExpand)
     check pc.kind == pcTracked
     check (not pc.tp.isProject)
     check pc.tp.display == "foo.nim"
@@ -378,7 +381,7 @@ suite "classify — F18 candidate-side 8.3 expansion (injected expandCandidate)"
   test "an expander that cannot resolve the short name still degrades to pcOutside, never throws":
     let roots = rootsWith("C:/Users/runneradmin/project", fpNone)
     proc noopExpand(p: string): string = p   # safeExpandFilename's own "never raises" degrade: unchanged on failure
-    let pc = classify("C:/Users/RUNNER~1/project/foo.nim", roots, noopExpand)
+    let pc = classify("C:/Users/RUNNER~1/project/foo.nim", roots, expandCandidate = noopExpand)
     check pc.kind == pcOutside
 
   test "an ordinary candidate (no 8.3 signature) never invokes the expander at all — zero cost on the hot path":
@@ -386,7 +389,7 @@ suite "classify — F18 candidate-side 8.3 expansion (injected expandCandidate)"
     proc explodingExpand(p: string): string =
       doAssert false, "expandCandidate must not be called for a non-8.3-shaped candidate"
       p
-    let pc = classify("C:/Users/runneradmin/project/foo.nim", roots, explodingExpand)
+    let pc = classify("C:/Users/runneradmin/project/foo.nim", roots, expandCandidate = explodingExpand)
     check pc.kind == pcTracked
     check pc.tp.display == "foo.nim"
 
@@ -394,8 +397,181 @@ suite "classify — F18 candidate-side 8.3 expansion (injected expandCandidate)"
     let roots = rootsWith("C:/Users/runneradmin/project", fpNone)
     proc fakeExpand(p: string): string =
       p.replace("RUNNER~1", "runneradmin")
-    let pc = classify("C:/Users/RUNNER~1/elsewhere/foo.nim", roots, fakeExpand)
+    let pc = classify("C:/Users/RUNNER~1/elsewhere/foo.nim", roots, expandCandidate = fakeExpand)
     check pc.kind == pcOutside
+
+suite "classify — F18 candidate-side CASE expansion (issue #21 slice 1c)":
+  ## The 8.3 suite above fixed ONE spelling of a candidate that names a real
+  ## tracked file in a non-canonical way. Case is the same defect in
+  ## different clothes, and `cl /sourceDependencies` makes it total: it
+  ## lowercases every path it reports, so under any mixed-case project root
+  ## EVERY MSVC-derived header lexically missed `matchRoots` and landed
+  ## pcOutside — silently dropped from the closure, which is why impact
+  ## selection stayed dead under vcc even after the dep probe itself worked.
+  ##
+  ## The fix is deliberately NOT "fold the membership test". `TrackedPath.rel`
+  ## is documented REAL-CASE and `keyBytes` is `rel` UNFOLDED — it IS the
+  ## cache-key material. Matching while mis-cased would store cl's lowercased
+  ## spelling, so a cl-populated closure and a gcc-populated one would hash
+  ## differently for the same files and cross-host cache portability
+  ## (RFC-0005) would break. Instead the candidate is RESOLVED to its real
+  ## on-disk spelling (`winRealPath`/GetFinalPathNameByHandleW returns the
+  ## true case) and the existing case-SENSITIVE `underRoot` decides, so `rel`
+  ## comes out real-case by construction.
+
+  test "a lowercased candidate under an fpAsciiLower root resolves, and rel keeps the REAL case":
+    let roots = rootsWith("C:/Users/RunnerAdmin/Project", fpAsciiLower)
+    # What cl reports vs what is actually on disk.
+    const reported = "c:/users/runneradmin/project/native/add.h"
+    const onDisk   = "C:/Users/RunnerAdmin/Project/Native/Add.h"
+    proc fakeExpand(p: string): string =
+      ## Models GetFinalPathNameByHandleW: it resolves whatever casing it is
+      ## handed to the ONE true on-disk spelling. (classify canonicalizes the
+      ## drive letter to upper case before calling this, so an exact-string
+      ## fake would miss for a reason the real call never has.)
+      if p.toLowerAscii == reported: onDisk else: p
+    let pc = classify(ReportedPath(reported), roots, fakeExpand)
+    check pc.kind == pcTracked
+    check pc.tp.isProject
+    # The load-bearing assertion: the REAL spelling is stored, not the
+    # lowercased one the probe happened to report. keyBytes == rel, so this
+    # is what keeps a cl-derived closure hash equal to a gcc-derived one.
+    check pc.tp.display == "Native/Add.h"
+
+  test "a lowercased candidate under an fpAsciiLower DEP root resolves too":
+    let roots = rootsWith("C:/Users/RunnerAdmin/Project", fpAsciiLower,
+                           @[("mydep", "C:/Users/RunnerAdmin/DepSrc")])
+    const reported = "c:/users/runneradmin/depsrc/inc/vendor.h"
+    const onDisk   = "C:/Users/RunnerAdmin/DepSrc/inc/Vendor.h"
+    proc fakeExpand(p: string): string =
+      ## Models GetFinalPathNameByHandleW: it resolves whatever casing it is
+      ## handed to the ONE true on-disk spelling. (classify canonicalizes the
+      ## drive letter to upper case before calling this, so an exact-string
+      ## fake would miss for a reason the real call never has.)
+      if p.toLowerAscii == reported: onDisk else: p
+    let pc = classify(ReportedPath(reported), roots, fakeExpand)
+    check pc.kind == pcTracked
+    check (not pc.tp.isProject)
+    check pc.tp.display == "inc/Vendor.h"
+
+  test "a genuinely-outside lowercased candidate never invokes the expander — the folded pre-filter is text-only, no I/O":
+    ## This is the whole reason the trigger is a folded PREFIX test rather
+    ## than "retry on every miss": every system header and every stdlib path
+    ## is a miss, and each one would otherwise pay a disk round-trip.
+    let roots = rootsWith("C:/Users/RunnerAdmin/Project", fpAsciiLower)
+    proc explodingExpand(p: string): string =
+      doAssert false, "expandCandidate must not be called for a candidate no root could claim"
+      p
+    let pc = classify(ReportedPath("c:/msvc/vc/include/stdint.h"), roots, explodingExpand)
+    check pc.kind == pcOutside
+
+  test "under fpNone a mis-cased candidate is NOT rescued, and the expander is never called":
+    ## Case is SIGNIFICANT on an fpNone root: two spellings are two files.
+    ## The pre-filter must respect the root's probed policy, not assume
+    ## Windows semantics everywhere.
+    let roots = rootsWith("C:/Users/RunnerAdmin/Project", fpNone)
+    proc explodingExpand(p: string): string =
+      doAssert false, "expandCandidate must not be called under fpNone"
+      p
+    let pc = classify(ReportedPath("c:/users/runneradmin/project/native/add.h"), roots,
+                      explodingExpand)
+    check pc.kind == pcOutside
+
+  test "an expander that cannot resolve the case still degrades to pcOutside, never throws":
+    let roots = rootsWith("C:/Users/RunnerAdmin/Project", fpAsciiLower)
+    proc noopExpand(p: string): string = p   # safeExpandFilename's degrade contract
+    let pc = classify(ReportedPath("c:/users/runneradmin/project/native/add.h"), roots,
+                      noopExpand)
+    check pc.kind == pcOutside
+
+  test "W1: an exact-case ROOT with a mis-cased TAIL still resolves to the real spelling":
+    ## The wiring-audit W1 vector, and the one slice 1c left open.
+    ##
+    ## Every other test in this suite mis-cases the ROOT PREFIX, which is
+    ## the only thing `matchRoots` can miss on: `underRoot` compares the
+    ## prefix case-sensitively and then slices the remainder VERBATIM. So a
+    ## candidate whose root spelling already case-matches is a DIRECT HIT
+    ## and its tail is stored exactly as the foreign tool spelled it —
+    ## running the expansion only as a miss-fallback fixed mis-cased roots
+    ## and left mis-cased tails alone.
+    ##
+    ## This is the shape `windows-latest` actually runs: the workspace is
+    ## `D:\a\crisol\crisol`, all lowercase, so cl's lowercased output
+    ## case-matches the root exactly and only the tail can differ.
+    let roots = rootsWith("C:/Users/runneradmin/project", fpAsciiLower)
+    const reported = "c:/users/runneradmin/project/native/add.h"
+    const onDisk   = "C:/Users/runneradmin/project/Native/Add.h"
+    proc fakeExpand(p: string): string =
+      if p.toLowerAscii == reported: onDisk else: p
+    let pc = classify(ReportedPath(reported), roots, fakeExpand)
+    check pc.kind == pcTracked
+    check pc.tp.isProject
+    # keyBytes == rel, UNFOLDED — so this is the assertion that keeps a
+    # cl-populated closure hashing equal to a gcc-populated one.
+    check pc.tp.display == "Native/Add.h"
+
+  test "a TRUSTED (string) exactly-cased candidate never invokes the expander — the hot path is unchanged":
+    ## `SourceIndex` classifies thousands of candidates per run, all of them
+    ## crisol's own real-case spellings. They must not pay a disk round-trip
+    ## for W1's sake — which is why provenance is now carried by the
+    ## ARGUMENT'S TYPE (a bare `string` here, never a `ReportedPath`) rather
+    ## than a parameter a caller could pass wrong or forget (CR10).
+    let roots = rootsWith("C:/Users/RunnerAdmin/Project", fpAsciiLower)
+    proc explodingExpand(p: string): string =
+      doAssert false, "expandCandidate must not be called for a trusted (string) candidate"
+      p
+    let pc = classify("C:/Users/RunnerAdmin/Project/Native/Add.h", roots,
+                      explodingExpand)
+    check pc.kind == pcTracked
+    check pc.tp.display == "Native/Add.h"
+
+  test "a REPORTED (ReportedPath) exactly-cased candidate DOES pay one resolution, and still answers real case":
+    ## The cost this fix accepts, stated as a behaviour rather than left
+    ## implicit: for a REPORTED spelling there is no way to know the tail is
+    ## already canonical without asking the disk, so the resolution runs even
+    ## when it turns out to be a no-op. One `GetFinalPathNameByHandleW` per
+    ## tracked header per external — tens per run, not thousands, because
+    ## the folded pre-filter still excludes every system header first.
+    let roots = rootsWith("C:/Users/RunnerAdmin/Project", fpAsciiLower)
+    var calls = 0
+    proc countingExpand(p: string): string =
+      inc calls
+      p          # already canonical: resolution is a no-op here
+    let pc = classify(ReportedPath("C:/Users/RunnerAdmin/Project/Native/Add.h"), roots,
+                      countingExpand)
+    check calls == 1
+    check pc.kind == pcTracked
+    check pc.tp.display == "Native/Add.h"
+
+suite "W9m guard -- the shared `folds` predicate keeps foldMatchesSomeRoot and narrow.anyRootFolds in agreement":
+  ## RFC-0009 wiring-audit W9m: `foldMatchesSomeRoot` (this module, private
+  ## -- exercised here through `classify`'s mis-case rescue, which is its
+  ## only observable effect) and `narrow.anyRootFolds` each used to ask
+  ## "does this policy fold case?" with their OWN `== fpAsciiLower` /
+  ## `!= fpNone` comparison. `FoldPolicy` has exactly two arms today, so
+  ## those happened to agree -- but nothing forced them to keep agreeing
+  ## once a third arm existed. Both call sites now route through the one
+  ## `folds` predicate declared next to `FoldPolicy` itself, so they cannot
+  ## silently diverge; this test pins that INTENT directly rather than
+  ## trusting the refactor, and iterates `FoldPolicy` itself (not today's
+  ## two arms by name) so a future arm gains coverage here automatically.
+  test "every FoldPolicy arm: classify's mis-case rescue and narrow.anyRootFolds agree with `folds`":
+    const reported = "c:/users/runneradmin/project/native/add.h"
+    const onDisk   = "C:/Users/RunnerAdmin/Project/Native/Add.h"
+    proc fakeExpand(p: string): string =
+      if p.toLowerAscii == reported: onDisk else: p
+
+    for p in FoldPolicy:
+      let roots = rootsWith("C:/Users/RunnerAdmin/Project", p)
+      # paths.nim's call site: foldMatchesSomeRoot gates classify's mis-case
+      # rescue for a ReportedPath candidate -- its only observable effect.
+      let pc = classify(ReportedPath(reported), roots, fakeExpand)
+      let rescuedByPaths = pc.kind == pcTracked
+      # narrow.nim's call site.
+      let foldsByNarrow = anyRootFolds(roots)
+      check rescuedByPaths == folds(p)
+      check foldsByNarrow == folds(p)
+      check rescuedByPaths == foldsByNarrow
 
 # ===========================================================================
 # The dep:* keyBytes escape (Linux-only: a colon-containing filename can't
@@ -772,3 +948,73 @@ suite "DisplayPath — display() is compiler-sealed against direct I/O use":
     check compiles(fileExists(string(display(tp))))
     check compiles(execProcess(string(display(tp))))
     check compiles(absolutePath(string(display(tp))))
+
+# ===========================================================================
+# ReportedPath — the compiler-enforced seal (CR10).
+#
+# `ReportedPath` (distinct string) is what `ccprobe.depIncludeHeaders` (and
+# `parseMsvcSourceDeps`/`parseCcMDeps` beneath it) hand back for a foreign
+# tool's dependency-report path — see paths.nim's own doc comment on the
+# type. The invariant this suite proves executably: a `ReportedPath` cannot
+# reach `TrackedPath.rel` (the unfolded cache-key material) through any
+# STRING-typed identity API — `fromCanonical`, the trusted `classify`
+# overload, `nativeCanonicalize`, `isUnderRoot` — because none of them
+# accept it; only `classify`/`tracked`'s dedicated `ReportedPath` overload
+# does, and THAT overload is exactly the one that resolves it first (W1).
+# The escape hatch, `string(rp)`, is explicit and greppable — mirroring
+# `DisplayPath`'s own discipline above.
+# ===========================================================================
+
+suite "ReportedPath — a foreign-tool spelling cannot reach TrackedPath.rel without resolution (CR10)":
+
+  test "a bare ReportedPath does not compile against any string-typed identity API":
+    var roots: TrackedRoots
+    let rp = ReportedPath("c:/msvc/vc/include/stdint.h")
+    # The trusted-text constructors and the trusted `classify` overload all
+    # take `string`, never `ReportedPath` — no implicit conversion exists,
+    # so handing one a `ReportedPath` is a TYPE ERROR, not a silent
+    # unresolved-spelling bug.
+    check not compiles(fromCanonical(rp, roots))
+    check not compiles(fromCanonical(RootTag(0), rp, roots))
+    check not compiles(nativeCanonicalize(rp, "/fake/proj"))
+    check not compiles(isUnderRoot(rp, "/fake/proj"))
+    # Nor can it stand in for the trusted OTHER argument of `isUnderRoot`.
+    check not compiles(isUnderRoot("/fake/proj/x.nim", rp))
+
+  test "F36-style: ReportedPath deliberately has no $ or & — pinned, not just documented":
+    ## Same rationale as `DisplayPath`'s own F36 test above: `$`/`&` would
+    ## be exactly as low-friction as the sanctioned `classify`/`tracked`
+    ## overload at a call site, while being far less greppable than the
+    ## `string(...)` escape hatch — reopening the hole this type exists to
+    ## close. Nothing borrows or hand-writes either for `ReportedPath`, and
+    ## no `converter` exists anywhere in paths.nim, so these fail to compile
+    ## for the right reason: no matching overload for a distinct,
+    ## non-string, non-convertible type.
+    let rp = ReportedPath("c:/msvc/vc/include/stdint.h")
+    check not compiles($rp)
+    check not compiles(rp & "x")
+    check not compiles("x" & rp)
+
+  test "the explicit string(...) escape hatch still compiles, and reaches the string-typed APIs":
+    var roots: TrackedRoots
+    let rp = ReportedPath("c:/msvc/vc/include/stdint.h")
+    check compiles(fromCanonical(string(rp), roots))
+    check compiles(nativeCanonicalize(string(rp), "/fake/proj"))
+    check compiles(isUnderRoot(string(rp), "/fake/proj"))
+
+  test "the ONE sanctioned path — classify/tracked's ReportedPath overload — compiles and actually resolves":
+    let roots = rootsWith("C:/Users/RunnerAdmin/Project", fpAsciiLower)
+    const reported = "c:/users/runneradmin/project/native/add.h"
+    const onDisk   = "C:/Users/RunnerAdmin/Project/Native/Add.h"
+    proc fakeExpand(p: string): string =
+      if p.toLowerAscii == reported: onDisk else: p
+    let rp = ReportedPath(reported)
+    check compiles(classify(rp, roots, fakeExpand))
+    check compiles(tracked(rp, roots))
+    # Not just "compiles" — actually resolves to the real on-disk spelling,
+    # the whole point of routing a ReportedPath through this overload at
+    # all (mirrors the "classify — F18 candidate-side CASE expansion" suite
+    # above, restated here as the type-level guarantee).
+    let pc = classify(rp, roots, fakeExpand)
+    check pc.kind == pcTracked
+    check pc.tp.display == "Native/Add.h"

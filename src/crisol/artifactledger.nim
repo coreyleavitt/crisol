@@ -32,7 +32,21 @@
 ## Row line (one JSON object per line):
 ##   {"rowVersion":1,"entrypointIdentity":"<str>","groupId":"<str>",
 ##    "configHash":"<str>","artifactBasename":"<str>","keyHash":"<str>",
-##    "sizeBytes":<int64>,"ccTimeUs":<int64>,"timestamp":<int64>}
+##    "sizeBytes":<int64>,"ccTimeUs":<int64>,"toolchainFp":"<str>",
+##    "timestamp":<int64>}
+##
+## `toolchainFp` (W9l): the toolchain identity `ccTimeUs` was measured under
+## -- `planner.toolchainFingerprint(nimVersion, ccVersion)`, computed ONCE by
+## the host process and passed down through `MeasurePlan.toolchainFp` (the
+## measure-worker never re-probes; see `workerplan.MeasurePlan.toolchainFp`'s
+## doc for why). OPTIONAL on read, same convention as `depgraph.DepGraphHeader.
+## ccVersion` (W3): a pre-W9l row with no `toolchainFp` field decodes as `""`
+## -- a real, queryable "unknown toolchain" bucket, not a crash and not
+## silently folded into whatever toolchain wrote the NEXT row. No
+## `artifactLedgerFormatVersion`/`rowVersion` bump: this is a strictly
+## additive field an old reader ignores and a new reader defaults cleanly,
+## the same shape of change W3 already established for this exact file
+## format family.
 ##
 ## `entrypointIdentity` is the same `IdentityKey` ((path, flagHash)) RunLedger
 ## rows carry — but that hash is opaque and does not decode back to a group
@@ -82,6 +96,8 @@ type
     keyHash*:            string       ## opaque Stage-R key-material hash; not computed here
     sizeBytes*:          int64        ## artifact size in bytes
     ccTimeUs*:           int64        ## measured cc wall-time for this artifact, microseconds
+    toolchainFp*:        string       ## W9l: toolchainFingerprint(nimVersion, ccVersion) this
+                                       ## ccTimeUs was measured under. "" = unknown/pre-W9l row.
     timestamp*:          int64        ## unix epoch microseconds
     rowVersion*:         int          ## must equal currentArtifactRowVersion to be accepted
 
@@ -104,6 +120,7 @@ proc encodeArtifactExtra(n: var JsonNode; row: ArtifactRow) =
   n["keyHash"]          = newJString(row.keyHash)
   n["sizeBytes"]        = newJInt(row.sizeBytes)
   n["ccTimeUs"]         = newJInt(row.ccTimeUs)
+  n["toolchainFp"]      = newJString(row.toolchainFp)
 
 proc decodeArtifactExtra(n: JsonNode; rv: int; ident: IdentityKey;
                           groupId, configHash: string; timestamp: int64): ArtifactRow =
@@ -116,6 +133,9 @@ proc decodeArtifactExtra(n: JsonNode; rv: int; ident: IdentityKey;
     keyHash:            n{"keyHash"}.getStr(""),
     sizeBytes:          n{"sizeBytes"}.getBiggestInt(0),
     ccTimeUs:           n{"ccTimeUs"}.getBiggestInt(0),
+    # W9l: OPTIONAL on read -- a pre-W9l row has no "toolchainFp" field and
+    # decodes to "" (same treatment as depgraph's W3 ccVersion field).
+    toolchainFp:        n{"toolchainFp"}.getStr(""),
     timestamp:          timestamp,
   )
 

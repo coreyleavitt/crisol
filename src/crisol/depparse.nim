@@ -1,7 +1,7 @@
 ## depparse.nim — LEGACY / TEST-SUPPORT decode helper from the D1a spike.
 ##
 ## ⚠️  NOT USED BY THE IMPACT-ANALYSIS PIPELINE.  The canonical, SOUND decoder is
-##     `closure.nim` (`resolveMangled` + `extractClosure`).  This module survives
+##     `closure.nim` (`resolveMangledAll` + `extractClosure`).  This module survives
 ##     only as the `@p` soundness CANARY: `tests/fixtures/pathimport_main.nim`
 ##     imports it via `--path:src` precisely so `tests/integration/test_closure.nim`
 ##     can prove that project source reached through `@p` lands in the closure.

@@ -640,6 +640,83 @@ Dependency-correct order: **A0 → A1a…A1f → A2a-i/ii/iii → A2d → A2b �
 - **JUnit:** `oKilled`/`oCrashed` → `<error>` with `cause` in the message.
 - **RFC-0001** Implementation Decisions table: `fcntl F_SETLK` → `flock`; poll loop → event-driven where available; process-group placement → kill-domain ladder; `spawn.supervise` retired (dead code). Prose amendments: the "5 s grace" wording corrected to the 400 ms constant; the interrupt "delete all temp sink files … re-raise" paragraph amended (partial results, above); the reader-contract's executor-precedence rule subsumed by the pure derivation (§2 `hasFailRecords`).
 
+## Addendum — MSVC toolchain findings (issues #21/#22/#23, 2026-09-21)
+
+Recorded here rather than as a new RFC (decided 2026-09-20): these are
+measured properties of the `cc = vcc` toolchain that this RFC's tool-invocation
+layer has to live with, not a new design. Every claim below was measured
+against cl 19.44.35228 inside `ghcr.io/coreyleavitt/nim:2.2.10-windows`, not
+inferred. The workstream's own record is `docs/handoff/msvc-selection-layer.md`.
+
+**1. Stream routing is not a property of the tool; it is a property of the
+tool AND the question.** There is no rule of the form "compilers write
+diagnostics to stderr". cl splits by MESSAGE, and the split is the opposite of
+the intuitive one in both directions:
+
+| invocation | stdout | stderr |
+|---|---|---|
+| `cl` with no arguments | `usage: cl [ option... ] ...` | the version banner |
+| `cl /Zs /sourceDependencies- x.c` | `x.c` then the JSON document | (empty) |
+| `cl /Zs /Qzzzbogus x.c` | `x.c` | `cl : Command line warning D9002 ...` |
+
+This is why `ccprobe` carries TWO `RunProc` implementations rather than one
+widened type (issue #23). A version-banner probe needs `realRunMerged`
+(`poStdErrToStdOut`), because a stdout-only probe of `cl` sees the usage line
+and no version at all. A dependency probe needs the opposite — `realRunIn`'s
+stdout-only capture — because merging would put `D9002` text into the byte
+range the JSON parser reads, and, worse, would corrupt the GNU arm outright:
+`parseCcMDeps` strips everything before the FIRST `:`, so a single warning
+line containing a colon silently truncates the dependency list. One capture
+policy cannot serve both; the choice belongs to the call site.
+
+**2. A tool that cannot answer still exits 0.** The measured no-answer case:
+
+```
+vccexe.exe /Zs --platform:amd64 /nologo /Qzzzbogus unit.c
+  rc = 0, stdout = "unit.c\n", stderr = "cl : Command line warning D9002 ..."
+```
+
+An exit code is therefore NOT evidence that a tool invocation produced an
+answer, and for a probe whose output feeds a soundness key that distinction is
+the whole ballgame. The dependency probe treats the STRUCTURAL presence of a
+`/sourceDependencies` document as the success signal and the absence of one as
+a loud, specific failure — never as an empty header set. `/showIncludes` was
+rejected for precisely this reason: it emits zero lines both when a source
+includes nothing and when the probe never ran, so it cannot express the
+difference at all. (Note for anyone re-measuring: `/sourceDependenciesNOPE` is
+not an unknown option — cl reads it as "write the document to a file named
+NOPE" — so it exits 0 with an empty stderr for an unrelated reason.)
+
+**3. `/Zs` dominates `/c` and `/Fo<obj>`.** With `/Zs` (syntax-check only)
+present, no `.obj`, no `.pdb` and no `.idb` is written even with both flags
+left in place. The MSVC dependency derivation is therefore a PURE PREPEND of
+two flags with zero removals — a strictly stronger form of this RFC's
+replicate-don't-allow-list rule than the GNU arm can manage, since `-M` does
+not suppress `-c`. It also removes a side effect that was real before #21: the
+old derivation stripped only GNU-spelled `-c`/`-o`, so under vcc both survived
+and the "probe" recompiled and REWROTE the nimcache object it was supposed to
+be merely inspecting.
+
+**4. Locale.** `/sourceDependencies` emits JSON with fixed ASCII keys and no
+localizable prose, so it needs no locale pinning. `/showIncludes` does: its
+`Note: including file:` prefix is localized, which is why CMake ships a
+prefix-detection probe. The same trap governs version banners, and is why
+`ccprobe.versionLine` selects the banner by CONTENT (the first line bearing a
+dotted version token) rather than by position — a localized cl banner still
+carries `19.44.35228`.
+
+**5. Windows capture is not merely POSIX capture with different paths.**
+`streams.readAll` stops at the first read shorter than its buffer. On POSIX
+that is sound (osproc hands back a buffered `FILE*`); on Windows it is not
+(a raw-handle stream returns as soon as any bytes are available). cl flushes
+its banner immediately and its real payload milliseconds later, so crisol read
+8 bytes and called it the whole answer — with exit code 0 and nothing to
+indicate truncation. Issue #22; `toolexec.drainToEof`/`drainBoth` now own this
+for every tool invocation this RFC's §Scope exempts from the process contract.
+The pipe budget is also far smaller than folklore suggests: `osproc`'s
+`CreatePipe` uses `nSize = 0`, i.e. roughly 4 KB, well under a real dependency
+report.
+
 ## Risks accepted
 
 - macOS/Windows backends are CI-only to develop (no host Nim; podman is Linux); A2d's early legs + the posix-plus-overrides structure (C1) and skeleton-first sequencing (D1) keep each CI-iterated slice small.

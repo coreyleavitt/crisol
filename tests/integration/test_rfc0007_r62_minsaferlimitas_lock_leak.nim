@@ -1,5 +1,6 @@
 ## test_rfc0007_r62_minsaferlimitas_lock_leak.nim -- code-review r62:
-## the MinSafeRlimitAs warning (r18, api.nim) is a bare `stderr.write`
+## the MinSafeRlimitAs warning (r18, api.nim) was a bare `stderr.write`
+## (now routed through `warnStderr`)
 ## reached BEFORE `runTestsWith`'s first `try` -- the advisory lock is
 ## already held by that point (`acquireLock` runs ahead of it, and no
 ## `finally` covers this span at all). A closed/broken stderr

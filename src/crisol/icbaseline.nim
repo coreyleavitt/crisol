@@ -14,7 +14,7 @@
 ## the monolithic `nim c` in runner.nim, untouched) and it does NO caching —
 ## that would be Stage R, a separate, conditional slice.
 ##
-## ## The IcRunProc seam (mirrors ccprobe.RunProc / compiledriver.CompileDriver)
+## ## The IcRunProc seam (mirrors toolrun.RunProc / compiledriver.CompileDriver)
 ##
 ## The actual `nim` invocation is an injectable closure so unit tests never
 ## spawn a real compiler: they inject a fake `IcRunProc` that returns
@@ -51,7 +51,14 @@
 ## means the option was accepted but the build itself failed under
 ## `--mm:orc --incremental`, captured in `errorMsg`.
 
-import std/[monotimes, os, osproc, streams, strutils, times]  # process-contract-exempt: icbaseline is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
+import std/[monotimes, os, osproc, strutils, times]  # process-contract-exempt: icbaseline is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
+# R4-6 (round-4 review, 2026-09-24): `streams` was dropped here. The only
+# stream contact is `drainToEof(p.outputStream)` below, where `outputStream`
+# is osproc's own accessor and `toolexec.drainToEof` is what calls the streams
+# API -- so the import was dead on BOTH platforms (this file has no
+# `when defined` branch to hide a use in). It was the last unused import in
+# `src/` repo-wide, which is what let `icbaseline` join the source-soundness
+# gate in `dev` and `ci.yml` instead of being excluded from it.
 import crisol/toolexec  # drainBoth/drainToEof -- the capture primitives (issue #22)
 
 # ---------------------------------------------------------------------------

@@ -64,6 +64,14 @@ import std/[algorithm, monotimes, os, options, sequtils, strutils, times]
 import crisol/types
 import crisol/ioutils  # sanitizeControlBytes — issue #14: report-body field sanitization
 import crisol/cachetelemetry  # RFC-0005 B2b: CacheStats — the --cache-stats summary line
+# CR11: the ONE parser for the ccVersion string grammar lives in
+# ccidentity.nim now (parseCcFingerprint / CcFingerprint / CcHalf) — render.nim
+# consumes the structured value instead of re-deriving the pipe/`#` grammar by
+# hand (that re-derivation is what drifted and produced W7). No cycle:
+# ccidentity.nim is a leaf (imports only std + crisol/toolrun + crisol/fnv;
+# CR7 split it out of the old ccprobe.nim, which this module used to import
+# for the same reason).
+import crisol/ccidentity
 # rfc-0007 A1c: cause-aware detail for killed/crashed lines. `import nil` so
 # nothing unqualified leaks in.
 from crisol/process/types as ptypes import nil
@@ -351,10 +359,17 @@ proc countRecords(records: seq[TestRecord]): RecordCounts =
 #     content hash>" (nimprobe.nimFingerprint). Terse: first line of the
 #     text + first-8-hex of the hash on each side; when only the hash
 #     differs (text identical), "compiler binary differs" instead.
-#   kcCcVersion — value is "<cc --version first line>|<ldd --version first
-#     line>" (ccprobe.ccVersion) — NOT a multi-line+hash shape like
-#     kcNimVersion, despite RFC-0005's now-corrected line 377. Split on the
-#     pipe; name cc/ldd independently, no truncation (already single lines).
+#   kcCcVersion — value is `ccidentity.ccVersion`'s serialized `CcFingerprint`
+#     ("<cc version line>[ #<16-hex driver hash — POSIX only>]|<runtime
+#     version text> #<16-hex content hash>"). Parsed via
+#     `ccidentity.parseCcFingerprint` (the ONE parser for this grammar — CR11,
+#     W7) rather than re-split by hand here. Name cc/runtime independently,
+#     no truncation on the raw-segment fallback; when a half's TEXT is
+#     unchanged and only its content DIGEST moved, render "compiler binary
+#     differs"/"runtime library differs" — a field comparison on the parsed
+#     halves, the same shape `kcNimVersion` already uses for its own hash-only
+#     case — truncated to 8 hex chars terse, full hex verbose (closes W7: the
+#     two modes used to be indistinguishable on this component).
 #   kcHermeticEnv — lists envNames (never values).
 #   kcLimits — per-LimitKind diff over the "<kind>=<v>|..." fold string.
 #   kcArgv — already a plain joined argv string; shown in full.
@@ -387,13 +402,6 @@ proc splitLastPipe(s: string): tuple[left, right: string, ok: bool] =
   if idx < 0: return ("", "", false)
   (s[0 ..< idx], s[idx+1 .. ^1], true)
 
-proc splitFirstPipe(s: string): tuple[left, right: string, ok: bool] =
-  ## Split on the FIRST '|'. kcCcVersion is exactly two already-single-line
-  ## segments (`ccprobe.ccVersion`: "<cc first line>|<ldd first line>").
-  let idx = s.find('|')
-  if idx < 0: return ("", "", false)
-  (s[0 ..< idx], s[idx+1 .. ^1], true)
-
 proc renderOpaqueChanged(label: string; prev, curr: string; verbose: bool): string =
   ## Generic opaque-hash render, shared by every component with no
   ## dedicated renderer AND as the malformed-value fallback for
@@ -419,23 +427,69 @@ proc renderNimVersionLine(d: KeyDiff; verbose: bool): string =
     "kcNimVersion: " & prevLine & " (" & hash8(prevHash) & "…) → " &
                         currLine & " (" & hash8(currHash) & "…)"
 
+proc ccHalfDigestTag(d: CcDigest; verbose: bool): string =
+  ## The digest half of a "binary/library differs" line — mirrors
+  ## `hash8`'s terse/verbose split (kcNimVersion's own hash-only arm), which
+  ## is what W7 found MISSING for kcCcVersion ("terse/verbose modes are
+  ## indistinguishable").
+  case d.kind
+  of cdkKnown:      (if verbose: d.hex else: hash8(d.hex) & "…")
+  of cdkUnreadable: "unreadable"
+  of cdkNone:       "n/a"
+
+proc renderCcHalfLine(label: string; prev, curr: CcHalf; verbose: bool): string =
+  ## PURE, one half (`cc` or `runtime`) of a kcCcVersion diff. "" when this
+  ## half did not change at all.
+  ##
+  ## W7 (CR11): when the LEGIBLE TEXT is unchanged and only the content
+  ## DIGEST moved — a distro rebuild that leaves the version banner alone —
+  ## this is now a dedicated field comparison on the parsed halves instead of
+  ## being indistinguishable string surgery: "compiler binary differs" /
+  ## "runtime library differs", exactly what `docs/rfc/0005-distributed-cache-
+  ## and-trust.md:389`'s amendment declared and what
+  ## `tests/unit/test_render.nim` used to actively pin shut.
+  if prev == curr: return ""
+  if prev.state == cfsKnown and curr.state == cfsKnown and
+     prev.text == curr.text and prev.digest != curr.digest:
+    let subject = if label == "cc": "compiler binary" else: "runtime library"
+    return label & ": " & subject & " differs (hash " &
+           ccHalfDigestTag(prev.digest, verbose) & " → " &
+           ccHalfDigestTag(curr.digest, verbose) & ")"
+  # Anything else that changed (text, or a state transition to/from
+  # unavailable) — the raw segment, verbatim, no truncation (coordinator
+  # ruling: both segments are already single lines). `serializeCcHalf` is the
+  # SAME producer `ccidentity.ccVersion` used to build the original string, so
+  # this round-trips byte-identically to the pre-refactor rendering for every
+  # value that isn't the new digest-only case above.
+  let sentinel = if label == "cc": CcSentinel else: RuntimeSentinel
+  label & ": " & serializeCcHalf(prev, sentinel) & " → " &
+                 serializeCcHalf(curr, sentinel)
+
 proc renderCcVersionLines(d: KeyDiff; verbose: bool): seq[string] =
-  ## No verbose/terse distinction on the NORMAL path: cc/ldd segments are
-  ## already single lines (coordinator ruling) — always shown in full,
-  ## never truncated. `verbose` is only consulted on the malformed-value
-  ## fallback, mirroring kcNimVersion's fallback.
-  let (prevCc, prevLdd, prevOk) = splitFirstPipe(d.prev)
-  let (currCc, currLdd, currOk) = splitFirstPipe(d.curr)
+  ## Parses `d.prev`/`d.curr` through `ccidentity.parseCcFingerprint` — THE one
+  ## parser for this grammar (CR11) — and compares the two `CcFingerprint`
+  ## values as DATA (field comparison), never by re-splitting the raw string
+  ## by hand. `verbose` now genuinely changes output on the digest-only arm
+  ## (`renderCcHalfLine`'s W7 case); it is otherwise consulted only on the
+  ## malformed-value fallback, mirroring kcNimVersion's fallback.
+  ##
+  ## The runtime segment is labelled `runtime`, not `ldd`: since issue #23 it
+  ## identifies the C runtime library the toolchain links, as
+  ## `<version text> #<content hash>`, and `ldd` is merely where the text
+  ## comes from on glibc hosts. It is `libc.so.6 #<hash>` where there is no
+  ## `ldd` to ask.
+  let (prevFp, prevOk) = parseCcFingerprint(d.prev)
+  let (currFp, currOk) = parseCcFingerprint(d.curr)
   if not prevOk or not currOk:
     return @[renderOpaqueChanged("kcCcVersion", d.prev, d.curr, verbose)]
   result = @[]
-  if prevCc != currCc:
-    result.add "kcCcVersion: cc: " & prevCc & " → " & currCc
-  if prevLdd != currLdd:
-    result.add "kcCcVersion: ldd: " & prevLdd & " → " & currLdd
+  let ccLine = renderCcHalfLine("cc", prevFp.compiler, currFp.compiler, verbose)
+  if ccLine.len > 0: result.add "kcCcVersion: " & ccLine
+  let rtLine = renderCcHalfLine("runtime", prevFp.runtime, currFp.runtime, verbose)
+  if rtLine.len > 0: result.add "kcCcVersion: " & rtLine
   if result.len == 0:
     # Defensive: the component is only ever emitted (keys.explainMiss) when
-    # the combined value differs, so a diff with both segments equal should
+    # the combined value differs, so a diff with both halves equal should
     # not occur — fall back rather than render nothing.
     result.add renderOpaqueChanged("kcCcVersion", d.prev, d.curr, verbose)
 
@@ -503,9 +557,13 @@ proc isCacheMissDecision*(cd: CacheDecision): bool =
   ## rendering applies to. Excludes cdmHit (nothing to explain) and every
   ## "cache not even consulted" variant (cdmNotEligible/cdmGroupOptOut/
   ## cdmPolicyDisabled) — explaining "why did this miss" is meaningless
-  ## when the cache was never asked.
+  ## when the cache was never asked. `cdmToolchainUnidentified` (W4 full
+  ## fix) belongs here for the SAME reason as `cdmHermeticityDeg`: the run
+  ## was consulted and DID run live/pass, but the store gate refused to
+  ## publish it — a silent refusal (no explain-miss line at all) is its
+  ## own defect.
   cd in {cdmStored, cdmKeyMiss, cdmHermeticityDeg, cdmFlaky,
-         cdmClosureUnrecorded, cdmRecomputeMiss}
+         cdmClosureUnrecorded, cdmRecomputeMiss, cdmToolchainUnidentified}
 
 proc renderCacheStats*(s: CacheStats): string =
   ## PURE: the one-line --cache-stats summary (RFC-0005 "Hit-rate

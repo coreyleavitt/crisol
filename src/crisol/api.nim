@@ -55,7 +55,7 @@
 import std/[algorithm, json, options, os, sequtils, sets, strutils, tables, times]
 import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock,
                sandbox, cachedispatch, cacheregistry, cachetier, cacheport, cachetelemetry,
-               resultcache, ccprobe, nimprobe, planner, order, ledger, keys, depgraph, stats,
+               resultcache, ccidentity, nimprobe, planner, order, ledger, keys, depgraph, stats,
                compilereport]
 # RFC-0009 A2: `RunReport.trackedRoots`'s type (below) is a `paths.TrackedRoots`
 # -- types.nim imports paths.nim itself but does not export it, so this
@@ -172,15 +172,16 @@ export order.parseOrderMode
 #
 # CACHE IDENTITY now uses `nimprobe.cachedNimFingerprint()` — a RUNTIME probe
 # of the nim binary crisol's own compile invocations resolve via PATH (mirrors
-# `ccprobe.cachedCcVersion()` for the C compiler) — NOT `crisolNimVersion`
+# `ccidentity.cachedCcFingerprint()` for the C compiler) — NOT `crisolNimVersion`
 # below. `crisolNimVersion` (= `system.NimVersion`, crisol's OWN compile-time
 # Nim version, e.g. "2.2.10") is just a version STRING: two builds of Nim can
 # share it while differing in codegen (a stock vs. a locally-patched build),
 # which a cache/staleness check keyed on the string alone cannot detect. This
 # value is threaded into buildRunPlan → loadDepGraph / plan → execute →
-# realSeams so BOTH the staleness check (planner.decideCompile) AND the
-# soundness key (keys.soundnessKey) observe the binary-distinguishing
-# fingerprint instead of the compile-time string.
+# realSeams so BOTH the staleness check (depgraph.loadDepGraph's discard arms
+# -- planner.decideCompile carried a matching one until R3-8 removed it as
+# unreachable) AND the soundness key (keys.soundnessKey) observe the
+# binary-distinguishing fingerprint instead of the compile-time string.
 
 const crisolNimVersion* = NimVersion
   ## The Nim compiler version crisol was built with (e.g. "2.2.0").
@@ -1077,12 +1078,51 @@ proc renderPlan*(report: PlanReport; opts: RenderOpts): string =
 # planImpl — internal shared plan phase (raises CrisolError on structural problems)
 # ---------------------------------------------------------------------------
 
-type PlanImplResult = object
-  pr:          PlanReport      ## public projection (returned to callers of planTests)
-  cfg:         Config          ## full config (used by runTests to pass to execute)
-  pv:          RunPlanView     ## full view (used by runTests for graph + runnable count)
-  useFailed:   bool            ## surfaced to avoid recomputation in runTests
-  useChanged:  bool
+type
+  CcFingerprintProbe* = proc(): CcFingerprint {.closure.}
+    ## R5-10 (round-5 review): the one seam through which a test can hand this
+    ## module a C-toolchain fingerprint instead of the host's real one.
+    ##
+    ## WHY IT EXISTS. `runTestsWith` derives `toolchainUnidentified` from
+    ## `ccidentity.toolchainUnsound(<this probe's result>)` and threads it into
+    ## `cachedispatch.cacheEnabled` — the W4 gate that refuses to PUBLISH a
+    ## result under a toolchain identity that folded to a sentinel constant
+    ## (see the `let toolchainUnidentified = ...` block below). That predicate
+    ## has unit coverage and the store gate it feeds has unit coverage, but the
+    ## WIRE between them had none and could not get any: every host the suite
+    ## runs on identifies its `cc` cleanly, so the interesting branch was
+    ## unreachable from a real run, and both "hardcode `toolchainUnidentified
+    ## = false`" and "replace `toolchainUnsound(ccFp)` with `false`" left the
+    ## whole tree green. This seam makes the degraded host reachable, so
+    ## `tests/integration/test_r5_10_toolchain_unsound_wire.nim` can observe
+    ## the refusal (`cdmToolchainUnidentified`) through production code.
+    ##
+    ## PRODUCTION IS UNCHANGED. The default is `cachedCcFingerprint` itself —
+    ## the same memoised, real probe the call sites called directly before this
+    ## type existed — so `runTests`/`planTests`/`closureReport`/the CLI all
+    ## keep the byte-for-byte prior behaviour and pay the same single probe per
+    ## process. Nothing in `src/` ever passes this argument; it is test-only in
+    ## the same sense as `CacheDeps` (documented-uncontracted injection on an
+    ## internal entry point), not a runtime knob: there is no env var, no flag
+    ## and no config key that can reach it.
+    ##
+    ## MEMOISATION. `ccidentity.cachedCcFingerprint` memoises per PROCESS, so
+    ## the real probe runs once no matter how many runs a test driver performs;
+    ## an INJECTED probe is called afresh on every run (it is just a closure —
+    ## nothing here caches it), which is what lets one test process drive a
+    ## sound run and a degraded run back to back. A test must therefore return
+    ## a stable value from its closure, exactly as the memoised default does.
+    ## `planImpl` and `runTestsWith` each call the probe once and both take it
+    ## from the SAME parameter, preserving the invariant `planImpl`'s own
+    ## `ccVersion` comment states: the depgraph header written by `execute()`
+    ## and the one `loadDepGraph` checks are derived from one value.
+
+  PlanImplResult = object
+    pr:          PlanReport      ## public projection (returned to callers of planTests)
+    cfg:         Config          ## full config (used by runTests to pass to execute)
+    pv:          RunPlanView     ## full view (used by runTests for graph + runnable count)
+    useFailed:   bool            ## surfaced to avoid recomputation in runTests
+    useChanged:  bool
 
 proc shouldReportCompileBlock*(measureCompileReuse: bool): bool =
   ## R14-T6 (code review): the pure predicate gating whether runTests() even
@@ -1131,9 +1171,13 @@ proc envPassthroughsFrom*(cfg: Config; opts: RunOptions): seq[string] =
   ## DefaultEnvAllowlist's doc and resolveSandbox's `passthroughs` param).
   deduplicate(cfg.envPassthroughs & opts.envPassthroughs, isSorted = false)
 
-proc planImpl(opts: RunOptions): PlanImplResult =
+proc planImpl(opts: RunOptions; ccProbe: CcFingerprintProbe = cachedCcFingerprint): PlanImplResult =
   ## Internal plan phase shared by planTests and runTests.
   ## Raises CrisolError on any structural problem.
+  ##
+  ## `ccProbe` defaults to the real memoised probe (`cachedCcFingerprint`) —
+  ## see `CcFingerprintProbe`'s own doc for why the seam exists (R5-10) and
+  ## why passing anything else is test-only.
 
   # rfc-0007 code-review r19: `--hermetic network` (RunOptions.hermeticLevel
   # == hlNetwork) is a live arm for a mechanism that has never been
@@ -1234,6 +1278,19 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     changedSet = changedFiles(cfg.projectRoot, cfg.trackedRoots, opts.narrowing.baseRef)
 
   # 4. Build the run plan.
+  # W3 liveness fix: ccVersion was previously omitted here, so it silently
+  # took pipeline.buildRunPlan's old "" default -- loadDepGraph's
+  # dgdCcVersion discard arm (and decideCompile's matching check, which R3-8
+  # later removed as unreachable) were correct and unit-tested but never
+  # fired on a real `crisol run`.
+  # `$ccProbe()` (default `cachedCcFingerprint`, memoized per host process,
+  # same convention as cachedNimFingerprint() just above) -- this is the value
+  # that both loads the dep graph below (via buildRunPlan -> loadDepGraph) and,
+  # later in this call's lifetime, is re-derived from the same probe by
+  # runTestsWith to key execute()'s cache/compile decisions and to persist
+  # the graph header on save -- write and check sides always agree.
+  # pipeline.buildRunPlan's ccVersion parameter now has NO default
+  # specifically so this omission is a compile error, not a silent no-op.
   let pv = buildRunPlan(
     cfg          = cfg,
     selection    = opts.selection,
@@ -1242,6 +1299,9 @@ proc planImpl(opts: RunOptions): PlanImplResult =
     useChanged   = useChanged,
     changed      = changedSet,
     nimVersion   = cachedNimFingerprint(),
+    ccVersion    = $ccProbe(),   # R5-10: `$cachedCcFingerprint()` by default,
+                                  # i.e. cachedCcVersion() verbatim -- see CcFingerprintProbe
+
     forceCompile = opts.forceCompile,
     warnings     = cfgWarnings,
     shardK       = opts.shardK,
@@ -1631,7 +1691,8 @@ proc annotatePerfRegressions(results: var seq[EntrypointResult];
 # `runTests` (below) is the public, opts-only facade.
 # ---------------------------------------------------------------------------
 
-proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
+proc runTestsWith*(opts: RunOptions; deps: CacheDeps;
+                   ccProbe: CcFingerprintProbe = cachedCcFingerprint): RunReport =
   ## Full run facade.  Returns outcomes; never raises for expected conditions.
   ## Structural problems are encoded in RunReport.status / .error / .exitCode.
   ##
@@ -1690,7 +1751,12 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # Plan phase: catch CrisolError and encode into RunReport.
   var impl: PlanImplResult
   try:
-    impl = planImpl(opts)
+    # R5-10: the SAME probe this proc derives `ccFp`/`ccVer` from below, so a
+    # run's plan-time ccVersion (depgraph header check) and its execute-time
+    # ccVersion (header write + soundness key) can never come from two
+    # different fingerprints -- see `CcFingerprintProbe` and `planImpl`'s ccVersion
+    # comment. Production: both are `cachedCcFingerprint`, memoised, one probe.
+    impl = planImpl(opts, ccProbe)
   except CrisolError as e:
     let code = if e.kind == cekInternal: 2 else: 3
     return structuralResult(e.msg, code)
@@ -1860,8 +1926,137 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
   # nimVer is the RUNTIME fingerprint (nimprobe.cachedNimFingerprint) — not
   # crisolNimVersion — so a stock->patched compiler swap at the same version
   # STRING is soundly distinguished; see the module-doc note above.
-  let ccVer  = cachedCcVersion()
+  #
+  # W4 (CR11): `cachedCcFingerprint()` is called ONCE here (memoised — see its
+  # own doc) and `ccVer` is derived from it (`$`), rather than calling
+  # `cachedCcVersion()` separately, so the fully-degraded check below and the
+  # string folded into the SoundnessKey/depgraph header are guaranteed to
+  # agree on the SAME probe result.
+  #
+  # R5-10 (round-5 review): the probe itself now arrives through `ccProbe`,
+  # defaulting to `cachedCcFingerprint` -- production reads exactly as it did
+  # (one memoised probe per process), while a test can hand this proc a
+  # degraded fingerprint and so reach the `toolchainUnidentified` branch below
+  # from a REAL run. That wire (`toolchainUnsound` -> `cacheEnabled` ->
+  # `shouldStore`'s `cdmToolchainUnidentified`) was previously unobservable:
+  # both the predicate and the gate had tests, the connection between them had
+  # none. See `CcFingerprintProbe`'s doc, and
+  # `tests/integration/test_r5_10_toolchain_unsound_wire.nim`.
+  let ccFp   = ccProbe()
+  let ccVer  = $ccFp
   let nimVer = cachedNimFingerprint()
+  # W4 (full fix): the degradation ladder (`CcSentinel`/`RuntimeSentinel`) had
+  # no production consumer -- a degraded host (either half of the C
+  # toolchain fails to identify anything) folds `ccVer`'s degraded half(s) to
+  # a FIXED constant regardless of what is actually installed, structurally
+  # the same constant-folding defect issue #23 was opened to kill, narrowed
+  # to a broken/partially-broken host. `toolchainUnidentified` below is
+  # threaded into `cacheEnabled` (-> `CacheContext.toolchainUnidentified` ->
+  # every `shouldStore` call this run makes) so the store gate REFUSES to
+  # publish under that degraded key at all (`cdmToolchainUnidentified`) --
+  # see `ccidentity.toolchainUnsound`'s own doc for why the trigger is EITHER
+  # half not `cfsKnown`, not only both. The warning below explains the
+  # refusal to a human at the terminal, same `warnStderr` precedent as the
+  # `--rlimit-*` warning just above, at the SAME one production call site.
+  #
+  # WHAT THE REFUSAL COSTS (R8-D1, round-8 review; this comment and every
+  # message below used to say "not published to the shared cache ... reads
+  # are unaffected", which was wrong on both counts):
+  #   - EVERY store is refused, not only the shared one. `shouldStore`'s
+  #     `cdmToolchainUnidentified` arm is the single gate in front of
+  #     `runner.execute`'s one `cache.seams.store` call, which writes the
+  #     whole `TieredCache` -- the local L1 tier included. Observed:
+  #     `test_r5_10_toolchain_unsound_wire.nim` has only an L1 tier, and its
+  #     `put` is never reached.
+  #   - Reads are consulted, but find nothing. The lookup key folds `ccVer`,
+  #     i.e. the degraded identity (`<cc-unavailable>|...`), and no host
+  #     stores under a degraded identity -- they all take this same refusal
+  #     (only a crisol predating W4 ever did). Observed: a refused run twice
+  #     against one backend is `cdmToolchainUnidentified` both times; the
+  #     sound control is `cdmStored`, then `cdmHit`
+  #     (`test_r7_toolchain_warning_ladder.nim`).
+  # So while the cause persists, crisol does not cache at all on this host:
+  # every test runs every time. Since R7-S1 that includes any non-empty `CL`
+  # on an MSVC host (`CL=/MP` too): cl exits 2 and is refused.
+  let toolchainUnidentified = toolchainUnsound(ccFp)
+  # R6 (round-6 review 2026-09-24): an exhaustive `case` over
+  # `toolchainUnsoundReason` rather than an if/elif chain on the halves'
+  # states, so a new reason is a compile error HERE instead of
+  # silently inheriting whichever message came last -- which is exactly what
+  # happened to a driver that answered with only a diagnostic: it fell through
+  # to "answered, but not both" (or "neither ... answered"), both false.
+  # R8-D1 (round-8 review): every arm below states what the refusal really
+  # costs (see WHAT THE REFUSAL COSTS above): no result is cached, locally or
+  # remotely, and no cached result is found. `NotCached` is that shared
+  # sentence; each arm adds its own cause and what restores caching.
+  const NotCached =
+    "test results are NOT cached for this run, locally or remotely: " &
+    "nothing is stored in the local cache or the shared one, and no cached " &
+    "result is found, since no host stores results under an unidentified " &
+    "toolchain -- every test runs every time."
+  case toolchainUnsoundReason(ccFp)
+  of turSound:
+    discard
+  of turCompilerRefused:
+    # R7-S1/R7-D6 (round-7 review): names the refused drivers, and says that
+    # a non-zero EXIT is one of the ways to be refused -- with any non-empty
+    # `CL`, `cl` (and `vccexe`, which relays it) exits 2, whether or not it
+    # printed its banner first. `refusedDrivers` is never empty on this arm
+    # (`toolchainUnsoundReason` returns it only when `answeredUnidentified`).
+    # R8-D6 (round-8 review): singular for one driver; "refused", not "did
+    # not identify themselves", because under `CL=/W4` cl DOES print its
+    # banner and is refused for the exit; and no "_CL_" hint -- the probe runs
+    # cl with no arguments, which ignores `_CL_`, so it cannot cause this.
+    let drivers = ccFp.compiler.refusedDrivers
+    let names = drivers.mapIt("`" & it & "`").join(", ")
+    let one = drivers.len == 1
+    warnStderr("crisol: warning: the C compiler " &
+               (if one: "driver " & names & " was" else: "drivers " & names & " were") &
+               " refused as this host's compiler identity: " &
+               (if one: "it" else: "each") & " ran, but exited non-zero or " &
+               "printed no version banner (only a diagnostic, an echo of its " &
+               "arguments, or nothing) -- " & NotCached & " Caching resumes " &
+               "once the " & (if one: "driver answers" else: "drivers answer") &
+               " cleanly: if the CL environment variable is set, unset it " &
+               "(with any non-empty CL, cl exits non-zero even after printing " &
+               "its banner); otherwise repair the " &
+               (if one: "driver" else: "drivers") &
+               " (see ccidentity.CcFingerprint)\n")
+  of turBlind:
+    warnStderr("crisol: warning: the C toolchain could not be identified " &
+               "at all (neither a compiler driver nor a runtime library " &
+               "identified itself) -- " & NotCached & " Caching resumes " &
+               "once both the C compiler driver and the C runtime library " &
+               "can be identified on this host (see " &
+               "ccidentity.CcFingerprint)\n")
+  of turCompilerUnnamed:
+    # R3-4 (round-3 review): both halves answered, but the compiler half
+    # carries no content digest AND its text does not name a compiler
+    # version (`namesCompilerVersion`: no free-standing version token, or a
+    # diagnostic shape), so nothing established that the text describes a
+    # compiler. Without this arm the user was told "a compiler driver or a
+    # runtime library answered, but not both", which is FALSE here: both
+    # answered. Reachable only via a `cdVersionOnly` producer that does not
+    # filter unversioned candidates -- `ccIdentity` does (R3-1, and R6's
+    # `turCompilerRefused` above is what its refusals report), so in this
+    # tree the case is a backstop rather than a live path. The arm exists so
+    # the message can never be wrong if it does fire.
+    warnStderr("crisol: warning: the C compiler answered but did not " &
+               "identify itself (its output carries no version banner -- " &
+               "only a diagnostic, or no version token at all -- and this " &
+               "platform's profile records no content digest for the " &
+               "driver, so two hosts with two different such toolchains " &
+               "would fold to the same identity) -- " & NotCached &
+               " Caching resumes once the compiler states its version (see " &
+               "ccidentity.CcFingerprint)\n")
+  of turHalfMissing:
+    warnStderr("crisol: warning: half of the C toolchain identity could " &
+               "not be established (a compiler driver or a runtime " &
+               "library answered, but not both; the unresolved half would " &
+               "fold to a constant shared by any other host in the same " &
+               "state) -- " & NotCached & " Caching resumes once the " &
+               "missing half can be identified (see " &
+               "ccidentity.CcFingerprint)\n")
   # RFC-0005 B2b: --cache-stats installs a REAL InMemorySink in place of the
   # default NilSink so the run's hit/miss/publish/remote-error/verifyFail
   # events are actually collected. `cfg.cacheStats` is the RESOLVED value
@@ -1930,7 +2125,11 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
         # as failed — see CacheContext.outcomePolicy's own doc comment
         # (cachedispatch.nim) and the `let policy = ...` comment further
         # down this proc for why this is built here too, ahead of execute().
-        outcomePolicy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene))
+        outcomePolicy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene),
+        # W4 full fix: the SAME `ccFp` the warning above just judged --
+        # threaded through so every `shouldStore` call this run makes
+        # refuses to publish under a degraded toolchain identity.
+        toolchainUnidentified = toolchainUnidentified)
 
   # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
   # come off execute()'s returned ExecuteReport (code-review r7: no longer
@@ -2239,7 +2438,8 @@ proc runTestsWith*(opts: RunOptions; deps: CacheDeps): RunReport =
 proc runTests*(opts: RunOptions = RunOptions()): RunReport =
   ## Full run facade.  Returns outcomes; never raises for expected conditions.
   ## Thin wrapper over `runTestsWith` with `productionCacheDeps()` — the
-  ## real dependency (`cacheregistry.localOnlyCache`, unchanged behavior).
+  ## real dependency (`cacheregistry.configuredCache`, which falls back to
+  ## `localOnlyCache` when no `remote-cache` block is configured).
   ## See `runTestsWith`'s doc comment for the full flow; see `CacheDeps`'s
   ## for why the split exists.
   ##

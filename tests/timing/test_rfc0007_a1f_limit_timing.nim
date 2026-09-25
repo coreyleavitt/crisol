@@ -32,6 +32,13 @@ when defined(posix):
   import crisol/sandbox
   import crisol/process/types as ptypes
   import "../support/testep"
+  import "../support/statedir"
+
+  # R8-D3: this process's own crisol state dir -- never the repo root's shared
+  # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+  # run in the same tree would race (slot binaries / nimcache JSON deleted
+  # mid-compile).
+  let testStateDir = processStateDir("a1flimit")
 
   if getEnv("CRISOL_TIMING_TESTS") == "":
     quit(0)
@@ -60,7 +67,7 @@ when defined(posix):
       ## host, well inside that budget.
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "rlimit_cpu.nim")]
-      let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
+      let cfg  = Config(jobs: 1, compileTimeoutSecs: 30, timeoutSecs: 10, projectRoot: getCurrentDir(), stateDir: testStateDir, trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
       let spec = resolveSandbox(level = hlIsolated,
@@ -92,7 +99,7 @@ when defined(posix):
 
       let fdir = fixtureDir()
       let eps  = @[mkEp(fdir / "compile_interrupt.nim")]
-      let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
+      let cfg  = Config(jobs: 1, compileTimeoutSecs: 60, timeoutSecs: 60, projectRoot: getCurrentDir(), stateDir: testStateDir, trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
 

@@ -13,8 +13,9 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_artifactid.nim
 
-import std/[strutils, tables, unittest]
-import crisol/artifactid   # re-exports ccprobe.RunProc/realRun
+import std/[options, sequtils, strutils, tables, unittest]
+import crisol/artifactid   # re-exports toolrun.RunProc/realRun
+import crisol/paths         # CR3/CR10: TrackedRoots/classify's ReportedPath overload
 
 # ===========================================================================
 # Behavior 1 — normalize(): 4-line header strip + known-string erasure
@@ -139,7 +140,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
       else:
         (content: "", ok: false)
 
-  test "review Finding 1: deriveCcMInvocation REPLICATES the real command verbatim, dropping only -c and -o <obj>":
+  test "review Finding 1: deriveDepInvocation REPLICATES the real command verbatim, dropping only -c and -o <obj>":
     ## Previously an ALLOW-LIST (kept only -I/-D/-std, silently dropped
     ## everything else, including -w and -fmax-errors=3 here). Now a
     ## DENYLIST of exactly the two things a -M run must not carry: the
@@ -149,7 +150,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
     ## the exact class of flag the allow-list used to silently drop).
     let ccCmd = "gcc -c -w -fmax-errors=3 -I/inc -I/nim/lib -DFOO=1 -std=c99 " &
                 "-o /cache/@pfoo.nim.c.o /cache/@pfoo.nim.c"
-    let inv = deriveCcMInvocation(ccCmd)
+    let inv = deriveDepInvocation(ccCmd)
     check inv.ok
     check inv.cmd == "gcc"
     check inv.sourceFile == "/cache/@pfoo.nim.c"
@@ -165,7 +166,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
     ## reachable only via -isystem could change in place without changing
     ## includeClosureContentHash, an undetected wrong-hit.
     let ccCmd = "gcc -c -w -isystem /vendor/inc -I/proj/inc -o /cache/mod.c.o /cache/mod.c"
-    let inv = deriveCcMInvocation(ccCmd)
+    let inv = deriveDepInvocation(ccCmd)
     check inv.ok
     check "-isystem" in inv.args
     check "/vendor/inc" in inv.args
@@ -176,7 +177,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
     ## starts — every bit as header-resolution-relevant as -I. Same
     ## wrong-hit exposure as -isystem above under the pre-fix allow-list.
     let ccCmd = "gcc -c -include /proj/config.h -I/proj/inc -o /cache/mod.c.o /cache/mod.c"
-    let inv = deriveCcMInvocation(ccCmd)
+    let inv = deriveDepInvocation(ccCmd)
     check inv.ok
     check "-include" in inv.args
     check "/proj/config.h" in inv.args
@@ -184,7 +185,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
 
   test "review Finding 1 regression: -c and space-separated -o <obj> are removed, -M added, source preserved, other flags verbatim":
     let ccCmd = "gcc -c -w -I/inc -o /cache/mod.c.o /cache/mod.c"
-    let inv = deriveCcMInvocation(ccCmd)
+    let inv = deriveDepInvocation(ccCmd)
     check inv.ok
     check "-c" notin inv.args
     check "-o" notin inv.args
@@ -193,7 +194,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
 
   test "review Finding 1 regression: the fused -o<obj> form is dropped as a single token, other flags verbatim":
     let ccCmd = "gcc -c -w -I/inc -o/cache/mod.c.o /cache/mod.c"
-    let inv = deriveCcMInvocation(ccCmd)
+    let inv = deriveDepInvocation(ccCmd)
     check inv.ok
     for a in inv.args:
       check not (a.startsWith("-o") and a.len > 2)   # no fused -o<obj> survives
@@ -204,7 +205,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
     ## NOT caught by a worker's `except CatchableError` escape hatch. A
     ## malformed/degenerate manifest entry must degrade gracefully like
     ## every other per-unit oddity in this module.
-    let inv = deriveCcMInvocation("gcc")   # single token — no source file
+    let inv = deriveDepInvocation("gcc")   # single token — no source file
     check not inv.ok
     check inv.cmd == ""
     check inv.args.len == 0
@@ -219,7 +220,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
     ## resulting closure probe silently omits headers reachable only via
     ## that -I.
     let ccCmd = "gcc -c -w '-I/opt/my toolchain/include' -o /cache/mod.c.o /cache/mod.c"
-    let inv = deriveCcMInvocation(ccCmd)
+    let inv = deriveDepInvocation(ccCmd)
     check inv.ok
     check inv.cmd == "gcc"
     check inv.sourceFile == "/cache/mod.c"
@@ -228,14 +229,15 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
 
   test "R1b: an unterminated shell quote is fail-safe (ok=false), never mis-tokenizes and never raises":
     let ccCmd = "gcc -c -w '-I/opt/unterminated -o /cache/mod.c.o /cache/mod.c"
-    let inv = deriveCcMInvocation(ccCmd)
+    let inv = deriveDepInvocation(ccCmd)
     check not inv.ok
 
   test "parses a Make-style dependency list (with backslash continuations) into the header set":
     let ccMOutput = "@pfoo.nim.c.o: /cache/@pfoo.nim.c \\\n" &
                     " /inc/foo.h \\\n" &
                     " /usr/include/stdio.h\n"
-    let headers = ccIncludeHeaders(ccMOutput, "/cache/@pfoo.nim.c")
+    let headers = depIncludeHeaders(ccfGnuMake, ccMOutput,
+                                    "/cache/@pfoo.nim.c").headers.mapIt(string(it))
     check headers.len == 2
     check "/inc/foo.h" in headers
     check "/usr/include/stdio.h" in headers
@@ -248,7 +250,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
       check cmd == "gcc"
       (output: ccMOutput, ok: true)
     let reader = syntheticReader({"/inc/foo.h": "int x;"}.toTable)
-    let res = ccIncludeClosure(ccCmd, run, reader)
+    let res = ccIncludeClosure(ccCmd, run, reader, TrackedRoots())
     check res.ok
     check res.headers == @["/inc/foo.h"]
     check res.contentHash.len > 0
@@ -260,15 +262,15 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
       (output: ccMOutput, ok: true)
     let readerOld = syntheticReader({"/inc/foo.h": "struct S { int a; };"}.toTable)
     let readerNew = syntheticReader({"/inc/foo.h": "struct S { int a; int b; };"}.toTable)
-    let resOld = ccIncludeClosure(ccCmd, run, readerOld)
-    let resNew = ccIncludeClosure(ccCmd, run, readerNew)
+    let resOld = ccIncludeClosure(ccCmd, run, readerOld, TrackedRoots())
+    let resNew = ccIncludeClosure(ccCmd, run, readerNew, TrackedRoots())
     check resOld.contentHash != resNew.contentHash
 
   test "a failed cc -M invocation surfaces ok=false, never raises":
     let ccCmd = "gcc -c -I/inc -o out.o /src/mod.c"
     let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
       (output: "", ok: false)
-    let res = ccIncludeClosure(ccCmd, run, realFileReader)
+    let res = ccIncludeClosure(ccCmd, run, realFileReader, TrackedRoots())
     check not res.ok
     check res.headers.len == 0
 
@@ -277,7 +279,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
     let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
       runCalled = true
       (output: "should never be reached", ok: true)
-    let res = ccIncludeClosure("gcc", run, realFileReader)   # too short — no source file
+    let res = ccIncludeClosure("gcc", run, realFileReader, TrackedRoots())   # too short — no source file
     check not res.ok
     check res.headers.len == 0
     check res.contentHash == ""
@@ -318,11 +320,19 @@ suite "artifactKeyHash — normalized .c content XOR'd (chained) with the closur
     let k2 = artifactKeyHash("same body", "same-closure", "gcc -O3 -c -o a.o a.c")
     check k1 != k2
 
-  test "R5: omitting the cc-command argument (2-arg call) is backward-compatible with a call that explicitly passes an empty string":
-    ## Existing 2-arg call sites (e.g. the committed golden-fixture oracle)
-    ## must keep compiling and computing consistently: the third parameter
-    ## defaults to "", so a 2-arg call is exactly equivalent to explicitly
-    ## folding an empty cc-command component.
+  test "R5-15: the deprecated 2-arg companion forwards \"\", so it agrees with an explicit empty cc-command":
+    ## What this pins CHANGED in round 5 without the assertion changing, which is
+    ## worth stating so the next reader does not misread it. It used to pin a
+    ## DEFAULT: `normalizedCcCmd` was the third parameter of one proc and
+    ## defaulted to "". R5-15 removed that default -- a parameter that is cache
+    ## KEY MATERIAL must not be omittable -- and added a `{.deprecated.}` 2-arity
+    ## companion forwarding "" so existing calls keep compiling.
+    ##
+    ## So the equality below now pins the COMPANION'S FORWARDING CONTRACT: the
+    ## 2-arg spelling must fold an empty cc-command component and nothing else.
+    ## Existing 2-arg call sites (e.g. the committed golden-fixture oracle) depend
+    ## on that, and it is the reason removing the default cost zero churn. The
+    ## 3-arity proc has no default to test.
     check artifactKeyHash("body", "closure") == artifactKeyHash("body", "closure", "")
 
 # ===========================================================================
@@ -391,6 +401,150 @@ suite "reuseRatios — closed-form r_time (primary) / r_size (secondary), segmen
 
   test "an empty record set yields an empty segment table":
     check reuseRatios(@[]).len == 0
+
+# ===========================================================================
+# Behavior 6 — CR3: ccIncludeClosure must resolve a reported header's CASE
+# before it becomes identity/key material (the W1 gate, `paths.classify`'s
+# `ReportedPath` overload — CR10, applied to artifactid's SECOND consumer of
+# a dependency report).
+# ===========================================================================
+
+suite "ccIncludeClosure — CR3: a mis-cased reported header must not desync the closure hash":
+  ## Models the MSVC shape: `/sourceDependencies-` lowercases every path it
+  ## reports, unconditionally, while a gcc/clang `-M` report echoes the
+  ## `#include` directive's own literal (here: real-case) spelling. Both
+  ## reports name the SAME on-disk file. Pre-fix, `includeClosureContentHash`
+  ## chains the raw reported path string into the hash BEFORE the header's
+  ## content (`includeClosureContentHash`'s `fnv1a64(... & p & "\x00" & c)`
+  ## fold), so the two reports hash differently even
+  ## though the file is byte-identical — a permanent cross-toolchain
+  ## `keyHash` desync that skews the `--measure-compile-reuse` r_time/r_size
+  ## telemetry (CR3). Post-fix, both resolve to the SAME real on-disk
+  ## spelling via `classify`'s `ReportedPath` overload before hashing, so
+  ## the two hashes agree.
+
+  proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): Option[FoldPolicy] =
+    result = proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(policy)
+
+  proc rootsWith(projectAbs: string; policy: FoldPolicy): TrackedRoots =
+    initTrackedRoots(projectAbs, @[], "", fixedProbe(policy))
+
+  const realCaseHeader  = "/fake/proj-cr3/Native/Add.h"
+  const lowerCaseHeader = "/fake/proj-cr3/native/add.h"
+  const sourceFile      = "/fake/proj-cr3/src/mod.c"
+  const ccCmd = "gcc -c -I/fake/proj-cr3/src -o out.o " & sourceFile
+
+  proc fakeExpand(p: string): string =
+    ## Models the real on-disk-spelling resolver (`GetFinalPathNameByHandleW`
+    ## on a real Windows/case-insensitive volume): whatever case it is
+    ## handed, it answers with the ONE true on-disk spelling — exactly the
+    ## `paths.CandidateExpander` seam `classify` already exercises this way
+    ## in tests/unit/test_paths.nim's own W1 vectors.
+    if p.toLowerAscii == lowerCaseHeader: realCaseHeader else: p
+
+  proc makeRun(reportedHeader: string): RunProc =
+    let ccMOutput = "out.o: " & sourceFile & " " & reportedHeader & "\n"
+    result = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      (output: ccMOutput, ok: true)
+
+  proc caseInsensitiveReader(path: string): tuple[content: string; ok: bool] =
+    ## A real case-insensitive disk read: BOTH spellings of the same file
+    ## answer with IDENTICAL content, exactly as a real folding filesystem
+    ## would — isolating the bug to the PATH STRING folded into the hash,
+    ## never the content.
+    if path.toLowerAscii == lowerCaseHeader:
+      (content: "struct S { int a; };", ok: true)
+    else:
+      (content: "", ok: false)
+
+  test "RED (documents the pre-fix defect): with an explicitly EMPTY TrackedRoots, a real-case report and a lowercased report of the SAME file still hash differently":
+    ## CR10: `roots` no longer DEFAULTS to the unpopulated zero value — every
+    ## call site must now name it. This test pins the documented residual of
+    ## an EXPLICITLY-empty `TrackedRoots()` (never resolves case — see this
+    ## module's doc for why), so it doesn't silently regress into "always
+    ## fixed" without anyone noticing the behavior changed.
+    let resGcc  = ccIncludeClosure(ccCmd, makeRun(realCaseHeader), caseInsensitiveReader,
+                                   TrackedRoots())
+    let resMsvc = ccIncludeClosure(ccCmd, makeRun(lowerCaseHeader), caseInsensitiveReader,
+                                   TrackedRoots())
+    check resGcc.ok
+    check resMsvc.ok
+    check resGcc.contentHash != resMsvc.contentHash   # same file, different hash: the bug
+
+  test "FIXED: with TrackedRoots supplied, the two reports resolve to the SAME real spelling and hash identically":
+    let roots = rootsWith("/fake/proj-cr3", fpAsciiLower)
+    let resGcc  = ccIncludeClosure(ccCmd, makeRun(realCaseHeader), caseInsensitiveReader,
+                                   roots, fakeExpand)
+    let resMsvc = ccIncludeClosure(ccCmd, makeRun(lowerCaseHeader), caseInsensitiveReader,
+                                   roots, fakeExpand)
+    check resGcc.ok
+    check resMsvc.ok
+    check resGcc.headers == resMsvc.headers           # resolved to the same real spelling
+    check resGcc.contentHash == resMsvc.contentHash   # CR3: same file -> same hash
+
+    # ...and the downstream artifactKeyHash the reuse-ratio telemetry
+    # actually keys on agrees too.
+    let keyGcc  = artifactKeyHash("same .c body", resGcc.contentHash)
+    let keyMsvc = artifactKeyHash("same .c body", resMsvc.contentHash)
+    check keyGcc == keyMsvc
+
+  test "a genuinely-outside (system) header is kept, not silently dropped, when roots are supplied":
+    ## UNLIKE closure.extractCompileInputs' tracked-closure loop (which drops
+    ## anything outside every root), ccIncludeClosure must keep system
+    ## headers: RFC-0006's soundness argument is that a libc/header upgrade
+    ## must remain visible in the hash (module doc's cc -M, not -MM,
+    ## rationale). This is the documented reason the two loops are NOT
+    ## unified behind one drop-outside-roots helper.
+    let roots = rootsWith("/fake/proj-cr3", fpAsciiLower)
+    let ccMOutput = "out.o: " & sourceFile & " /usr/include/stdint.h\n"
+    let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      (output: ccMOutput, ok: true)
+    let reader = proc(path: string): tuple[content: string; ok: bool] =
+      (content: "typedef long intptr_t;", ok: true)
+    let res = ccIncludeClosure(ccCmd, run, reader, roots, fakeExpand)
+    check res.ok
+    check res.headers == @["/usr/include/stdint.h"]
+
+# ===========================================================================
+# Behavior 7 — round-2 review (MEDIUM): a /sourceDependencies document whose
+# own Data.Source names a DIFFERENT translation unit than the one just
+# probed (W9j's `dscMismatch`) must fail as loudly as a `DepProbeError` --
+# never fall through as an empty-but-successful closure. Pre-fix,
+# `ccIncludeClosure` checked only `probed.err != dpeNone` and never read
+# `probed.sourceCheck`, so this exact case returned `ok: true,
+# probeErr: cpeNone` with an empty header set indistinguishable from a
+# genuine empty closure. Mirrors closure.extractCompileInputs's raise on the
+# identical signal.
+# ===========================================================================
+
+suite "ccIncludeClosure — round-2 review: a Data.Source mismatch must fail loudly, not as an empty successful closure":
+
+  test "a stale/misattributed /sourceDependencies document surfaces ok=false, probeErr=cpeSourceMismatch, and a message naming the mismatch":
+    ## `cl` is on `MsvcDrivers`, so `deriveDepInvocation` classifies this
+    ## `ccCmd` as `ccfMsvc` and `depIncludeHeaders` parses the run's output
+    ## with the `/sourceDependencies` JSON parser. The document below is
+    ## well-formed and its Includes are real, but `Data.Source` names
+    ## "OTHER.c" -- a different translation unit than `add.c`, the one this
+    ## probe was actually for (mirrors test_ccprobe.nim's own dscMismatch
+    ## fixture).
+    let ccCmd = "cl /c /Foout.obj c:/p/native/add.c"
+    let staleDoc = "unit.c\n" & """{
+    "Version": "1.2",
+    "Data": {
+        "Source": "c:\\p\\native\\OTHER.c",
+        "Includes": [ "c:\\p\\native\\add.h" ]
+    }
+}
+"""
+    let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      (output: staleDoc, ok: true)
+    let res = ccIncludeClosure(ccCmd, run, realFileReader, TrackedRoots())
+    check not res.ok
+    check res.probeErr == cpeSourceMismatch
+    check res.headers.len == 0
+    check res.contentHash == ""
+    check "DIFFERENT translation unit" in res.errMsg
+    check "/sourceDependencies" in res.errMsg   # names the ACTUAL probe family, not a hard-coded GNU spelling
 
 when isMainModule:
   echo "All artifactid tests passed."

@@ -45,8 +45,8 @@
 ##   • Output captured to per-entrypoint temp files; read atomically after
 ##     completion; bounded by maxOutputBytes.
 
-import std/[envvars, json, monotimes, options, os, sequtils, sets, strutils, tables, tempfiles, times]
-import crisol/[types, config, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver, ccprobe]
+import std/[envvars, json, monotimes, options, os, sequtils, sets, tables, tempfiles, times]
+import crisol/[types, config, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver, toolrun]
 # rfc-0007 A2b: the runner is supervised entirely through `crisol/process`'s
 # Supervisor contract now — `std/posix` and `crisol/spawn` (forkExec/
 # forkExecEnvScratch/GracePeriodMs) are GONE from this file; every compile
@@ -73,7 +73,19 @@ export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/
 # don't need a separate `import crisol/cachedispatch`.
 export cachedispatch.CacheContext
 export cachedispatch.cacheDisabled
+# R4-4 (round-4 review, 2026-09-24): `cacheEnabled` now has a `{.deprecated.}`
+# compatibility overload (the arity without `toolchainUnidentified` — see
+# cachedispatch.nim's R4-4 section). Re-exporting the NAME re-exports both
+# arities, which is required: a consumer that imports crisol/runner must keep
+# compiling exactly as before, and the deprecation must reach it at ITS OWN
+# call site, not be spent here on the export line. Nim charges the warning to
+# whoever names a deprecated symbol, so an unguarded `export` would make this
+# line the only thing `--warningAsError:Deprecated:on` ever reports — masking
+# every real omission in `src/` behind one unfixable error. Suppressed for the
+# export statement alone; the warning is untouched at every call site.
+{.push warning[Deprecated]: off.}
 export cachedispatch.cacheEnabled
+{.pop.}
 export cachedispatch.isActive
                  # so consumers that `import crisol/runner` keep their symbols.
                  # ResultCallback was moved to types.nim; it is in scope here via
@@ -1128,14 +1140,22 @@ proc warnMeasureCompileReuseNoWorkerOnce() =
     warned = true
 
 proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string;
-                             config: Config; projectRoot: string): MeasurePlan =
+                             config: Config; projectRoot: string;
+                             toolchainFp: string): MeasurePlan =
   ## Plan construction for the compile-slot measurement worker
   ## (`config.measureCompileReuse`).
   ##
   ## configHash = flagHash(ep.flags), computed PER-ENTRYPOINT — this MUST
   ## collide with appendAttemptRow's identityKey(ep, roots) (this file,
-  ## ~line 213) or ArtifactRows silently orphan from the RunLedger's
+  ## `proc appendAttemptRow`) or ArtifactRows silently orphan from the RunLedger's
   ## IdentityKey (measureworker.nim's own documented contract).
+  ##
+  ## W9l: `toolchainFp` is `ctx.toolchainFp` — the SAME `toolchainFingerprint
+  ## (nimVersion, ccVersion)` value execute() already computes once per run
+  ## for nimcache-persistence (see ExecCtx's doc) — threaded straight through
+  ## so the measure-worker can stamp its ArtifactRow/CompileCostRow rows
+  ## without re-probing ccVersion itself (it deliberately cannot: see
+  ## workerplan.MeasurePlan.toolchainFp's doc).
   ##
   ## r65: `projectRoot` is threaded in by the caller (`ctx.projectRoot`) —
   ## this proc has no `ExecCtx` of its own to read, but must still use the
@@ -1159,6 +1179,7 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
     configHash:        flagHash(ep.flags),
     stateDir:          stateDirOf(config),
     projectRoot:       projectRoot,
+    toolchainFp:       toolchainFp,
   )
 
 proc dirHasEntries(dir: string): bool =
@@ -1203,7 +1224,9 @@ proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
   ##    PRECISELY which external objects are stale, so it conservatively
   ##    colds EVERY foreign (non-module) object directly in `cacheDir` —
   ##    anything `closure.isModuleObjectName` does NOT recognize as a Nim
-  ##    module object — forcing Nim to recompile every external. This lets
+  ##    module object (filtered by `closure.hasObjectExt`, which accepts both
+  ##    `.o` and MSVC's `.obj` — hardcoding `.o` here made this whole rule a
+  ##    silent no-op under vcc, issue #21 slice 1a) — forcing Nim to recompile every external. This lets
   ##    the next `extractCompileInputs` see a fresh `compile` entry for each
   ##    one and re-derive its headers via `cc -M`, instead of failing closed
   ##    for want of a carried-forward header record.
@@ -1222,7 +1245,7 @@ proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
     for kind, path in walkDir(cacheDir):
       if kind != pcFile: continue
       let base = path.extractFilename
-      if not base.endsWith(".o"): continue
+      if not hasObjectExt(base): continue
       if isModuleObjectName(base): continue
       removeFile(path)
 
@@ -1445,9 +1468,10 @@ proc spawnCompileStable(
     removeFile(binCompiled)
     # Issue #16: bust any external object Nim's own cache would otherwise
     # serve stale because a header it #includes changed — see
-    # bustStaleExternalObjects's doc comment. Must run BEFORE forkExec
-    # below; a failed eviction is a pre-compile setup failure like the
-    # createDir/removeFile calls above (return false, oSpawnError).
+    # bustStaleExternalObjects's doc comment. Must run BEFORE the compile
+    # child's `sv.spawn(childSpec)` below; a failed eviction is a
+    # pre-compile setup failure like the createDir/removeFile calls above
+    # (return false, oSpawnError).
     bustStaleExternalObjects(cacheDir, ep, graph, config, hadPriorCacheContent)
   except:
     return false
@@ -1458,7 +1482,7 @@ proc spawnCompileStable(
     tmpDir = makeTmpDir("crisol_slot_")
   except:
     # M15: clean up the scratch bin dir. cacheDir is deliberately left alone:
-    # nim c never ran this attempt (mkdtemp failed before forkExec), so any
+    # nim c never ran this attempt (mkdtemp failed before `sv.spawn`), so any
     # content in cacheDir is a valid PERSISTENT nimcache from a prior run —
     # wiping it here would destroy good state over an unrelated tmp-dir
     # allocation failure.
@@ -1490,13 +1514,14 @@ proc spawnCompileStable(
   # pattern as `monolithicCompArgs` above) so the write+cleanup logic has a
   # single home.
   template writeWorkerPlan(planFilename: string; token: string): seq[string] =
-    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config, ctx.projectRoot)
+    let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config,
+                                       ctx.projectRoot, ctx.toolchainFp)
     let planPath = tmpDir / planFilename
     try:
       writeFile(planPath, $toJson(mplan))
     except:
       # M15: cacheDir intentionally NOT wiped — nim c never ran this attempt
-      # (plan write failed before forkExec); see the mkdtemp-failure comment
+      # (plan write failed before `sv.spawn`); see the mkdtemp-failure comment
       # above for why a persistent nimcache must survive an unrelated
       # pre-compile I/O error.
       try: removeDir(tmpDir)     except: discard
@@ -1824,6 +1849,112 @@ proc buildVerifyPlan*(entrypoints: seq[PlannedEntrypoint];
 # execute — bounded-parallel continue-on-failure runner
 # ---------------------------------------------------------------------------
 
+# SOUNDNESS-PARAMETER WARNING (round-2 review, R2-7). The `ccVersion` default
+# below is an instance of the shape that produced defect L1: a parameter that
+# governs cache-key soundness while carrying a convenient default, so a caller
+# who omits it silently gets the unsound value AND the omission is invisible in
+# review. L1 was exactly that -- a fix whose scope excluded `api.nim` left
+# `ccVersion` silently "" on a real run path: built, unit-tested, green, and
+# completely inert in production. `pipeline.buildRunPlan`'s equivalent default
+# was removed for that reason.
+#
+# WHAT `execute`'S SURFACE STATUS ACTUALLY IS (round-5 review, R5-8(a),
+# 2026-09-24). This note used to call `execute` "this module's documented public
+# API". That is the opposite of what RFC-0003 says. Per
+# `docs/rfc/0003-library-facade-and-onboarding.md` (Goals #2 and Non-Goals, "API
+# stability is a convention"), "a single module (`crisol/api`) is THE documented,
+# stable library surface; everything else is an implementation detail a consumer
+# need not import", and — verbatim — Nim "cannot make `runner`/`pipeline`/
+# `config` un-importable; `crisol/api` is THE contracted surface by documentation
+# + CHANGELOG discipline, and the others become 'importable but uncontracted.'"
+# README.md's Status line records the whole surface as unstable pre-1.0 on top of
+# that. So `execute` is IMPORTABLE BUT UNCONTRACTED, not documented public API.
+#
+# Getting this right is load-bearing beyond pedantry: R3-8's entire justification
+# for deleting dead code was that `crisol/planner` is not contracted surface, and
+# this file re-exports `planner` WHOLESALE (`export planner`, above). If `runner`
+# were public API that premise would fail. RFC-0003 says it is not, so the
+# premise holds — and the false sentence was here, not in R3-8.
+#
+# The soundness argument is UNCHANGED by the correction, and if anything reads
+# more honestly for it: "uncontracted" bounds what may break, not who may call.
+# A consumer can `import crisol/runner` today (five sibling projects consume
+# crisol as a library, and nothing stops one of them reaching past `crisol/api`),
+# so a `ccVersion`-omitting call site can appear entirely outside this repo, in a
+# diff no crisol reviewer ever sees. A defaulted soundness parameter on an
+# uncontracted-but-importable proc is therefore no safer than on a contracted
+# one; it is only less visible.
+#
+# Every production caller threads a real value or an EXPLICIT "" today. That
+# claim was false when first written (round-3 review, R3-6): `runEntrypoint*`
+# in this same file omitted both versions, which is why the rule below is
+# "pass it explicitly", not "pass something real" -- a cold-start caller that
+# genuinely has no probe still has to say so. If you add one, pass it
+# EXPLICITLY -- including `""` when you genuinely mean "no probe available" --
+# so the intent appears in the diff that adds the call rather than in whether
+# the author knew the parameter existed.
+#
+# WHY THE DEFAULT IS STILL HERE (round-4 review, R4-7, 2026-09-24 — replacing a
+# reason R3-7 had already refuted). This note used to say the removal was
+# deferred "only because it touches 527 call sites (~450 in tests)" and wanted
+# to land as one atomic batch. That cost does not apply — twice over.
+#
+# First, the figure was never `execute`'s own. `527`/`~450` is the R3-7 census's
+# AGGREGATE over six procs (`docs/handoff/msvc-selection-layer.md`: "execute 291,
+# initDepGraph 100, loadDepGraph 63, toolchainFingerprint 32, cachePath 23,
+# cleanOrphans 18"). Measured for `execute` alone on 2026-09-24, comment lines
+# excluded:
+#
+#   grep -o '\bexecute(' over tests/  ->  114 call sites
+#   grep -o '\bexecute(' over src/    ->    3 call sites
+#                                          (api.nim x2, this file's runEntrypoint)
+#
+# 117, not 527. The census's own "execute 291" does not reproduce either, and
+# round 5 (R5-9) corrected the aggregate for exactly that reason: the `execute`
+# component had counted comment PROSE, and this file's own comments are a large
+# part of why. Substituting the measured 117 gives 353 call sites, 326 of them in
+# tests. Do not re-derive 527 from the quotation above -- it is quoted as the
+# claim being corrected, not as a figure.
+#
+# Second, R3-7 found a remedy that costs nothing at the call sites regardless of
+# their number — drop the default from the full-arity proc and add a
+# `{.deprecated.}` companion carrying the old signature, so every existing call
+# keeps compiling while the compiler reports each omission at the CALLER's own
+# file:line (silent under the `--warnings:off` every test invocation here already
+# passes; a hard error under `dev check`'s `--warningAsError:Deprecated:on`).
+# Sibling procs DID get that treatment, which is what makes this a considered
+# exception rather than an oversight.
+#
+# HOW MANY siblings is deliberately NOT stated here (round-5 review, R5-8(b)).
+# The previous wording hand-maintained a count — "Five sibling procs DID get that
+# treatment" — which was already stale when it was written: three more companions
+# landed in R4-4, in the same round as that sentence. A count nobody can
+# recompute while reading rots by construction, so the count is replaced by the
+# commands that answer it:
+#
+#   grep -rn '{\.deprecated:' src/ | grep -c '\.} ='     # companion overloads
+#   grep -rln '{\.deprecated:' src/                      # modules carrying them
+#   ci/assert-defaulted-params.sh                         # the whole defaulted-
+#                                                         # parameter population,
+#                                                         # pinned and CI-gated
+#
+# No count is quoted here even parenthetically -- the previous sentence's whole
+# failure was that a number in a comment cannot be re-derived from the comment.
+# `execute` is the exception to a rule whose size is whatever those commands
+# print at the moment you run them.
+#
+# `execute` is excluded because the remedy does not scale to its signature: 14
+# parameters, several with EXPRESSION defaults (`cacheDisabled(resolveSandbox())`,
+# `noopResult`) and several carrying their own `##` documentation. A companion
+# overload would mean two hand-written copies of that signature, both public,
+# both needing to stay in sync through every later parameter addition — a drift
+# hazard judged worse than the defaulted parameter itself, since a companion
+# that silently falls behind the real proc reintroduces exactly the "green,
+# built, and inert" failure mode L1 was. (`clean.nim`'s R3-7 section records the
+# same trade-off from the other side: it could use an `auto` return precisely to
+# avoid a second copy of one long result tuple.) If that ever changes, the
+# `##` doc on `ccVersion` below is the contract to preserve. See R2-7/R3-7 in
+# docs/handoff/msvc-selection-layer.md.
 proc execute*(
   p:                RunPlan;
   config:           Config = Config();
@@ -1834,6 +1965,12 @@ proc execute*(
                                   ## that keys the persistent nimcache path — see spawnCompileStable.
                                   ## "" (default, same convention as nimVersion) disables the
                                   ## fingerprint suffix — used by tests / cold-start callers.
+                                  ## PASS IT EXPLICITLY (R3-6), including "" when you have no
+                                  ## probe: the default is for source compatibility, not a
+                                  ## recommended calling convention. Stated in the `##` doc
+                                  ## because generated docs and editor hover show only these
+                                  ## lines, never the `#` warning above this proc — and the
+                                  ## five sibling projects consume crisol as a library.
   onResult:         ResultCallback = noopResult;
   failFast:         bool = false;
   showProgress:     bool = true;
@@ -1985,15 +2122,12 @@ proc execute*(
   # Pre-allocate result slots so we can fill them by index (plan order).
   var results = newSeq[EntrypointResult](n)
 
-  # B2: open the ledger shard for this invocation (if stateDir is set).
-  # Guards on empty stateDir — some callers (e.g. runEntrypoint) leave it "".
-  # Resolve to absolute path using projectRoot so the ledger dir is co-located
-  # with the rest of the state (resultcache, lastrun.json, etc.) regardless of CWD.
-  var led: Ledger
-  let resolvedLedgerStateDir = stateDirOf(config)
-  let ledgerActive = resolvedLedgerStateDir.len > 0
-  if ledgerActive:
-    led = openLedger(resolvedLedgerStateDir)
+  # B2: open the ledger shard for this invocation. `stateDirOf` always
+  # yields an absolute dir (R8-D3: an empty `Config.stateDir` means the
+  # default `.crisol` under projectRoot, never "" and never cwd), so the
+  # ledger is co-located with the rest of the state (resultcache,
+  # lastrun.json, bin/, cache/) and is always open.
+  var led = openLedger(stateDirOf(config))
 
   # Slots array: nJobs concurrent slots; idle when state == ssIdle (rfc-0007
   # A2b — replaces the pepIdx==-1 sentinel).
@@ -2340,7 +2474,7 @@ proc execute*(
             # inputHash will be stamped later by the cache-store gate if caching
             # is active, but for observability we record the plan-time key here
             # (consistent: the build identity is the same across all attempts).
-            if ledgerActive and recordLedger:
+            if recordLedger:
               appendAttemptRow(led, p.entrypoints[completedIdx].ep, slotAttempt,
                                results[completedIdx], inputHashes[completedIdx],
                                slots[idx].peakRssBytes, config.trackedRoots,
@@ -2355,7 +2489,8 @@ proc execute*(
             let verdict =
               if cacheActive:
                 shouldStore(results[completedIdx], cache.spec, slotAttempt,
-                           cache.policy, p.entrypoints[completedIdx].cacheable)
+                           cache.policy, p.entrypoints[completedIdx].cacheable,
+                           toolchainUnidentified = cache.toolchainUnidentified)
               else:
                 StoreVerdict()
 
@@ -2944,8 +3079,7 @@ proc execute*(
     # the try block's), so `ac.memThrottledSlots` is still readable below,
     # on the normal-return path, without needing the finally-time capture.
     teardownDiscard(sv, slots)
-    if ledgerActive:
-      closeLedger(led)
+    closeLedger(led)
 
   # rfc-0007 A1e-ii: trim `results` to the §2 emission set — entries whose
   # last-started phase is pkRan/pkCached/pkSpawnFailed, i.e. `finalized`.
@@ -2995,23 +3129,48 @@ proc runEntrypoint*(
   ## Returns a canonical EntrypointResult.
   ## M6: thin wrapper around execute() — no duplicate compile+run+classify path.
   ## Uses a temporary Config with the given timeouts; does not record freshness.
+  ##
+  ## R8-D3: the call gets its OWN fresh state dir (a unique temp dir, removed
+  ## on return) rather than sharing one. It records nothing worth keeping --
+  ## cache disabled, empty dep graph, no freshness -- so there is nothing to
+  ## reuse across calls, and a shared dir (formerly bin/ and cache/ under
+  ## the process cwd) let two concurrent callers delete each other's slot
+  ## binaries and nimcache JSON mid-run. An explicit CRISOL_STATE_DIR still
+  ## wins, exactly as for every other run (`stateDirOf`).
+  let privateStateDir = createTempDir("crisol_runep_", "")
+  defer:
+    try: removeDir(privateStateDir)
+    except OSError: discard  # best-effort scratch cleanup; the result stands
   var cfg = Config(
     compileTimeoutSecs: compileTimeoutMs div 1000,
     timeoutSecs:        runTimeoutMs div 1000,
     maxOutputBytes:     maxOutputBytes,
+    stateDir:           privateStateDir,
     # Use current dir as projectRoot so a tag-0 ep.tp resolves via toNative.
     # trackedRoots must be populated too -- toNative resolves through it,
     # never through projectRoot directly (RFC-0009 A-final-ii).
     projectRoot:        getCurrentDir(),
-    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), privateStateDir),
   )
   # Ensure non-zero fields so M1 derivation uses them (not defaults).
   if cfg.compileTimeoutSecs == 0: cfg.compileTimeoutSecs = 30
   if cfg.timeoutSecs == 0:        cfg.timeoutSecs = 30
   if cfg.maxOutputBytes == 0:     cfg.maxOutputBytes = 65_536
-  let p = plan(cfg, @[ep], emptyDepGraph())
+  # R3-6 (round-3 review): `nimVersion`/`ccVersion` are threaded EXPLICITLY as
+  # "" rather than left to their defaults. Nothing about the behaviour changes
+  # -- "" is what the defaults already supplied -- but this is the one exported
+  # proc in the tree that omitted them, which falsified the SOUNDNESS-PARAMETER
+  # WARNING above `execute` ("every production caller threads a real value
+  # today") and is precisely the omission that note asks a reader to make
+  # visible in the diff. "" is correct and deliberate here: this wrapper
+  # disables the cache (`cacheDisabled`) and plans against `emptyDepGraph()`,
+  # so there is no key to be unsound and nothing to be stale against; it is a
+  # cold-start caller in the note's own sense, not a probe-less production run.
+  let p = plan(cfg, @[ep], emptyDepGraph(), nimVersion = "", ccVersion = "")
   var g = emptyDepGraph()
-  let results = execute(p, config = cfg, graph = g, onResult = noopResult,
+  let results = execute(p, config = cfg, graph = g,
+                        nimVersion = "", ccVersion = "",
+                        onResult = noopResult,
                         failFast = false, showProgress = false,
                         progressIntervalMs = 30_000,
                         cache = cacheDisabled(resolveSandbox())).results

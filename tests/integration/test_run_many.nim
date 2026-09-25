@@ -35,16 +35,15 @@ proc mkEp(path: string): Entrypoint =
 
 proc isolatedStateDir(tag: string): string =
   ## RFC-0009 A5b-i test hygiene: `plan()`'s `decideCompile` calls
-  ## `fileExists(binPath(ep, config) / binName(ep))`. A `Config` with no
-  ## `stateDir` resolves (via `stateDirOf`) to an empty string, so
-  ## `binPath`/`cachePath` collapse to a CWD-RELATIVE "bin"/"cache" — i.e.
-  ## the repo root when this suite runs under `./dev test`. An earlier test
-  ## file in the same `./dev test` invocation may have already compiled a
-  ## fixture into that same canonical (A5b-i TrackedPath-derived) slug's
-  ## `./bin/<slug>`, which makes THIS suite observe `edStale` instead of the
-  ## `edNeverBuilt` it asserts against an empty graph. Give every `Config`
-  ## its own fresh, isolated, ABSOLUTE stateDir so binPath/cachePath can
-  ## never collide with repo-root pollution from any other test.
+  ## `fileExists(binPath(ep, config) / binName(ep))`, and `execute()` compiles
+  ## into `binPath`/`cachePath`. Without an explicit `stateDir` those resolve
+  ## (via `stateDirOf`) under `<projectRoot>/.crisol` -- the repo root's, for
+  ## the execute suite below -- which is SHARED: an earlier test file in the
+  ## same `./dev test` invocation may already have compiled a fixture into the
+  ## same slug (so THIS suite sees `edStale`, not the `edNeverBuilt` it asserts),
+  ## and a concurrent run in the same tree deletes this run's slot binaries and
+  ## nimcache JSON mid-compile (R8-D3). Give every `Config` its own fresh,
+  ## isolated, ABSOLUTE stateDir.
   createTempDir("crisol_runmany_ann_" & tag & "_", "")
 
 ## rfc-0007 A1e-i: EntrypointResult.outcome is gone — outcome(r) derives from
@@ -119,8 +118,10 @@ suite "execute — continue-on-failure aggregation":
 
   test "all pass → every result is oPassed, summary all-passed":
     let fdir = fixtureDir()
+    let sd = isolatedStateDir("x1")
+    defer: removeDir(sd)
     let cfg = Config(compileTimeoutSecs: 30, timeoutSecs: 10,
-                     projectRoot: getCurrentDir(),
+                     projectRoot: getCurrentDir(), stateDir: sd,
                      trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let eps = @[
       mkEp("tests/fixtures/pass_always.nim"),
@@ -140,8 +141,10 @@ suite "execute — continue-on-failure aggregation":
 
   test "mix of pass and fail → ALL run, correct outcomes, non-zero exit":
     let fdir = fixtureDir()
+    let sd = isolatedStateDir("x2")
+    defer: removeDir(sd)
     let cfg = Config(compileTimeoutSecs: 30, timeoutSecs: 10,
-                     projectRoot: getCurrentDir(),
+                     projectRoot: getCurrentDir(), stateDir: sd,
                      trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let eps = @[
       mkEp("tests/fixtures/pass_always.nim"),
@@ -180,8 +183,10 @@ suite "execute — continue-on-failure aggregation":
 
   test "all fail → summary correctly tallied, exitCode non-zero":
     let fdir = fixtureDir()
+    let sd = isolatedStateDir("x3")
+    defer: removeDir(sd)
     let cfg = Config(compileTimeoutSecs: 30, timeoutSecs: 10,
-                     projectRoot: getCurrentDir(),
+                     projectRoot: getCurrentDir(), stateDir: sd,
                      trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
     let eps = @[
       mkEp("tests/fixtures/fail_always.nim"),

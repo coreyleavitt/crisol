@@ -219,6 +219,22 @@ type
       ## from `shouldStore`'s STORE-side check, which stays policy-
       ## unconditional (`evidenceSatisfies` alone gates publication,
       ## RFC-0007 §2) — this field only ever reaches the READ side.
+    toolchainUnidentified*: bool
+      ## W4 (full fix): true iff this HOST's `CcFingerprint` is
+      ## `ccidentity.toolchainUnsound` — set ONCE in `api.nim` from
+      ## `cachedCcFingerprint()`, the SAME probe result the SoundnessKey's
+      ## cc component was folded from, so this can never disagree with the
+      ## key a store would actually publish under. Threaded verbatim to
+      ## every `shouldStore` call the runner makes for this invocation (a
+      ## HOST-level fact, not a per-entrypoint one). The `cacheEnabled`
+      ## parameter that sets it carries NO default (R4-4) — `false` is the
+      ## publish-anyway value and must be a conscious choice at the call site;
+      ## see the SOUNDNESS-PARAMETER note above `cacheEnabled` and its
+      ## deprecated compatibility overload. `cacheDisabled` initialises the
+      ## field to `false` because an inactive cache never reaches the store
+      ## gate at all (a field initialisation, not a defaulted parameter).
+      ## WRITE-side only — see `shouldStore`'s own doc on why the READ path
+      ## never consults this field.
 
 proc noopPrefetch(keys: openArray[SoundnessKey]; abandoned: proc(): bool {.closure.}) =
   discard
@@ -235,13 +251,36 @@ proc cacheDisabled*(spec: SandboxSpec): CacheContext =
     sink:   NilSink[TelemetryEvent](),
     prefetch: noopPrefetch,
     outcomePolicy: ptypes.DefaultPolicy,
+    toolchainUnidentified: false,
   )
 
+# SOUNDNESS-PARAMETER WARNING (round-4 review, R4-4, 2026-09-24):
+# `toolchainUnidentified` below governs cache-KEY soundness, and crisol's L2
+# tier is SHARED ACROSS HOSTS — a store published under a degraded key is
+# cross-host cache poisoning, not a local inefficiency. `false` is the
+# publish-anyway value: it is the one setting under which `shouldStore` (which
+# reads this straight off `CacheContext.toolchainUnidentified`, threaded
+# verbatim by `runner.execute`) can still return `store: true` for a host whose
+# `CcFingerprint` folded to `ccidentity.toolchainUnsound`'s sentinel constant —
+# i.e. exactly the publish the W4 gate exists to refuse. A DEFAULT of `false`
+# is therefore the literal shape round 2 catalogued at R2-7 and defect L1 was
+# caused by: omitting the parameter silently selects the unsound value, and the
+# omission is invisible in review because a call site that leaves it off simply
+# looks short. The default is gone; the deprecated compatibility overload below
+# keeps every existing call compiling while the compiler reports the omission
+# at the CALLER's own file:line, and `dev check`'s
+# `--warningAsError:Deprecated:on` is what holds `src/` to zero omissions
+# (every test invocation passes `--warnings:off`, so the 26 test call sites that
+# omit it stay silent and no test output moves). Pass it EXPLICITLY, including `false`
+# when you mean "this host's C-toolchain identity is known sound". Full
+# rationale on the overload and at R2-7/R3-7/R4-4 in
+# docs/handoff/msvc-selection-layer.md.
 proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
                    seams: CacheSeams;
                    sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
                    prefetch: PrefetchProc = noopPrefetch,
                    outcomePolicy: ptypes.OutcomePolicy = ptypes.DefaultPolicy,
+                   toolchainUnidentified: bool,
                    ): CacheContext =
   ## Construct a CacheContext with caching enabled.
   ## `seams.keyOf` MUST be non-nil; asserted at construction time so an
@@ -253,6 +292,12 @@ proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
   ## `outcomePolicy` defaults to `ptypes.DefaultPolicy` (unstrict) — RFC-0005
   ## SO1 fix; production passes the run's resolved `--strict-hygiene` policy
   ## (see `outcomePolicy`'s own field doc, above).
+  ## `toolchainUnidentified` (W4 full fix) has NO default (R4-4) — pass it
+  ## explicitly; production passes
+  ## `ccidentity.toolchainUnsound(cachedCcFingerprint())`, and `false` (the
+  ## publish-anyway value) must be a conscious statement that this host's
+  ## C-toolchain identity is sound. See the field's own doc on `CacheContext`
+  ## and the SOUNDNESS-PARAMETER note above.
   doAssert seams.keyOf != nil,
     "cacheEnabled: seams.keyOf must be non-nil (use cacheDisabled if not caching)"
   doAssert policy.enabled,
@@ -265,7 +310,86 @@ proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
     sink:   sink,
     prefetch: prefetch,
     outcomePolicy: outcomePolicy,
+    toolchainUnidentified: toolchainUnidentified,
   )
+
+proc cacheEnabled*(spec: SandboxSpec; policy: CachePolicy;
+                   seams: CacheSeams;
+                   sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
+                   prefetch: PrefetchProc = noopPrefetch,
+                   outcomePolicy: ptypes.OutcomePolicy = ptypes.DefaultPolicy,
+                   ): CacheContext
+    {.deprecated: "R4-4: pass toolchainUnidentified explicitly (false when this host's C-toolchain identity is known sound) — omitting it silently builds a context that lets shouldStore publish under a degraded, cross-host-shared cache key".} =
+  ## Deprecated compatibility overload — see R4-4 below.
+  ##
+  ## R4-4 (round-4 review, 2026-09-24) — WHY A DEPRECATED OVERLOAD RATHER THAN
+  ## A REMOVED DEFAULT. `toolchainUnidentified` used to default to `false`,
+  ## justified (W4 full fix) as "so every existing `cacheEnabled` call site
+  ## predating this fix is unaffected". That is precisely the disguise R2-7
+  ## named: a parameter governing cache-key soundness, carrying the convenient
+  ## value, so an omission is both silent and invisible.
+  ##
+  ## WHY A COMPANION AND NOT A `sed` (round-5 review, R5-9, 2026-09-24 —
+  ## correcting a figure this block inherited rather than measured). This
+  ## paragraph used to read "removing the default outright across the tree was
+  ## measured at hundreds of call sites (~450 in tests) and deferred as too much
+  ## churn to apply by hand". That `~450` is not `cacheEnabled`'s number and
+  ## never was: it is the R3-7 census's AGGREGATE over six OTHER procs —
+  ## `execute`, `depgraph.initDepGraph`, `depgraph.loadDepGraph`,
+  ## `planner.toolchainFingerprint`, `planner.cachePath`, `clean.cleanOrphans` —
+  ## a census `cacheEnabled` does not appear in at all. (The aggregate is not
+  ## even right on its own terms: re-measured 2026-09-24 it is 353, 326 of them
+  ## in tests, because the census's `execute` component counted comment PROSE
+  ## mentioning `execute(` — 291 rather than the true 117. See
+  ## `docs/handoff/msvc-selection-layer.md`'s census paragraph and `runner.nim`'s
+  ## own R4-7/R5-8 block. No number from that census is restated here as a fact
+  ## about this proc, which is the whole point of the finding.)
+  ##
+  ## Measured for THIS proc instead, by a method the reader can re-run — drop
+  ## everything from the first `#` on each line (so comment prose does not
+  ## count), skip the two `proc cacheEnabled*` declaration lines, then count
+  ## `cacheEnabled(` occurrences:
+  ##
+  ##   over tests/   ->  27 call sites
+  ##   over src/     ->   2 call sites
+  ##   of the 27 test sites, exactly ONE names `toolchainUnidentified`
+  ##   (tests/unit/test_cachedispatch.nim's toolchainUnidentified=true store
+  ##   test), so 26 omit it
+  ##
+  ## The two `src/` sites are `api.nim`'s single production construction (which
+  ## already names the parameter) and this overload's own forwarding call. So
+  ## the honest total is 29 call sites, 26 of which would need an added
+  ## argument — not "hundreds", and off by ~17x for the proc the sentence was
+  ## written on. At 26 sites the churn is a `sed`, not a hand edit, and
+  ## "too much churn" is NOT why this overload exists.
+  ##
+  ## What it exists for is CONSISTENCY with its siblings. `planner.cachePath`,
+  ## `depgraph.initDepGraph`, both `depgraph.loadDepGraph` arities, both
+  ## `clean.cleanOrphans` arities, `pipeline.buildRunPlan`,
+  ## `artifactid.artifactKeyHash` and `shouldStore` in this file all took the
+  ## same `{.deprecated.}`-companion shape R3-7 established. (No count is stated
+  ## here on purpose — see `runner.nim`'s R5-8(b) note on hand-maintained counts;
+  ## `grep -rn '{\.deprecated:' src/ | grep -c '\.} ='` answers it whenever you
+  ## need it, and `ci/assert-defaulted-params.sh` pins the wider population.)
+  ## A proc solving the identical problem a different way would leave two idioms
+  ## for one rule. The companion also buys something a `sed` does not: it keeps the
+  ## compiler reporting a FUTURE omission at the caller's own file:line forever,
+  ## whereas a bulk edit fixes today's 26 sites and silently permits the 27th.
+  ##
+  ## Deprecation gets the compile-time signal at zero call-site churn: the
+  ## full-arity proc above loses its default, this overload keeps every
+  ## existing call compiling, and a caller that omits the parameter is told so
+  ## AT ITS OWN file:line. `--warnings:off` (which every test invocation in
+  ## this repo passes) silences it entirely, so no test output moves; and
+  ## `--warningAsError:Deprecated:on` (`dev check`) promotes it to a hard
+  ## error, which is how `src/` is held to zero omissions.
+  ##
+  ## This overload forwards `false` — byte-for-byte what a call that omitted
+  ## the argument already got, and byte-for-byte pre-W4 behaviour, in which the
+  ## parameter did not exist and no store was ever refused on toolchain-
+  ## identity grounds. Nothing moves. Full rationale on
+  ## `planner.cachePath`'s deprecated overload (R3-7).
+  cacheEnabled(spec, policy, seams, sink, prefetch, outcomePolicy, false)
 
 proc isActive*(ctx: CacheContext): bool {.inline.} =
   ## True iff caching is fully operational for this context.
@@ -478,11 +602,11 @@ proc lookupAtPlan*(
   ##
   ## `spec`/`outcomePolicy` (RFC-0005 SO1 fix): threaded straight to
   ## `consultReal`'s serve-time recompute -- the caller (runner.nim) passes
-  ## `cache.spec`/`cache.outcomePolicy`. Both default to the pre-SO1 values
-  ## (`default(SandboxSpec)` / `ptypes.DefaultPolicy`) so every existing
-  ## direct caller of this proc (the A9/M8 unit suites, which construct a
+  ## `cache.spec`/`cache.outcomePolicy`. Neither carries a default (R2-D3,
+  ## above): the direct unit-suite callers (A9/M8, which construct a
   ## `PlannedEntrypoint`/`CachedResult` pair with default `Evidence` and
-  ## never touch hermeticity) is unaffected.
+  ## never touch hermeticity) pass the pre-SO1 values
+  ## (`default(SandboxSpec)` / `ptypes.DefaultPolicy`) explicitly.
   ##
   ## Only `edRunFresh` entrypoints are eligible (a fresh binary is required for
   ## edCached).  edNeverBuilt / edStale are `cdmNotEligible` HERE (cache not
@@ -608,12 +732,31 @@ type
     store*:    bool
     decision*: CacheDecision
 
+# SOUNDNESS-PARAMETER WARNING (round-4 review, R4-4, 2026-09-24):
+# `toolchainUnidentified` below is THE store gate's key-soundness input, and
+# crisol's L2 tier is SHARED ACROSS HOSTS, so getting it wrong poisons other
+# hosts' caches rather than merely wasting local work. `false` is the
+# publish-anyway value — it is the single setting under which this proc can
+# return `store: true` for a host whose cc identity folded to
+# `ccidentity.toolchainUnsound`'s sentinel (see the `if toolchainUnidentified:`
+# refusal in the body below). A DEFAULT of `false` is therefore the most
+# literal instance in the tree of the shape round 2 catalogued at R2-7 and
+# defect L1 was caused by: omission silently yields the unsound value and is
+# invisible in review. The default is gone; the deprecated compatibility
+# overload below keeps every existing call compiling while the compiler names
+# the omission at the CALLER's own file:line, and `dev check`'s
+# `--warningAsError:Deprecated:on` is what holds `src/` to zero omissions
+# (every test invocation passes `--warnings:off`, so the test call sites stay
+# silent and no test output moves). Pass it EXPLICITLY, including `false` when
+# you mean "this host's C-toolchain identity is known sound". Full rationale on
+# the overload and at R2-7/R3-7/R4-4 in docs/handoff/msvc-selection-layer.md.
 proc shouldStore*(
   res:       EntrypointResult;
   spec:      SandboxSpec;
   attempt:   int;
   policy:    CachePolicy;
   cacheable: CacheableState = csDefault;
+  toolchainUnidentified: bool;
 ): StoreVerdict =
   ## Gate a freshly-run result for caching (RFC-0004 F3).  Store ONLY when:
   ##   (a) per-group cacheable is not csFalse AND global policy permits, and
@@ -621,7 +764,9 @@ proc shouldStore*(
   ##       `Evidence` — rfc-0007 A6a: named guarantees, incl. escapees and
   ##       the per-limit rules, §6), and
   ##   (c) it PASSED on attempt 1 (never cache a flaky-pass from attempt > 1, or
-  ##       it freezes as PASS forever).
+  ##       it freezes as PASS forever), and
+  ##   (d) the host's C-toolchain identity is actually SOUND (W4 full fix —
+  ##       `toolchainUnidentified` is false).
   ##
   ## No separate `achieved`/`evidence` parameter (A6a): the run phase's own
   ## `ProcessResult.evidence` — copied VERBATIM from the ReapReport at reap
@@ -629,6 +774,25 @@ proc shouldStore*(
   ## (`runEvidence(res)`); threading a second, independently-settable value
   ## alongside `res` would let the gate's input disagree with the very
   ## observation it is gating.
+  ##
+  ## `toolchainUnidentified` (W4 full fix, RFC-0005 §trust): the caller
+  ## (`runner.execute`, via `CacheContext.toolchainUnidentified` — set once
+  ## in `api.nim` from `ccidentity.toolchainUnsound(cachedCcFingerprint())`)
+  ## reports whether this HOST's toolchain identity folds to a sentinel
+  ## constant rather than a real value. This gate is deliberately a plain
+  ## `bool`, not a `CcFingerprint` — `cachedispatch` stays decoupled from
+  ## `ccprobe`'s probe machinery, exactly like `evidenceSatisfies` above
+  ## takes the ALREADY-COMPUTED `Evidence`, never re-derives it. It carries NO
+  ## default (R4-4): `false` is the publish-anyway value, so leaving it off can
+  ## only ever weaken the gate, and a default would make that omission
+  ## invisible — say `false` explicitly when you mean "this host's toolchain
+  ## identity is known sound". This is a WRITE-side gate only: a degraded host's plan-time
+  ## LOOKUP (`lookupAtPlan`/`consultPostCompile`) is untouched — it may
+  ## still serve/use a hit that some other, non-degraded host legitimately
+  ## published. Checked ahead of the hermeticity/attempt gates below: an
+  ## unsound key identity is a prerequisite defect (the entry would be
+  ## published under the WRONG key entirely), not one more quality bar a
+  ## run can otherwise clear.
   ##
   ## v1 caches passes only; a failing outcome is simply not eligible.  The
   ## returned CacheDecision is the MISS reason for the live result so the
@@ -643,6 +807,12 @@ proc shouldStore*(
     # fresh run is cdmKeyMiss; a fresh FAIL is simply not stored — we keep the
     # key-miss label (it was a fresh run that found no entry and produced none).
     return StoreVerdict(store: false, decision: cdmKeyMiss)
+  if toolchainUnidentified:
+    # W4 full fix: refuse to PUBLISH under a key whose cc component is a
+    # known-degraded constant -- see the proc doc above and
+    # `ccidentity.toolchainUnsound`'s own doc for the exact trigger + why it is
+    # broader than "both halves blind".
+    return StoreVerdict(store: false, decision: cdmToolchainUnidentified)
   if not evidenceSatisfies(spec, runEvidence(res)):
     return StoreVerdict(store: false, decision: cdmHermeticityDeg)
   if attempt != 1:
@@ -650,6 +820,32 @@ proc shouldStore*(
   # store=true: the live result was a fresh key-miss now being cached; the live
   # result's own CacheDecision stays cdmKeyMiss (it ran live).
   StoreVerdict(store: true, decision: cdmKeyMiss)
+
+proc shouldStore*(
+  res:       EntrypointResult;
+  spec:      SandboxSpec;
+  attempt:   int;
+  policy:    CachePolicy;
+  cacheable: CacheableState = csDefault;
+): StoreVerdict
+    {.deprecated: "R4-4: pass toolchainUnidentified explicitly (false when this host's C-toolchain identity is known sound) — omitting it silently lets the store gate publish under a degraded, cross-host-shared cache key".} =
+  ## Deprecated compatibility overload. `toolchainUnidentified` used to default
+  ## to `false`, and this proc's own doc sold that default as a feature
+  ## ("Defaults to `false` so every existing call site … is unaffected") — the
+  ## exact premise R2-7 identified as the defaulted-soundness-parameter
+  ## disguise, on the gate whose whole purpose is to REFUSE a publish under a
+  ## degraded key. R4-4 (round-4 review, 2026-09-24) removed the default and
+  ## moved the compatibility here, so the omission is reported at the caller's
+  ## own file:line instead of being absorbed silently.
+  ##
+  ## Forwards `false` — byte-for-byte what a call that omitted the argument
+  ## already got, and byte-for-byte pre-W4 behaviour, in which the parameter did
+  ## not exist and the `if toolchainUnidentified:` refusal did not either. No
+  ## behaviour moves. No ambiguity with the 6-arg full overload above: it
+  ## requires the sixth argument, so a 4- or 5-argument call can only bind
+  ## here. Full rationale on `planner.cachePath`'s deprecated overload (R3-7)
+  ## and in the SOUNDNESS-PARAMETER note above `shouldStore`.
+  shouldStore(res, spec, attempt, policy, cacheable, false)
 
 proc toCachedResult*(res: EntrypointResult; cachedAt: int64): CachedResult =
   ## Project a live EntrypointResult into the on-disk CachedResult shape
@@ -861,6 +1057,36 @@ proc keyOfProc*(ctx: KeyContext; graph: ptr DepGraph): KeyOfProc =
 # Real production seams (cacheport.nim + cachetier.nim + cacheregistry.nim)
 # ---------------------------------------------------------------------------
 
+proc writeSidecarFor(rt: CacheRuntime; ctx: KeyContext; pep: PlannedEntrypoint;
+                     key: SoundnessKey; inputs: KeyInputs) =
+  ## RFC-0005 B1b/:391 — the ONE place that writes the path-keyed
+  ## explain-miss sidecar, shared by `realSeams.store` (a live, freshly-run
+  ## result — passes ITS OWN derived `d.inputs`) and `realSeams.load` (a
+  ## remote-tier hit that just backfilled tier "l1" — passes the BACKFILLED
+  ## entry's own recorded `TierHit.keyInputs`, never the consulting run's
+  ## `d.inputs`: RFC-0005 :391 is explicit that a backfill "seeds the local
+  ## sidecar FROM IT" — from the fetched entry, not from this run's own
+  ## derivation, which happens to hash the same on a genuine hit but is not
+  ## what actually produced this entry). A no-op when there is no local
+  ## root to write against (`rt.localRoot.len == 0` — e.g. a bare test
+  ## runtime with no local-fs tier at all).
+  if rt.localRoot.len > 0:
+    let sidecarEntry = SidecarEntry(key: key, inputs: inputs, envDigest: ctx.envDigest)
+    writeSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots, sidecarEntry)
+
+proc backfilledLocal(l: CacheLookup): bool =
+  ## True iff THIS lookup's backfill fan-out (`CacheLookup.backfillVerdicts`)
+  ## includes a successful write to tier "l1" — the pinned local-fs tier the
+  ## explain-miss sidecar is scoped to (RFC-0005 "Local-fs root": "never a
+  ## shared file:// L2, which must not host per-host history";
+  ## `CacheRuntime.localRoot`'s own doc comment: "tier 0 / 'l1' only"). A
+  ## bare string literal, not a shared constant, matching the tier-name
+  ## convention already used unqualified throughout `cachetelemetry.nim`/
+  ## `api.nim` (there is no `Tier`-name type, just the pinned label).
+  for tv in l.backfillVerdicts:
+    if tv.tier == "l1" and tv.verdict == cvOk: return true
+  false
+
 proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSeams =
   ## Build the production seam bundle.  `load`/`store` close over `rt.cache`
   ## (a single-tier `TieredCache` over the local-fs backend by default, via
@@ -907,6 +1133,17 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
              # concern this adapter already owns for puts.
              for ev in backfillErrEvents(result):
                rt.sink.emit(ev)
+             # RFC-0005 :391 -- a hit that ALSO backfilled tier "l1" seeds
+             # l1's explain-miss sidecar from the BACKFILLED entry's own
+             # recorded inputs, so a later miss on this same path (e.g. the
+             # cross-toolchain miss issue #23 introduces) is explainable
+             # instead of degrading to "no prior inputs recorded". `store`
+             # never ran for this entry (it was fetched, not freshly run),
+             # so without this, backfill is the one path that silently drops
+             # `keyInputs` on the floor -- see `writeSidecarFor`'s own doc
+             # comment for why it takes the ENTRY's inputs, not `d.inputs`.
+             if result.hit.isSome and result.hit.get.keyInputs.isSome and backfilledLocal(result):
+               writeSidecarFor(rt, ctx, pep, d.key, result.hit.get.keyInputs.get)
              if result.hit.isNone and rt.localRoot.len > 0:
                let prior =
                  mostRecentRecord(readSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots))
@@ -934,10 +1171,8 @@ proc realSeams*(ctx: KeyContext; graph: ptr DepGraph; rt: CacheRuntime): CacheSe
                                            putVerdict: v.verdict))
              if rt.cache.tiers.len > 1:
                rt.pending.add entry
-             if result and rt.localRoot.len > 0:
-               let sidecarEntry = SidecarEntry(key: d.key, inputs: d.inputs,
-                                                envDigest: ctx.envDigest)
-               writeSidecar(rt.localRoot, pep.ep.tp, ctx.trackedRoots, sidecarEntry)
+             if result:
+               writeSidecarFor(rt, ctx, pep, d.key, d.inputs)
     ,
   )
 

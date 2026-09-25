@@ -157,6 +157,7 @@ suite "readOnlyFallback (probe tier 2) — F6":
            "APFS) -- writing `Alpha.txt` makes its case-flipped spelling " &
            "`alpha.txt` EXIST by construction (same directory entry), so " &
            "\"flipped spelling absent\" is unfabricable here"
+      echo "CRISOL-SKIP-TEST: tests/unit/test_fold_probe_tiers.nim#t2_flipped_absent"
       skip()
     else:
       let dir = freshDir("t2-absent")
@@ -175,6 +176,7 @@ suite "readOnlyFallback (probe tier 2) — F6":
            "whose names are exact case-flips of each other cannot coexist " &
            "here (the second write folds onto the first, same directory " &
            "entry), so the DISTINCT-file scenario is unfabricable"
+      echo "CRISOL-SKIP-TEST: tests/unit/test_fold_probe_tiers.nim#t2_flipped_distinct"
       skip()
     else:
       let dir = freshDir("t2-distinct")
@@ -197,6 +199,7 @@ suite "readOnlyFallback (probe tier 2) — F6":
            "case-flipped write cannot create a same-identity pair without " &
            "the hardlink simulation in the test above; this scenario " &
            "proves the same branch via the volume's OWN real fold instead"
+      echo "CRISOL-SKIP-TEST: tests/unit/test_fold_probe_tiers.nim#t2_flipped_same_real_fold"
       skip()
     else:
       let dir = freshDir("t2-samefile-real")
@@ -219,6 +222,7 @@ suite "readOnlyFallback (probe tier 2) — F6":
     if not linked:
       echo "SKIPPED: this environment cannot create hard links " &
            "(createHardlink raised) -- F6's same-file verdict is untestable here"
+      echo "CRISOL-SKIP-TEST: tests/unit/test_fold_probe_tiers.nim#t2_flipped_same_hardlink"
       skip()
     else:
       check readOnlyFallback(dir) == some(fpAsciiLower)
@@ -255,6 +259,7 @@ suite "readOnlyFallback (probe tier 2) — F6":
     if not linked:
       echo "SKIPPED: this environment cannot create symlinks -- the " &
            "dangling-candidate fall-through path is untestable here"
+      echo "CRISOL-SKIP-TEST: tests/unit/test_fold_probe_tiers.nim#t2_dangling_symlink_fallthrough"
       skip()
     else:
       writeFile(dir / "Beta.txt", "original")
@@ -316,6 +321,7 @@ suite "createAndStatFallback (probe tier 3) — F7":
       echo "SKIPPED: running as root inside this container -- chmod 0 does " &
            "not block a write here, so tier 3's unwritable-root path " &
            "cannot be forced honestly in this environment"
+      echo "CRISOL-SKIP-TEST: tests/unit/test_fold_probe_tiers.nim#t3_rootabs_unwritable"
       skip()
     else:
       # `stateDir` is a real, writable, DIFFERENT directory -- the F7 bug
@@ -355,6 +361,7 @@ suite "createAndStatFallback (probe tier 3) — F29 symlink-refusing create":
     if not linked:
       echo "SKIPPED: this environment cannot create symlinks -- F29's " &
            "symlink-refusal path is untestable here"
+      echo "CRISOL-SKIP-TEST: tests/unit/test_fold_probe_tiers.nim#t3_presplaced_symlink_refused"
       skip()
     else:
       let answer = createAndStatFallback(dir, "")
@@ -376,6 +383,7 @@ suite "createAndStatFallback (probe tier 3) — F29 symlink-refusing create":
       echo "SKIPPED: readRandomBytes returned no bytes in this environment " &
            "-- F29's non-predictability smoke needs a working " &
            "/dev/urandom (or sysrand) source here"
+      echo "CRISOL-SKIP-TEST: tests/unit/test_fold_probe_tiers.nim#t3_probe_basename_random_suffix"
       skip()
     else:
       check suffix.len == 16  # 8 random bytes, hex-encoded

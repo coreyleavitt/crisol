@@ -204,3 +204,73 @@ suite "extractClosure — warm recompile (issue #5)":
       raised = true
       check e.kind == cekEnvironment
     check raised
+
+# ---------------------------------------------------------------------------
+# Issue #21 slice 1a — the object extension is `.obj` under MSVC.
+#
+# `link` entries carry whatever extension the TOOLCHAIN THAT PRODUCED THE
+# NIMCACHE emits: `.o` for every POSIX cc and for mingw, `.obj` under
+# cl/vccexe. Both decoders (`moduleMangledNameOf`, `externalMangledNameOf`)
+# used to hardcode `.o`, so under MSVC no link entry resolved at all: every
+# one of them — module objects included — fell through to
+# `classifyForeignLinkEntry`, was classified `flkTupleCompile` (absolute, and
+# inside the nimcache), and raised. The closure came back EMPTY and the
+# dependency record was invalidated on every run, which is why impact
+# selection was dead under vcc long before the `cc -M` probe could be blamed
+# for it.
+#
+# Accepting BOTH spellings unconditionally — rather than switching on
+# `defined(vcc)` or on the host — is the same rule the dep-probe family
+# classification follows: read the artifact, never the build that is reading
+# it. A gcc-built crisol must be able to resolve a cl-produced nimcache.
+#
+# Shapes below are verbatim from a REAL vcc manifest's `link` array
+# (`@munit.c.obj`, `@psystem@sexceptions.nim.c.obj`).
+# ---------------------------------------------------------------------------
+
+suite "extractClosure — MSVC object extension (issue #21 slice 1a)":
+
+  test "a vcc-produced manifest ('.obj' link entries) yields the same closure as '.o'":
+    let root = freshRoot("msvcobj")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    createDir(root / "src")
+    let ep = root / "tests" / "main.nim"
+    writeFile(ep, "# main\n")
+    writeFile(root / "tests" / "unit.c", "// vendor C\n")
+    writeFile(root / "src" / "proj.nim", "# proj via --path:src\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "main", compile = @[], link = @[
+      nc / "@munit.c.obj",                  # {.compile.}d C external
+      nc / "@mmain.nim.c.obj",              # the entrypoint's own module
+      nc / "@pproj.nim.c.obj",              # a --path:src module
+      nc / "@psystem@sexceptions.nim.c.obj",  # stdlib: not under a tracked root
+    ])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
+    let cl = extractClosure(nc, "main", ep, cfg)
+    check cl == toHashSet([
+      projTp("tests/main.nim", cfg.trackedRoots),
+      projTp("tests/unit.c", cfg.trackedRoots),
+      projTp("src/proj.nim", cfg.trackedRoots),
+    ])
+
+  test "a '.obj' module compiled to .cpp or .m is recognized too":
+    let root = freshRoot("msvcobjcpp")
+    defer: removeDir(root)
+    createDir(root / "tests")
+    let ep = root / "tests" / "main.nim"
+    writeFile(ep, "# main\n")
+    writeFile(root / "tests" / "cppmod.nim", "# cpp module\n")
+    let nc = root / "nimcache"
+    writeManifest(nc, "main", compile = @[], link = @[
+      nc / "@mmain.nim.c.obj",
+      nc / "@mcppmod.nim.cpp.obj",
+    ])
+    var cfg = Config(projectRoot: root, stateDir: ".crisol", depRoots: @[])
+    cfg.trackedRoots = initTrackedRoots(root, newSeq[tuple[name, native: string]](), ".crisol")
+    let cl = extractClosure(nc, "main", ep, cfg)
+    check cl == toHashSet([
+      projTp("tests/main.nim", cfg.trackedRoots),
+      projTp("tests/cppmod.nim", cfg.trackedRoots),
+    ])

@@ -12,13 +12,74 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # R8-D2: no job used to set a timeout, so a wedged step ran to GitHub's
+    # 360-minute default. Typical wall time here is ~35 min (runs
+    # 35491097764/35486328581); roughly 2.5x that, so a slow runner never
+    # trips it but a hang cannot hold the runner for six hours.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
+      # R5-15: the defaulted-soundness-parameter census, pinned as an exact set.
+      # R2-7 named the class -- a parameter that governs correctness carrying a
+      # convenient default, so omitting it silently yields the unsound value and
+      # is invisible in review -- and R3-7/R4-4 fixed the known population one
+      # proc at a time. R5-15 found one the population had missed
+      # (artifactid.artifactKeyHash) and, more importantly, that the prescribed
+      # remedy was a grep a reviewer runs by hand. This step is that census as a
+      # machine check: every defaulted parameter under src/ is either in the
+      # allowlist with a one-line reason, or this step fails.
+      #
+      # It fails in BOTH directions, like ci/assert-subset-honesty.sh: a new
+      # unclassified parameter AND a stale pin. Exit 1 is drift; exit 2 is a
+      # broken enumerator -- notably zero signatures found, which it refuses to
+      # report as a clean tree.
+      #
+      # FIRST step in the job, before Fetch vendored deps: no Nim, no network, no
+      # dependencies, source text only, seconds. A source-text census is not
+      # platform-dependent, so it runs on this leg only.
+      #
+      # R7-L2, corrected by R8-D2: FIRST, but not a gate on the rest of the
+      # job. The census, the soundness gate, the meta-test and the suites are
+      # independent verdicts, and a red census must not hide whether the suite
+      # is also red (the same "surface every issue per run" rule the windows
+      # leg states on its D1a steps). So the steps below run after an
+      # UNRELATED red step, but on two conditions R7-L2's `if: always()` did
+      # not state:
+      #   - `!cancelled()`, never `always()`: a PR run superseded by a newer
+      #     push (cancel-in-progress, top of file) stops instead of grinding
+      #     through every remaining step. GitHub's own guidance: always() is
+      #     for steps that must run even on cancellation, which none of these
+      #     are.
+      #   - every step that needs the vendored deps is gated on
+      #     `steps.deps.outcome == 'success'`, so a failed fetch fails ONCE,
+      #     not once more per step as a missing-module error. Fetch vendored
+      #     deps and the cache restore themselves need nothing before them, so
+      #     they carry `!cancelled()` alone.
+      # The self-test is the one exception -- it needs a green census (see its
+      # comment), so it keeps the default success() gate.
+      - name: Defaulted-parameter census (src/)
+        run: bash ci/assert-defaulted-params.sh
+
+      # R6-S2/R6-D2: the census is itself a parser (a depth walk over Nim
+      # signatures that must see past string literals and comments), and a
+      # parser that goes quietly blind looks exactly like a clean tree. This
+      # step mutation-tests the census script on temp copies of src/ -- never
+      # the working tree: parens/# inside string, raw, triple and char literals
+      # and block comments; flipped default values; a signature, triple string
+      # or block comment left open at EOF (exit 2, cannot tell); and a new and a
+      # removed defaulted parameter. It needs a green census, so it runs right
+      # after it. Same budget: bash, mktemp, sed, grep, awk -- seconds.
+      - name: Defaulted-parameter census self-test
+        run: bash ci/assert-defaulted-params.selftest.sh
+
       - name: Fetch vendored deps (milpa.lock)
+        id: deps
+        if: ${{ !cancelled() }}
         run: bash ci/fetch-deps.sh
 
       - name: Cache nim compile cache
+        if: ${{ !cancelled() }}
         uses: actions/cache@v4
         with:
           path: .ci-nimcache
@@ -26,26 +87,89 @@ jobs:
           restore-keys: |
             nimcache-${{ runner.os }}-
 
+      # R4-3 / R4-6: the ONLY automated producer for the two source-level
+      # soundness gates. Before this step nothing in CI ran either flag -- every
+      # test compile goes through crisol.nimble's `nim r --hints:off
+      # --warnings:off --path:src`, which silences both, and the -d:ssl build
+      # gate at the end of this job emits them as plain Warnings nothing greps
+      # for. `./dev check` on its own is a host-side habit, not an enforcement
+      # point. This job is the right home: it is the only leg with no
+      # CRISOL_TEST_DIRS restriction.
+      #
+      # The gate itself -- both --warningAsError flags, every invocation, all
+      # three --os targets, and the `{.push warning[Deprecated]: off.}` remedy
+      # for an export line that starts failing it -- lives in
+      # ci/source-soundness-gate.sh, ONE copy shared with `./dev check`
+      # (R5-11). Deliberately no second copy of that prose here.
+      #
+      # That script also asserts its OWN coverage (R5-11, round 5): its three
+      # aggregator passes run through codegen with -d:nimBetterRun, and
+      # ci/assert-gate-coverage.py reads the resulting depfiles manifests and
+      # exits non-zero if any .nim file under src/ is compiled by no pass. So a
+      # new module that lands outside every target's import closure fails this
+      # step instead of being silently ungated. It needs python3, present in this
+      # image, and REFUSES to report success without it -- a coverage check that
+      # skips itself is the darkness class ci/assert-subset-honesty.sh audits for.
+      #
+      # It runs on the LINUX leg only, cross-targeting windows and macosx from
+      # here (`nim check` never invokes a C compiler, so it needs no cross
+      # toolchain). The windows/macos legs' own `nim check` steps stay as they
+      # are: one job that can see all three targets is cheaper than three
+      # partial gates, and keeps the gate in a single place to read.
+      #
+      # `nim check` in a container directly, never `./dev check`: `dev` drives
+      # podman from a host shell, and this job already runs inside its own
+      # container.
+      - name: Source soundness gate — zero deprecations, zero unused imports in src/ (linux + windows + macosx)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            ghcr.io/coreyleavitt/nim:2.2.10 bash ci/source-soundness-gate.sh
+
       # ci/run-tests.sh, not bare `nimble test`: nimble 0.22.2's custom-task
       # dispatch does not turn a failing task into a nonzero process exit
       # code (see that script's header for the full mechanism, verified
       # against nimble's own source). The script is the only trustworthy
       # exit-code signal — this step is what actually proves it, over the
       # deliberately-failing dummy in tests/meta/.
+      #
+      # R8-S5: a nonzero exit alone proves nothing -- a failed deps fetch, a
+      # docker pull failure or a crisol.nimble that no longer parses all exit
+      # nonzero too, and R7-L2's `if: always()` let this step run after
+      # exactly those and print "META-TEST OK". So it now (a) runs only when
+      # the deps fetch succeeded, and (b) requires the SPECIFIC failure it
+      # exists to observe: the dummy's own doAssert message, and the nimble
+      # task's verdict naming that one file as the failure. Anything else is
+      # "the harness failed for a different reason", which is a META-TEST
+      # failure, not a pass.
       - name: Meta-test — assert a failing test fails the harness
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
-          if docker run --rm \
-              -v "$PWD:/workspace" -w /workspace \
-              -e CRISOL_TEST_DIRS=tests/meta \
-              -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
-              ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh; then
-            echo "META-TEST FAILED: harness exited 0 on a failing test"
+          set +e
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -e CRISOL_TEST_DIRS=tests/meta \
+            -e XDG_CACHE_HOME=/workspace/.ci-nimcache \
+            ghcr.io/coreyleavitt/nim:2.2.10 bash ci/run-tests.sh > "$RUNNER_TEMP/meta.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/meta.log"
+          if [ "$status" -eq 0 ]; then
+            echo "META-TEST FAILED: harness exited 0 on a failing test" >&2
             exit 1
-          else
-            echo "META-TEST OK: nonzero exit propagated"
           fi
+          if ! grep -qF "deliberate failure: CI meta-test asserting nonzero exit propagates" "$RUNNER_TEMP/meta.log" ||
+             ! grep -qF "FAILED: 1 file(s)" "$RUNNER_TEMP/meta.log" ||
+             ! grep -qE '^  tests/meta/test_fail_dummy\.nim$' "$RUNNER_TEMP/meta.log"; then
+            echo "META-TEST FAILED: harness exited $status, but not because of the dummy -- its doAssert message or the task's 'FAILED: 1 file(s)' / 'tests/meta/test_fail_dummy.nim' verdict is missing (see output above)" >&2
+            exit 1
+          fi
+          echo "META-TEST OK: the dummy's failure propagated as exit $status"
 
       - name: Run test suite
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         # CRISOL_TIER=ci-linux (rfc-0007 A7): tells the substrate acceptance
         # test (tests/integration/test_rfc0007_a7_substrate_cli.nim) which
         # tier's capabilities() pins to check — GITHUB_ACTIONS itself is a
@@ -69,6 +193,7 @@ jobs:
       # (posixcore.initPosixCore); every other suite above already ran and
       # is agnostic to which tier is live underneath.
       - name: Run conformance suite forced onto the poll(2) fallback path
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
@@ -88,6 +213,7 @@ jobs:
       # file, not a `CRISOL_TEST_DIRS` sweep -- this is the one test this
       # gate exists for.
       - name: rfc-0009 A3b-ii — fold-membership selection (forced fpAsciiLower)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
@@ -126,6 +252,7 @@ jobs:
       # (-d:ssl)". Absence of that error is the L1 property, directly tested
       # and immune to link/strip differences.
       - name: Build production binary — confirm -d:ssl is the default
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
@@ -145,6 +272,10 @@ jobs:
 
   timing:
     runs-on: ubuntu-latest
+    # R8-D2: typical wall time ~2 min (runs 35491097764/35486328581). 30 is
+    # generous on purpose -- a cold nimcache recompiles every file -- but a
+    # wedged timing test still cannot hold the runner for six hours.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -230,6 +361,9 @@ jobs:
   # tries to consume it.
   cgroup:
     runs-on: ubuntu-latest
+    # R8-D2: typical wall time ~30 min (runs 35491097764/35486328581); the
+    # same ~2.5x headroom as the `test` job, which runs the same suite.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -291,6 +425,11 @@ jobs:
   # from Linux; these two legs are where it actually EXECUTES.
   windows:
     runs-on: windows-latest
+    # R8-D2: typical wall time ~55 min (runs 35491097764/35486328581), the
+    # slowest leg by far -- ~40 native `nim r` steps plus the B4b sweep, all
+    # MSVC links. Roughly 2.5x that; a hang no longer holds the runner for
+    # GitHub's 360-minute default.
+    timeout-minutes: 150
     defaults:
       run:
         shell: bash   # ci/fetch-deps.sh needs it; keeps every step's
@@ -310,20 +449,80 @@ jobs:
       # it too, not just the top-level suite builds; vccexe.exe ships in
       # the artifact and resolves cl.exe via vswhere on windows-latest.
       - name: Install patched Nim toolchain (MSVC)
+        id: toolchain
         run: |
           BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-windows-x64 "$RUNNER_TEMP/nimtc" | tail -1)
-          printf '\n@if windows:\n  cc = vcc\n@end\n' >> "$(dirname "$BIN")/config/nim.cfg"
+          CFG="$(dirname "$BIN")/config/nim.cfg"
+          printf '\n@if windows:\n  cc = vcc\n@end\n' >> "$CFG"
+          # wiring-audit W2: prove the append actually landed where nim will
+          # read it. `fetch-nim-toolchain.sh` locates the bin dir with a
+          # `find -maxdepth 2 -type d -name bin | head -1` and this caller
+          # takes its `tail -1`, so an artifact-layout change could silently
+          # append to the wrong path (or create one) and leave this leg on
+          # mingw-gcc. The backend itself is asserted by the step below;
+          # this catches the mechanical half with a clearer message.
+          grep -q '^  cc = vcc$' "$CFG" || {
+            echo "W2: 'cc = vcc' did not land in $CFG" >&2; exit 1; }
           echo "$BIN" >> "$GITHUB_PATH"
           # crisol#21: lets assert-subset-honesty sanction the interim
           # vcc self-skips of the closure-dependent identity tests.
           echo "CRISOL_CC=vcc" >> "$GITHUB_ENV"
 
+      # Default success() gate, and the `id` every later step keys on: this
+      # step can only run after `toolchain` succeeded, so `steps.sanity.outcome
+      # == 'success'` means "a patched nim is on PATH" (R8-D2).
       - name: Toolchain sanity (patched build, vcc backend)
+        id: sanity
         run: |
           nim --version
           nim --version 2>&1 | grep -qi "2.2.10" || { echo "wrong nim version" >&2; exit 1; }
 
+      # wiring-audit W2: this leg IS the MSVC leg, and until this step
+      # existed nothing proved it. Every MSVC capability in crisol dispatches
+      # on RUNTIME facts, never on `defined(vcc)` — ccFamilyOfDriver reads
+      # the manifest's driver token, ObjectExtensions accepts both spellings
+      # unconditionally, classify keys on the root's probed fold policy. That
+      # is deliberate (a gcc-built crisol must read a cl-produced nimcache),
+      # and its consequence is that a leg silently reverted to mingw-gcc
+      # would take the GNU arm everywhere and pass EVERY test green while
+      # proving nothing — including the two files that are the sole CI
+      # producers for #21 and #23.
+      #
+      # Placed here, before `Fetch vendored deps`, so it fails in seconds
+      # rather than after twenty-odd steps of misleading green. The test
+      # imports only std, so it needs no deps and no --path:src. It also runs
+      # again inside the B4b sweep below (same env), which is what puts its
+      # CRISOL-CC-BACKEND line into the log assert-subset-honesty.sh reads.
+      #
+      # R7-L2, corrected by R8-D2: from this step on, a red step does not
+      # skip the ones after it ("surface every windows issue per run"), so
+      # "fails in seconds" still holds -- this step goes red first -- without
+      # silently skipping the rest. But nothing runs on a broken foundation,
+      # and nothing runs on a cancelled run:
+      #   - this step and Fetch vendored deps: `!cancelled() &&
+      #     steps.sanity.outcome == 'success'` -- run after an unrelated red
+      #     step, never without a patched nim on PATH;
+      #   - every step after the fetch: `!cancelled() && steps.deps.outcome ==
+      #     'success'` (the fetch itself only runs on a sane toolchain, so this
+      #     implies it too). A failed toolchain install or fetch therefore
+      #     fails ONCE, instead of R7-L2's `if: always()` turning it into
+      #     thirty-odd `nim: not found` / missing-module failures -- the noise
+      #     R7-L2 said it prevented, and did not;
+      #   - the one step that needs neither (F16's registry write) carries
+      #     `!cancelled()` alone.
+      # `!cancelled()`, never `always()`: `cancel-in-progress` (top of file)
+      # stops a superseded PR run, and always() kept ~40 MSVC `nim r` steps
+      # grinding on after it. GitHub's guidance reserves always() for steps
+      # that must run even on cancellation; none of these must.
+      - name: "wiring-audit W2 — assert this leg is on the vcc backend"
+        if: ${{ !cancelled() && steps.sanity.outcome == 'success' }}
+        env:
+          CRISOL_EXPECT_CC: vcc
+        run: nim r --hints:off --warnings:off tests/conformance/test_cc_backend.nim
+
       - name: Fetch vendored deps (milpa.lock)
+        id: deps
+        if: ${{ !cancelled() && steps.sanity.outcome == 'success' }}
         run: bash ci/fetch-deps.sh
 
       # Fast semantic pass first: `nim check` here targets the HOST os
@@ -331,7 +530,13 @@ jobs:
       # `./dev run nim check --os:windows` cross-check a contributor runs
       # from a Linux checkout). Fails fast with clearer diagnostics before
       # the full compile+link below.
+      # NOT the soundness gate: this step deliberately carries neither
+      # --warningAsError flag. That gate is ci/source-soundness-gate.sh, run
+      # once from the linux `test` job, which cross-targets windows and macosx
+      # with `nim check --os:` (R5-2) -- three partial gates would be a worse
+      # deal than one that can see all three targets.
       - name: nim check — process.nim on real Windows
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim check --hints:off --path:src src/crisol/process.nim
 
       # A2d's acceptance for this leg (historical): COMPILES and the smoke test
@@ -344,6 +549,7 @@ jobs:
       # by the per-file test_windows_* steps in this job). This smoke step is
       # kept as the fast early spawn/kill check ahead of the fuller sweep.
       - name: Compile and run the Windows smoke test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_smoke.nim
 
       # rfc-0007 D1a — the four load-bearing pieces, each with its own
@@ -354,63 +560,63 @@ jobs:
       # sink delivery. "Conformance SMOKE green" per the D1a bullet — full
       # windows-suite parity remains RFC-0009's acceptance, not this leg's.
       - name: D1a — ekNtStatus producer proof (access violation)
-        if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_ntstatus.nim
 
       - name: D1a — snapshotTree forensics
-        if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_forensics.nim
 
       - name: D1a — completion-port next (IOCP)
-        if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_iocp.nim
 
       - name: D1a — inherited handles to sinks
-        if: always()   # run all D1a checks even if an earlier one failed — surface every windows issue per run
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}   # run all D1a checks even if an earlier one failed — surface every windows issue per run
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_sinks.nim
 
       - name: rfc-0007 D1b — windows cooperative stop / cooperativeUnavailable
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_coopstop.nim
 
       - name: rfc-0007 D1b — windows Job limits (cpu/address-space)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_limits.nim
 
       - name: rfc-0007 D1b — windows containment / ppid forensics
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_containment.nim
 
       - name: rfc-0007 D2a — windows memprobe groupRssBytes + shutdown getter
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_memprobe.nim
 
       - name: rfc-0007 D2a — windows advisory lock (LockFileEx)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_lock.nim
 
       - name: rfc-0007 D2a — windows availableMemBytes (GlobalMemoryStatusEx)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_availmem.nim
 
       - name: rfc-0007 D2a-5 — windows socket timeouts (winsock DWORD-ms)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_httptimeout.nim
 
       - name: rfc-0007 D2a-4 — windows ioutils (CRT int-fd backend)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_ioutils.nim
 
       - name: rfc-0007 D2a — crisol CLI compiles on windows
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim c --hints:off --warnings:off --path:src -o:crisol_win_smoke src/crisol.nim
 
       - name: rfc-0007 D2a-6 — windows CLI liveness (crisol run --json)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_windows_cli_smoke.nim
 
       - name: A0-spike — import-case manifest observation
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_spike_import_case.nim
 
       # issue #22 — the two capture-completeness tests, pinned as per-file
@@ -430,16 +636,160 @@ jobs:
       # whose diff arrives in two bursts must still yield every changed name
       # to `--changed` selection, and a git whose stderr overruns the pipe
       # buffer must neither wedge nor be truncated.
+      # wiring-audit W9i (code-review ledger, 2026-09-21): every step below
+      # that runs a tests/integration/ file individually appends its output
+      # into harness.log via `tee -a` (the `shell: bash` default this job
+      # sets above already resolves to `bash -eo pipefail {0}`, so a nonzero
+      # `nim r` exit still fails the step through the pipe). tests/integration
+      # is out of scope for the B4b sweep below (CRISOL_TEST_DIRS:
+      # tests/unit:tests/conformance), so without this append a pinned
+      # integration file that started silently SKIPPING instead of failing
+      # would exit 0 and leave no trace in the only log
+      # ci/assert-subset-honesty.sh ever reads -- exactly the CR6/W9i defect
+      # class. harness.log does not exist yet at this point in the job;
+      # `tee -a` creates it on the first append, same as a fresh file.
       - name: "issue #22 — child-output capture completeness (ccprobe/icbaseline)"
-        if: always()
-        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue22_capture.nim
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue22_capture.nim 2>&1 | tee -a harness.log
 
       - name: "issue #22 — --changed sees every changed file (gitdiff)"
-        if: always()
-        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue22_changed_completeness.nim
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue22_changed_completeness.nim 2>&1 | tee -a harness.log
+
+      # issue #23 — the soundness key's C-toolchain component, pinned as a
+      # per-file step for the same reason as #22's above: it lives under
+      # tests/integration, which this leg's suite step does not sweep, and it
+      # can only fail HERE. On POSIX `cc` and `ldd` both answer, so the
+      # fingerprint already named a real toolchain and this file was green
+      # before the fix; on Windows neither command exists under any
+      # toolchain, so every Windows host folded to the constant
+      # `<cc-unavailable>|<ldd-unavailable>` and an MSVC cache entry shared a
+      # soundness key with a mingw-gcc one. Without this step the fix has no
+      # CI producer on the only platform that can regress it.
+      #
+      # It drives `ccprobe.cachedCcVersion()` -- the real accessor, real
+      # seams -- and asserts the cc half names an installed compiler and the
+      # runtime half carries a content digest of the .lib files this
+      # toolchain will actually link (Nim+vcc links the CRT statically, so
+      # there is no libc DLL and no version string to read).
+      # wiring-audit W9i: append into harness.log (see the comment above the
+      # issue #22 steps) — this is CR6's own producer, whose per-test
+      # CRISOL-SKIP-TEST marker (it self-skips one of its three tests on
+      # non-POSIX) must now reach the honesty gate instead of vanishing.
+      - name: "issue #23 — soundness key identifies this host's C toolchain"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue23_cc_identity.nim 2>&1 | tee -a harness.log
+
+      # Issue #21: the MSVC impact-selection tracer. This file is the ONLY
+      # end-to-end producer of the property #21 exists for -- that a
+      # {.compile.}d C source's #include'd header is a tracked closure member
+      # and drives `--changed` selection -- driven through the real
+      # `crisol run` / `crisol closure --json` entry points.
+      #
+      # It had never run on this leg, and that is precisely why four stacked
+      # gcc-isms survived here unnoticed: it lives in tests/integration/, and
+      # the bulk sweep step below only covers tests/unit:tests/conformance.
+      # Every one of those four failed SILENTLY (an empty closure, a
+      # never-matched compile entry, a bogus one-entry header set, a dropped
+      # header) rather than erroring, so no other leg or step could have
+      # caught them either.
+      # wiring-audit W9i: append into harness.log (see the comment above the
+      # issue #22 steps).
+      - name: "issue #21 — {.compile.}d header closure under MSVC"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue16_headers.nim 2>&1 | tee -a harness.log
+
+      # wiring-audit W9b (code-review ledger, 2026-09-21): the M-driver's
+      # single real live-compile integration test (real newMeasureDriver(),
+      # real `nim c --compileOnly`, real cc, real linker) had NO producer on
+      # this leg at all -- it lives under tests/integration, which this
+      # leg's bulk sweep below (CRISOL_TEST_DIRS: tests/unit:tests/
+      # conformance) does not reach, and it was never pinned as a per-file
+      # step either. Its own nimcache object-file scan was MSVC-blind
+      # (`walkFiles(nimcacheDir / "*.o")`, silently zero matches under
+      # cl/vccexe, whose objects are `.obj`), so the `check sawObjectFile`
+      # would fail loudly the first time this file ran here -- except it
+      # never once ran here, so that loud failure was never observed. The
+      # scan is now `closure.ObjectExtensions`-aware (both `.o` and `.obj`);
+      # this step gives that fix its first real MSVC producer.
+      # wiring-audit W9i: append into harness.log (see the comment above the
+      # issue #22 steps).
+      - name: "wiring-audit W9b — compiledriver real live-compile MSVC producer"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_compiledriver_real.nim 2>&1 | tee -a harness.log
+
+      # ROUND-2 REVIEW (High): CR4's deadline guard had NO producer on ANY
+      # leg. tests/integration/test_cr4_tool_deadline.nim appeared nowhere in
+      # this file, and it lives under tests/integration/, which this leg's
+      # bulk sweep below (CRISOL_TEST_DIRS: tests/unit:tests/conformance)
+      # does not reach -- so only the Linux leg's default integration sweep
+      # ever ran it. toolexec.nim's deadline drain is genuinely
+      # platform-forked: a `when defined(windows)` PeekNamedPipe polling arm
+      # vs a POSIX poll(2) arm. The Windows arm -- the platform where a
+      # wedged MSVC linker probe (`vccexe ... /link /VERBOSE:LIB`) is the
+      # actual hazard CR4 exists to bound -- had therefore never executed
+      # once, anywhere. This step is its first producer.
+      # wiring-audit W9i: append into harness.log (see the comment above the
+      # issue #22 steps).
+      - name: "round-2 — CR4 tool-deadline Windows (PeekNamedPipe) producer"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_cr4_tool_deadline.nim 2>&1 | tee -a harness.log
+
+      # R8-L1: toolrun's presence contract -- "not on PATH -> empty output,
+      # ran-and-failed -> non-empty output" -- which ccidentity's R7-S1 refusal
+      # rests on. Its own header says it is pinned against the real primitive
+      # "on every platform", but it lives under tests/integration/, which this
+      # leg's B4b sweep does not reach, so until this step it ran only on the
+      # Linux legs. Windows is the platform whose spawn-failure path
+      # (CreateProcess, not execvp) R7-S1 actually depends on. Appended into
+      # harness.log (wiring-audit W9i) so assert-subset-honesty.sh's
+      # MUST-EXECUTE check can see its three [OK] lines.
+      - name: "round-8 — R7-S1 probe presence contract (toolrun) on Windows"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_r7_probe_presence_contract.nim 2>&1 | tee -a harness.log
+
+      # R8-L1: R7-S1's REAL trigger -- a real `cl` exits 2 under a non-empty
+      # `CL`, and ccIdentity must refuse the compiler half (`cl` in
+      # refusedDrivers, turCompilerRefused) rather than read it as absent.
+      # No other step sets CL, so before this the refusal was proven only with
+      # synthetic captures on Linux. The file sets CL=/W4 in-process and
+      # restores it; this step's job is to make `cl` resolve on PATH, which on
+      # windows-latest it does not outside a Developer Command Prompt (vccexe
+      # finds cl via vswhere; the bare `cl` candidate cannot). So it imports
+      # vcvars64.bat's environment into THIS step's shell only -- no other
+      # step sees it -- and fails loudly if `cl` still does not resolve, since
+      # the file would otherwise self-skip. assert-subset-honesty.sh REQUIRES
+      # its real body on this leg (MUST-EXECUTE, and its skip labels are in
+      # no windows pin), so a silent skip fails the B4b audit too.
+      - name: "round-8 — R7-S1 real cl refused under CL=/W4 (MSVC)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          if ! command -v cl >/dev/null 2>&1; then
+            vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            vsdir=$("$vswhere" -latest -products '*' \
+                      -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+                      -property installationPath | tr -d '\r')
+            [ -n "$vsdir" ] || { echo "R8-L1: vswhere found no VC toolset" >&2; exit 1; }
+            vcvars=$(cygpath -w "$vsdir/VC/Auxiliary/Build/vcvars64.bat")
+            printf '@call "%s" >NUL || exit /b 1\r\n@set\r\n' "$vcvars" > "$RUNNER_TEMP/r8-vcenv.bat"
+            cmd //d //c "$(cygpath -w "$RUNNER_TEMP/r8-vcenv.bat")" | tr -d '\r' > "$RUNNER_TEMP/r8-vcenv.txt"
+            while IFS='=' read -r name value; do
+              case "$name" in
+                Path|PATH) PATH="$(cygpath -u -p "$value"):$PATH" ;;
+                INCLUDE|LIB|LIBPATH|VCINSTALLDIR|VCToolsInstallDir|VSINSTALLDIR|WindowsSdkDir|WindowsSDKVersion|UCRTVersion|UniversalCRTSdkDir)
+                  export "$name=$value" ;;
+              esac
+            done < "$RUNNER_TEMP/r8-vcenv.txt"
+            export PATH
+          fi
+          command -v cl >/dev/null 2>&1 || {
+            echo "R8-L1: cl does not resolve on PATH even after importing vcvars64 -- the real-cl refusal cannot run here" >&2
+            exit 1; }
+          echo "R8-L1: cl resolves to $(command -v cl)"
+          nim r --hints:off --warnings:off --path:src tests/integration/test_r8_real_cl_refusal.nim 2>&1 | tee -a harness.log
 
       - name: rfc-0009 A1 — fold-probe real-volume runtime evidence
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_fold_probe.nim
 
       # RFC-0009 A3b-ii (round-3, R3-18.4): the load-bearing E2E test, real
@@ -452,7 +802,7 @@ jobs:
       # property -- a pinned per-file step, not a conformance sweep, so
       # without it the property has no producer here until B4b.
       - name: rfc-0009 A3b-ii — fold-membership selection (real NTFS probe)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         env:
           CRISOL_EXPECT_FOLD: fpAsciiLower
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a3bii_fold_selection.nim
@@ -466,7 +816,7 @@ jobs:
       # producer here, not a skip. A pinned per-file step, not a
       # conformance sweep, mirroring the A3b-ii step immediately above.
       - name: rfc-0009 A4b — closure member on-disk-case determinism (real NTFS probe)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a4b_determinism.nim
 
       # RFC-0009 A5c: the cache-portability E2E — a depRoot closure member's
@@ -478,7 +828,7 @@ jobs:
       # cannot create symlinks at all (same convention as
       # test_closure_a4a.nim), never on case (in)sensitivity.
       - name: rfc-0009 A5c — cache-portability E2E (depRoot member, relocated tree)
-        if: always()
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a5c_cache_portability.nim
 
       # RFC-0009 wiring-audit F16 (TIER A unlock attempt): enable Windows'
@@ -493,11 +843,17 @@ jobs:
       # long-path-aware regardless of this OS-level switch, so TIER B is
       # the realistic near-term outcome — but the test's own adaptive tier
       # selection (see its header doc comment) handles either outcome
-      # honestly, so this step is pure upside. `shell: pwsh` overrides this
+      # honestly, so this step is pure upside. R7-L2/R8-D2: it runs after an
+      # earlier red step like every per-file step above -- before R7-L2 it was
+      # one of only two steps in this job with the default success() gate, so
+      # any earlier red step silently skipped it AND (through it) the B4b
+      # suite + honesty audit below. Its guard is `!cancelled()` alone: a
+      # registry write needs neither nim nor the deps. `shell: pwsh` overrides this
       # job's default `bash` (Git Bash cannot run a PowerShell cmdlet):
       # `Set-ItemProperty` is PowerShell-only; pwsh ships on windows-latest
       # runners alongside Git Bash.
       - name: rfc-0009 F16 — enable Windows LongPathsEnabled registry key
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1
 
@@ -522,30 +878,94 @@ jobs:
       # SUBSET-HONESTY (RFC-0009 round-3 R3-19): ci/assert-subset-honesty.sh
       # asserts, BY NAME not count, that the exact expected set of gated files
       # skipped (and no other), and that the three identity conformance tests
-      # ran their REAL body, not a self-skip. `set -o pipefail` +
-      # `${PIPESTATUS[0]}` preserve run-tests.sh's own honest exit code
-      # through the `tee` — a suite failure must never be masked by a
-      # passing (or even a failing) assertion step layered on top of it.
+      # ran their REAL body, not a self-skip. `${PIPESTATUS[0]}` preserves
+      # run-tests.sh's own honest exit code through the `tee` — a suite
+      # failure must never be masked by a passing (or even a failing)
+      # assertion step layered on top of it. Conversely the audit ALWAYS
+      # runs, even on a red suite: errexit is suspended around the two
+      # captured commands, both codes are logged, and the step fails if
+      # either is nonzero (code-review L3).
+      #
+      # R7-L2: the in-step half of that promise was hollow at the job level --
+      # this step had no `if:`, so ANY earlier red step (one failing #22/#23
+      # producer, say) skipped the whole sweep and the audit, and the markers
+      # those steps had already `tee -a`d into harness.log were never judged.
+      # Now it runs after any unrelated red step (R8-D2's guard: not
+      # cancelled, and the deps fetch -- hence the toolchain -- succeeded).
+      # It does NOT depend on the F16 step above having
+      # succeeded: test_rfc9_w2_longpath_e2e.nim selects its tier at runtime
+      # (TIER A if nim.exe can open a >MAX_PATH source, TIER B graceful-
+      # degradation otherwise) and both are honest outcomes, so a failed
+      # registry write degrades that one test to TIER B rather than
+      # invalidating the sweep. Its only real prerequisites are the toolchain
+      # install and deps fetch, and those are exactly what its `if:` names:
+      # without them there is nothing honest to sweep or audit, and the job is
+      # already red at the step that failed.
       - name: rfc-0009 B4b — unit + conformance suite (native, ci/run-tests.sh)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         env:
           CRISOL_TEST_DIRS: tests/unit:tests/conformance
+          # wiring-audit W2: pinned HERE as well as on the early step above,
+          # because this is the only run whose output reaches harness.log —
+          # the log assert-subset-honesty.sh audits. Without it the honesty
+          # gate's view of this leg would not record which C backend the
+          # suite actually built with.
+          CRISOL_EXPECT_CC: vcc
+          # wiring-audit W9h (code-review ledger, 2026-09-21): pinned HERE
+          # for the same reason as CRISOL_EXPECT_CC immediately above — this
+          # is the only run whose output reaches harness.log, and
+          # test_rfc9_a3bii_fold_selection.nim is swept into it via
+          # CRISOL_TEST_DIRS. Without this, the suite falls through to Mode
+          # 3 (belt-and-suspenders, unasserted real-probe) instead of Mode 2
+          # (real probe, HARD-asserted against fpAsciiLower) — the log the
+          # honesty gate reads would record this leg's weaker mode. Same
+          # value as the per-file A3b-ii step above: this is the same NTFS
+          # volume.
+          CRISOL_EXPECT_FOLD: fpAsciiLower
         run: |
-          set -o pipefail
-          bash ci/run-tests.sh 2>&1 | tee harness.log
+          # `shell: bash` runs this body under `bash -eo pipefail`, so a
+          # failing suite would abort the step AT the pipeline and the
+          # honesty audit below would never run (code-review L3). errexit is
+          # suspended across exactly the two commands whose statuses are
+          # captured, then restored before the verdict.
+          set +e
+          # wiring-audit W9i: append (-a), never overwrite -- the per-file
+          # tests/integration/ steps above already wrote their own output
+          # into harness.log, and this sweep must not discard it.
+          bash ci/run-tests.sh 2>&1 | tee -a harness.log
           suite_status=${PIPESTATUS[0]}
           bash ci/assert-subset-honesty.sh harness.log windows
           honesty_status=$?
+          set -e
+          echo "rfc-0009 B4b: harness suite exit $suite_status, subset-honesty exit $honesty_status"
           if [ "$suite_status" -ne 0 ]; then
             echo "rfc-0009 B4b: harness suite FAILED (exit $suite_status) -- see output above" >&2
-            exit "$suite_status"
           fi
           if [ "$honesty_status" -ne 0 ]; then
             echo "rfc-0009 B4b: subset-honesty assertion FAILED (exit $honesty_status)" >&2
-            exit "$honesty_status"
           fi
+          # The suite's own code wins when both failed; both are logged above.
+          if [ "$suite_status" -ne 0 ]; then exit "$suite_status"; fi
+          exit "$honesty_status"
 
   macos:
     runs-on: macos-latest
+    # R8-D2: typical wall time ~10 min (runs 35491097764/35486328581); 60
+    # leaves ample headroom for a slow runner or a cold nimcache while still
+    # bounding a hang well below GitHub's 360-minute default.
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash   # REQUIRED, not cosmetic: GitHub's implicit default on
+                      # non-Windows is `bash -e {0}` WITHOUT pipefail, while an
+                      # explicit `shell: bash` resolves to
+                      # `bash --noprofile --norc -eo pipefail {0}`. This leg has
+                      # per-file steps that pipe into `tee -a harness.log`
+                      # (wiring-audit W9i), and without pipefail such a step
+                      # returns TEE's exit code -- so a failing `nim r` would
+                      # report success. The windows leg already sets this
+                      # (see its `defaults:`); found by the code review
+                      # 2026-09-21 when W9i's `tee -a` was added here.
     steps:
       - uses: actions/checkout@v4
 
@@ -553,20 +973,97 @@ jobs:
       # leg's comment; same artifact channel, arm64 payload (macos-latest
       # runners are Apple Silicon), clang backend as before.
       - name: Install patched Nim toolchain
+        id: toolchain
         run: |
           BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-macos-arm64 "$RUNNER_TEMP/nimtc" | tail -1)
           echo "$BIN" >> "$GITHUB_PATH"
 
+      # Default success() gate: runs only once the toolchain installed, so
+      # `steps.deps.outcome == 'success'` -- the guard every step after the
+      # nim check keys on -- means "patched nim on PATH AND deps present"
+      # (R8-D2).
       - name: Fetch vendored deps (milpa.lock)
+        id: deps
         run: bash ci/fetch-deps.sh
 
+      # NOT the soundness gate: this step deliberately carries neither
+      # --warningAsError flag. That gate is ci/source-soundness-gate.sh, run
+      # once from the linux `test` job, which cross-targets windows and macosx
+      # with `nim check --os:` (R5-2) -- three partial gates would be a worse
+      # deal than one that can see all three targets.
       - name: nim check — process.nim on real macOS
         run: nim check --hints:off --path:src src/crisol/process.nim
 
       # Cheap pre-check: a suite-wide import mistake fails here before the
       # slower full compile+run below pays the per-file `nim r` cost.
+      #
+      # R7-L2, corrected by R8-D2: this and every step below carry
+      # `if: ${{ !cancelled() && steps.deps.outcome == 'success' }}`, as on
+      # the windows leg (see its comment above the W2 backend step). They are
+      # independent verdicts; before R7-L2, a red pre-check or a red CR2
+      # producer skipped the suite AND the subset-honesty audit that judges
+      # the markers CR2 had already `tee -a`d into harness.log. They run after
+      # an unrelated red step, but not on a cancelled run (R7-L2's always()
+      # did), and not without a toolchain and deps -- a failed install or
+      # fetch fails once rather than as a `nim: not found` per step. The
+      # pre-check is still the fastest signal of an import mistake -- it is
+      # just no longer a gate that hides the rest.
       - name: Conformance suite — import purity (fast pre-check)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_conformance_import_purity.nim
+
+      # code-review CR2 (2026-09-21): the gcc/clang arm's end-to-end
+      # producer for the W1 case-resolution fix (closure.nim:1632's
+      # `csReported` arm). Pinned as a per-file step for the same reason as
+      # #21/#22/#23's tests on the windows leg immediately below (ci.yml):
+      # it lives under tests/integration/, which this leg's bulk sweep
+      # (CRISOL_TEST_DIRS: tests/unit:tests/conformance, in the step below)
+      # does not cover.
+      #
+      # The file's original fixture (`AddMixed.h`) spells its `#include`
+      # directive with the SAME case as the on-disk file, so it only ever
+      # exercised cl's systemic `/sourceDependencies` lowercasing — under
+      # gcc/clang, whose `-M` echoes the directive's LITERAL spelling
+      # verbatim, that fixture produces no mismatch at all. This leg's APFS
+      # volume (case-insensitive) is the only CI producer that can trigger
+      # the gcc/clang arm, so the file's new self-probing "CR2" suite
+      # (native/GccCase.h on disk, `#include "gcccase.h"` in the source)
+      # runs its real body here; it self-skips harmlessly everywhere else
+      # this file already runs (the windows leg, and the Linux `test` job's
+      # unconditional tests/integration/ sweep on genuinely case-sensitive
+      # ext4).
+      # wiring-audit W9i (code-review ledger, 2026-09-21): append this pinned
+      # per-file step's output into harness.log -- the log
+      # ci/assert-subset-honesty.sh actually reads. This file lives under
+      # tests/integration/, which the "Run unit + conformance suites" sweep
+      # below (CRISOL_TEST_DIRS: tests/unit:tests/conformance) never covers,
+      # so without this append the CR2-followup per-test skip could go
+      # silent with no producer catching it. harness.log does not exist yet
+      # at this point in the job; `tee -a` creates it on the first append.
+      - name: "code-review CR2 — gcc/clang arm producer for the W1 case-resolution fix"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue16_headers.nim 2>&1 | tee -a harness.log
+
+      # R8-L1: the two round-7/round-8 integration files that make a
+      # per-platform claim, pinned here for the same reason as CR2 above
+      # (tests/integration/ is outside this leg's sweep) and appended into
+      # harness.log (wiring-audit W9i) for the honesty audit:
+      #   - test_r7_probe_presence_contract.nim says it is pinned against the
+      #     real primitive "on every platform"; until this step it ran only
+      #     on Linux. Darwin's posix_spawn/execvp failure path is a platform
+      #     fact of its own. Its three [OK] lines are MUST-EXECUTE here.
+      #   - test_r8_real_cl_refusal.nim has no `cl` to drive on this leg, so
+      #     both of its tests self-skip with CRISOL-SKIP-TEST markers. That
+      #     skip is PINNED in this leg's expected set, so the day it stops
+      #     firing (or a new one appears) the audit notices; the real body is
+      #     the windows leg's to run, and required there.
+      - name: "round-8 — R7-S1 probe presence contract (toolrun) on macOS"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_r7_probe_presence_contract.nim 2>&1 | tee -a harness.log
+
+      - name: "round-8 — R7-S1 real cl refusal (expected self-skip: no cl on macOS)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_r8_real_cl_refusal.nim 2>&1 | tee -a harness.log
 
       # rfc-0007 C1b: the ladder's `macosx` arm now maps to process/darwin —
       # kqueue EVFILT_PROC event-driven `next` + libproc process-table
@@ -592,10 +1089,12 @@ jobs:
       # B2/B3b gated set skips here (macOS/Darwin IS posix, so every
       # `when defined(posix)` gate takes its real branch -- the expected-skip
       # set for "macos" is empty) and that the three identity conformance
-      # tests (A3b-ii, A4b, A5c) ran their real body. Same pipefail +
-      # PIPESTATUS discipline as the windows leg: run-tests.sh's own honest
-      # exit code must never be masked by `tee` or by the assertion step.
+      # tests (A3b-ii, A4b, A5c) ran their real body. Same PIPESTATUS +
+      # always-audit discipline as the windows leg: run-tests.sh's own
+      # honest exit code must never be masked by `tee` or by the assertion
+      # step, and a red suite must never skip the audit (code-review L3).
       - name: Run unit + conformance suites (kqueue/libproc backend)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         env:
           CRISOL_TIER: macos
           CRISOL_TEST_DIRS: tests/unit:tests/conformance
@@ -614,19 +1113,30 @@ jobs:
           # individually rather than via CRISOL_TEST_DIRS sweep).
           CRISOL_EXPECT_FOLD: fpAsciiLower
         run: |
-          set -o pipefail
-          bash ci/run-tests.sh 2>&1 | tee harness.log
+          # `shell: bash` runs this body under `bash -eo pipefail`, so a
+          # failing suite would abort the step AT the pipeline and the
+          # honesty audit below would never run (code-review L3). errexit is
+          # suspended across exactly the two commands whose statuses are
+          # captured, then restored before the verdict.
+          set +e
+          # wiring-audit W9i: append (-a), never overwrite -- the CR2
+          # per-file tests/integration/ step above already wrote its own
+          # output into harness.log, and this sweep must not discard it.
+          bash ci/run-tests.sh 2>&1 | tee -a harness.log
           suite_status=${PIPESTATUS[0]}
           bash ci/assert-subset-honesty.sh harness.log macos
           honesty_status=$?
+          set -e
+          echo "rfc-0009 B4b: harness suite exit $suite_status, subset-honesty exit $honesty_status"
           if [ "$suite_status" -ne 0 ]; then
             echo "rfc-0009 B4b: harness suite FAILED (exit $suite_status) -- see output above" >&2
-            exit "$suite_status"
           fi
           if [ "$honesty_status" -ne 0 ]; then
             echo "rfc-0009 B4b: subset-honesty assertion FAILED (exit $honesty_status)" >&2
-            exit "$honesty_status"
           fi
+          # The suite's own code wins when both failed; both are logged above.
+          if [ "$suite_status" -ne 0 ]; then exit "$suite_status"; fi
+          exit "$honesty_status"
 
       # rfc-0007 C1b: tests/conformance's TIMING-SENSITIVE cases (self-gated
       # on CRISOL_TIMING_TESTS, unset in the step above) include this
@@ -639,6 +1149,7 @@ jobs:
       # (caps.subreaper is honestly false on Darwin) — out of scope for this
       # slice, not a gap this step is meant to cover.
       - name: Run conformance suite with timing enabled (kqueue latency proof)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         env:
           CRISOL_TIER: macos
           CRISOL_TIMING_TESTS: 1

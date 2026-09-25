@@ -203,6 +203,54 @@ when defined(posix):
       check dirExists(cacheDir / baseSlug)
       check r.cacheDeleted == 0
 
+    test "bin/ is toolchain-aware (W3): a binary backed by a CURRENT-toolchain cache dir is KEPT; one backed only by a STALE one is PRUNED":
+      ## W3 compounding finding: cleanOrphans used to prune cache/ against
+      ## the toolchain-fingerprinted expected set but bin/ against the bare
+      ## one unconditionally -- so a `crisol clean` run between a toolchain
+      ## upgrade and the next `crisol run` deleted the old (orphaned)
+      ## nimcache dir yet kept the binary that nimcache had built, an
+      ## inconsistency `crisol clean` itself must never leave behind.
+      let root = makeTempRoot()
+      defer: removeDir(root)
+
+      let unitDir = root / "tests" / "unit"
+      createDir(unitDir)
+      writeFile(unitDir / "test_tc2.nim", "# stub\n")
+      writeFile(unitDir / "test_tc3.nim", "# stub\n")
+
+      let cfg      = makeConfig(root)
+      let stateDir = root / ".crisol"
+      let cacheDir = stateDir / "cache"
+      let binDir   = stateDir / "bin"
+      createDir(cacheDir)
+      createDir(binDir)
+
+      let currentFp = toolchainFingerprint("2.2.10", "gcc-current|ldd-current")
+      let staleFp   = toolchainFingerprint("2.2.10", "gcc-OLD|ldd-OLD")
+      check currentFp != staleFp  ## precondition
+
+      # Entrypoint A: a CURRENT-toolchain cache dir exists -- its binary is
+      # plausibly built by the current toolchain and must be KEPT.
+      let relA  = "tests/unit/test_tc2.nim"
+      let slugA = slugFor(relA, cfg.trackedRoots, @[])
+      createDir(cacheDir / (slugA & "-" & currentFp))
+      createDir(binDir / slugA)
+
+      # Entrypoint B: ONLY a stale-toolchain cache dir exists (pruned as an
+      # orphan by this same cleanOrphans call) -- its binary cannot be
+      # vouched for under the CURRENT toolchain and must be pruned too.
+      let relB  = "tests/unit/test_tc3.nim"
+      let slugB = slugFor(relB, cfg.trackedRoots, @[])
+      createDir(cacheDir / (slugB & "-" & staleFp))
+      createDir(binDir / slugB)
+
+      let r = cleanOrphans(cfg, nimVersion = "2.2.10", ccVersion = "gcc-current|ldd-current")
+
+      check dirExists(binDir / slugA)      ## kept: current-toolchain cache dir backs it
+      check not dirExists(binDir / slugB)  ## pruned: only a stale-toolchain cache dir backed it
+      check not dirExists(cacheDir / (slugB & "-" & staleFp))  ## the stale cache dir itself is gone too
+      check r.binDeleted >= 1
+
   # ---------------------------------------------------------------------------
   # Suite 2 — clean ignores gates (gated-group caches are KEPT)
   # ---------------------------------------------------------------------------

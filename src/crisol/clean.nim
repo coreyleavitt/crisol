@@ -110,7 +110,20 @@ proc cleanAll*(config: Config) =
 # Public: cleanOrphans
 # ---------------------------------------------------------------------------
 
-proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = ""): tuple[
+# SOUNDNESS-PARAMETER WARNING (round-2 review R2-7; ENFORCED round 3, R3-7;
+# text corrected round 4, R4-5, 2026-09-24): `nimVersion`/`ccVersion` below are
+# soundness parameters of the shape that produced defect L1 -- the value they
+# carry decides WHICH persistent nimcache directories this proc counts as
+# orphans and deletes, so the wrong one either spares a dir built by a dead
+# toolchain or deletes a live one. Neither carries a default any more: an
+# omission is no longer silent or invisible, because it now resolves to one of
+# the deprecated compatibility overloads at the bottom of this file and the
+# compiler names the call site's own file:line (a hard error under `dev
+# check`'s `--warningAsError:Deprecated:on`). Pass both EXPLICITLY, including
+# "" when you mean "no probe available". Full rationale on those overloads,
+# on `planner.cachePath`'s, and at R2-7/R3-7 in
+# docs/handoff/msvc-selection-layer.md.
+proc cleanOrphans*(config: Config; nimVersion: string; ccVersion: string): tuple[
     cacheDeleted, binDeleted, graphEntriesDropped,
     cacheEvicted, shardsRemoved, ledgerRowsKept: int,
     artifactReport, compileCostReport: CompactReport] =
@@ -124,10 +137,18 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   ## the CURRENT-toolchain-fingerprinted dir name for each live entrypoint —
   ## `<slug>-<toolchainFingerprint(nimVersion,ccVersion)>` — so a dir left
   ## over from an OLD toolchain fingerprint (a cc/nim upgrade) is pruned as
-  ## an orphan, same as a dir for a deleted entrypoint. Left at the "" default
-  ## (no real probe available — tests, cold-start), the expected set falls
-  ## back to the bare `<slug>` shape with no toolchain suffix, preserving
-  ## pre-fingerprint behavior exactly.
+  ## an orphan, same as a dir for a deleted entrypoint. Passing `""` for both
+  ## instead makes the expected set fall back to the bare `<slug>` shape with
+  ## no toolchain suffix, preserving pre-fingerprint behavior exactly.
+  ##
+  ## NEITHER PARAMETER HAS A DEFAULT (R3-7; this paragraph corrected in round 4,
+  ## R4-5, 2026-09-24 — it previously described a `""` default that no longer
+  ## exists). A caller with no toolchain probe — a test, a cold start, `crisol
+  ## clean` before the probes have run — writes the sentinel out loud:
+  ## `cleanOrphans(config, "", "")`. The two shorter arities still compile, but
+  ## they are `{.deprecated.}` (see the bottom of this file) precisely so that
+  ## the choice appears in the diff that makes it: which directories this proc
+  ## deletes depends on it.
   ##
   ## Steps:
   ##   1. Discover ALL entrypoints (gskAll, gates ignored — no applyGates call).
@@ -192,7 +213,51 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
   let cacheParent = stateDir / "cache"
   let binParent   = stateDir / "bin"
   let cacheDeleted = pruneDir(cacheParent, expectedCacheSlugs)
-  let binDeleted   = pruneDir(binParent,   expectedSlugs)
+
+  # bin/ toolchain-awareness (W3 wiring-audit finding): `bin/<slug>` is
+  # architecturally NOT toolchain-fingerprinted -- `planner.binPath` is
+  # deliberately ONE stable path per entrypoint, always overwritten in
+  # place by the next compile (see that proc's doc) -- so it cannot be
+  # matched against `expectedCacheSlugs` the way cache/ is above; there is
+  # no `<slug>-<fp>` bin dir name to compare.
+  #
+  # Without this, `cleanOrphans` pruned cache/ against the toolchain-
+  # fingerprinted set but bin/ against the bare one unconditionally: after a
+  # cc/nim upgrade, a `crisol clean` run BEFORE the next `crisol run` would
+  # delete the old (now orphaned) nimcache dir yet retain the binary that
+  # nimcache had just built -- a binary `crisol clean` itself can no longer
+  # vouch for having been built by the CURRENT toolchain, sitting next to a
+  # nimcache directory that no longer exists for it. The NEXT `run` closes
+  # this on its own: `depgraph.loadDepGraph` discards a graph whose header
+  # `nimVersion`/`ccVersion` disagrees with the live toolchain (the W3 fix;
+  # `decideCompile` no longer compares toolchains at all since R3-8), so every
+  # entrypoint lands on `planner.decideCompile`'s "no closure record in dep
+  # graph" arm and recompiles, overwriting `bin/<slug>` in place. This closes
+  # the gap for the window before that run happens, so `crisol clean` alone
+  # can never leave that inconsistency behind.
+  #
+  # Fix: when a real toolchain probe is available (`toolchainFp.len > 0`),
+  # a live entrypoint's binary is retained ONLY if a cache/ directory for
+  # THIS run's OWN current-toolchain fingerprint already exists on disk for
+  # it -- i.e. there is a nimcache directory that plausibly produced it
+  # under the CURRENT toolchain. Absent that (no current-fp cache dir --
+  # e.g. every cache dir for this slug was an old-toolchain orphan just
+  # pruned above, or none ever existed under the current toolchain), the
+  # binary cannot be trusted to have been built by the current toolchain,
+  # so it is treated as an orphan too and pruned. With no real probe
+  # supplied (`toolchainFp == ""` — tests, cold-start, or any pre-fingerprint
+  # caller), this degrades to exactly the bare `expectedSlugs` set, byte-
+  # identical to pre-fix behavior (see the "no toolchain probe supplied"
+  # back-compat test in test_clean.nim).
+  var expectedBinSlugs = expectedSlugs
+  if toolchainFp.len > 0:
+    expectedBinSlugs = initHashSet[string]()
+    for ep in eps:
+      let baseSlug = epSlug(ep, config.trackedRoots)
+      if dirExists(cacheParent / (baseSlug & "-" & toolchainFp)):
+        expectedBinSlugs.incl baseSlug
+
+  let binDeleted   = pruneDir(binParent,   expectedBinSlugs)
 
   # Step 4: GC depgraph entries.
   # Build the currentKeys set as entryKey(ep.tp, ep.flags) — the same key
@@ -285,3 +350,28 @@ proc cleanOrphans*(config: Config; nimVersion: string = ""; ccVersion: string = 
     artifactReport:       artifactCompactReport,
     compileCostReport:    compileCostCompactReport,
   )
+
+# ---------------------------------------------------------------------------
+# R3-7 — deprecated compatibility overloads
+# ---------------------------------------------------------------------------
+##
+## `nimVersion`/`ccVersion` above no longer carry defaults. They select the
+## toolchain fingerprint that decides WHICH persistent nimcache directories
+## count as orphans (`planner.toolchainFingerprint` → `planner.cachePath`), so
+## omitting one silently changes what this proc deletes — a soundness parameter
+## of the shape R2-7 catalogued and L1 was caused by. These overloads keep every
+## existing call compiling while the compiler reports the omission at the
+## caller's own file:line. Full rationale on `planner.cachePath`'s deprecated
+## overload (R3-7).
+##
+## `auto` return rather than a second copy of the (long) result tuple: two
+## hand-maintained copies of one signature is precisely the drift hazard that
+## kept `runner.execute` out of this treatment.
+
+proc cleanOrphans*(config: Config): auto
+    {.deprecated: "R3-7: pass nimVersion and ccVersion explicitly (\"\" when no probe is available) — omitting them changes which nimcache directories count as orphans".} =
+  cleanOrphans(config, "", "")
+
+proc cleanOrphans*(config: Config; nimVersion: string): auto
+    {.deprecated: "R3-7: pass ccVersion explicitly (\"\" when no probe is available) — omitting it changes which nimcache directories count as orphans".} =
+  cleanOrphans(config, nimVersion, "")

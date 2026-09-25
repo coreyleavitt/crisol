@@ -78,7 +78,7 @@ suite "buildRunPlan — shard wiring":
     writeFixture(root, "tests/unit/test_c.nim")
 
     let cfg = makeConfig(root, @["tests/unit/test_*.nim"])
-    let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault))
+    let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault), ccVersion = "")
     check pv.runnable == 3
 
   test "shardK=1/shardN=1 returns all runnable":
@@ -90,7 +90,7 @@ suite "buildRunPlan — shard wiring":
 
     let cfg = makeConfig(root, @["tests/unit/test_*.nim"])
     let pv = buildRunPlan(cfg = cfg,
-                          selection = GroupSelection(kind: gskDefault),
+                          selection = GroupSelection(kind: gskDefault), ccVersion = "",
                           shardK = 1, shardN = 1)
     check pv.runnable == 2
 
@@ -106,8 +106,8 @@ suite "buildRunPlan — shard wiring":
     let cfg = makeConfig(root, @["tests/unit/test_*.nim"])
     let sel = GroupSelection(kind: gskDefault)
 
-    let pv1 = buildRunPlan(cfg = cfg, selection = sel, shardK = 1, shardN = 2)
-    let pv2 = buildRunPlan(cfg = cfg, selection = sel, shardK = 2, shardN = 2)
+    let pv1 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", shardK = 1, shardN = 2)
+    let pv2 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", shardK = 2, shardN = 2)
 
     let s1 = pathSetOf(pv1)
     let s2 = pathSetOf(pv2)
@@ -143,10 +143,10 @@ suite "buildRunPlan — shard wiring":
     var changedSet = initHashSet[TrackedPath]()
     changedSet.incl fromCanonical("src/crisol/types.nim", cfg.trackedRoots).get   # any file — graph absent triggers inclusion
 
-    let pv1 = buildRunPlan(cfg = cfg, selection = sel,
+    let pv1 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "",
                            useChanged = true, changed = changedSet,
                            shardK = 1, shardN = 2)
-    let pv2 = buildRunPlan(cfg = cfg, selection = sel,
+    let pv2 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "",
                            useChanged = true, changed = changedSet,
                            shardK = 2, shardN = 2)
 
@@ -183,10 +183,10 @@ suite "buildRunPlan — shard wiring":
     failedKeys.incl (tp: fromCanonical("tests/unit/test_a.nim", cfg.trackedRoots).get, group: "unit")
     failedKeys.incl (tp: fromCanonical("tests/unit/test_b.nim", cfg.trackedRoots).get, group: "unit")
 
-    let pv1 = buildRunPlan(cfg = cfg, selection = sel,
+    let pv1 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "",
                            useFailed = true, failedKeys = failedKeys,
                            shardK = 1, shardN = 2)
-    let pv2 = buildRunPlan(cfg = cfg, selection = sel,
+    let pv2 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "",
                            useFailed = true, failedKeys = failedKeys,
                            shardK = 2, shardN = 2)
 
@@ -254,13 +254,13 @@ suite "buildRunPlan — C3 cold-start parity with C2":
     # Since buildRunPlan now calls shardWithHistory, cold-start must give identical
     # membership to the old shardOf call.
     for k in 1..n:
-      let pv = buildRunPlan(cfg = cfg, selection = sel, shardK = k, shardN = n)
+      let pv = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", shardK = k, shardN = n)
       # The plan's entrypoints should match shardOf over the discovered set.
       # We verify the C3 pipeline output is complete+disjoint over k=1..2.
       discard pathSetOf(pv)  # just ensure it works
 
-    let pv1 = buildRunPlan(cfg = cfg, selection = sel, shardK = 1, shardN = n)
-    let pv2 = buildRunPlan(cfg = cfg, selection = sel, shardK = 2, shardN = n)
+    let pv1 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", shardK = 1, shardN = n)
+    let pv2 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", shardK = 2, shardN = n)
     let s1 = pathSetOf(pv1)
     let s2 = pathSetOf(pv2)
 
@@ -299,8 +299,8 @@ suite "buildRunPlan — C3 balanced sharding with ledger history":
 
     let sel = GroupSelection(kind: gskDefault)
     let n = 2
-    let pv1 = buildRunPlan(cfg = cfg, selection = sel, shardK = 1, shardN = n)
-    let pv2 = buildRunPlan(cfg = cfg, selection = sel, shardK = 2, shardN = n)
+    let pv1 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", shardK = 1, shardN = n)
+    let pv2 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", shardK = 2, shardN = n)
     let s1 = pathSetOf(pv1)
     let s2 = pathSetOf(pv2)
 

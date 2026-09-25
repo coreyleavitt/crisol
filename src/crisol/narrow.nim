@@ -210,15 +210,18 @@ proc changedSetHasNonAscii*(changed: HashSet[TrackedPath]): bool =
   false
 
 proc anyRootFolds*(roots: TrackedRoots): bool =
-  ## True iff the project root or any configured dep root has an active
-  ## (non-`fpNone`) fold policy. On the Linux default (every root
-  ## genuinely case-sensitive, `fpNone` everywhere) this is always false,
-  ## so `foldUntrusted` below is always false too — zero behavior change,
-  ## one cheap enum comparison per root.
-  if roots.project.foldPolicy != fpNone:
+  ## True iff the project root or any configured dep root has a
+  ## case-folding policy, per the shared `paths.folds` predicate (RFC-0009
+  ## wiring-audit W9m — the single source of truth for "does this policy
+  ## fold case", also used by `paths.foldMatchesSomeRoot`, so the two can
+  ## never silently disagree about what counts as folding). On the Linux
+  ## default (every root genuinely case-sensitive, `fpNone` everywhere)
+  ## this is always false, so `foldUntrusted` below is always false too —
+  ## zero behavior change, one cheap call per root.
+  if roots.project.foldPolicy.folds:
     return true
   for d in roots.deps:
-    if d.foldPolicy != fpNone:
+    if d.foldPolicy.folds:
       return true
   false
 

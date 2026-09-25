@@ -1,8 +1,8 @@
 ## nimprobe.nim — Nim compiler version + binary-content probe (soundness fix).
 ##
-## Mirrors `ccprobe.nim`'s shape exactly: effectful I/O behind an injectable
-## seam, never raises, sentinel fallback on failure, memoised per-process
-## accessor.
+## Mirrors `ccidentity.nim`'s shape exactly: effectful I/O behind an
+## injectable seam, never raises, sentinel fallback on failure, memoised
+## per-process accessor.
 ##
 ## ## Why this exists
 ##
@@ -12,7 +12,7 @@
 ## builds of Nim can share the same version STRING (a stock 2.2.10 and a
 ## locally-patched 2.2.10) while producing different codegen; a cache/
 ## freshness check keyed only on that string cannot tell them apart, which
-## is a soundness gap symmetric to the one `ccprobe.nim` already closes for
+## is a soundness gap symmetric to the one `ccidentity.nim` already closes for
 ## the C compiler (a RUNTIME probe, not a compile-time constant).
 ##
 ## `nimFingerprint` closes the same gap for Nim by combining:
@@ -28,8 +28,11 @@
 ##
 ## ## Seam contract
 ##
-## `run` — reuses `ccprobe.RunProc`/`ccprobe.realRun` verbatim (same idiom,
-## same contract: `ok=false` on any failure, never raises).
+## `run` — reuses `toolrun.RunProc`/`toolrun.realRun` verbatim (same idiom,
+## same contract: `ok=false` on any failure, never raises). CR7 split this
+## seam out of the old `ccprobe.nim` into its own module (`crisol/toolrun`)
+## precisely because this module's reliance on it was the tell that the seam
+## was never a "cc" concern to begin with.
 ##
 ## `hashBin` has signature:
 ##   proc(path: string): string
@@ -64,14 +67,17 @@
 ## `nimFingerprint` is seam-injectable and pure-ish (given fixed seam
 ## outputs) so it's called freely in tests.  `cachedNimFingerprint` is a
 ## thin memoised wrapper — probes exactly once per process, using the real
-## seams — mirroring `ccprobe.cachedCcVersion`.
+## seams — mirroring `ccidentity.cachedCcFingerprint`.
 
 import std/[os, strutils]
-import crisol/ccprobe
+import crisol/toolrun    # CR7: RunProc/realRun -- the process-execution seam,
+                          # split out of the old ccprobe.nim into its own
+                          # module because this module's need for it was never
+                          # a "cc" concern; see toolrun.nim's own doc.
 import crisol/depgraph   # re-uses fnv1a64, toHex16; never reimplement hashing
 
-export ccprobe.RunProc
-export ccprobe.realRun
+export toolrun.RunProc
+export toolrun.realRun
 
 # ---------------------------------------------------------------------------
 # Sentinels
@@ -93,7 +99,7 @@ type
 # ---------------------------------------------------------------------------
 
 proc normalizeOutput(s: string): string =
-  ## Trim every line, drop blank lines, rejoin with "\n".  Unlike ccprobe's
+  ## Trim every line, drop blank lines, rejoin with "\n".  Unlike ccidentity's
   ## `firstLine`, this keeps ALL lines — the "Compiled at" date and "active
   ## boot switches" lines (beyond line 1) are exactly what distinguishes a
   ## patched build from a stock one at the same version number.

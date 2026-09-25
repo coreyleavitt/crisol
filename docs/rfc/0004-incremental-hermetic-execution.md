@@ -85,6 +85,73 @@ type
   2. `flagHash` — compile flags (existing).
   3. `nimVersion` — Nim compiler version (existing).
   4. `ccVersion` — C compiler + libc version (`cc --version` first line ⊕ `ldd --version` first line). Captures the toolchain/runtime that `nimVersion` alone misses (a `glibc` upgrade can change stdlib behavior). **Effectful** — probed once at startup, cached, and injected (mockable) into key derivation; see slice A2-pre.
+
+     **[Amended, issue #23, 2026-09-20 — the two version strings above are
+     SUPERSEDED. The component's position in the fold, its name, and its
+     effectful/probed-once/injected nature are unchanged; what it CONTAINS
+     changed.]** A version string is the wrong primitive. RFC-0006 §Soundness
+     already argues the principle, about headers — *"a distro header backport
+     that patches a struct layout without moving a version string must
+     invalidate"* — and a RHEL or Debian glibc backport moves no `ldd --version`
+     string either. By crisol's own stated standard this was a live **Linux**
+     hole, not a Windows-only one. The right pattern already existed one field
+     over: `nimVersion` is the full `nim --version` text **plus a content hash of
+     the nim binary** (RFC-0005:21, "sound by construction, not by luck").
+     `ccVersion` now follows it. Still two `|`-separated halves —
+     `render.splitFirstPipe` and `--explain-miss` depend on that shape — but each
+     half is legible text ⊕ a content hash of the artifact it names:
+
+     - **cc half** — `ccprobe.versionLine` of the merged `--version` banner
+       (content-selected, never position-selected: a driver's usage line can
+       arrive first, and two toolsets that both fall back to one would otherwise
+       fingerprint identically), ⊕ **on POSIX** a content hash of the driver
+       binary `findExe` resolved. Two gcc builds reporting the same version now
+       key apart.
+     - **runtime half** — the C runtime this toolchain will actually LINK, ⊕ a
+       content hash of its bytes. POSIX: `cc -print-file-name=libc.so.6` (gcc
+       echoes the bare name back with rc=0 when the file is not found, so
+       discovery `fileExists`-checks and never trusts the exit code). Windows: a
+       trivial TU linked with `vccexe ... /link /VERBOSE:LIB`, hashing every
+       `.lib` the linker actually searched — Nim+vcc links the CRT **statically**,
+       so there is no libc DLL and no version string to read, and `libucrt.lib`
+       ships with the Windows SDK versioned independently of `cl`, so any
+       cl-banner-only fix would have left exactly that library invisible.
+     - **The driver hash is POSIX-only, and that is a decision, not an
+       omission.** Windows has no canonical driver: `cl` is on PATH only inside a
+       Developer Command Prompt, `vccexe` always, and those are two binaries for
+       one toolchain. Banner-text dedup is what keeps both launches on one key; a
+       per-driver hash would split one toolchain into two, costing a spurious
+       miss on every shell switch — a cost RFC-0005's shared cache cannot carry.
+       Nothing is lost: `cl`'s banner carries a full build number
+       (`19.44.35228`) that moves with every toolset patch, and the Windows
+       runtime half already hashes the `.lib` bytes. The reason is recorded on
+       `ccprobe.WindowsCcProfile`; do not "restore symmetry" without reading it.
+     - **Sentinels mean two things now, not three.** `RuntimeSentinel =
+       "<runtime-unidentified>"` (nothing identified the runtime at all) and
+       `FileHashSentinel = "<artifact-unreadable>"` (named but unreadable — what
+       a musl host produces, since gcc echoes the name back). `LddSentinel`, a
+       third meaning "this platform has no runtime probe", is **retired**: a
+       value meaning *we did not look* is indistinguishable, inside a soundness
+       key, from two hosts genuinely agreeing.
+     - **What it was before.** `cc` and `ldd` exist under **no** Windows
+       toolchain, so every Windows host folded to the constant
+       `<cc-unavailable>|<ldd-unavailable>` — an MSVC cache entry and a mingw-gcc
+       one shared a soundness key. Measured after, from the production accessor:
+       `Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for
+       x64|kernel32+libcmt+libucrt+libvcruntime+oldnames+uuid #0d8cab78a8b5d998`
+       and `cc (SUSE Linux) 16.2.0 #b0dd4cd034d13600|ldd (GNU libc) 2.43
+       #542b390a4be6deb6`.
+     - **Cost, measured.** Windows 193-242 ms for the whole probe (five driver
+       candidates, a `vccexe` compile-and-link of a trivial TU, and hashing six
+       `.lib` files); Linux 9 ms. Once per host process, memoised after; never in
+       `measureworker`.
+     - **Migration: none needed.** `ccVersion` is a key *input*, not a schema
+       field, so a changed value self-invalidates in the safe direction —
+       existing entries **miss** rather than collide. No format-version bump.
+       Worked in `docs/handoff/msvc-selection-layer.md`; probe in
+       `src/crisol/ccprobe.nim`; proven end-to-end through the real accessor by
+       `tests/integration/test_issue23_cc_identity.nim`, which runs on both the
+       linux and windows CI legs.
   5. `fixtureHash` — content-hash of the per-group `fixtures` glob set (golden/testdata files NOT in the Nim import closure). Empty-glob ⇒ sentinel constant. **Read-only fixtures only** — a test that mutates a golden file in place must set `cacheable #false`.
   6. `argvHash` — the exact `argv` the binary is invoked with.
   7. `rlimitHash` — the **requested, config-declared** rlimit tuple (`RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`), hashed at *plan time* from config constants (NOT what the kernel ultimately clamps to — see the cache gate, which voids the write if the achieved sandbox ≠ requested). A pass under one ceiling is not a pass under another, so the ceiling is an input.
@@ -235,7 +302,7 @@ All original forks resolved. Governing principle (Corey, round 1): **crisol has 
 
 1. **Default hermeticity = `isolated`.** Soundness substrate always active; the published default allowlist bounds the env input set. (`chdir`-into-scratch and `network` remain **opt-in** — correctness/capability constraints, not migration concessions.)
 2. **Caching = on by default.** Sound because hermeticity is `isolated` and the gate keys on *achieved* hermeticity.
-3. **Cache key = input-hash**, reusing `DepGraphEntry.closureHash` augmented with `ccVersion`/libc (an independently-compiled-but-source-identical binary is the same input equivalence class; binary-bytes hashing fights Nim's path-embedding).
+3. **Cache key = input-hash**, reusing `DepGraphEntry.closureHash` augmented with `ccVersion`/libc (an independently-compiled-but-source-identical binary is the same input equivalence class; binary-bytes hashing fights Nim's path-embedding). **[Amended, issue #23, 2026-09-20: `ccVersion`/libc is now a content fingerprint — of the cc driver binary on POSIX, and of the C runtime artifacts the toolchain links on both platforms — not a pair of version strings; see component 4 above. The equivalence-class argument is untouched, and this is why: what gets hashed is the TOOLCHAIN's bytes, not the produced binary's, so an independently-compiled-but-source-identical test binary is still the same input class.]**
 
 A consumer needing looser behavior opts out explicitly (`--hermetic none`, `--no-cache`, per-group `cacheable #false`).
 
@@ -246,7 +313,7 @@ Dependency-correct order (rounds 1 & 2). **Stage A:** A2-pre → A3 → A5 → A
 **Fixture inventory (prerequisite for the A4/B integration slices):** a binary that overruns `RLIMIT_FSIZE`; one that exhausts `RLIMIT_NOFILE`; one that attempts `RLIMIT_AS` allocation **above a documented safe minimum** (so it doesn't crash the crisol process group); one that reads an unlisted env var and reports it; one that reads `TMPDIR`; a `network`-touching binary whose test asserts **degradation** (rootless podman has no `CAP_NET_ADMIN`); a deterministically-flaky binary keyed on `CRISOL_ATTEMPT`. Build these before the slices that consume them.
 
 **Stage A — engine core (highest architect scrutiny):**
-- [ ] **A2-pre** cc/libc version probe (`cc --version`, `ldd --version`): run once at startup, cache, expose a mockable seam. Effectful; tested via injection.
+- [ ] **A2-pre** cc/libc version probe (`cc --version`, `ldd --version`): run once at startup, cache, expose a mockable seam. Effectful; tested via injection. **[Amended, issue #23, 2026-09-20: the shipped probe is no longer `cc --version` + `ldd --version`. It resolves a driver from a per-platform candidate list, captures stdout and stderr merged (`realRunMerged` — cl writes its banner to one and its usage line to the other), content-selects the banner, and probes the link-time runtime (`cc -print-file-name=` / `vccexe ... /link /VERBOSE:LIB`), content-hashing each artifact it names. Three seams, all injectable: `RunProc`, `BinHashProc`, `LinkProbeProc`. See component 4 above.]**
 - [ ] **A3** `Sandbox` spec resolution from config + flags (level, env allowlist, tmpdir/cwd policy, config-declared rlimits) → `SandboxSpec`. Pure resolution, tested.
 - [ ] **A5** env allowlist/scrub in spawn — modify `forkExecEnv` to filter to the allowlist (then append crisol-injected vars) rather than copy parent env; `hermeticEnvHash` derivation. Integration-tested: unlisted var absent in-child; injected vars present; hash stable; `TMPDIR` excluded from hash.
 - [ ] **A2** soundness-key + identity-key derivation in `keys.nim` (chained FNV; `hermeticEnvHash` and `ccVersion` injected as params so the proc is pure/testable). Vectors-tested, incl. XOR-cancellation and NUL-in-fixture negative cases.

@@ -2,10 +2,11 @@
 ##
 ## A shell (import posix; export posix), modeled exactly on
 ## `process/linux.nim`: every macOS-specific mechanism — kqueue
-## `EVFILT_PROC` event-driven `next`, libproc process-table forensics
-## (`walkProcTable`/`readVmRssBytes`, macOS has no `/proc`), and the
-## `kqueue` capability probe — lives in `process/posixcore.nim`'s
-## `when defined(macosx):` branches, not here (Nim has no partial module
+## `EVFILT_PROC` event-driven `next` (`process/posixcore.nim`), libproc
+## process-table forensics (`walkProcTable`/`readVmRssBytes`,
+## `process/procscan.nim`; macOS has no `/proc`), and the `kqueue`
+## capability probe (`process/caps.nim`'s `probeKqueue`) — lives in those
+## shared modules' `when defined(macosx):` branches, not here (Nim has no partial module
 ## override — a backend cannot "re-export posix plus two procs" — the §1
 ## module-layout comment's sharing mechanism). `process.nim`'s selection
 ## ladder gives `macosx` this named arm so it is distinct from the generic

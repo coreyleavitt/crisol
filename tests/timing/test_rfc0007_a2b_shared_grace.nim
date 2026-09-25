@@ -35,6 +35,13 @@ when defined(posix):
   import crisol/depgraph
   import crisol/process/types as ptypes
   import "../support/testep"
+  import "../support/statedir"
+
+  # R8-D3: this process's own crisol state dir -- never the repo root's shared
+  # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+  # run in the same tree would race (slot binaries / nimcache JSON deleted
+  # mid-compile).
+  let testStateDir = processStateDir("a2bgrace")
 
   if getEnv("CRISOL_TIMING_TESTS") == "":
     quit(0)
@@ -65,7 +72,7 @@ when defined(posix):
       var eps: seq[Entrypoint]
       for i in 0 ..< N:
         eps.add mkEp(fd / "term_ignores.nim", @["-d:CRISOL_A2B_GRACE_" & $i])
-      let cfg = Config(jobs: N, compileTimeoutSecs: 60, timeoutSecs: 60, projectRoot: getCurrentDir(), trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
+      let cfg = Config(jobs: N, compileTimeoutSecs: 60, timeoutSecs: 60, projectRoot: getCurrentDir(), stateDir: testStateDir, trackedRoots: initTrackedRoots(getCurrentDir(), @[], ""))
       let p   = plan(cfg, eps, emptyDepGraph())
       var g   = emptyDepGraph()
 

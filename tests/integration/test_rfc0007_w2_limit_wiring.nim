@@ -1,8 +1,9 @@
 ## test_rfc0007_w2_limit_wiring.nim — rfc-0007 wiring-audit W2 E2E: the
 ## cbLimit attribution chain (posix SIGXCPU -> cbLimit(lkCpu), B3
 ## memoryOomKill -> cbLimit(lkMemory)) is CI-proven at the backend layer
-## (see tests/timing/test_rfc0007_a1f_limit_timing.nim, tests/unit/
-## test_rfc0007_b3_*) but was UNREACHABLE from every entry point: crisol.kdl
+## (see tests/timing/test_rfc0007_a1f_limit_timing.nim,
+## tests/unit/test_process_cause.nim,
+## tests/integration/test_rfc0007_b3_cgroup.nim) but was UNREACHABLE from every entry point: crisol.kdl
 ## exposed only `rlimit-nofile`; nothing production ever set
 ## RlimitOverrides.limitCpu/limitAs/limitFsize/limitCore, and `req[lkMemory]`
 ## had NO config/CLI surface at all. This slice wires the remaining four

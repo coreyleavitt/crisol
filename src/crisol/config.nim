@@ -107,27 +107,51 @@ import crisol/paths
 # stateDirOf — single authoritative resolver for crisol's on-disk state dir
 # ---------------------------------------------------------------------------
 
+const DefaultStateDir*           = ".crisol"
+  ## The project-root-relative state dir the CLI uses when crisol.kdl has no
+  ## `state-dir` node (and the convention fallback uses always). Declared
+  ## here, ahead of `stateDirOf`, because `stateDirOf` applies it to an
+  ## empty `Config.stateDir` too.
+
 proc stateDirOf*(cfg: Config): string =
-  ## Single source of truth for crisol's on-disk state directory (absolute).
+  ## Single source of truth for crisol's on-disk state directory. The result
+  ## is ALWAYS absolute and NEVER derived from the process cwd.
   ## CRISOL_STATE_DIR, when set, OVERRIDES the config's project-root-relative
   ## `state-dir` — this is how a sandboxed container redirects crisol's build
   ## cache onto a mounted volume (e.g. /cache/crisol) that lives outside the
   ## project tree. Resolution order:
   ##   1. CRISOL_STATE_DIR set (non-empty) -> nativeCanonicalize(env, cfg.projectRoot)
-  ##   2. cfg.stateDir empty -> "" (caller signalled "no state dir"; e.g. some
-  ##      runEntrypoint callers leave it unset and want the ledger disabled)
+  ##   2. cfg.stateDir empty -> treated as `DefaultStateDir` (".crisol"), the
+  ##      same default the config loader and the convention fallback give the
+  ##      CLI, so a zero-valued field means "the default", not "no state dir"
   ##   3. cfg.stateDir absolute -> use as-is
-  ##   4. otherwise -> absolutePath(cfg.projectRoot / cfg.stateDir)
+  ##   4. otherwise -> absolutePath(cfg.projectRoot / cfg.stateDir), which
+  ##      REQUIRES an absolute `cfg.projectRoot`; a relative or empty one
+  ##      raises `CrisolError(cekConfig)` rather than resolving against cwd
   ##
   ## RFC-0009 A2 (R3-25): step 1 used to be a bare `absolutePath(getEnv(...))`,
   ## which joins a RELATIVE env value against the process cwd. `cfg.projectRoot`
   ## is now the explicit base instead (never cwd); an already-absolute env
   ## value is still normalized (dot-segments, redundant separators).
+  ##
+  ## R8-D3: step 2 used to return "" -- and every consumer (`binPath`,
+  ## `cachePath`, `depgraphPath`, the ledger) then joined "bin"/"cache"/
+  ## "depgraph" onto "", i.e. resolved them against the process cwd, which is
+  ## how two concurrent runs sharing a cwd deleted each other's slot binaries
+  ## and nimcache JSON. There is no "no state dir" mode: compile output has to
+  ## land somewhere, and the only sound somewhere is under the project root
+  ## (or an explicit absolute/env location). Step 4's absoluteness check
+  ## closes the same hole for a relative `projectRoot`.
   let env = getEnv("CRISOL_STATE_DIR")
   if env.len > 0: return nativeCanonicalize(env, cfg.projectRoot).path
-  if cfg.stateDir.len == 0: return ""
-  if cfg.stateDir.isAbsolute: return cfg.stateDir  # canon-ok: A2 stateDir join branch, not a root-membership check
-  absolutePath(cfg.projectRoot / cfg.stateDir)  # canon-ok: A2 stateDir resolution (join relative stateDir onto projectRoot, never cwd)
+  let stateDir = if cfg.stateDir.len == 0: DefaultStateDir else: cfg.stateDir
+  if stateDir.isAbsolute: return stateDir  # canon-ok: A2 stateDir join branch, not a root-membership check
+  if not cfg.projectRoot.isAbsolute:  # canon-ok: A2 stateDir join precondition (refuse a cwd join), not a root-membership check
+    raise newCrisolError(cekConfig,
+      "cannot resolve state dir '" & stateDir & "': projectRoot '" &
+      cfg.projectRoot & "' is not absolute (crisol never resolves state " &
+      "against the process cwd)")
+  absolutePath(cfg.projectRoot / stateDir)  # canon-ok: A2 stateDir resolution (join relative stateDir onto projectRoot, never cwd)
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -136,7 +160,6 @@ proc stateDirOf*(cfg: Config): string =
 const DefaultTimeoutSecs*        = 300
 const DefaultCompileTimeoutSecs* = 600
 const DefaultMaxOutputBytes*     = 10 * 1024 * 1024   # 10 MiB
-const DefaultStateDir*           = ".crisol"
 const DefaultVerifyCachePct*     = 5   # RFC-0005 B3c: --verify-cache-pct's default
                                         # when no crisol.kdl `verify-cache-pct` node
                                         # is present (r29: api.verifySample()'s own

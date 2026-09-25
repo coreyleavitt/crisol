@@ -7,7 +7,7 @@
 ##
 ## These are CHARACTERIZATION tests of already-landed behavior — real `cc`
 ## coverage lives in tests/integration/test_issue16_headers.nim; everything
-## here injects a synthetic `ccRun` (crisol/ccprobe.RunProc) or hand-writes
+## here injects a synthetic `ccRun` (crisol/toolrun.RunProc) or hand-writes
 ## nimcache-manifest / depgraph JSON, exactly like
 ## tests/unit/test_closure_warm.nim, tests/unit/test_depgraph_guard.nim, and
 ## tests/unit/test_soundness_m10.nim.
@@ -21,7 +21,7 @@ import crisol/types
 import crisol/paths
 import crisol/closure    # ExternalSource, CompileInputs, extractCompileInputs,
                           # isModuleObjectName, buildSourceIndex; re-exports
-                          # ccprobe.RunProc/realRun.
+                          # toolrun.RunProc/realRun.
 import crisol/depgraph    # DepGraph, updateEntry, saveDepGraph,
                           # loadStoredDepGraph, staleExternalObjects,
                           # DepGraphFormatVersion, depgraphPath, flagHash
@@ -475,6 +475,158 @@ suite "staleExternalObjects (issue #16 slice 1b)":
     check staleExternalObjects(g, "tests/nokey.nim", @[], roots).len == 0
 
 # ---------------------------------------------------------------------------
+# 8b: extractCompileInputs under MSVC (issue #21 slice 1b)
+# ---------------------------------------------------------------------------
+
+proc vccObjAbs(p: ExtProject): string =
+  ## What vccexe/cl actually name the external's object: `.obj`, not `.o`.
+  p.nc / "@mnative@sadd.c.obj"
+
+proc vccCcCmd(p: ExtProject): string =
+  ## A manifest `ccCmd` in the shape a real `cc = vcc` nimcache records
+  ## (verbatim structure from the POC capture, paths localised):
+  ##   vccexe.exe /c --platform:amd64 /nologo /I<dir> /Fo<obj> <src>
+  ## Note `/c` and `/Fo<obj>` -- the MSVC spellings of the two flags the GNU
+  ## arm strips. They must SURVIVE into the probe invocation: `/Zs`
+  ## (syntax-check only) dominates both, so the derivation is a pure prepend
+  ## with zero removals and the object is never rewritten as a side effect.
+  "vccexe.exe /c --platform:amd64 /nologo /I" & (p.root / "native") &
+    " /Fo" & vccObjAbs(p) & " " & p.srcAbs
+
+suite "extractCompileInputs — MSVC external (issue #21 slice 1b)":
+
+  test "a vcc manifest yields the real header set: family-classified, /Zs-prepended, JSON-parsed":
+    let p = setupExtProject("msvc")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                 link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+
+    var capturedCmd = ""
+    var capturedArgs: seq[string] = @[]
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      capturedCmd = cmd
+      capturedArgs = @args
+      # Real `/sourceDependencies-` stdout: cl's one-line source-name banner,
+      # then the pretty-printed JSON document starting at a line that is
+      # exactly `{`. Built through std/json so Windows path separators are
+      # escaped the way cl itself escapes them.
+      let doc = %*{
+        "Version": "1.2",
+        "Data": {
+          "Source": p.srcAbs,
+          "ProvidedModule": "",
+          "Includes": [p.addH, p.otherH, p.vendorH,
+                       "/usr/include/stdint.h", p.srcAbs]
+        }
+      }
+      (output: "add.c\n" & doc.pretty & "\n", ok: true)
+
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+
+    # Derivation: the driver is replayed verbatim with two flags prepended.
+    check capturedCmd == "vccexe.exe"
+    check capturedArgs.len >= 2
+    check capturedArgs[0] == "/Zs"
+    check capturedArgs[1] == "/sourceDependencies-"
+    check "/c" in capturedArgs                      # NOT stripped
+    check ("/Fo" & vccObjAbs(p)) in capturedArgs    # NOT stripped
+    check "-M" notin capturedArgs                   # never the GNU flag
+
+    check inputs.externals.len == 1
+    let ext = inputs.externals[0]
+    check ext.obj == "@mnative@sadd.c.obj"
+    check ext.source == "native/add.c"
+
+    let vendorTp = tpOf(p.vendorH, cfg.trackedRoots)
+    var expectedHeaders = @["native/add.h", "native/other.h",
+                            string(keyBytes(vendorTp, cfg.trackedRoots))]
+    expectedHeaders.sort()
+    check ext.headers == expectedHeaders
+    check "/usr/include/stdint.h" notin ext.headers  # system header excluded
+    check "native/add.c" notin ext.headers           # the compiled source is never its own header
+
+  test "a vcc manifest with a CRLF-terminated /sourceDependencies document still yields the real header set (CR14)":
+    ## Real Windows console/subprocess capture is typically CRLF-terminated;
+    ## before this test, every `/sourceDependencies` fixture in this file was
+    ## LF-only (CR14, code review 2026-09-21). Same document as the test
+    ## above, translated to CRLF line endings end to end -- banner line
+    ## included, since a real capture would not switch terminators
+    ## mid-stream.
+    let p = setupExtProject("msvc_crlf")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                 link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      let doc = %*{
+        "Version": "1.2",
+        "Data": {
+          "Source": p.srcAbs,
+          "ProvidedModule": "",
+          "Includes": [p.addH, p.otherH, p.vendorH,
+                       "/usr/include/stdint.h", p.srcAbs]
+        }
+      }
+      let banner = "add.c\n".replace("\n", "\r\n")
+      let body = (doc.pretty & "\n").replace("\n", "\r\n")
+      (output: banner & body, ok: true)
+
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+
+    check inputs.externals.len == 1
+    let ext = inputs.externals[0]
+    check ext.obj == "@mnative@sadd.c.obj"
+    check ext.source == "native/add.c"
+
+    let vendorTp = tpOf(p.vendorH, cfg.trackedRoots)
+    var expectedHeaders = @["native/add.h", "native/other.h",
+                            string(keyBytes(vendorTp, cfg.trackedRoots))]
+    expectedHeaders.sort()
+    check ext.headers == expectedHeaders
+    check "/usr/include/stdint.h" notin ext.headers
+    check "native/add.c" notin ext.headers
+
+  test "a probe that exits 0 with NO dependency document fails LOUDLY, never as an empty header set":
+    ## The exact shape measured against cl 19.44 in the MSVC container when
+    ## the driver does not understand `/sourceDependencies`:
+    ##
+    ##   rc     = 0
+    ##   stdout = "unit.c\n"
+    ##   stderr = "cl : Command line warning D9002 : ignoring unknown option"
+    ##
+    ## `ranOk` is therefore TRUE and `realRunIn` captures stdout only, so the
+    ## D9002 never reaches crisol. Nothing about the invocation says it
+    ## failed -- the structural absence of the document is the only signal in
+    ## existence. Before issue #21 this exact case recorded a one-entry
+    ## header set parsed out of the banner and vouched for it with a
+    ## soundness key.
+    let p = setupExtProject("msvc_nojson")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                 link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      (output: "add.c\n", ok: true)      # banner only, exit 0 -- no document
+
+    var raised = false
+    var msg = ""
+    try:
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+    except CrisolError as e:
+      raised = true
+      msg = e.msg
+      check e.kind == cekEnvironment
+    check raised
+    check "native/add.c" in msg     # names the source that could not be probed
+    check "dpeNoJson" in msg        # and says precisely what went wrong
+
+# ---------------------------------------------------------------------------
 # 9: isModuleObjectName
 # ---------------------------------------------------------------------------
 
@@ -490,6 +642,21 @@ suite "isModuleObjectName (issue #16 slice 1b)":
 
   test "false for a bare foreign object basename":
     check not isModuleObjectName("foo.o")
+
+  test "true for the MSVC spelling of a module object (.nim.c.obj) -- issue #21 slice 1a":
+    ## cl/vccexe emit `.obj`, every POSIX cc and mingw emit `.o`; the
+    ## extension belongs to the toolchain that PRODUCED the nimcache, not to
+    ## the crisol that is reading it. Recognising only `.o` made
+    ## `bustStaleExternalObjects` rule 2 a silent no-op under vcc -- it skips
+    ## every file that is not `.o`, so a warm nimcache with no depgraph
+    ## record never cold-started its externals and a header-only edit relinked
+    ## the STALE object.
+    check isModuleObjectName("@mfixture_substrate.nim.c.obj")
+    check isModuleObjectName("@mcppmod.nim.cpp.obj")
+
+  test "false for a {.compile.}d external's object in MSVC spelling":
+    check not isModuleObjectName("@mnative@sadd.c.obj")
+    check not isModuleObjectName("foo.obj")
 
 when isMainModule:
   echo "All test_issue16_unit tests passed."

@@ -683,7 +683,7 @@ const RunSchemaRevision* = 26
   ##       an oversight this slice touches): `verifyFails` is always 0 on
   ##       lastrun.json because `--verify-cache` runs AFTER persistLastRun
   ##       (api.nim's own ordering comment); `cacheStats` is never persisted
-  ##       to lastrun.json at all (no param exists for it on `persistLastRun`).
+  ##       to lastrun.json at all (`persistLastRun` ignores `doc.cacheStats`; r8).
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
   ## seeing `schema == "crisol/run/v1"` ALSO treats the file as no-data — see
@@ -724,17 +724,26 @@ proc cacheDecisionString*(d: CacheDecision): string =
   ##                        recomputed outcome is not oPassed; treated as a
   ##                        miss and rerun (§2) — distinct from "keyMiss"
   ##                        (no entry was found at all).
+  ## W4 full fix (rev 18):
+  ##   "toolchainUnidentified" — cdmToolchainUnidentified: fresh, hermetic
+  ##                        pass, but the host's C-toolchain identity
+  ##                        (`ccidentity.CcFingerprint`) folds to a degraded
+  ##                        sentinel — the store gate refused to publish
+  ##                        under a key that would not actually distinguish
+  ##                        this host's real toolchain from another host in
+  ##                        the same degraded state.
   case d
-  of cdmNotEligible:       "notEligible"
-  of cdmHit:               "hit"
-  of cdmStored:            "stored"
-  of cdmKeyMiss:           "keyMiss"
-  of cdmHermeticityDeg:    "hermeticityDegraded"
-  of cdmGroupOptOut:       "groupOptOut"
-  of cdmPolicyDisabled:    "policyDisabled"
-  of cdmFlaky:             "flaky"
-  of cdmClosureUnrecorded: "closureUnrecorded"
-  of cdmRecomputeMiss:     "recomputeMiss"
+  of cdmNotEligible:            "notEligible"
+  of cdmHit:                    "hit"
+  of cdmStored:                 "stored"
+  of cdmKeyMiss:                "keyMiss"
+  of cdmHermeticityDeg:         "hermeticityDegraded"
+  of cdmGroupOptOut:            "groupOptOut"
+  of cdmPolicyDisabled:         "policyDisabled"
+  of cdmFlaky:                  "flaky"
+  of cdmClosureUnrecorded:      "closureUnrecorded"
+  of cdmRecomputeMiss:          "recomputeMiss"
+  of cdmToolchainUnidentified:  "toolchainUnidentified"
 
 proc cacheVerdictString*(v: CacheVerdict): string =
   ## Returns the stable JSON string for a CacheVerdict enum value (RFC-0005

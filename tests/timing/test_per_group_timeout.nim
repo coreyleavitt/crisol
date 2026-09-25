@@ -17,6 +17,13 @@ import crisol/types
 import crisol/runner
 import crisol/scheduler  # effectiveRunTimeoutMs
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race (slot binaries / nimcache JSON deleted
+# mid-compile).
+let testStateDir = processStateDir("pergroup")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,6 +49,7 @@ proc runWith(eps: seq[Entrypoint]; jobs: int;
     compileTimeoutSecs: 60,          # generous compile budget
     timeoutSecs:        globalRunSecs,
     projectRoot:        getCurrentDir(),
+    stateDir:           testStateDir,
     trackedRoots:       initTrackedRoots(getCurrentDir(), @[], "")
   )
   let p = plan(cfg, eps, emptyDepGraph())

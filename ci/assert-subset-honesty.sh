@@ -19,16 +19,28 @@
 #   1. EXPECTED-SKIP: the set of `CRISOL-SKIP: <path>` markers observed in
 #      the harness log exactly equals the pinned per-leg expected-skip set
 #      below (whole-FILE self-skips: the entrypoint prints nothing else).
-#   2. EXPECTED-SKIP-TEST (S5 wiring-audit fix): the set of
+#   2. EXPECTED-SKIP-TEST (S5 wiring-audit fix; broadened by the CR6/CR2-
+#      followup/W5d honesty-defect fixes, 2026-09-21): the set of
 #      `CRISOL-SKIP-TEST: <path>#<label>` markers observed exactly equals the
 #      pinned per-leg expected set below (per-test/per-block self-skips
-#      inside a file whose other tests still run for real — these files each
-#      call tests/support/symlinkprobe.nim's `symlinksAvailable()` and
-#      self-skip only the individual test/block, via unittest `skip()` or a
-#      bare `block`/`break`, when this environment cannot create a symlink.
-#      windows-latest lacks SeCreateSymbolicLinkPrivilege, so these are
+#      inside a file whose other tests still run for real). The ORIGINAL S5
+#      instances all share one shape: the file calls
+#      tests/support/symlinkprobe.nim's `symlinksAvailable()` and self-skips
+#      only the individual test/block via unittest `skip()` when this
+#      environment cannot create a symlink (windows-latest lacks
+#      SeCreateSymbolicLinkPrivilege in some historical runs, so these were
 #      EXPECTED there; macos-latest (APFS) has it, so these MUST run for
-#      real there — same leg-aware shape as A5c below).
+#      real there — same leg-aware shape as A5c below; empirically, per the
+#      windows-leg comment below, the CURRENT windows-latest image also has
+#      the privilege, so even the symlink-gated set is EMPTY today). The
+#      CR6/CR2-followup/W5d fixes reuse the SAME `CRISOL-SKIP-TEST` marker
+#      for other per-test self-skip REASONS that are not symlink-shaped at
+#      all (a POSIX-only assertion, a documented Windows-only known
+#      divergence, a case-fold-volume-dependent fixture, an
+#      environment-capability probe such as hardlink/random-byte
+#      availability) — the vocabulary is "this ONE test in an otherwise-live
+#      file self-skipped, honestly, for a NAMED reason", not "symlinks
+#      specifically"; see each pinned entry below for its own reason.
 #   3. MUST-EXECUTE: the three load-bearing identity conformance tests
 #      (A3b-ii, A4b, A5c) ran their REAL body, not a self-skip.
 #
@@ -70,11 +82,22 @@ case "$LEG" in
     # backend is proven by the per-file test_windows_* suite instead. It is
     # NOT in the B2/B3b import buckets (it imports no std/posix any more), but
     # it IS a posix-backend-category skip on windows, so it belongs here.
+    #
+    # W5b/W5c (code-review ledger, 2026-09-21): test_memprobe.nim and
+    # test_rfc0007_b2_fd_leak.nim are both whole-file `when defined(linux):`
+    # gated (real /proc+cgroup parsing and pidfd/epoll fd-leak introspection
+    # respectively — neither has a portable equivalent), so both take their
+    # `else` branch and self-skip on windows exactly like the B2/B3b files
+    # above. Newly marked with CRISOL-SKIP; previously silent (W5b a bespoke
+    # unmarked echo, W5c missing an else branch entirely — its `done` line
+    # printed unconditionally, asserting nothing).
     EXPECTED_SKIP="$(cat <<'EOF'
 tests/conformance/test_conformance.nim
 tests/conformance/test_conformance_timing.nim
+tests/unit/test_memprobe.nim
 tests/unit/test_process_capabilities.nim
 tests/unit/test_rfc0007_a6a_escapee_evidence.nim
+tests/unit/test_rfc0007_b2_fd_leak.nim
 tests/unit/test_rfc0007_r2_cross_slot_escapee.nim
 tests/unit/test_rfc0007_r9_probe_flock.nim
 tests/unit/test_rfc0007_r10_cgroup_kill_degrade.nim
@@ -107,7 +130,76 @@ EOF
     #   tests/unit/test_ioutils.nim#test_writeguardedfile_overwrite_true_still_refuses_symlink
     #   tests/unit/test_jsonout.nim#p3_symlink_safe_temp_write
     #   tests/unit/test_rfc9_a2_config.nim#dep_roots_alias_symlink_cekConfig
-    EXPECTED_SKIP_TEST=""
+    #
+    # CR6/W5d (code-review ledger, 2026-09-21): four NEW per-test skips that
+    # are NOT symlink-gated (see the header comment above) and, unlike the
+    # symlink set immediately above, DO fire on this leg today:
+    #
+    #   - tests/integration/test_issue23_cc_identity.nim#posix_cc_half_content_fingerprint
+    #     (CR6) is `when defined(posix): ... else: skip()` -- windows is
+    #     never posix, so this ALWAYS fires here. Reaches this log only
+    #     because the wiring-audit W9i fix now appends that per-file step's
+    #     output into harness.log; before that fix this marker existed in
+    #     the test binary's own stdout but had no producer into the log the
+    #     gate reads at all.
+    #   - tests/unit/test_source_index.nim#mangling_escape_colon_hash_windows_excluded
+    #     is `when defined(windows): skip()` (unconditional on this leg) --
+    #     NTFS categorically forbids ':' in a filename, so this ALWAYS fires.
+    #   - tests/unit/test_paths.nim#classify_symlinked_deproot_realabs_windows_known_divergence
+    #     is likewise `when defined(windows): skip()` (a documented,
+    #     undiagnosed Windows-only divergence in `classify`'s realAbs match
+    #     -- see the test's own comment) -- ALWAYS fires here. Its sibling
+    #     per-test label (`..._no_symlink_privilege`, the nested
+    #     `if not symlinksAvailable(): skip()` in the file's `else` arm) is
+    #     deliberately NOT pinned: windows always takes the `when
+    #     defined(windows)` branch above it first, so that second skip()
+    #     site is unreachable code on this leg and can never emit its own
+    #     marker here.
+    #   - tests/unit/test_fold_probe_tiers.nim#t2_flipped_absent and
+    #     tests/unit/test_fold_probe_tiers.nim#t2_flipped_distinct both skip
+    #     `if volumeIsCaseInsensitive` -- windows-latest NTFS is
+    #     case-insensitive (same fact the A3b-ii/A4b steps above rely on),
+    #     so both ALWAYS fire here. test_fold_probe_tiers.nim's other six
+    #     skip() sites (same-file/hardlink fold, dangling-symlink
+    #     fall-through, root-unwritable, pre-placed-symlink-refused,
+    #     probe-basename-random-suffix) each depend on a capability
+    #     (hardlink creation, symlink creation, chmod actually restricting a
+    #     non-root user, a working RNG) that this leg genuinely HAS, so none
+    #     of those six are expected to skip here and none are pinned.
+    #   - tests/integration/test_issue16_headers.nim#gcc_clang_case_mismatch_producer
+    #     (CR2-followup) skips `if not gccCaseVolumeIsInsensitive()` -- NTFS
+    #     IS case-insensitive, so this does NOT skip on windows (it runs for
+    #     real, same as the file's other suites) and is deliberately NOT
+    #     pinned here.
+    #
+    # R8-L1 (round-8 review, 2026-09-25): test_r8_real_cl_refusal.nim's two
+    # labels (#real_cl_refused_under_cl_env, #real_cl_known_without_cl_env)
+    # are DELIBERATELY absent from this set. ci.yml's windows step imports
+    # vcvars64 so `cl` resolves, and the file's real body is MUST-EXECUTE
+    # below; either skip marker appearing on this leg is a failure here.
+    #
+    # R3-5 (code-review round 3, 2026-09-24): test_depgraph_guard.nim's
+    # "unreadable-but-present depgraph" case gates on
+    # `fileExists("/proc/self/mem")` and there is no procfs on windows, so it
+    # skips here every run. It was a BARE `skip()` — printing nothing, therefore
+    # invisible to this gate in BOTH directions — and it predates the
+    # workstream, so the W5 audit that added eight marker sites walked past it.
+    # Now marked and pinned on this leg and on macos (neither has /proc; the
+    # trigger is a platform fact, not a capability probe, so the pin cannot
+    # flap).
+    EXPECTED_SKIP_TEST="$(cat <<'EOF'
+tests/integration/test_issue23_cc_identity.nim#posix_cc_half_content_fingerprint
+tests/unit/test_source_index.nim#mangling_escape_colon_hash_windows_excluded
+tests/unit/test_paths.nim#classify_symlinked_deproot_realabs_windows_known_divergence
+tests/unit/test_fold_probe_tiers.nim#t2_flipped_absent
+tests/unit/test_fold_probe_tiers.nim#t2_flipped_distinct
+tests/unit/test_ccprobe.nim#cc_half_content_fingerprint_realenv
+tests/unit/test_ccprobe.nim#realrun_execv_no_shell_splitting
+tests/unit/test_ccprobe.nim#realrunin_subprocess_cwd
+tests/unit/test_ccprobe.nim#lastprobestderr_w9a_nonmerged
+tests/unit/test_depgraph_guard.nim#f4_unreadable_depgraph_needs_procfs
+EOF
+)"
     ;;
   macos)
     # macos-latest (Darwin) IS posix: every `when defined(posix)` gate takes
@@ -121,7 +213,15 @@ EOF
     # subreaper tier specifically (PR_SET_CHILD_SUBREAPER reparenting; Darwin
     # reparents orphans to launchd), so both are whole-file linux-gated and
     # correctly skip on this leg.
+    #
+    # W5b/W5c (code-review ledger, 2026-09-21): same reasoning as the
+    # windows leg's own W5b/W5c entry above -- test_memprobe.nim and
+    # test_rfc0007_b2_fd_leak.nim are both whole-file `when defined(linux):`
+    # gated (real /proc+cgroup parsing; pidfd/epoll fd-leak introspection),
+    # and macOS/Darwin is not Linux either, so both self-skip here too.
     EXPECTED_SKIP="$(cat <<'EOF'
+tests/unit/test_memprobe.nim
+tests/unit/test_rfc0007_b2_fd_leak.nim
 tests/unit/test_rfc0007_r2_cross_slot_escapee.nim
 tests/unit/test_rfc0007_r12_cgroup_killsnapshot.nim
 tests/unit/test_rfc0007_w4_cgroup_memory_peak.nim
@@ -129,9 +229,47 @@ tests/conformance/test_rfc0007_r3_library_embedding.nim
 EOF
 )"
     # macos-latest (APFS) HAS symlink-create privilege, so every
-    # symlinksAvailable()-gated test/block above runs its real body here —
-    # the expected CRISOL-SKIP-TEST set is empty, same shape as A5c below.
-    EXPECTED_SKIP_TEST=""
+    # symlinksAvailable()-gated test/block above (including the six NEW
+    # source_index.nim ones and test_paths.nim's
+    # ..._no_symlink_privilege arm added by the W5d fix) runs its real body
+    # here — same shape as A5c below.
+    #
+    # W5d (code-review ledger, 2026-09-21): test_fold_probe_tiers.nim's
+    # #t2_flipped_absent and #t2_flipped_distinct both skip `if
+    # volumeIsCaseInsensitive` -- macOS/APFS IS case-insensitive (the same
+    # fact the A3b-ii/A4b CRISOL_EXPECT_FOLD=fpAsciiLower env pins above rely
+    # on), so both fire here too, same as the windows leg. Its other six
+    # skip() sites each depend on a capability (hardlink creation, symlink
+    # creation, chmod genuinely restricting a non-root user, a working RNG)
+    # this leg genuinely has, so none of those six are pinned. Neither
+    # test_issue23_cc_identity.nim (windows-only per-file step; this file
+    # never runs on the macOS leg at all) nor
+    # test_issue16_headers.nim#gcc_clang_case_mismatch_producer (APFS is
+    # case-insensitive, so the CR2 suite's own premise holds and it runs for
+    # real here, its intended leg) belong in this set.
+    #
+    # R3-5 (code-review round 3, 2026-09-24): test_depgraph_guard.nim's
+    # /proc/self/mem case is pinned here for the same reason as on the windows
+    # leg -- Darwin has no procfs either, so it skips every run. See that leg's
+    # own R3-5 comment for how it went undetected (a bare `skip()` emits
+    # nothing, so this gate was blind to it in both directions).
+    #
+    # R8-L1 (round-8 review, 2026-09-25): tests/integration/
+    # test_r8_real_cl_refusal.nim drives R7-S1's real trigger (a real `cl`
+    # under CL=/W4) and needs `cl` on PATH. macOS has no MSVC, so both of its
+    # tests self-skip here EVERY run -- a platform fact, not a capability
+    # probe, so the pin cannot flap. ci.yml runs it as a per-file step on this
+    # leg precisely so this pin exists: a THIRD label appearing, or these two
+    # vanishing, is drift the gate reports. On windows the same labels are in
+    # NO pin and the real body is MUST-EXECUTE (below).
+    EXPECTED_SKIP_TEST="$(cat <<'EOF'
+tests/unit/test_fold_probe_tiers.nim#t2_flipped_absent
+tests/unit/test_fold_probe_tiers.nim#t2_flipped_distinct
+tests/unit/test_depgraph_guard.nim#f4_unreadable_depgraph_needs_procfs
+tests/integration/test_r8_real_cl_refusal.nim#real_cl_refused_under_cl_env
+tests/integration/test_r8_real_cl_refusal.nim#real_cl_known_without_cl_env
+EOF
+)"
     ;;
   *)
     echo "assert-subset-honesty.sh: unknown leg '$LEG' (expected windows|macos)" >&2
@@ -272,6 +410,52 @@ if [ "$LEG" = "windows" ]; then
     "test_windows_cli_smoke done" \
     "CLI-SMOKE-CASECHANGED REAL" \
     "CLI-SMOKE-CASECHANGED SKIPPED"
+fi
+
+# R8-L1 (round-8 review, 2026-09-25): R7-S1's real trigger, on a real `cl`.
+# WINDOWS-ONLY as a MUST-EXECUTE: the macos leg has no MSVC and its two
+# per-test skips are pinned above instead. "R8-REAL-CL REAL" is echoed only
+# when `cl` resolved on PATH, before either test runs; each test's own skip
+# marker is the skip pattern. The two [OK] lines are checked as well, because
+# the file's `done` marker prints after a FAILED test too -- the step's own
+# exit code carries that failure, but this audit should not be the one place
+# that would call a red body "executed".
+if [ "$LEG" = "windows" ]; then
+  check_must_execute \
+    "R8-L1 real cl refused under CL=/W4 (test_r8_real_cl_refusal.nim)" \
+    "test_r8_real_cl_refusal done" \
+    "R8-REAL-CL REAL" \
+    "CRISOL-SKIP-TEST: tests/integration/test_r8_real_cl_refusal.nim#"
+  for okLine in \
+      "[OK] CL=/W4: real cl exits non-zero and the compiler half is refused" \
+      "[OK] CONTROL CL unset: the same real cl identifies itself"; do
+    if ! grep -qF "$okLine" "$LOG"; then
+      echo "MUST-EXECUTE FAILED ($LEG): test_r8_real_cl_refusal.nim is missing '$okLine'" >&2
+      fail=1
+    fi
+  done
+fi
+
+# R8-L1 (round-8 review, 2026-09-25): toolrun's presence contract
+# (tests/integration/test_r7_probe_presence_contract.nim) -- "not on PATH ->
+# empty output, ran-and-failed -> non-empty output" -- which ccidentity's
+# R7-S1 refusal rests on. Its header claims it is pinned on every platform;
+# before ci.yml's per-file steps on both legs it ran only on Linux. BOTH legs:
+# it has no skip path, so all three [OK] lines must be present. A plain
+# unittest suite with no isMainModule marker, so the [OK] lines are the proof.
+presence_ok=1
+for okLine in \
+    "[OK] a command that is not on PATH: empty output, not ok" \
+    "[OK] a command that ran and exited non-zero: its output, not ok" \
+    "[OK] CONTROL a command that ran and exited 0: its output, ok"; do
+  if ! grep -qF "$okLine" "$LOG"; then
+    echo "MUST-EXECUTE FAILED ($LEG): test_r7_probe_presence_contract.nim is missing '$okLine'" >&2
+    presence_ok=0
+    fail=1
+  fi
+done
+if [ "$presence_ok" -eq 1 ]; then
+  echo "MUST-EXECUTE OK ($LEG): R7-S1 probe presence contract (test_r7_probe_presence_contract.nim) ran all three tests"
 fi
 
 # RFC-0009 wiring-audit F16: the real on-disk long-path E2E

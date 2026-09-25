@@ -10,12 +10,13 @@
 ## host — signatures get per-platform compiler checking; the conformance suite
 ## (A2a-ii) checks behaviour. (`include` would reduce the contract to doc comments.)
 ##
-## `process/windows.nim` (Stage D) does not exist yet — `when` is a
-## compile-time branch, so its unbuilt arm below is never parsed on this
-## host. `process/darwin.nim` was born in C1b: `macosx` now maps to it
+## `process/windows.nim` is the Stage D backend. `when` is a compile-time
+## branch, so each arm below is parsed only for its own `--os` target.
+## `process/darwin.nim` was born in C1b: `macosx` now maps to it
 ## directly, a pure shell over `process/posix` exactly like `process/linux.nim`
-## — every macOS mechanism (kqueue `next`, libproc forensics) lives in
-## `process/posixcore.nim`'s `when defined(macosx):` branches.
+## — every macOS mechanism lives in `when defined(macosx):` branches of the
+## shared modules (kqueue `next` in `process/posixcore.nim`, libproc
+## forensics in `process/procscan.nim`, the kqueue probe in `process/caps.nim`).
 
 when defined(windows):
   import crisol/process/windows as backend

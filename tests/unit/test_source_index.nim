@@ -124,7 +124,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), projTp("vendor/foo.nim", cfg.trackedRoots)])
 
   test "index exclusions: state dir, hidden dir, nimcache dir, and a nested symlinked dir are never candidates":
-    if not symlinksAvailable(): skip()
+    if not symlinksAvailable():
+      echo "CRISOL-SKIP-TEST: tests/unit/test_source_index.nim#index_exclusions_symlinked_dir"
+      skip()
     let root = freshRoot("excl")
     defer: removeDir(root)
     let outside = freshRoot("excl_outside")
@@ -177,7 +179,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## REALPATH, not the lexical (symlinked) root — yielding a `..`-laden,
     ## realpath-relative body (trigger B). A body with no `..`
     ## at all (the old pin) is a shape Nim never emits for a symlinked root.
-    if not symlinksAvailable(): skip()
+    if not symlinksAvailable():
+      echo "CRISOL-SKIP-TEST: tests/unit/test_source_index.nim#deproot_symlink_walked_lexical"
+      skip()
     let root = freshRoot("deproot_symlink")
     defer: removeDir(root)
     let outside = freshRoot("deproot_outside")
@@ -296,6 +300,7 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## filename, so no real Windows filesystem could ever present this
     ## vector; there is nothing to fix here, only to exclude.
     when defined(windows):
+      echo "CRISOL-SKIP-TEST: tests/unit/test_source_index.nim#mangling_escape_colon_hash_windows_excluded"
       skip()
     else:
       let root = freshRoot("hashcolonescapes")
@@ -402,7 +407,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## REALPATH-canonicalized source, so a realistic body here is realpath-
     ## relative; lookup must report the file's LEXICAL project path
     ## (lib/dep.nim), not the untracked outside real path.
-    if not symlinksAvailable(): skip()
+    if not symlinksAvailable():
+      echo "CRISOL-SKIP-TEST: tests/unit/test_source_index.nim#symlink_file_lexical_realpath_body"
+      skip()
     let root = freshRoot("symlinkfile")
     defer: removeDir(root)
     let outside = freshRoot("symlinkfile_outside")
@@ -463,12 +470,13 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## recovery path is never reached for this case. The member is still
     ## retained (no under-selection: the soundness property this test
     ## guards is unchanged) — only its SPELLING changes, from the old
-    ## project-relative-looking recovered string to the dep-tagged member's
-    ## corrected-D5 spelling, its ABSOLUTE native path (`toNative`) — see
-    ## `closureMemberSpelling`'s doc comment in closure.nim for why a
-    ## dep-root member must spell as absolute for `depgraph.recordClosure`'s
-    ## downstream `classify` round-trip to stay sound.
-    if not symlinksAvailable(): skip()
+    ## project-relative-looking recovered string to a dep-tagged
+    ## `TrackedPath` (whose wire spelling is `paths.keyBytes`'s portable
+    ## `dep:<name>/<rel>` — see `closureMemberSpelling`'s doc comment in
+    ## closure.nim, F13; the pre-F13 absolute `toNative` spelling is gone).
+    if not symlinksAvailable():
+      echo "CRISOL-SKIP-TEST: tests/unit/test_source_index.nim#at_m_realpath_symlinked_deproot_realabs"
+      skip()
     let root = freshRoot("s3_m_symlink")
     defer: removeDir(root)
     let outside = freshRoot("s3_m_symlink_outside")
@@ -518,8 +526,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     # volume-independent assertion: exactly 2 members (entrypoint + dep),
     # and the non-entrypoint member's WIRE spelling (project-relative
     # `display` when recovered project-tagged, absolute `toNative` when
-    # matched dep-tagged — the same branch closure.nim's own
-    # `closureMemberSpelling` takes) ends with "dep/src/dep.nim" either way.
+    # matched dep-tagged — a test-local projection; closure.nim's
+    # `closureMemberSpelling` no longer branches this way (F13: every member
+    # spells via `paths.keyBytes`)) ends with "dep/src/dep.nim" either way.
     let epTp = projTp("tests/t.nim", cfg.trackedRoots)
     check epTp in cl
     check cl.len == 2
@@ -611,7 +620,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## closure instead. The fix detects that `expandFilename(epDir) !=
     ## epDir` and resolves the body from the REAL epDir, recovering the file
     ## at its LEXICAL path via `byReal`.
-    if not symlinksAvailable(): skip()
+    if not symlinksAvailable():
+      echo "CRISOL-SKIP-TEST: tests/unit/test_source_index.nim#at_m_symlinked_entrypoint_dir_byreal"
+      skip()
     let root = freshRoot("f2_symlinked_epdir")
     defer: removeDir(root)
     let stDir = freshRoot("f2_symlinked_epdir_st")
@@ -660,7 +671,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## @m body of plain "helper.nim" — the real dependency is
     ## `other/helper.nim`. `closureContentHash` then raises on the missing
     ## file on every subsequent run, permanently invalidating the entry.
-    if not symlinksAvailable(): skip()
+    if not symlinksAvailable():
+      echo "CRISOL-SKIP-TEST: tests/unit/test_source_index.nim#at_m_symlinked_entrypoint_file_realdir"
+      skip()
     let root = freshRoot("symlinked_ep_file")
     defer: removeDir(root)
     createDir(root / "tests")
@@ -696,7 +709,9 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     ## itself instead: it lies OUTSIDE `root` (a sibling temp dir), so
     ## `extractClosure`'s ordinary under-tracked-root filter correctly drops
     ## it, exactly like any other untracked out-of-root import.
-    if not symlinksAvailable(): skip()
+    if not symlinksAvailable():
+      echo "CRISOL-SKIP-TEST: tests/unit/test_source_index.nim#case2_miss_keeps_realcandidate"
+      skip()
     let root = freshRoot("case2_miss")
     defer: removeDir(root)
     let st = freshRoot("case2_miss_st")

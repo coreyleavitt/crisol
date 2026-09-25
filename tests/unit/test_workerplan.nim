@@ -35,6 +35,9 @@ proc samplePlan(): MeasurePlan =
     configHash:        "deadbeefcafef00d",
     stateDir:          "/workspace/.crisol",
     projectRoot:       "/workspace",
+    # W9l / L1: a distinctive non-empty value, so the round-trip below fails
+    # if toJson or parseMeasurePlan drops the field (both would yield "").
+    toolchainFp:       "0123456789abcdef",
   )
 
 # ===========================================================================
@@ -59,6 +62,12 @@ suite "MeasurePlan — toJson / parseMeasurePlan round-trip":
     check parsed.configHash        == plan.configHash
     check parsed.stateDir          == plan.stateDir
     check parsed.projectRoot       == plan.projectRoot
+    # L1: the plan file is the ONLY channel the toolchain fingerprint takes
+    # from the host process into the measure-worker (which deliberately never
+    # re-probes it) -- a dropped key here orphans every row the worker writes
+    # from the toolchain it was measured under.
+    check parsed.toolchainFp       == plan.toolchainFp
+    check parsed.toolchainFp.len   > 0
 
   test "an empty flags array round-trips as an empty seq (not a parse failure)":
     var plan = samplePlan()
@@ -70,7 +79,7 @@ suite "MeasurePlan — toJson / parseMeasurePlan round-trip":
     let parsed = parseMeasurePlan(path)
     check parsed.flags.len == 0
 
-  test "groupId/configHash default to empty string when absent from the JSON":
+  test "groupId/configHash/toolchainFp default to empty string when absent from the JSON":
     let path = tmpPlanPath()
     var n = newJObject()
     n["entrypointPath"]    = newJString("tests/fixtures/pass_always.nim")
@@ -85,6 +94,7 @@ suite "MeasurePlan — toJson / parseMeasurePlan round-trip":
     let parsed = parseMeasurePlan(path)
     check parsed.groupId == ""
     check parsed.configHash == ""
+    check parsed.toolchainFp == ""   # W9l: a pre-W9l plan parses, never raises
     check parsed.flags.len == 0
 
 # ===========================================================================

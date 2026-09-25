@@ -11,7 +11,7 @@
 ## root — no real directory, no real Win32 call). That proves the STRING
 ## TRANSFORM is correct; it proves nothing about whether the real
 ## `CreateFileW`/`GetFileAttributesExW` calls behind `fileExists`/`readFile`
-## — what `planner.decideCompile` (steps 5/6) and `depgraph.isEntryStale`
+## — what `planner.decideCompile` (steps 4/5) and `depgraph.isEntryStale`
 ## actually call on every one of `toNative`'s outputs — accept that prefix
 ## at the OS boundary for a path that genuinely exceeds MAX_PATH on a real
 ## volume, through a real compile and a real dep-graph persist/reload
@@ -120,7 +120,7 @@
 ##     entry, and `saveDepGraph` writes it to `.crisol/depgraph`.
 ##
 ##   RUN 2 (`crisol run --json` again, NOTHING changed): `decideCompile`
-##     (planner.nim, steps 5/6) calls `fileExists(toNative(deepTp))` and
+##     (planner.nim, steps 4/5) calls `fileExists(toNative(deepTp))` and
 ##     `closureContentHash` (which `readFile`s via that SAME `toNative`
 ##     output) for `deep_leaf.nim` and must get the SAME answer as at
 ##     record time — POSITIVE proof that `toNative`'s `\\?\` prefix
@@ -525,7 +525,7 @@ when defined(windows):
         echo "W2-LONGPATH: persisted depgraph carries the deep closure member = ", sawDeepMember
         check sawDeepMember
 
-        # RUN 2: nothing changed. decideCompile (planner.nim, steps 5/6) must
+        # RUN 2: nothing changed. decideCompile (planner.nim, steps 4/5) must
         # fileExists+readFile deep_leaf.nim through toNative's REAL \\?\
         # prefix and get the SAME answer as at record time — POSITIVE proof.
         let (code2, doc2) = runCrisol(crisolBin, repo, @["run", "--jobs", "1", "--json"], "RUN2")

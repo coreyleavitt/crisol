@@ -62,9 +62,21 @@ proc uniqueTmpDir(tag: string): string =
 suite "rfc-0007 A5 — rusage reaches the crisol/run/v2 wire":
 
   test "pass_always: run.rusage is non-null with a plausible nonzero maxRssBytes":
-    let fd = fixtureDir()
+    # R7-L3: run from a unique temp project root, exactly like Suite 2 below.
+    # Run from the repo root this took `<repo>/.crisol/lock`, so any other
+    # crisol run holding that lock (a parallel local sweep) turned this test
+    # into a spurious exit 3 ("another crisol run is in progress") with empty
+    # stdout -- a failure about the host, not about rusage.
+    let root = uniqueTmpDir("rusage")
+    defer: removeDir(root)
+    writeFD(root, "pass_always.nim", readFile(fixtureDir() / "pass_always.nim"))
+
+    let oldCwd = getCurrentDir()
+    setCurrentDir(root)
+    defer: setCurrentDir(oldCwd)
+
     var code = 0
-    let output = captureStdout(proc() = code = runMain(@["run", fd / "pass_always.nim",
+    let output = captureStdout(proc() = code = runMain(@["run", "pass_always.nim",
                                          "--jobs", "1", "--json", "--no-cache"]))
     check code == 0
     let ep = firstEntrypoint(output)

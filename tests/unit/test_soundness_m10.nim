@@ -385,8 +385,9 @@ block test_m10_depRoot_via_symlink_absolute_path_dropped_on_load:
   var cfg = makeTmpConfig(root)
   cfg.depRoots = @[depRootLink]
   # RFC-0009 A3c-ii: the closure-path M10 filter runs via `fromKeyBytes`
-  # (W1) against `cfg.trackedRoots` (NOT `cfg.depRoots`, which only the
-  # externals filter still consults) -- register the same dep root there
+  # (W1) against `cfg.trackedRoots` (NOT `cfg.depRoots`, which the depgraph
+  # load path no longer reads at all -- only `closure.buildSourceIndex` walks
+  # it) -- register the same dep root there
   # too, or this dep root would be invisible to the closure guard.
   cfg.trackedRoots = initTrackedRoots(root, @[("x", depRootLink)], ".crisol")
   # loadDepGraph reads the depgraph file directly (not via a separate config

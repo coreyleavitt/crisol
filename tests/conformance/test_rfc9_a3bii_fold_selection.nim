@@ -297,7 +297,7 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   check not isEntryStale(graph, depKey, cfg.projectRoot, cfg.trackedRoots)  # confirms Rule 4 cannot be why it's selected
 
   # --- Selection, via the REAL shared plan phase (buildRunPlan) ---
-  let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault),
+  let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault), ccVersion = "",
                         useChanged = true, changed = changed,
                         nimVersion = nimVersion)
   let selectedPaths = pv.plan.entrypoints.mapIt(string(it.ep.tp.display()))

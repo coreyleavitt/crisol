@@ -31,6 +31,7 @@ import crisol/jsonout
 import crisol/process/types as ptypes
 import "../support/testep"
 import ../support/capture
+import ../support/statedir
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -63,6 +64,18 @@ proc fixtureDir(): string =
 # ---------------------------------------------------------------------------
 
 suite "crisol CLI — A5 wiring":
+
+  # R8-D3: `run` with no --config roots at the repo, so its state (bin/,
+  # cache/, depgraph, lastrun.json) and its lock would be <repo>/.crisol --
+  # shared with any concurrent crisol run in the same tree, which then races
+  # this suite's compiles or turns it into exit 3 ("another crisol run is in
+  # progress"). CRISOL_STATE_DIR moves all of it to a per-test temp dir.
+  setup:
+    let isoState = freshStateDir("clirun")
+    let savedStateEnv = redirectStateDir(isoState)
+  teardown:
+    restoreStateDir(savedStateEnv)
+    removeDir(isoState)
 
   # -------------------------------------------------------------------------
   # Test 1: passing fixture → exit 0
@@ -256,25 +269,27 @@ proc makeCfg(projectRoot, stateDir: string): Config =
 
 suite "crisol CLI — B7 --failed":
 
+  # R8-D3: `run` with no --config roots at the repo, so its state (bin/,
+  # cache/, depgraph, lastrun.json) and its lock would be <repo>/.crisol --
+  # shared with any concurrent crisol run in the same tree, which then races
+  # this suite's compiles or turns it into exit 3 ("another crisol run is in
+  # progress"). CRISOL_STATE_DIR moves all of it to a per-test temp dir.
+  setup:
+    let isoState = freshStateDir("clirunb7")
+    let savedStateEnv = redirectStateDir(isoState)
+  teardown:
+    restoreStateDir(savedStateEnv)
+    removeDir(isoState)
+
   # -------------------------------------------------------------------------
   # Absent lastrun.json → exit 3
   # -------------------------------------------------------------------------
 
   test "--failed with absent lastrun.json → exit 3":
-    ## loadConfig() roots at getCurrentDir(), so we must ensure that
-    ## .crisol/lastrun.json does NOT exist in the cwd during this test.
-    ## We move it aside temporarily if it exists, then restore it.
-    let realRoot   = getCurrentDir()
-    let stateDir   = realRoot / ".crisol"
-    let lrPath     = stateDir / "lastrun.json"
-    let backupPath = stateDir / "lastrun.json.b7bak"
-
-    let hadFile = fileExists(lrPath)
-    if hadFile:
-      moveFile(lrPath, backupPath)
-    defer:
-      if hadFile: moveFile(backupPath, lrPath)
-      else: (try: removeFile(lrPath) except: discard)
+    ## The suite's `setup` points the run's state dir at a fresh, empty temp
+    ## dir (R8-D3), so there is no lastrun.json -- no need to move the repo's
+    ## own aside (which raced any concurrent run in the tree).
+    check not fileExists(isoState / "lastrun.json")
 
     let fd   = fixtureDir()
     let code = runMain(@["run", "--failed", fd / "pass_always.nim", "--jobs", "1"])
@@ -289,25 +304,14 @@ suite "crisol CLI — B7 --failed":
     ## passed.  With --dry-run + --failed, only fail_always should appear
     ## in the plan (without actually running anything).
     ##
-    ## We use a temp project root and copy the fixture files there so we can
-    ## control the state directory independently.  However, loadConfig() roots
-    ## at getCurrentDir(); to avoid that ambiguity we test through the
-    ## loadLastRun+buildPlanView path directly — but since we want to test
-    ## the runMain surface, we seed via persistLastRun and use the dry-run
-    ## stdout output to verify narrowing.
-    ##
-    ## Strategy: write a lastrun.json directly (v1 JSON string) into a temp
-    ## stateDir, then call runMain with --dry-run --failed pointing at
-    ## the fixture dir.  The loadConfig() will still root at cwd, so we must
-    ## use the current project root's .crisol/ dir.
-    ##
-    ## To keep this non-fragile we write the lastrun.json into the REAL
-    ## .crisol/ dir (current project root), then restore it afterward.
+    ## Strategy: seed lastrun.json via persistLastRun into the suite's
+    ## isolated state dir (`isoState`, which CRISOL_STATE_DIR points the
+    ## runMain call at too -- R8-D3), then call runMain with --dry-run
+    ## --failed pointing at the fixture dir. The Config still roots at the
+    ## real project root so the seeded paths are root-relative.
 
     let fd       = fixtureDir()
     let realRoot = fd.parentDir.parentDir  # tests/.. → project root
-    let stateDir = realRoot / ".crisol"
-    let lrPath   = stateDir / "lastrun.json"
 
     # Compute root-relative paths for the two fixtures.
     let failRelPath = relativePath(fd / "fail_always.nim", realRoot)
@@ -323,18 +327,10 @@ suite "crisol CLI — B7 --failed":
         compile: okPhase(), run: okPhase()),
     ]
     let summary = Summary(total: 2, passed: 1, failed: 1)
-    let cfg = makeCfg(realRoot, ".crisol")
-
-    # Save old lastrun.json if present, restore on exit.
-    var oldContent: string = ""
-    let hadOld = fileExists(lrPath)
-    if hadOld:
-      oldContent = readFile(lrPath)
+    let cfg = makeCfg(realRoot, isoState)
 
     persistLastRun(RunDocument(results: results, summary: summary), cfg)
-    defer:
-      if hadOld: writeFile(lrPath, oldContent)
-      else: (try: removeFile(lrPath) except: discard)
+    require fileExists(isoState / "lastrun.json")
 
     # --dry-run + --failed: capture stdout, check only fail_always in plan.
     let outPath = getTempDir() / "crisol_b7_dryrun.txt"
@@ -364,7 +360,6 @@ suite "crisol CLI — B7 --failed":
 
     let fd       = fixtureDir()
     let realRoot = fd.parentDir.parentDir
-    let lrPath   = realRoot / ".crisol" / "lastrun.json"
 
     # Seed: a non-existent entrypoint as failed.
     let results = @[
@@ -373,15 +368,9 @@ suite "crisol CLI — B7 --failed":
         compile: okPhase(), run: okPhase(1)),
     ]
     let summary = Summary(total: 1, passed: 0, failed: 1)
-    let cfg = makeCfg(realRoot, ".crisol")
-
-    var oldContent = ""
-    let hadOld = fileExists(lrPath)
-    if hadOld: oldContent = readFile(lrPath)
+    let cfg = makeCfg(realRoot, isoState)
     persistLastRun(RunDocument(results: results, summary: summary), cfg)
-    defer:
-      if hadOld: writeFile(lrPath, oldContent)
-      else: (try: removeFile(lrPath) except: discard)
+    require fileExists(isoState / "lastrun.json")
 
     # We must pass at least one path arg so discovery only scans that area.
     # Pass a path that exists but doesn't contain the seeded (nonexistent) path.

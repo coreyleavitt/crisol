@@ -84,7 +84,8 @@ import crisol/cachetelemetry
 import crisol/cachetrust
 import crisol/paths
 # RFC-0009 A5c: `rootInsideStateDir`'s fold-routing fix. `paths` imports only
-# `std/*` (no `crisol/*`), so this cannot introduce an import cycle.
+# `std/*` plus `crisol/ioutils` (itself `std/*`-only), so this cannot
+# introduce an import cycle.
 
 export cachetelemetry
 # RFC-0005 C5a: re-exports `cachetrust`'s public surface -- notably its
@@ -429,9 +430,10 @@ proc rootInsideStateDir(root, stateDir: string;
                          probe: FoldProbe = probeFoldPolicy): bool =
   ## `root` (a configured `file://` remote's directory) resolves equal to,
   ## or nested under, `stateDir` — RFC-0005 "Local-fs root": such a tier
-  ## would recurse the L1 cache (`clean.nim`'s `pruneDir` walks the whole
-  ## `stateDir`, not just `stateDir/cache`, so ANY location inside it is
-  ## fair game for pruning).
+  ## would recurse the L1 cache (`clean.nim` deletes under the whole
+  ## `stateDir`, not just `stateDir/cache` -- `pruneDir` also prunes
+  ## `stateDir/bin`, and `cleanAll` removes `stateDir` outright -- so ANY
+  ## location inside it is fair game for deletion).
   ##
   ## RFC-0009 A5c: BOTH sides are folded under a probed `FoldPolicy`
   ## (`paths.fold` — the SAME helper `TrackedPath`'s own `==`/`hash` use)

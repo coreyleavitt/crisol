@@ -473,6 +473,16 @@ suite "depgraph load provenance: discarded persisted graph":
     defer: removeDir(root)
     let path = root / ".crisol" / "depgraph"
     if not fileExists("/proc/self/mem"):
+      # R3-5 (round-3 review): this used to be a BARE `skip()`. `tests/unit/` is
+      # swept on the windows and macOS legs too (CRISOL_TEST_DIRS =
+      # tests/unit:tests/conformance), and neither has /proc, so this test
+      # skipped on BOTH of them — and because a bare `skip()` prints nothing,
+      # ci/assert-subset-honesty.sh could not see it in either direction. That
+      # is precisely the darkness the marker regime exists to prevent (the
+      # W5/CR6 class), and the audit that added eight marker sites missed it.
+      # Pinned in the windows AND macos EXPECTED_SKIP_TEST sets: the trigger is
+      # deterministic (there is no /proc on either), unlike a capability probe.
+      echo "CRISOL-SKIP-TEST: tests/unit/test_depgraph_guard.nim#f4_unreadable_depgraph_needs_procfs"
       skip()
     else:
       createSymlink("/proc/self/mem", path)

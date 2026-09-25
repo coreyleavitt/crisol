@@ -21,6 +21,15 @@
 ##       away — `core.autocrlf` emits one warning line PER FILE, so a few
 ##       thousand files is far past the pipe buffer. A caller that does not
 ##       drain stderr concurrently with stdout wedges here.
+##   CRISOL_FAKE_GIT_HANG_SUBCOMMAND
+##       when set to a subcommand name (e.g. "rev-parse"), that subcommand
+##       hangs forever — writes NOTHING, on either stream, and never exits —
+##       instead of answering. Models CR4: "a `git` blocked on an SSH/
+##       credential prompt" is indistinguishable, from `gitdiff`'s side, from
+##       a `git` that simply never writes anything and never returns. Checked
+##       before any output is produced, so this exercises the case where
+##       NEITHER pipe ever has data — the `poll(-1)` / unbounded-spin path
+##       `drainBoth` itself blocks in, not merely a slow finish.
 ##
 ## Sizing: see `two_burst_output.nim`'s header — the whole list must stay under
 ## the ~4 KB pipe buffer or a truncating caller wedges instead of failing. 100
@@ -45,6 +54,9 @@ proc envInt(name: string; fallback: int): int =
 
 when isMainModule:
   let sub = if paramCount() >= 1: paramStr(1) else: ""
+  if getEnv("CRISOL_FAKE_GIT_HANG_SUBCOMMAND", "") == sub and sub.len > 0:
+    while true:
+      sleep(1000)
   case sub
   of "rev-parse":
     # `rev-parse --is-inside-work-tree` — changedFiles' "is this a work tree?"

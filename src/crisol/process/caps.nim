@@ -34,8 +34,12 @@
 
 import std/[options, os, posix, strutils]
 import crisol/process/types
-import crisol/process/cgroup
 import crisol/ioutils
+when defined(linux):
+  # R5-2: cgroup v2 does not exist on Darwin; every symbol this module takes
+  # from `process/cgroup` is named inside a `when defined(linux):` block
+  # (`probeCgroupV2`), so the import carries the same guard as its uses.
+  import crisol/process/cgroup
 
 when defined(linux):
   # rfc-0007 B1/B2 (§1/§3): pidfd_open/pidfd_send_signal — no Nim wrapper
@@ -233,7 +237,7 @@ proc probeWait4Rusage*(): bool =
 
 proc probeCapabilities*(): Capabilities =
   ## The raw, seam-free probe — real I/O, freely callable (mirrors
-  ## `ccprobe.ccVersion` / `nimprobe.nimFingerprint`: the pure-ish real
+  ## `ccidentity.ccVersion` / `nimprobe.nimFingerprint`: the pure-ish real
   ## probe stays exported and un-memoised; `cachedCapabilities` below is
   ## the memoised wrapper every production call site actually uses).
   let cg = probeCgroupV2()

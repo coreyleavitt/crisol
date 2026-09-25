@@ -20,6 +20,12 @@ import std/[os, sets, unittest]
 import crisol/types
 import crisol/runner
 import crisol/depgraph
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race.
+let testStateDir = processStateDir("b4")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,6 +44,7 @@ proc makeCfg(q: HashSet[string] = initHashSet[string]()): Config =
     timeoutSecs:        30,
     maxOutputBytes:     65_536,
     projectRoot:        getCurrentDir(),
+    stateDir:           testStateDir,
     quarantine:         q,
     trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
   )

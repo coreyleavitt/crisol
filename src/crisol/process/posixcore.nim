@@ -36,8 +36,14 @@
 import std/[options, os, posix, sets, tables, monotimes, times]
 import crisol/process/types
 import crisol/process/procscan
-import crisol/process/cgroup
 import crisol/process/caps
+when defined(linux):
+  # R5-2: same guard as every use. Each `cgroup.*` call site below (spawn's
+  # leaf creation, forceKillCore's `cgroup.kill`, reapCore's survivor/oom/peak
+  # reads, the bounded leaf removal) and the re-export block at the bottom of
+  # this file already sits inside `when defined(linux):`, so on a non-Linux
+  # target this import is genuinely unused.
+  import crisol/process/cgroup
 
 # ---------------------------------------------------------------------------
 # rlimit constants missing from std/posix (same set spawn.nim importc's).
@@ -263,9 +269,10 @@ when defined(macosx):
   # rfc-0007 C1b (§1): the macOS backend's own mechanism — kqueue
   # EVFILT_PROC event-driven `next` (this file's peer of Linux's
   # pidfd+epoll above). `process/darwin.nim` is a pure shell (mirrors
-  # `process/linux.nim` exactly) — every macOS-specific mechanism lives
-  # HERE, beside the `when defined(linux):` blocks above, per this file's
-  # module-layout comment; `process/caps.nim`'s `probeKqueue` imports this
+  # `process/linux.nim` exactly) — the macOS event-loop mechanism lives
+  # HERE, beside the `when defined(linux):` blocks above (the libproc
+  # process-table walk lives in `process/procscan.nim`, per this file's
+  # module-layout comment); `process/caps.nim`'s `probeKqueue` imports this
   # same stdlib module independently for its own self-contained probe.
   #
   # `posix/kqueue` (stdlib, same "lives under lib/posix/, not std/" shape

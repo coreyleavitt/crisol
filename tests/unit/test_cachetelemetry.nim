@@ -58,11 +58,13 @@ suite "aggregateCacheStats — decision-sourced counts":
     let decisions: seq[DecisionTier] = @[
       (cdmHit, "l1"), (cdmStored, ""), (cdmKeyMiss, ""), (cdmHermeticityDeg, ""),
       (cdmFlaky, ""), (cdmClosureUnrecorded, ""), (cdmRecomputeMiss, ""),
+      (cdmToolchainUnidentified, ""),  # W4 full fix: consulted, refused to store
     ]
     let s = aggregateCacheStats(@[], decisions)
     check s.total == decisions.len
     check s.notConsulted == 0
     check s.l1Hits == 1   # only cdmHit
+    check s.misses == decisions.len - 1   # everything but the one cdmHit
 
   test "every notConsulted decision variant is excluded from total":
     let decisions: seq[DecisionTier] =

@@ -69,6 +69,45 @@ proc findSegment(node: JsonNode; groupId, configHash: string): JsonNode =
       return seg
   result = nil
 
+proc mkArtifactRowTc(identity: string; groupId, configHash, basename, keyHash: string;
+                     sizeBytes, ccTimeUs: int64; toolchainFp: string): ArtifactRow =
+  ## Like mkArtifactRow, but with an explicit toolchainFp -- W9l.
+  ArtifactRow(
+    rowVersion:         1,
+    entrypointIdentity: IdentityKey(identity),
+    groupId:            groupId,
+    configHash:         configHash,
+    artifactBasename:   basename,
+    keyHash:            keyHash,
+    sizeBytes:          sizeBytes,
+    ccTimeUs:           ccTimeUs,
+    toolchainFp:        toolchainFp,
+    timestamp:          1000,
+  )
+
+proc mkCostRowAtTc(identity: string; groupId, configHash: string;
+                   codegenUs, ccUs, linkUs, timestamp: int64;
+                   toolchainFp: string): CompileCostRow =
+  ## Like mkCostRowAt, but with an explicit toolchainFp -- W9l.
+  CompileCostRow(
+    rowVersion:         1,
+    entrypointIdentity: IdentityKey(identity),
+    groupId:            groupId,
+    configHash:         configHash,
+    codegenUs:          codegenUs,
+    ccUs:               ccUs,
+    linkUs:             linkUs,
+    toolchainFp:        toolchainFp,
+    timestamp:          timestamp,
+  )
+
+proc findSegmentTc(node: JsonNode; groupId, configHash, toolchainFp: string): JsonNode =
+  for seg in node["segments"]:
+    if seg["groupId"].getStr == groupId and seg["configHash"].getStr == configHash and
+       seg["toolchainFp"].getStr == toolchainFp:
+      return seg
+  result = nil
+
 # ---------------------------------------------------------------------------
 # 1. Two segments: rTime/rSize, ccPct/codegenPct/linkPct, counts, ordering
 # ---------------------------------------------------------------------------
@@ -625,6 +664,92 @@ suite "readCompileBlock — R14-T5: adversarial on-disk state across both teleme
                        $getCurrentProcessId()
     removeDir(neverCreated)
     check readCompileBlock(neverCreated, currentRunStartUs = 2000) == nil
+
+# ---------------------------------------------------------------------------
+# 14. W9l — toolchain identity partitions the aggregate (RED-first: before
+#     this fix, `SegmentKey` was (groupId, configHash) ONLY, so two rows
+#     recorded under different toolchains but the SAME (groupId, configHash)
+#     landed in ONE segment and produced ONE blended rTime -- a number that
+#     represents neither toolchain honestly and can't tell a real code
+#     regression from "the compiler changed". These tests fail against the
+#     pre-fix 2-tuple SegmentKey: same (groupId, configHash) rows from two
+#     `toolchainFp`s would collapse into a single segment (`segments.len == 1`
+#     below would be 1, not 2) with a blended rTime of 200/300 ≈ 0.667 instead
+#     of two segments reading exactly 1.0 and 0.0.
+# ---------------------------------------------------------------------------
+
+suite "buildCompileBlock — W9l: toolchainFp partitions rTime/rSize aggregation":
+
+  test "same (groupId, configHash), two toolchains: rows partition into TWO segments, each with its own correct rTime -- never pooled into one blended ratio":
+    let artifactRows = @[
+      # toolchain "tc1": ep_a/ep_b fully share one unit -> rTime should read 1.0.
+      mkArtifactRowTc("ep_a", "g1", "c1", "u.c", "K_SHARED", 100, 100, "tc1"),
+      mkArtifactRowTc("ep_b", "g1", "c1", "u.c", "K_SHARED", 100, 100, "tc1"),
+      # toolchain "tc2": a single entrypoint, inherently unshared -> rTime
+      # should read 0.0. If pooled with tc1's rows (pre-fix: same
+      # (groupId, configHash), toolchain-blind segmentation), the combined
+      # segment would compute sharedCc=200/totalCc=300 ~= 0.667 -- a number
+      # that is neither tc1's true 1.0 nor tc2's true 0.0, and indistinguishable
+      # from a genuine partial-sharing scenario.
+      mkArtifactRowTc("ep_c", "g1", "c1", "u.c", "K_TC2_ONLY", 100, 100, "tc2"),
+    ]
+    let node = buildCompileBlock(artifactRows, @[])
+    check node != nil
+    # Partition, not pooling: two segments, not one.
+    check node["segments"].len == 2
+
+    let segTc1 = findSegmentTc(node, "g1", "c1", "tc1")
+    let segTc2 = findSegmentTc(node, "g1", "c1", "tc2")
+    check segTc1 != nil
+    check segTc2 != nil
+    check abs(segTc1["rTime"].getFloat - 1.0) < 1e-9
+    check abs(segTc2["rTime"].getFloat - 0.0) < 1e-9
+    check segTc1["artifactsTotal"].getInt == 2
+    check segTc2["artifactsTotal"].getInt == 1
+
+  test "a pre-W9l row (toolchainFp defaults to \"\") forms its own segment rather than crashing or guessing":
+    let artifactRows = @[
+      mkArtifactRow("ep_a", "g1", "c1", "u.c", "K1", 100, 100),  # no toolchainFp -> ""
+    ]
+    let node = buildCompileBlock(artifactRows, @[])
+    let seg = findSegmentTc(node, "g1", "c1", "")
+    check seg != nil
+    check seg["toolchainFp"].getStr == ""
+
+suite "computeCompileRegressions — W9l: a toolchain upgrade never pools into an entrypoint's baseline":
+
+  const CurrentRunStartUs = 10_000_000'i64
+
+  test "10 fast prior rows under toolchain tc_old, then a slower CURRENT row under tc_new -- NOT flagged: tc_old history never enters tc_new's baseline, so tc_new starts under the sample floor":
+    var rows: seq[CompileCostRow]
+    for i in 0 ..< 10:
+      rows.add mkCostRowAtTc("ep_x", "g1", "c1", 100_000, 0, 0,
+                             CurrentRunStartUs - 1000 - int64(i), "tc_old")
+    # Current run: same entrypoint, NEW toolchain, genuinely slower (e.g. a
+    # stricter/slower codegen pass in the new compiler) -- pre-fix, this
+    # would have been compared against tc_old's fast 100_000us history and
+    # flagged as a false regression. Post-fix: tc_old rows are excluded from
+    # tc_new's baseline, leaving 0 prior tc_new rows (< sampleFloor), so the
+    # guard correctly declines to judge it yet.
+    rows.add mkCostRowAtTc("ep_x", "g1", "c1", 500_000, 0, 0,
+                           CurrentRunStartUs, "tc_new")
+
+    let node = computeCompileRegressions(rows, CurrentRunStartUs)
+    check node.kind == JArray
+    check node.len == 0
+
+  test "history rows under the SAME toolchain as the current row still count normally (partition doesn't just blindly zero out all history)":
+    var rows: seq[CompileCostRow]
+    for i in 0 ..< 10:
+      rows.add mkCostRowAtTc("ep_y", "g1", "c1", 100_000, 0, 0,
+                             CurrentRunStartUs - 1000 - int64(i), "tc_new")
+    rows.add mkCostRowAtTc("ep_y", "g1", "c1", 500_000, 0, 0,
+                           CurrentRunStartUs, "tc_new")
+
+    let node = computeCompileRegressions(rows, CurrentRunStartUs)
+    check node.len == 1
+    check node[0]["entrypointIdentity"].getStr == "ep_y"
+    check node[0]["baselineUs"].getBiggestInt == 100_000
 
 when isMainModule:
   echo "All compilereport tests passed."

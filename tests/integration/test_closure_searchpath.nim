@@ -21,9 +21,21 @@
 
 import std/[os, sets, tables, times, unittest, json, strutils]
 import crisol/[types, runner, depgraph, narrow, planner]
+import crisol/closure
 import "../support/rfc9_narrow_support"
 import "../support/testep"
 import ../support/symlinkprobe
+
+proc hasDepNimCObjectSuffix(base: string): bool =
+  ## True iff `base` is a nimcache `link` entry basename for the
+  ## `dep.nim.c` compile unit, regardless of which toolchain produced the
+  ## nimcache (`closure.ObjectExtensions`: `.o` under gcc/mingw, `.obj`
+  ## under cl/vccexe -- issue #21 slice 1a). The object extension belongs
+  ## to the toolchain, not to this host, so both spellings are accepted
+  ## unconditionally rather than hardcoding `.o`.
+  for ext in closure.ObjectExtensions:
+    if base.endsWith("dep.nim.c" & ext): return true
+  false
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_searchpath_" & tag & "_" &
@@ -33,8 +45,10 @@ proc makeTempRoot(tag: string): string =
 
 proc makeCfg(root: string): Config =
   ## RFC-0009 A3c-ii: `trackedRoots` must be REAL (matching `root`), not the
-  ## zero-value/vacuous root -- `recordClosure` (depgraph.nim) now converts
-  ## each closure member to `TrackedPath` via `classify(member,
+  ## zero-value/vacuous root -- closure members reach `recordClosure`
+  ## (depgraph.nim) already classified against `config.trackedRoots`
+  ## (closure.nim's `extractCompileInputs` -> `index.tracked`/`classify`),
+  ## and are hashed via `closureHashInputs(inputs.files,
   ## config.trackedRoots)`, and several tests below separately build a
   ## `TrackedRoots` (e.g. for `selectByDiff`) that must fold-agree with this
   ## one (`TrackedPath.==` asserts on a same-rootTag/different-fold
@@ -283,7 +297,7 @@ doAssert depValue() == 7
       var mangledSeen = ""
       for node in manifest{"link"}:
         let base = node.getStr("").extractFilename
-        if base.startsWith("@m") and base.endsWith("dep.nim.c.o"):
+        if base.startsWith("@m") and hasDepNimCObjectSuffix(base):
           sawMangledDep = true
           mangledSeen = base
       echo "trigger C observed mangled dep entry: ", mangledSeen
@@ -585,9 +599,10 @@ doAssert depValue() == 7
       var mangledSeen = ""
       for node in manifest{"link"}:
         let base = node.getStr("").extractFilename
-        if base.endsWith("dep.nim.c.o") and not base.contains("test_uses_dep"):
+        if hasDepNimCObjectSuffix(base) and not base.contains("test_uses_dep"):
           mangledSeen = base
       echo "dotdir-deep observed mangled dep entry: ", mangledSeen
+      check mangledSeen.len > 0
 
     let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")
@@ -642,9 +657,10 @@ doAssert depValue() == 7
       var mangledSeen = ""
       for node in manifest{"link"}:
         let base = node.getStr("").extractFilename
-        if base.endsWith("dep.nim.c.o") and not base.contains("test_uses_dep"):
+        if hasDepNimCObjectSuffix(base) and not base.contains("test_uses_dep"):
           mangledSeen = base
       echo "dotdir-shallow observed mangled dep entry: ", mangledSeen
+      check mangledSeen.len > 0
 
     let key = (string(ep.tp.display()), flagHash(ep.flags))
     let loaded = loadDepGraph(cfg, "")

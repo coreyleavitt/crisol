@@ -522,4 +522,8 @@ when defined(linux):
     echo "All memprobe tests passed."
 else:
   when isMainModule:
+    # RFC-0009 S5 wiring-audit convention: a whole-file self-skip must emit
+    # the CRISOL-SKIP marker -- see ci/assert-subset-honesty.sh's
+    # EXPECTED_SKIP manifest.
+    echo "CRISOL-SKIP: tests/unit/test_memprobe.nim"
     echo "test_memprobe: skipped (Linux-only /proc+cgroup parsing; availableMemBytes bypasses the read seam on this platform)"

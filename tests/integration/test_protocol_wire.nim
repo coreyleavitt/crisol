@@ -20,6 +20,12 @@ import crisol/types
 import crisol/runner
 import crisol/depgraph
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race.
+let testStateDir = processStateDir("protowire")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,6 +48,7 @@ proc makeCfg(): Config =
     timeoutSecs:        30,
     maxOutputBytes:     65_536,
     projectRoot:        getCurrentDir(),
+    stateDir:           testStateDir,
     trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
   )
 

@@ -17,6 +17,12 @@ import std/[math, os, times, unittest]
 import crisol/types
 import crisol/runner
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race.
+let testStateDir = processStateDir("sched")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,6 +53,7 @@ proc runPlan(eps: seq[Entrypoint]; jobs: int;
     compileTimeoutSecs: max(1, int(ceil(compMs / 1000))),
     timeoutSecs:        max(1, int(ceil(runMs / 1000))),
     projectRoot:        getCurrentDir(),
+    stateDir:           testStateDir,
     trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
   )
   let p   = plan(cfg, eps, emptyDepGraph())

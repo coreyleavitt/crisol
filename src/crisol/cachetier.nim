@@ -93,6 +93,20 @@ type
       ## True iff the entry PASSED trust verification (NOT merely "the
       ## tier didn't require it"). Meaningful only when `trust.name !=
       ## "none"`; under `nonePolicy` it is trivially true.
+    keyInputs*: Option[KeyInputs]
+      ## RFC-0005 :391 — the served `StoredEntry`'s OWN recorded inputs
+      ## (`fetched.value.keyInputs`, verbatim; NOT the consulting run's own
+      ## derived inputs, which merely happen to hash to the same key on a
+      ## genuine hit). `none` only for a pre-0005 entry written before
+      ## `keyInputs` existed (`cachewire`'s decoder tolerates its absence).
+      ## The caller-side adapter (`cachedispatch.realSeams.load`) is the
+      ## sole reader: on a hit that ALSO backfilled tier "l1"
+      ## (`CacheLookup.backfillVerdicts`), it seeds l1's explain-miss
+      ## sidecar from exactly this value — "a backfill-on-hit seeds the
+      ## local sidecar from it" (RFC-0005 :391). This is data threading,
+      ## not I/O: `TieredCache` still performs no sidecar/path work itself
+      ## (see the module doc comment, above) — it merely stops discarding a
+      ## field it already has in hand.
 
   TierVerdict* = tuple[tier: string, verdict: CacheVerdict]
 
@@ -245,7 +259,8 @@ proc lookup*(tc: var TieredCache; key: SoundnessKey): CacheLookup =
       continue
 
     verdicts.add (tier.name, cvOk)
-    let hit = TierHit(result: fetched.value.result, tier: tier.name, verified: verified)
+    let hit = TierHit(result: fetched.value.result, tier: tier.name, verified: verified,
+                       keyInputs: fetched.value.keyInputs)
 
     # Backfill: earlier (upstream) `backfillOnHit` tiers, subject ONLY to
     # the verified-bit backfill rule -- "backfill tier t only if

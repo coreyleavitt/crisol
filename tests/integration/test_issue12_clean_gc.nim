@@ -22,7 +22,7 @@
 
 import std/[json, os, osproc, sets, strutils, tables, times, unittest]
 import crisol
-import crisol/[config, depgraph, nimprobe]
+import crisol/[config, depgraph, nimprobe, ccidentity]
 import ../support/capture
 
 # ---------------------------------------------------------------------------
@@ -100,9 +100,19 @@ suite "issue #12 — crisol clean GCs the real (fingerprinted) depgraph":
     # gone, the kept entry survived, and the header's nimVersion (the
     # fingerprint) survived the clean's save — clean must never rewrite
     # the fingerprint, only the entries.
+    #
+    # W3: the REAL `runMain(@["run", ...])` above now stamps the on-disk
+    # graph with a REAL ccVersion (api.nim's planImpl threads `$ccProbe()` --
+    # ccidentity.cachedCcVersion() verbatim by default -- into buildRunPlan),
+    # so this reload MUST use the same real probe too — the deprecated 2-arg
+    # loadDepGraph(cfg, fp) overload passes ccVersion "" explicitly, which
+    # mismatches that real stored ccVersion and would discard the
+    # whole graph as toolchain-mismatched (dgdCcVersion), losing every
+    # entry and defeating the entries-survived assertions below.
     let (cfg, _) = loadConfig(cfgPath)
     let fp = cachedNimFingerprint()
-    let graph = loadDepGraph(cfg, fp)
+    let ccv = cachedCcVersion()
+    let graph = loadDepGraph(cfg, fp, ccv)
     check graph.header.nimVersion == fp
     check ("tests/unit/t_gone.nim", flagHash(@[])) notin graph.entries
     check ("tests/unit/t_keep.nim", flagHash(@[])) in graph.entries

@@ -9,7 +9,7 @@
 ##   discover(cfg, selection)
 ##     → applyGates(discovered, cfg, gateState)
 ##       → [optional narrowing: --failed ∩ failedKeys, --changed ∩ diff]
-##         → plan(cfg, runnable, graph, nimVersion, forceCompile)
+##         → plan(cfg, runnable, graph, nimVersion, forceCompile, ccVersion)
 ##
 ## All steps are pure (no I/O beyond the file-system reads in discover/plan).
 ## The effectful seams — loadGateState, loadDepGraph — are called here once
@@ -51,6 +51,59 @@ type
 # buildRunPlan — the SHARED pure plan phase
 # ---------------------------------------------------------------------------
 
+# SOUNDNESS-PARAMETER WARNING (round-4 review, R4-4, 2026-09-24): `nimVersion`
+# below is a soundness parameter and no longer carries a default. What it
+# governs FROM HERE is the dep-graph FRESHNESS view: it is handed to
+# `loadDepGraph` below, and a caller that passes "" also persists a header
+# stamped "", so every later load compares "" against "" and "the Nim compiler
+# moved" can never be observed — a graph built by a DIFFERENT Nim is accepted
+# as fresh.
+#
+# CORRECTED round 5 (R5-7, 2026-09-24): this note used to claim a second
+# surface — that `nimVersion` "flows through `plan` into
+# `planner.toolchainFingerprint` and thence `planner.cachePath`". It does not,
+# and did not when that sentence was written (R4-4, round 4): `plan` has never
+# called either proc, and since R3-8 removed `decideCompile`'s toolchain arms
+# `plan` does not read `nimVersion`/`ccVersion` at all. The persistent-nimcache
+# key is computed inside `runner.execute` (and `clean.cleanOrphans`) from the
+# `nimVersion`/`ccVersion` arguments THOSE procs are handed directly. The
+# reason to pass a real value here is nonetheless the same one: api.nim feeds
+# this proc and `execute` the SAME probes (`nimprobe.cachedNimFingerprint()`
+# and `$ccProbe()`, default the memoised `ccidentity.cachedCcFingerprint`), so
+# "" here means a caller is running a real toolchain's compiles against a
+# freshness view that checks no toolchain at all for a ""-stamped graph. A
+# real-stamped graph is discarded once -- `loadDepGraph`'s version-mismatch
+# arms return an EMPTY graph re-stamped "" -- and once the caller saves that,
+# every later "" load accepts it unchecked. The L2 result cache is
+# shared across hosts, which makes key soundness a security property rather
+# than a performance one — the cache-key half of that lives on
+# `planner.toolchainFingerprint`/`runner.execute`, not here.
+#
+# Its old `""` default was justified in this proc's own doc with "every
+# production caller of IT already threads a real value and has since before W3"
+# — verbatim the premise round 2 catalogued at R2-7 as the defaulted-soundness-
+# parameter disguise, and this is the very proc defect L1 happened on: the
+# sibling `ccVersion` carried the identical default under the identical
+# justification and shipped dark, its staleness check never firing on a real
+# run. "Every caller already passes it" is a fact about today's tree, not an
+# invariant the compiler enforces; the default is what guarantees the NEXT
+# caller's omission is silent.
+#
+# The deprecated compatibility overload below keeps every existing call
+# compiling (all 27 call sites in the tree — 1 in src/, 26 in tests/ — pass
+# their arguments BY NAME, so each binds to exactly one of the two arities with
+# no ambiguity) while the compiler reports an omission at the CALLER's own
+# file:line. `--warnings:off`, which every test invocation in this repo passes,
+# silences it, so no test output moves; `dev check`'s
+# `--warningAsError:Deprecated:on` promotes it to a hard error, which is how
+# `src/` is held to zero omissions. Pass it EXPLICITLY, including `""` when you
+# genuinely mean "no probe available". What `""` actually does is narrower than
+# "disable both checks": a graph stamped with a real identity is discarded (and
+# replaced by an empty graph stamped `""`); only a `""`-stamped graph -- which
+# is what that replacement becomes once saved -- is then accepted with no
+# toolchain check at all. Full rationale on
+# `planner.cachePath`'s deprecated overload and at R2-7/R3-7/R4-4 in
+# docs/handoff/msvc-selection-layer.md.
 proc buildRunPlan*(
   cfg:          Config;
   selection:    GroupSelection;
@@ -58,7 +111,8 @@ proc buildRunPlan*(
   useFailed:    bool = false;
   useChanged:   bool = false;
   changed:      HashSet[TrackedPath] = initHashSet[TrackedPath]();
-  nimVersion:   string = "";
+  nimVersion:   string;
+  ccVersion:    string;
   forceCompile: bool = false;
   warnings:     seq[ConfigWarning] = @[];
   shardK:       int = 0;          ## C2: shard index (1-indexed); 0 = no sharding
@@ -82,7 +136,47 @@ proc buildRunPlan*(
   ##                  (nimprobe.cachedNimFingerprint()), not the compile-time
   ##                  api.crisolNimVersion string — see api.nim's module-doc
   ##                  note on why a version STRING alone is not a sound
-  ##                  discriminator.  "" disables (test/cold-start only).
+  ##                  discriminator.  REQUIRED (no default, R4-4): "" means
+  ##                  no probe — a header stamped "" then passes
+  ##                  loadDepGraph's nim-version check unexamined, while one
+  ##                  stamped with a real version is discarded — so it is a
+  ##                  test/cold-start-only choice that must be stated at the
+  ##                  call site — see the SOUNDNESS-PARAMETER note above this
+  ##                  proc. It does NOT reach the persistent-nimcache key from
+  ##                  here: that key is built by runner.execute /
+  ##                  clean.cleanOrphans from their own arguments (R5-7
+  ##                  correction to an R4-4 claim).
+  ##   ccVersion    — C toolchain fingerprint (W3), nimVersion's sibling for
+  ##                  freshness checks; threaded to loadDepGraph/plan the
+  ##                  same way. REQUIRED (no default) — this is the exact
+  ##                  parameter whose "" default let the W3 fix ship dark:
+  ##                  api.nim's only production call site compiled cleanly
+  ##                  while silently never passing a real value, so every real
+  ##                  run wrote AND read the dep-graph header with
+  ##                  `ccVersion == ""` and depgraph.loadDepGraph's
+  ##                  `dgdCcVersion` discard arm could never observe a
+  ##                  mismatch. That arm is the live mechanism — see
+  ##                  `depgraph.loadDepGraph`'s discard arms, the
+  ##                  dgdNimVersion/dgdCcVersion blocks in
+  ##                  tests/unit/test_depgraph.nim, and the end-to-end
+  ##                  tests/integration/test_w3_cc_liveness.nim. (This bullet
+  ##                  used to point at planner.decideCompile's own cc-version
+  ##                  check; round 5's R3-8 removed that check as unreachable,
+  ##                  so there is nothing to see there.) Pass "" explicitly
+  ##                  when there is no probe (test/cold-start callers that
+  ##                  don't care about toolchain freshness): a ""-stamped
+  ##                  graph is then accepted with no cc check, and a graph
+  ##                  stamped with a real cc identity is discarded — that is
+  ##                  now a conscious choice at the call site, never a
+  ##                  silent fallback. `nimVersion` above is REQUIRED on the
+  ##                  same terms (R4-4): it was previously left defaulted on
+  ##                  the grounds that "every production caller of IT already
+  ##                  threads a real value and has since before W3", which is
+  ##                  the exact premise R2-7 catalogued as the defaulted-
+  ##                  soundness-parameter disguise -- a property of today's
+  ##                  call graph, not an invariant, and it is what let
+  ##                  ccVersion's own identical omission ship dark on THIS
+  ##                  proc. Neither half has a default now.
   ##   forceCompile — when true, skip freshness checks (recompile everything).
   ##   shardK       — C2: shard index (1-indexed, 1..shardN); 0 = no sharding.
   ##   shardN       — C2: total shard count; only used when shardK > 0.
@@ -111,7 +205,7 @@ proc buildRunPlan*(
 
   # Load the persisted dep graph (D6 freshness; D5 impact selection).
   var discarded: DepGraphDiscard
-  let graph = loadDepGraph(cfg, nimVersion, discarded)
+  let graph = loadDepGraph(cfg, nimVersion, discarded, ccVersion)
 
   # A discarded depgraph (nimVersion/formatVersion mismatch, or an
   # unreadable/malformed file) must be a visible, structured diagnostic —
@@ -219,7 +313,7 @@ proc buildRunPlan*(
     let resolvedStateDir = stateDirOf(cfg)
     runnable = orderByHistory(runnable, order, resolvedStateDir, cfg.trackedRoots)
 
-  let runPlan = plan(cfg, runnable, graph, nimVersion, forceCompile)
+  let runPlan = plan(cfg, runnable, graph, nimVersion, forceCompile, ccVersion)
   RunPlanView(
     plan:     runPlan,
     gatedOut: gatedEntries,
@@ -228,3 +322,53 @@ proc buildRunPlan*(
     warnings: planWarnings,
     adHocPaths:     discovered.adHocPaths,
   )
+
+# ---------------------------------------------------------------------------
+# Deprecated compatibility overload (R4-4)
+# ---------------------------------------------------------------------------
+#
+# `nimVersion` on `buildRunPlan` above no longer defaults to "". It is the Nim
+# half of the dep-graph freshness view (loadDepGraph's nim-version staleness
+# branch). "" does not switch that check off -- it compares against "": a graph
+# stamped with a real Nim version is discarded, the rebuilt graph the caller
+# then saves is stamped "", and a ""-stamped graph is accepted by every later
+# "" load with no nim-version check (R7-S4; the `{.deprecated.}` message below
+# says the same). A soundness parameter with a convenient default, the shape
+# R2-7 catalogued and defect L1 was caused by on this very proc. (It does NOT also feed the persistent-nimcache key;
+# R5-7 corrected that R4-4 claim here and in the note above the full-arity
+# proc — `plan` never called `planner.toolchainFingerprint`/`cachePath`, and
+# `runner.execute`/`clean.cleanOrphans` build that key from their own
+# arguments; the `{.deprecated.}` message below now names only the
+# `loadDepGraph` freshness discard.) The default was what made an omission
+# invisible, and
+# the doc justification it carried ("every production caller of IT already
+# threads a real value") is the disguise itself.
+#
+# This overload keeps every existing call site compiling while the compiler
+# names the omission at the caller's own file:line. Full rationale on
+# `planner.cachePath`'s deprecated overload (R3-7). No ambiguity with the
+# full-arity proc above: that one REQUIRES `nimVersion`, and this one does not
+# accept it at all, so each call shape binds to exactly one of the two. Every
+# call site in the tree passes its arguments by NAME, so none of them can
+# accidentally reach the arity where a trailing positional list would fit both.
+
+proc buildRunPlan*(
+  cfg:          Config;
+  selection:    GroupSelection;
+  failedKeys:   HashSet[tuple[tp: TrackedPath, group: string]] = initHashSet[tuple[tp: TrackedPath, group: string]]();
+  useFailed:    bool = false;
+  useChanged:   bool = false;
+  changed:      HashSet[TrackedPath] = initHashSet[TrackedPath]();
+  ccVersion:    string;
+  forceCompile: bool = false;
+  warnings:     seq[ConfigWarning] = @[];
+  shardK:       int = 0;
+  shardN:       int = 1;
+  order:        OrderMode = omNone;
+): RunPlanView
+    {.deprecated: "R4-4: pass nimVersion explicitly (\"\" when no probe is available) — omitting it passes \"\" to depgraph.loadDepGraph, which accepts a \"\"-stamped graph with no nim-version check and discards one stamped with a real version".} =
+  ## Deprecated compatibility overload — forwards the `""` that `nimVersion`
+  ## used to default to (verified against base commit 630ecc6), so no behaviour
+  ## moves for a caller that already omitted it.
+  buildRunPlan(cfg, selection, failedKeys, useFailed, useChanged, changed,
+               "", ccVersion, forceCompile, warnings, shardK, shardN, order)

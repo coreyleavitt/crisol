@@ -35,6 +35,13 @@ import crisol/runner
 import crisol/config
 import crisol/sandbox
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race (slot binaries / nimcache JSON deleted
+# mid-compile).
+let testStateDir = processStateDir("s7")
 
 # A6: the live run path is now hermetic by default (env scrub).  These tests
 # spawn overlap_probe, which reads CRISOL_TEST_OVERLAP_FILE from its env — so we
@@ -146,9 +153,9 @@ proc testCapAndMemoryCompose() =
     timeoutSecs:        30,
     compileTimeoutSecs: 120,
     maxOutputBytes:     10 * 1024 * 1024,
-    stateDir:           ".crisol",
+    stateDir:           testStateDir,
     projectRoot:        getCurrentDir(),
-    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), testStateDir),
     memBudgetMb:        none(int),  # no mem constraint for this sub-test
   )
   let epsSerial = @[
@@ -180,9 +187,9 @@ proc testCapAndMemoryCompose() =
     timeoutSecs:        30,
     compileTimeoutSecs: 120,
     maxOutputBytes:     10 * 1024 * 1024,
-    stateDir:           ".crisol",
+    stateDir:           testStateDir,
     projectRoot:        getCurrentDir(),
-    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), testStateDir),
     memBudgetMb:        some(256),  # < 512 MiB seed → gate serializes
     memAware:           none(bool),
   )
@@ -252,9 +259,9 @@ proc testFailFastDrains() =
     timeoutSecs:        30,
     compileTimeoutSecs: 120,
     maxOutputBytes:     10 * 1024 * 1024,
-    stateDir:           ".crisol",
+    stateDir:           testStateDir,
     projectRoot:        getCurrentDir(),
-    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), testStateDir),
     memBudgetMb:        some(256),   # memory gate active
     memAware:           none(bool),
   )
@@ -331,9 +338,9 @@ proc testPerGroupTimeoutInComposedRun() =
     timeoutSecs:        60,
     compileTimeoutSecs: 120,
     maxOutputBytes:     10 * 1024 * 1024,
-    stateDir:           ".crisol",
+    stateDir:           testStateDir,
     projectRoot:        getCurrentDir(),
-    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
+    trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), testStateDir),
   )
 
   let eps = @[

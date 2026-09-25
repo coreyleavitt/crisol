@@ -152,6 +152,33 @@ proc `==`*(a, b: NativeAbs): bool = a.abs == b.abs
 proc hash*(n: NativeAbs): Hash = hash(n.abs)
 
 proc foldPolicy*(r: NativeRoot): FoldPolicy = r.foldPolicy
+
+proc folds*(p: FoldPolicy): bool =
+  ## The single source of truth for "does this policy fold case?" — every
+  ## call site that needs a yes/no answer to that question (as opposed to
+  ## the specific fold TRANSFORM, which is `fold(s, policy)` below) goes
+  ## through this, rather than re-deriving the answer with its own
+  ## `== fpAsciiLower` / `!= fpNone` comparison (RFC-0009 wiring-audit
+  ## W9m). Two such comparisons — `foldMatchesSomeRoot` here and
+  ## `narrow.anyRootFolds` — happened to agree while `FoldPolicy` had
+  ## exactly two arms, but a bare comparison against one arm has no way to
+  ## demand attention when a third arm is added; the two sites could
+  ## silently diverge, and `foldMatchesSomeRoot` is the trigger for the W1
+  ## case-resolution fix, so that divergence would be a silent soundness
+  ## regression, not a cosmetic one.
+  ##
+  ## Written as an exhaustive `case`, deliberately NOT collapsed to
+  ## `p != fpNone` or similar: Nim rejects a non-exhaustive `case` over an
+  ## enum at compile time, so the day RFC-0009's contemplated third arm
+  ## (case-preserving-but-folding, or Unicode folding) lands, every caller
+  ## of `folds` keeps working unmodified, but THIS proc fails to compile
+  ## until someone decides, right here, whether the new arm folds. That
+  ## compile error is the whole point — it is strictly better than a
+  ## silent behavior change at either call site.
+  case p
+  of fpNone: false
+  of fpAsciiLower: true
+
 proc name*(r: NativeRoot): string = r.name
   ## `abs`/`realAbs` are deliberately NOT exported as accessors: a public
   ## raw-path getter invites exactly the raw `startsWith` comparison this
@@ -283,7 +310,8 @@ proc looksLikeDepEscape(rel: string): bool =
   ## DROPPED from a persisted closure (unsound under-selection, never a
   ## crash). The escape must cover every shape `fromKeyBytes` would
   ## otherwise misclassify, i.e. every `dep:`-prefixed first segment, full
-  ## stop — see `keyBytes`' "the escape is injective" note.
+  ## stop. The resulting `./` prefix stays injective because a canonical
+  ## tag-0 `rel` never itself begins `./` (see `fromKeyBytes`' `./` arm).
   firstSegment(rel).startsWith("dep:")
 
 proc keyBytes*(tp: TrackedPath; roots: TrackedRoots): CacheKeyPath =
@@ -499,6 +527,55 @@ proc plausibly8Dot3*(nativeAbs: string): bool =
     if looksLike8Dot3Component(seg): return true
   false
 
+type ReportedPath* = distinct string
+  ## A path spelling reported by a FOREIGN tool, not yet resolved against
+  ## the real on-disk spelling — `cl /sourceDependencies` (lowercases every
+  ## path unconditionally) or gcc/clang `-M` (echoes the `#include`
+  ## directive's own literal spelling). Both are potentially non-canonical
+  ## spellings of a real tracked file whenever the volume folds case, and
+  ## `TrackedPath.rel` is documented real-case and IS the unfolded cache-key
+  ## material — so a `ReportedPath` must never be sliced into a `rel`
+  ## without resolution first (see `classify`'s `ReportedPath` overload,
+  ## below).
+  ##
+  ## CR10: this REPLACES the earlier `CandidateSpelling` enum
+  ## (`csTrusted`/`csReported`), which made provenance an ARGUMENT — easy to
+  ## default away, and defaulted away is exactly the shape this codebase's
+  ## recurring soundness defect takes (W1, CR3, W3). Provenance is now a
+  ## property of the VALUE instead: `ccprobe.depIncludeHeaders` (and
+  ## `parseMsvcSourceDeps`/`parseCcMDeps` beneath it) hand back
+  ## `seq[ReportedPath]`, never `seq[string]`, so a header that came out of
+  ## a foreign tool's dependency report is a DIFFERENT TYPE from a path
+  ## crisol produced itself (`walkDir`, Nim's own mangled nimcache names,
+  ## git's index) from the moment it is parsed — there is no argument left
+  ## to forget. `classify`/`tracked` are overloaded on this type instead of
+  ## branching on an enum parameter: a `ReportedPath` argument SELECTS the
+  ## resolve-before-match code path at the call site, by construction, not
+  ## by a value a future contributor has to know to pass.
+  ##
+  ## Deliberately borrows almost nothing — no `$`, no `&`, no `==`/`hash`
+  ## against a plain `string` beyond the one narrow exclusion-filter
+  ## overload below, no implicit conversion to `string` anywhere. The ONE
+  ## sanctioned way to turn a `ReportedPath` into identity material is
+  ## `classify`/`tracked`'s `ReportedPath` overload (which resolves it).
+  ## `string(rp)` is the sole, explicit, greppable escape hatch — exactly
+  ## `DisplayPath`'s own discipline, mirrored here because the risk is the
+  ## same shape: a low-friction implicit conversion would silently reopen
+  ## the hole this type exists to close.
+
+proc `==`*(a: ReportedPath; b: string): bool = string(a) == b
+proc `==`*(a: string; b: ReportedPath): bool = a == string(b)
+proc len*(p: ReportedPath): int {.borrow.}
+  ## The only two operations exposed directly on `ReportedPath`: an
+  ## emptiness/length check, and equality against a known TRUSTED string
+  ## (never another `ReportedPath` — two foreign-tool spellings are not
+  ## safely comparable without resolving both first, so that overload is
+  ## deliberately absent). This is exactly what
+  ## `ccprobe.depIncludeHeaders`'s own exclusion filter needs (`p.len > 0
+  ## and p != sourceFile`, where `sourceFile` is the manifest's own known,
+  ## trusted path) and nothing more — neither op can construct or leak
+  ## identity material.
+
 type CandidateExpander* = proc (p: string): string
   ## RFC-0009 wiring-audit F18: the injectable candidate-side realpath-
   ## expansion seam `classify` falls back to — NEVER on the hot path (see
@@ -516,6 +593,62 @@ type CandidateExpander* = proc (p: string): string
   ## testability seam that exercises the FALLBACK'S WIRING (predicate ->
   ## expand -> re-match) without a real Windows short name to expand,
   ## mirroring `FoldProbe` above.
+
+proc underRootFolded(candidate, rootAbs: string; policy: FoldPolicy): bool =
+  ## `underRoot`'s membership question asked under `policy` — but as a
+  ## CHEAP FILTER only, never as an identity decision.
+  ##
+  ## Allocation-free on purpose. This runs on every `classify` MISS, and
+  ## misses are the common case on a real run (every system header, every
+  ## stdlib path, every out-of-tree file `SourceIndex` walks past). Folding
+  ## both operands into fresh strings would put two `toLowerAscii`
+  ## allocations on that path; comparing byte-by-byte instead short-circuits
+  ## at the first difference, which for a genuinely-foreign path is within
+  ## the first few characters (`c:/msvc/...` vs `c:/users/...` parts at
+  ## index 3).
+  ##
+  ## Same component-boundary semantics as `underRoot`, including its
+  ## treatment of the root itself: a candidate EQUAL to the root is not
+  ## under it (a root is a container, never a trackable file), so at least
+  ## one further component is required.
+  var rl = rootAbs.len
+  while rl > 0 and rootAbs[rl - 1] == '/':
+    dec rl                                   # ignore any trailing separator
+  if rl == 0: return false
+  if candidate.len <= rl: return false
+  if candidate[rl] != '/': return false      # component boundary, not a prefix
+  for i in 0 ..< rl:
+    let c = case policy
+            of fpNone: candidate[i]
+            of fpAsciiLower: toLowerAscii(candidate[i])
+    let r = case policy
+            of fpNone: rootAbs[i]
+            of fpAsciiLower: toLowerAscii(rootAbs[i])
+    if c != r: return false
+  true
+
+proc foldMatchesSomeRoot(abs: string; roots: TrackedRoots): bool =
+  ## True iff SOME root could claim `abs` once case is disregarded under
+  ## that root's OWN probed policy — the trigger for `classify`'s expansion
+  ## fallback, and nothing more.
+  ##
+  ## A root whose policy does not fold (`folds` false) is skipped entirely:
+  ## there, two spellings that differ in case are two different files, and
+  ## rescuing one into the other would be a soundness bug rather than a
+  ## fix. This only ever fires for a root whose filesystem genuinely
+  ## reported that case is not significant — per the shared `folds`
+  ## predicate (RFC-0009 wiring-audit W9m), not a re-derived condition of
+  ## its own.
+  if roots.project.foldPolicy.folds and
+     (underRootFolded(abs, roots.project.abs, fpAsciiLower) or
+      underRootFolded(abs, roots.project.realAbs, fpAsciiLower)):
+    return true
+  for d in roots.fdeps:
+    if d.foldPolicy.folds and
+       (underRootFolded(abs, d.abs, fpAsciiLower) or
+        underRootFolded(abs, d.realAbs, fpAsciiLower)):
+      return true
+  false
 
 proc matchRoots(abs: string; roots: TrackedRoots): Option[PathClass] =
   ## The shared root-membership decision `classify` applies to a candidate
@@ -550,9 +683,26 @@ proc matchRoots(abs: string; roots: TrackedRoots): Option[PathClass] =
                        fold: roots.fdeps[bestIdx].foldPolicy, rel: bestRel)))
   none(PathClass)
 
-proc classify*(native: string; roots: TrackedRoots;
-               expandCandidate: CandidateExpander = safeExpandFilename): PathClass =
+proc matchExpanded(na: NativeAbs; roots: TrackedRoots;
+                   expandCandidate: CandidateExpander): Option[PathClass] =
+  ## Resolve a candidate to its real on-disk spelling and re-match ONCE.
+  ##
+  ## TOTAL: an expander that cannot resolve the name returns its input
+  ## unchanged (`safeExpandFilename`'s own never-raises contract), which
+  ## would re-match identically to the plain lexical attempt — so that case
+  ## short-circuits to `none` rather than paying a second `matchRoots`.
+  let expandedAbs = nativeCanonicalize(expandCandidate(na.abs), roots.project.abs).abs
+  if expandedAbs == na.abs: return none(PathClass)
+  matchRoots(expandedAbs, roots)
+
+proc classifyCore(na: NativeAbs; roots: TrackedRoots; reportedSpelling: bool;
+                  expandCandidate: CandidateExpander): PathClass =
   ## TOTAL: every native spelling classifies. Nothing is refused here.
+  ## Shared by both `classify` overloads below — `reportedSpelling` is the
+  ## ONLY thing that differs between them, and it is fixed per overload
+  ## (never a caller-supplied value), so a call site can no longer get this
+  ## wrong by forgetting an argument the way the old `spelling:
+  ## CandidateSpelling = csTrusted` default parameter allowed (CR10).
   ##
   ## RFC-0009 wiring-audit F18: only ROOTS were ever realpath-expanded
   ## (`NativeRoot.realAbs`, `initTrackedRoots` time) — the CANDIDATE side
@@ -564,30 +714,132 @@ proc classify*(native: string; roots: TrackedRoots;
   ## `SourceIndex` classifies thousands of paths per run, so this must cost
   ## nothing for the overwhelming common case. `matchRoots` is tried first
   ## against the plain lexical candidate, exactly as before; only when that
-  ## fails AND the candidate plausibly contains an 8.3 component
-  ## (`plausibly8Dot3` — a cheap text scan, no I/O) does `expandCandidate`
+  ## fails AND the candidate is plausibly a NON-CANONICAL spelling of a
+  ## real tracked file — an 8.3 component (`plausibly8Dot3`), or the wrong
+  ## case under a case-folding root (`foldMatchesSomeRoot`); both cheap text
+  ## scans, no I/O — does `expandCandidate`
   ## (real disk I/O on Windows, a no-op match failure everywhere else) run
   ## at all, and the result is re-matched exactly once. Still TOTAL: an
   ## expander that cannot resolve the name returns its input unchanged
   ## (`safeExpandFilename`'s own "never raises" contract), which re-matches
   ## identically to the first attempt and falls through to `pcOutside`.
-  let na = nativeCanonicalize(native, roots.project.abs)
+  ##
+  ## Issue #21 widened "plausibly non-canonical" from 8.3 alone to 8.3 OR
+  ## wrong-case, because 8.3 was only ONE SPELLING of the same defect.
+  ## `cl /sourceDependencies` reports every path LOWERCASED, so on a
+  ## mixed-case project root every MSVC-derived header lexically missed and
+  ## was silently dropped from the closure — impact selection stayed dead
+  ## under vcc even once the dependency probe itself worked.
+  ##
+  ## Note what this deliberately does NOT do: fold the membership test
+  ## itself. `TrackedPath.rel` is REAL-CASE by invariant and `keyBytes` is
+  ## `rel` UNFOLDED — `rel` IS the cache-key material. Matching a mis-cased
+  ## candidate directly would store the probe's lowercased spelling, so a
+  ## cl-populated closure and a gcc-populated one would produce different
+  ## `headersHash`/closure hashes for the identical files, and cross-host
+  ## cache portability (RFC-0005) would break. RESOLVING the candidate to
+  ## its real on-disk spelling first (`winRealPath` /
+  ## `GetFinalPathNameByHandleW` returns the true case) and letting the
+  ## UNCHANGED case-sensitive `underRoot` decide keeps `rel` real-case by
+  ## construction. The folded comparison is a FILTER over whether to pay for
+  ## that resolution, never the identity decision itself.
+  let mayBeNonCanonical =
+    plausibly8Dot3(na.abs) or foldMatchesSomeRoot(na.abs, roots)
+
+  # WIRING-AUDIT W1. For a REPORTED spelling the expansion runs BEFORE the
+  # lexical match, not as a fallback after it. `matchRoots` misses only on a
+  # case difference inside the ROOT PREFIX — `underRoot` compares the
+  # prefix case-sensitively and then slices the remainder VERBATIM — so a
+  # candidate whose root spelling already case-matches is a DIRECT HIT whose
+  # `rel` is whatever the foreign tool spelled, tail included. Running the
+  # expansion only on a miss therefore fixed mis-cased ROOTS and left
+  # mis-cased TAILS stored as the probe reported them, which is a divergent
+  # `keyBytes` (`rel` UNFOLDED) that `==`/`hash` folding hides completely:
+  # it never surfaces as a failed comparison, only as a permanent
+  # cross-toolchain cache miss.
+  #
+  # The predicate is the same cheap allocation-free text scan the fallback
+  # uses, so the cost budget below is preserved exactly: a genuinely-foreign
+  # path (every system header, every stdlib path) still reaches no disk, and
+  # an `fpNone` root still never rescues a mis-cased candidate — there two
+  # casings ARE two files, and rescuing one into the other would be the
+  # soundness bug this whole mechanism exists to avoid.
+  if reportedSpelling and mayBeNonCanonical:
+    let viaExpansion = matchExpanded(na, roots, expandCandidate)
+    if viaExpansion.isSome: return viaExpansion.get
 
   let direct = matchRoots(na.abs, roots)
   if direct.isSome: return direct.get
 
-  if plausibly8Dot3(na.abs):
-    let expandedAbs = nativeCanonicalize(expandCandidate(na.abs), roots.project.abs).abs
-    if expandedAbs != na.abs:
-      let viaExpansion = matchRoots(expandedAbs, roots)
-      if viaExpansion.isSome: return viaExpansion.get
+  # TRUSTED spelling only: a REPORTED candidate already tried this above,
+  # and `matchExpanded` is deterministic, so re-running it here would be
+  # pure cost for an identical `none`.
+  if (not reportedSpelling) and mayBeNonCanonical:
+    let viaExpansion = matchExpanded(na, roots, expandCandidate)
+    if viaExpansion.isSome: return viaExpansion.get
 
   PathClass(kind: pcOutside, native: na)
+
+proc classify*(native: string; roots: TrackedRoots;
+               expandCandidate: CandidateExpander = safeExpandFilename): PathClass =
+  ## TRUSTED-spelling classify — the hot path. `native` is a spelling
+  ## crisol produced itself (`walkDir`, Nim's own mangled nimcache names,
+  ## git's index): already on-disk real case, so the disk-resolution
+  ## fallback only ever runs on an 8.3-shaped or fold-ambiguous MISS (see
+  ## `classifyCore`), never unconditionally — `SourceIndex` classifies
+  ## thousands of these per run, and this overload is what it calls.
+  ##
+  ## Cost, stated precisely rather than left implicit (per this refactor's
+  ## own bar): dropping the old `spelling: CandidateSpelling = csTrusted`
+  ## parameter removes one field every hot call site was already leaving at
+  ## its default (so no call site pays anything new); `classifyCore`'s
+  ## `reportedSpelling: bool` argument is a literal `false` at this call
+  ## site, exactly replacing the old `spelling == csTrusted`/`== csReported`
+  ## enum comparisons with an equivalent boolean check — same order of cost
+  ## (one cheap compare per branch), not a regression. No new allocation on
+  ## either overload; the only per-call-site difference CR10 introduces is
+  ## which overload the ARGUMENT'S TYPE selects, decided at compile time by
+  ## overload resolution, not at runtime.
+  ##
+  ## For a spelling that came out of a FOREIGN tool's dependency report
+  ## instead — `ccprobe.depIncludeHeaders`'s `ReportedPath` results — use
+  ## the `ReportedPath` overload below, never this one with a bare
+  ## `string(...)` unwrap: that overload is what applies the W1
+  ## resolve-before-match ordering; this one does not, and passing an
+  ## unresolved foreign spelling through this proc silently reintroduces the
+  ## W1/CR3 defect class.
+  classifyCore(nativeCanonicalize(native, roots.project.abs), roots, false,
+              expandCandidate)
+
+proc classify*(reported: ReportedPath; roots: TrackedRoots;
+               expandCandidate: CandidateExpander = safeExpandFilename): PathClass =
+  ## REPORTED-spelling classify (CR10) — the ONE sanctioned way to turn a
+  ## `ReportedPath` into identity. Applies the W1 fix: when the candidate is
+  ## plausibly non-canonical (wrong case under a folding root, or an 8.3
+  ## short name), disk resolution runs BEFORE the lexical match, not merely
+  ## as a fallback after it — see `classifyCore`'s doc for exactly why that
+  ## ordering matters for a reported tail, not just a reported root.
+  ##
+  ## This overload is SELECTED BY THE ARGUMENT'S TYPE, not by a value a
+  ## caller has to remember to pass: any new foreign-tool boundary that
+  ## hands back `seq[ReportedPath]` (mirroring `ccprobe.depIncludeHeaders`)
+  ## gets this resolution automatically, the moment it calls `classify` at
+  ## all — there is no `csTrusted`-shaped default to silently fall through.
+  classifyCore(nativeCanonicalize(string(reported), roots.project.abs), roots,
+              true, expandCandidate)
 
 proc tracked*(native: string; roots: TrackedRoots): Option[TrackedPath] =
   ## Convenience over `classify` for the include-or-skip call sites that
   ## only ever want the pcTracked case and discard pcOutside silently.
   let pc = classify(native, roots)
+  case pc.kind
+  of pcTracked: some(pc.tp)
+  of pcOutside: none(TrackedPath)
+
+proc tracked*(reported: ReportedPath; roots: TrackedRoots): Option[TrackedPath] =
+  ## `tracked`'s `ReportedPath` counterpart — see `classify`'s `ReportedPath`
+  ## overload for what this resolves and why.
+  let pc = classify(reported, roots)
   case pc.kind
   of pcTracked: some(pc.tp)
   of pcOutside: none(TrackedPath)
@@ -705,8 +957,9 @@ proc fromKeyBytes*(s: string; roots: TrackedRoots): Option[TrackedPath] =
   ##     a tag-0 rel whose first segment starts with `dep:` at all — not
   ##     just a shape that also happens to parse as a well-formed dep-root
   ##     name). `rel` (the text after `./`) must itself satisfy
-  ##     `looksLikeDepEscape` — nothing else legally begins `./` (see
-  ##     `keyBytes`' "the escape is injective" note), so any other
+  ##     `looksLikeDepEscape` — nothing else legally begins `./` (a
+  ##     canonical `rel` carries no dot-segments, so `keyBytes` emits `./`
+  ##     only for an escaped rel), so any other
   ##     `./`-prefixed text is malformed and returns `none`.
   ##   - anything else — tag 0, unchanged.
   ## Every arm delegates final shape validation to `fromCanonical`, which

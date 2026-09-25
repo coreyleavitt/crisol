@@ -24,6 +24,13 @@ let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
 
 import crisol/config
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race (slot binaries / nimcache JSON deleted
+# mid-compile).
+let testStateDir = processStateDir("maxjobs")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -100,7 +107,7 @@ proc runWithCap(eps: seq[Entrypoint]; groupName: string;
     timeoutSecs:        30,
     compileTimeoutSecs: 60,
     maxOutputBytes:     10 * 1024 * 1024,
-    stateDir:           ".crisol",
+    stateDir:           testStateDir,
     projectRoot:        getCurrentDir(),
     trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
     # This suite verifies the per-group max-jobs CAP, not the memory-admission

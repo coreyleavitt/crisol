@@ -29,6 +29,13 @@ import crisol/types
 import crisol/runner
 import crisol/config
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race (slot binaries / nimcache JSON deleted
+# mid-compile).
+let testStateDir = processStateDir("failfast")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,9 +104,9 @@ suite "H1/fail-fast — no phantom entry under non-contiguous dispatch":
       timeoutSecs:        30,
       compileTimeoutSecs: 120,
       maxOutputBytes:     10 * 1024 * 1024,
-      stateDir:           ".crisol",
+      stateDir:           testStateDir,
       projectRoot:        getCurrentDir(),
-      trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
+      trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), testStateDir),
       memAware:           some(false),          # disable mem gate for determinism
     )
 
@@ -175,9 +182,9 @@ suite "H1/fail-fast — no phantom entry under non-contiguous dispatch":
       timeoutSecs:        30,
       compileTimeoutSecs: 120,
       maxOutputBytes:     10 * 1024 * 1024,
-      stateDir:           ".crisol",
+      stateDir:           testStateDir,
       projectRoot:        getCurrentDir(),
-      trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ".crisol"),
+      trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), testStateDir),
       memAware:           some(false),
     )
     let eps = @[

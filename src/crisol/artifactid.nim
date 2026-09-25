@@ -6,7 +6,7 @@
 ## hook, artifact-ledger emission, and measurement-mode gate it once lacked
 ## are now built in pass (b) (`measureworker.nim` + `runner.nim`'s
 ## measurement-worker wiring — see those modules). Every effectful step here
-## is still an injectable seam, mirroring `ccprobe.RunProc` (cmd,args)->
+## is still an injectable seam, mirroring `toolrun.RunProc` (cmd,args)->
 ## (output,ok) and `compiledriver.CompileDriver`'s closure-field idiom —
 ## never a bare unseamed I/O call.
 ##
@@ -16,7 +16,7 @@
 ## `cachePath(ep, config, toolchainFp)` for the common case — RFC-0006
 ## nimcache-persistence made this STABLE per-entrypoint, dropping the old
 ## volatile `_<pepIdx>` (plan-position) suffix; that suffix survives only as
-## a rare same-entrypoint-twice-in-plan fallback, see runner.duplicateSlugs —
+## a rare same-entrypoint-twice-in-plan fallback, see planner.duplicateSlugs —
 ## and `binPath(ep, config) & "_" & $pepIdx` for the always-per-slot binary
 ## dir), so normalization is a literal substring-erase of those KNOWN
 ## strings — never a regex that guesses which paths "look like" slot paths
@@ -60,7 +60,7 @@
 ## must be visible too) invocation from the manifest's own `ccCmd`.
 ##
 ## **Review Finding 1 (soundness): REPLICATE, never allow-list.** An earlier
-## version of `deriveCcMInvocation` kept only tokens starting with
+## version of `deriveDepInvocation` kept only tokens starting with
 ## `-I`/`-D`/`-std` and dropped everything else. GCC/Clang have OTHER flags
 ## that change header resolution — `-isystem`, `-iquote`, `-idirafter`,
 ## `-include`, `-imacros`, `-iprefix`, `-nostdinc`, and more — reachable via
@@ -68,7 +68,7 @@
 ## DIFFERENT directories than the real compile: a header reachable ONLY via
 ## a dropped flag can change in place (same path text, same `.c`, same
 ## normalized cc command) without changing `includeClosureContentHash` —
-## identical key/preimage, wrong-hit. `deriveCcMInvocation` therefore
+## identical key/preimage, wrong-hit. `deriveDepInvocation` therefore
 ## REPLICATES the real `ccCmd`'s arguments verbatim and only REMOVES what
 ## must not be there for a `-M` dependency-listing run: the compile-action
 ## flag `-c`, and the output flag `-o <obj>` (both the space-separated and
@@ -83,14 +83,65 @@
 ## closureContentHash` (sorted paths, chained FNV-1a, path+content both
 ## mixed in) — mirrored, not reinvented.
 ##
+## **CR3 (adversarially verified, 2026-09-21): a SECOND consumer of the same
+## dependency report.** `closure.extractCompileInputs`'s header loop resolves
+## a `cc -M`/`/sourceDependencies` report's CASE against the real on-disk
+## spelling before it becomes identity material (`paths.classify`'s W1 fix,
+## reached via the `index.tracked(ReportedPath(habs))` call in that loop) — but `ccIncludeClosure` is a structurally separate
+## consumer of the identical report and the W1 fix could not reach it:
+## `includeClosureContentHash` chains the raw reported path STRING into the
+## hash before the header's content, so a mis-cased spelling (MSVC
+## `/sourceDependencies` lowercases every path unconditionally) changed the
+## hash even for a byte-identical file — a permanent cross-toolchain
+## `keyHash` desync that only ever surfaces as skewed
+## `--measure-compile-reuse` r_time/r_size telemetry (`keyHash` feeds
+## `reuseRatios` ONLY — never a cache key, never a selection decision).
+## Fixed by threading `roots`/`expandCandidate` into `ccIncludeClosure` and
+## routing every reported header through the SAME `classify`'s
+## `ReportedPath` overload (CR10) via
+## `resolveReportedHeaderPath`/`resolveReportedHeaders`
+## (below) — see those procs' own doc for exactly what is resolved.
+##
+## The two loops are NOT unified behind one shared drop-or-keep helper: they
+## make OPPOSITE decisions about a header OUTSIDE every tracked root.
+## `closure.extractCompileInputs` drops it (only TRACKED files belong in an
+## impact-analysis closure). `ccIncludeClosure` must KEEP it (this section's
+## own "cc -M, not -MM" soundness argument — a libc/header upgrade must stay
+## visible in the hash). The genuinely shared piece — `paths.classify` itself
+## — already IS the one implementation both call; only the per-header
+## keep-vs-drop policy around it differs, which is a real semantic fork, not
+## duplicated logic.
+##
+## **Residual limits, declared per this module's own bar (cf.
+## `icbaseline.nim`'s "NOT wired into the production compile path" note):**
+##   - An UNTRACKED (system) header's reported case is never corrected —
+##     `TrackedPath`'s real-case-recovery machinery has no meaning outside a
+##     tracked root. A cross-host reuse-ratio comparison can still under-count
+##     two units as unshared if they differ ONLY in an untracked header's
+##     reported case. Narrower than the pre-fix defect (which hit every
+##     header, tracked or not), not eliminated.
+##   - `roots` has NO default (removed at CR10 — see the `artifactKeyHash`
+##     section below). A caller that passes the unpopulated `TrackedRoots()`,
+##     as every test call site does, gets no case resolution: with no root to
+##     be tracked under, every header takes the untracked arm (pre-CR3
+##     behavior). The one production caller, `measureworker.recordArtifactRows`,
+##     always supplies a real `roots`.
+##   - `measureworker`'s `MeasurePlan` wire format carries `projectRoot` but
+##     no configured dep-root specs, so in production today only PROJECT-root
+##     headers get the case fix; a header under a configured dep root
+##     resolves `pcOutside` (kept, merely canonicalized) rather than
+##     `pcTracked` (case-corrected) until that wire format is widened — see
+##     `measureworker.planRoots`'s doc.
+##
 ## ## artifactKeyHash() — the Stage-R key material hash
 ##
 ## `normalized(ccCmd) ⊕ normalized .c content ⊕ full cc -M #include-closure
 ## content-hash`, using `keys.soundnessKey`'s own per-component-wrapped
 ## chained-FNV-1a idiom (`keys.chainComponent` is module-private to
 ## `keys.nim`; the 4-line helper is duplicated here rather than exported
-## across an unrelated import — the same deliberate, documented choice
-## `artifactledger.nim` makes for its `bootId` duplication).
+## across an unrelated import — the same deliberate choice
+## `artifactledger.nim` once made for its `bootId` duplication, before
+## `shardedledger.nim` absorbed it).
 ##
 ## The RFC states Stage M must measure "on the exact key material Stage R
 ## would use" — Stage R's own key (removed with the object cache; see the
@@ -106,14 +157,51 @@
 ## `docs/rfc/0006-cross-entrypoint-compile-reuse.md` §Soundness and the
 ## stage-4 review's R5 finding.
 ##
-## `normalizedCcCmd` is the LAST parameter with a `""` default — not the
-## first, despite being folded FIRST internally — so existing 2-arg call
-## sites (the committed golden-fixture oracle test, which pins closed-form
-## r_size/r_time numbers over a FIXED, uniform per-run cc command and so is
-## insensitive to which constant gets folded in, as long as it's the SAME
-## constant for every call in that file) keep compiling and computing
-## unchanged. The production caller (`measureworker.recordArtifactRows`)
-## passes the real normalized cc command explicitly.
+## `normalizedCcCmd` is the LAST parameter — not the first, despite being
+## folded FIRST internally — so that the `{.deprecated.}` 2-arg companion
+## below can carry the pre-R5-15 signature without reordering anything.
+##
+## **R5-15(a) (round-5 review, 2026-09-24): the `""` DEFAULT IS GONE.** It used
+## to read `normalizedCcCmd: string = ""`, justified as "backward compatibility
+## with existing 2-arg call sites". That is the DEFAULTED SOUNDNESS PARAMETER
+## this repo named at R2-7, on a parameter that is literally key material:
+## omitting the argument folds the EMPTY cc command, so two units with identical
+## `.c` + closure but a REAL cc-flag delta collapse onto ONE key — the exact
+## over-count the paragraph above says folding `normalizedCcCmd` exists to
+## prevent. The omission was invisible in review because a 2-arg call simply
+## looks short. Every previous round's census missed it because the census tool
+## was `grep -rl "SOUNDNESS-PARAMETER WARNING" src/`, which can only return
+## sites somebody had already annotated; `ci/assert-defaulted-params.sh` now
+## enumerates from the LANGUAGE instead and pins the whole population.
+##
+## The BLAST RADIUS today is Low and is stated here rather than used as an
+## excuse: `artifactKeyHash` feeds Stage-M measurement only
+## (`measureworker.recordArtifactRows` -> `reuseRatios` -> r_time/r_size
+## telemetry), and Stage R's object cache was deleted 2026-07-30, so an omission
+## over-counts sharing in a REPORT rather than serving a wrong artifact. The
+## default is removed anyway, for two reasons. (1) The RFC's own requirement is
+## that M measure "on the exact key material Stage R would use" — the moment an
+## object cache returns, this default becomes a live under-invalidation with no
+## diff to notice it in. (2) The treatment for this defect class is the CLASS's,
+## not the instance's: `ccIncludeClosure`'s `roots` in this same file had its
+## default removed at CR10 on identical reasoning while its blast radius was
+## also only telemetry-skew, and leaving a second key-material default beside it
+## would say the rule is negotiable per-parameter.
+##
+## Churn is zero, by the R3-7 remedy: a `{.deprecated.}` 2-arg companion
+## forwards `""`, which is byte-for-byte what an omitting call already computed.
+## Measured 2026-09-24 (comment lines and `suite`/`test` title strings
+## excluded): 16 test call sites, 12 of them 2-arg
+## (`tests/unit/test_artifactid.nim`, `tests/unit/test_golden_reuse.nim`'s
+## committed golden-fixture oracle — which pins closed-form r_size/r_time over a
+## FIXED, uniform per-run cc command and so is insensitive to WHICH constant is
+## folded, as long as it is the same constant for every call in that file) and 4
+## already 3-arg; plus the ONE `src/` caller
+## (`measureworker.recordArtifactRows`), which already passes the real
+## normalized cc command explicitly. All 12 keep compiling and computing
+## unchanged; `--warnings:off` (which every test invocation here passes) keeps
+## test output still, and `dev check`'s `--warningAsError:Deprecated:on` holds
+## `src/` to zero omissions.
 ##
 ## ## reuseRatios() — r_time (PRIMARY) and r_size (secondary)
 ##
@@ -126,22 +214,47 @@
 ## storage-planning analog. Segmented by group/config, mirroring M-report's
 ## segmentation.
 
-import std/[algorithm, sets, strutils, tables]
+import std/[algorithm, sequtils, sets, strutils, tables]
 import crisol/depgraph   # re-uses fnv1a64, toHex16, fnvOffset64 — now defined in
                           # crisol/fnv, re-exported by depgraph; never reimplement
-import crisol/ccprobe    # re-uses the RunProc (cmd,args)->(output,ok) seam idiom
-export ccprobe.RunProc
-export ccprobe.realRun
-# `shellSplit`/`deriveCcMInvocation`/`parseCcMDeps`/`ccIncludeHeaders` moved to
+import crisol/ccprobe    # re-uses the dependency-probing derivation procs
+                          # (shellSplit/deriveDepInvocation/parseCcMDeps/
+                          # parseMsvcSourceDeps/depIncludeHeaders/
+                          # ccFamilyOfDriver) — CR7: this module needs only
+                          # that half of the old ccprobe.nim, never the cc
+                          # IDENTITY half (now crisol/ccidentity).
+import crisol/toolrun    # CR7: RunProc/realRun — the process-execution seam,
+                          # its own module now; re-exported below for the same
+                          # reason the dependency-probing procs are.
+import crisol/paths      # CR3/CR10 fix: classify/TrackedRoots/ReportedPath — the
+                          # SAME W1 case-resolution gate `closure.extractCompileInputs`'
+                          # header loop applies (its `ReportedPath`-typed
+                          # `index.tracked` call), now also applied to THIS
+                          # module's own, structurally-separate consumer of a
+                          # dependency report. No cycle: `paths.nim` imports only
+                          # `std/*`/`crisol/ioutils` — `artifactid.nim` already
+                          # reaches it transitively via `crisol/depgraph` ->
+                          # `crisol/closure` -> `crisol/paths`; this is a direct
+                          # import of an already-transitive leaf, not a new edge
+                          # into the cycle `ccprobe.nim`'s own doc comment
+                          # describes (that one is about `closure.nim` importing
+                          # `artifactid.nim`, the opposite direction).
+export toolrun.RunProc
+export toolrun.realRun
+# `shellSplit`/`deriveDepInvocation`/`parseCcMDeps`/`depIncludeHeaders` moved to
 # `crisol/ccprobe` (issue #16, see that module's doc comment for why: they are
 # dependency-free and `crisol/closure`'s `extractCompileInputs` needed them
 # too, but `closure.nim` cannot import `artifactid.nim` without closing a
 # cycle through `depgraph.nim`). Re-exported here so every existing caller of
 # `import crisol/artifactid` keeps compiling unchanged.
 export ccprobe.shellSplit
-export ccprobe.deriveCcMInvocation
+export ccprobe.deriveDepInvocation
 export ccprobe.parseCcMDeps
-export ccprobe.ccIncludeHeaders
+export ccprobe.parseMsvcSourceDeps
+export ccprobe.depIncludeHeaders
+export ccprobe.ccFamilyOfDriver
+export ccprobe.CcFamily
+export ccprobe.DepProbeError
 
 # ---------------------------------------------------------------------------
 # Seam: file reader (response-file inlining + header-closure content hashing)
@@ -271,7 +384,7 @@ proc normalize*(content: string; knownStrings: openArray[string];
 # ccIncludeClosure()
 # ---------------------------------------------------------------------------
 #
-# `shellSplit`/`deriveCcMInvocation`/`parseCcMDeps`/`ccIncludeHeaders` now
+# `shellSplit`/`deriveDepInvocation`/`parseCcMDeps`/`depIncludeHeaders` now
 # live in `crisol/ccprobe` (issue #16) and are re-exported above — see this
 # module's top-of-file import comment and ccprobe.nim's module doc for why.
 
@@ -293,44 +406,255 @@ proc includeClosureContentHash*(headerPaths: seq[string];
     running = fnv1a64(toHex16(running) & "\x00" & p & "\x00" & c)
   result = toHex16(running)
 
+type
+  ClosureProbeError* = enum
+    ## CR3/W9c: WHY `ccIncludeClosure` failed, distinguishable in both the
+    ## returned result and the caller-facing message — replacing the three
+    ## `DepProbeError` arms (`dpeNoJson`/`dpeBadJson`/`dpeNoIncludes`) that
+    ## a bare `ok=false` used to collapse into one indistinguishable outcome,
+    ## PLUS the two failure classes upstream of `depIncludeHeaders` entirely
+    ## (invocation derivation, probe execution) that were never a
+    ## `DepProbeError` in the first place, PLUS `cpeSourceMismatch` (round-2
+    ## review, MEDIUM): a sixth failure class carried on a signal
+    ## `depIncludeHeaders` reports OUTSIDE `DepProbeError` entirely
+    ## (`sourceCheck: ccprobe.DepSourceCheck`, W9j). Without that arm this
+    ## doc's claim was false: a `dscMismatch` never sets `err`, so it fell
+    ## straight through the `probed.err != dpeNone` check into `ok: true,
+    ## probeErr: cpeNone` with an empty header set reported as a successful,
+    ## complete closure — indistinguishable from a genuine empty answer, the
+    ## exact defect class this type exists to eliminate.
+    cpeNone              ## success — `headers`/`contentHash` are the real answer
+    cpeDerivationFailed  ## `deriveDepInvocation` could not derive a probe
+                         ## invocation from `ccCmd` (R1b/R4: unterminated shell
+                         ## quote, or too few tokens to name a source file)
+    cpeRunFailed         ## the derived probe invocation itself failed to run
+                         ## (compiler not found, non-zero exit, etc.)
+    cpeNoJson            ## MSVC only: no `/sourceDependencies` JSON document
+                         ## appeared on the probe's stdout at all
+    cpeBadJson           ## MSVC only: a document appeared but is not the
+                         ## shape cl documents
+    cpeNoIncludes        ## MSVC only: a valid document whose `Data` carries
+                         ## no `Includes` array
+    cpeSourceMismatch    ## MSVC only (W9j): a document appeared and parsed
+                         ## cleanly, but its own `Data.Source` names a
+                         ## DIFFERENT translation unit than the one just
+                         ## probed — a stale or misattributed document left
+                         ## behind by an earlier probe. Mirrors
+                         ## `closure.extractCompileInputs`'s raise on the
+                         ## identical signal (`closure.nim`, the
+                         ## `dscMismatch` arm). Kept as its own arm rather
+                         ## than folded into `DepProbeError` because
+                         ## `ccprobe.DepSourceCheck` was itself deliberately
+                         ## kept a separate type from `DepProbeError` — see
+                         ## that enum's own doc for why widening
+                         ## `DepProbeError` was off-limits.
+
+proc toClosureProbeError(e: DepProbeError): ClosureProbeError =
+  ## `depIncludeHeaders`'s own three-way failure taxonomy, carried through
+  ## unchanged rather than collapsed. `dpeNone` never reaches here (the
+  ## caller only converts on the `probed.err != dpeNone` failure arm).
+  case e
+  of dpeNone:       cpeNone       # unreachable in practice — see above
+  of dpeNoJson:     cpeNoJson
+  of dpeBadJson:     cpeBadJson
+  of dpeNoIncludes: cpeNoIncludes
+
+proc probeFamilyName(family: CcFamily): string =
+  ## The ACTUAL probe this manifest's driver family runs — never hard-coded
+  ## to the GNU spelling (CR3/W9c: the pre-fix message said "cc -M include-
+  ## closure probe failed" unconditionally, which is simply WRONG for an
+  ## `/sourceDependencies` failure on an MSVC-driven unit).
+  case family
+  of ccfGnuMake: "cc -M"
+  of ccfMsvc: "/sourceDependencies"
+
+proc resolveReportedHeaderPath(h: ReportedPath; roots: TrackedRoots;
+                               expandCandidate: CandidateExpander): string =
+  ## CR3/CR10: resolve one dependency-probe-reported header path to its real
+  ## on-disk spelling when it names a TRACKED file — the identical
+  ## `classify`'s `ReportedPath` overload `closure.extractCompileInputs`'s
+  ## header loop applies (`paths.nim`'s W1 fix, `closure.nim`'s header
+  ## loop) — so MSVC's unconditionally-lowercased `/sourceDependencies`
+  ## report, or a gcc/clang `-M` report's literal `#include`-directive
+  ## spelling, can no longer desync `includeClosureContentHash` for two
+  ## hosts (or two toolchains) probing the byte-identical file (the CR3
+  ## crux: `includeClosureContentHash` chains the raw path string into the
+  ## hash BEFORE the content). `h`'s TYPE — `paths.ReportedPath`, threaded
+  ## all the way from `ccprobe.depIncludeHeaders` — is what makes calling
+  ## this with an unresolved spelling impossible to get wrong silently
+  ## (CR10): there is no bare-`string` overload of this proc to
+  ## accidentally reach for instead.
+  ##
+  ## UNLIKE `closure.extractCompileInputs`'s loop, a header OUTSIDE every
+  ## tracked root is returned UNCHANGED here (merely lexically
+  ## canonicalized), never dropped: `ccIncludeClosure` derives a `cc -M`
+  ## (not `-MM`) probe SPECIFICALLY so system headers stay visible in the
+  ## hash (module doc, "the FULL cc -M #include closure" — a libc/header
+  ## backport must be able to invalidate the key). `classify`'s real-case
+  ## recovery machinery only exists for TRACKED members (`TrackedPath` has
+  ## no meaning for a file outside every root), so an untracked header's
+  ## reported case is NOT corrected — see this module's doc for the residual
+  ## this leaves.
+  let pc = classify(h, roots, expandCandidate)
+  case pc.kind
+  of pcTracked: toNative(pc.tp, roots)
+  of pcOutside: pc.native.path
+
+proc resolveReportedHeaders(headers: seq[ReportedPath]; roots: TrackedRoots;
+                            expandCandidate: CandidateExpander): seq[string] =
+  ## `resolveReportedHeaderPath` over the full header set, deduplicated on
+  ## the RESOLVED spelling (two originally-differently-cased reports of the
+  ## same tracked file collapse to one entry; two untracked reports that
+  ## differ only in formatting after canonicalization collapse too) — dedup
+  ## happens here, not in `includeClosureContentHash`, so a resolved
+  ## duplicate never double-counts a header's content into the chained hash.
+  var seen: HashSet[string]
+  for h in headers:
+    let r = resolveReportedHeaderPath(h, roots, expandCandidate)
+    if r notin seen:
+      seen.incl r
+      result.add r
+
 proc ccIncludeClosure*(ccCmd: string; run: RunProc = realRun;
-                       readFile: FileReaderProc = realFileReader):
-    tuple[headers: seq[string]; contentHash: string; ok: bool] =
-  ## Derive + run the `cc -M` invocation (via the injectable `RunProc` seam
-  ## — `crisol/ccprobe`'s own seam type, reused not reinvented) and fold the
-  ## resulting header set's CONTENT into a single hash. `ok = false` (with
-  ## empty headers/hash) iff EITHER the invocation could not be cleanly
-  ## derived (R1b/R4 — `deriveCcMInvocation` degrade: too few tokens or an
-  ## unterminated shell quote) OR the `cc -M` invocation itself failed; never
-  ## raises.
-  let inv = deriveCcMInvocation(ccCmd)
+                       readFile: FileReaderProc = realFileReader;
+                       roots: TrackedRoots;
+                       expandCandidate: CandidateExpander = safeExpandFilename):
+    tuple[headers: seq[string]; contentHash: string; ok: bool;
+          probeErr: ClosureProbeError; errMsg: string] =
+  ## Derive + run the dependency-probe invocation (via the injectable
+  ## `RunProc` seam — `crisol/ccprobe`'s own seam type, reused not
+  ## reinvented) and fold the resulting header set's CONTENT into a single
+  ## hash. The probe form and its parser are chosen per compiler family from
+  ## the manifest's own driver token (`ccprobe.deriveDepInvocation`), so this
+  ## reads a cl-produced command as correctly as a gcc-produced one.
+  ##
+  ## ## CR3/CR10 — case resolution (roots/expandCandidate)
+  ##
+  ## When `roots` is a POPULATED `TrackedRoots` (`paths.populated`), every
+  ## reported header is resolved via `resolveReportedHeaders` BEFORE it
+  ## becomes hash material — the W1 gate, applied here too (see that proc's
+  ## doc for exactly what is and is not corrected). When `roots` is the
+  ## unpopulated zero value, NO resolution happens at all and a reported
+  ## header's case (or a `.`/`..`/separator quirk) passes straight into the
+  ## hash unchanged, the pre-CR3 behavior.
+  ##
+  ## CR10: `roots` used to default to that unpopulated zero value
+  ## (`TrackedRoots()`), for "backward compatibility with existing 2/3-arg
+  ## call sites" — the exact shape of this codebase's recurring soundness
+  ## defect (a defaulted parameter a future/careless call site can forget
+  ## to override, and never notice it forgot). The default is gone: every
+  ## call site must now name `roots` explicitly, spelling out its choice —
+  ## a real `TrackedRoots` to opt into resolution, or an explicit
+  ## `TrackedRoots()` to opt out (this module's own unit tests do the
+  ## latter, deliberately, to exercise the pure parsing/hashing behavior in
+  ## isolation) — so "was resolution wired here" is answered by the diff
+  ## that added the call, not by whether whoever wrote it happened to know
+  ## this parameter existed. The ONE production call site
+  ## (`measureworker.recordArtifactRows`) already named `roots` explicitly
+  ## and is unaffected.
+  ##
+  ## `ok = false` (with empty headers/hash) iff the invocation could not be
+  ## cleanly derived (R1b/R4 — `deriveDepInvocation` degrade: too few tokens
+  ## or an unterminated shell quote), OR the probe invocation itself failed,
+  ## OR the probe ran but produced no usable dependency report
+  ## (`DepProbeError`, the MSVC arm's loud-failure path), OR (round-2 review)
+  ## the probe ran and produced a well-formed document whose own
+  ## `Data.Source` names a DIFFERENT translation unit than the one probed
+  ## (`sourceCheck == dscMismatch` — a stale or misattributed document; see
+  ## `cpeSourceMismatch`). `probeErr`/`errMsg` (CR3/W9c) distinguish WHICH of
+  ## these happened and name the ACTUAL probe family (`/sourceDependencies`
+  ## vs `cc -M`) rather than a hard-coded GNU spelling. Never raises.
+  let inv = deriveDepInvocation(ccCmd)
   if not inv.ok:
-    return (headers: newSeq[string](), contentHash: "", ok: false)
+    return (headers: newSeq[string](), contentHash: "", ok: false,
+            probeErr: cpeDerivationFailed,
+            errMsg: "could not derive a dependency-probe invocation from " &
+                    "the compile command (unterminated shell quote, or too " &
+                    "few tokens to name a source file): '" & ccCmd & "'")
+  let probeName = probeFamilyName(inv.family)
   let (output, ranOk) = run(inv.cmd, inv.args)
   if not ranOk:
-    return (headers: newSeq[string](), contentHash: "", ok: false)
-  let headers = ccIncludeHeaders(output, inv.sourceFile)
+    return (headers: newSeq[string](), contentHash: "", ok: false,
+            probeErr: cpeRunFailed,
+            errMsg: probeName & " probe invocation failed to run (command: " &
+                    inv.cmd & ")")
+  let probed = depIncludeHeaders(inv.family, output, inv.sourceFile)
+  if probed.err != dpeNone:
+    return (headers: newSeq[string](), contentHash: "", ok: false,
+            probeErr: toClosureProbeError(probed.err),
+            errMsg: probeName & " produced no usable dependency report (" &
+                    $probed.err & ")")
+  if probed.sourceCheck == dscMismatch:
+    # Round-2 review (MEDIUM), mirrors closure.extractCompileInputs's raise
+    # on the identical signal: `depIncludeHeaders`' own doc requires this be
+    # treated exactly as loudly as `probed.err != dpeNone` above -- a stale
+    # or misattributed /sourceDependencies document must never fall through
+    # as an empty-but-successful closure.
+    return (headers: newSeq[string](), contentHash: "", ok: false,
+            probeErr: cpeSourceMismatch,
+            errMsg: probeName & " returned a dependency report for a " &
+                    "DIFFERENT translation unit than the one probed (stale " &
+                    "or misattributed document; probed source: " &
+                    inv.sourceFile & ")")
+  var headers: seq[string]
+  if populated(roots):
+    headers = resolveReportedHeaders(probed.headers, roots, expandCandidate)
+  else:
+    # Deliberate, greppable escape hatch (CR10): `roots` was explicitly
+    # passed unpopulated, so resolution is skipped on purpose and each
+    # reported header's raw text is what becomes hash material — see this
+    # proc's own doc for when that is the right call.
+    headers = probed.headers.mapIt(string(it))
   result = (headers: headers,
             contentHash: includeClosureContentHash(headers, readFile),
-            ok: true)
+            ok: true, probeErr: cpeNone, errMsg: "")
 
 # ---------------------------------------------------------------------------
 # artifactKeyHash()
 # ---------------------------------------------------------------------------
 
+# SOUNDNESS-PARAMETER WARNING (round-5 review, R5-15(a), 2026-09-24).
+# `normalizedCcCmd` below is KEY MATERIAL — one of exactly three components this
+# proc folds — and it used to carry a `""` default. That is the shape R2-7
+# catalogued and defect L1 was caused by: omitting the parameter silently selects
+# the value that WEAKENS the key (the empty cc command, collapsing two units that
+# differ only in cc flags onto one hash), and the omission is invisible in review
+# because the short call simply looks short. The default is gone; the
+# `{.deprecated.}` companion below keeps every existing 2-arg call compiling while
+# the compiler reports the omission at the CALLER's own file:line, and `dev
+# check`'s `--warningAsError:Deprecated:on` is what holds `src/` to zero
+# omissions. Pass it EXPLICITLY, including `""` when you genuinely mean "no cc
+# command in this key" (the pure-hashing unit tests still reach `""` through
+# the deprecated 2-arg companion, on purpose).
+# Full rationale — including why a Low-blast-radius instance still gets the
+# class's treatment — in this module's doc, §artifactKeyHash().
 proc artifactKeyHash*(normalizedC: string; includeClosureContentHash: string;
-                      normalizedCcCmd: string = ""): string =
+                      normalizedCcCmd: string): string =
   ## The Stage-M key material hash: `normalized(ccCmd) ⊕ normalized .c
   ## content ⊕ full cc -M #include-closure content-hash` (R5 fix — see
   ## module doc §artifactKeyHash(): a true PREFIX of Stage R's `stageRKey`,
-  ## which additionally folds nimVersion/ccVersion). `normalizedCcCmd`
-  ## defaults to "" for backward compatibility with existing 2-arg call
-  ## sites (module doc explains why this is safe).
+  ## which additionally folds nimVersion/ccVersion). `normalizedCcCmd` has NO
+  ## default (R5-15(a)) — pass it explicitly; see the SOUNDNESS-PARAMETER note
+  ## above and the deprecated compatibility overload below.
   var running: uint64 = fnvOffset64
   running = chainComponent(running, normalizedCcCmd)
   running = chainComponent(running, normalizedC)
   running = chainComponent(running, includeClosureContentHash)
   result = toHex16(running)
+
+proc artifactKeyHash*(normalizedC: string;
+                      includeClosureContentHash: string): string
+    {.deprecated: "R5-15(a): pass normalizedCcCmd explicitly (\"\" when you genuinely mean no cc command in this key) — omitting it folds the EMPTY cc command into key material, collapsing two units that differ only in cc flags onto one hash".} =
+  ## Deprecated compatibility overload — see R5-15(a) in this module's doc,
+  ## §artifactKeyHash(), and the SOUNDNESS-PARAMETER note above.
+  ##
+  ## Forwards `""` — byte-for-byte what a call that omitted the argument already
+  ## computed, so no pinned hash, no golden r_size/r_time number and no test
+  ## output moves. No ambiguity with the 3-arg full overload above: that one now
+  ## REQUIRES its third argument, so a 2-arg call can only bind here and a 3-arg
+  ## call can only bind there. Same shape as `cachedispatch.shouldStore`'s and
+  ## `planner.cachePath`'s companions (R3-7/R4-4).
+  artifactKeyHash(normalizedC, includeClosureContentHash, "")
 
 # ---------------------------------------------------------------------------
 # reuseRatios()

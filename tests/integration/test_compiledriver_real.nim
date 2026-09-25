@@ -19,6 +19,7 @@
 
 import std/[os, osproc, tables, unittest]
 import crisol/compiledriver
+import crisol/closure
 
 let projectRoot = currentSourcePath().parentDir.parentDir.parentDir
   # test is at tests/integration/; go up 2 -> project root
@@ -51,10 +52,17 @@ suite "runMeasured — real live compile (pass_always fixture)":
     let manifestPath = nimcacheDir / "pass_always.json"
     check fileExists(manifestPath)
 
+    # The object extension belongs to the toolchain that produced the
+    # nimcache (`.o` under gcc/mingw, `.obj` under cl/vccexe), never to the
+    # host reading it -- accept whichever `closure.ObjectExtensions` this
+    # nimcache actually used rather than hardcoding `.o` (issue #21 slice 1a;
+    # a `.o`-only scan finds nothing and this `check` fails loudly on MSVC).
     var sawObjectFile = false
-    for f in walkFiles(nimcacheDir / "*.o"):
-      sawObjectFile = true
-      break
+    for ext in closure.ObjectExtensions:
+      for f in walkFiles(nimcacheDir / "*" & ext):
+        sawObjectFile = true
+        break
+      if sawObjectFile: break
     check sawObjectFile
 
     check fileExists(outputBinPath)

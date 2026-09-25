@@ -40,6 +40,13 @@ import crisol/types
 import crisol/depgraph
 import crisol/runner
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race (slot binaries / nimcache JSON deleted
+# mid-compile).
+let testStateDir = processStateDir("r66")
 
 proc fixtureDir(): string =
   let thisFile = currentSourcePath()
@@ -67,6 +74,7 @@ suite "rfc-0007 code-review r66 — fill-pass spawn failure respects the quarant
       compileTimeoutSecs: 30,
       timeoutSecs:        30,
       projectRoot:        getCurrentDir(),
+      stateDir:           testStateDir,
       trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
       quarantineTp:       toHashSet([ep.tp]),  # B3: whole-binary path rule
     )
@@ -112,6 +120,7 @@ suite "rfc-0007 code-review r66 — fill-pass spawn failure respects the quarant
       compileTimeoutSecs: 30,
       timeoutSecs:        30,
       projectRoot:        getCurrentDir(),
+      stateDir:           testStateDir,
       trackedRoots:       initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""),
       # quarantineTp deliberately empty — this entrypoint is NOT quarantined.
     )

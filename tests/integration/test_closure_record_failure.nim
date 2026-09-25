@@ -34,7 +34,7 @@
 ##         tests/integration/test_closure_record_failure.nim
 
 import std/[options, os, sets, tables, times, unittest]
-import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache, closure, ccprobe]
+import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache, closure, toolrun]
 import "../support/helpers"  # legacySeams
 import "../support/testep"
 

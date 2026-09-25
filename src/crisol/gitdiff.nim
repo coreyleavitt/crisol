@@ -49,12 +49,28 @@
 import std/[options, os, osproc, sets, strutils]  # process-contract-exempt: git is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
 import crisol/[toolexec, types]
 
+const
+  GitToolTimeoutMs* = 10_000
+    ## CR4: bound on one `git` invocation (`rev-parse`, `diff`, or
+    ## `ls-files`) — `changedFiles` runs in the host process during
+    ## plan-building, outside RFC-0007's Supervisor and its
+    ## `compileTimeoutMs`/tree-kill, so nothing else stops a `git` blocked on
+    ## an SSH/credential prompt or a hook from hanging the whole invocation.
+    ##
+    ## Generous relative to the actual cost: `rev-parse`/`diff`/`ls-files`
+    ## are all local-metadata reads that complete in well under a second on a
+    ## normal work tree (same order of magnitude as `ccidentity`'s measured
+    ## probe cost — see `toolrun.ToolProbeTimeoutMs`), so a legitimately
+    ## large repo is never at risk while a genuinely wedged `git` is bounded
+    ## to single-digit seconds and surfaces as a clear `CrisolError` instead
+    ## of a hang.
+
 # ---------------------------------------------------------------------------
 # Internal helper: run git without a shell
 # ---------------------------------------------------------------------------
 
 proc runGit(args: seq[string]; workingDir: string):
-    tuple[output, errOutput: string; exitCode: int] =
+    tuple[output, errOutput: string; exitCode: int; timedOut: bool] =
   ## Invoke `git <args>` in `workingDir` without a shell intermediary.
   ## Uses `poUsePath` so `git` is found via PATH. stderr is captured
   ## SEPARATELY from stdout and NEVER merged: git writes diagnostics to
@@ -63,24 +79,37 @@ proc runGit(args: seq[string]; workingDir: string):
   ## would let a warning line be parsed as a changed-file NAME — a real
   ## correctness bug that corrupted the changed set on the windows leg.
   ## stdout carries the machine-readable, NUL-separated names ONLY; stderr
-  ## is surfaced only in error messages. Returns (stdout, stderr, exitCode);
-  ## raises OSError if git cannot be exec'd at all.
+  ## is surfaced only in error messages. Returns (stdout, stderr, exitCode,
+  ## timedOut); raises OSError if git cannot be exec'd at all.
   ##
-  ## Both pipes are drained CONCURRENTLY (`toolexec.drainBoth`), never one
-  ## after the other. The previous shape -- stdout to EOF, then stderr --
-  ## rested on the claim that "git's stderr here is bounded to a few short
-  ## warning lines that comfortably fit the OS pipe buffer". That was wrong,
-  ## and issue #22 pins it: the very warning it cited, `core.autocrlf`'s "LF
-  ## will be replaced by CRLF", is emitted PER FILE, so a large checkout runs
-  ## far past the pipe budget (~4 KB on Windows). git then blocks inside its
-  ## own stderr `write`, never finishes stdout, never exits -- and the stdout
-  ## read never returns.
+  ## Both pipes are drained CONCURRENTLY (`toolexec.drainBothDeadline`),
+  ## never one after the other. The previous shape -- stdout to EOF, then
+  ## stderr -- rested on the claim that "git's stderr here is bounded to a
+  ## few short warning lines that comfortably fit the OS pipe buffer". That
+  ## was wrong, and issue #22 pins it: the very warning it cited,
+  ## `core.autocrlf`'s "LF will be replaced by CRLF", is emitted PER FILE, so
+  ## a large checkout runs far past the pipe budget (~4 KB on Windows). git
+  ## then blocks inside its own stderr `write`, never finishes stdout, never
+  ## exits -- and the stdout read never returns.
+  ##
+  ## CR4: bounded by `GitToolTimeoutMs` at both the drain and the
+  ## `waitForExit` stage. On `timedOut = true` the child has already been
+  ## terminated and reaped (`toolexec.terminateAndReap`) before this
+  ## returns — the caller never needs to clean up itself — and `exitCode` is
+  ## `-1`, a value real git never produces (POSIX/Windows exit codes are
+  ## non-negative), so it cannot be mistaken for a real exit.
   let p = startProcess("git", workingDir = workingDir, args = args,
                         options = {poUsePath})
   defer: close(p)
-  let (output, errOut) = drainBoth(p)
-  let code = waitForExit(p)
-  result = (output: output, errOutput: errOut, exitCode: code)
+  let (output, errOut, drainTimedOut) = drainBothDeadline(p, GitToolTimeoutMs)
+  if drainTimedOut:
+    terminateAndReap(p)
+    return (output: output, errOutput: errOut, exitCode: -1, timedOut: true)
+  let (code, waitTimedOut) = waitForExitDeadline(p, GitToolTimeoutMs)
+  if waitTimedOut:
+    terminateAndReap(p)
+    return (output: output, errOutput: errOut, exitCode: -1, timedOut: true)
+  result = (output: output, errOutput: errOut, exitCode: code, timedOut: false)
 
 proc splitNul(output: string): seq[string] =
   ## Splits `-z` git output on NUL, dropping empty fragments (a trailing NUL
@@ -160,8 +189,9 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
   # of letting git's own diagnostics leak through.
   var probeOut: string
   var probeCode: int
+  var probeTimedOut: bool
   try:
-    (probeOut, _, probeCode) = runGit(
+    (probeOut, _, probeCode, probeTimedOut) = runGit(
       @["rev-parse", "--is-inside-work-tree"],
       workingDir = projectRoot)
   except OSError as e:
@@ -170,6 +200,17 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
   except Exception as e:
     raise newCrisolError(cekEnvironment,
       "git is not available (could not execute 'git'): " & e.msg)
+
+  # CR4: distinguishable from every other outcome above -- those mean git
+  # answered (or could not even be started); this means it never answered at
+  # all within the deadline, which reads very differently to someone
+  # debugging a hang (e.g. a credential prompt) than "not a git repository".
+  if probeTimedOut:
+    raise newCrisolError(cekEnvironment,
+      "cannot confirm '" & projectRoot & "' is a git work tree: " &
+      "git rev-parse --is-inside-work-tree did not respond within " &
+      $GitToolTimeoutMs & "ms (it may be blocked on a credential/SSH " &
+      "prompt or a hook) [CR4 git timeout]")
 
   if probeCode != 0 or probeOut.strip() != "true":
     raise newCrisolError(cekEnvironment,
@@ -193,14 +234,24 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
 
   var diffOut, diffErr: string
   var diffCode: int
+  var diffTimedOut: bool
   try:
-    (diffOut, diffErr, diffCode) = runGit(diffArgs, workingDir = projectRoot)
+    (diffOut, diffErr, diffCode, diffTimedOut) =
+      runGit(diffArgs, workingDir = projectRoot)
   except OSError as e:
     raise newCrisolError(cekEnvironment,
       "git diff failed to execute: " & e.msg)
   except Exception as e:
     raise newCrisolError(cekEnvironment,
       "git diff failed to execute: " & e.msg)
+
+  # CR4: same distinction as the rev-parse probe above -- a timeout is not
+  # "git diff exited nonzero" and not "git could not be executed".
+  if diffTimedOut:
+    raise newCrisolError(cekEnvironment,
+      "git diff did not respond within " & $GitToolTimeoutMs &
+      "ms (it may be blocked on a credential/SSH prompt or a hook) " &
+      "[CR4 git timeout]")
 
   if diffCode != 0:
     raise newCrisolError(cekEnvironment,
@@ -224,8 +275,9 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
   # elsewhere.
   var untrackedOut: string
   var untrackedCode: int
+  var untrackedTimedOut: bool
   try:
-    (untrackedOut, _, untrackedCode) = runGit(
+    (untrackedOut, _, untrackedCode, untrackedTimedOut) = runGit(
       @["ls-files", "-z", "--others", "--exclude-standard"],
       workingDir = projectRoot)
   except:
@@ -245,6 +297,17 @@ proc changedFiles*(projectRoot: string; roots: TrackedRoots;
     stderr.write("crisol: warning: `git ls-files --others --exclude-standard` " &
                  "failed; untracked (not-yet-added) changed files may be " &
                  "missing from this --changed run's changed set\n")
+    try: stderr.flushFile() except CatchableError: discard
+    untrackedCode = -1
+
+  # CR4: a timeout here does not raise (`runGit` returns a flag, it does not
+  # except) -- fold it into the same best-effort degrade path above, with
+  # wording that names the timeout specifically rather than reusing "failed".
+  if untrackedTimedOut:
+    stderr.write("crisol: warning: `git ls-files --others --exclude-standard` " &
+                 "did not respond within " & $GitToolTimeoutMs & "ms; " &
+                 "untracked (not-yet-added) changed files may be missing " &
+                 "from this --changed run's changed set\n")
     try: stderr.flushFile() except CatchableError: discard
     untrackedCode = -1
 

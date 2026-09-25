@@ -88,8 +88,8 @@ suite "buildRunPlan — C4 omNone parity":
     let cfg = makeConfig(root, @["tests/unit/test_*.nim"])
     let sel = GroupSelection(kind: gskDefault)
 
-    let pvBase  = buildRunPlan(cfg = cfg, selection = sel)
-    let pvNone  = buildRunPlan(cfg = cfg, selection = sel, order = omNone)
+    let pvBase  = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "")
+    let pvNone  = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", order = omNone)
 
     check pvBase.runnable  == pvNone.runnable
     check pathSetOf(pvBase) == pathSetOf(pvNone)
@@ -117,10 +117,10 @@ suite "buildRunPlan — C4 shard × order composition":
     let sel = GroupSelection(kind: gskDefault)
 
     # Shard 1/2 without ordering
-    let pvShard = buildRunPlan(cfg = cfg, selection = sel,
+    let pvShard = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "",
                                shardK = 1, shardN = 2)
     # Shard 1/2 with omRecentFail ordering
-    let pvShardOrder = buildRunPlan(cfg = cfg, selection = sel,
+    let pvShardOrder = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "",
                                     shardK = 1, shardN = 2,
                                     order = omRecentFail)
 
@@ -147,9 +147,9 @@ suite "buildRunPlan — C4 shard × order composition":
     let cfg = makeConfig(root, @["tests/unit/test_*.nim"])
     let sel = GroupSelection(kind: gskDefault)
 
-    let pv1 = buildRunPlan(cfg = cfg, selection = sel,
+    let pv1 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "",
                            shardK = 1, shardN = 2, order = omRecentFail)
-    let pv2 = buildRunPlan(cfg = cfg, selection = sel,
+    let pv2 = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "",
                            shardK = 2, shardN = 2, order = omRecentFail)
 
     let s1 = pathSetOf(pv1)
@@ -188,7 +188,7 @@ suite "buildRunPlan — C4 omRecentFail ordering":
     let cfg = makeConfig(root, @["tests/unit/test_*.nim"])
     let sel = GroupSelection(kind: gskDefault)
 
-    let pv = buildRunPlan(cfg = cfg, selection = sel, order = omRecentFail)
+    let pv = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", order = omRecentFail)
     let paths = pathsOf(pv)
 
     # test_b failed at t=3000 (most recent), test_a at t=1000, test_c never failed
@@ -222,7 +222,7 @@ suite "buildRunPlan — C4 omDuration ordering":
     let cfg = makeConfig(root, @["tests/unit/test_*.nim"])
     let sel = GroupSelection(kind: gskDefault)
 
-    let pv = buildRunPlan(cfg = cfg, selection = sel, order = omDuration)
+    let pv = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", order = omDuration)
     let paths = pathsOf(pv)
 
     # descending: test_b(9000) > test_c(500) > test_a(100)

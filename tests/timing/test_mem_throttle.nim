@@ -33,6 +33,13 @@ let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
 import crisol/config
 import crisol/jsonout
 import "../support/testep"
+import "../support/statedir"
+
+# R8-D3: this process's own crisol state dir -- never the repo root's shared
+# .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
+# run in the same tree would race (slot binaries / nimcache JSON deleted
+# mid-compile).
+let testStateDir = processStateDir("memthrottle")
 
 # ---------------------------------------------------------------------------
 # Helpers (shared with test_max_jobs_overlap)
@@ -97,7 +104,7 @@ proc runWithMemConfig(eps: seq[Entrypoint];
     timeoutSecs:        30,
     compileTimeoutSecs: 120,
     maxOutputBytes:     10 * 1024 * 1024,
-    stateDir:           ".crisol",
+    stateDir:           testStateDir,
     projectRoot:        getCurrentDir(),
     trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
     memBudgetMb:        memBudgetMb,
@@ -128,7 +135,7 @@ proc runWithMemConfigThrottled(eps: seq[Entrypoint];
     timeoutSecs:        30,
     compileTimeoutSecs: 120,
     maxOutputBytes:     10 * 1024 * 1024,
-    stateDir:           ".crisol",
+    stateDir:           testStateDir,
     projectRoot:        getCurrentDir(),
     trackedRoots:       initTrackedRoots(getCurrentDir(), @[], ""),
     memBudgetMb:        memBudgetMb,

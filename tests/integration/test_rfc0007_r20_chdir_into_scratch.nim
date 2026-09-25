@@ -10,8 +10,8 @@
 ## FIX: RunOptions.chdirIntoScratch + Config.chdirIntoScratch (KDL
 ## `chdir-into-scratch #true`) + CLI `--chdir-into-scratch`, merged with
 ## the same CLI/library-wins precedence as the rlimit-* family in
-## api.planImpl, threaded to `resolveSandbox` at the api.nim:~1514 call
-## site.
+## api.planImpl, threaded to `resolveSandbox` at its one call site in
+## api.nim's `runTestsWith` (grep `chdirIntoScratch = cfg.chdirIntoScratch,  # r20`).
 ##
 ## Driven through the REAL entry point (`crisol run`), against an ISOLATED
 ## tmp project dir (own crisol.kdl, own cwd, own .crisol state dir -- same

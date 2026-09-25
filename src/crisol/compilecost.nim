@@ -47,7 +47,13 @@
 ## Row line (one JSON object per line):
 ##   {"rowVersion":1,"entrypointIdentity":"<str>","groupId":"<str>",
 ##    "configHash":"<str>","codegenUs":<int64>,"ccUs":<int64>,
-##    "linkUs":<int64>,"timestamp":<int64>}
+##    "linkUs":<int64>,"toolchainFp":"<str>","timestamp":<int64>}
+##
+## `toolchainFp` (W9l): the toolchain identity sibling of `artifactledger.
+## ArtifactRow.toolchainFp` -- see that field's doc for provenance (passed
+## down via `MeasurePlan.toolchainFp`, never re-probed by the worker) and for
+## why this is an OPTIONAL, non-format-version-bumping addition (a pre-W9l
+## row decodes with `toolchainFp == ""`).
 ##
 ## This stream is LEAN relative to `artifactledger.nim`: at most ONE row is
 ## appended per successful compile (one CompileCostRow per entrypoint per
@@ -113,6 +119,8 @@ type
     codegenUs*:          int64        ## raw codegen-phase wall time, microseconds
     ccUs*:                int64        ## raw whole-cc-phase wall time, microseconds
     linkUs*:              int64        ## raw link-phase wall time, microseconds
+    toolchainFp*:        string       ## W9l: toolchainFingerprint(nimVersion, ccVersion) this
+                                       ## compile ran under. "" = unknown/pre-W9l row.
     timestamp*:          int64        ## unix epoch microseconds
     rowVersion*:         int          ## must equal currentCompileCostRowVersion to be accepted
 
@@ -133,6 +141,7 @@ proc encodeCompileCostExtra(n: var JsonNode; row: CompileCostRow) =
   n["codegenUs"] = newJInt(row.codegenUs)
   n["ccUs"]      = newJInt(row.ccUs)
   n["linkUs"]    = newJInt(row.linkUs)
+  n["toolchainFp"] = newJString(row.toolchainFp)
 
 proc decodeCompileCostExtra(n: JsonNode; rv: int; ident: IdentityKey;
                              groupId, configHash: string; timestamp: int64): CompileCostRow =
@@ -144,6 +153,8 @@ proc decodeCompileCostExtra(n: JsonNode; rv: int; ident: IdentityKey;
     codegenUs:          n{"codegenUs"}.getBiggestInt(0),
     ccUs:               n{"ccUs"}.getBiggestInt(0),
     linkUs:             n{"linkUs"}.getBiggestInt(0),
+    # W9l: OPTIONAL on read -- see ArtifactRow.toolchainFp's doc.
+    toolchainFp:        n{"toolchainFp"}.getStr(""),
     timestamp:          timestamp,
   )
 

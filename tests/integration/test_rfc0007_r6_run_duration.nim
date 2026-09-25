@@ -5,7 +5,8 @@
 ## this fix, was never reset at the compile→run transition
 ## (`transitionToRun`) — `finalizeSlot`'s `elapsed` (computed from `t0`) is
 ## stamped as the RUN phase's `durationUs` (jsonout.nim documents compile+run
-## as independently summable, jsonout.nim:193-197), so a recompiled
+## as independently summable -- its module doc's `durationMs DROPPED` row),
+## so a recompiled
 ## entrypoint's reported run duration silently included its ENTIRE compile
 ## time. `spawnRunDirect` (the cdSkipFresh path) already reset `t0` fresh, so
 ## only the "just compiled, transitioning straight to run" path was affected
@@ -20,7 +21,7 @@
 ## fraction of it.
 ##
 ## Drives the real CLI surface (`runMain(... "--json")`) in-process, the same
-## `crisol/jsonout` wire the RFC's summing claim (jsonout.nim:193-197)
+## `crisol/jsonout` wire the RFC's summing claim (jsonout.nim's `durationMs DROPPED` row)
 ## describes — mirrors test_interrupt_e2e.nim's own JSON-field-path
 ## conventions (`entry["compile"]["durationUs"]` / `entry["run"]["durationUs"]`,
 ## `phaseToJson`'s <PhaseNode> shape) and test_rfc0007_a1f_authorship.nim's

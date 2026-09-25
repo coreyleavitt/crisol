@@ -39,7 +39,7 @@ import std/[options, os, strutils]
 import std/terminal as stdterm  # isatty(File) — cross-platform TTY check, no
                                 # std/posix needed (RFC-0007 A3); distinct
                                 # from crisol/terminal (color rendering) below
-import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccprobe, nimprobe, render, ioutils, paths]
+import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccidentity, nimprobe, render, ioutils, paths]
 import crisol/process  # rfc-0007 A7: capabilities() -- the real substrate node for run/v2 + plan/v1
 
 # `_exit(2)`: skips Nim's exitprocs/GC-finalize cleanup on the int8-overflow

@@ -152,7 +152,11 @@ type
       ## Lookups actually consulted: every per-result `CacheDecision` NOT in
       ## `notConsultedDecisions` (RFC: "hit + keyMiss + recomputeMiss +
       ## stored + hermeticityDegraded + flaky + closureUnrecorded +
-      ## trust-rejected").
+      ## toolchainUnidentified + trust-rejected"). `cdmToolchainUnidentified`
+      ## (W4 full fix) is deliberately NOT added to `notConsultedDecisions`
+      ## below: the run WAS consulted and DID execute live — only the
+      ## publish was refused — so it folds into `misses` exactly like
+      ## `cdmHermeticityDeg` does, with no separate counter needed.
     notConsulted*: int
       ## `cdmNotEligible` / `cdmGroupOptOut` / `cdmPolicyDisabled` — kept OUT
       ## of `total` so `hitPct` is not diluted by e.g. `cacheable #false`

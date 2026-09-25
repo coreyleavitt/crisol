@@ -476,8 +476,9 @@ suite "crisol closure — stale depgraph diagnostic":
     ## never match the running compiler's fingerprint. `closure --all --json`
     ## must still exit 0, but every entry must show recorded==false AND the
     ## discard must be a VISIBLE, STRUCTURED diagnostic — both in the JSON
-    ## `warnings` array and on stderr (crisol.nim's closure handler: `for w
-    ## in cr.warnings: stderr.write("warning: " & w.message & "\n")`) — not
+    ## `warnings` array and on stderr (crisol.nim's closure handler:
+    ## `writeWarnings(cr.warnings)`, i.e. `writeStderr("warning: " &
+    ## w.message)` per warning) — not
     ## silently indistinguishable from "never ran".
     let root = setUpProject()
     defer: removeDir(root)

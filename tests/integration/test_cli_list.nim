@@ -12,6 +12,7 @@
 
 import std/[json, monotimes, os, strutils, unittest]
 import crisol  # runMain
+import ../support/statedir
 import ../support/capture
 
 proc fixtureDir(): string =
@@ -23,6 +24,18 @@ proc fixtureDir(): string =
 const RunMarkers = ["[OK]", "[FAIL]", "[COMPILE]", "PASSED:", "FAILED:"]
 
 suite "crisol list / run --dry-run — B6 (no execution)":
+
+  # R8-D3: `run` with no --config roots at the repo, so its state (bin/,
+  # cache/, depgraph, lastrun.json) and its lock would be <repo>/.crisol --
+  # shared with any concurrent crisol run in the same tree, which then races
+  # this suite's compiles or turns it into exit 3 ("another crisol run is in
+  # progress"). CRISOL_STATE_DIR moves all of it to a per-test temp dir.
+  setup:
+    let isoState = freshStateDir("clilist")
+    let savedStateEnv = redirectStateDir(isoState)
+  teardown:
+    restoreStateDir(savedStateEnv)
+    removeDir(isoState)
 
   # -------------------------------------------------------------------------
   # list: human output

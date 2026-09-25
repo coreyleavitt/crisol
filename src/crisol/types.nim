@@ -20,7 +20,8 @@ import crisol/process/types as ptypes
 export ptypes.Outcome, ptypes.HermeticLevel
 # RFC-0009 A2: `Config.trackedRoots` (below) is a `paths.TrackedRoots` --
 # needed here just to name the field's type; paths.nim imports nothing from
-# this module (or anywhere else in the package), so this cannot cycle.
+# this module (its only crisol import is the std-only `ioutils`), so this
+# cannot cycle.
 import crisol/paths
 # RFC-0009 A3a-i: `Entrypoint` (below) now carries a `tp: TrackedPath`
 # field. A bare `import crisol/paths` (above) only makes its symbols
@@ -511,7 +512,8 @@ type
                                 ## `resolveSandbox`. Empty by default -- nothing pinned unless an
                                 ## operator opts in (§Non-Goals: no default pins in RFC-0005).
     chdirIntoScratch*: bool    ## rfc-0007 code-review r20: config-declared opt-in for
-                                ## `SandboxSpec.chdirIntoScratch` (sandbox.nim) -- runner.nim's
+                                ## `SandboxSpec.chdirIntoScratch` (above; set by
+                                ## `sandbox.resolveSandbox`) -- runner.nim's
                                 ## run child picks its cwd from this field, but before this slice
                                 ## NOTHING ever set it (no RunOptions field, no KDL key, no CLI
                                 ## flag existed). Populated from the top-level `chdir-into-scratch
@@ -681,6 +683,27 @@ type
                            ## oPassed — e.g. a derivation/policy change since the
                            ## entry was stored.  Treated as a MISS and rerun; distinct
                            ## from cdmKeyMiss (no entry was found at all).
+    cdmToolchainUnidentified  ## W4 (full fix, RFC-0005 §trust): a fresh pass on
+                           ## attempt 1, fully hermetic — but the host's
+                           ## `CcFingerprint` folds at least one half to a
+                           ## documented sentinel (`ccidentity.toolchainUnsound`),
+                           ## so the SoundnessKey's cc component does not
+                           ## actually distinguish this host's real toolchain
+                           ## from any other host in the same degraded state.
+                           ## Publishing under that key is cross-host cache
+                           ## poisoning by under-invalidation (a different host,
+                           ## a different real compiler/runtime, same folded
+                           ## constant, gets a HIT) — strictly worse than a
+                           ## miss, so the store gate refuses it outright.
+                           ## Distinct from a merely-missing content DIGEST
+                           ## (`ccidentity.CcDigestKind.cdkNone`, e.g. the
+                           ## Windows `cdVersionOnly` profile), which is a
+                           ## legitimate, already-accepted degradation and
+                           ## must NOT trip this decision. The READ path
+                           ## (lookupAtPlan / consultPostCompile) is
+                           ## unaffected — a degraded host may still LOOK UP
+                           ## and legitimately USE an existing entry; only
+                           ## the WRITE is gated. See `cachedispatch.shouldStore`.
 
   KeyComponent* = enum
     ## RFC-0005 B1a/B1c: names WHICH of the 10 `KeyInputs` soundness
@@ -1007,8 +1030,9 @@ type
     ##     policy "none"`).
     ##   - **Depgraph discard** (`pipeline.nim`'s `buildRunPlan`, `context:
     ##     "depgraph"`) — the persisted dep graph was discarded whole
-    ##     (nimVersion/formatVersion/fold-policy mismatch, or an
-    ##     unreadable/malformed file); `depgraph.nim`'s `key`/`message` procs
+    ##     (nimVersion/ccVersion/formatVersion/fold-policy mismatch, an
+    ##     unknown root name, or an unreadable/malformed file);
+    ##     `depgraph.nim`'s `key`/`message` procs
     ##     are the single formatting authority for this fact.
     ##   - **Fold-lever advisory** (`pipeline.nim`'s `buildRunPlan`, `context:
     ##     "changed-set-fold"`) — a non-ASCII name in the `--changed` changed
@@ -1016,7 +1040,7 @@ type
     ##     the ASCII-only fold and fell back to the full discovered set for
     ##     this run (RFC-0009 "Risks accepted", NFC/NFD bullet).
     ##   - **Measure-compile-reuse with no worker binary** (`api.nim`'s
-    ##     `runTestsWith`, `context: "measure-compile-reuse"`) — an explicit
+    ##     `planImpl`, `context: "measure-compile-reuse"`) — an explicit
     ##     `--measure-compile-reuse` request silently degrades to the
     ##     monolithic compile path when no worker binary is configured; this
     ##     makes that degradation visible to a `--json` consumer whose stderr

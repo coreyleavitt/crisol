@@ -201,7 +201,7 @@ suite "pipeline.buildRunPlan — NFC/NFD lever wiring":
     let helperIncluded = fromCanonical("tests/unit/helper_included.nim", roots).get
     let changed = [helperIncluded, ghost].toHashSet
 
-    let pv = buildRunPlan(cfg = cfg, selection = sel, useChanged = true, changed = changed)
+    let pv = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", useChanged = true, changed = changed)
     let selected = pathSetOf(pv)
     check "tests/unit/test_included.nim" in selected
     check string(excluded.display()) in selected   # would be a closure-miss under real narrowing
@@ -217,7 +217,7 @@ suite "pipeline.buildRunPlan — NFC/NFD lever wiring":
     let helperIncluded = fromCanonical("tests/unit/helper_included.nim", roots).get
     let changed = [helperIncluded].toHashSet
 
-    let pv = buildRunPlan(cfg = cfg, selection = sel, useChanged = true, changed = changed)
+    let pv = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", useChanged = true, changed = changed)
     let selected = pathSetOf(pv)
     check "tests/unit/test_included.nim" in selected
     check string(excluded.display()) notin selected
@@ -234,7 +234,7 @@ suite "pipeline.buildRunPlan — NFC/NFD lever wiring":
     let helperIncluded = fromCanonical("tests/unit/helper_included.nim", roots).get
     let changed = [helperIncluded, ghost].toHashSet
 
-    let pv = buildRunPlan(cfg = cfg, selection = sel, useChanged = true, changed = changed)
+    let pv = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", useChanged = true, changed = changed)
     let selected = pathSetOf(pv)
     check "tests/unit/test_included.nim" in selected
     check string(excluded.display()) notin selected
@@ -250,7 +250,7 @@ suite "pipeline.buildRunPlan — NFC/NFD lever wiring":
     let ghost = fromCanonical("tests/unit/tëst_ghost.nim", roots).get
     let changed = [ghost].toHashSet
 
-    let pv = buildRunPlan(cfg = cfg, selection = sel, useChanged = true, changed = changed)
+    let pv = buildRunPlan(cfg = cfg, selection = sel, ccVersion = "", useChanged = true, changed = changed)
     var found = false
     for w in pv.warnings:
       if w.context == "changed-set-fold" and w.key == "nonAsciiChangedName":

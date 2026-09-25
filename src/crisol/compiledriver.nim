@@ -1,7 +1,8 @@
 ## compiledriver.nim — RFC-0006 M-driver: split-compile MEASUREMENT driver.
 ##
 ## crisol compiles each entrypoint as one opaque `nim c ... -o:<bin> <ep>`
-## (runner.nim:379 builds the nimcache arg, runner.nim:393 forkExec's it).
+## (runner.nim's `spawnCompileStable` builds it via `nimCompileArgs`, below,
+## and hands it to the Supervisor as the slot's compile child).
 ## That hides the codegen/cc/link cost split RFC-0006's Stage M needs to
 ## report `cc%` and per-unit cc wall-time (the inputs to the whole
 ## Stage R/S decision gate — see docs/rfc/0006). This module drives ONE
@@ -59,7 +60,15 @@
 ## phases that DID complete before the failure are preserved (e.g. a link
 ## failure still reports real codegen/cc spans).
 
-import std/[monotimes, os, osproc, sequtils, streams, tables, times]  # process-contract-exempt: measure-mode realCompileOnly/cc/link, aligned at A2c — not the entrypoint compile/run children (RFC-0007 §Scope)
+import std/[monotimes, os, osproc, sequtils, tables, times]  # process-contract-exempt: measure-mode realCompileOnly/cc/link, aligned at A2c — not the entrypoint compile/run children (RFC-0007 §Scope)
+# NOTE (R4-6): std/streams is deliberately NOT imported here. `p.outputStream`
+# is osproc's own accessor and the returned `Stream` is only ever handed
+# straight to `toolexec.drainToEof`, which is where the streams API is
+# actually called — this module names no `streams` symbol of its own, in any
+# branch (it has no `when defined(...)` code at all). Keeping the import made
+# `nim check --warningAsError:UnusedImport:on` fail, which is fatal for
+# consumers that build with that flag (amoxtli does); the gate that now
+# enforces this lives in `./dev check` and in ci.yml's src/ soundness step.
 import crisol/toolexec  # drainBoth/drainToEof -- the capture primitives (issue #22)
 import crisol/closure
 
@@ -72,8 +81,8 @@ type
                           nimcacheDir, outputBinPath: string):
                             tuple[ok: bool; output: string] {.closure.}
     ## Runs codegen only. Real impl (`realCompileOnly`): argv-array spawn, no
-    ## shell — mirrors runner.nim's forkExec compile-arg construction
-    ## (runner.nim:379-393), plus `--compileOnly`.
+    ## shell — the same `nimCompileArgs` argv runner.nim's
+    ## `spawnCompileStable` uses for the real compile, plus `--compileOnly`.
 
   CompileUnit* = tuple[basename: string; ccCmd: string]
     ## One entry from the manifest's raw `compile` array (see
@@ -101,7 +110,7 @@ type
     ## the string (matches Nim's own `execLinkCmd`, which also shell-invokes it).
 
   CompileDriver* = object
-    ## Closure-field seam object (crisol idiom — mirrors ccprobe.RunProc).
+    ## Closure-field seam object (crisol idiom — mirrors toolrun.RunProc).
     ## `newMeasureDriver` builds the real measure-mode implementation.
     compileOnly*: CompileOnlyProc
     runCc*:       RunCcProc
@@ -245,8 +254,25 @@ proc defaultRunCc*(units: seq[CompileUnit];
     oks[idx] = p.peekExitCode() == 0
 
   let n = max(1, concurrency)
-  discard execProcesses(cmds, {poStdErrToStdOut, poUsePath, poParentStreams},
-                        n, before, after)
+  # poParentStreams is the correct choice here, not poStdErrToStdOut: this
+  # phase exists to be a faithful reproduction of Nim's own cc phase (see
+  # module doc §Concurrency) — real `nim c` lets each cc invocation's
+  # stdout/stderr go straight to the terminal the compiler itself was run
+  # from, interleaved live across the concurrency window, which is exactly
+  # what a human watching a slow parallel compile wants to see. Neither
+  # `CcUnitResult` nor `RunCcResult` carries an `output` field (unlike
+  # `compileOnly`/`link` above, whose output IS captured because callers
+  # inspect it on failure) — nothing here reads cc output, so there is
+  # nothing to merge into anything.
+  # osproc silently ignores `poStdErrToStdOut` once `poParentStreams` is
+  # set (with parent streams the child writes straight to the parent's
+  # OS-level handles; there is no pipe for osproc to merge stderr into) —
+  # so keeping that flag here just asserted an intent this call never
+  # delivered. Dropped rather than acted on: capturing/merging would mean
+  # buffering N processes' interleaved output only to discard it, and it
+  # would take live cc progress away from the terminal, which is the
+  # observable behavior this driver is explicitly designed to preserve.
+  discard execProcesses(cmds, {poUsePath, poParentStreams}, n, before, after)
 
   result.units = newSeq[CcUnitResult](units.len)
   var allOk     = true

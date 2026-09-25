@@ -8,7 +8,8 @@
 ## FIX: RunOptions.envPassthroughs + Config.envPassthroughs (KDL repeatable
 ## `env-passthrough "NAME"`) + CLI `--env-passthrough NAME` (repeatable),
 ## merged as a deduplicated UNION (api.envPassthroughsFrom) and threaded to
-## `resolveSandbox`'s `passthroughs` param at the api.nim:~1514 call site.
+## `resolveSandbox`'s `passthroughs` param at its one call site in api.nim's
+## `runTestsWith` (grep `passthroughs = cfg.envPassthroughs,  # r21`).
 ##
 ## SOUNDNESS: a passed-through variable's live host VALUE already enters
 ## the soundness key via the EXISTING mechanism -- `resolveSandbox` folds
