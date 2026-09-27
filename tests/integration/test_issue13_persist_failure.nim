@@ -153,7 +153,7 @@ suite "issue #13.3 — a depgraph persist failure must not let a reverted source
     check readFile(markerPath).strip == "2"
     check "could not record its source closure" in broken.stderr
     check "dependency graph could not be persisted" in broken.stderr
-    check "its binary was discarded" in broken.stderr
+    check "binary will not be kept" in broken.stderr
 
     # The stable binary must be gone — nothing on disk describes its
     # provenance now (the depgraph entry still names the OLD closure hash).

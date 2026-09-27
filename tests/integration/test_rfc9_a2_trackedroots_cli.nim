@@ -58,7 +58,7 @@ group "unit" {
     discard stderrText
     check code == 0
     let doc = parseJson(stdoutText)
-    check doc["schemaRevision"].getInt == 26
+    check doc["schemaRevision"].getInt == 27
 
     # RED before wiring: `doc["trackedRoots"]` renders the jsonout
     # zero-value default (project only, dep root silently dropped) because

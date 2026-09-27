@@ -15,6 +15,7 @@ import crisol/types
 import crisol/depgraph
 import crisol/runner
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -74,13 +75,13 @@ suite "skip-fresh — compile avoidance integration":
 
     # First run: empty graph, binary does not exist yet.
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, "", false)
+    let p = plan(cfg, @[ep], graph, false)
     check p.entrypoints.len == 1
     check p.entrypoints[0].edecision == edNeverBuilt
 
     let results = execute(p, config = cfg, graph = graph,
                           nimVersion = "",
-                          showProgress = false).results
+                          showProgress = false, toolchain = unprobedToolchain()).results
     check results.len == 1
     check results[0].outcome == oPassed
     check results[0].compileSkipped == false
@@ -102,10 +103,10 @@ suite "skip-fresh — compile avoidance integration":
 
     # Run 1: compile and record.
     var graph1 = initDepGraph("")
-    let p1 = plan(cfg, @[ep], graph1, "", false)
+    let p1 = plan(cfg, @[ep], graph1, false)
     let results1 = execute(p1, config = cfg, graph = graph1,
                            nimVersion = "",
-                           showProgress = false).results
+                           showProgress = false, toolchain = unprobedToolchain()).results
     check results1.len == 1
     check results1[0].outcome == oPassed
 
@@ -115,13 +116,13 @@ suite "skip-fresh — compile avoidance integration":
     check (string(ep.tp.display()), fHash) in graph2.entries
 
     var graph2Mut = graph2
-    let p2 = plan(cfg, @[ep], graph2Mut, "", false)
+    let p2 = plan(cfg, @[ep], graph2Mut, false)
     check p2.entrypoints.len == 1
     check p2.entrypoints[0].edecision == edRunFresh
 
     let results2 = execute(p2, config = cfg, graph = graph2Mut,
                            nimVersion = "",
-                           showProgress = false).results
+                           showProgress = false, toolchain = unprobedToolchain()).results
     check results2.len == 1
     check results2[0].outcome == oPassed
     check results2[0].compileSkipped == true
@@ -136,22 +137,22 @@ suite "skip-fresh — compile avoidance integration":
 
     # Run 1: compile and record.
     var graph1 = initDepGraph("")
-    let p1 = plan(cfg, @[ep], graph1, "", false)
+    let p1 = plan(cfg, @[ep], graph1, false)
     let results1 = execute(p1, config = cfg, graph = graph1,
                            nimVersion = "",
-                           showProgress = false).results
+                           showProgress = false, toolchain = unprobedToolchain()).results
     check results1[0].outcome == oPassed
 
     # Run 2 with forceCompile=true: must be cdStale (not cdSkipFresh).
     let graph2 = loadDepGraph(cfg, "")
     var graph2Mut = graph2
-    let p2 = plan(cfg, @[ep], graph2Mut, "", true)   # forceCompile=true
+    let p2 = plan(cfg, @[ep], graph2Mut, true)   # forceCompile=true
     check p2.entrypoints.len == 1
     check p2.entrypoints[0].edecision == edStale
 
     let results2 = execute(p2, config = cfg, graph = graph2Mut,
                            nimVersion = "",
-                           showProgress = false).results
+                           showProgress = false, toolchain = unprobedToolchain()).results
     check results2.len == 1
     check results2[0].outcome == oPassed
     check results2[0].compileSkipped == false
@@ -171,20 +172,20 @@ suite "skip-fresh — compile avoidance integration":
 
     # Run 1 for ep1 only.
     var graph1 = initDepGraph("")
-    let p1 = plan(cfg, @[ep1], graph1, "", false)
+    let p1 = plan(cfg, @[ep1], graph1, false)
     let r1 = execute(p1, config = cfg, graph = graph1,
-                     nimVersion = "", showProgress = false).results
+                     nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
     check r1[0].outcome == oPassed
 
     # Run 2: ep1 should be fresh, ep2 should be never-built.
     let graph2 = loadDepGraph(cfg, "")
     var graph2Mut = graph2
-    let p2 = plan(cfg, @[ep1, ep2], graph2Mut, "", false)
+    let p2 = plan(cfg, @[ep1, ep2], graph2Mut, false)
     check p2.entrypoints[0].edecision == edRunFresh
     check p2.entrypoints[1].edecision == edNeverBuilt
 
     let r2 = execute(p2, config = cfg, graph = graph2Mut,
-                     nimVersion = "", showProgress = false).results
+                     nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
     check r2.len == 2
     check r2[0].outcome == oPassed
     check r2[0].compileSkipped == true

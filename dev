@@ -179,10 +179,11 @@ case "${cmd}" in
         rm -rf "${PROJECT_DIR}/nimcache" "${PROJECT_DIR}/bin" "${PROJECT_DIR}/.crisol"
         ;;
     help|*)
-        # Lines 2..23: the title line through the last usage entry. Both bounds
-        # are load-bearing -- it was '4,20p', which started mid-sentence at line
-        # 4 AND stopped three entries short, hiding `shell`, `clean` and `help`
-        # (R5-2, found in passing). If you add a usage line, move the 23.
-        sed -n '2,23p' "$0"
+        # The header comment block: every `#` line after the shebang, up to
+        # the first line that is not a comment. Computed, not a fixed line
+        # range: a range ('4,20p', then '2,23p') had to be moved by hand for
+        # every usage line, and once hid `shell`, `clean` and `help` (R5-2,
+        # R6-D10).
+        awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"
         ;;
 esac

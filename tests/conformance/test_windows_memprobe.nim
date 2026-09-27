@@ -1,7 +1,9 @@
 ## test_windows_memprobe.nim — rfc-0007 D2a-1: `groupRssBytes` is a REAL
 ## live sum on Windows (no longer the `none()` stub D1a left honestly
-## degraded), and `globalShutdownSignal()` — the getter `crisol/signals`
-## delegates onto — exists and compiles against this backend.
+## degraded), and `shutdownRequested()` — the one reader of the interrupt
+## record (`crisol/signals`; R14-D5 removed the backend's
+## `globalShutdownSignal` pass-through) — compiles and reads against this
+## backend.
 ##
 ## `groupRssBytes` peer of test_conformance_forensics.nim (the cross-
 ## platform C1b file, which cannot cover Windows until this slice): same
@@ -10,10 +12,10 @@
 ## page residency and process-group-scan timing are never guaranteed by a
 ## fixed delay).
 ##
-## `globalShutdownSignal` gets only a light liveness/compile proof here: a
+## `shutdownRequested` gets only a light liveness/compile proof here: a
 ## fresh process, no CTRL event ever sent, so `isNone` is the entire
 ## contract this case can honestly exercise. The getter's STAMPED path
-## (gShutdownSignum written by ctrlHandlerProc) is already proven live by
+## (the scope signal `tooltrees`' console handler writes) is proven live by
 ## D1b-i's coopstop CTRL_BREAK-to-child tests and by `next()`'s `weShutdown`
 ## reading the same global — sending a console ctrl event to the test
 ## process itself would risk killing the test runner, so that path is
@@ -33,10 +35,11 @@ when defined(windows):
   import ./helpers
   import crisol/types
   import crisol/process/types as ptypes
+  import crisol/signals
 
   let rssHogBin = compileFixture("rss_hog")
 
-  suite "rfc-0007 D2a-1 — windows memprobe: groupRssBytes is real, globalShutdownSignal exists":
+  suite "rfc-0007 D2a-1 — windows memprobe: groupRssBytes is real, shutdownRequested reads":
 
     test "rss_hog: groupRssBytes live sum is plausible":
       var sv = initSupervisor(installSignals = false)
@@ -65,8 +68,8 @@ when defined(windows):
       check rss.isSome
       check rss.get > 1 * 1024 * 1024   # > 1 MiB — plausible for an 8 MiB touch, never fabricated
 
-    test "globalShutdownSignal: none in a fresh process with no CTRL event sent":
-      check globalShutdownSignal().isNone
+    test "shutdownRequested: none in a fresh process with no CTRL event sent":
+      check shutdownRequested().isNone
 
   when isMainModule:
     echo "test_windows_memprobe done"

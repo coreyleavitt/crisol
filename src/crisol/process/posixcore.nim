@@ -37,6 +37,7 @@ import std/[options, os, posix, sets, tables, monotimes, times]
 import crisol/process/types
 import crisol/process/procscan
 import crisol/process/caps
+import crisol/process/tooltrees  # the one SIGINT/SIGTERM handler and its scope (R11-L4, R12-D3)
 when defined(linux):
   # R5-2: same guard as every use. Each `cgroup.*` call site below (spawn's
   # leaf creation, forceKillCore's `cgroup.kill`, reapCore's survivor/oom/peak
@@ -53,23 +54,6 @@ var RLIMIT_CORE   {.importc: "RLIMIT_CORE",   header: "<sys/resource.h>".}: cint
 var RLIMIT_FSIZE  {.importc: "RLIMIT_FSIZE",  header: "<sys/resource.h>".}: cint
 var RLIMIT_CPU    {.importc: "RLIMIT_CPU",    header: "<sys/resource.h>".}: cint
 var RLIMIT_AS     {.importc: "RLIMIT_AS",     header: "<sys/resource.h>".}: cint
-
-proc sigactionRaw(signum: cint; act: ptr Sigaction; oact: ptr Sigaction): cint {.
-  importc: "sigaction", header: "<signal.h>".}
-  ## rfc-0007 code-review r69: a duplicate `importc` of the SAME C
-  ## `sigaction(2)` symbol as std/posix's own `sigaction` proc — safe and
-  ## idiomatic (same discipline as the RLIMIT_* duplicate-importc `var`s
-  ## above: no C definition is emitted, only a reference through the
-  ## header) — but with `ptr Sigaction` (not `var Sigaction`) parameters,
-  ## so a caller CAN legally pass a real NULL for either argument: the
-  ## POSIX "query-only" (`act == NULL`, disposition unchanged) and
-  ## "install-only" (`oact == NULL`, prior disposition discarded) forms
-  ## std/posix's own two overloads cannot express (both require an actual
-  ## `var Sigaction` — never absent — for the new-action argument).
-  ## `initPosixCore` uses the query form to SAVE the disposition in effect
-  ## before installing crisol's own handler; `destroyPosixCore` uses the
-  ## install form to RESTORE it — see `PosixCore.prevSigint`/
-  ## `prevSigterm`'s field doc comments.
 
 proc forcePollRequested(): bool =
   ## rfc-0007 B2 checklist item 544's env knob: forces `next()` onto the
@@ -354,37 +338,6 @@ type
                                   ## unconditionally, so a nested/second
                                   ## Supervisor sharing a process never
                                   ## clobbers a bit it did not itself set.
-    prevSigint: Sigaction          ## rfc-0007 code-review r69: the SIGINT
-                                  ## disposition that was in effect
-                                  ## immediately before THIS core's
-                                  ## `initPosixCore` installed
-                                  ## `shutdownSigHandler` — meaningful ONLY
-                                  ## when `installedSignals` is true (same
-                                  ## "only if THIS core set it" discipline
-                                  ## as `subreaperSet`); `destroyPosixCore`
-                                  ## restores it under `installedSignals`
-                                  ## AND (r73) `gShutdownWriteFd ==
-                                  ## core.pipeWrite` — the LATTER
-                                  ## specifically because `initPosixCore`
-                                  ## is not a process-wide singleton: a
-                                  ## non-LIFO destroy of two live cores
-                                  ## must never let the OLDER (non-owning)
-                                  ## one's restore clobber the disposition
-                                  ## the NEWER one still needs — so an
-                                  ## embedding host's own prior handler (or
-                                  ## SIG_DFL) comes back rather than being
-                                  ## silently replaced forever, but ONLY
-                                  ## once the actual owning core tears
-                                  ## down. (r80: two live `installSignals
-                                  ## = true` cores is no longer a
-                                  ## reachable state at all — the SECOND
-                                  ## concurrent `initPosixCore` call
-                                  ## raises `OSError` instead — but this
-                                  ## ownership gate stays regardless, both
-                                  ## as defense-in-depth and because it
-                                  ## also guards the `gShutdownWriteFd`
-                                  ## clear immediately above it.)
-    prevSigterm: Sigaction         ## SIGTERM's peer of `prevSigint`.
     preExisting: Table[int, int64] ## rfc-0007 code-review r3 (identity
                                   ## fixed by r60): pid -> starttime for
                                   ## every process that was already a child
@@ -425,45 +378,34 @@ type
 # ---------------------------------------------------------------------------
 # Self-pipe + shutdown signal handler.
 #
-# sigaction handlers cannot capture state, so the write end lives in a
-# module-level global — exactly the "process-global handler must reach a
-# per-run Supervisor's pipe" seam §1's lifecycle rules name. One Supervisor
-# with installSignals=true is the supported configuration per process.
+# sigaction handlers cannot capture state, so the handler reaches a per-run
+# Supervisor's self-pipe through a process global — exactly the "process-
+# global handler must reach a per-run Supervisor's pipe" seam §1's lifecycle
+# rules name. One Supervisor with installSignals=true is the supported
+# configuration per process.
 #
-# rfc-0007 A4: the handler ALSO stamps `gShutdownSignum`, a second,
-# sticky, async-signal-safe global — the same write(2) syscall that wakes a
-# blocked `next()` cannot be "the" state on its own, because it is drained
-# per-instance (`PosixCore.pendingShutdown`, consumed edge-triggered, once
-# per delivered signal — §1's weShutdown contract) and unreachable from
-# outside the owning Supervisor. `gShutdownSignum` is the process-global,
-# level-triggered mirror `crisol/signals.shutdownRequested()` reads: ONE
-# handler, ONE signal delivery, two consumption models over the same fact
-# — never two independent `sigaction` installs racing to overwrite each
-# other. This is the seam A4 unifies signals.nim onto for real.
+# R12-D3: the handler itself is `tooltrees`' — the ONE SIGINT/SIGTERM handler
+# crisol has, open for an interrupt scope (`enterInterruptScope`) rather than
+# for one Supervisor's lifetime, so a run that opens a scope before planning
+# (`runcore.runTestsWith` with `installSignals`, the CLI) keeps it through
+# planning and execution alike. An `installSignals = true` core enters a scope
+# (the outermost one installs the handler and saves the host's dispositions;
+# inside a run's scope this nests) and attaches its self-pipe as the scope's
+# wake (`attachInterruptWake`); `destroyPosixCore` detaches it and leaves the
+# scope (the outermost leave restores the host's dispositions, the r69 rule).
+# The handler kills every live bounded tool, stamps the scope's signal, and
+# writes the signal number to the attached self-pipe — the same write(2) that
+# wakes a blocked `next()`, drained per instance (`PosixCore.pendingShutdown`,
+# consumed edge-triggered, once per delivered signal — §1's weShutdown
+# contract). The scope's signal is the level-triggered view
+# `tooltrees.shutdownRequested()` reads (re-exported as
+# `crisol/signals.shutdownRequested`, rfc-0007 A4): ONE handler, ONE signal
+# delivery, two consumption models over the same fact. It lasts as long as
+# the outermost scope (R13-D2): an interrupt is a fact about the run it
+# landed in, never a process-lifetime latch. Which core owns the wake-up is
+# recorded once, in `tooltrees` (the attached wake, R13-D4): this module keeps
+# no token of its own.
 # ---------------------------------------------------------------------------
-
-var gShutdownWriteFd {.global.}: cint = -1
-var gShutdownSignum {.global, volatile.}: cint = 0
-
-proc shutdownSigHandler(signum: cint) {.noconv.} =
-  ## Async-signal-safe: writes the signal number to the self-pipe (Supervisor
-  ## wakeup) and stamps the sticky global (shutdownRequested()). No Nim
-  ## runtime, no alloc, no GC — a volatile store and a write(2), nothing else.
-  gShutdownSignum = signum
-  if gShutdownWriteFd >= 0:
-    var b = uint8(signum)
-    discard posix.write(gShutdownWriteFd, addr b, 1)
-
-proc globalShutdownSignalCore*(): Option[ShutdownSignal] =
-  ## Process-global, level-triggered view of the last shutdown signal any
-  ## installSignals=true Supervisor in THIS process has observed (§1's
-  ## `shutdownRequested()` seam) — sticky by design: unlike `next()`'s
-  ## per-instance `weShutdown` (edge-triggered, consumed once), a caller
-  ## with no Supervisor reference at all must still be able to ask "was a
-  ## shutdown ever requested here" at any later point.
-  let s = gShutdownSignum
-  if s != 0: some(ShutdownSignal(signum: int(s)))
-  else: none(ShutdownSignal)
 
 proc initPosixCore*(installSignals: bool): PosixCore =
   ## `initSupervisor` can fail (§1) — this raises OSError (a structural
@@ -559,34 +501,32 @@ proc initPosixCore*(installSignals: bool): PosixCore =
       result.kqueueFd = kq
       result.useKqueue = true
   if installSignals:
-    # rfc-0007 code-review r80: refuse a concurrent second signal-installing
-    # core outright, structurally (mirroring `initSupervisor`'s (windows.nim)
-    # `jobObjectNesting` precedent: a fatal, no-half-loop `OSError` at init
-    # time, rather than a degraded runtime state that only surfaces at
-    # teardown). r73 fixed non-LIFO CLOBBER (an OLDER core's destroy
-    # overwriting a NEWER core's still-live disposition) by gating
-    # `destroyPosixCore`'s restore on `gShutdownWriteFd == core.pipeWrite`
-    # ownership — but that same fix REGRESSED the LIFO case. With core A
-    # installing first, then core B installing while A is still live: B's
-    # init saves whatever is CURRENTLY installed as its own `prevSigint`/
-    # `prevSigterm` — which is crisol's OWN `shutdownSigHandler` (A's
-    # install), never the host's true original disposition. Destroying in
-    # LIFO order (B, the owner, then A) then leaves crisol's handler
-    # installed FOREVER: B's destroy "restores" what it saved — crisol's
-    # own handler again — and A's subsequent destroy is a no-op (A is not
-    # the `gShutdownWriteFd` owner, so its restore is skipped). The host's
-    # real original disposition, from before A ever ran, never comes back.
-    # `gShutdownWriteFd` is a single last-installer slot; it cannot express
-    # a prev-chain across more than one live installer. Rather than build
-    # one, this refuses the SECOND concurrent install outright: only one
-    # `installSignals=true` core may be live at a time. Sequential use
-    # (install, destroy, install again — e.g. api.nim's r74 main-run-then-
-    # verify-sub-run flow) is unaffected, since the owner's destroy clears
-    # `gShutdownWriteFd` back to -1 before any later `initPosixCore` call
-    # runs. No-half-loop: every resource this call already opened above
-    # (self-pipe, epoll/timerfd or kqueue) is closed before raising, same
-    # discipline as every other failure exit in this proc.
-    if gShutdownWriteFd != -1:
+    # R12-D3: the handler is `tooltrees`' one handler, open for an interrupt
+    # scope. Entering one here installs it when no scope is open yet (a
+    # Supervisor used on its own), saving the dispositions in effect so the
+    # matching leave in `destroyPosixCore` can restore them — the r69
+    # embedding-host rule: an embedding host's own prior SIGINT/SIGTERM
+    # handler (or SIG_DFL) must come back at teardown, not stay silently
+    # replaced forever. Inside a run's scope (`runTestsWith` with
+    # `installSignals`) it nests, and the run's own leave restores them.
+    # Attaching the self-pipe makes this core the one the handler wakes, and
+    # replays a signal that landed in the scope before any core was attached.
+    #
+    # rfc-0007 code-review r80, R13-D4: only one `installSignals=true` core
+    # may be live at a time, and `attachInterruptWake` is what refuses the
+    # second: the attached wake is the one record of who owns the wake-up.
+    # (A second installer would save crisol's own handler as "the host's"
+    # and, destroyed LIFO, leave it installed forever: r80.) The refusal is
+    # a fatal, no-half-loop `OSError` at init time, mirroring
+    # `initSupervisor`'s (windows.nim) `jobObjectNesting` precedent: every
+    # resource this call already opened above (self-pipe, epoll/timerfd or
+    # kqueue) is closed, and the scope entered for the attempt is left,
+    # before raising. Sequential use (install, destroy, install again — e.g.
+    # api.nim's r74 main-run-then-verify-sub-run flow) is unaffected: the
+    # owner's destroy detaches before any later `initPosixCore` call runs.
+    enterInterruptScope()
+    if not attachInterruptWake(fds[1]):
+      discard leaveInterruptScope()
       when defined(linux):
         if result.epollFd >= 0: discard posix.close(result.epollFd)
         if result.timerFd >= 0: discard posix.close(result.timerFd)
@@ -597,24 +537,6 @@ proc initPosixCore*(installSignals: bool): PosixCore =
       raise newException(OSError,
         "initSupervisor: another live PosixCore already owns signal delivery " &
         "(installSignals=true refused while a prior core is still live)")
-    # rfc-0007 code-review r69: save whatever disposition is ALREADY in
-    # effect for SIGINT/SIGTERM before installing crisol's own handler —
-    # a pure query (`act = nil` leaves the disposition untouched) via
-    # `sigactionRaw`, since std/posix's own `sigaction` overloads cannot
-    # express "query without installing". `destroyPosixCore` restores
-    # these — the embedding-host analogue of `subreaperSet`'s "leave
-    # nothing behind THIS core did not itself put there" discipline: an
-    # embedding host's own prior SIGINT/SIGTERM handler (or SIG_DFL) must
-    # come back at teardown, not stay silently replaced forever.
-    discard sigactionRaw(SIGINT, nil, addr result.prevSigint)
-    discard sigactionRaw(SIGTERM, nil, addr result.prevSigterm)
-    gShutdownWriteFd = fds[1]
-    var sa: Sigaction
-    sa.sa_handler = shutdownSigHandler
-    discard sigemptyset(sa.sa_mask)
-    sa.sa_flags = SA_RESTART
-    discard sigaction(SIGINT, sa, nil)
-    discard sigaction(SIGTERM, sa, nil)
   when defined(linux):
     # rfc-0007 code-review r3: snapshot this process's PRE-EXISTING
     # children BEFORE the subreaper bit goes live, below. When crisol runs
@@ -655,44 +577,30 @@ proc destroyPosixCore*(core: var PosixCore) =
   ## clears the managed collections: a custom `=destroy` on `Supervisor`
   ## replaces (not supplements) the compiler's default field-wise teardown,
   ## so this module stays responsible for its own Table/seq cleanup.
-  # rfc-0007 code-review r73/r80: BOTH the write-fd clear and the sigaction
-  # restore below are gated on the SAME ownership token —
-  # `gShutdownWriteFd == core.pipeWrite`, true only for the one core that
-  # currently owns signal delivery (see `initPosixCore`'s own comment).
-  # r73 introduced this gate to fix a non-LIFO CLOBBER (an older, non-
-  # owning core's destroy unconditionally restoring its own stale saved
-  # disposition over a newer core's live one). r80 then closed the
-  # complementary gap this same gate could not, by itself, express: at
-  # most one `installSignals=true` core may now ever be live at a time
-  # (`initPosixCore` raises rather than let a second one install), so
-  # `ownsShutdownSignal` below is simply `core.installedSignals` in every
-  # reachable order — there is no other live core left that could contest
-  # ownership, LIFO or not. The gate itself stays (cheap, and it still
-  # does double duty guarding the fd clear immediately below), but the
-  # non-LIFO clobber scenario it was built to fix is now unreachable by
-  # construction rather than merely handled. The windows half
-  # (windows.nim) gates its handler removal under `gShutdownEventHandle`
-  # ownership the same way.
-  let ownsShutdownSignal = core.installedSignals and gShutdownWriteFd == core.pipeWrite
-  if ownsShutdownSignal:
-    gShutdownWriteFd = -1
-  if ownsShutdownSignal:
-    # rfc-0007 code-review r69: restore whatever disposition was in effect
-    # before THIS core installed its own SIGINT/SIGTERM handler (saved in
-    # `initPosixCore` — see `prevSigint`/`prevSigterm`'s field doc
-    # comments). Pre-fix (r69), `destroyPosixCore` cleared
-    # `gShutdownWriteFd` above but left the handlers themselves installed
-    # forever: an embedding host's own SIGINT/SIGTERM handler was silently
-    # replaced for the rest of the process's life, and a later SIGINT only
-    # stamped `gShutdownSignum` — a global nothing reads once this
-    # Supervisor is gone. Runs on every teardown path, including exception
-    # unwind: `=destroy` (process/posix.nim) calls this unconditionally on
-    # scope exit, the same guarantee `subreaperSet`'s clear already relies
-    # on. r73: now additionally gated on `ownsShutdownSignal` (see above)
-    # — a non-owning core's destroy is a no-op on the disposition, leaving
-    # it for whichever core actually owns `gShutdownWriteFd` to restore.
-    discard sigactionRaw(SIGINT, addr core.prevSigint, nil)
-    discard sigactionRaw(SIGTERM, addr core.prevSigterm, nil)
+  # rfc-0007 code-review r73/r80, R13-D4: a core with `installedSignals` is
+  # the one live core that attached its self-pipe as the scope's wake
+  # (`initPosixCore` raises rather than let a second one install), so it is
+  # the one that detaches and leaves; no other core can contest that, LIFO
+  # or not.
+  if core.installedSignals:
+    # Stop the handler writing to the self-pipe before it is closed below.
+    detachInterruptWake()
+    # rfc-0007 code-review r69: leave the interrupt scope `initPosixCore`
+    # entered. When it was the outermost one, this restores whatever
+    # disposition was in effect before it installed crisol's handler.
+    # Pre-fix (r69), the handlers stayed installed forever: an embedding
+    # host's own SIGINT/SIGTERM handler was silently replaced for the rest
+    # of the process's life. Runs on every teardown path, including
+    # exception unwind: `=destroy` (process/posix.nim) calls this
+    # unconditionally on scope exit, the same guarantee `subreaperSet`'s
+    # clear already relies on. The scope's signal it answers is not this
+    # core's to deliver: `next()` already reported it as `weShutdown`.
+    discard leaveInterruptScope()
+  # R15-S2: a child this core never reaped is no longer its to track; its
+  # group entry goes with the core, since whoever reaps the child now would
+  # not clear it and the escape could then signal a recycled group id.
+  for entry in core.children.values:
+    if entry.state == csSpawned: unregisterChildGroup(int(entry.pid))
   if core.pipeRead >= 0: discard posix.close(core.pipeRead)
   if core.pipeWrite >= 0: discard posix.close(core.pipeWrite)
   when defined(linux):
@@ -976,6 +884,7 @@ proc killStalledPreExecChild(core: PosixCore; childPid: Pid; pipeRead: cint;
   ## this spawn made, and report a genuine spawn error naming WHICH read
   ## stalled. `stage` is that name, folded into the error string.
   discard killpg(childPid, SIGKILL)
+  unregisterChildGroup(int(childPid))   # R15-S2: before the reap
   reapBounded(childPid)
   discard posix.close(pipeRead)
   when defined(linux):
@@ -1177,6 +1086,12 @@ proc spawnChild*(core: var PosixCore; spec: ChildSpec): SpawnResult =
   discard posix.close(sinkFd)
   discard posix.close(pipeWrite)
   discard setpgid(childPid, childPid)
+  # R15-S2: the escape (`tooltrees`) cannot unwind to this Supervisor's
+  # stops, and `_exit` does not reach a group of the child's own, so the
+  # group is registered for the escape to kill. Cleared before every reap
+  # of the leader (`reapLeader`), whose unreaped pid pins the group id. A
+  # full registry leaves this child out of the escape's reach.
+  discard registerChildGroup(int(childPid))
 
   when defined(macosx):
     # rfc-0007 C1b: register the child's exit with kqueue — EVFILT_PROC's
@@ -1388,13 +1303,35 @@ proc drainSelfPipe(core: var PosixCore) =
     for i in 0 ..< n:
       core.pendingShutdown.add ShutdownSignal(signum: int(buf[i]))
 
+var idtypePid {.importc: "P_PID", header: "<sys/wait.h>".}: cint
+
+proc leaderExited(pid: Pid): bool =
+  ## Whether the child `pid` has exited, WITHOUT reaping it (`waitid` with
+  ## `WNOWAIT`), so its group entry can be cleared while the unreaped pid
+  ## still pins the group id (R15-S2).
+  var info: SigInfo
+  zeroMem(addr info, sizeof(info))
+  waitid(idtypePid, Id(pid), info, WEXITED or WNOHANG or WNOWAIT) == 0 and
+    info.si_pid == pid
+
+proc reapLeader(pid: Pid; wstatus: var cint; options: cint;
+                ru: var posix.Rusage): tuple[r: Pid, rusageValid: bool] =
+  ## `reapWait4` on a Supervisor child the caller has seen exit, with its
+  ## escape registration cleared first (R15-S2): the reap frees the pid,
+  ## and with it the group id, for reuse.
+  unregisterChildGroup(int(pid))
+  reapWait4(pid, wstatus, options, ru)
+
 proc pollSweepChildren(core: var PosixCore): Option[int32] =
   ## One WNOHANG sweep; captures + decodes the FIRST newly-exited child.
+  ## R15-S2: a child is observed exited (`leaderExited`) before it is
+  ## reaped, so its escape registration is cleared while its pid is pinned.
   for id, entry in core.children.mpairs:
     if entry.state != csSpawned: continue
+    if not leaderExited(entry.pid): continue
     var wstatus: cint = 0
     var ru: posix.Rusage
-    let (r, rusageValid) = reapWait4(entry.pid, wstatus, WNOHANG, ru)
+    let (r, rusageValid) = reapLeader(entry.pid, wstatus, WNOHANG, ru)
     if r == entry.pid:
       entry.exit = decodeExit(wstatus)
       # r31: rusage is only a real observation on the wait4 arm — the
@@ -1478,7 +1415,7 @@ when defined(linux):
         # `csSpawned`) and reports no event this tick, honestly retryable
         # on the next `sweepAdoptedOrphan` call rather than fabricating an
         # exit.
-        let (rw, rusageValid) = reapWait4(Pid(orphanPid), wstatus, 0.cint, ru)
+        let (rw, rusageValid) = reapLeader(Pid(orphanPid), wstatus, 0.cint, ru)
         if rw != Pid(orphanPid):
           return none(WaitEvent)
         var updated = e

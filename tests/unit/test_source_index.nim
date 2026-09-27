@@ -542,7 +542,16 @@ suite "SourceIndex — @p/@n resolution (issue #8)":
     let depSpelling =
       if isProject(depMember): string(display(depMember))
       else: toNative(depMember, cfg.trackedRoots)
-    check depSpelling.endsWith("dep/src/dep.nim")
+    # R15-L5: toNative spells natively -- backslashes, and possibly a
+    # `\\?\` long-path prefix, on Windows (paths.nim's toNative) -- so the
+    # literal forward-slash suffix below would never match whichever branch
+    # actually takes toNative there, on that platform, no matter whether the
+    # property holds or is broken: dead in one direction or the other, not
+    # just untested. Normalise to the portable separator before comparing
+    # (the same idiom test_artifactid.nim/test_ccprobe.nim use for a
+    # toNative-produced path elsewhere) so the check is live on every
+    # platform; only the SPELLING form is normalised, not the property.
+    check depSpelling.replace('\\', '/').endsWith("dep/src/dep.nim")
 
   test "negative pin: an in-root @m body is NOT unioned against the index — a same-basename decoy elsewhere is never selected":
     ## The fallback (index.lookup for an @m body) is gated on the plain
@@ -821,3 +830,36 @@ suite "SourceIndex — @p/@n roots-existence fallback for a file under a pruned 
     let expectedTp = depTp(expected, cfg.trackedRoots)
     check expectedTp in cl
     check cl == toHashSet([projTp("tests/t.nim", cfg.trackedRoots), expectedTp])
+
+suite "dirRole -- walkForIndex's pruning rule table (R13-D8)":
+
+  const state = "/proj/.crisol"
+
+  test "an ordinary directory under an indexed one is indexed":
+    check dirRole("src", "/proj/src", state, drIndex) == drIndex
+
+  test "a dot-dir or a nimcache dir is walked for its links only":
+    check dirRole(".git", "/proj/.git", state, drIndex) == drLinksOnly
+    check dirRole(".deps", "/proj/.deps", state, drIndex) == drLinksOnly
+    check dirRole("nimcache", "/proj/nimcache", state, drIndex) == drLinksOnly
+
+  test "everything below a link-only directory stays link-only":
+    check dirRole("src", "/proj/.deps/src", state, drLinksOnly) == drLinksOnly
+    check dirRole("nimcache", "/proj/.deps/nimcache", state, drLinksOnly) == drLinksOnly
+
+  test "the state dir is skipped outright, ahead of the dot-dir rule, by absolute path":
+    check dirRole(".crisol", state, state, drIndex) == drSkip
+    check dirRole(".crisol", state, state, drLinksOnly) == drSkip
+    # A non-dot state dir is skipped by its path, not its name.
+    check dirRole("cache", "/proj/cache", "/proj/cache", drIndex) == drSkip
+    # The same name elsewhere is only a dot-dir.
+    check dirRole(".crisol", "/proj/sub/.crisol", state, drIndex) == drLinksOnly
+
+  test "an unknown state dir skips nothing":
+    check dirRole(".crisol", "/proj/.crisol", "", drIndex) == drLinksOnly
+    check dirRole("", "", "", drIndex) == drIndex
+
+  test "a name merely containing a dot or `nimcache` is indexed":
+    check dirRole("a.b", "/proj/a.b", state, drIndex) == drIndex
+    check dirRole("nimcache2", "/proj/nimcache2", state, drIndex) == drIndex
+    check dirRole("my_nimcache", "/proj/my_nimcache", state, drIndex) == drIndex

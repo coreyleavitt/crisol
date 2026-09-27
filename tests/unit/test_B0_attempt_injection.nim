@@ -19,6 +19,7 @@
 import std/[os, options, osproc, strutils, unittest, tempfiles]
 import crisol/[types, runner, depgraph, sandbox, cachedispatch]
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -81,8 +82,8 @@ suite "B0 — CRISOL_ATTEMPT injection":
     # Use hlNone so output capture works without env-scrub complexity in the test.
     let spec = resolveSandbox(level = hlNone)
 
-    let results = execute(p, cfg, graph, "", "", cb, false, false, 30_000,
-                          cache = cacheDisabled(spec)).results
+    let results = execute(p, cfg, graph, "", cb, false, false, 30_000,
+                          cache = cacheDisabled(spec), toolchain = unprobedToolchain()).results
 
     require results.len == 1
     doAssert results[0].outcome == oPassed,

@@ -41,6 +41,7 @@ import crisol/depgraph
 import crisol/runner
 import "../support/testep"
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -82,7 +83,7 @@ suite "rfc-0007 code-review r66 — fill-pass spawn failure respects the quarant
     let p = plan(cfg, @[ep], emptyDepGraph())
     var g = emptyDepGraph()
     let execReport = execute(p, config = cfg, graph = g, onResult = noopResult,
-                             showProgress = false, progressIntervalMs = 30_000)
+                             showProgress = false, progressIntervalMs = 30_000, toolchain = unprobedToolchain())
     let results = execReport.results
 
     check results.len == 1
@@ -128,7 +129,7 @@ suite "rfc-0007 code-review r66 — fill-pass spawn failure respects the quarant
     let p = plan(cfg, @[ep], emptyDepGraph())
     var g = emptyDepGraph()
     let execReport = execute(p, config = cfg, graph = g, onResult = noopResult,
-                             showProgress = false, progressIntervalMs = 30_000)
+                             showProgress = false, progressIntervalMs = 30_000, toolchain = unprobedToolchain())
     let results = execReport.results
 
     check results.len == 1

@@ -25,6 +25,7 @@ let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
 import crisol/config
 import "../support/testep"
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -125,7 +126,7 @@ proc runWithCap(eps: seq[Entrypoint]; groupName: string;
 
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
-  discard execute(p, config = cfg, graph = g, showProgress = false, cache = cacheDisabled(overlapSpec))
+  discard execute(p, config = cfg, graph = g, showProgress = false, cache = cacheDisabled(overlapSpec), toolchain = unprobedToolchain())
 
   parseOverlapFile(tmpPath)
 

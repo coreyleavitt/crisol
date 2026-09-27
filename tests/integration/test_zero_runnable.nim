@@ -16,14 +16,16 @@ import crisol/types
 import crisol/jsonout
 import crisol/depgraph
 import crisol/nimprobe  # for cachedNimFingerprint (the fingerprint runMain seeds/reads with)
+import crisol/pipeline  # ccProbeContextOf
 import crisol/ccidentity  # W3: for cachedCcVersion (runMain now also threads this into
-                        # loadDepGraph via api.nim's planImpl -- see the seed graph
+                        # loadDepGraph via runcore.nim's planImpl -- see the seed graph
                         # comment below)
 import crisol/planner  # for CrisolProtocolMajor
 
 import crisol/process/types as ptypes
 import "../support/testep"
 import ../support/capture
+import "../support/ccprobes"
 
 # rfc-0007 A1d-i: run/v2's `outcome` (and --failed's loadLastRun narrowing,
 # which reads it) is sourced from deriveOutcome(r), which walks the real
@@ -86,12 +88,12 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
     ##
     ## We seed the dep graph manually before calling runMain.  The seed graph
     ## MUST use cachedNimFingerprint() — the same runtime fingerprint runMain
-    ## now threads into loadDepGraph (via api.nim's cachedNimFingerprint(),
+    ## now threads into loadDepGraph (via runcore.nim's cachedNimFingerprint(),
     ## not the compile-time crisolNimVersion string) — AND, since the W3
-    ## liveness fix (api.nim's planImpl now threads a real `$ccProbe()` into
-    ## buildRunPlan instead of silently defaulting to ""; `ccProbe` defaults
-    ## to ccidentity.cachedCcFingerprint, and cachedCcVersion() is exactly
-    ## `$cachedCcFingerprint()`), it must ALSO use cachedCcVersion() — or the
+    ## liveness fix (runcore.nim's planImpl threads the toolchain identity,
+    ## `$ccFp` for an identified toolchain, into buildRunPlan instead of silently defaulting to ""; in production the
+    ## probe is ccidentity.cachedToolchainProbe, and the test-support
+    ## cachedCcVersion() is its `$fp`), it must ALSO use cachedCcVersion(ctx) — or the
     ## graph is treated as toolchain-mismatched (dgdCcVersion, same
     ## "cold-start empty" treatment nimVersion mismatch already got), the
     ## precise closure is lost, and the ep is force-run instead of narrowed
@@ -136,9 +138,10 @@ suite "crisol zero-runnable — branch 1: --changed clean tree":
     cfg.trackedRoots = initTrackedRoots(repo, @[], "")
     let closureSet = [fromCanonical(epPath, cfg.trackedRoots).get].toHashSet
     let cHash  = closureContentHash(@[(key: epPath, nativePath: repo / epPath)])
-    var graph  = initDepGraph(cachedNimFingerprint(), cachedCcVersion())
+    var graph  = initDepGraph(cachedNimFingerprint(),
+                              cachedCcVersion(ccProbeContextOf(cfg)))
     graph.updateEntry(
-      epPath, fHash, closureSet,
+      epPath, fHash, closureSet, @[],
       closureHash   = cHash,
       protocolMajor = CrisolProtocolMajor,
     )

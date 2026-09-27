@@ -99,7 +99,7 @@ block test_round_trip:
   let fh1 = flagHash(@["-d:foo"])
   let closure1 = tpSet("tests/unit/test_foo.nim", "src/crisol/foo.nim")
 
-  updateEntry(g, "tests/unit/test_foo.nim", fh1, closure1)
+  updateEntry(g, "tests/unit/test_foo.nim", fh1, closure1, @[])
 
   doAssert saveDepGraph(g, cfg)
 
@@ -128,7 +128,7 @@ block test_atomic_valid_json:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"), @[])
   doAssert saveDepGraph(g, cfg)
 
   let depgraphPath = root / ".crisol" / "depgraph"
@@ -158,8 +158,8 @@ block test_two_flaghashes_same_path:
   let path = "tests/unit/test_x.nim"
   let cl1 = tpSet("tests/unit/test_x.nim", "src/a.nim")
   let cl2 = tpSet("tests/unit/test_x.nim", "src/b.nim")
-  updateEntry(g, path, fh1, cl1)
-  updateEntry(g, path, fh2, cl2)
+  updateEntry(g, path, fh1, cl1, @[])
+  updateEntry(g, path, fh2, cl2, @[])
 
   doAssert saveDepGraph(g, cfg)
   let g2 = loadDepGraph(cfg, "2.2.10")
@@ -182,7 +182,7 @@ block test_nim_version_mismatch_empty:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"), @[])
   doAssert saveDepGraph(g, cfg)
 
   # Load with a DIFFERENT nim version → should get empty graph
@@ -199,7 +199,7 @@ block test_nim_version_match_entries_present:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"), @[])
   doAssert saveDepGraph(g, cfg)
 
   let g2 = loadDepGraph(cfg, "2.2.10")
@@ -218,7 +218,7 @@ block test_cc_version_mismatch_empty:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10", "cc-OLD")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"), @[])
   doAssert saveDepGraph(g, cfg)
 
   # Same nim version, DIFFERENT cc version → should get empty graph.
@@ -235,7 +235,7 @@ block test_cc_version_match_entries_present:
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10", "cc-OLD")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"), @[])
   doAssert saveDepGraph(g, cfg)
 
   let g2 = loadDepGraph(cfg, "2.2.10", "cc-OLD")
@@ -270,7 +270,7 @@ block test_nim_version_mismatch_reason_and_stamp:
 
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10", "cc-OLD")
-  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[])
   doAssert saveDepGraph(g, cfg)
 
   var discarded = DepGraphDiscard(kind: dgdNone)
@@ -301,7 +301,7 @@ block test_cc_version_mismatch_reason_and_stamp:
 
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10", "cc-OLD")
-  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[])
   doAssert saveDepGraph(g, cfg)
 
   # Same nim version, DIFFERENT cc version: the cc-only change that W3 exists
@@ -334,7 +334,7 @@ block test_both_versions_changed_reported_as_nim:
 
   let cfg = makeTmpConfig(root)
   var g = initDepGraph("2.2.10", "cc-OLD")
-  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[])
   doAssert saveDepGraph(g, cfg)
 
   var discarded = DepGraphDiscard(kind: dgdNone)
@@ -392,10 +392,10 @@ block test_isEntryStale_missing_file:
   let fh = flagHash(@[])
   # Closure includes a path that definitely does not exist
   let nonExistent = root / "this_does_not_exist.nim"
-  updateEntry(g, path, fh, tpSet(nonExistent))
+  updateEntry(g, path, fh, tpSet(nonExistent), @[])
 
   let key = (path, fh)
-  assert isEntryStale(g, key, root, tpSetRoots),
+  assert isEntryStale(g, key, tpSetRoots),
     "isEntryStale must be true when closure contains a non-existent file"
 
 block test_isEntryStale_all_files_exist:
@@ -410,10 +410,10 @@ block test_isEntryStale_all_files_exist:
   var g = initDepGraph("2.2.10")
   let path = "tests/unit/test_real.nim"
   let fh = flagHash(@[])
-  updateEntry(g, path, fh, tpSet(realFile))
+  updateEntry(g, path, fh, tpSet(realFile), @[])
 
   let key = (path, fh)
-  assert not isEntryStale(g, key, root, tpSetRoots),
+  assert not isEntryStale(g, key, tpSetRoots),
     "isEntryStale must be false when all closure files exist"
 
 block test_isEntryStale_absent_entry:
@@ -424,7 +424,7 @@ block test_isEntryStale_absent_entry:
   var g = initDepGraph("2.2.10")
   let key = ("tests/nonexistent.nim", flagHash(@[]))
   # Key is not in the graph at all — should be treated as stale
-  assert isEntryStale(g, key, root, default(TrackedRoots)),
+  assert isEntryStale(g, key, default(TrackedRoots)),
     "isEntryStale must be true when entry is absent from graph"
 
 # ---------------------------------------------------------------------------
@@ -439,8 +439,8 @@ block test_gcDeletedEntrypoints:
   let keyA = ("tests/unit/test_a.nim", fhA)
   let keyB = ("tests/unit/test_b.nim", fhB)
 
-  updateEntry(g, keyA[0], keyA[1], tpSet("tests/unit/test_a.nim"), "", 0)
-  updateEntry(g, keyB[0], keyB[1], tpSet("tests/unit/test_b.nim"), "", 0)
+  updateEntry(g, keyA[0], keyA[1], tpSet("tests/unit/test_a.nim"), @[], "", 0)
+  updateEntry(g, keyB[0], keyB[1], tpSet("tests/unit/test_b.nim"), @[], "", 0)
 
   assert g.entries.len == 2
 
@@ -476,11 +476,11 @@ block test_updateEntry_upsert:
   let fh = flagHash(@[])
 
   let cl1 = tpSet("tests/unit/test_u.nim", "src/a.nim")
-  updateEntry(g, path, fh, cl1)
+  updateEntry(g, path, fh, cl1, @[])
   assert g.entries[(path, fh)].closure == cl1
 
   let cl2 = tpSet("tests/unit/test_u.nim", "src/b.nim")
-  updateEntry(g, path, fh, cl2)
+  updateEntry(g, path, fh, cl2, @[])
   assert g.entries[(path, fh)].closure == cl2, "upsert should overwrite old closure"
 
 # ---------------------------------------------------------------------------
@@ -520,7 +520,7 @@ block test_saveDepGraph_symlink_write_through_protection:
 
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@[])
-  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"))
+  updateEntry(g, "tests/t.nim", fh, tpSet("tests/t.nim"), @[])
 
   # Must not crash; sentinel must remain untouched.
   doAssert saveDepGraph(g, cfg)
@@ -540,7 +540,7 @@ block test_saveDepGraph_normal_roundtrip_after_p5:
   var g = initDepGraph("2.2.10")
   let fh = flagHash(@["-d:test"])
   let cl = tpSet("tests/unit/test_p5.nim")
-  updateEntry(g, "tests/unit/test_p5.nim", fh, cl)
+  updateEntry(g, "tests/unit/test_p5.nim", fh, cl, @[])
 
   doAssert saveDepGraph(g, cfg)
 
@@ -556,7 +556,13 @@ echo "PASS test_depgraph"
 # ---------------------------------------------------------------------------
 
 block test_format_version_pin:
-  ## DepGraphFormatVersion is 9 as of W3 (wiring-audit finding, re-verified
+  ## DepGraphFormatVersion is 10 as of issue #25: each entry records
+  ## `links`, every symlink its closure members may have been reached
+  ## through, re-resolved by `decideCompile`/`isEntryStale`. A v9 entry
+  ## would read back as "crossed no link" and skip the new check, so the
+  ## graph is discarded once.
+  ##
+  ## DepGraphFormatVersion was 9 as of W3 (wiring-audit finding, re-verified
   ## 2026-09-21): the header gains `ccVersion` -- the depgraph-header sibling
   ## of `nimVersion` -- so `loadDepGraph` can finally see a C toolchain change
   ## and discard a cc-mismatched graph (`dgdCcVersion`). W3 also wired it into
@@ -592,8 +598,8 @@ block test_format_version_pin:
   ## tracked compile inputs recorded per-external in `externals`.)
   ## Bump this pin only together with a History entry in depgraph.nim and a
   ## CHANGELOG "BREAKING CHANGE — dependency graph format N" section.
-  assert DepGraphFormatVersion == 9,
-    "DepGraphFormatVersion pin: expected 9 (W3), got " & $DepGraphFormatVersion
+  assert DepGraphFormatVersion == 10,
+    "DepGraphFormatVersion pin: expected 10 (issue #25), got " & $DepGraphFormatVersion
 
   # A v4 graph on disk is treated as absent (discarded, not migrated).
   let root = getTempDir() / ("crisol_depgraph_v4pin_" & $getCurrentProcessId())
@@ -665,7 +671,7 @@ block test_deproot_closure_member_round_trip:
                             # contains the entrypoint itself.
   let fh = flagHash(@[])
   var g = initDepGraph("2.2.10")
-  updateEntry(g, "tests/t.nim", fh, closure, "h", 1)
+  updateEntry(g, "tests/t.nim", fh, closure, @[], "h", 1)
 
   doAssert saveDepGraph(g, cfg)
 

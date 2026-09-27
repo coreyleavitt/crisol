@@ -20,17 +20,18 @@
 
 | Issue | What | State |
 |---|---|---|
-| **#22** | `readAll()` truncates child stdout on Windows; undrained stderr deadlocks | **DONE, COMMITTED** (`9219670`, docs `630ecc6`) |
-| **#23** | `ccVersion` is toolchain-blind on Windows, and version-string-keyed everywhere | **DONE, 9/9 slices — UNCOMMITTED** |
-| **#21** | MSVC dep extraction (`/sourceDependencies`) — the actual capability | **DONE in code, all slices (1a/1b/1c/2/3/4) — UNCOMMITTED.** Only `test_rfc9_a5c_cache_portability.nim`'s real-body verdict is outstanding, and only a windows CI run can give it (see `### Remaining` under #21) |
+| **#22** | `readAll()` truncates child stdout on Windows; undrained stderr deadlocks | **DONE, COMMITTED** (`9219670`, docs `630ecc6`; rebased onto `origin/main` in round 9 as `e6c9966` and `869c268`). Round 9's capture fixes (`RunResult`/`RunEnd`, the single drain, the `ls-files` fail-closed) and round 10's (one result type in `toolexec`, stdin input, submodule-aware `--changed`) are UNCOMMITTED |
+| **#23** | `ccVersion` is toolchain-blind on Windows, and version-string-keyed everywhere | **DONE, 9/9 slices — COMMITTED** with review rounds 1-8 as `fb0e7ff` (was `55c9fb0` before the rebase). Round 9 REDESIGNED the identity (preprocessor probe of the configured driver, R9-D1); round 10 refused `@file` in `CL`/`_CL_` and moved the runtime half to the loaded runtime (R10-S2, R10-S3). Both are UNCOMMITTED |
+| **#21** | MSVC dep extraction (`/sourceDependencies`) — the actual capability | **DONE in code, all slices (1a/1b/1c/2/3/4) — COMMITTED** in `fb0e7ff`; `7da32d3` removes `origin/main`'s interim vcc self-skips (R9-L1). Round 9's closure fixes (R9-S1, R9-S2) and round 10's (Unicode case-blind root check R10-S1, one header-probe pipeline R10-D4) are UNCOMMITTED. `test_rfc9_a5c_cache_portability.nim` now uses a directory junction on Windows and the honesty script requires its real body on every leg (R10-L1); it passes on the MSVC container, and its windows CI verdict needs a push |
 
 All three issues are now under `/code-review #21-23`. That review, not further
 slices, is the active work: see the review state below and the Resume block.
 
-**Review state — 2026-09-25.** `/code-review #21-23` has run **eight rounds** over
+**Review state — 2026-09-25.** `/code-review #21-23` has run **ten rounds** over
 this workstream (the sections "Code review — 2026-09-21", "Round 2 re-review",
 "Round 3 re-review", "Round 4 re-review", "Round 5 re-review", "Round 6
-re-review", "Round 7 re-review", "Round 8 re-review"). Each round's
+re-review", "Round 7 re-review", "Round 8 re-review", "Round 9 re-review", "Round 10
+re-review"), and **round 11 is next**. Each round's
 dispositions are in its own findings table's status column — deliberately not
 restated here, because a second copy of them drifts (R5-14).
 
@@ -76,18 +77,41 @@ the worst in-scope finding traces to the previous round's remedy: R8-D1, the
 no-caching-at-all cost of R7-S1's refusal, which the warning understated.
 R7-S5's comment carry-over is closed (R8-D4).
 
+**Round 9's fixes have landed** and every row in "Round 9 re-review" has a
+terminal status. Before it ran, rounds 1-8 were committed (`55c9fb0`, rebased
+onto `origin/main` as `fb0e7ff`, with `7da32d3` removing the interim vcc
+self-skips; nothing pushed), #24 was filed, and Corey restated the scope: #21-23
+for the life of the loop, out-of-scope observations logged, not fixed. Counted
+from its table: **27 rows — 7 High, 13 Med, 7 Low**; 23 fixed, 1 partial and 3
+deferred (all Low). No Critical. The largest change is R9-D1, which replaced the
+banner heuristics with a preprocessor probe of the configured driver and folds
+`CL`/`_CL_` into the key, retiring R7-S1's refusal stopgap.
+
+**Round 10's fixes have landed** and every row in "Round 10 re-review" has a
+terminal status. Counted from its table: **30 rows — 1 High, 15 Med, 14 Low**;
+22 fixed and 8 deferred (all Low). No Critical. The High, R10-S1 (non-ASCII
+root letters under MSVC's lowercasing), is in R9-S1's remedy. The `--json`
+schema revision moved 26 → 27 (additive, `rootsDegraded`). **Rounds 9 and 10
+are UNCOMMITTED**; Corey chose to commit them together once round 10 is done
+and the sweep is green.
+
+**The Lows pass has landed** (2026-09-26, "Lows pass" section): Corey asked for
+every deferred Low across rounds 1-10 to be fixed. 43 rows: 29 fixed, 13
+closed as obsolete, 1 closed by convention. It also ran the windows leg's full
+set on the MSVC container for the first time since round 8 and fixed four
+failures in the #21-23 area.
+
 **This is NOT the floor**: the loop stops only when a round surfaces nothing above
-Low, and round 8 surfaced a Critical (out of scope, folded into the split-out
-issue) and five Meds. **Round 9 runs next**, over round 8's fix diff (re-sweep
-first).
+Low, and round 10 surfaced a High. **Round 11 is next** over the same #21-23
+scope.
 
-**Current verification state:** see "Verification state at the end of round
-8". The round-5 paragraphs below are history. Their figures (258/259
+**Current verification state:** see "Verification state at the end of the Lows
+pass". The round-5 paragraphs below are history. Their figures (258/259
 entrypoints, 197 records over 1010 signatures) are superseded: there are now
-264 entrypoints, and the census holds 231 records over 1131 signatures.
+277 entrypoints, and the census holds 212 records.
 
-Five items sit with Corey: R7-S6 + R8-S1 (both Critical, one issue to file,
-needs a yes), R7-S7 (a trust-gate default, Low), W9c (feature-sized, and now
+Five items sit with Corey: R7-S6 + R8-S1 (both Critical, filed as #24),
+R7-S7 (a trust-gate default, Low), W9c (feature-sized, and now
 known to need a *windows* producer, not the Linux one it was scoped as), R2-8
 (needs a Windows-capable check) and R4-11 (a pre-existing flake outside this
 workstream — a scope call, not a technical one). R3-8 came off the list in round 5: it was
@@ -143,34 +167,78 @@ flipping it would be a false claim.
 **Resume:**
 
 ```
-/code-review #21-23 round 9
-# The active work is the REVIEW LOOP, not slices. All three issues are done in
-# code: #22 committed; #23 9/9 and #21 1a/1b/1c/2/3/4, both UNCOMMITTED.
-# The RFC-0007 addendum is written (docs/rfc/0007-execution-substrate.md,
-# "Addendum — MSVC toolchain findings"). #21's only open item is the a5c
-# real-body verdict, which only a windows CI run can give.
+/code-review #21-23 round 11
+# ROUND 10 AND THE LOWS PASS ARE DONE (sweep 276/277, only test_fallback, the
+# known bind-mount fold case). Round 11 DONE 2026-09-26: every Medium+ row
+# fixed, #25 filed and fixed, sweep 280/281 (only test_fallback). Round 12 (the
+# re-review of round 11) DONE: every Medium+ fixed, sweep 285/286. Round 13
+# (re-review of round 12) DONE: every Medium+ fixed, sweep 286/287. Round 14
+# (re-review of round 13) DONE: Mediums fixed, sweep 286/287. LOWS PASS 2
+# DONE (sweep 289/290, gates green). Round 15 (re-review of the Lows pass)
+# DONE (every Medium+ FIXED, #26 wired into Windows CI). Round 16 (re-review of
+# round 15) DONE: R16-D1 (Medium) plus S1/S2 FIXED by lane A. Round 17
+# (re-review of round 16) DONE: two Mediums (R17-D1, R17-L1) plus Lows,
+# all six rows FIXED by lane A. Round 18 (re-review of round 17) DONE:
+# R18-D1 (Medium) + R18-L1 (Low), both FIXED by lane A. Round 19 (re-review
+# of round 18) DONE: two Mediums, all rows FIXED by lane A. Round 20
+# (re-review of round 19) DONE: R20-S1, D1, D2 FIXED by lane A. Round 21
+# (re-review of round 20) DONE: every row FIXED (S1 inline, D1/D2 by lane A).
+# Round 22 (re-review of round 21) DONE: R22-D1, R22-D2 FIXED by lane A.
+# Round 23 (re-review of round 22) DONE: FLOOR -- no Critical, High or
+# Medium; one new Low (R23-D1). Sweep 290/291, gates green.
 #
-# Round 8 is closed: every row terminal, fixes landed (lanes A-D). Round 9
-# re-sweeps first (enumerate entrypoints as the nimble task does; re-derive,
-# do not restate, the counts), then reviews round 8's fix diff (R8-N
-# markers; interim liveness IDs, see the round-8 "On IDs" note), same three
-# dimensions. Look hardest at: the stateDirOf semantics change (a bare
-# Config() now raises), the new ci.yml gating/steps (never run on Actions
-# yet), and the census's backward object walk. For any fix founded on a
-# measurement, re-measure the real binary.
-# R7-S6 + R8-S1 (Critical) are one split-out issue, filed as #24
-# (2026-09-25) -- not round 9's scope.
-# NOTHING HERE IS COMMITTED and nothing may be without Corey saying so.
+# LOWS PASS 3 (Corey, 2026-09-27: "fix lows and we're finally done"):
+# six lanes dispatched in parallel on disjoint files, rules in scratchpad
+# lows3_rules.md. A: R15-D3/S5 relay + R23-D1 (runner, workerplan).
+# B: R15-D5/L2, D4 CleanToolchain, D8, R16-D2 (clean). C: R15-D6/D7
+# (headerprobe, closure, artifactid). D: R15-D9, D4 Registration/
+# RunToolchain, S2, S6 (toolexec, tooltrees, toolchainwarn). E: R15-S4 and
+# R13-L5 (ccidentity). F: R15-D11/S3/L5 (honesty script, test_source_index).
+# LOWS PASS 3 DONE: all Lows fixed; R13-L5 ACCEPTED by Corey (cost is ms).
+# Sweep 291/292, gates green, MSVC spot-checks green.
+# RESUME: ask Corey to approve the one combined commit on top of 7da32d3.
+# After it lands (and only with approval) close #25/#26. Lows were
+# listed at the end of the round 23 section. Previously: loop until a
+# round finds nothing above Low, then report Lows and ask Corey to approve
+# the combined commit on top of 7da32d3 (close #25/#26 after it lands).
+#
+# The combined rounds 9+10+Lows commit (one commit on top of 7da32d3, message
+# drafted, no AI attribution) was proposed to Corey on 2026-09-26; he started
+# round 11 without approving it, so it is STILL UNCOMMITTED. Ask again at the
+# end of round 11.
+#
+# Round 11 reviews the WORKING TREE. Scope is #21-23 for
+# the life of the loop (Corey, restated in round 9): every in-scope finding is
+# fixed through Medium; an out-of-scope observation gets one line under "Out
+# of scope, noted" and never opens a round. Every reviewer brief states the
+# scope and lists what is out of it (#24, stateDir/test isolation, the census
+# and gate scripts, the RFC-0006 measure-path response-file normalization).
+#
+# Git: local main = origin/main 49fb53b + e6c9966, 869c268, fb0e7ff (rounds
+# 1-8) + 7da32d3 (vcc self-skips removed). Backup: backup/pre-rebase-55c9fb0.
+# NOTHING IS PUSHED.
+#
+# Look hardest at round 10's changes: paths' Unicode case-blind comparison
+# and caseBlindEqual, headerprobe.nim, parseCompileCommand/msvcArgvSplit,
+# RunResult in toolexec and runTool's stdin, gitdiff's submodule expansion
+# and directory-link refusal, runcore.nim (the moved engine), cacheGate and
+# toolchainIdentity's per-run nonce, ToolchainVerdict, the runtime-DLL
+# lookup (loaderDll) and the CL @file refusal, dirlink.nim and the renamed
+# tests. Also the Lows pass: DriverSite/locateDriver/siteResolver, the
+# project-dependent config scan, the memo stamp, argvRulesOf, the process-tree
+# kill and post-exit drain, the CRISOL_CACHE_* scrub, and its "Things for
+# round 11 to examine" list. macOS runtime identity is UNMEASURED; the macOS
+# CI leg is its first real run and needs a push. Re-sweep with exit codes
+# recorded; re-derive the counts.
+# NOTHING may be committed or pushed without Corey saying so.
 ```
 
 **Slices done / remaining on #23:** **9 of 9 done** (1, 2, 3, 4a, 4b, 6, 7, 8;
 slice 5 absorbed into 4a, and 4b retired `LddSentinel`, which was slice 7's
 third item). Plan approved 2026-09-20, including the RFC-0004 spec change.
-Remaining: **none**. Nothing is committed yet: `ccprobe.nim`,
-`render.nim`, `test_ccprobe.nim`, `test_render.nim`, `.github/workflows/ci.yml`,
-the new `tests/integration/test_issue23_cc_identity.nim`, and slice 8's
-amendments to `docs/rfc/0004`, `0005`, `0006` and the `0004`/`0006`/`0007`/
-`0009` handoffs are all dirty.
+Remaining: **none**. (UPDATED IN ROUND 9: the slices and slice 8's RFC and
+handoff amendments are committed in `fb0e7ff`. Round 9's identity redesign,
+R9-D1, is uncommitted.)
 
 **Ordering rationale (decided 2026-09-20).** #23 before #21, because #21's own
 design notes rest on a premise that is false today — "gcc-closure and cl-closure
@@ -1023,17 +1091,37 @@ Run in `ghcr.io/coreyleavitt/nim:2.2.10-windows` with
 **a5c is not claimed.** It self-skips with "symlink creation failed in this
 environment: Access is denied" — Windows containers run without
 `SeCreateSymbolicLinkPrivilege`. Confirmed NOT a bind-mount artifact (it skips
-identically from a container-local checkout). `windows-latest` has the
+identically from a container-local checkout). ~~`windows-latest` has the
 privilege (`ci/assert-subset-honesty.sh` carries `EXPECTED_SKIP_TEST=""` for
 that leg and lists a5c as must-execute), so its verdict lands on CI — exactly
 the CI-paced definition-of-done RFC-0009 records for windows-runtime-only
 slices. Memory `[[windows-latest-no-symlink-privilege]]` covers the same
-ground.
+ground.~~
 
-Also confirmed, as the caveat already in this doc predicted: **there are no
+**CORRECTED IN ROUND 9 (R9-L2).** All three claims in the struck sentence were
+false. CI run 35491097764 (2026-09-20) logged "SKIP
+test_rfc9_a5c_cache_portability: symlink creation failed in this environment:
+Access is denied." on its windows job, so `windows-latest` lacks the privilege
+too. The windows `EXPECTED_SKIP_TEST` has 10 entries, not `""`. And
+`ci/assert-subset-honesty.sh` (~366-368) accepts that documented SKIP as
+"MUST-EXECUTE OK" on windows, so a skip and a pass look the same to it. The
+script matches reality; the doc did not. The cited memory note does not
+exist. **a5c's windows real-body verdict cannot come from the current CI**;
+that is the carried W9.4/W12 item.
+
+~~Also confirmed, as the caveat already in this doc predicted: **there are no
 vcc self-skips to remove.** `grep -rn "defined(vcc)" tests/ src/` is empty and
 the windows `EXPECTED_SKIP` list names none of the four. #21's acceptance is
-"make them pass", not "remove gates".
+"make them pass", not "remove gates".~~
+
+**CORRECTED IN ROUND 9 (R9-L1).** That grep was true of the local tree only.
+`origin/main` carried `49fb53b` ("ci: interim vcc self-skips"), which the
+local branch was not built on: top-of-module `when defined(vcc): quit(0)`
+guards in a3bii, a4b and a5c, a vcc `skip()` arm in `test_windows_cli_smoke`,
+`check_must_execute_or_vcc_skip` in the honesty script, and `CRISOL_CC=vcc`
+in `ci.yml`. A merge would have restored all of them silently. After the
+rebase, `7da32d3` removes them. #21's acceptance does include removing the
+gates and their accounting.
 
 ### Slice 4 — docs
 
@@ -1054,9 +1142,13 @@ the windows `EXPECTED_SKIP` list names none of the four. #21's acceptance is
 
 - **Nothing in code.** The load-bearing property is green end-to-end under
   real MSVC; slices 1a/1b/1c/2/3/4 are done.
-- `test_rfc9_a5c_cache_portability.nim`'s real-body verdict, which only a
-  windows CI leg can give (above).
-- **Everything is UNCOMMITTED**, #23's nine slices included.
+- `test_rfc9_a5c_cache_portability.nim`'s real-body verdict. ~~Only a windows
+  CI leg can give it.~~ CORRECTED IN ROUND 9 (R9-L2): the current windows CI
+  runner cannot give it either, because it lacks the symlink privilege and the
+  honesty script accepts the documented skip (above). Carried as W9.4/W12.
+- ~~**Everything is UNCOMMITTED**, #23's nine slices included.~~ UPDATED IN
+  ROUND 9: committed in `fb0e7ff` (rounds 1-8), with `7da32d3` removing the
+  interim vcc self-skips. Round 9's own fixes are uncommitted.
 
 ### Measured: what a driver that cannot answer actually does
 
@@ -1491,7 +1583,7 @@ the order they appear in the condensed paragraph above.
 | W9.2 | `hasObjectExt` reached one of three test-side nimcache scans; two remain `.o`-only, one of them the only `@m`-mangled dep-object producer | W9b | closed (round 1) |
 | W9.3 | `artifactid.ccIncludeClosure` reachable only via off-by-default `--measure-compile-reuse`, no MSVC test, all `DepProbeError` arms collapsed to bare `ok=false` | W9c | **ESCALATED — with Corey.** Sharpened by R3-9; see `## Open for Corey` |
 | W9.4 | A5c has no MSVC producer and its property is substituted from macOS, which has no `cl` — removing exactly the net W1's class would fall into | **W12** | open — carried; the W1 fix (round 1) closed the trigger, not the detector |
-| W9.5 | `shellSplit`'s backslash arm gated on `defined(windows)` — the *reader's* host — violating the manifest-not-host rule | W9e | deferred (Low, per mandate) |
+| W9.5 | `shellSplit`'s backslash arm gated on `defined(windows)` — the *reader's* host — violating the manifest-not-host rule | W9e | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
 | W9.6 | `ccprobe.nim`'s "true leaf (std-only imports)" claim false; `nimprobe.nim` still imports `crisol/depgraph` | W9f | closed (round 1) |
 | W9.7 | "the 9-component key pins stay untouched" — `keys.soundnessKey` folds **10** since r57 added `cwdPosture`; slice 8 verified six pins as untouched rather than correct | W9g | closed (round 1) |
 | W9.8 | `CRISOL_EXPECT_FOLD` set on the windows per-file and macos bulk steps but not the windows bulk step — the only log the gate reads shows the weaker mode | W9h | closed (round 1) |
@@ -1715,9 +1807,9 @@ refuted. Verified = an adversarial verifier confirmed with a concrete trigger.
 | CR13 | Med | `ccprobe.nim:492-494` | The Windows cc-candidate "exits 0 and answers nothing" case is untested. `ccIdentity` treats `ok=true`+empty identically to `ok=false`; POSIX pins this (`test_ccprobe.nim:157`) but `makeMsvcRun`/`makeMingwRun` (`:205-230`) only ever model "not found". The handoff measured this exact shape for a real driver (`rc=0`, bare banner, D9002 on stderr). | fixed | — |
 | CR14 | Med | `test_ccprobe.nim`, `test_issue16_unit.nim` | **Zero** MSVC fixtures use CRLF — 0 raw CR bytes and 0 backslash-r escapes across both files. `firstLine`, `versionLine` and `parseVerboseLibPaths` are CRLF-safe by design (`splitLines`+`strip`); `parseMsvcSourceDeps` is CRLF-safe only by **incidental** `parseJson` whitespace tolerance — its `pos += line.len + 1` under-counts one byte per CRLF line, harmless at 1-2 preceding lines and corrupting at >=3 (see CR-X1). Narrowing a trim would regress silently with no test signal. | fixed | CONFIRMED |
 | CR15 | Low | `ccprobe.nim:858-867` | `parseCcMDeps` takes `find(':')`, which on a mingw rule (`C:/proj/build/add.o: ...`) matches the **drive-letter** colon, emitting one bogus token (`/proj/build/add.o:`) per invocation. Verified harmless to selection: the real dependency tokens after the target are untouched, and the garbage resolves to nothing and is dropped at `closure.nim:1633`. Cost is a wasted `winRealPath`/`realpath` resolution under `csReported`. Fix alongside W8, which is the same proc. | fixed | CONFIRMED (Low) |
-| CR16 | Low | `ccprobe.nim:606` | `ccVersion` takes four seams whose correlation the type does not express: `linkProbe` is consulted only under `rpMsvcLinkVerbose`, yet a caller passing `PosixCcProfile` still receives a live Windows-effecting default — harmless only because the `case` never reaches it. Folding the runtime seam into `CcProbeProfile.runtime` as a variant makes the pairing a compile-time fact. | deferred (Low, per mandate) | — |
-| CR17 | Low | `ccprobe.nim:399-407` | `RuntimeProbe`'s arms name the mechanism (`rpPrintFileName`, `rpMsvcLinkVerbose`) while the sibling axis `CcDriverIdentity` names the effect (`cdVersionOnly`, `cdVersionAndBinary`) — inviting a new near-duplicate arm per OS API. | deferred (Low, per mandate) | — |
-| CR18 | Low | `ccprobe.nim:145-160,200-237` | The version probes `startProcess` with no explicit `env:`, so a PATH-hijacked `gcc.exe`/`vccexe.exe` receives `CRISOL_CACHE_TOKEN*` (`cacheregistry.nim:69,301-326` — the credential is env-borne, not file-borne). Hygiene only: such an attacker already has code execution via the real `cc`/`nim` invocation. Pass an explicit env without the token. | deferred (Low, per mandate) | — |
+| CR16 | Low | `ccprobe.nim:606` | `ccVersion` takes four seams whose correlation the type does not express: `linkProbe` is consulted only under `rpMsvcLinkVerbose`, yet a caller passing `PosixCcProfile` still receives a live Windows-effecting default — harmless only because the `case` never reaches it. Folding the runtime seam into `CcProbeProfile.runtime` as a variant makes the pairing a compile-time fact. | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** | — |
+| CR17 | Low | `ccprobe.nim:399-407` | `RuntimeProbe`'s arms name the mechanism (`rpPrintFileName`, `rpMsvcLinkVerbose`) while the sibling axis `CcDriverIdentity` names the effect (`cdVersionOnly`, `cdVersionAndBinary`) — inviting a new near-duplicate arm per OS API. | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** | — |
+| CR18 | Low | `ccprobe.nim:145-160,200-237` | The version probes `startProcess` with no explicit `env:`, so a PATH-hijacked `gcc.exe`/`vccexe.exe` receives `CRISOL_CACHE_TOKEN*` (`cacheregistry.nim:69,301-326` — the credential is env-borne, not file-borne). Hygiene only: such an attacker already has code execution via the real `cc`/`nim` invocation. Pass an explicit env without the token. | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** | — |
 
 ### Refuted — recorded, not presented
 
@@ -1963,9 +2055,9 @@ the FIX LOOP'S OWN diff, on the evidence that round 1 introduced three defects
 | R2-6 | Med | `test_ccprobe.nim` (= **CR5**) | Test seam cancels out `resolveDriver`; a wrong-but-nonempty answer invisible across all 82 tests | fixed |
 | R2-7 | Med | `runner`/`planner`/`depgraph`/`clean` | Defaulted soundness parameters, 4th-7th instances | partial — see below |
 | R2-8 | Med | `ci.yml`, `test_closure_searchpath.nim` | `.obj` branch has no CI producer | BLOCKED — see below |
-| R2-9 | Low | `parseCcHalf`, `sanitizeCcFingerprintField` | Both split on the FIRST pipe; a pipe in compiler text misattributes halves | deferred (Low) |
-| R2-10 | Low | `test_paths.nim:620-627` | `cmpKeyBytes` `not compiles(...)` seal has no positive control | deferred (Low) |
-| R2-11 | Low | `assert-subset-honesty.sh` | Comment says "six marker-bearing sites"; `test_source_index.nim` now has 8 | deferred (Low) |
+| R2-9 | Low | `parseCcHalf`, `sanitizeCcFingerprintField` | Both split on the FIRST pipe; a pipe in compiler text misattributes halves | deferred (Low). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
+| R2-10 | Low | `test_paths.nim:620-627` | `cmpKeyBytes` `not compiles(...)` seal has no positive control | deferred (Low). **FIXED in the Lows pass (2026-09-26)** |
+| R2-11 | Low | `assert-subset-honesty.sh` | Comment says "six marker-bearing sites"; `test_source_index.nim` now has 8 | deferred (Low). **FIXED in the Lows pass (2026-09-26)** |
 
 ### R2-1 — the exemption's own justification did not cover the dangerous case
 
@@ -2186,13 +2278,13 @@ also converged on `runEntrypoint*` as R2-7's one real omission.
 | R3-8 | Med | `planner.nim`, `decideCompile` | The dead staleness checks' underlying smell is that `decideCompile` takes two values already in `graph.header` | **fixed** round 5 (mutation-proven) — NOT a fork: RFC-0003 decided it |
 | R3-9 | Med | `artifactid.nim:547`, `ci.yml` | `cpeSourceMismatch` is unit-live but has ZERO producers on any leg, and W9c's Linux producer as scoped cannot supply one | **BLOCKED, with Corey via W9c** — sharpens W9c (= W9.3 in the W-audit status table); needs a Windows-capable producer |
 | R3-10 | Low-Med | `toolrun.nim:25-38, 66-100` | The module defining the process boundary misstates its own importer set (says three, names `ccprobe`/`runner`; the real set is five) and omits two exports | **fixed** — INCOMPLETE, see R4-7 |
-| R3-11 | Low | `ccidentity.nim:225-234` | `hasDottedVersion` accepts ANY `digit.digit`, so a path segment (`C:\tools\1.5\`) or a date (`2024.09.01`) in error text passes as KNOWN | **deferred (Low, per mandate)** — but NOW LOAD-BEARING after R4-1, and SHARPENED by R5-4: see the R3-11 note in round 4 and R5-4 in round 5. The obvious two-dot fix is refuted (the ldd constraint); the live remedy is R5-4 banner-vs-diagnostic at the degrade site |
-| R3-12 | Low | `toolexec.nim`, `gitdiff.nim:298-306` | A valid driver whose grandchild holds the pipe is reported unavailable and leaves an orphan (over-invalidation + no tree kill) | deferred (Low, per mandate) |
-| R3-13 | Low | `test_ccprobe.nim:1371-1373` | The R2-6 helper `removeDir`s a predictable shared-tmp name before creating it; a pre-planted symlink there is followed | deferred (Low, per mandate) |
-| R3-14 | Low | `test_api_boundary.nim:89,96` | `not compiles(...)` seals with no positive control (`test_paths.nim`'s equivalents DO have them, at 944 and 998) | deferred (Low, per mandate) |
-| R3-15 | Low | `test_compiledriver.nim:229`, `test_fold_probe.nim:41`, `test_spike_import_case.nim:132` | Three more unmarked or bespoke `skip()`s inside the win/mac sweep scope that do not fire today | deferred (Low, per mandate) |
-| R3-16 | Low | `test_ccprobe.nim`, five sites | Tests hand-split the fingerprint pipe instead of using `parseCcFingerprint`, CR11's single parser — which no test in the tree uses | deferred (Low, per mandate) |
-| R3-17 | Low | `artifactid.nim` `toClosureProbeError` | `of dpeNone: cpeNone` maps an error enum's success value to success and calls itself unreachable; a `doAssert` would make that a checked claim | deferred (Low, per mandate) |
+| R3-11 | Low | `ccidentity.nim:225-234` | `hasDottedVersion` accepts ANY `digit.digit`, so a path segment (`C:\tools\1.5\`) or a date (`2024.09.01`) in error text passes as KNOWN | **deferred (Low, per mandate)** — but NOW LOAD-BEARING after R4-1, and SHARPENED by R5-4: see the R3-11 note in round 4 and R5-4 in round 5. The obvious two-dot fix is refuted (the ldd constraint); the live remedy is R5-4 banner-vs-diagnostic at the degrade site. **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
+| R3-12 | Low | `toolexec.nim`, `gitdiff.nim:298-306` | A valid driver whose grandchild holds the pipe is reported unavailable and leaves an orphan (over-invalidation + no tree kill) | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R3-13 | Low | `test_ccprobe.nim:1371-1373` | The R2-6 helper `removeDir`s a predictable shared-tmp name before creating it; a pre-planted symlink there is followed | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R3-14 | Low | `test_api_boundary.nim:89,96` | `not compiles(...)` seals with no positive control (`test_paths.nim`'s equivalents DO have them, at 944 and 998) | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R3-15 | Low | `test_compiledriver.nim:229`, `test_fold_probe.nim:41`, `test_spike_import_case.nim:132` | Three more unmarked or bespoke `skip()`s inside the win/mac sweep scope that do not fire today | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R3-16 | Low | `test_ccprobe.nim`, five sites | Tests hand-split the fingerprint pipe instead of using `parseCcFingerprint`, CR11's single parser — which no test in the tree uses | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
+| R3-17 | Low | `artifactid.nim` `toClosureProbeError` | `of dpeNone: cpeNone` maps an error enum's success value to success and calls itself unreachable; a `doAssert` would make that a checked claim | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
 
 ### R3-1 — the fix was right about the bit, wrong about the operand
 
@@ -2382,7 +2474,7 @@ discoveries into its review findings is overstating what the review caught.
 | R4-6 | Med | `compiledriver.nim:62`, `runner.nim:48` | crisol's own source hard-fails a consumer building with `--warningAsError:UnusedImport` — a flag RFC-0004's handoff already recommended adopting | **fixed** — both imports dropped, gate adopted, zero exemptions |
 | R4-7 | Med | `toolrun.nim:26`, `planner.nim`, this doc | three of round 3's own bookkeeping fixes state something untrue, including R3-10 not deleting the roll-call it reports deleting | **fixed** (roll-call deleted, census → grep, reason corrected, citations anchored) |
 | R4-8 | Low | `toolexec.nim`, `test_r3_terminate_escalation.nim` | `TerminateGraceMs` exported with no consumer while the test hand-duplicates its value; `CeilingMs` dead as a bound; documented worst case understated by a full probe deadline | **fixed** with R4-2 — bound now computed from both constants |
-| R4-9 | Low | `toolrun.nim:195` | `lastProbeStderr` doc promises `""` on timeout while the non-merged path keeps partial stderr; diagnostics only, never reaches a key | deferred (Low, per mandate) |
+| R4-9 | Low | `toolrun.nim:195` | `lastProbeStderr` doc promises `""` on timeout while the non-merged path keeps partial stderr; diagnostics only, never reaches a key | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
 | R4-10 | Low-Med | `runner.nim`, qualified re-exports | `export mod.sym` of a name that gains a deprecated companion errors AT THE EXPORT, an unfixable site that can mask real omissions behind one confusing error | **guarded** + documented at the gate; grep-assertion declined, see note |
 | R4-11 | Med | `test_api.nim:2926`, `api.nim:1637` | PRE-EXISTING intermittent flake, found by the round-4 sweep: `regressed == true` while `perfBaselineUs == 0` — the C6 verdict flags a regression while reporting no baseline. 1 fail in 3 identical fresh containers | NEW — outside this workstream, for Corey |
 
@@ -2701,15 +2793,15 @@ this reviewable at all, which is an argument for keeping it.
 | R5-13 | Med | this doc | no round-5 table; four rows in neither list; the W1–W18 audit has no status column at all | **fixed** |
 | R5-14 | Med | this doc | R2-3's recorded resolution was "do not delete the line"; R3-8 deleted it, with no forward pointer | **fixed** |
 | R5-15 | Med | `artifactid.nim`, and the census **method** | a defaulted cache-key input outside R4-4's population — and the prescribed grep census is structurally incapable of finding a new one | **fixed** — (a) `artifactKeyHash` got the full class remedy, zero churn; (b) new `ci/assert-defaulted-params.sh` pins 197 records over 1010 signatures, fails BOTH directions, mutation-proven ×3; wired into `ci.yml` |
-| R5-16 | Low | `ccidentity.nim` | `cdVersionAndBinary`'s "POSIX has exactly one candidate" premise is a comment, not an invariant; an exported profile with two candidates folds N banners behind a digest of the first | deferred (Low, per mandate) |
+| R5-16 | Low | `ccidentity.nim` | `cdVersionAndBinary`'s "POSIX has exactly one candidate" premise is a comment, not an invariant; an exported profile with two candidates folds N banners behind a digest of the first | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
 | R5-17 | Low | `dev`, `ci.yml` | the stated reason for the gate's five-invocation shape is FALSE on 2.2.10 — the aggregator does catch a dead shared import | **fixed** with R5-2 — false rationale replaced with the true one (per-target `--os:` coverage) |
 | R5-18 | Low | `dev`, `ci.yml` | "`cachedispatch` is the only module whose symbols are exported individually" — 13 modules use the qualified form; the narrow claim holds, the sentence does not | **fixed** with R5-2 — narrowed to "among the modules carrying a deprecated companion" |
-| R5-19 | Low | `toolexec.nim` | the reap half of `terminateAndReap` is unobserved; closing it needs a `/proc/<pid>/stat` `Z` check, not a `cmdline` scan | deferred (declared backstop) |
-| R5-20 | Low | `test_cachedispatch.nim` | a doc describes the signature R4-4 removed, and the case now pins the deprecated overload's publish-anyway semantics | deferred (Low, per mandate) |
-| R5-21 | Low | `cachedispatch.nim`, `depgraph.nim` | two navigational docs recommend a deprecated arity and point at "the 3-arg overload" that is now 4-arg | deferred (Low, per mandate) |
-| R5-22 | Low | `test_freshness.nim` | a case named `cdNeverBuilt` asserts `cdStale`; pre-existing, byte-identical at base | deferred (Low, pre-existing) |
-| R5-23 | Low | this doc | nine of twenty spot-checked line citations have rotted, three of them invalidated by R3-8 itself | deferred — the anchor convention is the standing remedy |
-| R5-24 | Low | `planner.nim`, `plan` | after R3-8, `plan` takes two parameters its body never reads, and Nim never warns on an unused parameter — no gate can see it | deferred (Low) — **recommendation recorded below** |
+| R5-19 | Low | `toolexec.nim` | the reap half of `terminateAndReap` is unobserved; closing it needs a `/proc/<pid>/stat` `Z` check, not a `cmdline` scan | deferred (declared backstop). **FIXED in the Lows pass (2026-09-26)** |
+| R5-20 | Low | `test_cachedispatch.nim` | a doc describes the signature R4-4 removed, and the case now pins the deprecated overload's publish-anyway semantics | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
+| R5-21 | Low | `cachedispatch.nim`, `depgraph.nim` | two navigational docs recommend a deprecated arity and point at "the 3-arg overload" that is now 4-arg | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
+| R5-22 | Low | `test_freshness.nim` | a case named `cdNeverBuilt` asserts `cdStale`; pre-existing, byte-identical at base | deferred (Low, pre-existing). **FIXED in the Lows pass (2026-09-26)** |
+| R5-23 | Low | this doc | nine of twenty spot-checked line citations have rotted, three of them invalidated by R3-8 itself | deferred — the anchor convention is the standing remedy. **CLOSED in the Lows pass (2026-09-26)**: the anchor convention is the remedy |
+| R5-24 | Low | `planner.nim`, `plan` | after R3-8, `plan` takes two parameters its body never reads, and Nim never warns on an unused parameter — no gate can see it | deferred (Low) — **recommendation recorded below**. **FIXED in the Lows pass (2026-09-26)** |
 | R5-25 | Med | `src/`, `tests/` (census-defined, not file-listed) | stale code-comment citations: comments crediting a fix, check or behaviour to a proc, file or line that no longer holds it; the first ten sites asserted `decideCompile` performs a toolchain comparison, and one R4-4 clause propagated three times was **never true, not even at base** | **fixed for the census-matched population** — the original ten closed out-of-lane; round 6 replaced the hand enumeration (declared complete five rounds running, while `clean.nim`'s W3 attribution survived outside it) with a rerunnable grep census: every hit verdicted, **83 stale, all fixed, 0 open**, plus ~45 stale neighbours found while reading, also fixed. Completeness is claimed only for what the census matches — see the subsection for what it cannot catch |
 | R5-26 | Med | `ci/source-soundness-gate.sh`, new `ci/assert-gate-coverage.py` | R5-11 collapsed two gate copies into one but the survivor still CLAIMED its coverage in a comment; a new out-of-closure module would be in no gate, green | **fixed** (mutation-proven ×4) — coverage now measured every run; first run corrected 76—>78 |
 
@@ -3332,14 +3424,14 @@ hardest at round 6's own fixes, starting with `bannerLine`.
 | R6-D7 | Low | `planner.nim:176` | the "~450" call-site figure, again | **fixed** (folded into R6-D4) |
 | R6-D8 | Low | `artifactid.nim` | a doc's claim about the `roots` default did not hold | **fixed** (folded into R6-D4) |
 | R6-D11 | Low | `closure.nim` | citations that had rotted | **fixed** (folded into R6-D4) |
-| R6-S5 | Low | `ci/assert-subset-honesty.sh` | the honesty gate does not audit `test_cc_backend` | deferred (Low, per mandate) |
-| R6-S6 | Low | `ccidentity.nim` / `api.nim` | a doc claims `$(CcFingerprint)` round-trips, and nothing proves it | deferred (Low, per mandate) |
-| R6-S7 | Low | host dispatch | `shellSplit` on the host-dispatch path | deferred (Low, per mandate) |
-| R6-D6 | Low | `api.nim` | a consumer of `crisol/api` has no way to construct a `CcFingerprintProbe` | deferred (Low, per mandate) |
-| R6-D10 / L8 | Low | `dev` | the help text cites a fixed line range | deferred (Low, per mandate) |
-| R6-D13 | Low | `artifactid.nim` | where the `roots` parameter sits in the signature | deferred (Low, per mandate) |
-| R6-L6 | Low | `planner.nim` | no test observes the plan-time `$ccProbe()` | deferred (Low, per mandate) |
-| — | Low | `tests/unit/test_rfc7_a3_ioutils_ownership.nim` | a leftover test NAME still says `signals.nim` | deferred (Low, per mandate) |
+| R6-S5 | Low | `ci/assert-subset-honesty.sh` | the honesty gate does not audit `test_cc_backend` | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R6-S6 | Low | `ccidentity.nim` / `api.nim` | a doc claims `$(CcFingerprint)` round-trips, and nothing proves it | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R6-S7 | Low | host dispatch | `shellSplit` on the host-dispatch path | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R6-D6 | Low | `api.nim` | a consumer of `crisol/api` has no way to construct a `CcFingerprintProbe` | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
+| R6-D10 / L8 | Low | `dev` | the help text cites a fixed line range | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R6-D13 | Low | `artifactid.nim` | where the `roots` parameter sits in the signature | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
+| R6-L6 | Low | `planner.nim` | no test observes the plan-time `$ccProbe()` | deferred (Low, per mandate). **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
+| — | Low | `tests/unit/test_rfc7_a3_ioutils_ownership.nim` | a leftover test NAME still says `signals.nim` | deferred (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
 | R6-D12 / L9 | Low | repo root | `.sweep-tmp.sh` left behind | **closed**. Already removed |
 | R6-S3 / D9 / L7 | Low | this doc, `ci/assert-defaulted-params.sh` | the census population was quoted as "107", a stale figure the census itself no longer produced | **fixed** in R6-D2's lane: replaced with the measured 197 records over 1014 signatures and the command that produces them (row added in round 7, R7-D3) |
 | R6-L10 | Low | `ci/assert-defaulted-params.sh` | ubuntu-latest's `awk` is mawk, and the census had only ever run under gawk/busybox | **closed** by R6-S2's lane, which verified byte-identical output under busybox awk, mawk 1.3.4 and gawk 5.3.2 (row added in round 7, R7-D3) |
@@ -3553,7 +3645,7 @@ but to the measurement it was founded on.
 | R7-D2 | Med | this doc, Resume block and Stage table | Resume said "Remaining: slices 2-5" and "Still owed … the RFC-0007 addendum", contradicting `### Remaining` (all slices done) and the addendum at `0007-execution-substrate.md:643`; the Stage table showed #21 as "tracer GREEN (1a/1b/1c)"; `## #23 — NEXT` headed a DONE section | **FIXED**. Each claim checked against code and docs; Stage table, review-state block, Resume (now the review loop: land round 7, then round 8) and both issue headings rewritten |
 | R7-D3 | Med | this doc, round-6 table | no rows for R6-S3/D9/L7 (the stale "107" figure) or R6-L10 (mawk untested on ubuntu), though prose cited both; the counts built on the table were wrong | **FIXED**. Two rows added with terminal statuses; round-6 totals and the review-state block recounted by script: 27 rows, 1 High / 9 Med / 17 Low, 17 fixed / 8 deferred / 2 closed |
 | R7-S6 | **Critical** | `runner.nim` ~1570 (the compile `ChildSpec.env`) / `keys.nim` | the compile child gets the WHOLE parent environment (`filterEnv(envPairs, SandboxSpec(envScrub: false))`), so `CPATH`, `CL`, `_CL_`, `INCLUDE`, `LIB` and the rest reach `nim c` → gcc/cl, while the key's only environment component is `hermeticEnvHash` over the TEST child's allowlist. Proven end to end on Linux: a cached PASS is served to a host whose own binary FAILS. A second defect shares the root: `decideCompile` ignores the compile environment. Pre-existing (reproduced on a clean `git archive` of `630ecc6`). See "R7-S6" below | SPLIT OUT — separate issue (Corey, 2026-09-25); design under discussion |
-| R7-S7 | Low | `types.nim`, `TrustConfig.policy = "none"` | observed while pinning object-field defaults (R7-S2): a trust-gate input defaults to the non-verifying policy. Safe today — `config.nim` sets it explicitly, `api.nim:1799` builds a config with no remotes, and `configuredCache` rejects unsigned `s3://` and `http://` — but a `file://` or `https://` remote in a `TrustConfig` built in code without `policy` would be read unverified | DEFERRED (Low; needs Corey's eye — candidate for the no-default + `{.deprecated.}` companion treatment) |
+| R7-S7 | Low | `types.nim`, `TrustConfig.policy = "none"` | observed while pinning object-field defaults (R7-S2): a trust-gate input defaults to the non-verifying policy. Safe today — `config.nim` sets it explicitly, `api.nim:1799` builds a config with no remotes, and `configuredCache` rejects unsigned `s3://` and `http://` — but a `file://` or `https://` remote in a `TrustConfig` built in code without `policy` would be read unverified | DEFERRED (Low; needs Corey's eye — candidate for the no-default + `{.deprecated.}` companion treatment). **FIXED in the Lows pass (2026-09-26)** |
 | R7-S3 / D7 | Low | `ccidentity.nim` | `cfsNotProbed` fails open | **FIXED**. `toolchainUnsound` requires both halves `cfsKnown`, so the zero value is refused and reports `turBlind` |
 | R7-S4 | Low | `pipeline.nim`, the R4-4 overload comment | still said `""` "quietly disables a staleness check" | **FIXED**. Now states what `""` does: a real-stamped graph is discarded, the rebuilt graph is saved stamped `""`, and later `""` loads accept that one unchecked |
 | R7-S5 | Low | `depgraph.nim`, both deprecated `loadDepGraph` overloads | the message said a real-identity graph "is discarded on every load" — overstated: after the discard the caller saves a `""`-stamped graph, which later `""` loads accept | **FIXED** (message text only). `nim check` and the source-soundness gate exit 0. The same overstatement survives in two source comments no round-7 lane was allowed to edit: `depgraph.nim` ~1720-1724 (the `##` block above the R3-7 deprecated overloads: "discarded on every load (over-invalidation)") and `pipeline.nim` ~75 ("discards a real-stamped one on every load"). Correct text: a real-stamped graph is discarded, the caller then saves a rebuilt graph stamped `""`, and later `""` loads accept it unchecked. Carried to round 8 as a comment-only fix. **Carry-over closed in round 8 as R8-D4** (both comments plus a sibling at `pipeline.nim` ~99) |
@@ -3566,7 +3658,7 @@ but to the measurement it was founded on.
 | R7-L3 | Low | `test_rfc0007_a5_rusage_limits_wire.nim` | the first test ran from the repo root, so it took `<repo>/.crisol/lock` and failed with exit 3 (lock contention) under any parallel crisol run — round 6's "load-sensitive flake" | **FIXED**. Runs from a unique temp project root, like its second test; 2/2 OK in the container |
 | R7-L4 | Low | `ccidentity.nim`, `freeStanding` | its delimiter set was wider than anything observed: `(` on the left and `)`, `,`, `;` on the right; `;` was dead and its doc claim false | **FIXED**. Those four removed. `-` kept: Ubuntu clang needs it, now observed rather than assumed |
 | R7-L5 | Low | `ci/assert-defaulted-params.selftest.sh` | no case for raw strings or for the census's per-file state reset | **FIXED**. Both cases added; each kills its mutant |
-| R7-L6 | Low | `ci.yml` | `test_toolchainfp_producer_chain.nim` (R6-L1) lives under `tests/integration` and never runs on the windows or macos legs | DEFERRED (Low, per mandate) |
+| R7-L6 | Low | `ci.yml` | `test_toolchainfp_producer_chain.nim` (R6-L1) lives under `tests/integration` and never runs on the windows or macos legs | DEFERRED (Low, per mandate). **FIXED in the Lows pass (2026-09-26)** |
 
 Every row is terminal. Counted from the table by script: **22 rows** — 1
 Critical, 1 High, 6 Med, 14 Low; **19 fixed, 2 deferred** (R7-S7, R7-L6, both
@@ -3709,7 +3801,7 @@ the interim IDs too.
 | R8-D3 / L6 | Med | `config.stateDirOf`, `planner.binPath`/`cachePath`, `runner.runEntrypoint`; ~15 tests | an empty `stateDir` resolved against the process cwd. Tests therefore shared `<repo>/bin/`, `<repo>/cache/` and `<repo>/.crisol/lock`. This explains every parallel-sweep failure (see the round-7 verification state). Reproduced with two containers on one tree | **FIXED** (Lane D). `""` now means `<projectRoot>/.crisol`, never cwd. An empty or relative `projectRoot` raises `CrisolError(cekConfig)`. `runEntrypoint` uses a private temp state dir. Tests are isolated through the new `tests/support/statedir.nim`. Before/after repro: scratchpad `r8d3/`. See "R8-D3 / L6" below |
 | R8-L1 | Med | `tests/integration/test_r7_probe_presence_contract.nim`, `ci.yml` | the presence contract that R7-S1 rests on claims "every platform" but ran only on the Linux `test`/`cgroup` legs. No CI step or test ever set `CL`, so R7-S1's real trigger reached the logic only as synthetic `RunProc` captures on Linux. That repeats round 7's own lesson inside round 7's own fix | **FIXED** (Lane C). The presence-contract test has its own step on windows and macos, teed into `harness.log`, and `ci/assert-subset-honesty.sh` requires its three `[OK]` lines on both legs. New `tests/integration/test_r8_real_cl_refusal.nim`: when a real `cl` is on PATH, it sets `CL=/W4` in-process and calls `ccIdentity(realRunMerged, WindowsCcProfile, realFileHash)`, avoiding the memo. It asserts raw `cl` ran and exited non-zero, the half is refused with `cl` in `refusedDrivers`, and the reason is `turCompilerRefused`. The control (`CL` unset) asserts known, Microsoft, `turSound`, and `CL` is restored. The windows step imports `vcvars64.bat` (found with `vswhere`) into its own shell only and fails loudly if `cl` is still missing. The audit requires the real body on windows (`R8-REAL-CL REAL`, done, both `[OK]`), and macos pins both skip labels. Passed on the real MSVC container and self-skips on Linux. **The new `ci.yml` steps have only been dry-run with stubs, not on GitHub Actions** |
 | R8-L4 / S2 | Med | `ci/assert-defaulted-params.sh` (object-field scanner), its self-test | four object-field scanner arms were observed by nothing: continuation lines, variant-branch `of`/`else`/`elif`/`when` prefixes, field pragmas and `ref`/`ptr object`. Mutating each left the gate and the self-test at rc 0 (L4). Separately, the recognizer required `=` and `object` on one line, so three valid shapes whose default `nim r` confirms is applied were invisible, with census exit 0 and zero records: `T* =` then `object`, a comment after `=`, and `= ref` then `object`, including `ref object of Base` (S2). Nothing in `src/` uses those shapes today | **FIXED** (Lane B). The scanner finds `object` (or a line-ending `tuple`) and walks back across whitespace, line breaks, comments and at most one `ref`/`ptr` to the `=`. All four split shapes are recorded, plus `=` then `ref object of B`. Self-test: **34 cases**, green under busybox awk, mawk and gawk. Each new case has an exact exit code and a required output line. 13 scanner mutants, each red in exactly its own case. Real tree: 231 records, unchanged |
-| R8-S3 | Low | `toolrun.nim` timeout arm, `ccidentity.nim` | a wedged driver returns `""` on timeout and reads as absent. It warns (CR4) but does not refuse. Suggested trigger: a cold `vccexe`/vcvarsall passing 10 s on `windows-latest` while the later link probe finishes, so bystander gcc/clang banners become the compiler half. Not proven (measured `vccexe` at ~60 ms in the container), and the runtime half still hashes the VC toolset's `libcmt`/`libvcruntime` | DEFERRED (Low, per mandate) |
+| R8-S3 | Low | `toolrun.nim` timeout arm, `ccidentity.nim` | a wedged driver returns `""` on timeout and reads as absent. It warns (CR4) but does not refuse. Suggested trigger: a cold `vccexe`/vcvarsall passing 10 s on `windows-latest` while the later link probe finishes, so bystander gcc/clang banners become the compiler half. Not proven (measured `vccexe` at ~60 ms in the container), and the runtime half still hashes the VC toolset's `libcmt`/`libvcruntime` | DEFERRED (Low, per mandate). SUPERSEDED IN ROUND 9: R9-D2 made a timed-out driver present-and-refused, and R9-D1's redesign probes only the configured driver, so a probe that does not exit 0 leaves the half unavailable and the cache off; there is no PATH candidate list for a bystander to answer from. **CLOSED-OBSOLETE in the Lows pass (2026-09-26)** |
 | R8-S4 | Low | `ci/assert-defaulted-params.sh` | tuple field defaults (`tuple[policy: string = "none"]`, applied via `default(T)`) and `do`-block parameter defaults escaped the census | **FIXED** (Lane B). Tuple defaults are recorded in both forms as `anon_tuple(<binder>):<field> = <value>`. `do` blocks are recorded as `anon_do(_)`: the lambda's type drops the default today, but a template or macro taking the block `untyped` could splice it in. `src/` has 127 + 1 tuple types, none with a field default, and no `do` blocks |
 | R8-S5 | Low | `ci.yml`, the meta-test step | under `always()` the meta-test passed whenever the harness exited non-zero for any reason, so a failed deps fetch printed "META-TEST OK" | **FIXED** (Lane C). The step runs only after a successful fetch. It passes only on a non-zero exit plus all three of: the dummy's `deliberate failure: CI meta-test…` text, `FAILED: 1 file(s)`, and the `tests/meta/test_fail_dummy.nim` line. A dry run with stubbed `docker` reproduced the false pass first, then showed it fixed |
 | R8-D4 | Low | `depgraph.nim` ~1720-1724, `pipeline.nim` ~75 and ~99 | R7-S5's carry-over, confirmed, plus a sibling: `pipeline.nim` ~99 said `""` would "disable both checks" | **FIXED** (Lane D, comments only). A real-stamped graph is discarded once and replaced by an empty graph stamped `""`. Once saved, later `""` loads accept it with no toolchain check. Closes R7-S5's carry-over |
@@ -3805,6 +3897,12 @@ defaulted parameter was added.
   could be believed again. That would also remove R8-D1's cost (no caching at
   all while `CL` is set). The issue should carry this as an explicit
   follow-up.
+  **SUPERSEDED IN ROUND 9, without waiting for #24.** R9-D1 stopped running
+  bare `cl`: identity now comes from an `/EP` macro probe, which exits 0 under
+  any `CL` (measured with `/W4`, `/MP`, `/DFOO`, `/nologo`), and the values of
+  `CL` and `_CL_` are folded into the cc half directly. The refusal, the
+  banner rule and `presentButFailed` are gone, and so is R8-D1's cost. #24
+  still owns the general compile-environment scrub.
 
 ### R8-S1 and R7-S6: one issue, one design
 
@@ -3858,6 +3956,7 @@ not assume a route that does not work today.
 
 - **R8-S3** (Low, per mandate): a wedged driver warns but does not refuse.
   Unproven, and the runtime half still varies with the VC toolset.
+  SUPERSEDED IN ROUND 9 (see its row).
 - **Lane D leftovers**, outside its file list and not review findings:
   - `.gitignore`'s `/cache/`, `/bin/` and `/depgraph` lines, and their
     "stateDir defaulting to cwd" comment, are now obsolete. The old
@@ -3919,14 +4018,1209 @@ tree unless noted):
 
 **Full sweep (after Lane D), 4 parallel slices on the shared tree: 264 entrypoints, 263 pass, 1 fail.** The one failure is `tests/unit/test_fallback.nim` (`a.fold == b.fold` assertion, `paths.nim:275`), the known local bind-mount fold-policy case that never fails on CI. None of the round-7 parallel-collision failures recurred.
 
+## Round 9 re-review — 2026-09-25 (base `7da32d3`; round-9 fixes uncommitted)
+
+Round 9 is the first round to run against a **committed** baseline, and the
+first after the loop's scope was restated. Three process changes came before
+the review itself.
+
+- **Commit, then rebase (Corey approved both).** Rounds 1-8 were committed
+  locally as `55c9fb0`. Round 9's liveness review then found that local `main`
+  was not built on `origin/main` (R9-L1), and Corey approved a rebase. Local
+  `main` is now `origin/main` (`49fb53b`) plus the three rebased commits
+  `e6c9966` (was `9219670`), `869c268` (was `630ecc6`) and `fb0e7ff` (was
+  `55c9fb0`), plus **`7da32d3`**, which removes `49fb53b`'s interim vcc
+  self-skips. The rebase hit the same conflict twice, in
+  `docs/rfc/0007-execution-substrate.handoff.md`. Both times it was resolved
+  by keeping `origin/main`'s Stage and Resume lines and adding the
+  `MSVC SELECTION LAYER` pointer line. The pre-rebase state is kept on
+  `backup/pre-rebase-55c9fb0`. **Nothing is pushed.**
+- **#24 filed** (R7-S6 + R8-S1): the compile environment, user and global
+  `nim.cfg`, the C++ runtime, and the `.nim.c` entry-unit basename, from the
+  `--backend:cpp` check (see `## Open for Corey`). **R8-L3's guard half was
+  closed** before the commit: the dead `candidate.driver notin refused` guard
+  was removed and a compile-time uniqueness assertion added (its round-8 row
+  records this).
+- **Scope, restated by Corey.** `/code-review` is comprehensive but scoped:
+  every in-scope finding is fixed, and the scope is #21-23 for the whole life
+  of the loop. It is not "the uncommitted diff", which grows with the loop's
+  own tooling. An out-of-scope observation gets one line under "Out of scope,
+  noted" and does not open a round. Every round-9 reviewer brief named the
+  #21-23 scope explicitly and listed what was out of it, including #24.
+
+Dispatched over #21-23 as committed at `55c9fb0`, with the same three
+dimensions (security; design and ergonomics; liveness and completeness).
+Every High was then put to an adversarial verifier that tried to refute it,
+with experiments on the Linux and MSVC containers. All seven Highs held. Two
+claimed Highs were downgraded to Medium on verification (R9-D4, R9-L2). **Fixes
+LANDED** in six lanes, all on Opus 5.5: **S** (#21 closure soundness),
+**C** (cache gate and warning ladder), **R** (`RunProc` result type and
+drain), **I** (identity redesign), **G** (gitdiff `ls-files`), and a
+sweep-regressions lane. The status column below is the live record (R5-14).
+
+**No Critical; seven Highs.** Unlike rounds 5-8, the worst findings do not
+all trace to the previous round's remedy. R9-S1 and R9-S2 are in #21's
+dependency probe as first written. R9-D1 is the architectural verdict on
+eight rounds of banner heuristics. R9-L1 is branch state.
+
+**On IDs.** The liveness reviewer was told not to renumber, and renumbered
+anyway between its interim and final reports. This section uses the **final**
+IDs. The mapping, interim to final: L1 → L1 (the `origin/main` divergence),
+L2 → L2 (A5c honesty), L4 → **L3** (the `keyContext` mutant), L5 → **L4**
+(the closure-path mismatch check), L6 → **L5** (the merged two-burst path),
+L3 → **L6** (macOS and mingw runtime), L7 → L7 (`drainBoth`). The final report
+also downgraded the macOS row to Medium, because it was simulated rather than
+measured. **R9-L8** (no key version bump, which #23 asked for) comes from the
+final report's acceptance table, not its findings list. The orchestrator's
+status messages to Corey used the interim numbering in places; the fix lanes
+were briefed by content.
+
+### Findings
+
+| # | Sev | Where | What | Status |
+|---|---|---|---|---|
+| R9-S1 | **High** | `closure.nim` `extractCompileInputs` (~1698 at `55c9fb0`); `artifactid.nim` `resolveReportedHeaderPath`, `includeClosureContentHash` | `cl /sourceDependencies` lowercases every path. Verified on real `cl` 19.44: `Inc\MyHeader.h` is reported as `c:\work\inc\myheader.h`. Under an `fpNone` root (a case-sensitive NTFS directory, which `osQueryFoldPolicy` reports definitively, not as degraded), `classify` gives `pcOutside`. The closure path then drops the header, and the Stage-M hash keeps the lowercased path, fails to read it, and folds the constant `<unreadable:p>`. The same drop occurs under `fpAsciiLower` when `winRealPath` cannot resolve. A header edit invalidates nothing. The verifier enabled per-directory case sensitivity in the Windows container and confirmed that the lowercased spelling does not open | **FIXED** (Lane S). New `ccprobe.reportedHeaderUnresolved`: refuse a header outside every root that matches a folding root case-insensitively, and, for MSVC, any header that matches a case-sensitive root case-insensitively (cl cannot say which casing it opened). New `paths.caseBlindRootMembership`. `closure.nim` raises on an unresolved header and on a resolved spelling that is not an existing file. `includeClosureContentHash` returns `(contentHash, ok, unreadable)` and fails on the first unreadable header; new `cpeUnresolvedHeader` and `cpeUnreadableHeader`. The `fpNone` no-rescue rule (Fork A) is unchanged: refusal, not guessing |
+| R9-S2 | **High** | `ccprobe.nim` `deriveDepInvocation` GNU arm, `depIncludeHeaders` | the GNU replay kept every flag except `-c`/`-o`, so `-MD`/`-MMD`/`-MF` from `passC` survived beside `-M`. Real gcc 16.2: `gcc -M -MMD x.c` exits 0 with **empty stdout** and writes the rule to a `.d` file in the probe's cwd. Clang prints preprocessed source instead. `parseCcMDeps` read either as zero or junk headers with `dpeNone` ("the GNU arm cannot fail"). A `passC` dependency flag silently emptied the unit's header closure | **FIXED** (Lane S). The GNU replay drops the full gcc/clang dependency-output and output-mode flag list, in separated and attached forms, inside `-Wp,` lists and as `-Xpreprocessor` pairs. New `parseGnuDepRule` requires exactly one make rule whose first prerequisite is the probed source (a leading `./` ignored), else `dpeNoMakeRule` or `dpeSourceMismatch`. Tests use recorded gcc and clang output (empty, whitespace, clang preprocessed output, a `-dM` dump, `-MP` phony rules, escaped space, CRLF) plus a keep-list control |
+| R9-L1 | **High** | branch state: `origin/main` `49fb53b` vs local `55c9fb0` | local `main` was not built on `origin/main`. The actual merge base was `8e527bb`, not `630ecc6`. A merge conflicted only in the RFC-0007 handoff and silently restored `49fb53b`'s `when defined(vcc): quit(0)` guards in a3bii, a4b and a5c, the vcc `skip()` in `test_windows_cli_smoke`, `check_must_execute_or_vcc_skip` in the honesty script and `CRISOL_CC=vcc` in `ci.yml`. The windows leg would then pass with all four bodies skipped. This doc's "there are no vcc self-skips to remove" was true of the local tree only | **FIXED** (orchestrator, Corey approved). Rebased onto `origin/main`, then `7da32d3` restores the gate-free versions of the six files; `git diff --stat 55c9fb0 HEAD` shows only the RFC-0007 handoff. `grep -rn "defined(vcc)"` finds no skip guard, and `ci.yml` has no `CRISOL_CC=vcc`. The claim under #21 slice 3 is corrected in place (CORRECTED IN ROUND 9). Not pushed |
+| R9-L3 | **High** | `api.nim`, `keyContext(ccVersion = ccVer)` (~2102 at `55c9fb0`) | the one production site that feeds the cc identity into the soundness key was unobserved. The mutant `ccVersion = ""` stayed green across 12 files, including `test_cachedispatch`, `test_api`, `test_issue23_cc_identity`, `test_toolchainfp_producer_chain` and `test_rfc9_a5c`. The verifier re-ran it on five of them: all green. The next step (`cachedispatch.nim` ~1047) was covered | **FIXED** (Lane C). New `tests/integration/test_r9_cc_identity_keys_cache.nim`: two real runs share one cache; the same sound fingerprint twice hits, two different sound fingerprints miss. Under the mutant the second run came back `cdmHit`, `cached == true` |
+| R9-D1 | **High** | `ccidentity.nim` (Windows cc half, ~600 lines of banner heuristics) | nine predicates guessed whether localized merged output was a banner or a diagnostic, each tightened after a counterexample in a different round. Bare `cl` is the only reason any non-empty `CL` gives D8003 and rc 2 (R7-S1), so every MSVC host with `CL=/MP` cached nothing. Probing five PATH candidates is the only reason the bystander-gcc problem (R4-1) exists. Verified on the MSVC container: `cl /nologo /EP` over `_MSC_FULL_VER _MSC_BUILD` prints `194435228 0`, rc 0, under no `CL`, `CL=/W4` and `CL=/MP`, where bare `cl` returns rc 2; `vccexe` behaves the same. The verifier added two requirements: the banner's "for x64" needs `_M_*` macros, and there is no nimcache manifest at plan time to name the driver | **FIXED** (Lane I). See "R9-D1: the identity redesign" below. `ccidentity.nim` is 889 lines, down from about 1,740 |
+| R9-D2 | **High** | `toolrun.nim` `RunProc`; `ccidentity.nim` `presentButFailed`, `realLinkVerbose` | `tuple[output, ok]` used `""` for spawn failure, `OSError` and the CR4 timeout alike. That forced an inference in `presentButFailed` (a wedged but present driver read as absent), the module-global `lastProbeStderr()` side channel, and `realLinkVerbose` bypassing the seam and discarding `ok` | **FIXED** (Lane R). `RunResult` is a case object on `ending: RunEnd` (`reExited`, `reNotStarted`, `reTimedOut`, `reIoError`, `reOverflow`); only `reExited` carries an exit code, stdout and stderr. The global is gone, and the link probe goes through the seam (`realRunMergedIn`). A timed-out, I/O-error or overflowed driver counts as present and is refused. Named `RunOutcome`/`.outcome` at first; renamed by the sweep-regressions lane (see below). Shared test fake: `tests/support/fakerun.nim` |
+| R9-D3 | **High** | `cachedispatch.nim` (`toolchainUnidentified` field, parameters, two deprecated overloads); `api.nim` | an unidentified host still looked up every tier, including the shared L2 over the network, for every entrypoint, and no lookup could hit: a degraded key contains the sentinel text, and no sound host stores under it. `shouldStore`'s doc claimed a degraded host "may still serve/use a hit" another host published, which was false and contradicted `api.nim`'s own R8-D1 comment | **FIXED** (Lane C). `api.nim` computes one `cacheOn` (no `--no-cache`, roots not degraded, toolchain sound). An unsound host runs with `cacheDisabledBecause(spec, cdmToolchainUnidentified)`: no tier is consulted and nothing is stored. The field, the parameters, both overloads and the false doc are deleted. New `CacheContext.inactiveReason`; `cacheDisabled(spec)` is `cacheDisabledBecause(spec, cdmPolicyDisabled)`. `cdmToolchainUnidentified` moved into `cachetelemetry.notConsultedDecisions` and out of `render.isCacheMissDecision`. See "Decisions" below for the `--json` change |
+| R9-D4 | Med (from High) | `ccprobe.nim` `DepSourceCheck` beside `DepProbeError` | on a source mismatch `depIncludeHeaders` returned `err: dpeNone` with empty headers, contradicting the enum's "dpeNone is the only value that means trust the headers". Downgraded on verification: both callers (`closure.nim`, `artifactid.nim`) did check the second field | **FIXED** (Lane S). `DepSourceCheck` is deleted; `DepProbeError` gains `dpeSourceMismatch` (and `dpeNoMakeRule`, R9-S2). `closure.nim` has a `case probed.err` with its own "DIFFERENT translation unit" message |
+| R9-D5 / S4 | Med | `toolexec.nim` | four hand-written drain loops, each written per platform; `drainBoth` had no production caller; a 20-line doc explained a combined bound. On the error paths (POSIX `poll` failing with anything but EINTR, Windows `PeekNamedPipe` failing for anything but a broken pipe) the drain returned partial output with `timedOut=false`, which `runViaOsproc` reported as a complete `ok=true` capture: #22's silent truncation through the error path | **FIXED** (Lane R). One private `drain` per platform under one deadline budget, ending `eof`, `timedOut`, `ioError` or `overflow` (`ToolEnd`); an I/O error is never success. Entry points `capture` and `runTool`. The bound is `timeoutMs + 2*TerminateGraceMs`. New `tests/integration/test_r9_tool_capture_endings.nim`: a pipe closed mid-capture ends `ioError` |
+| R9-D6 | Med | `api.nim` `runTestsWith` (~1981-2060 at `55c9fb0`) | the warning ladder was built inline, judged the fingerprint twice, was pinned only by a 251-line integration test, and its user-visible text named internals ("see ccidentity.CcFingerprint") | **FIXED** (Lane C). New `src/crisol/toolchainwarn.nim`: a pure `toolchainWarning(fp): Option[string]` from one `toolchainUnsoundReason` call. `api.nim` uses the result both to warn and to switch the cache off. New `tests/unit/test_toolchainwarn.nim`: one case per reason, a warning exactly when unsound, and no text containing `ccidentity` or `CcFingerprint` |
+| R9-D7 | Med | `api.nim` `CcFingerprintProbe*`, `runTestsWith*`'s `ccProbe` parameter | a test-only seam exposed `CcFingerprint`, a type `crisol/api` does not export, on the supported surface | **FIXED** (Lane C), then reshaped by Lane I. The public type and parameter are gone; `runTestsWith*(opts, deps)` has two arguments. The seam is the field `CacheDeps.ccProbe*`, set by `productionCacheDeps`; `runTestsWith` asserts it is non-nil. `planImpl` calls it once and returns the result for the run to reuse. Lane I changed its type to `proc(ctx: CcProbeContext): CcFingerprint` (see Decisions) |
+| R9-D8 | Med | `ccidentity.nim` | the third disjunct of `toolchainUnsound`, `turCompilerUnnamed` and `cfsNotProbed` were reachable only from injected fingerprints; `cfsNotProbed` behaved exactly like `cfsUnavailable`; `isFullyDegraded*` had no production caller | **FIXED** (Lane I). `CcHalf` is built only through private `known`/`unavailable`, its zero value fails closed, and its accessors are total. `turCompilerUnnamed`, `cfsNotProbed` and `isFullyDegraded` are gone; the reasons are `turSound`, `turBlind`, `turCompilerUnidentified`, `turRuntimeUnidentified` |
+| R9-D9 | Med | `ccidentity.nim` `CcDriverIdentity`, `BinHashProc` | the profile bundled three policies and relied on a comment ("found.len == 1 always"). `BinHashProc` returned an in-band sentinel, so an unreadable POSIX driver became `cdkKnown(hex="<artifact-unreadable>")` and `parseCcFingerprint($fp).fp != fp`, contradicting `$`'s documented round-trip | **FIXED** (Lane I). The probe profile is a case object (`RuntimeProbe`), and round-trip parsing is rebuilt on the private constructors |
+| R9-D10 | Med | `ccidentity.nim`, `toolrun.nim`, `toolexec.nim`, `cachedispatch.nim` | round history in source: 1,272 of `ccidentity.nim`'s 1,744 lines were comments, with 112 review-round references, a 146-line doc on a 3-line body and a 150-line "WHAT R3-1 / R4-1 / R5-4 GOT WRONG" narrative | **FIXED** in the files named (Lanes C, R, I). `ccidentity.nim`, `toolexec.nim` and `toolrun.nim` now carry no round references (`grep -c 'R[0-9]-\|CR[0-9]'` = 0), and the `cachedispatch` overload docs went with the overloads. `ccprobe.nim` was not in the finding and still carries 15 |
+| R9-L2 | Med (from High) | `ci/assert-subset-honesty.sh` ~366-368; this doc, #21 slice 3 | the honesty script accepts `SKIP test_rfc9_a5c_cache_portability` on windows as MUST-EXECUTE OK, while this doc said windows-latest has the symlink privilege, `EXPECTED_SKIP_TEST=""` on that leg, and a5c's verdict "lands on CI". Downgraded on verification: the script matches reality. CI run 35491097764 logged "SKIP test_rfc9_a5c_cache_portability: symlink creation failed in this environment: Access is denied." The windows `EXPECTED_SKIP_TEST` has 10 entries, and the cited memory note does not exist | **FIXED** in this recording (doc, not script): #21's slice-3 text and `### Remaining` are corrected in place (CORRECTED IN ROUND 9). A5c's windows verdict cannot come from the current CI; that is the carried W9.4/W12 item |
+| R9-L4 | Med | `closure.nim` source-mismatch check (~1662 at `55c9fb0`) | mutant `if false:` stayed green in `test_artifactid`, `test_issue16_unit`, `test_rfc9_f13` and `test_ccprobe`; only the measure-path twin in `artifactid` was tested | **FIXED** (Lane S). New closure-path test in `test_issue16_unit.nim`: an MSVC document naming a different translation unit must fail loudly. Red under `if false:` (mutant M6) |
+| R9-L5 | Med | `toolexec.nim` `drainToEofDeadline` (the merged path) | mutant "short read = EOF" stayed green in all six capture and identity tests. The merged path serves the banner probe and `/VERBOSE:LIB`, whose output arrives in several flushes; a truncated `.lib` list still yields a digest | **FIXED** (Lane R). Two merged-path tests in `test_issue22_capture.nim`: two bursts (1024 stdout + 512 stderr) in exact order, and 192K + 64K, past the pipe buffer. The mutant is red in both the merged and separate-stream tests |
+| R9-L6 | Med (simulated) | `ccidentity.nim` runtime half | macOS has no `ldd`, and clang echoes `libc.so.6` back from `-print-file-name`; a mingw-only Windows host always took the MSVC link probe. The reviewer's simulation with the real code gave `<runtime-unidentified>`, `turHalfMissing`, on both: neither would ever cache, and the macOS leg's A5c (`l1Hits == 1`) would go red. **The verifier for this row never returned a verdict**; the round proceeded with it marked unverified | **FIXED in code, UNMEASURED** (Lane I). The runtime is chosen from the target the compiler reports, not the host OS: MSVC `.lib`s from `/link /VERBOSE:LIB`; glibc `libc.so.6` labelled with the `ldd` version; mingw `libucrt.a` and `libmsvcrt.a` via `-print-file-name`; macOS the SDK's `libSystem.tbd` from `-isysroot`/`--sysroot`, else `xcrun`. The macOS and mingw paths are built from recorded outputs only. The macOS CI leg is their first real run, and it needs a push |
+| R9-L8 | Med | `keys.nim` | #23 asked for a key or format version bump, and none was made (the fingerprint value change alone does separate entries) | **FIXED** (Lane I). `SoundnessKeyVersion = "crisol:soundness-key:v2"`, chained in first (`keys.nim:218`). Golden pin moved to `ca9d2ea90aa39afa`. Mutant "key version not chained" is red on the golden pin |
+| R9-X1 | Med | `gitdiff.nim` `changedFiles`, `git ls-files` | no reviewer ID; found by Lane R and recorded as an out-of-scope note, then taken as in scope (#22 covers git-diff capture for `--changed`). An `ls-files` run that did not finish only warned, and a non-zero exit discarded the untracked names silently. `api.nim` passes the result straight into narrowing, with no select-everything fallback. Red run: 2 names instead of 4, and `crisol run --changed --dry-run` exited 0 | **FIXED** (Lane G). Both cases raise `cekEnvironment` (exit 3), like `rev-parse` and `diff`; the message names `ls-files`, the exit code and git's stderr, or `[git timeout]`. New suite in `test_issue22_changed_completeness.nim` (a control plus three failure paths, two through the real CLI). `fake_git` gained `CRISOL_FAKE_GIT_UNTRACKED` and `CRISOL_FAKE_GIT_LS_FILES_EXIT`. `rev-parse` and `diff` were checked and already failed closed. The `ci.yml` comment on that step was updated by the orchestrator |
+| R9-D11 | Low | `ccidentity.nim` exports | the canonical `ccFingerprint` was unexported while the legacy `ccVersion*` (no production caller) was exported for tests | **FIXED** (Lane I). `ccFingerprint*(ctx)` is exported beside `cachedCcFingerprint*` and `cachedCcVersion*`; `ccVersion` is gone |
+| R9-D12 | Low | stale docs | `test_issue23_cc_identity.nim`'s header cited the retired `<ldd-unavailable>` and `render.splitFirstPipe`; `ccidentity.nim:74` called `ccVersion` pure; `ccprobe.nim:23` says "These four procs" and lists five; `toolexec.nim` said unbounded callers keep their behaviour | **PARTIAL**. Fixed by the rewrites: the `test_issue23` header, the `ccidentity` claim (`ccVersion` is gone), the `toolexec` sentence. **Still stale:** `ccprobe.nim`'s module doc says "These four procs" over five and still points readers to `ccVersion`, which no longer exists. Carried. **Closed in round 10 by R10-D11** |
+| R9-D13 | Low | test file names | tests named after review rounds (`test_r3_*`, `test_r5_10_*`, `test_r7_*`, `test_w3_*`, `test_cr4_*`) rather than behaviour | **DEFERRED** (Low). Round 9 added three more (`test_r9_cc_identity_keys_cache`, `test_r9_real_cl_identity`, `test_r9_tool_capture_endings`). **Resolved in round 10 by R10-D8** |
+| R9-D14 | Low | `ccprobe.nim` `shellSplit` | `when defined(windows)` branches on the host OS, against `ccFamilyOfDriver`'s "never by host OS" (tracked as W9e); basename helpers duplicated between `ccprobe` and `ccidentity` | **DEFERRED** (Low). The `when defined(windows)` branch is unchanged (`ccprobe.nim:117`); `ccidentity.nim` has its own private `baseName`. **FIXED in the Lows pass (2026-09-26)** |
+| R9-S3 | Low | `ccprobe.nim` `shellSplit` | `'` is treated as a POSIX quote on Windows, where `quoteShellWindows` never quotes an apostrophe: one apostrophe refuses the probe, an even count merges tokens (`O'Brien` paths). Fails closed in practice (cl D8003), at the cost of MSVC/mingw closure for such users | **DEFERRED** (Low). Unchanged. **FIXED in the Lows pass (2026-09-26)** |
+| R9-S5 | Low | `toolexec.nim` | no size limit on captured output | **FIXED** (Lane R). `MaxToolOutputBytes` = 64 MiB; exceeding it ends `overflow`, a failure. `test_r9_tool_capture_endings`: a cap of 1024 on a 4096-byte child ends `overflow`; the control cap fits and returns the exact output |
+| R9-L7 | Low | `toolexec.drainBoth`, `ccprobe.nim` ~483, import comments | `drainBoth` had no callers, and docs still said capture went through it | **FIXED** (Lane R). `drainBoth` and every reference to it are gone |
+
+Counted from the table by script: **27 rows** — **7 High, 13 Med, 7 Low**.
+**23 fixed**, of which R9-L2 is a doc correction made in this recording and
+R9-L6 is unmeasured on its target platforms; **1 partial** (R9-D12, Low); **3
+deferred** (R9-D13, R9-D14, R9-S3, all Low). Every row at Medium or above is
+fixed. R9-D5/S4 is one row, one defect seen from two dimensions. R9-X1 has no reviewer ID; it
+was assigned here so the row has somewhere to live.
+
+### R9-D1: the identity redesign
+
+The C-toolchain identity now names the compiler Nim is **configured** to use,
+not whatever answers on PATH, and it asks a question every driver answers
+without heuristics.
+
+- **Which driver (R9-D1b).** At plan time, `nim c --compileOnly` compiles a
+  probe module fed on **stdin**, run from the project root with the run's
+  global flags, and the compile command is read from the resulting
+  `stdinfile.json`. Measured: a probe module outside the project did not pick
+  up the project `nim.cfg`'s `cc = clang`; the stdin module did. Any failure
+  in discovery leaves both halves unidentified.
+- **Compiler half.** The recorded compile command is replayed as a
+  preprocessor probe. MSVC: `/EP` over twelve macros (version, build, six
+  `_M_*` architecture macros for R9-D1a, `_MT`, `_DLL`, `_DEBUG`, clang-cl).
+  GNU and clang: the whole sorted `-dM -E` dump is hashed (408 defines on gcc
+  16.2; unchanged by cwd, `-I` and `LANG`; changed by `-O2`, `-pthread`,
+  `-m32`). The driver binary's hash is folded in as well.
+- **`CL` and `_CL_` are folded into the cc half (R9-D1c).** Measured: the
+  `/EP` output is byte-identical under `CL=/W4`, `/MP`, `/DFOO` and `/nologo`,
+  so the macro output alone cannot see `CL`. The values of both variables are
+  appended to the digest material (`ccidentity.nim:548`). This **replaces
+  R7-S1's refusal stopgap**: a host with `CL=/MP` caches again, and a change to
+  `CL` still changes the key. The general compile-environment scrub stays in
+  #24.
+- **Runtime half (R9-L6)**, by target: see the R9-L6 row. `artifactRuntime`
+  now refuses when a library lookup fails or a resolved library cannot be
+  read. Before, it skipped that library and keyed on whatever was readable,
+  which is under-invalidation. Lane I found and fixed this itself, test first.
+- **What it cost.** Plan-time fingerprint cost, measured: about **1.5 s** per
+  run on Windows (0.7 s compileOnly, 0.55 s preprocessor probe, 0.14 s link
+  probe) and about **0.2 s** on Linux. Public API change: see Decisions.
+- **R8-S3 is superseded.** A wedged driver no longer reads as absent: a probe
+  that does not end `reExited` with exit 0 leaves the half unavailable
+  (`ccidentity.nim:520`), so the toolchain is unsound and the cache is off.
+  The bystander trigger R8-S3 described cannot arise, because candidates are
+  no longer enumerated from PATH.
+- **Notes for #24** from Lane I, not fixed here: per-group `--cc` and
+  per-directory `tests/nim.cfg`/`config.nims` are not seen by the stdin probe;
+  the GNU compile environment (`CPATH` and similar) is not in the key; for
+  MSVC a `nim.cfg` `passC` reaches the key only through the twelve named
+  macros; the hashed MSVC driver binary is `vccexe`'s, not `cl.exe`'s (cl's
+  version comes from the macros), and on macOS it is the `/usr/bin` shim; the
+  fingerprint is probed once per process, so a `CL` change inside one process
+  is not seen.
+
+### Decisions taken in the fix lanes
+
+- **Unsound toolchain means cache off** (R9-D3): the run takes
+  `cacheDisabledBecause(spec, cdmToolchainUnidentified)`. Entrypoints compiled
+  fresh or stale on such a host now report `toolchainUnidentified` in `--json`
+  instead of `notEligible`, so a reader of a first run can see why nothing
+  cached. `--no-cache` output is unchanged. Put to Corey as a behaviour change;
+  no objection recorded.
+- **Public API change:** `CacheDeps.ccProbe` is now
+  `proc(ctx: CcProbeContext): CcFingerprint`, and `api.ccProbeContextOf(cfg)`
+  builds the context (`api.nim:1137`, `:1487`).
+- **`SoundnessKeyVersion` is v2** (R9-L8). Every existing entry misses once.
+- **`RunResult.ending` / `RunEnd`.** Lane R named the field `outcome`
+  (`RunOutcome`, `roRan` …). The full sweep then failed
+  `test_rfc7_legacy_names_gone`, because `outcome` is a retired RFC-0007 name.
+  The sweep-regressions lane renamed it to match `toolexec`'s `ToolEnd`
+  (`RunEnd`, `ending`, `reExited`/`reNotStarted`/`reTimedOut`/`reIoError`/
+  `reOverflow`) rather than widen the guard's allowlist. The capture fixtures
+  now print `OK ending=<RunEnd> ...`.
+- **`test_r9_tool_capture_endings` uses `ioutils.closeFd`.** Its only POSIX
+  call closed one pipe fd, and importing `std/posix` put it outside
+  `test_rfc9_bucket_inventory`'s frozen audit. `ioutils.closeFd` is the seam
+  made for this, so the file left the sweep and the inventory (13/34/38/1,
+  total 86) is unchanged.
+- **Deleted tests, replaced:** `tests/unit/test_cc_banner_selection.nim` by
+  `tests/unit/test_ccidentity.nim` (with the fake toolchain
+  `tests/support/ccfake.nim`); `tests/integration/test_r8_real_cl_refusal.nim`
+  by `tests/integration/test_r9_real_cl_identity.nim`. `ci.yml` runs the r9
+  test on the windows and macos legs, and the honesty script requires its
+  markers. A macOS pin for `test_ccidentity.nim#cfg_cc_selects_gcc_or_clang`
+  (skips because `gcc` is Apple clang there) was added and is **unmeasured**.
+
+### Out of scope, noted
+
+- **`artifactid.inlineResponseFiles` hashes a constant for an unreadable
+  `@rsp` file** (`artifactid.nim:324`, `"<unreadable:" & path & ">"`). Lane S
+  flagged it and was sent back to fix it, and found the premise wrong: the
+  function is reached only through `normalize()`, whose only production caller
+  is `measureworker.nim` (the RFC-0006 compile-reuse measure path), not #21's
+  dependency probe. `ccIncludeClosure` never reads `@rsp` tokens; the compiler
+  does. Making `normalize` raise would break every vendor `.c` with a Doxygen
+  `@param`. Recommended, not done: split it into `normalizeContent` (no `@`
+  handling) and `normalizeCcCmd` returning `(text, ok, unreadable)`; have
+  `recordArtifactRows` skip with a warning on failure; replace the
+  "sentinel-derived digest" test (`test_artifactid.nim:123`) with a
+  fail-closed one plus a Doxygen control; check the `test_golden_reuse` pins.
+- **Windows drain jitter:** the Windows `drain` waits with `sleep(1)` between
+  checks (`toolexec.nim:160`), which can add about 15 ms to measured compile
+  and link times.
+- **`test_toolchainfp_producer_chain` builds `crisol` without `.exe`**
+  (line 68), so it fails on Windows. It predates this round and is not in the
+  windows leg (the carried R7-L6).
+- **`test_w3_cc_liveness` on Windows** failed its third run (`compileSkipped
+  was true`) under Lane R, and identically on a HEAD copy; its fake `cc` could
+  not move the old PATH-candidate identity there. After Lane I's redesign it
+  passed on the MSVC container (via `CL`). Not in the windows leg.
+- **#24 notes from the identity lane:** see the last bullet of "R9-D1: the
+  identity redesign".
+- **`cachedCcVersion()` comments Lane I flagged as stale** in
+  `measureworker.nim:228` and `workerplan.nim:114`, outside its files and not
+  edited. (The third it named, in `toolrun.nim`, is gone.)
+
+### Verification state at the end of round 9
+
+Per lane, as reported (Linux container on a copy of the tree unless noted;
+every mutant ran in a `mktemp` copy):
+
+- **Lane S** (#21 closure): 32 importer test files pass; `nim check` clean;
+  soundness gate 79 of 79. **8 mutants**, each red: M1 driver flag list,
+  M1b `-Wp,` filtering, M2 make-rule check, M3 refusal only, M3b refusal plus
+  file-exists check, M4 unreadable-header handling, M5 MSVC mismatch check,
+  M6 `if false:` at the closure mismatch check. Cost recorded: when the fold
+  probe falls back to `fpNone`, every tracked MSVC header is refused (a miss,
+  never a stale result).
+- **Lane C** (cache gate and ladder): 45 test files that import `api` or
+  `cachedispatch`, or use the changed decision sets, pass; census 225
+  records at the time. **2 mutants**, both red: `keyContext(ccVersion = "")`
+  (the R9-L3 test), and `cacheOn` ignoring the warning (both degraded R5-10
+  cases, on decision, `--json` value, `puts == 0` and `gets == 0`). The R5-10
+  test's lookup counter was written first and failed on the old code ("gets[]
+  was 1").
+- **Lane R** (`RunResult` and drain): about 63 Linux tests pass (only
+  `test_fallback` fails). On the MSVC container: `test_r9_tool_capture_endings`,
+  `test_issue22_capture`, `test_r7_probe_presence_contract`,
+  `test_cr4_tool_deadline`, `test_r8_real_cl_refusal` (real bodies),
+  `test_cc_banner_selection`, `test_ccprobe`,
+  `test_issue22_changed_completeness`, `test_issue23_cc_identity` and
+  `test_r7_toolchain_warning_ladder`. **5 mutants**, each red: short read =
+  EOF, I/O error = EOF, no overflow cap, wedged driver = absent, silent driver
+  = absent.
+- **Lane I** (identity redesign): 62-test Linux sweep passes, with the
+  real-probe block run against real gcc 16.2 and clang 22.1. On the MSVC
+  container: `test_ccidentity`, `test_toolchainwarn`, `test_ccprobe`,
+  `test_issue23_cc_identity`, `test_r7_probe_presence_contract`,
+  `test_r7_toolchain_warning_ladder`, `test_r9_real_cl_identity` (under `CL`),
+  `test_w3_cc_liveness`, `test_r9_cc_identity_keys_cache`, `test_r5_10`,
+  `test_render`, `test_cachedispatch`, `test_keys`, `test_rfc9_golden_pin`.
+  **13 of 13 mutants** red: `CL` fold dropped; MSVC arch lines left out of the
+  digest (survived at first, because the summary text alone covered it, until
+  a "every probed macro is key material" test was added); GNU dump not hashed;
+  `toolchainUnsound` always false; discovery failure treated as identified;
+  key version not chained; runtime library contents skipped; discovery run
+  from the state dir; unreadable resolved library dropped; failed lookup
+  skipped; driver binary not hashed; flags not replayed; MSVC unreadable
+  library dropped.
+- **Lane G** (gitdiff): the three failure-path tests were red before the fix
+  and green after; **1 mutant** (old behaviour restored) turns the same three
+  red while the control stays green. Every importer of `gitdiff` or
+  `fake_git`, both `test_issue22_*` files and all seven `test_cli_*` files
+  pass (not `test_windows_cli_smoke`, which was not run).
+- **Sweep-regressions lane:** 44 files pass, including
+  `test_rfc7_legacy_names_gone`, `test_rfc9_bucket_inventory`,
+  `test_conformance` and `test_conformance_import_purity`. **Census 213
+  records**, matching the pinned allowlist; **soundness gate 79 of 79** on
+  linux, windows and macosx; `nim check` clean.
+- **Full sweep, first pass** (4 parallel slices): 267 entrypoints, 4 failures:
+  `test_fallback` (fold policy), `test_rfc7_legacy_names_gone` and
+  `test_rfc9_bucket_inventory` (both fixed above), and **`test_conformance`**,
+  which printed every suite `[OK]` and `test_conformance done` and then exited
+  non-zero ("execution of an external program failed"). It did not reproduce:
+  5/5 isolated from a prebuilt binary, 3 + 3 under `nim r` (default and
+  `CRISOL_FORCE_POLL=1`), 32/32 in a serial conformance pass in nimble order,
+  12/12 under concurrent stress with the fixture-rebuilding tests, and 3/3 on
+  a `git archive HEAD` copy, with no leaked children. It imports only
+  `crisol/process` and the stdlib, none of which round 9 changed. **Recorded
+  as a one-off under 4-way parallel load.** The old sweep script kept only the
+  last 15 lines, which hid the exit code; the re-sweep script records it.
+- **Full sweep, re-run with exit codes: 267 entrypoints, 266 pass, 1 fail**
+  (slices 67/67/67/66). The failure is `tests/unit/test_fallback.nim`, rc 1,
+  the known local bind-mount fold-policy case that never fails on CI.
+  `test_conformance` passed.
+- **Entrypoints: 267** (264, minus `test_cc_banner_selection` and
+  `test_r8_real_cl_refusal`, plus `test_ccidentity`, `test_toolchainwarn`,
+  `test_r9_cc_identity_keys_cache`, `test_r9_real_cl_identity` and
+  `test_r9_tool_capture_endings`). Re-derive; do not restate.
+- **Unmeasured:** macOS runtime identity (`libSystem.tbd` from the SDK), the
+  recorded macOS dump shape, the new macOS honesty pin, `-m32` on arm64, and
+  the mingw runtime. The macOS CI leg is the first real run, and it needs a
+  push. None of the new `ci.yml` steps from rounds 8 and 9 has run on GitHub
+  Actions.
+- **Nothing from round 9 is committed.** `git diff HEAD --stat`: 60 tracked
+  files changed (3,196 insertions, 6,338 deletions), plus 8 new untracked
+  files.
+
+## Round 10 re-review — 2026-09-25 (base `7da32d3`; rounds 9 and 10 uncommitted)
+
+Dispatched over the #21-23 scope as it stands in the working tree: `7da32d3`
+plus round 9's uncommitted fixes. Same three dimensions (security; design and
+ergonomics; liveness and completeness), and every brief named the scope and
+listed what was out of it (#24, stateDir/test isolation, the census and gate
+scripts, RFC-0006 measure-path normalization). Both claimed Highs went to an
+adversarial verifier. **R10-S1 held**: on real `cl` 19.44, root `C:\poc\Ärger`
+is reported as `c:\poc\ärger\inc\myheader.h` (`Ä` = `C3 84`, `ä` = `C3 A4`),
+and crisol's own functions dropped the header, while an ASCII-only case
+difference was correctly refused. **R10-D1 was downgraded to Medium**: the
+duplication is real, no conversion loses data, and the one observable
+inconsistency was that a hung discovery probe did not warn the way a hung
+compiler probe did.
+
+**Commit decision.** Corey approved committing round 9 as a checkpoint, but the
+round-10 lanes had already started and their edits share files with round 9's.
+Corey chose to commit rounds 9 and 10 together once round 10 is finished and
+the sweep is green.
+
+**Fixes LANDED** in six lanes, all on Opus 5.5, split so no two lanes edited
+the same file at once: **A** (paths, ccprobe, closure, artifactid; new
+`headerprobe.nim`), **B** (toolexec, toolrun, gitdiff, compiledriver,
+icbaseline, `ci.yml`), **D** (api, cachedispatch, toolchainwarn, depgraph,
+keys, pipeline, types, render; new `runcore.nim`), **E** (the a5c test and the
+honesty script), then **C** (ccidentity, on A, B and D's new interfaces), then
+**R** (test renames, last because it touches every lane's files). The status
+column below is the live record (R5-14).
+
+**One High, and it is again in a prior round's remedy**: R10-S1 is in R9-S1's
+case-blind refusal, which folded ASCII only.
+
+### Findings
+
+| # | Sev | Where | What | Status |
+|---|---|---|---|---|
+| R10-S1 | **High** | `paths.nim` `underRootFolded`, `foldMatchesSomeRoot`, `caseBlindRootMembership`; `ccprobe.reportedHeaderUnresolved`; `closure.nim` | `cl /sourceDependencies` lowercases non-ASCII letters too. The root comparisons folded ASCII only, so a header under `C:\poc\Ärger` classified `pcOutside`, `reportedHeaderUnresolved` returned false, and the closure dropped it silently. The round-9 file-exists guard was never reached. Affects any user path like `C:\Users\Émile\...` | **FIXED** (Lane A). `paths.nextFoldUnit`/`underRootCaseBlind` compare under Unicode simple case folding (limits documented: no ß→ss, ligatures, Turkic i or normalization); new `caseBlindEqual`, used by `caseBlindRootMembership` and `ccprobe.msvcSourceMatches`. Identity still uses case-sensitive `underRoot`, so RFC-0009's `fpAsciiLower` policy is unchanged. Unit tests under both fold policies; `test_issue16_headers` runs an `R10S1_Ärger` project end to end on the MSVC container and goes red under the ASCII-only mutant |
+| R10-S2 | Med | `ccidentity.nim` `CL`/`_CL_` fold | cl reads a response file named in `CL`/`_CL_` (`CL=@C:\poc\flags.rsp` expands its `/DFROMRSP=42`), but the fold hashed the literal text, so editing the file changed the compile and not the key | **FIXED** (Lane C). Refuse, not hash: cl resolves `@file` against each compile's own working directory, which the probe does not share. New `namesResponseFile` follows cl's token and quote rules (an `@` inside `/DMAIL#a@b` is not a response file); the compiler half becomes unidentified and the warning names the variable. Measured on real cl |
+| R10-S3 | Med | `ccidentity.nim` runtime half | the runtime half hashed build-time stubs: MSVC `/MD` import libs, mingw `libucrt.a`/`libmsvcrt.a`, macOS SDK `libSystem.tbd` with no OS version | **FIXED in code; macOS and mingw UNMEASURED** (Lane C). MSVC `/MD`: each named import lib adds its runtime DLL (`vcruntime140`, `ucrtbase`, `msvcp140`, debug variants; `msvcrt.lib` binds both), found as the loader would (system dir, `SysWOW64`/`Sysnative`, then Windows dir); a DLL found only on PATH refuses, because the test's cwd is searched first. `/MT` (Nim's default) was already correct. mingw: each import lib also requires its DLL; a cross-compile from Linux refuses. macOS: the full `sw_vers` output is folded in; a missing version or build refuses. glibc unchanged. **Cost:** `/MD` builds on the MSVC Docker image run uncached, because its `vcruntime140.dll` is on PATH only |
+| R10-S4 / L8 | Med | `api.nim` (now `runcore.nim`) depgraph staleness and nimcache path/key | an unidentified toolchain turned off only the result cache; its constant sentinel still keyed the depgraph and the persistent nimcache, so two different unidentifiable toolchains compared equal: stale binaries reused, `--changed` not reselecting | **FIXED** (Lane D). New `toolchainwarn.toolchainIdentity(fp, runNonce)`: an unidentified toolchain gets a per-run nonce and never compares equal to anything, itself included. The depgraph is discarded, the compile uses a fresh nimcache, and `--changed` reselects everything; `clean` prunes the per-run directories as orphans. New `test_unidentified_toolchain_reuse` (red first, 4 failures) |
+| R10-S5 | Med | `gitdiff.nim` | `git diff --name-only` prints only a changed submodule's gitlink path and `ls-files --others` nothing inside it, so changes inside a submodule never matched a closure member | **FIXED** (Lane B). The diff passes `--ignore-submodules=none` (overrides `diff.ignoreSubmodules` and `.gitmodules` `ignore =`); any git-emitted name that is a real directory expands to every file under it, covering submodules and untracked nested repos. An unlistable directory or a directory link inside one raises `cekEnvironment` (exit 3). New `test_changed_submodule` through the real `--changed` path (red first) |
+| R10-S6 | Low | `ccidentity.nim` driver resolution | Nim's spawn searches `nim.exe`'s own directory first; crisol's probe searches its own exe dir, cwd, then PATH. A choosenim layout could probe a different `vccexe`/`gcc` than the build uses. Usually fails closed. Unverified | **DEFERRED** (Low). **FIXED in the Lows pass (2026-09-26)** |
+| R10-S7 | Low | `ccidentity.nim` discovery | discovery compiles a stdin module named `stdinfile`; a root `config.nims` that branches on `projectName()`/`projectPath()` can pick a different compiler for the tests. Adjacent to #24, separate trigger | **DEFERRED** (Low). **FIXED in the Lows pass (2026-09-26)** |
+| R10-S8 | Low | `ccidentity.cachedCcFingerprint` | memoized per process on project root, state dir and flags; a library host changing `CL`, `PATH` or `nim.cfg` between runs keeps a stale fingerprint | **DEFERRED** (Low). **FIXED in the Lows pass (2026-09-26)** |
+| R10-S9 | Low | `ccprobe.shellSplit` | on Windows, `\\` inside double quotes became `\`, but MSVC keeps backslashes not followed by a quote, so a quoted UNC `-I"\\srv\share dir\inc"` replayed wrong | **FIXED** (Lane A). New `msvcArgvSplit` applies cl's rules on every host for the MSVC family |
+| R10-L1 | Med | `test_rfc9_a5c_cache_portability`; `ci/assert-subset-honesty.sh` | #21's a5c acceptance could not be met: the test's symlink fails with "Access is denied" on windows-latest and in the MSVC container, and the honesty script accepted the skip | **FIXED** (Lane E). New `tests/support/dirlink.nim`: a directory junction on Windows (no privilege), a symlink elsewhere; crisol's `winRealPath` resolves both alike. The old alias checks used `expandFilename`, which never follows a link on Windows, so the old body would have failed there anyway; they now use `safeExpandFilename`. The self-skip is gone and the honesty script requires `RFC9-A5C ALIAS junction` (windows) / `symlink` (macOS) plus the `[OK]` line. Passes on Linux and the MSVC container |
+| R10-L2 | Med | `api.ccProbeContextOf` | the production wiring from `Config` into the probe context was unobserved: mutants `flags: @[]` and `projectRoot: stateDirOf(cfg)` survived every test, because tests used `ccProbeContextOf` on both sides | **FIXED** (Lane D). New `test_probe_context_wiring`: a `Config` literal against exact expected fields, and a real run from a `crisol.kdl` with a global and a group-only flag. Both mutants red |
+| R10-L3 | Med | `ci.yml` windows job | the windows leg sweeps only unit and conformance, and the Windows drain error arms and the MSVC `CL`-recompile end-to-end test had no per-file step | **FIXED** (Lanes B, E). Four windows steps: `test_tool_capture_endings`, `test_toolrun_endings`, `test_cc_depgraph_liveness`, `test_changed_submodule`; the honesty script requires each one's `done` line (where it has one) and every `[OK]` line, and forbids the liveness test's skip marker. Checked with synthetic logs: 16 of 16 removed lines and 13 of 13 `[FAILED]` substitutions fail |
+| R10-L4 | Low | `toolrun.nim` | a capture that overflowed or hit an I/O error reported as exit 0 at the toolrun layer survived every test | **FIXED** (Lane B). New `test_toolrun_endings`: past `MaxToolOutputBytes` is `reOverflow` through `realRun` and `realRunMerged`; red under the mutant |
+| R10-L5 | Low | `closure.nim` file-exists guard | the round-9 guard was not observed on its own | **FIXED** (Lane A). Tests for a tracked reported header that is missing and one that is a directory |
+| R10-L6 | Low | `ccidentity.cachedCcFingerprint` | the memo's per-context key is unobserved (always returning the first entry survives) | **DEFERRED** (Low). **FIXED in the Lows pass (2026-09-26)** |
+| R10-L7 | Low | `test_ccidentity.nim` | the real-probe suite is `when defined(posix)` with no `CRISOL-SKIP-TEST` marker on Windows, so the honesty gate cannot see it vanish | **DEFERRED** (Low). **FIXED in the Lows pass (2026-09-26)** |
+| R10-L9 | Low | runtime identity | the mingw runtime path has no producer on any leg; the macOS path and pin first run on the next macOS CI run | **DEFERRED** (Low, residual; needs a push). **FIXED in the Lows pass (2026-09-26)** |
+| R10-D1 | Med (from High) | `toolrun` `RunEnd`/`RunResult` vs `toolexec` `ToolEnd`/`ToolRun` | two parallel result types with hand-written translations in six places; the flat `ToolRun` let gitdiff, compiledriver and icbaseline read partial output from an unfinished run | **FIXED** (Lane B). One case object, `RunResult` on `RunEnd`, in `toolexec` with `ran`/`notRun`/`ok`/`describe`; `toolrun` re-exports it. Every translation is deleted; only `reExited` carries output |
+| R10-D2 | Med | `ccidentity.runNimOnStdin` | spawned nim through `std/osproc` to feed stdin, going around toolexec, and called the exported `capture` | **FIXED** (Lanes B, C). `runTool` takes an `input` argument (capped by `MaxToolInputBytes`; stdin is always closed); new `toolrun.realRunWithStdinIn`. `runNimOnStdin` is gone and `capture` is private |
+| R10-D3 | Med | `ccidentity.replayCommand`; `ccprobe` | `replayCommand` reverse-engineered `deriveDepInvocation`'s output by position | **FIXED** (Lanes A, C). New `ccprobe.parseCompileCommand` / `CompileCommand`; `deriveDepInvocation` and the identity replay are both built on it. The MSVC dependency probe no longer passes `/c` or `/Fo` (identical report on real cl 19.44); the runtime probe names its own `/Fo` and `/Fe`. `ccfGnuMake` renamed `ccfGnu`. `ccFamilyOfDriver` now takes the basename after either separator on every host |
+| R10-D4 | Med | `closure.extractCompileInputs`, `artifactid.ccIncludeClosure` | the header-probe pipeline existed twice, and `ClosureProbeError` duplicated `DepProbeError` value by value | **FIXED** (Lane A). New `src/crisol/headerprobe.nim`: `probeReportedHeaders` returns a `HeaderProbe` case object; both callers use it and differ only in header policy. `ClosureProbeError` wraps `DepProbeError`; the result is a named `IncludeClosure` with `ok` |
+| R10-D5 | Med | `api.nim` cache on/off | the gate was inline and keyed on whether a warning string existed; degraded roots were stamped `cdmPolicyDisabled`, which means `--no-cache` | **FIXED** (Lane D). Pure `toolchainwarn.cacheGate(noCache, rootsDegraded, fp)`, table-tested; precedence `--no-cache`, unidentified toolchain, degraded roots. New `CacheDecision` `cdmRootsDegraded` (`"rootsDegraded"` in `--json`); **`--json` schema revision 26 → 27**, additive |
+| R10-D6 | Med | `ccidentity.toolchainUnsound`, `ToolchainUnsoundReason` | unused predicate with a doc contradicting `shouldStore`; an "unsound reason" enum containing `turSound` | **FIXED** (Lane C). Replaced by `ToolchainVerdict` (`tvIdentified`, or `tvUnidentified` with `part` of `upCompiler`/`upRuntime`/`upBoth`); docs corrected |
+| R10-D7 | Med | `crisol/api` | internal types leaked through the contracted module: `ccProbeContextOf` (takes `Config`), `CacheDeps.ccProbe`, and the re-exported `rlimitOverridesFrom`/`envPinsFrom`/`envPassthroughsFrom` | **FIXED** (Lanes D, C). The run engine and test seam moved to internal `src/crisol/runcore.nim`; `ccProbeContextOf` to `pipeline.nim`; the three re-exports removed. `api.nim` is a facade; the contracted surface is otherwise unchanged |
+| R10-D8 | Med | test file names | tests named after review-round IDs | **FIXED** (Lane R). 14 renamed (mapping below), with `ci.yml`, the honesty script and comments updated. Also resolves R9-D13 |
+| R10-D9 | Low | `toolrun.runViaOsproc` | printed a `crisol: warning:` line inside the seam on timeout | **FIXED** (Lane B). Removed; callers use `describe()` |
+| R10-D10 | Low | `ccidentity` `CcHalf` accessors | `serializeCcHalf` exported for render with a caller-chosen sentinel; `digest` returns `cdkUnreadable` for an unidentified half | **DEFERRED** (Low). **FIXED in the Lows pass (2026-09-26)** |
+| R10-D11 | Low | stale docs | ccprobe's module doc (review narration, "These four procs", `ccVersion`), render, depgraph, keys, measureworker, cacheregistry, cachetier, signals | **FIXED** (Lanes A, C, D). Present tense; closes R9-D12's remainder |
+| R10-D12 | Low | `gitdiff.nim` | the same three checks repeated per git call | **FIXED** (Lane B). One `requireGit`; `runGit` and `unfinishedReason` gone |
+| R10-D13 | Low | `ccidentity.probeNimArgs` | a hand copy of `compiledriver.nimCompileArgs`, kept in sync only by a test | **DEFERRED** (Low). **FIXED in the Lows pass (2026-09-26)** |
+
+Counted from the table: **30 rows** — **1 High, 15 Med, 14 Low**. **22
+fixed**, of which R10-S3 is unmeasured on macOS and mingw; **8 deferred** (all
+Low: S6, S7, S8, L6, L7, L9, D10, D13). Every row at Medium or above is fixed.
+R10-S4 / L8 is one row, one defect seen from two dimensions.
+
+### Test renames (R10-D8)
+
+Earlier sections of this doc keep the old names as history. All in
+`tests/integration/`:
+
+| Old | New |
+|---|---|
+| `test_cr4_tool_deadline` | `test_tool_capture_deadline` |
+| `test_r3_terminate_escalation` | `test_tool_terminate_escalation` |
+| `test_r5_10_toolchain_unsound_wire` | `test_unidentified_toolchain_disables_cache` |
+| `test_r7_probe_presence_contract` | `test_probe_presence_contract` |
+| `test_r7_toolchain_warning_ladder` | `test_toolchain_warning_ladder` |
+| `test_w3_cc_liveness` | `test_cc_depgraph_liveness` |
+| `test_r9_cc_identity_keys_cache` | `test_cc_identity_keys_cache` |
+| `test_r9_real_cl_identity` | `test_real_cl_identity` |
+| `test_r9_tool_capture_endings` | `test_tool_capture_endings` |
+| `test_r10_changed_submodule` | `test_changed_submodule` |
+| `test_r10_degraded_cache_decision` | `test_degraded_roots_cache_decision` |
+| `test_r10_probe_context_wiring` | `test_probe_context_wiring` |
+| `test_r10_toolrun_endings` | `test_toolrun_endings` |
+| `test_r10_unidentified_toolchain_reuse` | `test_unidentified_toolchain_reuse` |
+
+Review-ID-named tests that predate `49fb53b` (`test_so2_*`, `test_r14_*`,
+`test_B*`, `test_b*`, `test_c*`, `test_m*`, the `test_rfc0007_r*/w*` family and
+others) are out of scope and unchanged. Suite names, CI step names and
+assertion labels inside the renamed files still cite finding IDs.
+
+### Out of scope, noted
+
+- **C++ runtime:** a `nim cpp` group on x64 also loads `vcruntime140_1.dll`,
+  which the runtime half does not cover. Belongs with #24.
+- **glibc sysroot:** a toolchain with its own sysroot resolves that sysroot's
+  `libc.so.6`, not the one the loader maps; `libm.so.6` is not hashed
+  separately.
+- **`test_toolchain_warning_ladder.nim`'s header** still cites
+  `api.runTestsWith` and `api.nim`.
+
+### Verification state at the end of round 10
+
+Per lane, as reported (Linux container on a copy unless noted; every mutant ran
+in a scratch copy):
+
+- **Lane A:** 144 of 146 tests importing the touched modules pass (the two
+  failures were `test_fallback` and `test_api` while Lane D was mid-move).
+  `test_issue16_headers` passes on the MSVC container. **6 mutants**, each red:
+  ASCII-only fold (including end to end on MSVC), no file-exists guard,
+  shell-style split for MSVC, MSVC `/c` kept, pipeline not refusing
+  unresolved headers, driver basename by host separator.
+- **Lane B:** 70 files pass; `test_tool_capture_endings`, `test_toolrun_endings`
+  and `test_changed_submodule` pass on the MSVC container. **5 mutants**, each
+  red: overflow/ioError as exit 0, stdin never closed,
+  `--ignore-submodules=none` dropped, submodule expansion off, directory link
+  skipped.
+- **Lane D:** 140 importer files pass except `test_fallback`. **6 mutants**,
+  each red: plain fingerprint as identity, constant nonce, degraded roots as
+  `cdmPolicyDisabled`, `cdmRootsDegraded` dropped from the run-level reasons,
+  `flags: @[]`, state dir as `projectRoot`.
+- **Lane E:** a5c's real body passes on Linux (symlink) and the MSVC container
+  (junction). The honesty script was checked with synthetic logs for a5c and
+  the four new windows steps.
+- **Lane C:** 94 tests pass; 14 new behavioural tests were red first. **20
+  mutants**, all red (two survived at first and got tests). On the MSVC
+  container `test_real_cl_identity`, `test_cc_depgraph_liveness` and
+  `test_cc_identity_keys_cache` pass; the default `/MT` build is identified,
+  `/MD` and `/MDd` refuse and name the missing DLL.
+- **Lane R:** all 14 renamed tests pass; `ci.yml` parses to
+  `['cgroup','macos','test','timing','windows']`; honesty script checked with
+  new-name and old-name synthetic logs.
+- **Gates:** `nim check src/crisol.nim` clean; `ci/source-soundness-gate.sh`
+  passes on linux, windows and macosx; census **213 records**.
+- **Full sweep, with exit codes (4 slices, 69/68/68/68): 273 entrypoints, 271
+  pass, 2 fail.** `test_fallback` (the known bind-mount fold-policy case) and
+  `test_rfc7_legacy_names_gone`, whose allowlist named `api.nim` for the
+  ledger-row `row.outcome` read that Lane D moved to `runcore.nim`. The
+  orchestrator added `runcore.nim` to the allowlist (the site is a
+  `scanLedger` row, the exception the check already grants); the test then
+  passed, rc 0. **Net: 272 pass, 1 known-benign fail.**
+- **Entrypoints: 273** (267 plus `test_headerprobe`, `test_changed_submodule`,
+  `test_degraded_roots_cache_decision`, `test_probe_context_wiring`,
+  `test_toolrun_endings`, `test_unidentified_toolchain_reuse`). Re-derive; do
+  not restate.
+- **Unmeasured:** macOS runtime identity (`sw_vers` fold), the mingw runtime
+  DLL requirement, and every `ci.yml` step added in rounds 8-10. Actions has
+  not run anything after `49fb53b`; that needs a push.
+- **Nothing from rounds 9 or 10 is committed.**
+
+## Lows pass — 2026-09-26 (after round 10; still uncommitted)
+
+Corey asked for every deferred Low to be fixed ("finally fix our lows"),
+across all rounds. Each row was first re-checked against the current tree: a
+row whose code no longer exists was closed with evidence, and every other row
+was fixed test-first, with mutants in scratch copies. Five lanes ran on Opus
+5.5, split by file: **I** (identity), **P** (probe parsing), **T** (process
+tree), **Q** (CI, tests, planner), and **W** (a follow-up: C++ drivers and a
+full Windows sweep). The status column of each round's table now carries the
+disposition; this section records what changed and what the pass found.
+
+**43 rows: 29 fixed, 13 closed as obsolete, 1 closed by convention.**
+
+- **Fixed:** CR18, R2-10, R2-11, R3-12, R3-13, R3-14, R3-15, R5-19, R5-22,
+  R5-24, R6-S5, R6-S6, R6-S7, R6-D10 / L8, R6-D13, the unnamed round-6
+  `signals.nim` test-name row, R7-S7, R7-L6, R9-D14, R9-S3, W9.5, R10-S6,
+  R10-S7, R10-S8, R10-L6, R10-L7, R10-L9, R10-D10, R10-D13.
+- **Closed as obsolete** (the code the row described is gone after rounds
+  9-10): CR16, CR17, R2-9, R3-11, R3-16, R3-17, R4-9, R5-16, R5-20, R5-21,
+  R6-D6, R6-L6, R8-S3.
+- **Closed by convention:** R5-23 (anchors, not line numbers).
+
+The two items that were waiting on Corey's decision, R7-S7 and R5-24, were
+applied with their recorded recommendations; Corey's instruction to fix the
+Lows is the approval.
+
+### What changed
+
+- **Driver resolution (R10-S6, both halves).** `ccidentity.locateDriver`
+  finds the compiler the way the build's `nim` does (Windows: nim's
+  directory, its cwd, System32/System/Windows, PATH, with `.exe`; POSIX:
+  PATH, an empty entry meaning nim's cwd). Discovery keeps the search context
+  (`ccprobe.DriverSite`), and the header/dependency probe resolves **each
+  command's own driver** against it (`headerprobe.siteResolver`), so a `.cpp`
+  external's `g++` is found beside a `gcc` C compiler. Unresolvable drivers
+  refuse (`hpfDriverUnresolved`). One discovery per run
+  (`cachedDriverSite` shares the fingerprint's memo entry); the measure
+  worker gets the context through `MeasurePlan.driverSite`, and a malformed
+  entry reads as unknown (fail closed). An intermediate version compared
+  every command's driver to the one C compiler and refused C++ externals;
+  Lane W replaced it. **Identity scope unchanged:** only discovery's C
+  compiler is fingerprinted, so a `g++`-only change invalidates nothing (#24).
+- **Project-dependent configs (R10-S7).** The probe scans `.nims` configs and
+  their non-stdlib imports for `projectName`, `projectDir`, `projectPath`,
+  `paramStr`, `paramCount`, `commandLineParams` and `querySetting(Seq)`; a hit
+  or an unreadable file refuses both halves.
+- **Memo freshness (R10-S8, L6).** `cachedCcFingerprint` re-probes when its
+  stamp changes: environment minus `CRISOL_CACHE_*`, cwd, every file the probe
+  read, nim.cfg/config.nims candidates, and the `nim` binaries on PATH.
+- **Splitting by command, not host (R9-D14, W9.5, R6-S7, R9-S3).**
+  `ccprobe.argvRulesOf` picks cl's rules for MSVC; for GNU, the rules Nim
+  quoted with (absolute Windows or POSIX source path; `.exe` driver as the
+  fallback; ambiguous commands refuse). `shellSplit` is POSIX-only. Apostrophe
+  paths such as `C:\Users\O'Brien` parse.
+- **Process tree (R3-12, R5-19).** After a bounded tool exits, its pipes get
+  `PostExitDrainMs` (1 s) to reach EOF; if a descendant still holds them, the
+  run ends `reIoError`, never as a finished run. Give-up kills the whole tree
+  (POSIX process group, TERM then KILL, reaped after the last signal; Windows
+  Job Object without `KILL_ON_JOB_CLOSE`). `NoDeadline` runs keep the caller's
+  group so the Supervisor can still kill them. A Linux test checks
+  `/proc/<pid>/stat` for a zombie.
+- **Credential scrub (CR18).** `runTool` spawns every tool without the
+  `CRISOL_CACHE_*` variables (case-insensitive on Windows). Test binaries run
+  through the Supervisor and are unaffected.
+- **Trust policy (R7-S7).** `TrustConfig.policy` has no default;
+  `configuredCache` rejects an empty policy when a remote tier is configured.
+- **`plan` (R5-24).** The two unread parameters are removed.
+- **Serializers (R10-D10), argv builder (R10-D13).** Role-specific
+  `serializeCompilerHalf`/`serializeRuntimeHalf`; `digest` returns an
+  `Option`. The `nim` argv builder moved to the new `src/crisol/nimargv.nim`.
+- **CI and honesty.** New windows steps: `test_mingw_runtime_identity` (R10-L9;
+  measured in the MSVC container with MinGW-w64 gcc 15.2.0 UCRT: fingerprint
+  names `msvcrt.dll+ucrtbase.dll`, stored then served from cache),
+  `test_toolchainfp_producer_chain` on windows and macOS (R7-L6, now `.exe`
+  aware), `test_tool_tree_termination` and `test_tool_env_scrub`. The honesty
+  script pins the backend (`vcc` on windows, `clang` on macOS, R6-S5), the
+  new skip markers (R3-15, R10-L7 `test_ccidentity.nim#real_probe_posix_host`
+  on windows), and requires each new step's `done` and `[OK]` lines. Checked
+  with synthetic logs.
+
+### Windows sweep (Lane W)
+
+None of rounds 9-10 or this pass had run the windows leg's full set. Lane W
+ran every `tests/unit` and `tests/conformance` file plus the windows per-file
+steps on the MSVC container, for `7da32d3` and for the working tree:
+
+| File | `7da32d3` | tree | after | Class | Action |
+|---|---|---|---|---|---|
+| `test_compiledriver_real` | 1 | 1 | 0 | pre-existing, #21 area (expected no `.exe`) | fixed |
+| `test_rfc9_a3bii_fold_selection` | 1 | 1 | 0 | pre-existing, #23 area (second run planned with an empty toolchain ID, discarding the first run's graph; also fails on Linux under `CRISOL_FOLD_POLICY=fpAsciiLower`) | fixed |
+| `test_artifactid` | 0 | 1 | 0 | regression (fake reader matched `/` paths only) | fixed |
+| `test_issue16_unit` (R10-S1 case) | new | 1 | 0 | test portability: NTFS folds `Ä` too, so a folding root resolves the real spelling | fixed (records the real spelling where the host resolves it; otherwise refuses; never drops) |
+| `test_windows_smoke`, `test_windows_limits`, `test_windows_forensics` | 0/1 | 1 | 0 | container artifact (LNK1104 relinking in a bind mount) | none |
+| `test_windows_ntstatus`, `test_windows_coopstop` | 1 | 1 | 1 | probably container gaps; CI green at `49fb53b`; outside #21-23 | listed |
+| `test_ioutils`, `test_report`, `test_source_index` | 1 | 1 | 1 | pre-existing on the container; outside #21-23 | listed |
+| `test_compiledriver`, `ssl/test_https_reject_selfsigned` | 1 | 1 | 1 | container gaps (no `sleep`/`true`, no openssl; CI runs under Git Bash) | none |
+| `test_api` | 1 | 1 | 0 | the R4-11 perf-baseline flake under load | listed (R4-11) |
+
+### Out of scope, noted
+
+- `test_windows_ntstatus`, `test_windows_coopstop`, `test_ioutils`,
+  `test_report` and `test_source_index` fail on the MSVC container at both
+  `7da32d3` and the tree; they need a real windows CI run to tell container
+  gaps from defects.
+- `test_measureworker_real` and `test_artifactid_real` are gcc-pinned (a count
+  of 4 where MSVC gives 7; a `cc -M` fixture) and are not in the windows leg.
+- A C++ driver's identity is not in the fingerprint (#24).
+
+### Things for round 11 to examine
+
+- A bounded tool in its own process group no longer receives the terminal's
+  Ctrl-C; if crisol is interrupted mid-probe, the tool runs to its own end.
+  A descendant that calls `setsid`/`setpgid` escapes the tree kill; on
+  Windows, a grandchild started before job assignment escapes the job.
+- In `test_toolchainfp_producer_chain`, the constant-fingerprint mutant left
+  the first test green (only the differential test caught it). Not
+  investigated.
+- The new windows CI steps are named "round-11 — …", a review-ID name of the
+  kind R10-D8 removed from test files.
+- `runner.execute` gained a defaulted `ccDriverFn = cachedDriverSite` seam
+  (census record added).
+
+### Verification state at the end of the Lows pass
+
+- **Gates:** `nim check src/crisol.nim` clean; `ci/source-soundness-gate.sh`
+  passes on linux, windows and macosx (82 files); census **212 records** and
+  its selftest pass; `ci.yml` parses to `['cgroup','macos','test','timing','windows']`.
+- **Mutants:** Lane I 18, Lane P 6 + 12, Lane T 5 + 1, Lane W 15; all red.
+- **MSVC container:** see the windows sweep table above; every file a lane
+  touched, and every #21-23 failure, passes there.
+- **Full Linux sweep, with exit codes (4 slices, 70/69/69/69): 277
+  entrypoints, 276 pass, 1 fail** (`test_fallback`, the known bind-mount
+  fold-policy case). Re-derive; do not restate.
+- **Unmeasured:** macOS runtime identity; every `ci.yml` step added in rounds
+  8-10 and this pass. Actions has not run anything after `49fb53b`.
+- **Nothing from rounds 9, 10 or this pass is committed.**
+
+**Round 11 is next** over the same #21-23 scope.
+
+## Round 11 re-review — 2026-09-26 (base `7da32d3`; rounds 9, 10 and the Lows pass uncommitted)
+
+Security, design and liveness ran in parallel over the working tree. The
+liveness lane ran every claim on copies in the Linux and MSVC containers. One
+High and one Critical went to an adversarial verifier; both HOLD. **Status:
+presented to Corey 2026-09-26; all Medium+ rows FIXED (below); mandate "follow the mandate": fix in-scope
+rows through Medium, Lows stay open, R11-L2 is out of scope and is not fixed
+here (listed under "Open for Corey"). Fix lanes: A (R11-L1, R11-S2; gitdiff),
+B (R11-D2; one cache-secret predicate), D (R11-L4; interrupt kills registered
+tools) in parallel; C (R11-S1 then R11-D1; ccidentity/runcore) after B.**
+
+### Findings
+
+| ID | Sev | Source | Where | Finding | Status |
+|---|---|---|---|---|---|
+| R11-L2 | **Critical** | liveness, verified | `closure.resolveMangledAll` (`@m`), `planner.decideCompile` | Repointing a tracked directory symlink that Nim modules are imported through (`vend -> libs/a` to `libs/b`) serves a stale cached PASS on a plain `crisol run`: the closure records the realpath `libs/a/m.nim`, the link is not key material, and the compile skip only re-hashes recorded members. Verifier: reproduces at `7da32d3`, code byte-identical; **pre-existing, outside #21-23**. | **filed as #25 and FIXED** (lane E: links recorded per depgraph entry, `decideCompile` re-resolves them; depgraph format 10; `test_issue25_symlink_retarget`, POSIX-only bug, Windows proves recording and controls) |
+| R11-L1 | High | liveness, verified | `gitdiff.addChanged`, `narrow.selectByDiff` | Repointing a tracked directory symlink makes `--changed` select nothing (exit 0): the diff names only the link, the closure names files under the target, and the match is exact. The round-10 directory-link refusal only guards links inside an expanded submodule. #22. | **FIXED** (lane A: `git diff --raw` modes; a name that was a link at the base, or now leads to a directory through a link, refuses exit 3; same rules inside a changed submodule via its own git; an unchecked-out submodule refuses; `test_changed_symlink`, `test_changed_submodule` +4) |
+| R11-S2 | Medium | security | `gitdiff.changedFiles` | `--base <ref>` has no `--` after it; an unresolvable ref that names a path is read as a pathspec, git exits 0 with an empty diff, and `--changed` selects nothing. Reproduced in scratch. | **FIXED** (lane A: `rev-parse --verify --end-of-options <ref>^{commit}` through `requireGit`, and `--` after the revision) |
+| R11-S1 | Medium | security | `ccidentity.siteOf`, `compilerIdentity` (`CL` fold), `headerprobe.siteResolver` | A `config.nims` `putEnv("PATH"/"CL"/"_CL_", …)` changes the compiler nim runs, or its flags, while crisol resolves and hashes from its own environment; `putEnv`/`delEnv` are not on the project-dependent scan. | **FIXED** (lane C: the discovery reports nim's own `PATH`, `CL`, `_CL_`; the site uses nim's `PATH`; a missing report refuses; under MSVC a `CL`/`_CL_` that differs from crisol's refuses) |
+| R11-D2 / S4 / L3 | Medium | all three | `runcore.resolveCacheSecrets`, `sandbox.filterEnv`, `ccidentity.realStamp`, `httpTokens` | Four copies of the `CRISOL_CACHE_*` test; only toolexec's is case-insensitive on Windows. A lowercase `crisol_cache_token` is used as the credential yet reaches the compile child (measured in the MSVC container) and `--hermetic none` tests. | **FIXED** (lane B: one predicate in new `cachesecrets.nim`; all four sites use it; read and scrub from one snapshot; `test_cachesecrets`, red on MSVC before) |
+| R11-L4 / S5 | Medium | liveness, security | `toolexec.runTool` (POSIX group), plan phase | Ctrl-C during the probe kills crisol but not the tool (own process group, no handler before the Supervisor); measured: the wrapper's `sleep 25` outlived crisol. `ccprobe_*` scratch leaks. | **FIXED** (lane D: new `tooltrees.nim` fixed-slot registry; `installInterruptExit` before planning and the Supervisor handlers both call `killLiveTools`; exit 130/143; stale `ccprobe_*` reclaimed after 1 h; `test_tool_interrupt`) |
+| R11-D1 | Medium | design | `runcore.planImpl`, `runner.execute` `ccDriverFn`, `ccidentity.cachedDriverSite` | Fingerprint and driver site come from one discovery but reach the run by two paths paired only by the global memo; an injected `ccProbe` gets a real site; a stamp change between plan and execute pairs a key with another discovery's site. One `ToolchainProbe` value, `driverSite` required, the seam deleted. | **FIXED** (lane C: `ToolchainProbe`, `cachedToolchainProbe`, `PlanImplResult.toolchain`; `execute`/`verifyCachePass` take a required `driverSite`; `ccDriverFn`/`cachedDriverSite` deleted; `CacheDeps` renamed `RunDeps`; census 211) |
+| R11-D3 | Low | design | `ccidentity` | `CcProbe` vs `ProbeRun`; `CcProbe.driver` read only by tests; uncalled 4-arg `locateDriver`; exported `siteOf`. | **FIXED with R11-D1** (`CcProbe.driver`, the 4-arg `locateDriver` and the `siteOf` export are gone) |
+| R11-D4 | Low | design | `ccidentity.cachedCcVersion`, clean path | Doc says it returns the key's `ccVersion`; since R10-S4 the key carries `toolchainIdentity(fp, nonce)`. | FIXED (Lows pass 2, lane T) |
+| R11-D5 | Low | design | `toolchainwarn.toolchainIdentity`, `runcore.planImpl` | Caller repeats the verdict check to decide whether to draw a nonce; a mismatch is a Defect. | FIXED (Lows pass 2, lane T) |
+| R11-D6 | Low | design | `headerprobe.ProbedHeader.pc`, `closure.extractCompileInputs`, `measureworker` | `Option[PathClass]` exists for unit tests only; closure `.get`s on a comment. measureworker relies on the default `realRun` cwd. | FIXED (Lows pass 2, lane C) |
+| R11-D7 | Low | design | `ci.yml` windows/macos | Step names carry review IDs ("round-N — …"), including "round-11" named before round 11 ran. | FIXED (Lows pass 2, lane I) |
+| R11-S3 | Low | security | `ccprobe.locateDriver`, `headerprobe.siteResolver` | A relative PATH entry (`.`, `bin`) is resolved against crisol's cwd, not nim's. | FIXED (R12-L1: `entryDir` resolves relative PATH entries against `nimCwd`) |
+| R11-S6 | Low | security | `ccidentity.projectDependentIdent` | Textual scan: backtick-split identifiers and macro-built names escape it; `nimcacheDir` is missing. A heuristic, not a trust boundary; say so. | FIXED (Lows pass 2, lane T) |
+| R11-L5 | Low | liveness | `test_toolchainfp_producer_chain` `checkAllHopsCarry` | `check` inside a top-level proc prints `[OK]` after "Check failed" (only the exit code fails). The constant-fingerprint mutant is caught only by the differential test, by design. | FIXED (Lows pass 2, lane I) |
+| R11-L6 | Low | liveness | `measureworker.recordArtifactRows` | Worker warnings for an unresolved driver never reach the user; the artifact ledger silently shrinks to its header. | FIXED (Lows pass 2, lane C) |
+
+### Out of scope, noted
+
+- R11-L2 above (pre-existing Nim-module closure property; proposed as its own issue).
+- `LINK`/`_LINK_` and per-directory `nim.cfg`/`config.nims` not in the key (#24).
+- `--changed` does not see edits under a dep-root outside the project root (RFC-0001 single-repo non-goal).
+- The "depgraph discarded" warning truncates both toolchain strings so they can print identically.
+- The `check`-in-a-proc pattern predates this work in a4b `runDeterminismBody`, a-degraded `buildFixture` and spike `observeDepSpellings`.
+
+### Fix lanes, decisions and verification (round 11)
+
+- **Lanes:** A (gitdiff: R11-L1, R11-S2, then the submodule follow-up), B
+  (R11-D2), C (R11-S1, R11-D1, the R11-D3 part that fell out), D (R11-L4),
+  E (#25), G (three structural gates the new code tripped). All on Opus 5.5.
+- **Lane C's calls, accepted:** a `CL`/`_CL_` that differs between nim and
+  crisol under MSVC refuses both halves rather than replaying nim's value
+  (replay needs an environment parameter on toolexec); `SystemRoot` and
+  `PATHEXT` are not reported (neither search reads them from the environment);
+  `CacheDeps` is renamed `RunDeps` (runcore's test seam, not re-exported by
+  api); `verifyCachePass` takes a required `DriverSite`.
+- **Lane D:** the stale `ccprobe_*` directory is reclaimed by the next run
+  after 1 h rather than on the interrupt path (the handler exits without
+  unwinding). `tooltrees.nim` lives in `src/crisol/process/` (lane G, per the
+  RFC-0007 ownership convention). The Windows console handler is untested in
+  the container; the job-kill path it calls is tested.
+- **Lane E (#25):** the bug is POSIX-only: on Windows nim keeps the junction
+  spelling, so the existing re-hash already caught it; the Windows run proves
+  the link recording and the controls. Depgraph format 9 to 10 (one full
+  recompile).
+- **New windows CI steps** (named by behaviour): "changed: a symlink in the
+  diff refuses --changed", "cache: a retargeted symlink on an import path
+  recompiles", "tool interrupt: a running bounded tool ends at once, job
+  kill". `assert-subset-honesty.sh` requires their `[OK]` lines; three new
+  POSIX-only skip labels.
+- **Orchestrator:** normalized CRLF to LF in 7 files one lane had written with
+  CRLF (the repo enforces `eol=lf`).
+- **Sweep 1** failed three structural gates (path-identity Tier 1 in
+  `closure.crossedLinks`, `std/posix` ownership for `tooltrees.nim`, the
+  bucket inventory for the interrupt test and driver; lane G fixed all three,
+  inventory 86 to 88) and `test_conformance` `pass_always` once (3 of 3 green
+  in isolation, green in sweep 2; recorded as a load flake).
+- **Sweep 2, with exit codes (4 slices, 71/70/70/70): 281 entrypoints, 280
+  pass, 1 fail** (`test_fallback`). Source-soundness gate 84 of 84 on three
+  OSes; census 211; `ci.yml` parses to the five jobs.
+- **Out of scope, from the lanes:** a config.nims `readFile`/`gorge` input is
+  not in the memo stamp (pre-existing); tools inherit crisol's open pipe fds
+  (osproc sets no close-on-exec); git for Windows treats a junction as a
+  directory, so a tracked junction's repoint shows as content changes only.
+
+**Round 12 (re-review of round 11) ran; see below.**
+
+## Round 12 re-review — 2026-09-26 (re-review of round 11; all uncommitted)
+
+Security, design and liveness ran over the working tree after round 11's
+fixes (network outages interrupted all three repeatedly; each resumed from a
+saved draft). The one High was adversarially verified and HOLDS. Mandate
+unchanged (fix through Medium, Lows stay open).
+
+| ID | Sev | Source | Where | Finding | Status |
+|---|---|---|---|---|---|
+| R12-S1 | High | security, verified | `closure.walkForIndex`, `crossedLinks` | #25's link recording rides the pruned index walk: a link inside a dot-directory or `nimcache` (`.deps/vend -> libs/a`) is never recorded, so repointing it serves a stale PASS (plain run and `--no-cache`); an ordinary directory is caught. A link outside every tracked root that points back in is never walkable. | **FIXED** (lane S1: `walkForIndex` visits dot-dirs and `nimcache` for links only; the state dir stays pruned, argued in code; relative dep roots now resolve against the project root, not the cwd. The outside-every-root variant is undetectable from anything crisol reads; accepted as the tracked-roots boundary and documented in README "What a closure tracks" and CHANGELOG, remedy `dep-roots`) |
+| R12-L1 | Medium | liveness | `ccidentity.probeRun` (`realRunIn(scratch)`), osproc `startProcess` | On POSIX, osproc chdirs the PARENT into `workingDir` and restores only on spawn success; a probe tool that fails to start (no `ldd` on PATH; a relative PATH entry) leaves crisol in the deleted `ccprobe_*` dir, and every command dies ("No such file or directory"). Pre-existing; makes `ldd` optionality and R11-S3 unreachable. | **FIXED** (lane L1: `runTool` restores the caller cwd on a failed POSIX spawn; `locateDriver` resolves every relative PATH entry against `nimCwd`, closing R11-S3 too; `test_tool_spawn_cwd`, `test_locate_driver_relative`, `test_probe_spawn_cwd`) |
+| R12-D1 | Medium | design | `gitdiff.addChanged`/`refuseLink`/`filesUnder`, `depgraph.movedLink`, `narrow.selectByDiff` | Since #25, `isEntryStale`'s `movedLink` already selects on a repointed link, so R11-L1's whole-run refusal is redundant and overbroad (a repointed `docs/` link refuses `--changed`); three refusal predicates mixed with I/O. One pure `linkVerdict`; refuse only what the walk cannot see. | **FIXED** (lane G2: `refuseLink` deleted; pure `depgraph.changedLink` in `narrow` rule 5 selects entries whose recorded links match, sit under, or sit above a changed name; pure `gitdiff.nameVerdict`; remaining refusals are submodule-only: not checked out, missing recorded commit, unlistable directory; `test_changed_links`) |
+| R12-D2 | Medium | design | `gitdiff.expandSubmodule`, `filesUnder(vetted)` | A changed submodule with a base still adds every file (over-selects every submodule test) although its own diff is precise; `vetted`/`trackedLinks`/`--stage` exist only to stop that walk refusing. Use the precise records; keep the walk for no-base directories. | **FIXED** (lane G2: a gitlink on both sides contributes only its own diff and untracked names; `vetted`, `trackedLinks`, `ls-files --stage` deleted) |
+| R12-D3 | Medium | design | `tooltrees.installInterruptExit` (CLI only), `runcore.runTestsWith` | A library host with `installSignals` gets no interrupt path during planning; R11-L4 still reproduces there. `runTestsWith(installSignals)` should own signals from its first act. | **FIXED** (lane D3: nesting interrupt scopes in `tooltrees`; `runTestsWith` opens one first; a planning interrupt kills registered tools and returns `rsInterrupted` 128+n; host handlers restored; `installInterruptExit` deleted; the CLI opens a scope around `runMain`; `test_library_interrupt_in_planning`) |
+| R12-D4 | Low | design | `runner.execute`, `PlanImplResult` | Pairing enforced only up to `execute`: `ccVersion` string defaults to `""`, `ccVer` is a separate field; one `RunToolchain {probe, identity}`. | FIXED (Lows pass 2, lane T) |
+| R12-D5 | Low | design | `runner.runEntrypoint`, `ProbeMemo` | `stateDir` is in the memo key, so `runEntrypoint` (fresh private stateDir) always misses and grows the memo. | FIXED (Lows pass 2, lane T) |
+| R12-D6 | Low | design | `depgraph.updateEntry`, `recordClosure` | `links` set by field assignment after the constructor; a second record path would silently record "no links". | FIXED (round-14 lane A: `links` is a required `updateEntry` argument) |
+| R12-D7 | Low | design | `ccidentity` | Test-only fingerprint wrappers exported; comments still name `cachedCcFingerprint` as the production memo. | FIXED (Lows pass 2, lane T) |
+| R12-D8 | Low | design | `toolexec.runTool` | An interrupted tool is `reIoError`; no `reInterrupted` ending. | FIXED (round-14 lane B: `reInterrupted`) |
+| R12-D9 | Low | design | `ci.yml`, `assert-subset-honesty.sh` | Windows per-file steps and honesty blocks are two hand-kept lists. | FIXED (Lows pass 2, lane I) |
+
+Verified live in round 12 (liveness, real CLI, Linux and MSVC): every R11-L1
+refusal case and the submodule cases; R11-S2; #25 across nine import forms
+and the format-9 discard; the Windows junction and `mklink /D` variants;
+R11-S1 on both hosts; R11-D2 on MSVC with cache on/off and `--hermetic none`;
+R11-L4 in seven phases (130/143 in about 100 ms, tool gone, stale dirs
+reclaimed); R11-D1 has no `unprobedSite` in `src/`; the honesty script
+catches each new step going silent. Not verifiable: the Windows console
+handler (the container has no console).
+
+### Fix lanes and verification (round 12)
+
+- Lanes S1, L1, D3 in parallel, then G2 (which depended on S1). All Opus 5.5.
+- **Decisions:** the outside-every-root link variant is the tracked-roots
+  boundary, documented (lane S1's recommendation; nothing crisol reads can
+  detect it). A link hit is reported as `srClosureHit`, not a new reason (a
+  new reason would change `types.nim` and the JSON). Lane L1 chose
+  save-and-restore of the cwd over replacing osproc's spawn.
+- **Behaviour changes:** `--changed` no longer refuses on a changed link; it
+  selects the entrypoints reached through it. A changed submodule no longer
+  selects every test touching it. A CLI signal outside planning and execution
+  (drain, persist, the verify sub-run) now unwinds, then exits 130/143.
+- **Known for round 13:** `lastInterruptSignal` never resets, so in a library
+  host one interrupt makes every later run's end-of-run cache drain give up
+  early (pre-existing for execution; now also for planning). On Windows each
+  tool refused after an interrupt leaks one job handle.
+- **Sweep, with exit codes (4 slices, 72/72/71/71): 286 entrypoints, 285
+  pass, 1 fail** (`test_fallback`). Gates green (soundness gate on three
+  OSes, census, bucket inventory 90, ioutils ownership, path identity).
+- **Out of scope, from the lanes:** search-path shadowing by a new file or
+  link is not tracked for `--changed` (pre-existing); osproc leaks six pipe
+  fds per failed spawn; `realStamp` still raises if an outside process deletes
+  crisol's cwd; `ldd` is looked up on crisol's PATH (runtime label only);
+  `test_source_index` and `test_closure_searchpath` fail their symlinked
+  dep-root cases in the local MSVC container with or without round 12.
+
+**Round 13 (re-review of round 12): see "Round 13 re-review".**
+
+### Out of scope, noted (round 12)
+
+- An import link to an absolute path outside every tracked root
+  (`vend -> /opt/la`) records only the test file; editing or repointing the
+  target serves a cached PASS (the tracked-roots boundary; with #24's
+  "headers outside the tracked roots are not content-hashed").
+- The probes run under crisol's PATH, so `link.exe`/`as`/`ld` looked up by a
+  driver may differ from the build's (with #24's vccexe note).
+- `git update-index --skip-worktree`/`--assume-unchanged` hides a change from
+  `--changed` (pre-existing, any file).
+- A hostile `patchFile("stdlib","envvars",...)` can make the environment
+  report lie (a hostile config, like R11-S6).
+- Children inherit an ignored SIGPIPE (Nim runtime, pre-existing).
+- `isEntryStale`'s unused `projectRoot` parameter (pre-existing).
+
+## Round 13 re-review — 2026-09-26 (re-review of round 12; all uncommitted)
+
+Security, Design and Liveness reviewed the working tree over `7da32d3`. R13-S1
+was verified by an adversarial sonnet agent (HOLDS, reproduced: `--changed`
+plans `[]` and exits 0 while a plain run exits 1). R13-L1 is the same missing
+rule, reproduced independently by Liveness. Drafts: scratchpad `r13sec_draft.md`,
+`r13des_draft.md`, `r13live_draft.md`.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R13-S1 / R13-L1 | High | Sec + Live | `narrow` rule 5, `depgraph.changedLink`/`isEntryStale`, `gitdiff.nameVerdict` | A directory (a submodule checkout, or a tracked dir) replaced by a link after the record: the diff names only the link, which is neither a closure member nor a recorded link, so `--changed` selects nothing and exits 0 while the test fails. On MSVC a junction repoint inside a submodule is invisible to git as well. | FIXED |
+| R13-L4 | Medium | Live | `gitdiff.addChanged`, `depgraph.changedLink` | An expanded submodule's own gitlink name is still added, and "a changed name above a link" then selects every entry that recorded any link in the submodule: the R12-D2 precision is lost whenever the submodule holds a link (over-selection only). Interacts with the S1 fix. | FIXED |
+| R13-D2 / R13-L2 | Medium | Des + Live | `tooltrees.gLastSignum`/`lastInterruptSignal`, `signals.shutdownRequested`, `windows.nim` `weShutdown` | The sticky signal: after one interrupted run a library host skips every cache lookup (all tests re-run) and drops remote puts for the rest of the process. | FIXED |
+| R13-L3 | Medium | Live | `nimprobe.cachedNimFingerprint` | A planning interrupt refuses `nim --version`; the memo keeps `<nim-version-unavailable>` for the host's lifetime and writes it into the depgraph header and cache keys. | FIXED |
+| R13-D1 / R13-S2 | Medium | Des + Sec | `runcore.runTestsWith` | A signal after `execute()` returns (drain, persist, verify sub-run) returns `rsOk`, and the outermost leave discards it; the host never sees it. | FIXED |
+| R13-D3 | Low | Des | `tooltrees.registerTool`/`unregisterTool` | The `false` return means two things; the source of the Windows job-handle leak after an interrupt. | FIXED (Lows pass 2, lane P) |
+| R13-D4 | Low | Des | `posixcore.gShutdownWriteFd`, Windows event vs `tooltrees.gWake` | Two records of who owns the wake-up. | FIXED (Lows pass 2, lane P) |
+| R13-D5 | Low | Des | `tooltrees.onInterrupt` | No second-signal escape. | FIXED (Lows pass 2, lane P) |
+| R13-D6 | Low | Des | `narrow` reasons, `fallbackNotes`, `changedLink` evidence | No reader outside tests; `srClosureHit` never reaches `--json`. | FIXED (Lows pass 2, lane S) |
+| R13-D7 | Low | Des | `ccprobe.locateDriver` | `""` means "unknown, refuse" in `entryDir` but is skipped in the Windows `nimCwd` loop. | FIXED (Lows pass 2, lane C) |
+| R13-D8 | Low | Des | `closure.walkForIndex(linksOnly)` | Pruning rules split between a bool and an inline `continue`; `narrow`'s "no I/O beyond fileExists" doc is stale. | FIXED (Lows pass 2, lane C) |
+| R13-S3 | Low | Sec | `gitdiff.changedFiles` | A submodule whose `.git` entry is removed is invisible to `--changed` (predates this work). | FIXED (Lows pass 2, lane S) |
+| R13-S4 | Low | Sec | `ccprobe.locateDriver`, `headerprobe.realPathExists` | The POSIX search stops at a non-executable entry where execvp would skip it; refusal only. | FIXED (Lows pass 2, lane C) |
+| R13-L5 | Low | Live | `ccidentity` discovery | Every invocation is 5-6x slower than at `7da32d3` (the per-invocation toolchain probe, not the dot-dir walk). | ACCEPTED (Corey, 2026-09-27: the toolchain-identity probe costs milliseconds and the compile skip it keeps sound saves minutes. Measured again in Lows pass 3, lanes E and G: discovery already compiles a stub, and ~85% is `system.nim` semantic checking. `nim dump` lacks the cc command. Overlapping the probe would hide only 9-13% of it on a normal filesystem) |
+
+### Fix lanes and verification (round 13)
+
+- Lane A (link selection; `depgraph`, `narrow`, `gitdiff`, `planner`):
+  - `depgraph.unrecordedLink` sits beside `movedLink`. It walks each member's directories from its root, and the first link met decides; a recorded link covers everything under it. Directory checks are memoized.
+  - It feeds `isEntryStale` (narrow rule 4) and `planner.decideCompile` (`cdStale`, "symlink not on record"), so a compile-skip cannot keep a link-less entry.
+  - Pure `depgraph.changedAncestor` is fold-aware through `keyBytes` and shares `ancestorsOrSelf` with `changedLink`. It is narrow rule 5's third arm.
+  - `addChanged` no longer adds an expanded submodule's own gitlink name (R13-L4). Gitlink->link and gitlink->file still add it.
+  - There is no depgraph format change.
+  - On MSVC, git reads a junction as the directory it replaced, so only the new staleness rule selects there. The committed-swap tests use `--allow-empty`.
+  - Mutation runs showed each part is load-bearing.
+- Lane B (interrupts; `tooltrees`, `signals`, `process/*`, `runcore`, `nimprobe`, `ccidentity`, `api`, `crisol.nim`):
+  - `gLastSignum`/`lastInterruptSignal` are deleted. `shutdownRequested`/`globalShutdownSignal` and Windows `weShutdown` read the scope signal.
+  - `nimprobe.probeNim` returns a `refused` flag. `cachedNimFingerprint` and `ccidentity`'s `ProbeMemo` never memoize a probe taken while an interrupt is pending.
+  - `runTestsWith` wraps a private `runTestsBody` with one end-of-call check (`markInterrupted` -> `rsInterrupted`, 128+n, keeping plan and results). The signal is not re-raised to the host; this is documented on `api.runTests`.
+  - `crisol clean` returns 128+n before `cleanOrphans` if an interrupt landed while probing. Otherwise placeholder fingerprints would orphan every cache directory.
+  - Behaviour changes:
+    - A caller with `installSignals = false` and no scope of its own always reads `shutdownRequested()` as none.
+    - A signal after `persistLastRun` leaves `lastrun.json` in place but reports `rsInterrupted`.
+  - New `test_library_interrupt_rerun` (plus a fixture), Linux-only like `test_library_interrupt_in_planning`. The bucket inventory is now 92.
+- Verification:
+  - Full Linux sweep 72/72/72/71: 287 entrypoints, 286 pass (only `test_fallback`).
+  - MSVC builds `src/crisol.nim`; `test_tool_interrupt`, `test_changed_symlink` and `test_changed_submodule` pass there.
+  - `assert-defaulted-params` passes (211) and `source-soundness-gate` passes (84/84). The YAML shows five jobs, and there is no CRLF.
+
+**Round 14 (re-review of round 13): see "Round 14 re-review".**
+
+### Out of scope, noted (round 13)
+- #24: `LINK`/`_LINK_` and per-directory configs are not in the key.
+- stateDir isolation: a stateDir at a non-default path inside the project, or reached through another spelling, escapes the link-walk prune; `crisol run test_x.nim` from a subdirectory matches nothing and exits 0 (predates round 12).
+- Links or files under gitignored directories never reach `--changed` (pre-existing class).
+- The tracked-roots boundary; census and gate scripts; RFC-0006; R4-11.
+
+## Round 14 re-review — 2026-09-26 (re-review of round 13; all uncommitted)
+
+Security (no Medium+; code reasoning only), Design (3 Medium) and Liveness (every
+round-13 repro closed on Linux and MSVC; ordinary link setups stay cached; no new
+walk cost) reviewed the tree. No Critical or High, so nothing needed adversarial
+verification. Drafts: scratchpad `r14sec_draft.md`, `r14des_draft.md`,
+`r14live_draft.md`.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R14-D1 | Medium | Des | `depgraph.movedLink`/`unrecordedLink`/`changedLink`/`changedAncestor`, `narrow` rule 5 | Four ad hoc link/ancestry predicates instead of one model: each new link shape has added a predicate. Redesign: a watched set per entry, with two public procs (`diffReach`, `entryDrift`) that return typed evidence. | FIXED (round-14 lane A: `entryDrift`/`diffReach` with typed `Drift`/`Hit`) |
+| R14-D2 | Medium | Des | `planner.decideCompile`, `depgraph.isEntryStale` | Staleness is written twice (members, `movedLink`, `unrecordedLink`); round 13 had to patch both. A record path that forgets `links` now makes an entry stale forever. Redesign: one `entryDrift`, and `links` required on `updateEntry`. | FIXED (round-14 lane A: one `entryDrift`; `links` required on `updateEntry`) |
+| R14-D3 | Medium | Des | `nimprobe.probeNim`, `ccidentity.ProbeMemo.lookup` | "Don't memoize while interrupted" is written twice, with different rules, from a process-global read. Worsens R12-D8. Redesign: a `reInterrupted` `RunEnd`; both memos drop answers derived from an interrupted run; unit-testable through the fakes. | FIXED (round-14 lane B: `reInterrupted` RunEnd; one memo rule) |
+| R14-D4 / R14-L1 | Low | Des + Live | `crisol clean`, `clean.cleanOrphans` | A placeholder fingerprint from a missing nim or gcc prunes every cache and bin dir (over-deletion; predates this work). | FIXED (Lows pass 2, lane T) |
+| R14-D5 | Low | Des | `signals` -> `process.globalShutdownSignal` -> `posixcore` -> `tooltrees` | Four pass-through layers to one atomic load; two readers (`int` and `Option`). | FIXED (Lows pass 2, lane P) |
+| R14-D6 | Low | Des | `runcore.runTestsWith` doc, `api.runTests` doc, `DepGraphEntry.links` doc | Stale doc passages. | FIXED (round-14 lanes A and B) |
+| R14-D7 | Low | Des | `test_changed_links` "R13-L4" suite | It asserts `nameVerdict` only; the L4 decision lives in `addChanged`. | FIXED (Lows pass 2, lane S) |
+| R14-D8 | Low | Des | `gitdiff` `filesUnder` vs `depgraph.changedAncestor` | The walk mostly duplicates the ancestor rule (a nested dep root may still need it; unverified). | FIXED (Lows pass 2, lane S) |
+| R14-S1 | Low | Sec | `tooltrees.leaveInterruptScope`, end of `runTestsWith` | A microsecond race: a signal between the final read and the outermost leave is lost on POSIX, or left stamped on Windows (transient refusals only). | FIXED (Lows pass 2, lane P) |
+
+### Fix lanes and verification (round 14)
+
+- Lane A (`depgraph`, `narrow`, `planner`): added a pure `diffReach(entry, changed, roots): Option[Hit]`, with `HitKind` hkMember/hkLink/hkUnderLink/hkAncestor, and `entryDrift(entry, roots): Option[Drift]`, with `DriftKind` dkMissing/dkMoved/dkUnrecorded. The four old predicates are now private helpers.
+  - `isEntryStale(graph, key, roots)` returns "absent or drifted"; its unused `projectRoot` is gone.
+  - `decideCompile` calls `entryDrift` once. The reason strings and their order are unchanged.
+  - `updateEntry` takes `links` as a required argument (85 test call sites gain `@[]`).
+  - Mutation runs showed each arm is load-bearing.
+  - Left over: `narrow.selectByDiff`/`narrowByDiff` still take an unread `projectRoot`.
+- Lane B (`toolexec`, `toolrun`, `nimprobe`, `ccidentity`, `gitdiff`, `compiledriver`, `runcore`, `api`): added a `reInterrupted` `RunEnd`, reported when the registry killed or refused a tool, and also when a run fails while an interrupt is pending.
+  - That second case is an accepted deviation: it covers a Windows console Ctrl-C that kills a tool before the sweep, and an untracked run.
+  - A failed spawn stays `reNotStarted`, and an exit 0 is kept.
+  - `NimMemo` and `ProbeMemo` apply one rule ("never keep an answer derived from an interrupted run") through a new `toolrun.RunWatch`.
+  - The `tooltrees` imports are gone from both modules, and there are unit tests with fake runs.
+- The disk filled up (0 bytes free) during lane B, from ~25 scratch repo copies of 7 GB each. The old copies were deleted, and the repo was checked intact (no truncated file, no `index.lock`).
+
+### Lows pass 2 (after round 14; Corey: "fix lows again now")
+
+The round-14 sweep was 72/72/72/71: 287 entrypoints, 286 pass (only `test_fallback`). Five lanes were dispatched in parallel; each brief carries the disk rule (small copies, deleted afterwards).
+
+| Lane | Files | Findings |
+|------|-------|----------|
+| P | process/*, `tooltrees`, `signals`, `toolexec`, `toolrun`, the `runTestsWith` wrapper | R13-D3, R13-D4, R13-D5, R14-D5, R14-S1 |
+| T | `ccidentity`, `toolchainwarn`, `nimprobe`, `clean`, `runner`, `planImpl` | R11-D4, R11-D5, R11-S6, R12-D4, R12-D5, R12-D7, R14-D4/L1, then R13-L5 |
+| C | `ccprobe`, `headerprobe`, `closure`, `measureworker` | R11-D6, R11-L6, R13-D7, R13-S4, the `dirRole` part of R13-D8 |
+| S | `gitdiff`, `narrow`, `depgraph`, `types`, `pipeline` | R13-D6 (with the unread `projectRoot`), R13-S3, R14-D7, R14-D8 |
+| I | `ci.yml`, `assert-subset-honesty.sh`, `test_toolchainfp_producer_chain` | R11-D7, R12-D9, R11-L5 |
+
+R13-L5 (the per-invocation probe cost) carries a soundness gate: an on-disk probe cache only if its key provably covers every probe input; otherwise report why and skip it.
+
+Already closed before this pass: R12-D6 and R12-D8 (round-14 lanes), R14-D6, and R11-S3 (by R12-L1).
+
+After the lanes: a full sweep, then round 15 (re-review).
+
+### Lows pass 2 outcome
+
+- **Lane P:**
+  - `registerTool` returns a `Registration` (`rkOwned`/`rkUnregistered`/`rkKilledNow`), and a tool killed at registration closes its job handle. On MSVC, 20 refused tools leak 0 handles, down from 20.
+  - `attachInterruptWake` refuses a second wake; both backend tokens are deleted. Windows gains the one-Supervisor refusal.
+  - `tooltrees.shutdownRequested(): Option[ShutdownSignal]` is the only reader (re-exported by `signals`); `interruptSignal` and the pass-throughs are deleted.
+  - The outermost `leaveInterruptScope` restores the handlers, then swaps the record out and returns it. The record is ignored at depth 0.
+  - R13-D5 deviation, accepted: with a Supervisor attached, the second signal is still its force-kill and the third escapes (killLiveTools, then `_exit`/`ExitProcess`). With no Supervisor, the second signal escapes. Residual: the escape does not reach tests in their own process groups.
+- **Lane T:**
+  - The test-only wrappers moved to `tests/support/ccprobes.nim`.
+  - `toolchainIdentity(fp, drawNonce)` makes one verdict call.
+  - `nimcacheDir` and backtick normalisation added.
+  - `RunToolchain {probe, identity}` has private fields and is built only by `runToolchain`/`unkeyed`; `execute` takes it as required.
+  - The memo is keyed on `(projectRoot, flags)`; a scratch-setup failure is not kept.
+  - `clean` has a typed `CleanToolchain`: an unknown toolchain skips the `cache/` prune and warns. This subsumes the interrupt special case.
+  - Lane C's two follow-ups: the runner relays measure-worker warnings to stderr, and `probeRun` uses `realDriverStop` through a new `CcProbeIo.driverStop` seam.
+- **R13-L5, deferred with measurements:**
+
+  | Command | 7da32d3 | Working tree |
+  |---|---|---|
+  | `list` | 35-39 ms | 264-349 ms |
+  | warm `run` | 35-40 ms | 294-346 ms |
+
+  About 265 ms of each probe is the discovery `nim c --compileOnly`. No sound on-disk key exists: `config.nims` runs arbitrary NimScript; `fileStamp` is size/mtime for large binaries; the key would not cover `cc1`, the backend or libc; the state dir can be shared across hosts. Skipping the probe for `list` would make `list` disagree with `run`. The real lever is a cheaper discovery compile, a follow-up redesign.
+- **Lane C:**
+  - Pure `closure.dirRole` returns `drIndex`/`drLinksOnly`/`drSkip`.
+  - `locateDriver` uses `Option` search steps (an unknown nim dir or cwd refuses on Windows).
+  - `headerprobe.realDriverStop` follows execvp on POSIX (regular file with an exec bit, via `getFileInfo`; there is no `std/posix` outside `process/`). Limit: any exec bit counts.
+  - `ProbedHeader.pc` is a required `PathClass`, with unpopulated roots as a separate branch. `closure` fails closed on an unclassified probe.
+  - The measureworker probes in `plan.projectRoot` and warns through `WorkerWarn` plus a summary line.
+  - Seen on MSVC and reproduced with lane C's change reverted: `test_source_index` "a dep-root that is itself a symlink…" fails, and `test_measureworker_real` pins 4 reusable units where Windows has 7. Round 15's Liveness checks whether these predate this work.
+- **Lane S:**
+  - One `narrowByDiff(eps, changed, graph, roots)`. Deleted: `selectByDiff`, `fallbackNotes`, `SelectionReason`/`SelectionResult` and the unread `projectRoot`.
+  - `nameVerdict` returns the whole decision (`refuse`, `addName`, `expandSubmodule`).
+  - The `filesUnder` walk is deleted, because `classify` tags nested dep roots inside the project to the project root. An unreadable subdirectory no longer refuses.
+  - Stranded submodules are read via `ls-files --stage`, recursively: files with no `.git` add the name; an empty or absent directory adds nothing.
+  - New `test_changed_stranded_submodule` (Windows step added).
+  - `fake_git` answers `ls-files --stage`. A Windows setup flake in `test_changed_submodule` is fixed.
+- **Lane I:**
+  - 17 review-ID step names renamed.
+  - The honesty script derives its per-file list from `ci.yml` and fails on drift in either direction. It found 7 per-file steps that were never judged; blocks were added for them.
+  - New `ci/assert-subset-honesty.selftest.sh` (13 cases), run by the Linux job.
+  - `checkAllHopsCarry` is now a template, so a failure prints `[FAILED]`.
+- **Orchestrator:**
+  - Stale comments naming the removed wrappers were updated.
+  - CHANGELOG entries added: repeated Ctrl-C and library-host interrupts; `clean` with an unknown toolchain.
+
+**Verification after Lows pass 2:** the full Linux sweep ran 73/73/72/72, which is 290 entrypoints with 289 passing (the only failure is `test_fallback`). `assert-defaulted-params` passed with 209 records. `source-soundness-gate` passed with 84/84. Both selftests passed. The YAML check lists five jobs, and there is no CRLF. **Round 15: see "Round 15 re-review".**
+
+### Out of scope, noted (round 14)
+- Root-crossing ancestry (a dep root that is itself a swapped link or nested under a changed name): the tracked-roots boundary.
+- Windows reparse points that are not links (OneDrive placeholders, mount points) are not descended by the index walk; this predates #25.
+- `skip-worktree` hides changes from `--changed` (the gitignored class). #24, stateDir, the gates, RFC-0006 and R4-11: nothing new.
+
+## Round 15 re-review — 2026-09-26 (re-review of Lows pass 2; all uncommitted)
+
+Security, Design and Liveness reviewed the tree.
+
+R15-S1 (Critical) was verified by an adversarial sonnet agent. The verdict is HOLDS: it reproduces with SIGINT and with SIGKILL, on both the working tree and `7da32d3`. Corey chose "fix now + file issue", as with #25. It is filed as **#26** and added to the loop's scope.
+
+Drafts are in the scratchpad: `r15sec_draft.md`, `r15des_draft.md` and `r15live_draft.md`.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R15-S1 (#26) | Critical | Sec | `runner.finalizeSlot` (records the closure at compile->run), `execute` fkDone (promotes only after a clean run), `planner.decideCompile` | An interrupt, `kill -9`, crash or run-phase spawn failure between the two leaves a new graph entry next to the old stable binary. The next run compile-skips, runs the old binary and reports PASS; that PASS is likely stored under the new key. Predates this work. | FIXED (lane A: `finalizeSlot` removes the previous stable binary before `recordClosureFn` persists the entry; if the removal fails the entry is dropped and the slot stays unrecorded. `promoteCompiledBinary` copies to `<stable>.promoting` and renames, so promotion is atomic. `decideExit` needed no change: with no old binary on disk nothing can be compile-skipped. `test_issue26_promotion_interrupt` covers SIGINT (POSIX), a hard kill and a run-phase spawn failure; it is wired into Windows CI and pinned by the honesty script) |
+| R15-D1 | Medium | Des | `gitdiff.nameVerdict` vs `gitlinkVerdict` | Two classifiers and two tables for a submodule directory disagree when the diff names the gitlink. A stranded dir refuses; an uninitialised submodule bumped since `--base` refuses, although `dkMissing` already covers its members. | FIXED (lane B: one `PathState` and one `nameVerdict` table decide both the diff-named and the index-walk paths. A stranded directory adds its name, and an uninitialised one contributes nothing (`dkMissing` covers its members). No refuse verdict remains in the table; the only refusal is R15-S7's empty `.git`) |
+| R15-D2 | Medium | Des | `api.runTests` "Interrupts" doc, README:300 | The docs say "crisol never exits the host", but the repeated-signal escape `_exit`s the host. The README still describes sticky `shutdownRequested` and handlers "for the duration of the call". | FIXED (orchestrator: `api.runTests` doc, README interrupts paragraph and CHANGELOG now state the repeated-signal host exit; the sticky-observer sentence is gone) |
+| R15-D3 / R15-S5 | Low | Des + Sec | `runner` relay, `workerplan.measureWorkerWarnings` | The warnings relay scans a head-truncated merged stream: a large compile log drops the warnings, and Nim output that starts with the prefix is relayed (spoofable, escape bytes). | FIXED (Lows pass 3, lane A: the relay streams the whole log and keeps only candidate lines; it matches `MeasureWarningPrefix` and replaces control bytes) |
+| R15-D4 | Low | Des | `CleanToolchain`, `Registration`, `RunToolchain` | Unsafe zero values: `CleanToolchain()` is known(""), `Registration()` is rkOwned slot 0, and `RunToolchain()` compiles outside the module. | FIXED (lanes B and D: `ctkUnknown` and `rkUnregistered` are the zero values; `RunToolchain` asserts through `checked`) |
+| R15-D5 | Low | Des | `crisol clean` interrupt | An interrupted clean still prunes `bin/`, the graph, the result cache and the ledgers. | FIXED (lane B: `cleanOrphans` stops at the next phase boundary on an interrupt and reports `interrupted`) |
+| R15-D6 | Low | Des | `headerprobe.HeaderProbe` `classified: false` | A test-only branch in a production type; `closure` and `artifactid` treat it differently. | FIXED (lane C: the unclassified branch is removed; `hpfRootsUnpopulated` refuses) |
+| R15-D7 | Low | Des | `locateDriver`/`siteResolver` `pathExists` vs `driverStop`, `realDriverStop` home | One predicate, two names; it lives in `headerprobe`. | FIXED (lane C: `ccprobe.DriverStop`, one name) |
+| R15-D8 | Low | Des | `clean.cleanOrphans` string overloads | Test-only overloads mark any string as known; the doc block is stale. | FIXED (lane B: the string overloads are removed; the doc is fixed) |
+| R15-D9 | Low | Des | `toolexec.ToolTree` | A three-state outcome held in two bools. | FIXED (lane D: `TreeOutcome` enum) |
+| R15-D10 | Low | Des | `gitdiff` header, `test_issue11_closure_inputs:10` | Stale docs name deleted things. | FIXED (lane B: the stale docs are updated) |
+| R15-D11 | Low | Des | honesty drift check | Cannot notice an integration file that no leg runs. | FIXED (lane F: an integration-coverage check plus 2 selftest cases) |
+| R15-S2 | Low | Sec | `tooltrees.onInterrupt` escape (POSIX) | Compile children in their own process groups outlive `_exit` and the released lock. | FIXED (lane D: a child process-group registry is killed before the escape `_exit`) |
+| R15-S3 | Low | Sec | honesty-script awk | Two producers on one line, `for` loops, a `run-tests.sh` mention or a YAML alias can hide an unjudged per-file test. | FIXED (lane F: a cannot-tell verdict, exit 2, plus 4 selftest cases) |
+| R15-S4 | Low | Sec | `ccidentity.MemoKey` | A runtime probe that failed because of a stateDir (noexec `/tmp`) is memoised for other stateDirs (over-refusal). | FIXED (lane E: an unidentified answer is scoped to its stateDir) |
+| R15-S6 | Low | Sec | `tooltrees.wake` (Windows) | `SetEvent` can hit a handle that detach just closed. | FIXED (lane D: a `gWakers` count; detach waits for zero) |
+| R15-S7 | Low | Sec | `gitdiff.addStrandedGitlinks` | An empty `.git` dir makes `ls-files` list `./`, which would recurse forever; currently unreachable. | FIXED (lane B: a `./` listing adds the name and stops, and an empty `.git` directory refuses `--changed` with exit 3, as git itself does) |
+| R15-L1 | Medium | Live | `depgraph.diffReach` hkMember branches | Under a case fold, `Hit.watched` carries the diff's spelling rather than the member's, so `test_rfc9_a3bii_fold_selection:321` fails on every case-insensitive leg. Windows and macOS CI would go red. Selection itself is correct. | FIXED (lane B: `diffReach` spells `name` from the changed set and `watched` from the entry, via `storedSpelling`; `test_rfc9_a3bii_fold_selection` passes) |
+| R15-L2 | Low | Live | `crisol clean` interrupt | Same as R15-D5: GC and compaction run after the signal, and the warning reports a false cause. | FIXED (with R15-D5) |
+| R15-L3 | Low | Live | honesty `require_per_file` | Five Windows-running link/submodule cases are not pinned by name. | FIXED (lane B: the five cases are pinned by name in `require_per_file`) |
+| R15-L4 | Low | Live | `test_changed_symlink:179` | Without `--allow-empty` the case is flaky on Windows under load (git misses the junction repoint). | FIXED (lane B: the case commits with `--allow-empty`) |
+| R15-L5 | Low | Live | `test_source_index:545` | The depSpelling half of an assertion is dead on Windows (backslashes); CI passes through its 8.3 TEMP. | FIXED (lane F: separators are normalised; RED/GREEN on MSVC) |
+
+### Fix lanes (round 15)
+
+- Lane A (opus) handles #26 / R15-S1 in `runner` and `planner`. The recommended fix removes the previous stable binary before the new entry is persisted. It also closes the `decideExit` `closureRecorded` store path and adds a CHANGELOG entry.
+- Lane B (opus) handles R15-L1, R15-D1, R15-S7, R15-L4, R15-L3 and R15-D10, working in `gitdiff`, `depgraph`, the tests and the honesty blocks. The Lows are bundled because they sit in the same code, or because they could turn CI red.
+- The orchestrator fixed R15-D2 inline.
+- Still open (Low): R15-D3..D9, D11, S2..S6, L2, L5.
+- Outcome: both lanes finished and every Medium+ row is FIXED. The orchestrator wired `test_issue26_promotion_interrupt` into Windows CI (a per-file step plus a `require_per_file` block with a done line). The honesty selftest, the bucket inventory and the YAML check pass.
+
+### Out of scope, noted (round 15)
+- #24: a newly created global `nim.cfg` is not in the memo stamp until nim reports it (the R8-S1 class).
+- stateDir: `dirRole`'s exact `abs == stateDirAbs` comparison can miss a differently spelled Windows stateDir.
+- Tracked roots: a dep root nested in the project and configured in a different case on Windows is tagged to the dep root.
+- `require_in_log` matches `[OK] <name>` across files.
+
+## Round 16 re-review — 2026-09-27 (re-review of round 15; all uncommitted)
+
+Security, Design and Liveness reviewed the tree. No Critical or High, so no finding needed an adversarial verifier. Liveness found nothing: with the #26 fix reverted in a scratch copy, all three cases of `test_issue26_promotion_interrupt` go RED, and they pass on the real tree on Linux and in the Windows MSVC container. The honesty pins match what the test prints. Security traced every interleaving the brief named and found that the #26 fix holds.
+
+Drafts are in the scratchpad: `r16sec_draft.md`, `r16des_draft.md` and `r16live_draft.md`. The security reviewer's second finding was also numbered R16-D1; it is renumbered R16-S2 here.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R16-D1 | Medium | Des | `runner.finalizeSlot` | Only statement order inside one proc enforces the #26 rule that the previous binary is removed before the new entry is recorded. A reordering edit would reintroduce #26 silently, and no test drives the branch where the binary could not be removed. | FIXED (lane A: `runner.retireThenRecordClosure` owns the whole sequence, with a required `retireFn: RetireBinaryProc` seam (real: `retireStableBinary`); `finalizeSlot` just calls it. RED proven by inverting the order in a scratch copy) |
+| R16-S1 | Low | Sec | `runner.finalizeSlot` | No test covers the case where the previous stable binary is locked or running when it has to be removed. Code reading says it fails closed. | FIXED (lane A: new suite "issue #26 — the previous stable binary cannot be removed": `a failed retire drops the entry instead of persisting it` (every leg, seam) and `an open previous binary (windows): the real retire fails and the entry is dropped`; both pinned in the honesty block) |
+| R16-S2 | Low | Sec | `depgraph.recordClosure` doc | The doc still describes the pre-#26 premise (the stable binary already exists; the caller discards the binary it just promoted). | FIXED (lane A: the doc states the compile->run contract and names `retireThenRecordClosure` as the #26 guard) |
+| R16-D2 | Low | Des | `runner.promoteCompiledBinary`, `clean` | Nothing ever removes a `<stable>.promoting` file left by a kill between the copy and the rename. Only disk litter; nothing reads it. | FIXED (lane B: `crisol clean` prunes stale `.promoting` under the state lock) |
+
+### Fix lanes (round 16)
+- Lane A (opus): R16-D1, S1 and S2. It extracts one named retire-then-record operation with a removal seam, adds a test that forces the removal to fail, and rewrites the `recordClosure` doc.
+- The first sweep attempt was lost (the tool timeout orphaned the PowerShell jobs) and was stopped; the full sweep runs after lane A.
+
+### Out of scope, noted (round 16)
+- None new.
+
+## Round 17 re-review — 2026-09-27 (re-review of round 16; all uncommitted)
+
+Security, Design and Liveness reviewed the tree. No Critical or High. Security checked Nim 2.2.10's `removeFile`, `fileExists` and `moveFile` sources and traced every combination of retire, record, save and promote outcomes; each lands in one of the three sound states. Liveness observed on the real CLI that the old stable binary is gone before run 2's test finishes. It also confirmed that the Windows "open binary" test really blocks deletion.
+
+Drafts are in the scratchpad: `r17sec_draft.md`, `r17des_draft.md` and `r17live_draft.md`.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R17-D1 | Medium | Des | `runner.finalizeSlot`, `execute`, `ExecCtx` | `retireFn` is not a seam of `execute()`: `finalizeSlot` hardcodes `retireStableBinary`, so the retire-failure branch and its forwarding into `closureRecorded` are only tested by a direct call. | FIXED (`ExecCtx.retireFn` plus an `execute*` `retireFn` param, next to `recordClosureFn` (one allowlist row); `finalizeSlot` passes `ctx.retireFn`. New case `a failed retire through execute(): the entry is dropped and the next run recompiles the new source`, RED when `finalizeSlot` ignores the seam) |
+| R17-L1 | Medium | Live | `ci.yml` macos job, `assert-subset-honesty.sh` | `test_issue26_promotion_interrupt` never runs on the macOS leg: its sweep covers only unit and conformance, and the honesty block is Windows-only. | FIXED (macOS per-file step; the #26 honesty block is shared, with a per-leg `case` adding the open-binary name on Windows and SIGINT on macOS; simulated against real test output for both legs. Linux runs it through the default sweep. Not yet run on a real macOS machine) |
+| R17-D2 | Low | Des | `runner.RetireBinaryProc` | `""` as the success sentinel, unlike its sibling seam's `tuple[ok, error]`. | FIXED (`RetireBinaryProc` returns `tuple[ok, error]`) |
+| R17-D3 / R17-S2 | Low | Des + Sec | `retireThenRecordClosure` | The `prevStableBin == binCompiled` skip is unreachable from its only caller and compares bare strings. | FIXED (the skip and the `binCompiled` param are gone; the retire always runs) |
+| R17-D4 | Low | Des | `depgraph.invalidateEntry` doc | Names only `recordClosure`'s reason; the retire failure is now a second caller. | FIXED (the doc names both callers) |
+| R17-S1 | Low | Sec | `retireThenRecordClosure` | The retire-failure path discards `saveDepGraph`'s result, unlike `recordClosure`, which reports it. | FIXED (appends "; dependency graph could not be persisted") |
+
+**Sweep of the round-16 tree:** 73/73/73/72, which is 291 entrypoints with 290 passing (the only failure is `test_fallback`).
+
+### Fix lanes (round 17)
+- Lane A (opus): all six rows. The same code and CI wiring make them one change.
+
+### Out of scope, noted (round 17)
+- None new.
+
+## Round 18 re-review — 2026-09-27 (re-review of round 17; all uncommitted)
+
+Security, Design and Liveness reviewed the tree. No Critical or High.
+- Security found nothing. A retire cannot alias the fresh compile: the slot directory is `pepIdx`-suffixed. Compile-skip runs never reach the retire, retries never promote, and none of the #26 pins is a substring of another.
+- Liveness traced `crisol run` and `api.runTests` to `execute()`; both production call sites take the real `retireStableBinary`. It also proved that each leg's honesty pins accept only that leg's real output.
+
+Drafts are in the scratchpad: `r18sec_draft.md`, `r18des_draft.md` and `r18live_draft.md`.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R18-D1 | Medium | Des | `runner` closure-record warning (~2715), `decideExit.cacheDecisionIfNotStored`, `ConfigWarning` | When a closure is not recorded (a failed retire, or a failed extraction), the fact reaches the caller only through stderr. `cdmClosureUnrecorded` is stamped only when the cache is active and would store. A `--json` consumer or a library host with swallowed stderr cannot see it, against `ConfigWarning`'s own documented policy. | FIXED (`runner.closureUnrecordedWarning` makes a `ConfigWarning` with context "closure-record" at the `discardOnUnrecordedClosure` site; it goes into the new `ExecuteReport.warnings` and onto stderr from one message; `runcore` appends it to the run doc, which reaches `--json` `warnings`, `lastrun.json` and `RunReport.doc.warnings`. Schema shape unchanged. Tests: the execute() case and the extraction-failure cases in `test_closure_record_failure` assert it; new CLI case `a failed retire through the CLI with --json: the unrecorded closure is in the warnings array`. RED both at the producer and at the runcore hand-off) |
+| R18-L1 | Low | Live | `ci.yml` macos job | `test_issue25_symlink_retarget` says it runs on every platform, but no macOS step runs it. #25's POSIX realpath defect is proven only on Linux. | FIXED (macOS step "cache: a retargeted symlink on an import path recompiles (macOS)"; the #25 honesty block moved to the shared section; simulated for both legs) |
+| R18-D2 | Low (FIXED as R19-D3) | Lane A | `runner` warning site | An unrecorded closure whose final attempt ended in `oSpawnError` is silent on both channels: the warning is raised only where the binary is discarded. Soundness is unaffected, since `test_issue26` covers the spawn-failure recompile. Reported by the fix lane. | open |
+
+**Sweep of the round-17 tree:** 73/73/73/72, which is 291 entrypoints with 290 passing (only `test_fallback`). `assert-defaulted-params` passed with 210 records. `source-soundness-gate` passed. Both selftests passed.
+
+### Fix lanes (round 18)
+- Lane A (opus): R18-D1 and R18-L1.
+
+### Decisions
+- R18-D1 is not a fork. A `ConfigWarning` (a new `context`) rides the existing `warnings` array, so the `--json` schema does not change, and the open `toolchainUnidentified` question is untouched.
+
+### Out of scope, noted (round 18)
+- None new.
+
+## Round 19 re-review — 2026-09-27 (re-review of round 18; all uncommitted)
+
+Security, Design and Liveness reviewed the tree. No Critical or High.
+- Security found nothing. Warnings reach JSON through `newJString` only. `loadLastRun` never reads `warnings`. A directory at `stableBinPath` fails safely, and paths are confined to the state dir.
+- Liveness confirmed on the real CLI (`--json` stdout and `lastrun.json`) and in a bare `api.runTests` host that the warning is there. The #25 macOS wiring and both legs' drift checks are also live.
+
+Drafts are in the scratchpad: `r19sec_draft.md`, `r19des_draft.md` and `r19live_draft.md`.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R19-D3 (+ R18-D2) | Medium | Des | `runner` warning site vs `finalizeSlot` | The closure-record warning is raised only where `decideExit` discards on promote, not where the fact becomes true (after `retireThenRecordClosure` in `finalizeSlot`). An interrupted, killed, crashed or `oSpawnError` run is silent. | FIXED (raised in `finalizeSlot` right after `retireThenRecordClosure` fails, before the run spawns; deduped per planned entrypoint and context; new test `a failed retire, then a run-phase spawn failure: the unrecorded closure is still reported`) |
+| R19-D1 / R19-L1 | Medium | Des + Live | `runner.promoteCompiledBinary` (~1380-1425) and its two call sites | A promotion failure is a bare `stderr.write` with the bool discarded, so it never reaches `--json`. When a blocked stable path fails the retire, the promotion then fails too, and stderr prints TWO warnings (reproduced on Linux and MSVC). The second one says "the previous binary was discarded", which is false. The round-18 CHANGELOG claims the warning is printed once. | FIXED (`decideExit`: `promoteBinary` requires a recorded closure and `discardOnUnrecordedClosure` an unrecorded one, so they are exclusive; `promoteCompiledBinary` returns `Option[ConfigWarning]` (context "promote-binary"), raised at both call sites; one `raiseWarning` helper writes stderr and appends together. Tests: `a blocked stable path through the CLI: one warning line on stderr and one structured entry, no promotion warning`, `a promotion failure with a recorded closure: one promote-binary warning`, unit `promote and discard are mutually exclusive across every outcome (R19-D1)`; CHANGELOG updated) |
+| R19-D2 | Low | Des | `types.ConfigWarning` field docs | The field comments still describe only the config-parse producer and contradict the producer list above them. | FIXED (field docs now describe every producer) |
+
+**Sweep of the round-18 tree:** 73/73/73/72, which is 291 entrypoints with 290 passing (only `test_fallback`). The gates passed, with 210 defaulted-params records, and both selftests passed.
+
+### Fix lanes (round 19)
+- Lane A (opus): R19-D3 (with R18-D2), R19-D1/L1 and R19-D2. It raises the warning in `finalizeSlot`, makes promote and discard exclusive, adds a structured promote-binary warning, and routes both producers through one helper that writes stderr and appends the warning.
+
+### Out of scope, noted (round 19)
+- The stderr text of warnings and relayed test output is not escaped. This is tree-wide and pre-existing.
+
+## Round 20 re-review — 2026-09-27 (re-review of round 19; all uncommitted)
+
+Security, Design and Liveness reviewed the tree. No Critical or High.
+- Liveness found nothing. On the real CLI it provoked a SIGINT after a failed retire and got one warning, carried into the interrupted run's `--json`. It also provoked a real promotion failure and got one promote-binary warning, in `--json` and `lastrun.json`.
+- On the macOS "exactly one warning line" risk, Liveness found that the only candidate is the `toolchainwarn` line, which fires only for `tvUnidentified`. That does not happen on a normal macOS runner.
+- Security reconfirmed #26's three-state invariant on every exit path, and that the store gate still refuses an unrecorded closure.
+
+**Sweep of the round-19 tree:** 73/73/73/72, which is 291 entrypoints with 290 passing (only `test_fallback`). The gates passed, with 210 defaulted-params records, and both selftests passed.
+
+Drafts are in the scratchpad: `r20sec_draft.md`, `r20des_draft.md` and `r20live_draft.md`.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R20-S1 | Medium | Sec | `runner.raiseWarning` / `RunWarnings`, `finalizeSlot` | With retries, if attempt N fails to record and a later attempt records and promotes, the stale closure-record warning ("will not be kept") is still reported on stderr and in `--json`. It contradicts the run's outcome; soundness is unaffected. Reproduced. | FIXED (`RunWarnings` holds a closure-record warning per planned index while another attempt is possible; a later record withdraws it; it is settled where the outcome becomes final (cache hit, interrupted-final, normal final, `finalizeSpawnFailure`) and swept in `execute`'s `finally` (normal end, drain, fail-fast before a retry, exception: stderr only). SIGKILL is documented as the one case that cannot report. New suite "issue #26 — an unrecorded closure across the retries of one run (R20-S1)", four cases, pinned on both legs; RED by four mutants) |
+| R20-D1 | Medium | Des | `runner.ExitDecision` / `decideExit` | The exclusive `promoteBinary` / `discardOnUnrecordedClosure` bools are held only by the function body, and a 96-case test defends them. A single enum would make the illegal state unrepresentable. | FIXED (`ExitDecision.binary: BinaryDisposition` = `bdNoBinary | bdPromote | bdDiscardUnrecorded`; the promote block is a `case`; the unit test was renamed and checks the exact disposition) |
+| R20-D2 | Low | Des | `closureUnrecordedWarning` `retriesLeft` | The name overstates what is known (another attempt is structurally possible, not certain). | FIXED (`retriesLeft` and the hedge are removed) |
+
+### Fix lanes (round 20)
+- Lane A (opus): all three rows. The fix introduces a `BinaryDisposition` enum. The closure-record warning is held as pending while a retry is possible, cleared by a later record, and flushed on every exit path of `execute`.
+
+### Out of scope, noted (round 20)
+- None new.
+
+## Round 21 re-review — 2026-09-27 (re-review of round 20; all uncommitted) — resumed and fixed
+
+**Paused on the subagent usage limit** (HTTP 429, "weekly limit, resets Oct 1, 3pm America/Mexico_City"). Security and Design finished. Liveness was cut off mid-run, and its partial draft `r21live_draft.md` is in the scratchpad.
+
+**Sweep of the round-20 tree:** 73/73/73/72, which is 291 entrypoints with 290 passing (only `test_fallback`). The gates passed, with 210 defaulted-params records, and both selftests passed.
+
+What the partial Liveness run established:
+- The production `execute` call passes no `retireFn` override, so the real retire is used.
+- On the real CLI, "every attempt fails to record" (`retries 1`, a directory at the stable path) gives exactly 1 stderr line and 1 `--json` entry.
+- On the real CLI, SIGINT during a retry's run phase gives exit 130, `interrupted: true`, and exactly 1 line and 1 entry.
+- The four R20-S1 names are pinned on both legs.
+- The timing-dependent fail-fast case passed 10/10 on Linux (no contention) and 8/8 on Windows MSVC. The Linux run under CPU contention never finished.
+- A "fails once, then records" CLI provocation is not feasible without root; it rests on the seam test.
+
+Security confirmed that the disposition refactor matches round 19 exactly. `isInFlight` keeps one live slot per planned index, so a held warning cannot be withdrawn by the wrong slot.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R21-S1 | Medium | Sec | `runner.raiseWarning` (~949), swept from `execute`'s `finally` | The `stderr.write` was unguarded, so a broken stderr during the `finally` sweep would replace an exception already unwinding (for example from `onResult`). | FIXED (orchestrator inline: the write and flush are in one try/except; the structured copy is kept. The #26 file passes 13/13 and `test_closure_record_failure` 2/2 on Linux; `source-soundness-gate` and `assert-defaulted-params` OK. Regression tests added by lane A: suite "issue #26 — reporting a warning on a broken stderr (R21-S1)", two cases, using `dup2` of a read-only fd onto fd 2; RED on Linux. On Windows the MSVC CRT never raises on a failed stderr write, so the tests pass there vacuously) |
+| R21-D1 | Medium | Des | `runner`: settle sites ~1207, 2722, 2785, 2863, 3055; `finalized[idx]=true` at ~2580/2720/2742/2843/3057 | "Settle exactly when finalized" is a convention across four finalizing sites, 20 to 43 lines apart at two of them. A new finalize path without a settle regresses early reporting silently, because the `finally` sweep hides it. | FIXED (lane A: `template markFinal(pepIdx)` sets `finalized`, does `inc done` and settles, at all five finalize sites; the interrupted final now also does `inc done`, which is unobservable) |
+| R21-D2 | Low-Med (treat as Medium) | Des | `RunWarnings` (~913-973) vs `finalizeSlot` (~1205) | `hold`/`withdraw`/`settle` are raw table operations. The caller computes finality (`attempt < retries + 1`), duplicating `decideExit.retry`'s reasoning without saying so. | FIXED (lane A: `noteClosureOutcome(rw, pepIdx, unrecorded: Option[ConfigWarning], final)`; `holdWarning`/`withdrawWarning` deleted; `func attemptsLeft(attempt, maxAttempts)` is shared with `decideExit`; `func maxAttempts(pep)` replaces three copies) |
+| R21-L1 | Low | Live | `ci.yml` macOS #26 step comment | "six [OK] lines", although the script requires 13. | FIXED (orchestrator: the count is dropped from the comment; YAML OK) |
+
+Lane A noted for round 22 (pre-existing): an exception from `retireFn`/`recordClosureFn` inside `finalizeSlot` (a live slot, child already reaped) makes `teardownDiscard` fail with `AssertionDefect: ChildId ... unknown or already consumed` (`posixcore.nim:1613`), which masks the original exception.
+
+### Out of scope, noted (round 21)
+- None new.
+
+## Round 22 re-review — 2026-09-27 (re-review of round 21; all uncommitted)
+
+**Sweep of the round-21 tree:** 73/73/73/72, which is 291 entrypoints with 290 passing (only `test_fallback`). The gates passed, with 210 defaulted-params records, and both selftests passed.
+
+**Liveness: no findings.**
+- It finished round 21's cut-off contention check: the #26 file ran 15 times on Linux with every core pinned by busy loops, with 0/15 failures.
+- On the real CLI with `retries 1`, "every attempt fails to record" gives exactly 1 stderr line and 1 `--json` entry.
+- SIGINT during a retry's run phase gives exit 130, `interrupted: true`, and exactly 1 line and 1 entry. The summary counts are consistent, so the `inc done` added on the interrupted path is unobservable.
+- `markFinal` is at all five finalize sites.
+- The #26 file passes 15/15 on both Linux and Windows MSVC, and both R21-S1 names are pinned on both legs.
+
+**Security** found round 21's change clean.
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R22-D1 | Medium | Des (Sec R22-S1, Low, merged) | `runner`: compile child reaped (~1120), then `finalizeSlot` and `transitionToRun` | Between the compile child's reap and `transitionToRun`, the slot stays `ssLive` with a consumed ChildId. That contradicts `SlotState`'s invariant. Any raise in that window (a `retireFn` or `recordClosureFn` exception, or a Defect) makes `teardownDiscard` call `requestStop`, which fails the `requireLive` doAssert (`posixcore.nim:1610-1613`, and `windows.nim:1436`). That failure masks the real exception. Security found no CatchableError path in production, because every call in the window is documented as never raising. | FIXED (lane A: `finalizeSlot` idles the slot once right after `sv.reap`, and `enterLive` is the only place that sets it live. The six per-branch idle lines and `claimSlot`'s live line are gone. An exception in the window propagates unmasked, because a raise there is a crisol bug and must not be reported as a test failure. New suite of two cases in the #26 file, raising from `retireFn` and from `recordClosureFn`. RED on Linux with the AssertionDefect, GREEN 18/18 on Linux and on Windows MSVC. Both names pinned in the shared #26 block) |
+| R22-D2 | Medium | Des | `tests/support/capture.nim:74-79`; #26 test comments (~51-54, suite ~794-869); `ci.yml` Windows #26 step comment (~842-853) | The `withStderrUnwritable` doc claims EBADF under both CRTs. On Windows the MSVC CRT never raises, so the R21-S1 suite passes there vacuously, and none of these places says so. | FIXED (lane A confirmed in the MSVC container that the write returns normally. The docs now state POSIX-only in the `capture.nim` doc, the #26 file header and the R21-S1 suite, the `ci.yml` Windows step and the honesty-script comment) |
+
+### Out of scope, noted (round 22)
+- None new.
+
+## Round 23 re-review — 2026-09-27 (re-review of round 22; all uncommitted) — FLOOR
+
+**Sweep of the round-22 tree:** 73/73/73/72, which is 291 entrypoints with 290 passing (only `test_fallback`). The gates passed, with 210 defaulted-params records (84/84 src files compiled), and both selftests passed.
+
+**Security: no findings.**
+- `enterLive` runs only after a spawn succeeds.
+- The spawn-failure path in `transitionToRun` leaves the slot idle and still finalizes the entrypoint.
+- `teardownDiscard` and the drain paths act only on slots that are really live.
+- Both process backends consume a ChildId exactly once.
+- Warnings are still reported exactly once.
+
+**Liveness: no findings.** On the real CLI on Linux:
+- SIGINT during a compile or during a run exits 130 with no orphan processes, and the run case is reported as `killed`.
+- A `retries 1` retry dispatches its second attempt.
+- "Every attempt fails to record" gives exactly 1 stderr line and 1 `--json` entry.
+
+The #26 file prints every required `[OK]` line on Linux (18) and Windows MSVC (17). The R22-D1 cases are not vacuous on Windows. The file is wired on all three legs.
+
+**Design: one Low.**
+
+### Findings
+
+| # | Sev | Source | Where | Issue | Status |
+|---|-----|--------|-------|-------|--------|
+| R23-D1 | Low | Des | `runner.nim:427-429` (`SlotState` doc) | The doc says "both edges have one owner each", then names a second `ssIdle` setter, `teardownDiscard`. Both are correct and they are on disjoint paths, but the sentence reads as contradicting itself. | FIXED (Lows pass 3, lane A: the doc is reworded) |
+
+### Out of scope, noted (round 23)
+- None new.
+
+**The loop has reached the floor:** 0 Critical, High or Medium. Remaining Lows: R23-D1; R15-D3..D9, D11, S2..S6, L2, L5; R16-D2; R13-L5 (deferred).
+
+## Lows pass 3 — 2026-09-27 (after the round-23 floor; all uncommitted)
+
+Corey: "fix lows and we're finally done". Seven lanes ran on disjoint files (A-G). Every open Low is FIXED except R13-L5, which stays deferred with fresh measurements (see its row). The row statuses are in the tables above.
+
+**Orchestrator fixes:**
+- R15-D3: lane A's whole-log read for the relay now streams the file and keeps only candidate lines, so memory is bounded by the warnings and not by the log.
+- Three cross-lane breaks surfaced by the sweep:
+  - `ToolTree.outcome` was renamed `fate`. `test_rfc7_legacy_names_gone` forbids `.outcome` outside the ledger.
+  - `test_tooltrees` (B2) and `test_r15_wake_detach` (B3a) were bucketed in `test_rfc9_bucket_inventory`; the frozen total is now 94.
+  - `test_ccidentity`'s `cppProbe` uses populated roots, after R15-D6.
+
+**Sweep:** 73/73/73/73, which is 292 entrypoints with 291 passing (only `test_fallback`). The four gates are green.
+
+**Windows MSVC:** these pass: `test_ccidentity`, `test_tooltrees`, `test_r15_wake_detach`, `test_c0_clean_stores`, `test_source_index` and the #26 file. The lanes also verified their own files on MSVC.
+
+**CHANGELOG:** one Unreleased entry for this pass.
+
 ## Open for Corey
 
-Five items. R2-7 came off this list in round 3 and R3-8 came off it in round 5;
-both are recorded under "Resolved, previously escalated". R4-11 is new in round 4
+- **R11-L2 (Critical, verified, pre-existing at `7da32d3`, outside #21-23;
+  new in round 11).** A repointed tracked directory symlink that tests import
+  Nim modules through serves a stale cached PASS on a plain `crisol run`: the
+  closure records the realpath (`closure.resolveMangledAll` `@m`), the link is
+  not key material, and `planner.decideCompile` re-hashes only recorded
+  members. Recommendation: file as its own issue (as #24 was): fold every
+  symlink crossed on a recorded closure path, link and target, into the
+  closure and the key. **Filed as #25 on 2026-09-26 at Corey's request**
+  ("if it's an easy enough fix do it now"): lane E assesses first and fixes
+  only if a sound fix fits in 2-3 modules without a fork. **FIXED in the
+  working tree (uncommitted); close #25 when it lands.** The in-scope
+  `--changed` half (R11-L1) is fixed in round 11 by refusing.
+
+Four earlier items. R2-7 came off this list in round 3, R3-8 in round 5 and R7-S7 in
+the Lows pass (2026-09-26); all three are recorded under "Resolved, previously
+escalated". R4-11 is new in round 4
 and is the only one that is not about this workstream at all. R7-S6 and R7-S7
 are new in round 7. R8-S1 is new in round 8 and is merged into the R7-S6 item,
 so the count stays five. That item is first because it holds the only two
-Criticals this loop has found.
+Criticals this loop has found. Round 9 added no item: every row at Medium or
+above was fixed, and its one behaviour change put to you (`toolchainUnidentified`
+instead of `notEligible` in `--json` on an unsound host) has had no reply, so it stands.
 
 - **R7-S6 + R8-S1: filed as #24 on 2026-09-25** (both
   **Critical**, both pre-existing at `630ecc6`; R7-S6 was SPLIT OUT as a
@@ -3950,23 +5244,24 @@ Criticals this loop has found.
     8: env scrub plus hash, hash every toolchain-reported input with no
     tracked-root filter, one `CompileInputs` record, linker-input tracing
     (required for C++), and optional rebuild verification. It also lists the
-    C++ route requirements. The issue should also say that R7-S1's blanket
-    refusal of a failing `cl` is a stopgap to remove once `CL` is in the key.
-  - **Before filing:** check whether `--backend:cpp` in an entrypoint's flags
-    gives a C++ build through `compiledriver.nimCompileArgs`, and copy the
-    proof scripts out of the temporary scratchpad (`r7-s6/poc2.sh`,
-    `r8-sec/poc_cfg.sh`, `r8-sec/poc_cfg_head.sh`).
+    C++ route requirements. ~~The issue should also say that R7-S1's blanket
+    refusal of a failing `cl` is a stopgap to remove once `CL` is in the key.~~
+    UPDATED IN ROUND 9: the stopgap is gone already. R9-D1's `/EP` probe
+    identifies `cl` under any `CL`, and the values of `CL` and `_CL_` are
+    folded into the cc half. #24 keeps the general environment scrub
+    (`CPATH`, `INCLUDE`, `LIB`, …).
+  - ~~**Before filing:** check `--backend:cpp` and copy the proof scripts out
+    of the scratchpad.~~ Done: the check ran before filing (`--backend:cpp`
+    does give a real C++ build; it exposed the `.nim.c` entry-unit basename
+    and the C-only identity, both in #24), and #24 carries the proofs.
+  - **Round 9 notes for #24**, from the identity-redesign lane (recorded under
+    "R9-D1: the identity redesign"; not confirmed added to the issue): per-group
+    `--cc` and per-directory `nim.cfg`/`config.nims` are not seen by the stdin
+    driver probe; `CPATH` and the rest of the GNU compile environment are not in
+    the key; MSVC `passC` reaches the key only through twelve named macros; the
+    hashed MSVC driver is `vccexe`, not `cl.exe`; the fingerprint is probed once
+    per process.
   - Not fixed in this loop, by that decision.
-
-- **R7-S7** (new, round 7 — Low, DEFERRED, needs your eye).
-  `types.nim`: `TrustConfig.policy` defaults to `"none"`, the non-verifying
-  policy, on a trust-gate input. Safe today: `config.nim` sets it explicitly,
-  `api.nim:1799` builds a config with no remotes, and `configuredCache` rejects
-  unsigned `s3://` and `http://`. But a `file://` or `https://` remote in a
-  `TrustConfig` built in code without `policy` would be read unverified. The
-  candidate remedy is R3-7's: no default plus a `{.deprecated.}` companion.
-  Since round 8 (R8-D7), the census record for this field is marked
-  `PENDING COREY (R7-S7)` rather than filed in a bucket.
 
 - **R4-11** (new, round 4 — a scope decision, not a technical fork)
   `tests/unit/test_api.nim:2926` is an intermittent failure, measured at one in
@@ -4008,6 +5303,12 @@ Criticals this loop has found.
   difference, and it is why one was safe to land blind and the other is not.)
 
 ## Resolved, previously escalated
+
+- **R7-S7 — `TrustConfig.policy` defaulted to the non-verifying `"none"`.**
+  Resolved in the Lows pass (2026-09-26), when Corey asked for every deferred
+  Low to be fixed: the field has no default, and `configuredCache` rejects an
+  empty policy when a remote tier is configured. Fixtures that use remotes set
+  it explicitly.
 
 - **R3-8 — "remove `decideCompile`'s redundant version parameters?"** — escalated
   at the end of round 3 as a genuine fork: the diagnosis was agreed (the two

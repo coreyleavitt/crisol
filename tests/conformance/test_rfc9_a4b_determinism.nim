@@ -53,6 +53,7 @@ import crisol/paths
 import crisol/depgraph
 import crisol/runner
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 proc uniqueTmpDir(tag: string): string =
   result = getTempDir() / ("crisol_a4b_determinism_" & tag & "_" & $getCurrentProcessId())
@@ -124,13 +125,13 @@ proc runDeterminismBody(root: string) =
 
   # --- COLD: fresh graph, both entrypoints never built; a REAL compile ---
   var graph = initDepGraph("")
-  let p = plan(cfg, @[epLower, epUpper], graph, "", false)
+  let p = plan(cfg, @[epLower, epUpper], graph, false)
   check p.entrypoints.len == 2
   for pep in p.entrypoints:
     check pep.edecision == edNeverBuilt
 
   let results = execute(p, config = cfg, graph = graph, nimVersion = "",
-                        showProgress = false).results
+                        showProgress = false, toolchain = unprobedToolchain()).results
   check results.len == 2
   for r in results:
     check r.outcome == oPassed

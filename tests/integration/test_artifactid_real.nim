@@ -26,16 +26,38 @@
 import std/[json, os, strutils, unittest]
 import crisol/artifactid
 import crisol/paths   # CR10: ccIncludeClosure's `roots` no longer defaults --
-                       # this suite deliberately passes an empty TrackedRoots()
-                       # (it exercises the real cc -M probe/parse/hash path, not
-                       # case resolution, which tests/unit/test_artifactid.nim's
-                       # CR3 suite already covers with injected roots).
+                       # this suite passes a REAL, populated TrackedRoots over
+                       # this project's own root. R15-D6: `probeReportedHeaders`
+                       # now refuses a reported header against an unpopulated
+                       # TrackedRoots (`hpfRootsUnpopulated`) rather than hash
+                       # it unresolved, so an empty `TrackedRoots()` here would
+                       # refuse the very fixture.h this suite exists to prove
+                       # is in the closure. This is still not about CASE
+                       # resolution -- fixture.h's reported and on-disk
+                       # spellings already agree on every host this runs on --
+                       # that residual is tests/unit/test_artifactid.nim's CR3
+                       # suite's, with injected roots and a mis-cased fixture.
 
 let projectRoot = currentSourcePath().parentDir.parentDir.parentDir
   # test is at tests/integration/; go up 2 -> project root (mirrors
   # test_compiledriver_real.nim's idiom).
 let fixtureDir = projectRoot / "tests" / "fixtures" / "golden_reuse"
 let manifestPath = fixtureDir / "generated" / "ep_a" / "ep_a.json"
+let realRoots = initTrackedRoots(projectRoot, @[], "")
+  # The one production call site (`measureworker.recordArtifactRows`) always
+  # passes the run's real roots too -- mirrored here rather than the
+  # unpopulated zero value (R15-D6).
+
+proc realDriver(ccCmd: string): DriverResolver =
+  ## The fixture's driver as this host's PATH finds it: these tests are
+  ## about the real probe's report, not about driver resolution (R10-S6).
+  # Not followed: nim runs the link's own name (`/usr/bin/gcc`, not the
+  # `gcc-16` it points at).
+  discard ccCmd
+  result = proc(driver: string): DriverLocation =
+    let exe = findExe(driver, followSymlinks = false)
+    if exe.len > 0: DriverLocation(found: true, path: exe)
+    else: DriverLocation(found: false, why: "not on PATH")
 
 proc fixtureCcCmd(): string =
   ## Pull the COMMITTED, real ccCmd for `fixture.c` straight out of the
@@ -53,7 +75,7 @@ suite "ccIncludeClosure — real cc -M against the golden fixture's committed fi
     let ccCmd = fixtureCcCmd()
     check ccCmd.len > 0
 
-    let res = ccIncludeClosure(ccCmd, roots = TrackedRoots())   # default run/readFile seams: real cc -M, real file reads
+    let res = ccIncludeClosure(ccCmd, roots = realRoots, driver = realDriver(ccCmd))   # default run/readFile seams: real cc -M, real file reads
     check res.ok
     check res.contentHash.len > 0
 
@@ -66,8 +88,8 @@ suite "ccIncludeClosure — real cc -M against the golden fixture's committed fi
 
   test "re-running the same invocation is deterministic (same headers, same content hash)":
     let ccCmd = fixtureCcCmd()
-    let res1 = ccIncludeClosure(ccCmd, roots = TrackedRoots())
-    let res2 = ccIncludeClosure(ccCmd, roots = TrackedRoots())
+    let res1 = ccIncludeClosure(ccCmd, roots = realRoots, driver = realDriver(ccCmd))
+    let res2 = ccIncludeClosure(ccCmd, roots = realRoots, driver = realDriver(ccCmd))
     check res1.ok and res2.ok
     check res1.headers.len == res2.headers.len
     check res1.contentHash == res2.contentHash

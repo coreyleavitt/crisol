@@ -28,7 +28,7 @@ import crisol/depgraph   # re-uses fnv1a64, toHex16, fnvOffset64; never reimplem
 import crisol/paths
 from crisol/process/types as ptypes import nil  ## qualified access to the
   ## §1 Limits/LimitKind shape (rfc-0007 A2a-iii) — house convention (see
-  ## runner.nim/jsonout.nim/api.nim); NOT re-exported from crisol/types.
+  ## runner.nim/jsonout.nim/runcore.nim); NOT re-exported from crisol/types.
 
 # ---------------------------------------------------------------------------
 # Sentinel for an empty fixture glob set (no files → deterministic constant).
@@ -40,6 +40,16 @@ const EmptyFixtureSentinel* = "crisol:empty-fixtures:v1"
   ## A test group with no fixtures glob set gets this deterministic constant
   ## rather than a hash of zero bytes, so "no fixtures" and "fixtures of empty
   ## content" cannot collide.
+
+const SoundnessKeyVersion* = "crisol:soundness-key:v2"
+  ## Seeds the `soundnessKey` chain, so a change in what a component MEANS
+  ## re-partitions every key even where the component's string could repeat.
+  ##
+  ## v2 (issue #23): component 4 (`ccVersion`) is the identity of
+  ## the C compiler Nim is CONFIGURED to use, probed through its preprocessor
+  ## (`ccidentity`); v1 read the version banner of whichever compiler
+  ## answered on PATH. A v1 key never names the toolchain that compiled its
+  ## result, so no v1 entry may be served to a v2 lookup.
 
 # ---------------------------------------------------------------------------
 # KeyInputs — the single record bundling all 10 soundness inputs.
@@ -59,7 +69,7 @@ type KeyInputs* = object
   nimVersion*:         string
     ## Nim compiler version string (e.g. "2.2.10").
   ccVersion*:          string
-    ## C compiler + libc fingerprint from ccprobe (injected; not called here).
+    ## `$ccidentity.CcFingerprint` (injected; not probed here).
   fixtureHash*:        string
     ## Content-hash of per-group fixtures glob set.
     ## Empty string ⇒ EmptyFixtureSentinel is substituted.
@@ -202,8 +212,10 @@ proc soundnessKey*(inp: KeyInputs): SoundnessKey =
   # captured within the component value before the per-component wrapping.
   let argvStr = inp.argv.join("\x00")
 
-  # Seed from FNV offset (not zero) for a non-trivial empty-component case.
+  # Seed from FNV offset (not zero) for a non-trivial empty-component case,
+  # then the derivation version.
   var running: uint64 = fnvOffset64   # re-use exported const from depgraph
+  running = chainComponent(running, SoundnessKeyVersion)
 
   # 1. closureContentHash
   running = chainComponent(running, inp.closureContentHash)

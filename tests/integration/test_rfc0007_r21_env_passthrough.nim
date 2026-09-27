@@ -7,8 +7,8 @@
 ##
 ## FIX: RunOptions.envPassthroughs + Config.envPassthroughs (KDL repeatable
 ## `env-passthrough "NAME"`) + CLI `--env-passthrough NAME` (repeatable),
-## merged as a deduplicated UNION (api.envPassthroughsFrom) and threaded to
-## `resolveSandbox`'s `passthroughs` param at its one call site in api.nim's
+## merged as a deduplicated UNION (runcore.envPassthroughsFrom) and threaded to
+## `resolveSandbox`'s `passthroughs` param at its one call site in runcore.nim's
 ## `runTestsWith` (grep `passthroughs = cfg.envPassthroughs,  # r21`).
 ##
 ## SOUNDNESS: a passed-through variable's live host VALUE already enters
@@ -39,6 +39,7 @@
 import std/[os, strutils, times, unittest]
 import crisol            # imports runMain
 import crisol/[api, types, sandbox]
+import crisol/runcore  # envPassthroughsFrom: a Config projection, internal (not crisol/api)
 import ../support/capture
 
 const ProbeVar = "CRISOL_R21_SENTINEL"

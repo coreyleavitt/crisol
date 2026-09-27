@@ -16,7 +16,7 @@
 ## SYNCHRONOUS half a live finalize calls (tier 0 / "l1" only — the caller
 ## queues the same entry for tiers 1..N and flushes that queue once, at the
 ## end-of-run join point, via the unchanged `drainPending` — see
-## `cachedispatch.realSeams.store`/`api.runTestsWith`).
+## `cachedispatch.realSeams.store`/`runcore.runTestsWith`).
 ##
 ## `TieredCache` stays a PURE lookup engine — no `TelemetrySink` field (that
 ## lives on `CacheRuntime`, Stage A2b): telemetry emission is a translation
@@ -367,10 +367,10 @@ proc drainPending*(tc: var TieredCache; pending: openArray[StoredEntry];
   ## remote warmth lost this way is the SAME acceptable loss `budget`
   ## already documents, just triggered by a shutdown instead of a budget
   ## exhaustion. The production caller wires `proc(): bool =
-  ## signals.shutdownRequested().isSome` (api.nim) -- the SAME global,
+  ## signals.shutdownRequested().isSome` (runcore.nim) -- the SAME
   ## level-triggered query the plan-time prefetch/consult loops already
-  ## use, so a shutdown observed by ANY installSignals=true Supervisor in
-  ## the process (not just this run's own) stops the drain too.
+  ## use: the signal crisol's handler observed in the run's open interrupt
+  ## scope (R13-D2: never one left over from an earlier run).
   result = @[]
   var attempted = 0
   for entry in pending:

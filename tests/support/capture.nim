@@ -69,6 +69,38 @@ proc captureStderrToFile*(path: string; body: proc()) =
 proc uniqueTmp(tag: string): string =
   getTempDir() / ("crisol_cap_" & tag & "_" & $getCurrentProcessId() & ".txt")
 
+proc cClearerr(f: File) {.importc: "clearerr", header: "<stdio.h>".}
+
+proc withStderrUnwritable*(body: proc()) =
+  ## Run `body` with fd 2 pointing at a file opened READ-ONLY, so every write
+  ## to stderr fails, then restore fd 2 and clear the stream's sticky error
+  ## flag. For code that must not raise when its stderr is broken.
+  ##
+  ## R22-D2: only POSIX libcs report that failure. There the write gets
+  ## EBADF and, `stderr` being unbuffered, Nim raises `IOError` on the write
+  ## itself. The MSVC CRT reports nothing: the write is dropped and Nim's
+  ## `stderr.write` returns normally (checked with `--cc:vcc`). So under
+  ## MSVC this helper provokes no exception, and a test built on it passes
+  ## whether or not the code under test guards its stderr writes; it is
+  ## load-bearing on POSIX only.
+  let p = uniqueTmp("ro")
+  writeFile(p, "")
+  let f = open(p, fmRead)
+  flushFile(stderr)
+  let saved = cDup(2.cint)
+  if saved < 0:
+    close(f)
+    raise newException(OSError, "dup(2) failed")
+  discard cDup2(cFileno(f), 2.cint)
+  try:
+    body()
+  finally:
+    discard cDup2(saved, 2.cint)
+    discard cClose(saved)
+    cClearerr(stderr)
+    close(f)
+    try: removeFile(p) except CatchableError: discard
+
 proc captureStdout*(body: proc()): string =
   ## Run `body`, return everything it wrote to stdout.
   let p = uniqueTmp("out")

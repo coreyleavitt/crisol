@@ -52,8 +52,8 @@ suite "runMeasured — orchestration with injected synthetic procs":
     var driver: CompileDriver
     driver.compileOnly = proc(entrypoint: string; flags: seq[string];
                               nimcacheDir, outputBinPath: string):
-                                tuple[ok: bool; output: string] =
-      (ok: true, output: "")
+                                RunResult =
+      ran(0, "", "")
     driver.runCc = proc(units: seq[CompileUnit]): RunCcResult =
       check units.len == 2
       check units[0].basename == "@pfoo.nim.c"
@@ -65,9 +65,9 @@ suite "runMeasured — orchestration with injected synthetic procs":
           CcUnitResult(basename: "@pfoo.nim.c", ok: true, ccTimeUs: 5000),
           CcUnitResult(basename: "@mmain.nim.c", ok: true, ccTimeUs: 9000),
         ])
-    driver.link = proc(linkCmd: string): tuple[ok: bool; output: string] =
+    driver.link = proc(linkCmd: string): RunResult =
       check linkCmd == "true"
-      (ok: true, output: "")
+      ran(0, "", "")
 
     let spans = runMeasured(driver, "/proj/ep.nim", @[], nimcacheDir, nimcacheDir / "ep")
 
@@ -84,14 +84,14 @@ suite "runMeasured — orchestration with injected synthetic procs":
     var driver: CompileDriver
     driver.compileOnly = proc(entrypoint: string; flags: seq[string];
                               nimcacheDir, outputBinPath: string):
-                                tuple[ok: bool; output: string] =
-      (ok: false, output: "boom: syntax error")
+                                RunResult =
+      ran(1, "boom: syntax error", "")
     driver.runCc = proc(units: seq[CompileUnit]): RunCcResult =
       ccCalled = true
       RunCcResult(ok: true)
-    driver.link = proc(linkCmd: string): tuple[ok: bool; output: string] =
+    driver.link = proc(linkCmd: string): RunResult =
       linkCalled = true
-      (ok: true, output: "")
+      ran(0, "", "")
 
     # No manifest file written — compileOnly fails before it would ever be read.
     let spans = runMeasured(driver, "/proj/ep.nim", @[], tmpRoot / "co_fail", tmpRoot / "co_fail" / "ep")
@@ -111,8 +111,8 @@ suite "runMeasured — orchestration with injected synthetic procs":
     var driver: CompileDriver
     driver.compileOnly = proc(entrypoint: string; flags: seq[string];
                               nimcacheDir, outputBinPath: string):
-                                tuple[ok: bool; output: string] =
-      (ok: true, output: "")
+                                RunResult =
+      ran(0, "", "")
     driver.runCc = proc(units: seq[CompileUnit]): RunCcResult =
       RunCcResult(
         ok: false,
@@ -121,9 +121,9 @@ suite "runMeasured — orchestration with injected synthetic procs":
           CcUnitResult(basename: "@pfoo.nim.c", ok: true, ccTimeUs: 100),
           CcUnitResult(basename: "@mmain.nim.c", ok: false, ccTimeUs: 200),
         ])
-    driver.link = proc(linkCmd: string): tuple[ok: bool; output: string] =
+    driver.link = proc(linkCmd: string): RunResult =
       linkCalled = true
-      (ok: true, output: "")
+      ran(0, "", "")
 
     let spans = runMeasured(driver, "/proj/ep.nim", @[], nimcacheDir, nimcacheDir / "ep")
 
@@ -142,13 +142,13 @@ suite "runMeasured — orchestration with injected synthetic procs":
     var driver: CompileDriver
     driver.compileOnly = proc(entrypoint: string; flags: seq[string];
                               nimcacheDir, outputBinPath: string):
-                                tuple[ok: bool; output: string] =
-      (ok: true, output: "")
+                                RunResult =
+      ran(0, "", "")
     driver.runCc = proc(units: seq[CompileUnit]): RunCcResult =
       RunCcResult(ok: true, ccSpanUs: 42,
                   units: @[CcUnitResult(basename: "@pfoo.nim.c", ok: true, ccTimeUs: 42)])
-    driver.link = proc(linkCmd: string): tuple[ok: bool; output: string] =
-      (ok: false, output: "undefined reference to `main`")
+    driver.link = proc(linkCmd: string): RunResult =
+      ran(1, "undefined reference to `main`", "")
 
     let spans = runMeasured(driver, "/proj/ep.nim", @[], nimcacheDir, nimcacheDir / "ep")
 
@@ -226,7 +226,9 @@ suite "defaultRunCc — overlap-aware concurrency (real cheap subprocesses)":
 
   test "default concurrency (unspecified) matches Nim's own default (countProcessors)":
     if countProcessors() < 2:
-      skip()   # single-core CI runner: sequential IS the honest default here too
+      # single-core CI runner: sequential IS the honest default here too
+      echo "CRISOL-SKIP-TEST: tests/unit/test_compiledriver.nim#default_concurrency_needs_two_cores"
+      skip()
     else:
       let units = @[
         (basename: "a.c", ccCmd: "sleep 0.08"),

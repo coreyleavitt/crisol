@@ -29,7 +29,7 @@
 ## ## Seam contract
 ##
 ## `run` — reuses `toolrun.RunProc`/`toolrun.realRun` verbatim (same idiom,
-## same contract: `ok=false` on any failure, never raises). CR7 split this
+## same contract: never raises; only an `ok` run is read). CR7 split this
 ## seam out of the old `ccprobe.nim` into its own module (`crisol/toolrun`)
 ## precisely because this module's reliance on it was the tell that the seam
 ## was never a "cc" concern to begin with.
@@ -65,9 +65,25 @@
 ## Caching
 ## -------
 ## `nimFingerprint` is seam-injectable and pure-ish (given fixed seam
-## outputs) so it's called freely in tests.  `cachedNimFingerprint` is a
-## thin memoised wrapper — probes exactly once per process, using the real
-## seams — mirroring `ccidentity.cachedCcFingerprint`.
+## outputs) so it's called freely in tests.  A `NimMemo` keeps the first
+## answer that is a fact about the compiler, and never one an interrupt
+## decided; `cachedNimFingerprint` is the process's memo over the real seams.
+##
+## R13-L3, R14-D3: once an interrupt has landed in the open scope, crisol
+## refuses every new tool (`tooltrees.registerTool` kills it at once), so a
+## `nim --version` asked for then fails for a reason that has nothing to do
+## with the compiler. Memoizing that answer poisoned the process: a library
+## host's every later run carried `<nim-version-unavailable>`, discarded its
+## depgraph, recompiled everything and wrote the placeholder into the
+## depgraph header and the cache keys. The run itself says so: it ends
+## `reInterrupted` (`toolexec.runTool`), and a probe derived from such a run
+## (`NimProbe.interrupted`) is returned but not kept, so the next lookup
+## probes again. Nothing persists it either: a run reaches persistence only
+## through `execute`, and `runcore.runTestsWith` returns `rsInterrupted`
+## before `execute` whenever the scope's signal is set, which it stays for
+## the rest of the scope; `crisol clean` stops before pruning by it. A
+## `nim --version` that genuinely fails is still the placeholder, memoized
+## as before.
 
 import std/[os, strutils]
 import crisol/toolrun    # CR7: RunProc/realRun -- the process-execution seam,
@@ -145,29 +161,77 @@ proc realBinHash*(path: string): string =
 # nimFingerprint — pure derivation (injectable)
 # ---------------------------------------------------------------------------
 
-proc nimFingerprint*(run: RunProc = realRun; hashBin: BinHashProc = realBinHash): string =
-  ## Derive a stable, binary-distinguishing fingerprint for the Nim compiler.
-  ## Both probes go through the injected seams; defaults are the real
-  ## runner + real file hash.  Never raises.
-  let (verOut, verOk) = run("nim", ["--version"])
-  let verNorm = if verOk: normalizeOutput(verOut) else: ""
+type
+  NimProbe* = object
+    ## One probe of the Nim compiler.
+    fingerprint*: string  ## `nimFingerprint`'s value
+    known*: bool
+      ## Both parts identified the compiler: `nim --version` answered, and
+      ## the binary on PATH was read. False when either part is its
+      ## placeholder (`NimVersionSentinel`, `NimBinSentinel`): such a
+      ## fingerprint names no toolchain any run recorded, so nothing may be
+      ## judged stale by it (`clean.cleanOrphans`, R14-D4).
+    interrupted*: bool
+      ## `nim --version` ended `reInterrupted`: the placeholder in
+      ## `fingerprint` says nothing about the compiler, so the answer must
+      ## not be kept (R13-L3, R14-D3).
+
+proc probeNim*(run: RunProc; hashBin: BinHashProc): NimProbe =
+  ## `nimFingerprint`, and whether an interrupt, not the compiler, decided
+  ## it. Never raises.
+  let ver = run("nim", ["--version"])
+  let verNorm = if ver.ok: normalizeOutput(ver.output) else: ""
   let verPart = if verNorm.len > 0: verNorm else: NimVersionSentinel
 
   let binPath = resolveNimBin()
   let binPart = hashBin(binPath)
 
-  verPart & "|" & binPart
+  NimProbe(fingerprint: verPart & "|" & binPart,
+           known: verNorm.len > 0 and binPart != NimBinSentinel,
+           interrupted: ver.ending == reInterrupted)
+
+proc nimFingerprint*(run: RunProc = realRun; hashBin: BinHashProc = realBinHash): string =
+  ## Derive a stable, binary-distinguishing fingerprint for the Nim compiler.
+  ## Both probes go through the injected seams; defaults are the real
+  ## runner + real file hash.  Never raises.
+  probeNim(run, hashBin).fingerprint
 
 # ---------------------------------------------------------------------------
 # cachedNimFingerprint — memoised startup accessor (uses the real seams)
 # ---------------------------------------------------------------------------
 
-var nimFingerprintCache: string = ""
+type
+  NimMemo* = object
+    ## One kept `probeNim` answer, or none yet.
+    kept: NimProbe
+    hasKept: bool
+
+proc lookupProbe*(m: var NimMemo; run: RunProc; hashBin: BinHashProc): NimProbe =
+  ## The kept probe, or a fresh `probeNim` through the given seams. The ONE
+  ## memo rule: an answer derived from an interrupted tool run
+  ## (`NimProbe.interrupted`) is returned but never kept, so the next lookup
+  ## probes again; any other answer, an ordinary failure's placeholder
+  ## included, is kept. Never raises.
+  if m.hasKept:
+    return m.kept
+  let probe = probeNim(run, hashBin)
+  if not probe.interrupted:
+    m.kept = probe
+    m.hasKept = true
+  probe
+
+proc lookup*(m: var NimMemo; run: RunProc; hashBin: BinHashProc): string =
+  ## `lookupProbe(...).fingerprint`.
+  m.lookupProbe(run, hashBin).fingerprint
+
+var nimMemo: NimMemo
+
+proc cachedNimProbe*(): NimProbe =
+  ## The process's `NimMemo` over the real seams (module doc): the
+  ## fingerprint and whether it identifies the compiler. Unit tests drive a
+  ## `NimMemo` of their own with injected seams instead.
+  nimMemo.lookupProbe(realRun, realBinHash)
 
 proc cachedNimFingerprint*(): string =
-  ## Probe exactly once; return the cached value on subsequent calls.
-  ## Always uses the real seams — unit tests should call `nimFingerprint`
-  ## directly with injected seams instead.
-  if nimFingerprintCache.len == 0:
-    nimFingerprintCache = nimFingerprint()
-  nimFingerprintCache
+  ## `cachedNimProbe().fingerprint`.
+  cachedNimProbe().fingerprint

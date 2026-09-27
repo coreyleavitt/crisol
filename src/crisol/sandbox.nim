@@ -11,6 +11,7 @@ import std/[algorithm, sequtils, strutils]
 import std/options
 import crisol/types
 import crisol/depgraph
+import crisol/cachesecrets
 from crisol/process/types as ptypes import nil  ## qualified access to the
   ## §1 Limits/LimitKind shape (rfc-0007 A2a-iii) — house convention (see
   ## runner.nim/jsonout.nim/api.nim); NOT re-exported from crisol/types.
@@ -198,14 +199,6 @@ proc resolveSandbox*(
 # filterEnv — pure env-var filtering per SandboxSpec (A5)
 # ---------------------------------------------------------------------------
 
-const CrisolCachePrefix = "CRISOL_CACHE_"
-  ## RFC-0005 A0 / Hard constraints: secrets resolved for the cache-trust
-  ## layer (C4) are read once in api.nim and MUST never reach a test child.
-  ## Stripped unconditionally in filterEnv's tail below — regardless of
-  ## envScrub, regardless of whether the name is (or is ever added to) the
-  ## allowlist, and regardless of whether it arrived via the host env, an
-  ## injected pair, or an operator's own ``--env-pin``.
-
 proc overrideByName*(
   base: openArray[(string, string)];
   overrides: openArray[(string, string)];
@@ -256,7 +249,11 @@ proc filterEnv*(
   ## Finally, any ``CRISOL_CACHE_*``-named var is stripped from the ENTIRE
   ## result, unconditionally — parent, pin, or injected alike (RFC-0005 Hard
   ## constraints: "CRISOL_CACHE_* stripped from every child env at every
-  ## hermeticity level").
+  ## hermeticity level"), and regardless of whether the name is (or is ever
+  ## added to) the allowlist. The name test is ``cachesecrets.
+  ## isCacheSecretName``, shared with the run's own scrub: on Windows any
+  ## spelling of the prefix, since ``getEnv`` there reads any spelling as the
+  ## credential.
 
   let tail = overrideByName(spec.envPins, injected)
   var tailNames: seq[string] = @[]
@@ -293,7 +290,7 @@ proc filterEnv*(
 
   result = @[]
   for pair in assembled:
-    if not pair[0].startsWith(CrisolCachePrefix):
+    if not isCacheSecretName(pair[0]):
       result.add(pair)
 
 # ---------------------------------------------------------------------------

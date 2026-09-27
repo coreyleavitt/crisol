@@ -123,11 +123,10 @@
 # The fix is a `{.push warning[Deprecated]: off.}` / `{.pop.}` around that ONE
 # export statement, never dropping the flag. Verified on 2.2.10: `export a.f`
 # trips, a whole-module `export a` does NOT, and a template companion behaves
-# the same as a proc. That asymmetry is why R3-7 never hit this -- among the
-# modules carrying a deprecated companion, only `cachedispatch`'s symbols are
-# re-exported one at a time. (Note the narrow scope of that claim: 9 modules in
-# src/ use the qualified `export mod.sym` form, api.nim alone 57 times; the
-# point is only about the modules with deprecated companions.)
+# the same as a proc. That asymmetry is why R3-7 never hit this -- no module
+# carrying a deprecated companion has its symbols re-exported one at a time
+# (`grep -rln '{\.deprecated:' src` lists those modules; none appears in an
+# `export mod.sym` statement).
 
 set -euo pipefail
 

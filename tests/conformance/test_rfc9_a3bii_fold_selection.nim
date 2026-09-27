@@ -49,7 +49,7 @@
 ## `--no-renames` — vacuous, since the deleted side raw-matches the
 ## persisted graph). The diff names the DEPENDENCY (`Widget.nim`), never
 ## either entrypoint's own file, so a hit can only come from the
-## closure-membership fold (Rule 5, `srClosureHit`), never Rule 2's direct
+## closure-membership fold (Rule 5, `depgraph.diffReach`), never Rule 2's direct
 ## own-file match.
 ##
 ## The MANDATORY negative control (asserted BEFORE the selection assertion):
@@ -97,6 +97,9 @@ import crisol/narrow
 import crisol/gitdiff
 import crisol/api
 import crisol/nimprobe
+from crisol/ccidentity import cachedToolchainProbe, toolchainVerdict,
+                               ToolchainVerdictKind
+from crisol/toolchainwarn import toolchainIdentity
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -256,13 +259,25 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
 
   let nimVersion = cachedNimFingerprint()
 
+  # The C-toolchain identity RUN 1 stamped the graph with: runcore's own
+  # `toolchainIdentity(ccFp, ...)` over the same memoized probe. RUN 2 must
+  # load and plan under it, exactly as a real second run does; a "" load
+  # discards the graph as dgdCcVersion. The body needs reuse across two
+  # runs, which only an identified toolchain gives (an unidentified one's
+  # identity is a fresh nonce per run, by design), so that is asserted
+  # rather than assumed.
+  let ccFp = cachedToolchainProbe(ccProbeContextOf(cfg)).fp
+  check toolchainVerdict(ccFp).kind == tvIdentified
+  let ccVer = toolchainIdentity(ccFp,
+    proc(): string = "unidentified: the check above failed")
+
   # The diff base is the POST-rename commit vs the working tree (which holds
   # the content edit) — so only `Widget.nim` (new spelling) can appear;
   # `widget.nim` (old spelling) exists in neither side of this diff.
   let changed = changedFiles(cfg.projectRoot, cfg.trackedRoots, renameRev)
 
   var discarded: DepGraphDiscard
-  let graph = loadDepGraph(cfg, nimVersion, discarded)
+  let graph = loadDepGraph(cfg, nimVersion, discarded, ccVer)
   check discarded.kind == dgdNone
 
   let depKey = ("tests/unit/test_dependent.nim", flagHash(@[]))
@@ -284,31 +299,27 @@ proc runE2EBody(useForcedProbe: bool; forcedPolicy: FoldPolicy;
   echo "RFC9-A3BII NEGATIVE CONTROL: full changed set = ", $changedDisplays
   check "tests/unit/Widget.nim" in changedDisplays        # the new spelling IS the diff
   check "tests/unit/widget.nim" notin changedDisplays     # the OLD (persisted) spelling is NOT
-  check not isEntryStale(graph, depKey, cfg.projectRoot, cfg.trackedRoots)  # confirms Rule 4 cannot be why it's selected
+  check not isEntryStale(graph, depKey, cfg.trackedRoots)  # confirms Rule 4 cannot be why it's selected
 
   # --- Selection, via the REAL shared plan phase (buildRunPlan) ---
-  let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault), ccVersion = "",
+  let pv = buildRunPlan(cfg = cfg, selection = GroupSelection(kind: gskDefault), ccVersion = ccVer,
                         useChanged = true, changed = changed,
                         nimVersion = nimVersion)
   let selectedPaths = pv.plan.entrypoints.mapIt(string(it.ep.tp.display()))
   check "tests/unit/test_dependent.nim" in selectedPaths
   check "tests/unit/test_independent.nim" notin selectedPaths
 
-  # Corroborating detail: replay buildRunPlan's own discover -> gate ->
-  # narrow steps (the identical production procs it calls internally, not a
-  # hand-rolled duplicate) to name the EXACT selection reason — proving the
-  # inclusion is srClosureHit (the fold), not some other rule.
-  let discovered = discover(cfg, GroupSelection(kind: gskDefault))
-  let gateState  = loadGateState(cfg)
-  let gated      = applyGates(discovered, cfg, gateState)
-  let detailed   = selectByDiff(gated.run, changed, graph, cfg.trackedRoots, cfg.projectRoot)
-
-  var depReason = none(SelectionReason)
-  for d in detailed:
-    if d.ep.tp.display() == "tests/unit/test_dependent.nim":
-      depReason = some(d.reason)
-  check depReason.isSome and depReason.get == srClosureHit
-  check not detailed.anyIt(it.ep.tp.display() == "tests/unit/test_independent.nim")
+  # Corroborating detail: name the EXACT rule. The entry is known and fresh
+  # (Rules 3 and 4 checked above), its own file is not in the diff (Rule 2),
+  # so Rule 5 (`depgraph.diffReach`) includes it — and it does so through a
+  # closure member whose persisted spelling differs from the diff's (the
+  # fold), not some other rule.
+  check "tests/unit/test_dependent.nim" notin changedDisplays
+  let hit = diffReach(graph.entries[depKey], changed, cfg.trackedRoots)
+  check hit.isSome and hit.get.kind == hkMember
+  if hit.isSome:
+    check string(hit.get.watched.display) == "tests/unit/widget.nim"
+    check string(hit.get.name.display) == "tests/unit/Widget.nim"
 
 # ---------------------------------------------------------------------------
 # Suite — mode dispatch

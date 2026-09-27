@@ -3,12 +3,12 @@
 ## `toolexec` is the sole owner of subprocess output capture. This pins that:
 ## no module may read a child's stdout or stderr with `streams.readAll`, which
 ## silently truncates at the child's first flush on Windows (see
-## `crisol/toolexec.drainToEof`), and no module may read one pipe of a
+## `crisol/toolexec`'s module doc), and no module may read one pipe of a
 ## separate-stream child without the other, which deadlocks (see
-## `crisol/toolexec.drainBoth`).
+## `crisol/toolexec.runTool`).
 ##
 ## Only the `readAll` rule is pinned mechanically. "A separate-stderr spawn
-## must use `drainBoth`" is stated in `toolexec`'s own doc instead of being
+## must be drained concurrently" is stated in `toolexec`'s own doc instead of being
 ## scanned for: every text heuristic tried for it keyed on the shape of an
 ## `options = {...}` line, which a harmless reformat would break. There are
 ## five spawn sites in `src/` in total and all five route through `toolexec`.
@@ -50,8 +50,8 @@ suite "issue #22 — toolexec owns subprocess output capture":
         if readsAChildStreamWithReadAll(line):
           offenders.add(relSlash(path) & ":" & $lineNo & ": " & line.strip)
         inc lineNo
-    checkpoint("child-stream readAll sites (use toolexec.drainToEof / " &
-               "toolexec.drainBoth):\n" & offenders.join("\n"))
+    checkpoint("child-stream readAll sites (use toolexec.runTool; " &
+               "it drains to genuine EOF):\n" & offenders.join("\n"))
     check offenders.len == 0
 
 when isMainModule:

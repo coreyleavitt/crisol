@@ -12,6 +12,8 @@
 
 import std/[unittest, strutils, os]
 import crisol/nimprobe
+import crisol/toolrun      # RunResult
+import ../support/fakerun  # fakeReply
 
 # ---------------------------------------------------------------------------
 # Seam helpers
@@ -19,12 +21,12 @@ import crisol/nimprobe
 
 proc makeRun(verOut: string, verOk: bool): RunProc =
   ## Returns a run proc that serves synthetic `nim --version` output.
-  result = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+  result = proc(cmd: string, args: openArray[string]): RunResult =
     case cmd
     of "nim":
-      (output: verOut, ok: verOk)
+      fakeReply(verOut, verOk)
     else:
-      (output: "", ok: false)
+      fakeReply("", false)
 
 proc makeHashBin(hash: string): BinHashProc =
   ## Returns a hashBin proc that ignores its `path` argument and returns a
@@ -182,6 +184,71 @@ suite "cachedNimFingerprint — memoised, never raises":
     let v2 = cachedNimFingerprint()
     check v1 == v2
     check v1.len > 0
+
+# ---------------------------------------------------------------------------
+# Suite 6b: NimMemo — the one memo rule, through the fakes (R14-D3)
+# ---------------------------------------------------------------------------
+
+suite "NimMemo — never keeps an answer an interrupted run decided (R14-D3)":
+
+  proc countingRun(replies: seq[RunResult]; calls: ref int): RunProc =
+    ## Serves `replies` in order (the last one repeats), counting calls.
+    result = proc(cmd: string, args: openArray[string]): RunResult =
+      let i = min(calls[], replies.high)
+      inc calls[]
+      replies[i]
+
+  test "a reInterrupted nim --version is returned but not kept; the next lookup probes again":
+    var m: NimMemo
+    let calls = new int
+    let run = countingRun(@[notRun(reInterrupted, "was interrupted"),
+                            ran(0, StockVersion, "")], calls)
+    let first = m.lookup(run, makeHashBin("h"))
+    check first == NimVersionSentinel & "|h"
+    let second = m.lookup(run, makeHashBin("h"))
+    check calls[] == 2
+    check second == nimFingerprint(makeRun(StockVersion, true), makeHashBin("h"))
+    check second != first
+    discard m.lookup(run, makeHashBin("h"))
+    check calls[] == 2   # the real answer is kept
+
+  test "an ordinary failure's placeholder is kept":
+    for failed in [ran(1, "", "boom"), notRun(reTimedOut, "did not answer"),
+                   notRun(reIoError, "held open"), notRun(reNotStarted, "no nim")]:
+      var m: NimMemo
+      let calls = new int
+      let run = countingRun(@[failed, ran(0, StockVersion, "")], calls)
+      checkpoint $failed.ending
+      check m.lookup(run, makeHashBin("h")) == NimVersionSentinel & "|h"
+      check m.lookup(run, makeHashBin("h")) == NimVersionSentinel & "|h"
+      check calls[] == 1
+
+  test "probeNim.known: a placeholder in either part is an unknown identity (R14-D4)":
+    check probeNim(makeRun(StockVersion, true), makeHashBin("h")).known
+    check not probeNim(makeRun("", false), makeHashBin("h")).known
+    check not probeNim(makeRun("  \n", true), makeHashBin("h")).known
+    check not probeNim(makeRun(StockVersion, true), makeHashBin(NimBinSentinel)).known
+    let interrupted = proc(cmd: string, args: openArray[string]): RunResult =
+      notRun(reInterrupted, "was interrupted")
+    check not probeNim(interrupted, makeHashBin("h")).known
+
+  test "lookupProbe carries the kept answer's known flag with its fingerprint":
+    var ok: NimMemo
+    let good = ok.lookupProbe(makeRun(StockVersion, true), makeHashBin("h"))
+    check good.known
+    check ok.lookupProbe(makeRun("", false), makeHashBin("h")) == good   # kept
+    var bad: NimMemo
+    let placeholder = bad.lookupProbe(makeRun("", false), makeHashBin("h"))
+    check not placeholder.known
+    check placeholder.fingerprint == NimVersionSentinel & "|h"
+    check bad.lookup(makeRun(StockVersion, true), makeHashBin("h")) == placeholder.fingerprint
+
+  test "probeNim.interrupted is exactly `nim --version` ending reInterrupted":
+    check probeNim(makeRun(StockVersion, true), makeHashBin("h")).interrupted == false
+    check probeNim(makeRun("", false), makeHashBin("h")).interrupted == false
+    let interrupted = proc(cmd: string, args: openArray[string]): RunResult =
+      notRun(reInterrupted, "was interrupted")
+    check probeNim(interrupted, makeHashBin("h")).interrupted
 
 # ---------------------------------------------------------------------------
 # Suite 7: resolveNimBin

@@ -30,6 +30,7 @@ import crisol/runner
 import crisol/config
 import "../support/testep"
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -123,7 +124,7 @@ suite "H1/fail-fast — no phantom entry under non-contiguous dispatch":
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let results = execute(p, config = cfg, graph = g,
-                          failFast = true, showProgress = false).results
+                          failFast = true, showProgress = false, toolchain = unprobedToolchain()).results
 
     # --- Core assertion: no phantom entries ---
     # Every returned result must correspond to an entry that actually ran.
@@ -196,7 +197,7 @@ suite "H1/fail-fast — no phantom entry under non-contiguous dispatch":
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
     let execReport = execute(p, config = cfg, graph = g,
-                             failFast = true, showProgress = false)
+                             failFast = true, showProgress = false, toolchain = unprobedToolchain())
 
     # RED on pre-refactor runner.nim/api.nim (verified against a scratch
     # copy of git HEAD's runner.nim/api.nim under the exact same scenario):

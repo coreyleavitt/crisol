@@ -39,8 +39,7 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
     )
     check d.retry == false
     check d.recordAsFailure == false
-    check d.promoteBinary == true
-    check d.discardOnUnrecordedClosure == false
+    check d.binary == bdPromote
     check d.stampCacheKeyInfo == true
     check d.attemptStore == true
 
@@ -59,7 +58,7 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
     )
     check d.retry == false
     check d.recordAsFailure == true   # failFast + a genuinely FINAL failure
-    check d.promoteBinary == true     # oFailed still produced a real binary
+    check d.binary == bdPromote     # oFailed still produced a real binary
     check d.attemptStore == false     # shouldStore's own verdict said no
     check d.cacheDecisionIfNotStored == cdmKeyMiss
 
@@ -81,7 +80,7 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
     # must still be honestly "no": the finalize-only policy (promotion,
     # failFast latch, store) has not run yet for this attempt.
     check d.recordAsFailure == false
-    check d.promoteBinary == false
+    check d.binary == bdNoBinary
     check d.attemptStore == false
 
   test "oCompileFailed/oSpawnError are NEVER retried even with attempts remaining":
@@ -92,7 +91,7 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
       verdict = StoreVerdict(), planTimeCacheDecision = cdmKeyMiss,
     )
     check compileFailed.retry == false
-    check compileFailed.promoteBinary == false   # no binary to promote
+    check compileFailed.binary == bdNoBinary   # no binary to promote
 
     let spawnError = decideExit(
       completedOutcome = oSpawnError, slotAttempt = 1, maxAttempts = 3,
@@ -101,7 +100,7 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
       verdict = StoreVerdict(), planTimeCacheDecision = cdmKeyMiss,
     )
     check spawnError.retry == false
-    check spawnError.promoteBinary == false
+    check spawnError.binary == bdNoBinary
 
   test "cached-promotion arm: a compiled-this-run pass promotes its binary":
     let d = decideExit(
@@ -116,8 +115,7 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
       verdict                 = StoreVerdict(),
       planTimeCacheDecision   = cdmKeyMiss,
     )
-    check d.promoteBinary == true
-    check d.discardOnUnrecordedClosure == false  # closure DID record
+    check d.binary == bdPromote  # closure DID record
 
   test "a cdSkipFresh (not compiled this run) pass never attempts promotion":
     let d = decideExit(
@@ -132,13 +130,12 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
       verdict                 = StoreVerdict(store: true, decision: cdmKeyMiss),
       planTimeCacheDecision   = cdmKeyMiss,
     )
-    check d.promoteBinary == false
-    check d.discardOnUnrecordedClosure == false
+    check d.binary == bdNoBinary
     # A skip-fresh pass is still eligible for a fresh store attempt — caching
     # a cdSkipFresh RE-run is legitimate (e.g. after a plan-time miss).
     check d.attemptStore == true
 
-  test "store-gate-refusal arm: R9 — closure failed to record, promoted binary discarded, never stored":
+  test "store-gate-refusal arm: R9 — closure failed to record, binary never promoted, never stored":
     let d = decideExit(
       completedOutcome      = oPassed,
       slotAttempt           = 1,
@@ -151,8 +148,9 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
       verdict                 = StoreVerdict(store: true, decision: cdmKeyMiss),
       planTimeCacheDecision   = cdmKeyMiss,
     )
-    check d.promoteBinary == true               # still copies the binary...
-    check d.discardOnUnrecordedClosure == true   # ...then discards it right back out
+    # R19-D1: an unrecorded closure's binary is never copied to the stable
+    # path at all.
+    check d.binary == bdDiscardUnrecorded
     check d.attemptStore == false                # never stored: dead cache write otherwise
     check d.cacheDecisionIfNotStored == cdmClosureUnrecorded
 
@@ -208,3 +206,34 @@ suite "r23: decideExit — pure retry/promotion/store-gate decision table":
     check d.stampCacheKeyInfo == false
     check d.attemptStore == false
     check d.cacheDecisionIfNotStored == cdmPolicyDisabled
+
+  test "the binary disposition tracks whether a finalizing compile's closure recorded (R19-D1, R20-D1)":
+    # R20-D1: one `BinaryDisposition`, so promote-and-discard cannot be
+    # expressed; what is left to pin is which one each case gets. A binary
+    # exists to act on only when this attempt finalizes and really compiled
+    # one; then it is promoted exactly when its closure recorded.
+    for o in Outcome:
+      for att in 1 .. 2:
+        for compiled in [false, true]:
+          for recorded in [false, true]:
+            let d = decideExit(
+              completedOutcome      = o,
+              slotAttempt           = att,
+              maxAttempts           = 2,
+              failFast              = false,
+              compiledThisRun       = compiled,
+              hasCacheDir           = compiled,
+              slotClosureRecorded   = recorded,
+              cacheActive           = true,
+              verdict               = StoreVerdict(store: true, decision: cdmKeyMiss),
+              planTimeCacheDecision = cdmKeyMiss,
+            )
+            checkpoint($o & " attempt " & $att & " compiled " & $compiled &
+                       " recorded " & $recorded)
+            let produced = not d.retry and compiled and
+                           o notin {oCompileFailed, oSpawnError}
+            let expected =
+              if not produced: bdNoBinary
+              elif recorded:   bdPromote
+              else:            bdDiscardUnrecorded
+            check d.binary == expected

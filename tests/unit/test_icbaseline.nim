@@ -20,10 +20,10 @@ proc makeRun(results: seq[tuple[exitCode: int, output: string]]): IcRunProc =
   ## Returns a run proc that serves `results` in order, one per call
   ## (call 1 -> results[0], call 2 -> results[1], ...).
   var idx = 0
-  result = proc(args: seq[string]): tuple[exitCode: int, output: string] =
+  result = proc(args: seq[string]): RunResult =
     let r = results[idx]
     inc idx
-    r
+    ran(r.exitCode, r.output, "")
 
 proc makeClock(usValues: seq[int64]): IcTimeProc =
   ## Returns a clock proc that serves synthetic MonoTime values built from

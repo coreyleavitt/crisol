@@ -73,6 +73,22 @@ jobs:
       - name: Defaulted-parameter census self-test
         run: bash ci/assert-defaulted-params.selftest.sh
 
+      # R12-D9: ci/assert-subset-honesty.sh (run by the windows and macos
+      # legs) parses this file's windows and macos jobs and fails when a
+      # per-file `nim r tests/<x>.nim | tee -a harness.log` step has no
+      # require_per_file block, or a block names a file with no step. This
+      # mutation-tests that check on temp copies of this file and of the
+      # script -- a new step, a deleted step, a step that stops appending, a
+      # deleted block, a step in the other leg's or an unrelated job, a
+      # comment, an unrecognised harness.log writer, a renamed job. The logs it
+      # judges are built from the script's own failure output, so it needs no
+      # CI log. Source text only, like the census: bash, awk, sed, comm --
+      # seconds, and this leg alone. It needs nothing before it, so it carries
+      # `!cancelled()` alone.
+      - name: Subset-honesty per-file drift self-test
+        if: ${{ !cancelled() }}
+        run: bash ci/assert-subset-honesty.selftest.sh
+
       - name: Fetch vendored deps (milpa.lock)
         id: deps
         if: ${{ !cancelled() }}
@@ -511,7 +527,7 @@ jobs:
       # stops a superseded PR run, and always() kept ~40 MSVC `nim r` steps
       # grinding on after it. GitHub's guidance reserves always() for steps
       # that must run even on cancellation; none of these must.
-      - name: "wiring-audit W2 — assert this leg is on the vcc backend"
+      - name: "C backend: this leg builds with vcc"
         if: ${{ !cancelled() && steps.sanity.outcome == 'success' }}
         env:
           CRISOL_EXPECT_CC: vcc
@@ -632,7 +648,9 @@ jobs:
       # test_issue22_changed_completeness: the user-visible one — a `git`
       # whose diff arrives in two bursts must still yield every changed name
       # to `--changed` selection, and a git whose stderr overruns the pipe
-      # buffer must neither wedge nor be truncated.
+      # buffer must neither wedge nor be truncated; and a `git ls-files`
+      # that exits non-zero or does not finish must fail `--changed` closed
+      # (exit 3) rather than silently drop untracked files.
       # wiring-audit W9i (code-review ledger, 2026-09-21): every step below
       # that runs a tests/integration/ file individually appends its output
       # into harness.log via `tee -a` (the `shell: bash` default this job
@@ -664,15 +682,14 @@ jobs:
       # soundness key with a mingw-gcc one. Without this step the fix has no
       # CI producer on the only platform that can regress it.
       #
-      # It drives `ccprobe.cachedCcVersion()` -- the real accessor, real
-      # seams -- and asserts the cc half names an installed compiler and the
-      # runtime half carries a content digest of the .lib files this
-      # toolchain will actually link (Nim+vcc links the CRT statically, so
-      # there is no libc DLL and no version string to read).
+      # It drives `ccidentity.cachedToolchainProbe(ctx)` -- the real accessor,
+      # real seams -- and asserts both halves of the configured toolchain are
+      # identified by content: the compiler through its preprocessor answer,
+      # the runtime by the .lib files this toolchain will actually link
+      # (Nim+vcc links the CRT statically, so there is no libc DLL and no
+      # version string to read).
       # wiring-audit W9i: append into harness.log (see the comment above the
-      # issue #22 steps) — this is CR6's own producer, whose per-test
-      # CRISOL-SKIP-TEST marker (it self-skips one of its three tests on
-      # non-POSIX) must now reach the honesty gate instead of vanishing.
+      # issue #22 steps).
       - name: "issue #23 — soundness key identifies this host's C toolchain"
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue23_cc_identity.nim 2>&1 | tee -a harness.log
@@ -711,12 +728,12 @@ jobs:
       # this step gives that fix its first real MSVC producer.
       # wiring-audit W9i: append into harness.log (see the comment above the
       # issue #22 steps).
-      - name: "wiring-audit W9b — compiledriver real live-compile MSVC producer"
+      - name: "compiledriver: a real live compile, cc and link under MSVC"
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/integration/test_compiledriver_real.nim 2>&1 | tee -a harness.log
 
       # ROUND-2 REVIEW (High): CR4's deadline guard had NO producer on ANY
-      # leg. tests/integration/test_cr4_tool_deadline.nim appeared nowhere in
+      # leg. tests/integration/test_tool_capture_deadline.nim appeared nowhere in
       # this file, and it lives under tests/integration/, which this leg's
       # bulk sweep below (CRISOL_TEST_DIRS: tests/unit:tests/conformance)
       # does not reach -- so only the Linux leg's default integration sweep
@@ -728,9 +745,9 @@ jobs:
       # once, anywhere. This step is its first producer.
       # wiring-audit W9i: append into harness.log (see the comment above the
       # issue #22 steps).
-      - name: "round-2 — CR4 tool-deadline Windows (PeekNamedPipe) producer"
+      - name: "tool capture deadline: a child that never exits is abandoned (Windows, PeekNamedPipe)"
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: nim r --hints:off --warnings:off --path:src tests/integration/test_cr4_tool_deadline.nim 2>&1 | tee -a harness.log
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_tool_capture_deadline.nim 2>&1 | tee -a harness.log
 
       # R8-L1: toolrun's presence contract -- "not on PATH -> empty output,
       # ran-and-failed -> non-empty output" -- which ccidentity's R7-S1 refusal
@@ -741,49 +758,160 @@ jobs:
       # (CreateProcess, not execvp) R7-S1 actually depends on. Appended into
       # harness.log (wiring-audit W9i) so assert-subset-honesty.sh's
       # MUST-EXECUTE check can see its three [OK] lines.
-      - name: "round-8 — R7-S1 probe presence contract (toolrun) on Windows"
+      - name: "toolrun presence contract: not started vs ran and failed (Windows)"
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: nim r --hints:off --warnings:off --path:src tests/integration/test_r7_probe_presence_contract.nim 2>&1 | tee -a harness.log
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_probe_presence_contract.nim 2>&1 | tee -a harness.log
 
-      # R8-L1: R7-S1's REAL trigger -- a real `cl` exits 2 under a non-empty
-      # `CL`, and ccIdentity must refuse the compiler half (`cl` in
-      # refusedDrivers, turCompilerRefused) rather than read it as absent.
-      # No other step sets CL, so before this the refusal was proven only with
-      # synthetic captures on Linux. The file sets CL=/W4 in-process and
-      # restores it; this step's job is to make `cl` resolve on PATH, which on
-      # windows-latest it does not outside a Developer Command Prompt (vccexe
-      # finds cl via vswhere; the bare `cl` candidate cannot). So it imports
-      # vcvars64.bat's environment into THIS step's shell only -- no other
-      # step sees it -- and fails loudly if `cl` still does not resolve, since
-      # the file would otherwise self-skip. assert-subset-honesty.sh REQUIRES
-      # its real body on this leg (MUST-EXECUTE, and its skip labels are in
-      # no windows pin), so a silent skip fails the B4b audit too.
-      - name: "round-8 — R7-S1 real cl refused under CL=/W4 (MSVC)"
+      # R9-D1c: the real MSVC identity probe under `CL`. cl reads `CL` and
+      # `_CL_` on every compile; the preprocessor probe must identify the
+      # configured compiler under a non-empty `CL` (the banner probe it
+      # replaced was refused there) and a `CL` value must move the compiler
+      # half of the key. The file sets `CL` in-process and restores it. It
+      # probes the compiler the global Nim configuration selects (`cc = vcc`
+      # on this leg), through vccexe, which finds cl itself -- no Developer
+      # Command Prompt environment is needed. assert-subset-honesty.sh
+      # REQUIRES its real body on this leg (MUST-EXECUTE).
+      - name: "real cl identified under CL, and CL keys the compiler (MSVC)"
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: |
-          if ! command -v cl >/dev/null 2>&1; then
-            vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-            vsdir=$("$vswhere" -latest -products '*' \
-                      -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
-                      -property installationPath | tr -d '\r')
-            [ -n "$vsdir" ] || { echo "R8-L1: vswhere found no VC toolset" >&2; exit 1; }
-            vcvars=$(cygpath -w "$vsdir/VC/Auxiliary/Build/vcvars64.bat")
-            printf '@call "%s" >NUL || exit /b 1\r\n@set\r\n' "$vcvars" > "$RUNNER_TEMP/r8-vcenv.bat"
-            cmd //d //c "$(cygpath -w "$RUNNER_TEMP/r8-vcenv.bat")" | tr -d '\r' > "$RUNNER_TEMP/r8-vcenv.txt"
-            while IFS='=' read -r name value; do
-              case "$name" in
-                Path|PATH) PATH="$(cygpath -u -p "$value"):$PATH" ;;
-                INCLUDE|LIB|LIBPATH|VCINSTALLDIR|VCToolsInstallDir|VSINSTALLDIR|WindowsSdkDir|WindowsSDKVersion|UCRTVersion|UniversalCRTSdkDir)
-                  export "$name=$value" ;;
-              esac
-            done < "$RUNNER_TEMP/r8-vcenv.txt"
-            export PATH
-          fi
-          command -v cl >/dev/null 2>&1 || {
-            echo "R8-L1: cl does not resolve on PATH even after importing vcvars64 -- the real-cl refusal cannot run here" >&2
-            exit 1; }
-          echo "R8-L1: cl resolves to $(command -v cl)"
-          nim r --hints:off --warnings:off --path:src tests/integration/test_r8_real_cl_refusal.nim 2>&1 | tee -a harness.log
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_real_cl_identity.nim 2>&1 | tee -a harness.log
+
+      # R10-L3: the Windows arms of toolexec's drain failure paths. The R9
+      # capture-endings file pins a pipe that fails mid-capture (on Windows,
+      # PeekNamedPipe's invalid-handle error) as `reIoError` and a child past
+      # the byte cap as `reOverflow`; both arms are `when defined(windows)`
+      # code that the Linux legs cannot reach, and the file lives under
+      # tests/integration/, which the B4b sweep below does not. Appended
+      # into harness.log (wiring-audit W9i) so assert-subset-honesty.sh can
+      # see its [OK] lines.
+      - name: "tool capture endings: drain error and output cap arms (Windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_tool_capture_endings.nim 2>&1 | tee -a harness.log
+
+      # R10-L4/D2: the same endings at the toolrun.RunProc seam every probe
+      # calls, plus the stdin feed (`realRunWithStdinIn`) ccidentity's
+      # discovery compile moves onto -- on Windows a handle-stream write and
+      # close, not a POSIX fd. Appended into harness.log (W9i).
+      - name: "toolrun endings and stdin feed (Windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_toolrun_endings.nim 2>&1 | tee -a harness.log
+
+      # R10-L3: W3 liveness end to end under MSVC. Run 3 sets
+      # `CL=/DW3_LIVENESS`; cl reads it on every compile and ccidentity folds
+      # it into the compiler digest, so a fresh `crisol run` subprocess must
+      # recompile rather than serve the run-1 binary. This leg is the only
+      # one with cl, and the file lives under tests/integration/, which the
+      # B4b sweep below does not reach. Its GNU-on-Windows arm self-skips
+      # with a CRISOL-SKIP-TEST marker; under MSVC it must run its real body.
+      # Appended into harness.log (W9i).
+      - name: "cc identity liveness: a CL change recompiles end to end (MSVC)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_cc_depgraph_liveness.nim 2>&1 | tee -a harness.log
+
+      # R10-S5/R12-D2: `--changed` against a real git submodule (a gitlink
+      # the diff names as a whole, expanded to the names its own diff
+      # reports), through runMain. An untracked nested repository is still
+      # walked with walkDir, whose Windows arm (FindFirstFile, junction
+      # detection) the Linux legs cannot reach, and the submodule's
+      # directory links are junctions here. Appended into harness.log (W9i).
+      - name: "changed: edits and commits inside a git submodule are seen (windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_changed_submodule.nim 2>&1 | tee -a harness.log
+
+      # R12-D1: a link the diff names (repointed, deleted, replaced, or seen
+      # through as a directory) selects exactly the tests whose closure was
+      # reached through it, and `--changed` refuses only when `--base` does
+      # not resolve to a commit, through runMain against real temp
+      # repositories. The directory links are junctions here, which git
+      # treats as plain directories; the index-recorded cases hold links as
+      # git does without symlink support (mode 120000,
+      # `core.symlinks=false`). No skip path. Appended into harness.log (W9i).
+      - name: "changed: a link in the diff selects the tests reached through it (windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_changed_symlink.nim 2>&1 | tee -a harness.log
+
+      # R13-S3: a submodule whose .git entry was removed (stranded), at the top
+      # level and nested, is still seen by `--changed`: an edit inside it
+      # selects its dependent test, while an uninitialised or unchanged
+      # submodule contributes nothing. Through runMain against real temp
+      # repositories, whose directory walk takes walkDir's Windows arm here.
+      # No skip path. Appended into harness.log (W9i).
+      - name: "changed: edits inside a submodule whose .git was removed are seen (windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_changed_stranded_submodule.nim 2>&1 | tee -a harness.log
+
+      # Issue #26: a run cut short between recording an entrypoint's closure
+      # and promoting its binary (TerminateProcess to the real CLI, or a
+      # run-phase spawn failure) must not leave the new depgraph entry beside
+      # the old stable binary; the next run recompiles and fails. A previous
+      # binary that cannot be retired (the seam, directly and through a real
+      # execute(), a directory in its place through the CLI's --json, and a
+      # held-open exe here) drops the entry instead. The
+      # SIGINT case is POSIX only and runs in the Linux sweep and the macOS
+      # step. The two R21-S1 broken-stderr cases run here but pass
+      # vacuously (R22-D2): the MSVC CRT never reports a failed stderr
+      # write, so nothing raises with or without the guard; they are
+      # load-bearing only on the POSIX legs. Appended into harness.log (W9i).
+      - name: "#26: a run cut short before promotion never runs the old binary (windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue26_promotion_interrupt.nim 2>&1 | tee -a harness.log
+
+      # A directory link on a Nim import path, repointed after a run, must
+      # force a recompile (never a stale compile skip or cached result),
+      # through runMain against real temp projects. The link is a junction
+      # here (tests/support/dirlink.nim, no privilege needed). The index
+      # walk's Windows arm (walkDir's reparse-point detection) is what must
+      # see the junction as a link and record it; the Linux legs cannot
+      # reach it. No skip path. Appended into harness.log (W9i).
+      - name: "cache: a retargeted symlink on an import path recompiles (windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue25_symlink_retarget.nim 2>&1 | tee -a harness.log
+
+      # R7-L6: the toolchainFp producer chain (a real measured run through
+      # the self-reexec measure worker, hops 1-7) under MSVC. It lives under
+      # tests/integration/, which the B4b sweep below does not reach, so
+      # until this step it ran only on Linux. Appended into harness.log
+      # (W9i); assert-subset-honesty.sh requires its four [OK] lines.
+      - name: "toolchain fingerprint reaches every row of a measured run (MSVC)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_toolchainfp_producer_chain.nim 2>&1 | tee -a harness.log
+
+      # R10-L9: the mingw runtime identity. windows-latest ships MinGW-w64
+      # gcc (UCRT) on PATH in C:\mingw64\bin beside MSVC; the file's
+      # project nim.cfg says `cc = gcc`, so both the real probe and a real
+      # `crisol run` take the mingw arm (`__MINGW32__`: libucrt.a/libmsvcrt.a
+      # and the DLLs they bind) that no other leg can reach. Appended into
+      # harness.log (W9i); assert-subset-honesty.sh requires both [OK] lines
+      # and forbids its no-gcc skip markers.
+      - name: "mingw runtime identity: a cc = gcc project beside MSVC"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_mingw_runtime_identity.nim 2>&1 | tee -a harness.log
+
+      # R3-12: a tool whose descendant keeps its output pipe open ends
+      # promptly as reIoError, and the whole tree is killed. On Windows the
+      # kill is the job-object arm of toolexec, which the Linux legs (process
+      # group) cannot reach, and the file lives under tests/integration/,
+      # which the B4b sweep below does not. Appended into harness.log (W9i);
+      # assert-subset-honesty.sh requires both [OK] lines.
+      - name: "tool tree termination: a descendant holding the output is killed (Windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_tool_tree_termination.nim 2>&1 | tee -a harness.log
+
+      # CR18: tools never inherit the CRISOL_CACHE_* credentials, through each
+      # tool entry point. The Windows environment is case-insensitive, so a
+      # lower-cased credential name must be scrubbed too -- a check only this
+      # leg can make. Appended into harness.log (W9i); assert-subset-honesty.sh
+      # requires all four [OK] lines.
+      - name: "tool environment: cache credentials are scrubbed (Windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_tool_env_scrub.nim 2>&1 | tee -a harness.log
+
+      # R11-L4: an interrupt ends a running bounded tool through the live-tool
+      # registry (the job kill a console Ctrl-C reaches). The signal suites in
+      # the same file are POSIX-only. Appended into harness.log (W9i);
+      # assert-subset-honesty.sh requires both [OK] lines.
+      - name: "tool interrupt: a running bounded tool ends at once, job kill (Windows)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_tool_interrupt.nim 2>&1 | tee -a harness.log
 
       - name: rfc-0009 A1 — fold-probe real-volume runtime evidence
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
@@ -821,9 +949,11 @@ jobs:
       # two runs still HITS the local cache). Fold-INDEPENDENT (no
       # CRISOL_EXPECT_FOLD, no volume-skip guard) — this is a producer here
       # regardless of NTFS case policy, mirroring the A3b-ii/A4b per-file
-      # steps immediately above. Self-skips only on an environment that
-      # cannot create symlinks at all (same convention as
-      # test_closure_a4a.nim), never on case (in)sensitivity.
+      # steps immediately above. It never self-skips: the aliased depRoot is
+      # a directory junction here and a symlink elsewhere
+      # (tests/support/dirlink.nim), and the test prints which
+      # (`RFC9-A5C ALIAS junction|symlink`). assert-subset-honesty.sh
+      # requires its real body on every leg.
       - name: rfc-0009 A5c — cache-portability E2E (depRoot member, relocated tree)
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/conformance/test_rfc9_a5c_cache_portability.nim
@@ -996,7 +1126,7 @@ jobs:
       #
       # R7-L2, corrected by R8-D2: this and every step below carry
       # `if: ${{ !cancelled() && steps.deps.outcome == 'success' }}`, as on
-      # the windows leg (see its comment above the W2 backend step). They are
+      # the windows leg (see its comment above the "C backend" step). They are
       # independent verdicts; before R7-L2, a red pre-check or a red CR2
       # producer skipped the suite AND the subset-honesty audit that judges
       # the markers CR2 had already `tee -a`d into harness.log. They run after
@@ -1037,30 +1167,64 @@ jobs:
       # so without this append the CR2-followup per-test skip could go
       # silent with no producer catching it. harness.log does not exist yet
       # at this point in the job; `tee -a` creates it on the first append.
-      - name: "code-review CR2 — gcc/clang arm producer for the W1 case-resolution fix"
+      - name: "header closure: a mis-cased gcc/clang #include resolves to the real case (macOS)"
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue16_headers.nim 2>&1 | tee -a harness.log
 
       # R8-L1: the two round-7/round-8 integration files that make a
-      # per-platform claim, pinned here for the same reason as CR2 above
-      # (tests/integration/ is outside this leg's sweep) and appended into
+      # per-platform claim, pinned here for the same reason as the
+      # header-closure step above (tests/integration/ is outside this leg's
+      # sweep) and appended into
       # harness.log (wiring-audit W9i) for the honesty audit:
-      #   - test_r7_probe_presence_contract.nim says it is pinned against the
+      #   - test_probe_presence_contract.nim says it is pinned against the
       #     real primitive "on every platform"; until this step it ran only
       #     on Linux. Darwin's posix_spawn/execvp failure path is a platform
       #     fact of its own. Its three [OK] lines are MUST-EXECUTE here.
-      #   - test_r8_real_cl_refusal.nim has no `cl` to drive on this leg, so
+      #   - test_real_cl_identity.nim has no MSVC to drive on this leg, so
       #     both of its tests self-skip with CRISOL-SKIP-TEST markers. That
       #     skip is PINNED in this leg's expected set, so the day it stops
       #     firing (or a new one appears) the audit notices; the real body is
       #     the windows leg's to run, and required there.
-      - name: "round-8 — R7-S1 probe presence contract (toolrun) on macOS"
+      - name: "toolrun presence contract: not started vs ran and failed (macOS)"
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: nim r --hints:off --warnings:off --path:src tests/integration/test_r7_probe_presence_contract.nim 2>&1 | tee -a harness.log
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_probe_presence_contract.nim 2>&1 | tee -a harness.log
 
-      - name: "round-8 — R7-S1 real cl refusal (expected self-skip: no cl on macOS)"
+      - name: "real cl identity: expected self-skip, no MSVC (macOS)"
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: nim r --hints:off --warnings:off --path:src tests/integration/test_r8_real_cl_refusal.nim 2>&1 | tee -a harness.log
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_real_cl_identity.nim 2>&1 | tee -a harness.log
+
+      # R7-L6: the toolchainFp producer chain on Darwin (the measure worker's
+      # self-reexec, and the default-probe case against this host's real
+      # clang/libSystem identity). tests/integration/ is outside this leg's
+      # sweep; appended into harness.log (W9i) so assert-subset-honesty.sh
+      # can require its four [OK] lines.
+      - name: "toolchain fingerprint reaches every row of a measured run (macOS)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_toolchainfp_producer_chain.nim 2>&1 | tee -a harness.log
+
+      # Issue #26 (R17-L1): a run cut short between recording an entrypoint's
+      # closure and promoting its binary (SIGINT and SIGKILL to the real CLI,
+      # or a run-phase spawn failure) must not leave the new depgraph entry
+      # beside the old stable binary, and a previous binary that cannot be
+      # retired drops the entry instead (directly, through a real
+      # execute(), and through the CLI's --json). tests/integration/ is
+      # outside this leg's sweep; appended into harness.log (W9i) so
+      # assert-subset-honesty.sh can require its [OK] lines on Darwin.
+      # The held-open-binary case is Windows only.
+      - name: "#26: a run cut short before promotion never runs the old binary (macOS)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue26_promotion_interrupt.nim 2>&1 | tee -a harness.log
+
+      # Issue #25 (R18-L1): a directory link on a Nim import path, repointed
+      # after a run, must force a recompile (never a stale compile skip or
+      # cached result), and the index walk must record the link, through
+      # runMain against real temp projects. The link is a symlink here
+      # (tests/support/dirlink.nim). tests/integration/ is outside this leg's
+      # sweep; appended into harness.log (W9i) so assert-subset-honesty.sh
+      # can require all ten [OK] lines on Darwin. No skip path.
+      - name: "cache: a retargeted symlink on an import path recompiles (macOS)"
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: nim r --hints:off --warnings:off --path:src tests/integration/test_issue25_symlink_retarget.nim 2>&1 | tee -a harness.log
 
       # rfc-0007 C1b: the ladder's `macosx` arm now maps to process/darwin —
       # kqueue EVFILT_PROC event-driven `next` + libproc process-table
@@ -1095,6 +1259,11 @@ jobs:
         env:
           CRISOL_TIER: macos
           CRISOL_TEST_DIRS: tests/unit:tests/conformance
+          # R6-S5: test_cc_backend.nim (swept in above) hard-asserts the C
+          # backend this leg built with. Nim's own config selects clang on
+          # macosx; assert-subset-honesty.sh requires
+          # "CRISOL-CC-BACKEND: clang" in this run's output.
+          CRISOL_EXPECT_CC: clang
           # RFC-0009 A3b-ii (round-3, R3-18.4): hard-asserts the real probe
           # on this leg's APFS volume before proving fold-membership
           # selection live (test_rfc9_a3bii_fold_selection.nim, swept in via

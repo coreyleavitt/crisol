@@ -236,7 +236,7 @@ block test_cleanorphans_compacts_compilecost_stream:
     "{\"rowVersion\":1,\"identity\":\"" & $execIdent & "\",\"timestamp\":1500," &
     "\"inputHash\":\"abc\",\"outcome\":\"passed\",\"attempt\":1,\"durationUs\":1000,\"rssBytes\":4096}\n")
 
-  let r = cleanOrphans(cfg)
+  let r = cleanOrphans(cfg, knownToolchain("", ""))
 
   # Compile-cost stream compacted: 2 shards merged into 1, 2 rows kept.
   assert r.compileCostReport.shardsRemoved == 2,

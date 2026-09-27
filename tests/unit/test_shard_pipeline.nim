@@ -125,7 +125,7 @@ suite "buildRunPlan — shard wiring":
     ## Scenario:
     ##   - 4 eps discovered
     ##   - useChanged=true + a dep-graph-absent trigger → all 4 are in changedNarrowed
-    ##     (srGraphAbsent rule: with empty graph, all eps are conservatively included)
+    ##     (graph-absent rule: with empty graph, all eps are conservatively included)
     ##   - shardK=1/2 then partitions those 4 → 2 shards, disjoint, complete
     let root = makeTempRoot("shard_changed")
     defer: cleanupDir(root)
@@ -137,7 +137,7 @@ suite "buildRunPlan — shard wiring":
     let sel = GroupSelection(kind: gskDefault)
 
     # With an empty dep graph (absent), narrowByDiff conservatively includes ALL
-    # eps (srGraphAbsent rule).  So useChanged=true with any non-empty changedSet
+    # eps (the graph-absent rule).  So useChanged=true with any non-empty changedSet
     # will return all 4 after narrowing.
     # RFC-0009 A3b-i: buildRunPlan's `changed` param is now HashSet[TrackedPath].
     var changedSet = initHashSet[TrackedPath]()

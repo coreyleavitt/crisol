@@ -429,7 +429,7 @@ block test_cleanorphans_cache_eviction:
   seedCacheEntry(stateDir, "new00000new00000", now - 200)
   seedCacheEntry(stateDir, "new10000new10000", now - 100)
 
-  let r = cleanOrphans(cfg)
+  let r = cleanOrphans(cfg, knownToolchain("", ""))
   # 4 entries, maxEntries=2 → 2 evicted.
   assert r.cacheEvicted == 2, "cleanOrphans cache eviction: expected 2 evicted, got " & $r.cacheEvicted
 
@@ -474,7 +474,7 @@ block test_cleanorphans_ledger_compact:
   seedLedgerShard(stateDir, "s2-x-1.ndjson", @[makeRow(ident, 2000)])
   seedLedgerShard(stateDir, "s3-x-1.ndjson", @[makeRow(ident, 3000)])
 
-  let r = cleanOrphans(cfg)
+  let r = cleanOrphans(cfg, knownToolchain("", ""))
   assert r.shardsRemoved == 3, "cleanOrphans ledger: expected 3 shards removed, got " & $r.shardsRemoved
   assert r.ledgerRowsKept == 3, "cleanOrphans ledger: expected 3 rows kept, got " & $r.ledgerRowsKept
 

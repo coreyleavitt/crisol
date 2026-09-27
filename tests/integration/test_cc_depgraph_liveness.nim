@@ -1,4 +1,4 @@
-## tests/integration/test_w3_cc_liveness.nim — W3 wiring-audit liveness proof.
+## tests/integration/test_cc_depgraph_liveness.nim — W3 wiring-audit liveness proof.
 ##
 ## The bug this closes (docs/handoff/msvc-selection-layer.md, "Wiring audit
 ## — 2026-09-21", row W3): a prior slice made
@@ -65,35 +65,40 @@
 ##
 ##   1. cold start (no binary, no dep graph yet)            -> compiles
 ##   2. same environment, unchanged fixture                 -> skips (cached)
-##   3. Nim UNCHANGED, but a genuinely different `cc` driver
-##      resolves first on PATH (content differs from run 1/2's
-##      real `cc`, so ccidentity.ccIdentity's `cdVersionAndBinary`
-##      content hash necessarily differs, independent of what
-##      banner text the fake driver prints)                 -> recompiles
+##   3. Nim UNCHANGED, the configured C compiler's identity
+##      changed                                             -> recompiles
 ##
-## Step 3 is the liveness assertion: with the fix, `crisol run`'s own
-## unconditional `cachedCcVersion()` probe (called once per host process —
-## this is a FRESH subprocess, so it probes fresh, exactly like a real
-## toolchain upgrade between two invocations of the CLI) observes the changed
-## identity, threads it into `buildRunPlan` -> `loadDepGraph`, which discards
-## the run-1/2 graph (`dgdCcVersion`) and returns an EMPTY one; the run-1/2
-## binary is still on disk, so `decideCompile` lands on its entry-absent-from-
-## graph arm and returns `cdStale`, surfaced on the wire as
+## Step 3 is the liveness assertion: `crisol run` probes the C toolchain once
+## per process -- this is a FRESH subprocess, so it probes fresh, exactly like
+## a real toolchain change between two invocations of the CLI -- observes the
+## changed identity, threads it into `buildRunPlan` -> `loadDepGraph`, which
+## discards the run-1/2 graph (`dgdCcVersion`) and returns an EMPTY one; the
+## run-1/2 binary is still on disk, so `decideCompile` lands on its
+## entry-absent-from-graph arm and returns `cdStale`, surfaced on the wire as
 ## `entrypoints[0].compileSkipped == false`. Before the fix, step 3 would
-## report `compileSkipped == true` (cdSkipFresh) — silently stale.
+## report `compileSkipped == true` (cdSkipFresh) -- silently stale.
 ##
-## No `ccprobe.nim` changes and no injection seam were added for this test:
-## it observes the REAL probe under a REAL (if fake-content) `cc` binary,
-## exactly as the memoised probe's own doc promises — `cachedCcVersion()` is a
-## projection of `ccidentity.cachedCcFingerprint()`, whose doc says "Always
-## uses the real runner — unit tests should call `ccVersion` (or
-## `ccIdentity`) directly with an injected seam"; this file is deliberately
-## NOT a unit test.
+## The change must reach the compiler Nim is CONFIGURED to use (ccidentity
+## probes that one, not whatever answers on PATH) and must still compile, so
+## it depends on the configured family, which the test learns from the real
+## probe:
+##   - MSVC (`cl` through `vccexe`): run 3 sets `CL=/DW3_LIVENESS`. cl reads
+##     it on every compile, and ccidentity folds its value into the compiler
+##     digest.
+##   - GNU family on POSIX: run 3 puts a directory first on PATH whose `gcc`,
+##     `clang` and `cc` are shell wrappers that `exec` the real driver. The
+##     compile is unchanged; the driver binary the probe hashes is not.
+##   - GNU family on Windows (mingw): no wrapper can shadow a `.exe` without
+##     building one; the test self-skips with a CRISOL-SKIP-TEST marker.
+##
+## No injection seam is used: the real probe runs in the real CLI.
 
 import std/[json, os, osproc, streams, strtabs, strutils, unittest]
+import crisol/ccidentity  # the real probe, to learn the configured family
+import "../support/ccprobes"
 
 const projectRoot = currentSourcePath().parentDir.parentDir.parentDir
-  ## tests/integration/test_w3_cc_liveness.nim -> tests/integration ->
+  ## tests/integration/test_cc_depgraph_liveness.nim -> tests/integration ->
   ## tests -> repo root.
 
 suite "W3 liveness — crisol run subprocess sees a real C toolchain change":
@@ -101,7 +106,7 @@ suite "W3 liveness — crisol run subprocess sees a real C toolchain change":
   test "Nim unchanged, cc identity changed -> recompile instead of cdSkipFresh":
     # 1. Build the real CLI binary once, isolated nimcache/workDir so this
     #    build never races any other suite's own compile cache.
-    let workDir = getTempDir() / ("crisol_w3_cc_liveness_" & $getCurrentProcessId())
+    let workDir = getTempDir() / ("crisol_cc_depgraph_liveness_" & $getCurrentProcessId())
     removeDir(workDir)
     createDir(workDir)
     let crisolBin = workDir / "crisol"
@@ -125,36 +130,26 @@ suite "W3 liveness — crisol run subprocess sees a real C toolchain change":
               "group \"unit\" {\n    globs \"tests/unit/test_*.nim\"\n}\n")
     writeFile(proj / "tests" / "unit" / "test_smoke.nim", "quit(0)\n")
 
-    # 3. A fake `cc` driver, content-distinct from whatever real `cc`
-    #    resolves to on this host. ccidentity.ccIdentity's `cdVersionAndBinary`
-    #    mode (the POSIX profile) folds a CONTENT HASH of the resolved
-    #    driver binary into the fingerprint, not just its version banner
-    #    (see ccidentity.nim's `ccIdentity` doc: "A distro that rebuilds gcc with a
-    #    codegen fix and leaves the version string alone changes the object
-    #    code crisol caches against; a banner cannot see that, and bytes
-    #    can.") — so a tiny shell script masquerading as `cc` is already
-    #    guaranteed to hash differently from a real compiled `cc` binary;
-    #    its banner text does not need to be plausible.
-    let fakeCcDir = workDir / "fakecc"
-    createDir(fakeCcDir)
-    let fakeCcPath = fakeCcDir / "cc"
-    writeFile(fakeCcPath,
-              "#!/bin/sh\necho 'fakecc version 0.0.0 (w3-liveness-test)'\nexit 0\n")
-    setFilePermissions(fakeCcPath,
-      {fpUserRead, fpUserWrite, fpUserExec,
-       fpGroupRead, fpGroupExec,
-       fpOthersRead, fpOthersExec})
+    # 3. The configured compiler's family, from the real probe over this
+    #    project (its configuration is the global Nim configuration).
+    let fp = ccFingerprint(CcProbeContext(projectRoot: proj,
+                                          stateDir: proj / ".crisol",
+                                          flags: @[]))
+    checkpoint("configured toolchain = " & $fp & " / " & fp.compiler.why)
+    require toolchainVerdict(fp).kind == tvIdentified
+    let msvc = fp.compiler.text.startsWith("msvc ") or
+               fp.compiler.text.startsWith("clang-cl ")
 
     # `env = nil` (osproc default) inherits the current process's real
     # environment/PATH for runs 1/2 -- the real `cc` on this host resolves
     # exactly the way an ordinary `crisol run` would.
     let realPath = getEnv("PATH")
 
-    proc envWithPath(path: string): StringTableRef =
+    proc envWith(name, value: string): StringTableRef =
       result = newStringTable(modeCaseSensitive)
       for k, v in envPairs():
         result[k] = v
-      result["PATH"] = path
+      result[name] = value
 
     proc runCrisol(env: StringTableRef): JsonNode =
       var p = startProcess(crisolBin, workingDir = proj,
@@ -176,7 +171,7 @@ suite "W3 liveness — crisol run subprocess sees a real C toolchain change":
         raise
 
     # --- Run 1: cold start, real cc on PATH -> must compile. ---
-    let doc1 = runCrisol(envWithPath(realPath))
+    let doc1 = runCrisol(envWith("PATH", realPath))
     check doc1["schema"].getStr == "crisol/run/v2"
     check doc1["entrypoints"].len == 1
     check doc1["entrypoints"][0]["outcome"].getStr == "passed"
@@ -184,16 +179,34 @@ suite "W3 liveness — crisol run subprocess sees a real C toolchain change":
 
     # --- Run 2: SAME environment, unchanged fixture -> must skip (baseline
     #     freshness works at all -- this is not yet the W3 assertion). ---
-    let doc2 = runCrisol(envWithPath(realPath))
+    let doc2 = runCrisol(envWith("PATH", realPath))
     check doc2["entrypoints"][0]["outcome"].getStr == "passed"
     check doc2["entrypoints"][0]["compileSkipped"].getBool == true
 
-    # --- Run 3: Nim UNCHANGED, cc identity changed (fake `cc` shadows the
-    #     real one) -> THE W3 liveness assertion: must recompile, not skip. ---
-    let shadowedPath = fakeCcDir & PathSep & realPath
-    let doc3 = runCrisol(envWithPath(shadowedPath))
-    check doc3["entrypoints"][0]["outcome"].getStr == "passed"
-    check doc3["entrypoints"][0]["compileSkipped"].getBool == false
+    # --- Run 3: Nim UNCHANGED, the configured compiler's identity changed
+    #     -> THE W3 liveness assertion: must recompile, not skip. ---
+    var run3: StringTableRef = nil
+    if msvc:
+      run3 = envWith("CL", "/DW3_LIVENESS")
+    elif defined(posix):
+      let shadowDir = workDir / "shadowcc"
+      createDir(shadowDir)
+      for driver in ["gcc", "clang", "cc"]:
+        let real = findExe(driver)
+        if real.len == 0: continue
+        let wrapper = shadowDir / driver
+        writeFile(wrapper, "#!/bin/sh\nexec " & real.quoteShell & " \"$@\"\n")
+        setFilePermissions(wrapper,
+          {fpUserRead, fpUserWrite, fpUserExec, fpGroupRead, fpGroupExec,
+           fpOthersRead, fpOthersExec})
+      run3 = envWith("PATH", shadowDir & PathSep & realPath)
+    if run3 == nil:
+      echo "CRISOL-SKIP-TEST: tests/integration/test_cc_depgraph_liveness.nim#gnu_on_windows_no_shadow"
+      skip()
+    else:
+      let doc3 = runCrisol(run3)
+      check doc3["entrypoints"][0]["outcome"].getStr == "passed"
+      check doc3["entrypoints"][0]["compileSkipped"].getBool == false
 
     # Clean up.
     removeDir(workDir)

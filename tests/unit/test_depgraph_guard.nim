@@ -24,6 +24,11 @@ import crisol/closure  # for buildSourceIndex — recordClosure needs a SourceIn
 import crisol/depgraph
 import crisol/clean     # for cleanOrphans — the BUG 2 clean scenario below
 import "../support/testep"
+from crisol/ccprobe import DriverLocation, DriverResolver
+
+let NoExternals: DriverResolver = proc(driver: string): DriverLocation =
+  DriverLocation(found: false,
+    why: "these manifests compile no external: no header probe runs")
 
 proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
   ## RFC-0009 A3c-ii: build a `HashSet[TrackedPath]` via `classify` under a
@@ -44,11 +49,11 @@ suite "depgraph writer guards (issue #5)":
     var g  = initDepGraph("")
     let fh = flagHash(@[])
     let prior = tpSet("tests/t.nim", "src/a.nim")
-    g.updateEntry("tests/t.nim", fh, prior, "hash-prior", 1)
+    g.updateEntry("tests/t.nim", fh, prior, @[], "hash-prior", 1)
 
     var raised = false
     try:
-      g.updateEntry("tests/t.nim", fh, initHashSet[TrackedPath](), "hash-empty", 1)
+      g.updateEntry("tests/t.nim", fh, initHashSet[TrackedPath](), @[], "hash-empty", 1)
     except CrisolError as e:
       raised = true
       check e.kind == cekInternal
@@ -60,13 +65,13 @@ suite "depgraph writer guards (issue #5)":
     var g  = initDepGraph("")
     let fh = flagHash(@[])
     expect CrisolError:
-      g.updateEntry("tests/new.nim", fh, initHashSet[TrackedPath](), "h", 1)
+      g.updateEntry("tests/new.nim", fh, initHashSet[TrackedPath](), @[], "h", 1)
     check ("tests/new.nim", fh) notin g.entries
 
   test "invalidateEntry drops the entry; absent key is a no-op":
     var g  = initDepGraph("")
     let fh = flagHash(@[])
-    g.updateEntry("tests/t.nim", fh, tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", fh, tpSet("tests/t.nim"), @[], "h", 1)
     g.invalidateEntry("tests/t.nim", fh)
     check ("tests/t.nim", fh) notin g.entries
     g.invalidateEntry("tests/t.nim", fh)          # idempotent
@@ -175,7 +180,8 @@ suite "recordClosure — recovery policy (R5)":
     var graph = initDepGraph("")
     let r = recordClosure(graph, cfg, testEp("tests/rec_ep.nim", group = "t"),
                           nc, "rec_ep",
-                          protocolMajor = 1, index = buildSourceIndex(cfg))
+                          protocolMajor = 1, index = buildSourceIndex(cfg),
+                          driver = NoExternals)
     check r.ok
     check r.error == ""
 
@@ -200,13 +206,14 @@ suite "recordClosure — recovery policy (R5)":
     let fh = flagHash(@[])
     # Pre-seed a fresh-looking prior entry — exactly what a naive writer
     # would leave behind on failure.
-    graph.updateEntry("tests/rec_fail.nim", fh, tpSet("tests/rec_fail.nim"),
+    graph.updateEntry("tests/rec_fail.nim", fh, tpSet("tests/rec_fail.nim"), @[],
                       "priorhash", 1)
     doAssert saveDepGraph(graph, cfg)
 
     let r = recordClosure(graph, cfg, testEp("tests/rec_fail.nim", group = "t"),
                           nc, "rec_fail",
-                          protocolMajor = 1, index = buildSourceIndex(cfg))
+                          protocolMajor = 1, index = buildSourceIndex(cfg),
+                          driver = NoExternals)
     check not r.ok
     check r.error.len > 0
     check ("tests/rec_fail.nim", fh) notin graph.entries
@@ -236,7 +243,8 @@ suite "recordClosure — recovery policy (R5)":
     var graph = initDepGraph("")
     let r = recordClosure(graph, cfg, testEp("tests/rec_persistfail.nim", group = "t"),
                           nc, "rec_persistfail",
-                          protocolMajor = 1, index = buildSourceIndex(cfg))
+                          protocolMajor = 1, index = buildSourceIndex(cfg),
+                          driver = NoExternals)
     check not r.ok
     check "dependency graph could not be persisted" in r.error
 
@@ -257,7 +265,7 @@ suite "saveDepGraph — return value (issue #13.3)":
     createDir(depgraphPath(cfg))
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     check not saveDepGraph(g, cfg)
     check not fileExists(depgraphPath(cfg))
 
@@ -267,7 +275,7 @@ suite "saveDepGraph — return value (issue #13.3)":
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     check saveDepGraph(g, cfg)
     check fileExists(depgraphPath(cfg))
 
@@ -280,7 +288,7 @@ suite "saveDepGraph — return value (issue #13.3)":
     let cfg = Config(projectRoot: root, stateDir: ".crisol", trackedRoots: roots)
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     check not saveDepGraph(g, cfg)
     check not fileExists(depgraphPath(cfg))
 
@@ -297,7 +305,7 @@ suite "depgraph load provenance: discarded persisted graph":
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     doAssert saveDepGraph(g, cfg)
 
     var d: DepGraphDiscard
@@ -333,7 +341,7 @@ suite "depgraph load provenance: discarded persisted graph":
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     doAssert saveDepGraph(g, cfg)
 
     var d: DepGraphDiscard
@@ -359,7 +367,7 @@ suite "depgraph load provenance: discarded persisted graph":
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     doAssert saveDepGraph(g, cfg)
 
     check loadDepGraph(cfg, "2.2.10").entries.len == 1
@@ -540,7 +548,7 @@ suite "depgraph load provenance: discarded persisted graph":
     check cfg.trackedRoots.deps[0].foldPolicy == fpAsciiLower
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     doAssert saveDepGraph(g, cfg)
 
     var d: DepGraphDiscard
@@ -557,7 +565,7 @@ suite "depgraph load provenance: discarded persisted graph":
     cfgWrite.trackedRoots = initTrackedRoots(root, @[("gonedep", root / "gonedep")], ".crisol",
                                              fixedProbe(fpNone))
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     doAssert saveDepGraph(g, cfgWrite)
 
     var cfgRead = Config(projectRoot: root, stateDir: ".crisol")
@@ -577,7 +585,7 @@ suite "depgraph load provenance: discarded persisted graph":
     var cfgWrite = Config(projectRoot: root, stateDir: ".crisol")
     cfgWrite.trackedRoots = initTrackedRoots(root, @[], ".crisol", fixedProbe(fpNone))
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     doAssert saveDepGraph(g, cfgWrite)
 
     # Same root NAME ("" — the project root), a DIFFERENT injected policy —
@@ -606,7 +614,7 @@ suite "RFC-0009 wiring-audit fix (BUG 2): saveDepGraph's preserveHeaderRoots":
     cfgWrite.trackedRoots = initTrackedRoots(root, @[("foo", depNative)], ".crisol",
                                              fixedProbe(fpNone))
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     doAssert saveDepGraph(g, cfgWrite)
 
     var d1: DepGraphDiscard
@@ -638,7 +646,7 @@ suite "RFC-0009 wiring-audit fix (BUG 2): saveDepGraph's preserveHeaderRoots":
     cfgWrite.trackedRoots = initTrackedRoots(root, @[("foo", depNative)], ".crisol",
                                              fixedProbe(fpNone))
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), "h", 1)
+    g.updateEntry("tests/t.nim", flagHash(@[]), tpSet("tests/t.nim"), @[], "h", 1)
     doAssert saveDepGraph(g, cfgWrite)
 
     var d1: DepGraphDiscard
@@ -694,12 +702,12 @@ suite "RFC-0009 wiring-audit fix (BUG 2): crisol clean + a renamed dep root, ful
     liveClosure.incl depMember.tp
 
     var g = initDepGraph("2.2.10")
-    g.updateEntry("tests/unit/test_live.nim", flagHash(@[]), liveClosure, "h-live", 1)
+    g.updateEntry("tests/unit/test_live.nim", flagHash(@[]), liveClosure, @[], "h-live", 1)
     # A STALE entry for an entrypoint discover() will NOT find under either
     # config below -- `clean` GCs it, which is what makes gcCount > 0 and
     # triggers the save this bug is about.
     g.updateEntry("tests/unit/test_gone.nim", flagHash(@[]),
-                  tpSet("tests/unit/test_gone.nim"), "h-gone", 1)
+                  tpSet("tests/unit/test_gone.nim"), @[], "h-gone", 1)
     doAssert saveDepGraph(g, cfgWrite)
 
     var dPre: DepGraphDiscard
@@ -708,7 +716,7 @@ suite "RFC-0009 wiring-audit fix (BUG 2): crisol clean + a renamed dep root, ful
 
     # Rename foo -> bar, then run `crisol clean`.
     let cfgRenamed = makeCfg("bar")
-    let report = cleanOrphans(cfgRenamed)
+    let report = cleanOrphans(cfgRenamed, knownToolchain("", ""))
     check report.graphEntriesDropped == 1   # only "test_gone.nim" -- proves the GC actually ran
 
     # The header on disk must still name "foo" -- NOT re-stamped to "bar".

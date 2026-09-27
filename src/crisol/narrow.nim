@@ -1,15 +1,18 @@
-## narrow.nim — D3+D4: diff ∩ closure selection with conservative fallback taxonomy.
+## narrow.nim — D3+D4: diff ∩ closure selection with conservative fallback.
 ##
-## `narrowByDiff` is a PURE function (no I/O beyond `isEntryStale`'s
-## file-existence probes) that keeps only those entrypoints whose dependency
-## closure intersects the changed-file set.  The safe bias is the whole point:
+## `narrowByDiff` keeps only those entrypoints whose watched set (closure
+## members plus recorded links) the changed-file set reaches. Its only I/O is
+## rule 4's staleness check (`depgraph.isEntryStale`, i.e. `entryDrift`: a
+## member's existence, each recorded link's target, and whether a directory
+## on a member's path is now an unrecorded link); every other rule is pure
+## (rule 5 is `depgraph.diffReach`).  The safe bias is the whole point:
 ## uncertainty ALWAYS includes; the ONLY exclusion path is a known-fresh-entry
 ## closure-miss.
 ##
-## D3 covers the known-closure case (entry present in graph).
-## D4 adds the full uncertainty taxonomy (graph absent / own-file-changed /
-## unknown closure / stale entry) with per-ep selection reasons and a
-## human-facing summary-message helper.
+## Why an entrypoint was included is not returned (R13-D6): nothing reads
+## it, and `--json` reports the plan, not the rule. A caller that wants the
+## evidence for rule 5 asks `depgraph.diffReach` (a typed `Hit`), and for
+## rule 4 `depgraph.entryDrift` (a typed `Drift`).
 ##
 ## ## "Graph absent" vs "entry missing"
 ##
@@ -20,147 +23,59 @@
 ## represents "the graph was never built or was invalidated wholesale".  A
 ## graph with entries but no key for *this* ep is "unknown closure".
 
-import std/[sets, strutils, tables]
+import std/[options, sets, tables]
 import crisol/types
 import crisol/depgraph
 import crisol/paths
 
 # ---------------------------------------------------------------------------
-# Public: selection-reason taxonomy
-# SelectionReason and SelectionResult are defined in types.nim and re-exported
-# from there so callers need only `import crisol/types`.
-
-# ---------------------------------------------------------------------------
-# Public: detailed selector (D4)
-# ---------------------------------------------------------------------------
-
-proc selectByDiff*(eps: seq[Entrypoint];
-                   changed: HashSet[TrackedPath];
-                   graph: DepGraph;
-                   roots: TrackedRoots;
-                   projectRoot: string): seq[SelectionResult] =
-  ## Detailed selector: returns each included entrypoint with its
-  ## `SelectionReason`.  Entrypoints that are excluded (known-fresh closure
-  ## miss) do NOT appear in the result.
-  ##
-  ## Rule precedence for each `ep` (evaluated in order; first match wins):
-  ##   1. **srGraphAbsent**    — graph.entries is empty (graph absent/empty).
-  ##   2. **srOwnFileChanged** — ep.tp ∈ changed.
-  ##   3. **srUnknownClosure** — no entry in graph for (ep.tp.display(), flagHash(ep.flags)).
-  ##   4. **srStaleEntry**     — isEntryStale returns true (a closure file vanished).
-  ##   5. **srClosureHit**     — known fresh closure ∩ changed ≠ ∅ (both already
-  ##                             `HashSet[TrackedPath]` — RFC-0009 A3c-ii;
-  ##                             `entry.closure` is compared directly, no
-  ##                             string->TrackedPath reduction needed) → include.
-  ##   (excluded)              — known fresh closure ∩ changed = ∅  → skip.
-  ##
-  ## Input order of `eps` is preserved.  The only side effect is the
-  ## `fileExists` calls inside `isEntryStale` (D2's responsibility).
-  result = newSeq[SelectionResult]()
-  let graphAbsent = graph.entries.len == 0
-  for ep in eps:
-    # Rule 1: graph entirely absent → force-include everything.
-    if graphAbsent:
-      result.add (ep: ep, reason: srGraphAbsent)
-      continue
-
-    # Rule 2: entrypoint's own source file was edited → always run.
-    # `ep.tp` already IS the entrypoint's TrackedPath identity — no
-    # re-derivation via `fromCanonical` needed.
-    if ep.tp in changed:
-      result.add (ep: ep, reason: srOwnFileChanged)
-      continue
-
-    let key = entryKey(ep.tp, ep.flags)
-
-    # Rule 3: no entry in graph for this key → unknown closure.
-    if key notin graph.entries:
-      result.add (ep: ep, reason: srUnknownClosure)
-      continue
-
-    # Rule 4: entry exists but a closure file has been deleted → stale.
-    if isEntryStale(graph, key, projectRoot, roots):
-      result.add (ep: ep, reason: srStaleEntry)
-      continue
-
-    # Rule 5: known fresh closure — include iff it intersects `changed`.
-    # RFC-0009 A3c-ii: `graph.entries[key].closure` is already
-    # `HashSet[TrackedPath]` (classified at load, `depgraph.fromJson`) —
-    # compared directly against `changed`, no reduction step.
-    if not disjoint(graph.entries[key].closure, changed):
-      result.add (ep: ep, reason: srClosureHit)
-    # else: closure miss → excluded (the only exclusion path)
-
-# ---------------------------------------------------------------------------
-# Public: summary message helper (D4)
-# ---------------------------------------------------------------------------
-
-proc fallbackNotes*(selected: seq[SelectionResult]; totalDiscovered: int): string =
-  ## Pure function: given the detailed selection result and the total number of
-  ## discovered entrypoints, return a human-facing notes string describing any
-  ## conservative over-selection.
-  ##
-  ## Emits (in order, each on its own line, only when applicable):
-  ##   "dep graph absent — full run"
-  ##     → when every selected ep carries srGraphAbsent.
-  ##   "N entrypoint(s) force-included: K unknown closure, J stale, I own-file"
-  ##     → when any ep was conservatively included for non-hit reasons.
-  ##
-  ## Returns "" when the selection was entirely precise (only srClosureHit,
-  ## or nothing selected at all with no conservative inclusions).
-  var
-    graphAbsentCount  = 0
-    ownFileCount      = 0
-    unknownCount      = 0
-    staleCount        = 0
-    closureHitCount   = 0
-  for item in selected:
-    case item.reason
-    of srGraphAbsent:    inc graphAbsentCount
-    of srOwnFileChanged: inc ownFileCount
-    of srUnknownClosure: inc unknownCount
-    of srStaleEntry:     inc staleCount
-    of srClosureHit:     inc closureHitCount
-
-  var lines: seq[string] = @[]
-
-  # When the entire run is driven by absent graph, say so explicitly.
-  if graphAbsentCount > 0 and graphAbsentCount == selected.len:
-    lines.add "dep graph absent — full run"
-  elif graphAbsentCount > 0:
-    # Mixed: some srGraphAbsent among others (shouldn't occur given rule 1
-    # short-circuits everything, but be safe).
-    lines.add "dep graph absent — full run"
-
-  # Conservative force-inclusions beyond the graph-absent case.
-  let forceCount = ownFileCount + unknownCount + staleCount
-  if forceCount > 0:
-    var parts: seq[string] = @[]
-    if unknownCount > 0: parts.add $unknownCount & " unknown closure"
-    if staleCount   > 0: parts.add $staleCount   & " stale"
-    if ownFileCount > 0: parts.add $ownFileCount  & " own-file"
-    lines.add $forceCount & " entrypoint(s) force-included: " & parts.join(", ")
-
-  result = lines.join("\n")
-
-# ---------------------------------------------------------------------------
-# Public: pipeline API (D3+D4 combined; RFC signature)
+# Public: the selector
 # ---------------------------------------------------------------------------
 
 proc narrowByDiff*(eps: seq[Entrypoint];
                    changed: HashSet[TrackedPath];
                    graph: DepGraph;
-                   roots: TrackedRoots;
-                   projectRoot: string): seq[Entrypoint] =
-  ## PURE: returns the subset of `eps` that should be run given `changed`.
-  ## Delegates to `selectByDiff` for the full D4 taxonomy; strips reasons for
-  ## callers that only need the entrypoint list.
+                   roots: TrackedRoots): seq[Entrypoint] =
+  ## Returns the subset of `eps` that should be run given `changed`. Every
+  ## path is resolved through `roots`.
   ##
-  ## Input order of `eps` is preserved in the output.
-  let detailed = selectByDiff(eps, changed, graph, roots, projectRoot)
+  ## Rules for each `ep` (evaluated in order; the first that applies
+  ## includes it):
+  ##   1. graph absent  — graph.entries is empty.
+  ##   2. own file      — ep.tp ∈ changed.
+  ##   3. unknown       — no entry in graph for (ep.tp.display(), flagHash(ep.flags)).
+  ##   4. stale         — isEntryStale returns true (`entryDrift`: a
+  ##                      closure file vanished, a recorded link moved, or
+  ##                      a directory on a member's path is now a link the
+  ##                      entry did not record, R13-S1).
+  ##   5. reached       — `depgraph.diffReach` finds the changed set
+  ##                      reaching the fresh entry's watched set: a changed
+  ##                      name is a member, is or contains or lies under a
+  ##                      recorded link (R12-D1), or is a directory above a
+  ##                      member (R13-S1: a submodule turned into a link is
+  ##                      named by its own path alone).
+  ##   (excluded)       — none of them → skip.
+  ##
+  ## Input order of `eps` is preserved.  The only file-system reads are
+  ## `isEntryStale`'s (rule 4).
   result = newSeq[Entrypoint]()
-  for item in detailed:
-    result.add item.ep
+  let graphAbsent = graph.entries.len == 0
+  for ep in eps:
+    # Rule 1: graph entirely absent → include everything.
+    # Rule 2: the entrypoint's own source file was edited. `ep.tp` already
+    # IS the entrypoint's TrackedPath identity.
+    if graphAbsent or ep.tp in changed:
+      result.add ep
+      continue
+    let key = entryKey(ep.tp, ep.flags)
+    # Rule 3: no entry in graph for this key → unknown closure.
+    # Rule 4: the entry has drifted from the file system → stale.
+    # Rule 5: known fresh entry — include iff the changed set reaches its
+    # watched set (`depgraph.diffReach`, the one diff-selection predicate).
+    if key notin graph.entries or isEntryStale(graph, key, roots) or
+        diffReach(graph.entries[key], changed, roots).isSome:
+      result.add ep
+    # else: closure miss → excluded (the only exclusion path)
 
 # ---------------------------------------------------------------------------
 # Public: NFC/NFD changed-set fold-trust lever (RFC-0009 "Risks accepted")

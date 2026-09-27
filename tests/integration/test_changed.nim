@@ -205,7 +205,7 @@ suite "crisol D5 — --changed end-to-end":
   test "--changed --dry-run narrows to the affected entrypoint":
     ## A project with two independent test entrypoints (no shared imports).
     ## Modify one; with an absent dep graph the conservative fallback selects
-    ## EVERYTHING (srGraphAbsent), so the plan must include BOTH — and crucially
+    ## EVERYTHING (graph absent), so the plan must include BOTH — and crucially
     ## must not error.  This proves the --changed seam is wired and the
     ## graph-absent full-run bias holds.
     let repo = uniqueTmpDir("e2e")
@@ -333,9 +333,9 @@ suite "crisol D5 — --failed --changed union":
     var graph = initDepGraph("2.2.10")
     let fh = flagHash(@[])
     graph.updateEntry("tests/unit/test_a.nim", fh,
-                      [fromCanonical("tests/unit/test_a.nim", roots).get].toHashSet)
+                      [fromCanonical("tests/unit/test_a.nim", roots).get].toHashSet, @[])
     graph.updateEntry("tests/unit/test_b.nim", fh,
-                      [fromCanonical("tests/unit/test_b.nim", roots).get].toHashSet)
+                      [fromCanonical("tests/unit/test_b.nim", roots).get].toHashSet, @[])
 
     # Only test_b changed on disk.
     var changed = initHashSet[TrackedPath]()
@@ -348,7 +348,7 @@ suite "crisol D5 — --failed --changed union":
     # --- replicate buildPlanView's union narrowing exactly ---
     let failedNarrowed = eps.filterIt(
       (tp: it.tp, group: it.group) in failedKeys)
-    let changedNarrowed = narrowByDiff(eps, changed, graph, roots, "")
+    let changedNarrowed = narrowByDiff(eps, changed, graph, roots)
 
     check failedNarrowed.mapIt(string(it.tp.display())) == @["tests/unit/test_a.nim"]
     check changedNarrowed.mapIt(string(it.tp.display())) == @["tests/unit/test_b.nim"]

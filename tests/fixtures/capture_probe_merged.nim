@@ -1,19 +1,20 @@
-## capture_probe_merged.nim — fixture for CR4's merged-stream (`drainToEof`)
-## deadline case.
+## capture_probe_merged.nim — the merged-stream counterpart of
+## `capture_probe.nim`.
 ##
-## Runs `toolrun.realRunMerged` on the program named in argv[1] and reports
-## the outcome on a single line, then exits. `realRunMerged` is the MERGED-
-## stream path (`poStdErrToStdOut` -> `toolexec.drainToEofDeadline`), the
-## counterpart to `capture_probe.nim`'s separate-stream (`drainBothDeadline`)
-## path. Like `capture_probe.nim`/`gitdiff_probe.nim`, it exists so a test can
-## put a DEADLINE around a call whose pre-fix defect is an unbounded hang.
+## Runs `toolrun.realRunMerged` (`poStdErrToStdOut`: one pipe) on the program
+## named in argv[1] and reports the ending on a single line, then exits, so
+## a test can put a DEADLINE around a call whose defect is a hang.
 ##
 ## Usage: capture_probe_merged <program>
-## Prints: OK ok=<true|false> outLen=<n>
+## Prints: OK ending=<RunEnd> exit=<n> outLen=<n>
+##   (`exit` is -1 and `outLen` 0 unless the ending is reExited)
 
 import std/os
 import crisol/toolrun
 
 when isMainModule:
-  let (output, ok) = realRunMerged(paramStr(1), [])
-  echo "OK ok=", ok, " outLen=", output.len
+  let r = realRunMerged(paramStr(1), [])
+  if r.ending == reExited:
+    echo "OK ending=", r.ending, " exit=", r.exitCode, " outLen=", r.output.len
+  else:
+    echo "OK ending=", r.ending, " exit=-1 outLen=0"

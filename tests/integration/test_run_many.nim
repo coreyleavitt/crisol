@@ -20,6 +20,7 @@ import crisol/types
 import crisol/runner
 from crisol/process/types as ptypes import nil
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -129,7 +130,7 @@ suite "execute — continue-on-failure aggregation":
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g).results
+    let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
     check results.len == 2
     for r in results:
       check outcome(r) == oPassed
@@ -158,7 +159,7 @@ suite "execute — continue-on-failure aggregation":
     proc onR(r: EntrypointResult) = inc callbackFired
 
     var g = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g, onResult = onR).results
+    let results = execute(p, config = cfg, graph = g, onResult = onR, toolchain = unprobedToolchain()).results
 
     # All three entrypoints must have produced a result — continue-on-failure.
     check results.len == 3
@@ -194,7 +195,7 @@ suite "execute — continue-on-failure aggregation":
     ]
     let p = plan(cfg, eps, emptyDepGraph())
     var g = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g).results
+    let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
     check results.len == 2
     let s = summarize(results)
     check s.total  == 2

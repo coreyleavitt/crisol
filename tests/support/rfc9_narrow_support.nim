@@ -1,7 +1,7 @@
 ## tests/support/rfc9_narrow_support.nim — RFC-0009 A3b-ii shared test
 ## helpers for narrow.nim's TrackedPath-typed `changed` parameter.
 ##
-## `selectByDiff`/`narrowByDiff` take `changed: HashSet[TrackedPath]` and a
+## `narrowByDiff` takes `changed: HashSet[TrackedPath]` and a
 ## `roots: TrackedRoots`. These two helpers exist so the ~20 call sites
 ## across test_narrow.nim/test_fallback.nim/test_closure_searchpath.nim do
 ## not each hand-roll the same `fromCanonical(...).get` boilerplate.

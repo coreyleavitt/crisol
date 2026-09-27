@@ -1,35 +1,29 @@
-## tests/integration/test_cr4_tool_deadline.nim — CR4 (code review
+## tests/integration/test_tool_capture_deadline.nim — CR4 (code review
 ## 2026-09-21): a deadline on the tool-invocation capture layer.
 ##
-## `toolexec.drainToEof`/`drainBoth` loop until genuine EOF -- the POSIX arm
-## of `drainBoth` polls with an INFINITE timeout, the Windows arm spins
-## forever -- and every caller then calls `waitForExit()` with no timeout and
-## never terminates the child. `toolrun.runViaOsproc` and `gitdiff.runGit` run
-## in the HOST PROCESS during plan-building, entirely outside RFC-0007's
-## Supervisor (`compileTimeoutMs`, tree-kill) -- so a `git` blocked on an
-## SSH/credential prompt, or a wedged `cc --version`, hangs the whole
-## invocation forever. See docs/handoff/msvc-selection-layer.md's CR4 row.
+## The original capture loops waited for genuine EOF with no bound (the POSIX
+## arm polled with an INFINITE timeout, the Windows arm spun forever), and
+## every caller then called `waitForExit()` with no timeout and never
+## terminated the child. `toolrun`'s probes and `gitdiff`'s git calls run in
+## the HOST PROCESS during plan-building, entirely outside RFC-0007's
+## Supervisor, so a `git` blocked on a credential prompt, or a wedged
+## `cc --version`, hung the whole invocation.
 ##
-## Three production paths are exercised, matching CR4's two exposed callers
-## and toolexec's two drain shapes:
-##   1. `toolrun.realRunMerged` (merged stream -> `toolexec.drainToEofDeadline`)
-##   2. `toolrun.realRun`       (separate streams -> `toolexec.drainBothDeadline`)
-##   3. `gitdiff.changedFiles`  (separate streams -> `toolexec.drainBothDeadline`,
-##      via `runGit`)
+## Three production paths are exercised, one per capture shape and caller:
+##   1. `toolrun.realRunMerged` (merged streams, one pipe)
+##   2. `toolrun.realRun`       (separate streams, two pipes)
+##   3. `gitdiff.changedFiles`  (separate streams, via `runGit`)
 ##
 ## A hang cannot be asserted from inside the process that would be hung, so
 ## each call runs in a small driver fixture (`capture_probe_merged.nim`,
 ## `capture_probe.nim`, `gitdiff_probe.nim`) under `tests/support/deadline`'s
-## OUTER wall-clock bound -- a second, independent deadline so a bug in this
-## fix cannot re-hang the suite the way the original defect would.
+## OUTER wall-clock bound -- a second, independent deadline so a bug in the
+## capture cannot re-hang the suite.
 ##
-## RED (pre-fix): every driver process itself hangs forever (the old
-## `drainToEof`/`drainBoth` + `waitForExit()` never give up), so the OUTER
-## `runWithDeadline` bound trips first and kills the driver -- `finished`
-## comes back `false`. GREEN (post-fix): the driver's own internal deadline
+## RED (a capture with no deadline): the driver hangs, the OUTER bound trips
+## first and `finished` comes back `false`. GREEN: the driver's own deadline
 ## (`toolrun.ToolProbeTimeoutMs` / `gitdiff.GitToolTimeoutMs`, both 10 s) is
-## reached well inside the outer bound, so the driver exits cleanly and
-## `finished` is `true`.
+## reached well inside the outer bound and the run reports a timeout.
 
 import std/[os, osproc, strutils, unittest]
 import ../support/deadline
@@ -77,19 +71,19 @@ let fakeGitBin = block:
 
 suite "CR4 — the tool-invocation capture layer gives up on a child that never exits":
 
-  test "toolrun.realRunMerged (drainToEofDeadline) gives up on a child that never exits":
+  test "toolrun.realRunMerged (one pipe) gives up on a child that never exits":
     let (finished, line) = runWithDeadline(mergedProbeBin, @[hangBin], OuterBoundMs)
-    check finished   # RED pre-fix: realRunMerged waits on drainToEof + waitForExit forever
+    check finished   # RED: an unbounded capture waits forever
     if finished:
-      check line == "OK ok=false outLen=0"
+      check line == "OK ending=reTimedOut exit=-1 outLen=0"
 
-  test "toolrun.realRun (drainBothDeadline) gives up on a child that never exits":
+  test "toolrun.realRun (two pipes) gives up on a child that never exits":
     let (finished, line) = runWithDeadline(separateProbeBin, @[hangBin], OuterBoundMs)
-    check finished   # RED pre-fix: realRun waits on drainBoth + waitForExit forever
+    check finished   # RED: an unbounded capture waits forever
     if finished:
-      check line == "OK ok=false outLen=0"
+      check line == "OK ending=reTimedOut exit=-1 outLen=0"
 
-  test "gitdiff.changedFiles (drainBothDeadline via runGit) gives up on a git that never answers":
+  test "gitdiff.changedFiles (two pipes, via runGit) gives up on a git that never answers":
     putEnv("PATH", fakeGitBin.dir & $PathSep & getEnv("PATH"))
     putEnv("CRISOL_FAKE_GIT_HANG_SUBCOMMAND", "rev-parse")
     defer:
@@ -97,10 +91,10 @@ suite "CR4 — the tool-invocation capture layer gives up on a child that never 
     let projectRoot = binDir / "not_a_real_git_call_target"
     createDir(projectRoot)
     let (finished, line) = runWithDeadline(gitProbeBin, @[projectRoot], OuterBoundMs)
-    check finished   # RED pre-fix: changedFiles waits on runGit's drainBoth + waitForExit forever
+    check finished   # RED: an unbounded capture waits forever
     if finished:
       check line.startsWith("RAISED")
       # `gitdiff_probe` prints only the message's last 32 chars (`tail=`);
       # the raised message is worded to end with this fixed marker so the
       # timeout path is identifiable regardless of `projectRoot`'s length.
-      check "CR4 git timeout" in line
+      check "[git timeout]" in line

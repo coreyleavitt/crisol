@@ -164,8 +164,8 @@ m_m5()  { append src/crisol/types.nim 'type ZzF* = proc (trusted: bool = true) {
 m_m5b() { append src/crisol/types.nim 'proc zzOuter*(cb: proc (x: int = 1) {.nimcall.} = nil) = discard'; }
 m_m7()  { append src/crisol/types.nim "$(printf '%s\n%s' 'type ZzObj* = object' '  trusted*: bool = true')"; }
 m_m7v() {
-  sed -i 's/^    policy\*: string = "none"/    policy*: string = "hmac"/' src/crisol/types.nim
-  grep -q '^    policy\*: string = "hmac"' src/crisol/types.nim
+  sed -i 's/^    claimOrphans\*: bool = true/    claimOrphans*: bool = false/' src/crisol/process/types.nim
+  grep -q '^    claimOrphans\*: bool = false' src/crisol/process/types.nim
 }
 # Not valid Nim: the scanner's own contract (a keyword it cannot resolve to a
 # known header shape is cannot-tell, never silently dropped).
@@ -325,7 +325,7 @@ case_ "R7-S2 M7: new object-field default is drift" 1 m_m7 \
   "+  > src/crisol/types.nim:ZzObj.trusted = true" '=1:  > ' '-  < ' '-  ~ ' \
   "+OPEN its reason with the bucket letter it was"
 case_ "R7-S2 M7: changed object-field default is drift naming old and new" 1 m_m7v \
-  '+  ~ src/crisol/types.nim:TrustConfig.policy: pinned `= "none"`, observed `= "hmac"`' \
+  '+  ~ src/crisol/process/types.nim:ChildSpec.claimOrphans: pinned `= true`, observed `= false`' \
   '=1:  ~ ' '-  < ' '-  > '
 case_ "R8-S2: \`T* =\` / \`object\` field default is drift" 1 m_r8_split \
   "+  > src/crisol/types.nim:ZzSplit.trusted = true" '=1:  > ' '-  < ' '-  ~ '

@@ -33,6 +33,7 @@ import std/[os, times, unittest]
 import crisol            # imports runMain
 import crisol/[types, runner, depgraph, planner]
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_a2c_" & tag & "_" &
@@ -74,9 +75,9 @@ suite "rfc-0007 A2c — compile child cwd is projectRoot regardless of the invok
     defer: setCurrentDir(savedCwd)
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:

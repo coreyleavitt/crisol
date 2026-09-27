@@ -102,6 +102,7 @@ when defined(posix):
   import "../support/testep"
   import "../support/helpers"  # r35: legacySeams
   import "../support/statedir"
+  import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
   # R8-D3: this process's own crisol state dir -- never the repo root's shared
   # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -168,7 +169,8 @@ when defined(posix):
 
         let hook = proc(graph: var DepGraph; config: Config; ep: Entrypoint;
                         nimcacheDir, binaryName: string; protocolMajor: int;
-                        index: SourceIndex; ccRun: RunProc): tuple[ok: bool, error: string] =
+                        index: SourceIndex; driver: DriverResolver;
+                        ccRun: RunProc): tuple[ok: bool, error: string] =
           if string(ep.tp.display()).endsWith("pass_fast.nim"):
             # A's own compile just succeeded — B's slower compile is still
             # running in the background. Sleep well past B's staticExec
@@ -178,7 +180,7 @@ when defined(posix):
             # compile has genuinely exited.
             os.sleep(6000)
             discard posix.kill(posix.getpid(), cint(SIGINT))
-          recordClosure(graph, config, ep, nimcacheDir, binaryName, protocolMajor, index, ccRun)
+          recordClosure(graph, config, ep, nimcacheDir, binaryName, protocolMajor, index, driver, ccRun)
 
         let cfg = baseCfg(jobs = 2)
         let p   = plan(cfg, @[epA, epB], emptyDepGraph())
@@ -188,7 +190,7 @@ when defined(posix):
         # ExecuteReport instead.
         let execReport = execute(p, config = cfg, graph = g, onResult = onRes,
                                  showProgress = false, progressIntervalMs = 30_000,
-                                 installSignals = true, recordClosureFn = hook)
+                                 installSignals = true, recordClosureFn = hook, toolchain = unprobedToolchain())
         let interrupted = execReport.interrupted
         let notStarted  = execReport.notStarted
 
@@ -242,7 +244,8 @@ when defined(posix):
 
         let hook = proc(graph: var DepGraph; config: Config; ep: Entrypoint;
                         nimcacheDir, binaryName: string; protocolMajor: int;
-                        index: SourceIndex; ccRun: RunProc): tuple[ok: bool, error: string] =
+                        index: SourceIndex; driver: DriverResolver;
+                        ccRun: RunProc): tuple[ok: bool, error: string] =
           if string(ep.tp.display()).endsWith("slow_compile.nim"):
             # D has had A's entire 3s+ compile floor to finish compiling and
             # start running (ignoring SIGTERM) — safely established by now.
@@ -258,7 +261,7 @@ when defined(posix):
                                                                  # very first
                                                                  # drain-loop
                                                                  # poll sees it.
-          recordClosure(graph, config, ep, nimcacheDir, binaryName, protocolMajor, index, ccRun)
+          recordClosure(graph, config, ep, nimcacheDir, binaryName, protocolMajor, index, driver, ccRun)
 
         let cfg = baseCfg(jobs = 3)
         let p   = plan(cfg, @[epA, epC, epD], emptyDepGraph())
@@ -267,7 +270,7 @@ when defined(posix):
         # `.interrupted` off the returned ExecuteReport instead.
         let execReport = execute(p, config = cfg, graph = g, onResult = onRes,
                                  showProgress = false, progressIntervalMs = 30_000,
-                                 installSignals = true, recordClosureFn = hook)
+                                 installSignals = true, recordClosureFn = hook, toolchain = unprobedToolchain())
         let interrupted = execReport.interrupted
 
         let deltaMs = if sigint2At > 0.0 and dDoneAt > 0.0: (dDoneAt - sigint2At) * 1000.0 else: -1.0
@@ -361,18 +364,18 @@ when defined(posix):
         # Pass 1: a short run timeout so `hang.nim`'s run child is killed by
         # the ordinary timeout path — compile succeeds either way, so the
         # closure records and the binary promotes to the stable path exactly
-        # as decideExit's `promoteBinary` (oKilled is NOT in its exclusion
+        # as decideExit's `bdPromote` (oKilled is NOT in its exclusion
         # set) already documents.
         let cfg1 = Config(projectRoot: root, stateDir: ".crisol", jobs: 1,
                           timeoutSecs: 1, compileTimeoutSecs: 60,
                           maxOutputBytes: 65_536, trackedRoots: trackedRoots)
-        let plan1 = plan(cfg1, @[ep], graph, nimVersion = "")
+        let plan1 = plan(cfg1, @[ep], graph)
         check plan1.entrypoints[0].edecision == edNeverBuilt
         discard execute(plan1, config = cfg1, graph = graph, nimVersion = "",
-                        showProgress = false)
+                        showProgress = false, toolchain = unprobedToolchain())
 
         # Pass 2 must now see a stable binary + matching closure: edRunFresh.
-        let plan2 = plan(cfg1, @[ep], graph, nimVersion = "")
+        let plan2 = plan(cfg1, @[ep], graph)
         check plan2.entrypoints[0].edecision == edRunFresh
 
         # A real, active cache — `load` always misses, so `lookupAtPlan`
@@ -414,7 +417,7 @@ when defined(posix):
         let execReport = execute(plan2, config = cfg2, graph = graph, nimVersion = "",
                                  onResult = onRes, showProgress = false,
                                  progressIntervalMs = 30_000, installSignals = true,
-                                 cache = cache)
+                                 cache = cache, toolchain = unprobedToolchain())
         # Reap the signaler so it doesn't linger as a zombie past this quit(0).
         var wstatus: cint = 0
         discard waitpid(sigPid, wstatus, 0)

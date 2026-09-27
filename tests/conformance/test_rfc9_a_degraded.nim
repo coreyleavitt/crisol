@@ -16,7 +16,7 @@
 ##                narrowing keys on it.
 ##   test_b.nim — passes on RUN 1; its content is edited (UNCOMMITTED) right
 ##                after, so a git diff (working tree vs HEAD) shows it
-##                changed — `srOwnFileChanged` (Rule 2, narrow.nim), no
+##                changed — its own file (narrowByDiff rule 2), no
 ##                dep-graph closure needed.
 ##   test_c.nim — passes on RUN 1; NEVER touched again. Neither failed nor
 ##                changed — the entry that proves narrowing is non-vacuous: a
@@ -179,7 +179,7 @@ suite "RFC-0009 A-degraded — D3 forces full selection, D4 bypasses the cache, 
     let controlPaths = rControl.plan.entrypoints.mapIt(string(it.ep.tp.display()))
     echo "A-DEGRADED CONTROL selected: ", $controlPaths
     check "tests/unit/test_a.nim" in controlPaths   # via --failed
-    check "tests/unit/test_b.nim" in controlPaths   # via --changed (srOwnFileChanged)
+    check "tests/unit/test_b.nim" in controlPaths   # via --changed (its own file, rule 2)
     # MANDATORY NEGATIVE CONTROL — proves the fixture is non-vacuous: a
     # healthy run genuinely narrows (excludes an entry neither criterion hits).
     check "tests/unit/test_c.nim" notin controlPaths
@@ -240,7 +240,8 @@ suite "RFC-0009 A-degraded — D3 forces full selection, D4 bypasses the cache, 
     # `test_configured_cache_degraded_trackedroots_rejects_even_an_outside_root`.
     let outsideRemote = uniqueTmpDir("d7_5_outside_remote")
     createDir(outsideRemote)
-    let cfg5 = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & outsideRemote)])
+    let cfg5 = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & outsideRemote)],
+                           trust: TrustConfig(policy: "none"))
 
     # Healthy control's REAL trackedRoots: a genuinely-outside remote is
     # ALLOWED (non-vacuous — proves the rejection below isn't simply

@@ -23,6 +23,7 @@ when defined(posix):
   import crisol/sandbox
   import "../support/testep"
   import "../support/statedir"
+  import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
   # R8-D3: this process's own crisol state dir -- never the repo root's shared
   # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -135,7 +136,7 @@ when defined(posix):
           # rfc-0007 code-review r7: `interruptedOut`/`shutdownSignalOut` ptr
           # params are gone — read straight off the returned ExecuteReport.
           let execReport = execute(p, config = cfg, graph = g, cache = cacheDisabled(hangSpec),
-                                   installSignals = true)
+                                   installSignals = true, toolchain = unprobedToolchain())
           let interrupted    = execReport.interrupted
           let shutdownSignum = execReport.shutdownSignal
           if interrupted:
@@ -218,7 +219,7 @@ when defined(posix):
 
       var g = emptyDepGraph()
       # rfc-0007 A1e-ii: no CrisolInterrupted to catch any more — a plain call.
-      let results = execute(p, config = cfg, graph = g, installSignals = true).results
+      let results = execute(p, config = cfg, graph = g, installSignals = true, toolchain = unprobedToolchain()).results
 
       check results.len == 1
       check results[0].outcome == oPassed
@@ -235,7 +236,7 @@ when defined(posix):
       let p    = plan(cfg, eps, emptyDepGraph())
 
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g, installSignals = true).results
+      let results = execute(p, config = cfg, graph = g, installSignals = true, toolchain = unprobedToolchain()).results
 
       check results.len == 1
       check results[0].outcome == oFailed

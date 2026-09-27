@@ -9,9 +9,9 @@
 ##
 ## Strategy (mirrors tests/timing/test_interrupt_e2e.nim's proven jobs=2
 ## race-free pattern, in-process via `runTestsWith` rather than a compiled
-## CLI subprocess — the injected two-tier `CacheDeps` this proves against
+## CLI subprocess — the injected two-tier `RunDeps` this proves against
 ## is a test-only seam with no CLI surface):
-##   1. Fork a child. Inside it: build a two-`memory`-tier `CacheDeps` (l1 +
+##   1. Fork a child. Inside it: build a two-`memory`-tier `RunDeps` (l1 +
 ##      a counting-wrapped l2 "remote" tier) and run `runTestsWith` over
 ##      `pass_fast.nim` (fast — writes a marker file, then exits 0) and
 ##      `hang_forever.nim` (never exits on its own), `jobs: 2` so both are
@@ -36,6 +36,7 @@
 when defined(posix):
   import std/[os, posix, strutils, times, unittest]
   import crisol/api
+  import crisol/runcore  # runTestsWith/RunDeps (uncontracted)
   import crisol/sandbox
   import crisol/types      # CacheConfig
   import crisol/cachetier   # Tier, TieredCache
@@ -43,6 +44,7 @@ when defined(posix):
   import crisol/cacheregistry # CacheRuntime
   import crisol/cacheport  # CacheBackend, nonePolicy, NilSink
   import crisol/cachetelemetry # TelemetryEvent
+  import crisol/ccidentity # cachedToolchainProbe: RunDeps.ccProbe
 
   proc fixtureDir(): string =
     let thisFile = currentSourcePath()
@@ -97,7 +99,7 @@ when defined(posix):
       if childPid == 0:
         # =====================================================================
         # CHILD: install signal handlers (installSignals:true), run over
-        # pass_fast.nim + hang_forever.nim with a two-tier CacheDeps.
+        # pass_fast.nim + hang_forever.nim with a two-tier RunDeps.
         # =====================================================================
         putEnv("CRISOL_PASS_FAST_MARKER", markerFile)
         putEnv("CRISOL_STATE_DIR", stateDir)
@@ -111,7 +113,7 @@ when defined(posix):
         # resolved inside this closure) -- this fixture builds its own
         # fixed two-tier CacheRuntime and never needs real secrets, so it is
         # accepted and discarded like the other three unused params.
-        let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; sd: string; maxEntries: int;
+        let deps = RunDeps(ccProbe: cachedToolchainProbe, buildRuntime: proc(cfg: CacheConfig; sd: string; maxEntries: int;
                                                 resolvedSecrets: CacheSecrets;
                                                 trackedRoots: TrackedRoots): CacheRuntime =
           discard cfg; discard sd; discard maxEntries; discard resolvedSecrets

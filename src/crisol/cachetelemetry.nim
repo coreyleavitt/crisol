@@ -152,13 +152,10 @@ type
       ## Lookups actually consulted: every per-result `CacheDecision` NOT in
       ## `notConsultedDecisions` (RFC: "hit + keyMiss + recomputeMiss +
       ## stored + hermeticityDegraded + flaky + closureUnrecorded +
-      ## toolchainUnidentified + trust-rejected"). `cdmToolchainUnidentified`
-      ## (W4 full fix) is deliberately NOT added to `notConsultedDecisions`
-      ## below: the run WAS consulted and DID execute live — only the
-      ## publish was refused — so it folds into `misses` exactly like
-      ## `cdmHermeticityDeg` does, with no separate counter needed.
+      ## trust-rejected").
     notConsulted*: int
-      ## `cdmNotEligible` / `cdmGroupOptOut` / `cdmPolicyDisabled` — kept OUT
+      ## `cdmNotEligible` / `cdmGroupOptOut` / `cdmPolicyDisabled` /
+      ## `cdmToolchainUnidentified` / `cdmRootsDegraded` — kept OUT
       ## of `total` so `hitPct` is not diluted by e.g. `cacheable #false`
       ## groups (RFC-0005 "Hit-rate telemetry").
     hitPct*:       float
@@ -193,9 +190,10 @@ type
       ## rejecting the same lookup on two different bases) — each tier's
       ## own verdict is judged on its own terms, not "first match wins".
 
-const notConsultedDecisions* = {cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled}
+const notConsultedDecisions* = {cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled,
+                                cdmToolchainUnidentified, cdmRootsDegraded}
   ## RFC-0005 "Hit-rate telemetry" / `cachedispatch.inactiveDecision`'s own
-  ## domain — the three `CacheDecision`s that mean "never consulted", not
+  ## domain — the `CacheDecision`s that mean "never consulted", not
   ## "consulted and did not hit". Exported since RFC-0005 A3b: `jsonout`
   ## reuses this SAME set as the presence gate for the per-result
   ## `cacheLookup` wire field (`EntrypointResult.cacheLookup`'s zero value,

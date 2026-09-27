@@ -16,7 +16,7 @@
 ##   toJsonString*(doc: RunDocument; filterTag: string = ""): string
 ##     Pure: compact JSON string (calls `$` on the JsonNode).
 ##     rfc-0007 r8: `doc` is the shared run-level record (see `RunDocument`'s
-##     own doc comment) -- assembled once by `api.runTestsWith` and passed to
+##     own doc comment) -- assembled once by `runcore.runTestsWith` and passed to
 ##     both this proc and `persistLastRun` below.
 ##
 ##   persistLastRun*(doc: RunDocument; config: Config)
@@ -282,7 +282,7 @@ const RunSchema* = "crisol/run/v2"
   ## v3 — a versioned identifier would need renaming for no reason the day
   ## rev 17 lands.
 
-const RunSchemaRevision* = 26
+const RunSchemaRevision* = 27
   ## Integer minor revision of the crisol/run/v2 schema (A8).  Additive only:
   ## the `schema` STRING stays "crisol/run/v2"; this integer is bumped each time
   ## additive optional fields land, so a consumer can gate on feature presence
@@ -486,7 +486,8 @@ const RunSchemaRevision* = 26
   ##                     — e.g. `"ok"`, `"miss"`, `"trustBadSignature"`);
   ##                     PRESENT ONLY when `cacheDecision` is NOT one of
   ##                     `cachetelemetry.notConsultedDecisions` ("notEligible"
-  ##                     / "groupOptOut" / "policyDisabled") — ABSENT
+  ##                     / "groupOptOut" / "policyDisabled" / "toolchainUnidentified"
+  ##                     / "rootsDegraded") — ABSENT
   ##                     otherwise, never a bare `"ok"`, because the
   ##                     underlying enum's zero value (`cvOk`) cannot
   ##                     otherwise be told apart from "never consulted" (same
@@ -613,7 +614,7 @@ const RunSchemaRevision* = 26
   ##                     counted here; it no longer is (a new,
   ##                     Nim-API-only `RunReport.verifyCouldNotReexec` field
   ##                     carries it instead -- not on the wire; see that
-  ##                     field's own doc comment in api.nim). Same rationale
+  ##                     field's own doc comment in runcore.nim). Same rationale
   ##                     as rfc-0007 A5/A6a's "no new field, an existing
   ##                     field's CONTENT changes" entries above: no reader
   ##                     depended on the OLD (incorrect) count, and the
@@ -663,6 +664,16 @@ const RunSchemaRevision* = 26
   ##                     above). `reason` is `trackedRoots.degradedReason`
   ##                     verbatim (D2's semicolon-joined, root-naming
   ##                     message) -- never empty when the key is present.
+  ##   rev 27 (round-10 review R10-D5) -- cacheDecision vocabulary gains
+  ##                     "rootsDegraded" (cdmRootsDegraded): the cache was
+  ##                     off for the run because a tracked root's fold
+  ##                     policy could not be probed (rev 26's `degraded`
+  ##                     object carries the reason). Such a run used to
+  ##                     stamp "policyDisabled", which means the `--no-cache`
+  ##                     flag and nothing else. Like "toolchainUnidentified"
+  ##                     it is a run-level reason: every result of the run
+  ##                     carries it, a never-built entrypoint included.
+  ##                     Not consulted, so `cacheLookup` is absent.
   ##   rfc-0007 W3 (no revision bump -- CONTENT change only; every field
   ##   below already existed on the wire with a default value, so this is
   ##   the two emission surfaces disagreeing less, not a new shape):
@@ -682,7 +693,7 @@ const RunSchemaRevision* = 26
   ##       deliberately EXCLUDED from that "matches" claim (by design, not
   ##       an oversight this slice touches): `verifyFails` is always 0 on
   ##       lastrun.json because `--verify-cache` runs AFTER persistLastRun
-  ##       (api.nim's own ordering comment); `cacheStats` is never persisted
+  ##       (runcore.nim's own ordering comment); `cacheStats` is never persisted
   ##       to lastrun.json at all (`persistLastRun` ignores `doc.cacheStats`; r8).
   ## A reader seeing `schemaRevision > RunSchemaRevision` treats the file as
   ## no-data (safe cold-start) — it was written by a newer crisol.  A reader
@@ -725,13 +736,19 @@ proc cacheDecisionString*(d: CacheDecision): string =
   ##                        miss and rerun (§2) — distinct from "keyMiss"
   ##                        (no entry was found at all).
   ## W4 full fix (rev 18):
-  ##   "toolchainUnidentified" — cdmToolchainUnidentified: fresh, hermetic
-  ##                        pass, but the host's C-toolchain identity
+  ##   "toolchainUnidentified" — cdmToolchainUnidentified: the cache was off
+  ##                        for this run (not consulted, nothing stored)
+  ##                        because the host's C-toolchain identity
   ##                        (`ccidentity.CcFingerprint`) folds to a degraded
-  ##                        sentinel — the store gate refused to publish
-  ##                        under a key that would not actually distinguish
-  ##                        this host's real toolchain from another host in
-  ##                        the same degraded state.
+  ##                        sentinel, so a key built from it would not
+  ##                        distinguish this host's real toolchain from
+  ##                        another host in the same degraded state.
+  ## R10-D5 (rev 27):
+  ##   "rootsDegraded"     — cdmRootsDegraded: the cache was off for this run
+  ##                        (not consulted, nothing stored) because the
+  ##                        fold policy of a tracked root could not be
+  ##                        probed (RFC-0009 §3); the top-level `degraded`
+  ##                        object carries the reason.
   case d
   of cdmNotEligible:            "notEligible"
   of cdmHit:                    "hit"
@@ -744,6 +761,7 @@ proc cacheDecisionString*(d: CacheDecision): string =
   of cdmClosureUnrecorded:      "closureUnrecorded"
   of cdmRecomputeMiss:          "recomputeMiss"
   of cdmToolchainUnidentified:  "toolchainUnidentified"
+  of cdmRootsDegraded:          "rootsDegraded"
 
 proc cacheVerdictString*(v: CacheVerdict): string =
   ## Returns the stable JSON string for a CacheVerdict enum value (RFC-0005
@@ -1079,7 +1097,7 @@ type
   RunDocument* = object
     ## rfc-0007 code-review r8: the single run-level emission-input record
     ## shared by `toJsonString` (stdout) and `persistLastRun` (lastrun.json).
-    ## Assembled ONCE in `api.runTestsWith` -- the one place that has every
+    ## Assembled ONCE in `runcore.runTestsWith` -- the one place that has every
     ## fact -- and passed to both sinks below, instead of each sink's own
     ## caller hand-listing an overlapping subset of the same ~15 facts (the
     ## shape that shipped the W3 defect: see this file's rev-history note
@@ -1097,7 +1115,7 @@ type
     ## documented sink DIFFERENCES over the fields that DO live here --
     ## lastrun.json never carries `cacheStats`, `verifyFails` is always 0
     ## there (--verify-cache runs after persistLastRun in
-    ## `api.runTestsWith` -- an ordering fact, not a caller choice), and a
+    ## `runcore.runTestsWith` -- an ordering fact, not a caller choice), and a
     ## run is never persisted at all when `interrupted` -- are `persistLastRun`
     ## body logic (see there), not a param this record omits.
     results*:           seq[EntrypointResult]
@@ -1138,7 +1156,7 @@ proc persistLastRun*(doc: RunDocument; config: Config) =
   ## On any failure: prints a warning to stderr and returns -- never raises.
   ##
   ## doc: rfc-0007 r8 -- the shared run-level record (see `RunDocument`'s own
-  ## doc comment), assembled once by `api.runTestsWith` and passed here
+  ## doc comment), assembled once by `runcore.runTestsWith` and passed here
   ## verbatim -- `warnings`/`memThrottledSlots`/`policy`/`substrate`/
   ## `trackedRoots`/`compileBlock`/`reuseAlerts` all thread through to
   ## `toJsonString` unchanged, so the persisted file matches the stdout
@@ -1154,12 +1172,12 @@ proc persistLastRun*(doc: RunDocument; config: Config) =
   ## here rather than left to caller discipline:
   ##   - interrupted: an interrupted run is never persisted at all (guard
   ##     below) -- an entrypoint never observed must not silently leave the
-  ##     `--failed` selection; `api.runTestsWith` already gates this call on
+  ##     `--failed` selection; `runcore.runTestsWith` already gates this call on
   ##     `not interrupted`, this is defense in depth against a future caller
   ##     that forgets to.
   ##   - verifyFails: always 0 here regardless of `doc.verifyFails` --
   ##     `--verify-cache` runs strictly AFTER `persistLastRun` in
-  ##     `api.runTestsWith` (an ordering fact: the real count does not exist
+  ##     `runcore.runTestsWith` (an ordering fact: the real count does not exist
   ##     yet at persist time, `doc.verifyFails` is whatever zero-value the
   ##     caller had on hand). r61 (code-review): this used to be true only
   ##     because THAT ONE CALLER happens to build `doc` before its own

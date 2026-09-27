@@ -56,7 +56,9 @@ import crisol/artifactledger
 import crisol/keys
 import crisol/jsonout  # RunSchemaRevision
 import crisol/ledger
+import crisol/workerplan  # MeasureWarningPrefix (R11-L6)
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Helpers — library-call path (behavior 1, OFF; never spawns a worker)
@@ -167,8 +169,8 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     check cfg.measureCompileReuse == false   # confirms the default-false gate
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, "", false)
-    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false).results
+    let p = plan(cfg, @[ep], graph, false)
+    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false, toolchain = hostUnkeyed(cfg)).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -198,9 +200,9 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     check cfg.workerBinary.len == 0   # unset by default — the unsafe case
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, "", false)
+    let p = plan(cfg, @[ep], graph, false)
     let t0 = epochTime()
-    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false).results
+    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false, toolchain = hostUnkeyed(cfg)).results
     let elapsed = epochTime() - t0
 
     check results.len == 1
@@ -225,8 +227,8 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     cfg.workerBinary = crisolBin
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, "", false)
-    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false).results
+    let p = plan(cfg, @[ep], graph, false)
+    let results = execute(p, config = cfg, graph = graph, nimVersion = "", showProgress = false, toolchain = hostUnkeyed(cfg)).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -284,6 +286,11 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     check exitCode == 0   # compile + run succeeded despite the sabotage
     if exitCode != 0: echo "crisol run output:\n", output
 
+    # R11-L6: the worker said so, and the parent relayed it. A successful
+    # compile's captured output is discarded with its slot, so without the
+    # relay this warning never reached the person running crisol.
+    check (MeasureWarningPrefix & "artifact-identity recording failed") in output
+
     let rows = scanArtifactLedger(stateDir)
     check rows.len == 0   # the ledger dir could not be created; no rows possible
 
@@ -294,6 +301,37 @@ suite "measure-compile-reuse gate — runner wiring (RFC-0006 M-artifact-identit
     let identity = identityKey(ep.tp, initTrackedRoots(projectRoot(), newSeq[tuple[name, native: string]](), stateDir), flagHash(ep.flags))
     let runRows = ledger.scanLedger(stateDir, identity)
     check runRows.len > 0
+
+  test "R15-D3: a tiny max-output-bytes cap must never drop the worker's warning relay":
+    ## The defect: the parent used to relay warnings by scanning a
+    ## HEAD-capped read of the worker's captured output (`readCapped`,
+    ## bounded by `Config.maxOutputBytes` -- the same cap DISPLAY output
+    ## uses). The worker's own warnings are written strictly AFTER a
+    ## successful compileOnly/runCc/link, so they are never among a compile
+    ## log's first bytes -- a cap tiny enough to cut off before reaching them
+    ## reproduces the bug on ANY compile, real output size irrelevant.
+    ## `max-output-bytes 1` (KDL-only knob -- there is no CLI flag for it,
+    ## hence the temp config file, same idiom as the reuse-check test above)
+    ## is the smallest possible cap: the old code would have kept at most 1
+    ## byte of compOut, discarding the warning outright; the fix must scan
+    ## the file WHOLE regardless of this cap.
+    let stateDir = freshStateDir("on_unwritable_tiny_cap")
+    defer: removeDir(stateDir)
+
+    let configPath = projectRoot() / ("crisol_test_tiny_cap_" & $getCurrentProcessId() & ".kdl")
+    defer: removeFile(configPath)
+    writeFile(configPath, "max-output-bytes 1\n")
+
+    # Same sabotage as the unwritable-ledger test above: forces a genuine
+    # MeasureWarningPrefix warning out of the worker.
+    createDir(stateDir / "ledger")
+    writeFile(stateDir / "ledger" / "artifacts", "not a directory")
+
+    let (exitCode, output) = runCrisolMeasured(stateDir, @["--config", configPath])
+    check exitCode == 0   # compile + run still succeed despite the sabotage
+    if exitCode != 0: echo "crisol run output:\n", output
+
+    check (MeasureWarningPrefix & "artifact-identity recording failed") in output
 
   test "ON: real crisol binary run persists a plausible 'compile' block in lastrun.json (RFC-0006 M-report pass a)":
     ## End-to-end proof of the M-report pass (a) decision-gate output: a real

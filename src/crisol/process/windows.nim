@@ -75,14 +75,12 @@
 ##     applies. No new sampler loop: this proc does the psapi walk once per
 ##     call; the 25 ms cadence is the runner's admission-tick loop, not
 ##     something this module owns.
-##   - globalShutdownSignal (D2a-1): a REAL process-global, level-triggered
-##     getter over `gShutdownSignum` — the same sticky global
-##     `ctrlHandlerProc` stamps (CTRL_C -> 2/SIGINT, CTRL_BREAK ->
-##     15/SIGTERM) and `next()`'s `weShutdown` already reads. Mirrors
-##     posixcore's `globalShutdownSignalCore` exactly (sticky, not
-##     edge-triggered/consumed like `weShutdown`); this is the seam
-##     `crisol/signals.shutdownRequested()` delegates onto, which now
-##     compiles and works against this backend.
+##   - the level-triggered shutdown query (D2a-1): the open interrupt
+##     scope's signal, which the one console control handler stamps (CTRL_C
+##     -> 2/SIGINT, CTRL_BREAK -> 15/SIGTERM), is read through
+##     `tooltrees.shutdownRequested` (re-exported by `crisol/signals`; R14-D5
+##     removed this backend's pass-through), the same reader `next()`'s
+##     `weShutdown` uses; `none` outside a scope (R13-D2).
 ##
 ## What is HONESTLY DEGRADED (never fabricated — §1's weakest-honest-claim
 ## rule), and why, per proc:
@@ -174,6 +172,7 @@
 import std/[options, os, tables, monotimes, times]
 import std/winlean
 import crisol/process/types
+import crisol/process/tooltrees  # the one console control handler and its scope (R11-L4, R12-D3)
 
 export types
 
@@ -402,55 +401,22 @@ proc queryFullProcessImageNameW(hProcess: Handle; dwFlags: int32;
                                  lpExeName: WideCString; lpdwSize: var int32): WINBOOL
   {.stdcall, dynlib: "kernel32", importc: "QueryFullProcessImageNameW".}
 
-type ConsoleCtrlHandlerProc = proc (dwCtrlType: int32): WINBOOL {.stdcall.}
-proc setConsoleCtrlHandler(handlerRoutine: ConsoleCtrlHandlerProc;
-                            add: WINBOOL): WINBOOL
-  {.stdcall, dynlib: "kernel32", importc: "SetConsoleCtrlHandler".}
-
 # ---------------------------------------------------------------------------
 # Shutdown wakeup — a manual-reset Event standing in for posixcore's
-# self-pipe (§1's handler↔Supervisor seam). `SetConsoleCtrlHandler`'s
-# callback runs on a SEPARATE OS thread the system creates for it (documented
-# Win32 behavior) — it cannot capture per-Supervisor state any more than a
-# POSIX signal handler can, so the same "process-global write reaching a
-# per-run Supervisor's wakeup" pattern applies, with `SetEvent` in place of
-# `write(2)`. One Supervisor with installSignals=true per process, same
-# documented constraint as posixcore.
+# self-pipe (§1's handler↔Supervisor seam). The console control handler is
+# `tooltrees`' one handler (R12-D3), installed for an interrupt scope rather
+# than for one Supervisor's lifetime: an `installSignals = true` Supervisor
+# enters a scope (the outermost one adds the handler; inside a run's scope,
+# `runcore.runTestsWith` with `installSignals`, it nests) and attaches its
+# event as the scope's wake (`attachInterruptWake`), which the handler sets
+# on Ctrl-C/Ctrl-Break after it has killed every live bounded tool. `=destroy`
+# detaches it and leaves the scope; the outermost leave removes the handler
+# (the r69 rule: a handler left registered, returning TRUE, would swallow the
+# host's own Ctrl-C forever). One Supervisor with installSignals=true per
+# process, as on posixcore: `attachInterruptWake` refuses a second, and
+# `initSupervisor` raises (R13-D4: the attached wake in `tooltrees` is the
+# one record of who owns the wake-up; this backend keeps no token of its own).
 # ---------------------------------------------------------------------------
-
-var gShutdownEventHandle {.global.}: Handle = 0
-var gShutdownSignum {.global.}: int32 = 0
-var gCtrlHandlerInstalled {.global.}: bool = false
-  ## r69: tracks whether `SetConsoleCtrlHandler(ctrlHandlerProc, 1)` is
-  ## CURRENTLY installed, process-wide — `ctrlHandlerProc` is a fixed
-  ## function pointer, not per-Supervisor state, so (unlike
-  ## `gShutdownEventHandle`, which changes value per instance) there is no
-  ## natural per-call token to compare against; this flag is that token.
-  ## Read/written only alongside `gShutdownEventHandle` (same
-  ## `installSignals` gate in `initSupervisor`, same ownership check in
-  ## `=destroy`) — install is idempotent (a second `initSupervisor` call
-  ## while a handler is already installed skips re-adding: Win32 does not
-  ## document repeated `TRUE` adds of the SAME function pointer as a no-op,
-  ## so guarding here avoids relying on that undocumented behavior), and
-  ## removal only fires from the Supervisor that currently "owns" the
-  ## global signal wakeup — mirrors posixcore's `subreaperSet` cleanup
-  ## rule in spirit ("clear only what THIS teardown is responsible for"),
-  ## adapted to this file's existing single-owner-token shape since
-  ## install/remove here are tied 1:1 to the SAME `gShutdownEventHandle`
-  ## ownership the ctrl handler's own callback depends on (`setEvent`
-  ## targets whatever `gShutdownEventHandle` currently is).
-
-proc ctrlHandlerProc(dwCtrlType: int32): WINBOOL {.stdcall.} =
-  case dwCtrlType
-  of CTRL_C_EVENT:
-    gShutdownSignum = 2   # SIGINT's number — RFC-0003's 128+n rule (§1 doc)
-  of CTRL_BREAK_EVENT:
-    gShutdownSignum = 15  # SIGTERM's number
-  else:
-    return 0'i32          # CTRL_CLOSE/LOGOFF/SHUTDOWN: not this spike's concern
-  if gShutdownEventHandle != 0:
-    discard setEvent(gShutdownEventHandle)
-  return 1'i32
 
 # ---------------------------------------------------------------------------
 # Supervisor — mirrors posix.nim's shape (deep module, private fields, the
@@ -503,22 +469,18 @@ proc `=destroy`*(sv: var Supervisor) =
   when not defined(release) and not defined(danger):
     doAssert sv.liveCount == 0,
       "Supervisor destroyed with live children — stop and reap them first (rfc-0007 §1)"
-  if sv.installedSignals and gShutdownEventHandle == sv.shutdownEvent:
-    gShutdownEventHandle = 0
-    # r69: remove the console ctrl handler with THIS Supervisor's shutdown
-    # wakeup — before this fix it was installed in `initSupervisor` and
-    # NEVER removed, so after every Supervisor in an embedding host's
-    # process was destroyed, `ctrlHandlerProc` stayed registered and kept
-    # returning 1 (TRUE, "handled") for CTRL_C/CTRL_BREAK forever — the
-    # host's own Ctrl+C stopped terminating the process at all, since a
-    # handler that returns TRUE tells the OS no further handler (including
-    # the default one) runs. Guarded on the SAME ownership check as
-    # `gShutdownEventHandle` above (only the currently-owning Supervisor's
-    # destroy removes it) and on `gCtrlHandlerInstalled` (idempotent-safe:
-    # a no-op if nothing is currently installed).
-    if gCtrlHandlerInstalled:
-      discard setConsoleCtrlHandler(ctrlHandlerProc, 0'i32)
-      gCtrlHandlerInstalled = false
+  if sv.installedSignals:
+    # Stop the handler setting the event before it is closed below. An
+    # `installedSignals` Supervisor is the one whose event is attached
+    # (`initSupervisor` raises for a second, R13-D4).
+    detachInterruptWake()
+    # r69: leave the scope `initSupervisor` entered; when it was the
+    # outermost one, this removes the console control handler. Before r69
+    # the handler stayed registered after every Supervisor was destroyed and
+    # kept returning TRUE ("handled") for CTRL_C/CTRL_BREAK, so the host's
+    # own Ctrl+C stopped terminating the process at all. The signal it
+    # answers was already reported by `next()` as `weShutdown`.
+    discard leaveInterruptScope()
   if sv.shutdownEvent != 0:
     discard closeHandle(sv.shutdownEvent)
   if sv.completionPort != 0:
@@ -599,17 +561,6 @@ proc probeJobObjectNesting(): Option[bool] =
     some(assignProcessToJobObject(job2, pi.hProcess) != 0'i32)
   except CatchableError:
     none(bool)   # unexpected exception: machinery failure, indeterminate
-
-proc globalShutdownSignal*(): Option[ShutdownSignal] =
-  ## Process-global, level-triggered view of the last shutdown signal the
-  ## console control handler recorded (sticky, like posixcore's
-  ## globalShutdownSignalCore) — the seam crisol/signals.shutdownRequested()
-  ## delegates onto. gShutdownSignum is stamped by ctrlHandlerProc (CTRL_C
-  ## -> 2/SIGINT, CTRL_BREAK -> 15/SIGTERM), the SAME source next()'s
-  ## weShutdown reads.
-  let s = gShutdownSignum
-  if s != 0: some(ShutdownSignal(signum: int(s)))
-  else: none(ShutdownSignal)
 
 proc probeCapabilities*(nesting: Option[bool] = probeJobObjectNesting()): Capabilities =
   ## The raw, seam-free probe — real I/O (a throwaway suspended-process
@@ -774,24 +725,26 @@ proc initSupervisor*(installSignals: bool = true): Supervisor =
     raise newException(OSError,
       "initSupervisor: host cannot create nested Job Objects; crisol requires Job-based containment")
   let consoleAttached = caps.ctrlBreakDeliverable
+  if installSignals:
+    # R12-D3: enter an interrupt scope (the outermost one adds `tooltrees`'
+    # console control handler; inside a run's scope it nests) and make this
+    # Supervisor's event the one the handler sets, replaying a Ctrl-C that
+    # landed in the scope before any Supervisor was attached. R13-D4: a
+    # second live `installSignals` Supervisor is refused there, and raised
+    # here before any Supervisor exists (no half-loop: its event, its port
+    # and the scope entered for the attempt are released first).
+    enterInterruptScope()
+    if not attachInterruptWake(ev):
+      discard leaveInterruptScope()
+      discard closeHandle(ev)
+      discard closeHandle(iocp)
+      raise newException(OSError,
+        "initSupervisor: another live Supervisor already owns signal delivery " &
+        "(installSignals=true refused while a prior one is still live)")
   result = Supervisor(nextIdVal: 0'i32, children: initTable[int32, ChildEntry](),
                        liveCount: 0, installedSignals: installSignals,
                        shutdownEvent: ev, completionPort: iocp,
                        consoleAttached: consoleAttached)
-  if installSignals:
-    gShutdownEventHandle = ev
-    # r69: idempotent-safe — if a handler is already installed (a second
-    # `initSupervisor(installSignals = true)` call in the same process,
-    # e.g. a prior Supervisor still alive, or destroyed without ever
-    # clearing this in a build predating r69's `=destroy` fix), skip the
-    # add. Win32 does not document repeated `TRUE` adds of the SAME
-    # function pointer as a no-op (each may register a SEPARATE list
-    # entry, needing a matching number of `FALSE` removes to fully clear)
-    # — guarding here avoids relying on that undocumented behavior rather
-    # than trying to rely on it.
-    if not gCtrlHandlerInstalled:
-      discard setConsoleCtrlHandler(ctrlHandlerProc, 1'i32)
-      gCtrlHandlerInstalled = true
   result.capsCache = caps
 
 proc capabilities*(): Capabilities =
@@ -1200,7 +1153,10 @@ proc nextEvent(sv: var Supervisor; deadline: MonoTime): WaitEvent =
     if sv.installedSignals:
       if waitForSingleObject(sv.shutdownEvent, 0'i32) == WAIT_OBJECT_0:
         discard resetEventW(sv.shutdownEvent)
-        return WaitEvent(kind: weShutdown, signal: ShutdownSignal(signum: int(gShutdownSignum)))
+        # An installSignals Supervisor holds an interrupt scope open for its
+        # whole life, so the scope's signal is the one that set the event.
+        return WaitEvent(kind: weShutdown,
+                         signal: shutdownRequested().get(ShutdownSignal()))
 
     sweepExitedChildren(sv)
 

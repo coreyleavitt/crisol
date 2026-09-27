@@ -26,9 +26,11 @@ import crisol/cachememory    # RFC-0005 A3b: memory() -- tekBackfillErr live-emi
 import crisol/cachetelemetry # RFC-0005 B2a: TelemetryEvent/InMemorySink
 import crisol/runner          # execute() -- drives a real run directly (no planner)
 import crisol/api             # verifyCachePass/VerifyCache/verifySample/VerifyDivergence
-import crisol/ccidentity      # W4 full fix: CcFingerprint/CcHalf/toolchainUnsound
+import crisol/ccidentity      # CcFingerprint/toolchainVerdict
 import "../support/helpers"  # legacySeams
 import "../support/testep"
+import "../support/ccfake"   # fpOf/SoundFp
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -696,174 +698,57 @@ suite "shouldStore — cache-write gate":
     let v = shouldStore(passResult(ev), isoSpec, 1, defaultCachePolicy())
     check v.store
 
-  test "toolchain unidentified → no store, cdmToolchainUnidentified":
-    ## W4 full fix: a fully/partially degraded `CcFingerprint` folds the
-    ## soundness key's cc component to a sentinel constant shared by every
-    ## host in the same degraded state — publishing under it is cross-host
-    ## cache poisoning by under-invalidation (see `cachedispatch.nim`'s own
-    ## W4 note in `shouldStore`, and RFC-0005 §trust). Modelled directly on
-    ## the `cdmHermeticityDeg` precedent just above: an otherwise-perfect
-    ## pass (full evidence, attempt 1) is STILL refused once the caller
-    ## reports the toolchain as unidentified.
-    let v = shouldStore(passResult(fullEvidence), isoSpec, 1, defaultCachePolicy(),
-                        toolchainUnidentified = true)
-    check not v.store
-    check v.decision == cdmToolchainUnidentified
-
-  test "toolchain identified (default) → the other gates still decide, unaffected":
-    ## `toolchainUnidentified` has no default since R4-4: omitting it binds
-    ## the deprecated 5-argument overload, which forwards `false` -- so a
-    ## call that omits it (as most tests in this suite do) is
-    ## unaffected by this gate.
-    let v = shouldStore(passResult(fullEvidence), isoSpec, 1, defaultCachePolicy())
-    check v.store
-    check v.decision == cdmKeyMiss
-
 # ---------------------------------------------------------------------------
-# ccidentity.toolchainUnsound — the exact trigger for shouldStore's new gate
+# ccidentity.toolchainVerdict -- the trigger for the cache-disabled run
 # ---------------------------------------------------------------------------
 #
-# W4 full fix: the trigger is NOT limited to `isFullyDegraded` (both halves
-# `cfsUnavailable`). A single degraded half is argued to be the MORE likely
-# real-world poisoning vector: many hosts sharing one common, correctly-
-# identified compiler (e.g. the same distro gcc package) whose runtime probe
-# independently fails on some subset of them (missing `ldd`, a sandboxed
-# link step, etc.) all fold that RUNTIME half to the SAME `RuntimeSentinel`
-# constant -- so two of those hosts, running genuinely different C runtimes
-# underneath, collide on the same soundness key. That is the identical
-# failure class `isFullyDegraded` was written to catch, just gated on one
-# axis instead of two, and arguably reached MORE often in practice (a
-# fleet-wide compiler match is common; total probe blindness is not).
-# `cdkNone` (a legitimately-known half with no CONTENT DIGEST -- e.g. the
-# Windows `cdVersionOnly` profile) is a different axis entirely and must
-# NOT trip this predicate -- refusing there would break every Windows
-# publish, which the task explicitly rules out.
+# Either half unidentified is unsound: every host whose probe fails on the
+# same half folds it to the same sentinel, so two hosts with different C
+# runtimes (or compilers) underneath would collide on one key. The common
+# case is not total blindness but one half failing on a subset of a fleet
+# that shares a compiler.
 
-suite "ccidentity.toolchainUnsound — trigger for the store-gate refusal":
+suite "ccidentity.toolchainVerdict -- trigger for the cache-disabled run":
 
-  proc knownHalf(text = "gcc 13.2.0"): CcHalf =
-    CcHalf(state: cfsKnown, text: text, digest: CcDigest(kind: cdkKnown, hex: "deadbeefcafef00d"))
+  let sound = fpOf(SoundFp)
 
-  proc knownHalfNoDigest(text = "cl 19.44.35228"): CcHalf =
-    ## The Windows `cdVersionOnly` shape: known text, `cdkNone` digest. The
-    ## full three-component build number, as a real `cl` prints it: since R6
-    ## (round-6 review 2026-09-24) `namesCompilerVersion` requires three
-    ## components, so a two-component `cl 19.44` is itself refused.
-    CcHalf(state: cfsKnown, text: text, digest: CcDigest(kind: cdkNone))
+  test "both halves unidentified (fully blind host) -> unsound":
+    check (toolchainVerdict(CcFingerprint()).kind == tvUnidentified)
 
-  proc unavailableHalf(): CcHalf = CcHalf(state: cfsUnavailable)
+  test "compiler known, runtime unidentified -> unsound":
+    check (toolchainVerdict(CcFingerprint(compiler: sound.compiler)).kind == tvUnidentified)
 
-  test "both halves unavailable (fully blind host) → unsound":
-    let fp = CcFingerprint(compiler: unavailableHalf(), runtime: unavailableHalf())
-    check isFullyDegraded(fp)
-    check toolchainUnsound(fp)
+  test "compiler unidentified, runtime known -> unsound":
+    check (toolchainVerdict(CcFingerprint(runtime: sound.runtime)).kind == tvUnidentified)
 
-  test "compiler known, runtime unavailable → unsound":
-    let fp = CcFingerprint(compiler: knownHalf(), runtime: unavailableHalf())
-    check not isFullyDegraded(fp)
-    check toolchainUnsound(fp)
-
-  test "compiler unavailable, runtime known → unsound":
-    let fp = CcFingerprint(compiler: unavailableHalf(), runtime: knownHalf("glibc 2.38"))
-    check not isFullyDegraded(fp)
-    check toolchainUnsound(fp)
-
-  test "both halves known → sound":
-    let fp = CcFingerprint(compiler: knownHalf(), runtime: knownHalf("glibc 2.38"))
-    check not toolchainUnsound(fp)
-
-  test "known half with no content digest (Windows cdVersionOnly) → still sound":
-    ## The digest-only gap `cdkNone` names is a DIFFERENT, already-accepted
-    ## degradation (RFC-0006 Windows profile) -- never conflated with
-    ## `cfsUnavailable`, which means the whole half's IDENTITY, not merely
-    ## its digest, could not be established.
-    let fp = CcFingerprint(compiler: knownHalfNoDigest(), runtime: knownHalf("msvcrt #abc123"))
-    check not toolchainUnsound(fp)
-
-  # -------------------------------------------------------------------------
-  # R3-2 (round-3 review): the THIRD disjunct, added in round 2 (R2-1), had no
-  # test producer anywhere -- deleting it left every suite in the tree green,
-  # and this suite's only `cdkNone` case (`knownHalfNoDigest`, then text
-  # "cl 19.44") carries a dotted token, so it asserted the pre-R2-1 EXEMPTION
-  # and never the new trigger. These four cases pin the predicate over the
-  # axis that actually decides it. `toolchainUnsound` is a pure predicate over
-  # `CcHalf`, so its input space is testable directly; after R3-1 moved the
-  # real enforcement to the producer (`ccidentity.ccIdentity`, which under
-  # `cdVersionOnly` now degrades the whole half when an answering candidate
-  # names no compiler version -- R4-1, tightened by R5-4/R6), this backstop is NOT
-  # reachable from production, which is exactly why it must be pinned here
-  # instead of through one.
-  # -------------------------------------------------------------------------
-
-  test "known digest-less half whose text has NO version token → unsound":
-    ## The fallback-`versionLine` shape: a driver exited 0 and printed
-    ## something, but nothing established that the something describes a
-    ## compiler. Two hosts with two different such drivers fold to one
-    ## `cfsKnown` half with no digest to tell them apart.
-    let fp = CcFingerprint(compiler: knownHalfNoDigest(text = "unit.c"),
-                           runtime: knownHalf("msvcrt #abc123"))
-    check not isFullyDegraded(fp)
-    check toolchainUnsound(fp)
-
-  test "the same text WITH a version token → sound (the exemption still holds)":
-    ## Differential against the case above: text is the only thing that
-    ## differs, so a regression that stops consulting it cannot hide here.
-    let fp = CcFingerprint(compiler: knownHalfNoDigest(text = "cl 19.44.35228"),
-                           runtime: knownHalf("msvcrt #abc123"))
-    check not toolchainUnsound(fp)
-
-  test "no version token but a REAL content digest → sound (POSIX shape)":
-    ## The disjunct is guarded on `digest.kind != cdkKnown` for a reason: a
-    ## content hash of the driver binary identifies it regardless of what its
-    ## banner says, so unversioned text behind a real digest is not this
-    ## defect. Pins that POSIX cannot be made unsound by banner text alone.
-    let fp = CcFingerprint(compiler: knownHalf(text = "cc"),
-                           runtime: knownHalf("glibc 2.38"))
-    check not toolchainUnsound(fp)
-
-  # R7-S3/D7 (round-7 review): `cfsNotProbed` is the ZERO VALUE of `CcHalf`,
-  # and `CcFingerprintProbe` (R5-10) makes a zero value reachable from outside
-  # `ccidentity`. "We never looked" identifies nothing, so it must fail closed
-  # exactly like `cfsUnavailable` -- it used to read as SOUND on either half.
-
-  test "the zero-value fingerprint (both halves cfsNotProbed) → unsound":
-    check toolchainUnsound(CcFingerprint())
-    check toolchainUnsoundReason(CcFingerprint()) == turBlind
-
-  test "compiler cfsNotProbed, runtime known → unsound":
-    let fp = CcFingerprint(compiler: CcHalf(state: cfsNotProbed),
-                           runtime: knownHalf("glibc 2.38"))
-    check toolchainUnsound(fp)
-    check toolchainUnsoundReason(fp) == turHalfMissing
-
-  test "compiler known, runtime cfsNotProbed → unsound":
-    let fp = CcFingerprint(compiler: knownHalf(),
-                           runtime: CcHalf(state: cfsNotProbed))
-    check toolchainUnsound(fp)
-    check toolchainUnsoundReason(fp) == turHalfMissing
-
-  test "the RUNTIME half's text is never version-checked":
-    ## Scoping pin: a runtime half is a library basename set
-    ## (`msvcRuntimeIdentity`) or a libc line, with no dotted-version
-    ## convention of its own -- applying the compiler-half rule to it would be
-    ## a category error, and would refuse every legitimate MSVC publish.
-    let fp = CcFingerprint(compiler: knownHalfNoDigest(text = "cl 19.44.35228"),
-                           runtime: CcHalf(state: cfsKnown,
-                                           text: "kernel32+libcmt+libucrt",
-                                           digest: CcDigest(kind: cdkNone)))
-    check not toolchainUnsound(fp)
+  test "both halves known -> sound":
+    check toolchainVerdict(sound).kind == tvIdentified
 
 # ---------------------------------------------------------------------------
-# W4 full fix — end to end: a degraded run must not persist an entry at all
+# cacheDisabledBecause — the cache-disabled context carries its cause
 # ---------------------------------------------------------------------------
 
-suite "execute — toolchain-unidentified run never reaches the cache":
+suite "cacheDisabledBecause — an inactive context names why it is inactive":
 
-  test "a fully-passing run with toolchainUnidentified=true stores nothing (proven by a follow-up miss)":
-    ## Proves the refusal at the STORE layer, not merely in the reported
-    ## `cacheDecision` -- a second run against the SAME real cache root
-    ## (`rt`) and the SAME derived key must still come up a miss, because
-    ## nothing was ever written for it.
+  test "cacheDisabled(spec) is --no-cache's context":
+    let ctx = cacheDisabled(resolveSandbox())
+    check not ctx.isActive
+    check ctx.inactiveReason == cdmPolicyDisabled
+
+  test "an unidentified toolchain's context is inactive and says so":
+    let ctx = cacheDisabledBecause(resolveSandbox(), cdmToolchainUnidentified)
+    check not ctx.isActive
+    check ctx.seams.keyOf == nil
+    check ctx.inactiveReason == cdmToolchainUnidentified
+
+  test "a decision that is not a reason to disable the cache is refused":
+    expect AssertionDefect:
+      discard cacheDisabledBecause(resolveSandbox(), cdmKeyMiss)
+
+  test "execute: every entrypoint of a toolchain-disabled run reports the cause, and nothing is stored":
+    ## Run 1 under the toolchain-disabled context; run 2, same key inputs,
+    ## under a live cache over the same root. Run 2 must miss and store:
+    ## run 1 wrote nothing.
     let dir = getTempDir() / ("crisol_w4_toolchain_" & $getCurrentProcessId())
     removeDir(dir); createDir(dir)
     defer: removeDir(dir)
@@ -884,24 +769,21 @@ suite "execute — toolchain-unidentified run never reaches the cache":
                                  edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt),
-                           toolchainUnidentified = true)).results
+      cache = cacheDisabledBecause(spec, cdmToolchainUnidentified), toolchain = unprobedToolchain()).results
     check results1.len == 1
-    check results1[0].outcome == oPassed              # the run itself still succeeds
-    check not results1[0].cached                      # never served from cache (nothing to serve)
+    check results1[0].outcome == oPassed
+    check not results1[0].cached
     check results1[0].cacheDecision == cdmToolchainUnidentified
+    check results1[0].inputHash == ""                 # no key was derived: not consulted
 
-    # Run 2: same key inputs, toolchain now reported identified. If run 1
-    # actually stored under the degraded/constant-folded key, this would
-    # come back cdmHit. It must instead run live again -- a genuine miss.
     let pep2 = PlannedEntrypoint(ep: testEp(epRelPath, group = "unit", flags = @[]),
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)), toolchain = unprobedToolchain()).results
     check results2.len == 1
     check results2[0].cacheDecision != cdmHit
-    check results2[0].cacheDecision == cdmStored       # this time it DOES publish
+    check results2[0].cacheDecision == cdmStored
 
 # ---------------------------------------------------------------------------
 # realSeams env-value soundness: RFC-0004 §Keys requires names+values in key.
@@ -1313,18 +1195,42 @@ suite "CacheContext — prefetch (RFC-0005 C3c)":
 suite "inactiveDecision — inactive-cache decision matrix":
 
   test "edRunFresh → cdmPolicyDisabled (was cache-eligible; --no-cache suppressed it)":
-    check inactiveDecision(edRunFresh) == cdmPolicyDisabled
+    check inactiveDecision(edRunFresh, cdmPolicyDisabled) == cdmPolicyDisabled
 
   test "edNeverBuilt → cdmNotEligible (had to compile; cache never applicable)":
-    check inactiveDecision(edNeverBuilt) == cdmNotEligible
+    check inactiveDecision(edNeverBuilt, cdmPolicyDisabled) == cdmNotEligible
 
   test "edStale → cdmNotEligible (had to recompile; cache never applicable)":
-    check inactiveDecision(edStale) == cdmNotEligible
+    check inactiveDecision(edStale, cdmPolicyDisabled) == cdmNotEligible
 
   test "edCached → cdmNotEligible (unreachable on inactive path; safe fallthrough)":
     ## edCached requires a plan-time hit which requires isActive; this branch is
     ## documented as unreachable but must not crash or produce a wrong decision.
-    check inactiveDecision(edCached) == cdmNotEligible
+    check inactiveDecision(edCached, cdmPolicyDisabled) == cdmNotEligible
+    check inactiveDecision(edCached, cdmToolchainUnidentified) == cdmNotEligible
+
+  test "an unidentified toolchain is reported on every built or unbuilt entrypoint":
+    ## Host-level cause: each entrypoint's key would have carried it.
+    for d in [edRunFresh, edNeverBuilt, edStale]:
+      check inactiveDecision(d, cdmToolchainUnidentified) == cdmToolchainUnidentified
+
+  test "degraded tracked roots are reported on every built or unbuilt entrypoint":
+    ## R10-D5: run-level, like the toolchain; never `cdmPolicyDisabled`, which
+    ## means the `--no-cache` flag.
+    for d in [edRunFresh, edNeverBuilt, edStale]:
+      check inactiveDecision(d, cdmRootsDegraded) == cdmRootsDegraded
+    check inactiveDecision(edCached, cdmRootsDegraded) == cdmNotEligible
+
+  test "the inactive reasons are exactly --no-cache plus the run-level causes":
+    check inactiveReasons == {cdmPolicyDisabled, cdmToolchainUnidentified,
+                              cdmRootsDegraded}
+    check cdmPolicyDisabled notin runLevelReasons
+    for r in inactiveReasons:
+      discard cacheDisabledBecause(default(SandboxSpec), r)
+
+  test "a decision that is not a reason to disable the cache is refused":
+    expect AssertionDefect:
+      discard inactiveDecision(edRunFresh, cdmHit)
 
 # ---------------------------------------------------------------------------
 # RFC-0005 B2a — telemetry: lookupAtPlan hit/miss through the real seam
@@ -1660,7 +1566,7 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
     check pep1.ep.tp.display().len > 0   # sanity: a real tag-0 tp
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)), toolchain = unprobedToolchain()).results
     check results1.len == 1
     check results1[0].cacheDecision == cdmStored
     check readFile(dir / "verify_counter.txt").strip() == "1"
@@ -1671,7 +1577,7 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)), toolchain = unprobedToolchain()).results
     check results2.len == 1
     check results2[0].cacheDecision == cdmHit
     check readFile(dir / "verify_counter.txt").strip() == "1"   # unchanged: served from cache
@@ -1685,7 +1591,7 @@ suite "RFC-0005 B2a — telemetry: tekVerifyFail":
     # production callers) -- project `.divergences` here explicitly.
     let divergences = verifyCachePass(
       results2, @[pep2], verifySample(pct = 100), cfg, g,
-      "2.2.10", "gcc 13.2.0", spec, mem.sink).divergences
+      "2.2.10", fakeToolchain("gcc 13.2.0"), spec, mem.sink).divergences
 
     check readFile(dir / "verify_counter.txt").strip() == "2"   # proves a real re-execution
     check divergences.len == 1

@@ -12,9 +12,9 @@
 ## THE CHAIN (every hop below is severable, and each has a red test here or in
 ## the two unit/integration files named):
 ##
-##   1. api.runTestsWith: `ccVer = $ccProbe()`, `nimVer = cachedNimFingerprint()`
-##      -> `execute(nimVersion = nimVer, ccVersion = ccVer)`
-##   2. runner.execute: `toolchainFingerprint(nimVersion, ccVersion)`
+##   1. api.runTestsWith: `ccVer = $ccProbe(ctx)`, `nimVer = cachedNimFingerprint()`
+##      -> `execute(nimVersion = nimVer, toolchain = impl.toolchain)`
+##   2. runner.execute: `toolchainFingerprint(nimVersion, toolchain.identity)`
 ##      -> `ExecCtx.toolchainFp`
 ##   3. runner.writeWorkerPlan -> buildCompileWorkerPlan(..., ctx.toolchainFp)
 ##      -> `MeasurePlan.toolchainFp`
@@ -26,7 +26,7 @@
 ##   7. compilereport.readCompileBlock -> `segments[].toolchainFp` (consumer)
 ##
 ## WHAT THIS FILE PINS. Suite 1 drives hops 1-7 through `runTestsWith` with the
-## C-toolchain identity injected via `api.CcFingerprintProbe` (R5-10's seam):
+## C-toolchain identity injected via `RunDeps.ccProbe`:
 ## the fingerprint is non-empty, equals `toolchainFingerprint` over the real nim
 ## identity and the injected cc identity, VARIES when only the cc identity
 ## varies, and survives onto both row streams and the persisted compile block.
@@ -43,18 +43,24 @@
 ##         tests/integration/test_toolchainfp_producer_chain.nim
 
 import std/[json, os, osproc, unittest]
-import crisol/api            # runTestsWith/productionCacheDeps/CcFingerprintProbe (uncontracted)
+import crisol/api
+import crisol/runcore        # runTestsWith/productionRunDeps/RunDeps (uncontracted)
+import crisol/pipeline       # ccProbeContextOf
 import crisol/types
 import crisol/depgraph
 import crisol/runner
 import crisol/planner        # toolchainFingerprint -- the expected value's derivation
-import crisol/ccidentity     # CcFingerprint/CcHalf/CcDigest, cachedCcVersion
+import crisol/ccidentity     # CcFingerprint/CcProbeContext
+import "../support/ccprobes" # cachedCcVersion
+import crisol/config         # loadConfig
 import crisol/nimprobe       # cachedNimFingerprint
 import crisol/artifactledger
 import crisol/compilecost
 import crisol/paths          # initTrackedRoots (suite 2 config)
 import "../support/helpers"  # withTempProject
 import "../support/testep"
+import "../support/ccfake"   # knownHalf
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 let repoRoot = currentSourcePath().parentDir.parentDir.parentDir
   # test is at tests/integration/; go up 2 -> project root.
@@ -62,8 +68,10 @@ let repoRoot = currentSourcePath().parentDir.parentDir.parentDir
 proc buildCrisolBinary(): string =
   ## The worker host: see test_measure_compile_gate.nim's `buildCrisolBinary`
   ## for why a library call cannot be its own measure-worker. A private output
-  ## path so a concurrently-running gate test never races this build.
-  result = getTempDir() / "crisol_test_toolchainfp_chain_bin" / "crisol"
+  ## path so a concurrently-running gate test never races this build. The
+  ## name carries the platform's executable extension (`crisol.exe` on
+  ## Windows), which `-o:` does not add to a name given without one.
+  result = getTempDir() / "crisol_test_toolchainfp_chain_bin" / addFileExt("crisol", ExeExt)
   createDir(result.parentDir)
   let cmd = "nim c --hints:off --warnings:off -d:release --mm:orc -o:" &
             result.quoteShell & " " & (repoRoot / "src" / "crisol.nim").quoteShell
@@ -76,9 +84,6 @@ let crisolBin = buildCrisolBinary()
 # ---------------------------------------------------------------------------
 # Suite 1 helpers -- the api layer, cc identity injected
 # ---------------------------------------------------------------------------
-
-proc knownHalf(text, hex: string): CcHalf =
-  CcHalf(state: cfsKnown, text: text, digest: CcDigest(kind: cdkKnown, hex: hex))
 
 proc gccFingerprint(): CcFingerprint =
   CcFingerprint(compiler: knownHalf("gcc 13.2.0", "1111111111111111"),
@@ -105,6 +110,7 @@ type ChainObservation = object
   artifactFps: seq[string]   # hop 5/6: every ArtifactRow's toolchainFp
   costFps:     seq[string]   # hop 5/6: every CompileCostRow's toolchainFp
   segmentFps:  seq[string]   # hop 7:   every compile-block segment's toolchainFp
+  ctx:         CcProbeContext # the probe context the run's configuration gives
 
 proc observe(rr: RunReport; stateDir: string): ChainObservation =
   for r in scanArtifactLedger(stateDir): result.artifactFps.add r.toolchainFp
@@ -113,43 +119,57 @@ proc observe(rr: RunReport; stateDir: string): ChainObservation =
   if cb != nil and cb.hasKey("segments"):
     for seg in cb["segments"]: result.segmentFps.add seg["toolchainFp"].getStr
 
-proc measuredRun(probe: CcFingerprintProbe): ChainObservation =
+proc measuredRun(probe: proc(ctx: CcProbeContext): CcFingerprint {.closure.}): ChainObservation =
   ## One real measured run in a fresh temp project; `probe == nil` means the
-  ## production default (the real memoised host probe).
+  ## production probe (the real memoised host probe `productionRunDeps`
+  ## installs).
   withTempProject:
     writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
-    let rr =
-      if probe == nil: runTestsWith(measuredOpts(projectRoot), productionCacheDeps())
-      else: runTestsWith(measuredOpts(projectRoot), productionCacheDeps(), ccProbe = probe)
+    var deps = productionRunDeps()
+    if probe != nil:
+      # The fingerprint is injected; the site is the host's real one, since
+      # the measure worker resolves each generated C unit's driver against
+      # it to key the artifact rows this file observes.
+      deps.ccProbe = proc(ctx: CcProbeContext): ToolchainProbe =
+        ToolchainProbe(fp: probe(ctx), site: cachedToolchainProbe(ctx).site)
+    let rr = runTestsWith(measuredOpts(projectRoot), deps)
     doAssert rr.status == rsOk, "run failed: " & $rr.status
     doAssert rr.results.len == 1 and rr.results[0].outcome == oPassed
     result = observe(rr, projectRoot / ".crisol")
+    result.ctx = ccProbeContextOf(loadConfig(projectRoot / "crisol.kdl")[0])
 
-proc checkAllHopsCarry(obs: ChainObservation; expected: string) =
+template checkAllHopsCarry(obs: ChainObservation; expected: string) =
   ## Every hop that can carry the value does, and carries THIS one. The len
   ## guards keep a vacuous (zero-row) run from passing the loops.
-  check expected.len > 0
-  check obs.artifactFps.len > 0
-  check obs.costFps.len == 1
-  check obs.segmentFps.len >= 1
-  for fp in obs.artifactFps: check fp == expected
-  for fp in obs.costFps:     check fp == expected
-  for fp in obs.segmentFps:  check fp == expected
+  ##
+  ## A template, not a proc: unittest's `check` marks the ENCLOSING test
+  ## failed only when it expands inside the test body. Inside a top-level
+  ## proc it has no test to mark, so a failed hop printed "Check failed" and
+  ## then `[OK]`, and only the exit code went red (R11-L5).
+  let hopsObs = obs
+  let hopsExpected = expected
+  check hopsExpected.len > 0
+  check hopsObs.artifactFps.len > 0
+  check hopsObs.costFps.len == 1
+  check hopsObs.segmentFps.len >= 1
+  for fp in hopsObs.artifactFps: check fp == hopsExpected
+  for fp in hopsObs.costFps:     check fp == hopsExpected
+  for fp in hopsObs.segmentFps:  check fp == hopsExpected
 
 # ---------------------------------------------------------------------------
 
 suite "L1 — toolchainFp producer chain, api layer (cc identity injected)":
 
   test "the fingerprint is derived from nim + the injected cc identity and reaches rows AND the compile block":
-    let obs = measuredRun(proc(): CcFingerprint = gccFingerprint())
+    let obs = measuredRun(proc(ctx: CcProbeContext): CcFingerprint = gccFingerprint())
     checkAllHopsCarry(obs,
       toolchainFingerprint(cachedNimFingerprint(), $gccFingerprint()))
 
   test "a different cc identity yields a different fingerprint at every hop (no constant fold)":
     ## The differential partner of the case above: same project, same nim,
     ## the ONLY difference is the compiler half of the injected identity.
-    let gcc   = measuredRun(proc(): CcFingerprint = gccFingerprint())
-    let clang = measuredRun(proc(): CcFingerprint = clangFingerprint())
+    let gcc   = measuredRun(proc(ctx: CcProbeContext): CcFingerprint = gccFingerprint())
+    let clang = measuredRun(proc(ctx: CcProbeContext): CcFingerprint = clangFingerprint())
     let clangExpected = toolchainFingerprint(cachedNimFingerprint(), $clangFingerprint())
     checkAllHopsCarry(clang, clangExpected)
     require gcc.artifactFps.len > 0 and clang.artifactFps.len > 0
@@ -164,7 +184,7 @@ suite "L1 — toolchainFp producer chain, api layer (cc identity injected)":
     ## identity, so the value is not merely self-consistent but the host's.
     let obs = measuredRun(nil)
     checkAllHopsCarry(obs,
-      toolchainFingerprint(cachedNimFingerprint(), cachedCcVersion()))
+      toolchainFingerprint(cachedNimFingerprint(), cachedCcVersion(obs.ctx)))
 
 # ---------------------------------------------------------------------------
 # Suite 2 -- the runner layer, nim identity varied
@@ -191,9 +211,10 @@ proc executeMeasured(stateDir, nimVersion, ccVersion: string): ChainObservation 
     workerBinary:        crisolBin,
   )
   var graph = initDepGraph("")
-  let p = plan(cfg, @[ep], graph, nimVersion, false, ccVersion)
+  let p = plan(cfg, @[ep], graph, false)
   let results = execute(p, config = cfg, graph = graph, nimVersion = nimVersion,
-                        ccVersion = ccVersion, showProgress = false).results
+                        toolchain = fakeToolchain(ccVersion, hostSite(cfg)),
+                        showProgress = false).results
   doAssert results.len == 1 and results[0].outcome == oPassed
   for r in scanArtifactLedger(stateDir): result.artifactFps.add r.toolchainFp
   for r in scanCompileCostLedger(stateDir): result.costFps.add r.toolchainFp
@@ -208,11 +229,14 @@ suite "L1 — toolchainFp producer chain, runner layer (nim identity varied)":
       removeDir(dirB)
     let a = executeMeasured(dirA, "nim-identity-A", "cc-identity-X")
     let b = executeMeasured(dirB, "nim-identity-B", "cc-identity-X")
-    let expectedA = toolchainFingerprint("nim-identity-A", "cc-identity-X")
-    let expectedB = toolchainFingerprint("nim-identity-B", "cc-identity-X")
+    let expectedA = toolchainFingerprint("nim-identity-A", fakeToolchain("cc-identity-X").identity)
+    let expectedB = toolchainFingerprint("nim-identity-B", fakeToolchain("cc-identity-X").identity)
     check expectedA != expectedB   # fixture sanity: the inputs really differ
     for (obs, expected) in [(a, expectedA), (b, expectedB)]:
       check obs.artifactFps.len > 0
       check obs.costFps.len == 1
       for fp in obs.artifactFps: check fp == expected
       for fp in obs.costFps:     check fp == expected
+
+when isMainModule:
+  echo "test_toolchainfp_producer_chain done"

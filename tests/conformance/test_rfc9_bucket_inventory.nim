@@ -30,7 +30,7 @@
 ## Audited 2026-09-14 (RFC-0009 A-final-ii follow-on). The counts below
 ## supersede the RFC's informal estimates (B1 ~3, B2 52, B3a ≤16, B3b ~3):
 ## classifying by the literal dominant posix API — reading past comments,
-## docstrings, and test-name strings — yields 13/23/38/1 at the B4 audit; rfc-0007 review round 1 (2026-09-18) added five B2 files (r2/r3/r5 tests + reparented-helper fixtures) -> 13/28/38/1; wave-2 fixes added four more B2 unit tests (r9-r12) -> 13/32/38/1; round-2 fix r69 added the signal-restore unit test (std/posix Sigaction) -> 13/33/38/1; code-review round 3 (2026-09-24, R3-3) added the SIGTERM-ignoring tool fixture (std/posix SIG_IGN) -> 13/34/38/1 (test_conformance_timing.nim moved B1->B2 during B1: it uses SIGKILL/SIGINT, not getpid-only). The two large
+## docstrings, and test-name strings — yields 13/23/38/1 at the B4 audit; rfc-0007 review round 1 (2026-09-18) added five B2 files (r2/r3/r5 tests + reparented-helper fixtures) -> 13/28/38/1; wave-2 fixes added four more B2 unit tests (r9-r12) -> 13/32/38/1; round-2 fix r69 added the signal-restore unit test (std/posix Sigaction) -> 13/33/38/1; code-review round 3 (2026-09-24, R3-3) added the SIGTERM-ignoring tool fixture (std/posix SIG_IGN) -> 13/34/38/1 (test_conformance_timing.nim moved B1->B2 during B1: it uses SIGKILL/SIGINT, not getpid-only); code-review round 11 (2026-09-26, R11-L4) added the tool-interrupt test and its driver fixture (std/posix kill/killpg/SIGINT/SIGTERM, exitnow) -> 13/36/38/1; code-review round 12 (2026-09-26, R12-D3) added the library-host planning-interrupt test and its host fixture (std/posix kill/SIGINT/SIGTERM, sigaction) -> 13/38/38/1; code-review round 13 (2026-09-26, R13-D2/L3/D1) added the library-host rerun-after-interrupt test and its host fixture (std/posix kill/SIGINT/SIGTERM/getpid, sigaction) -> 13/40/38/1; the Lows pass 3 (2026-09-27, R15-S2) added the tooltrees escape test (std/posix kill/ESRCH/SIGKILL) -> 13/41/38/1, and the wake/detach race test (std/posix pipe/read/close) -> 13/41/39/1. The two large
 ## shifts are real: `getpid`-only tests (B1) and the `captureBoth` FD-capture
 ## idiom (B3a) are each far more common than the thematic estimate assumed,
 ## and NO test in-tree calls `setrlimit` directly (limits flow through
@@ -64,7 +64,7 @@ const B1 = [
   "tests/fixtures/hang_with_pid.nim",
 ]
 
-# --- B2: process-control + signal → when defined(posix) gate (34) ----------
+# --- B2: process-control + signal → when defined(posix) gate (41) ----------
 const B2 = [
   "tests/fixtures/self_sigkill.nim",
   "tests/fixtures/spawn_grandchild.nim",
@@ -104,9 +104,34 @@ const B2 = [
   # whole-file `when defined(posix)`-gated, so it is B2 by the same rule as
   # the r69 signal-restore test — no Stage-B conversion is owed.
   "tests/fixtures/hang_ignores_term.nim",
+  # R11-L4 (code-review round 11, 2026-09-26): the live-tool registry's
+  # interrupt path. The test signals a driver (`posix.kill`, `killpg`,
+  # SIGINT/SIGTERM) and probes pid liveness; the driver's only posix use is
+  # `exitnow`. Category-B process control, both behind `when defined(posix)`
+  # imports, so B2 by the same rule as the entries above.
+  "tests/fixtures/tool_interrupt_driver.nim",
+  "tests/integration/test_tool_interrupt.nim",
+  # R12-D3: a library host interrupted while runTests plans. The test
+  # signals the host (`posix.kill`, SIGINT/SIGTERM); the host fixture queries
+  # and installs its own handlers through `sigaction`. Category-B signal
+  # control, both behind `when defined(posix)`/`linux`, so B2.
+  "tests/fixtures/library_interrupt_host.nim",
+  "tests/integration/test_library_interrupt_in_planning.nim",
+  # R13-D2/R13-L3/R13-D1: a library host that runs again after an interrupt,
+  # and one signalled after execute() returns. The test signals the host
+  # (`posix.kill`); the fixture installs its own handlers (`sigaction`) and
+  # reads its pid for the project's test to signal. Category-B signal
+  # control, both behind `when defined(posix)`/`linux`, so B2.
+  "tests/fixtures/library_interrupt_rerun_host.nim",
+  "tests/integration/test_library_interrupt_rerun.nim",
+  # R15-S2 (Lows pass 3): the escape test checks that a Supervisor child's
+  # process group is gone after the escape `_exit` (`posix.kill(pid, 0)`,
+  # ESRCH, SIGKILL cleanup). Category-B process control behind
+  # `when defined(posix)`, so B2.
+  "tests/unit/test_tooltrees.nim",
 ]
 
-# --- B3a: filesystem / FD plumbing → std/os,syncio (or gate) (38) ----------
+# --- B3a: filesystem / FD plumbing → std/os,syncio (or gate) (39) ----------
 const B3a = [
   # captureBoth dup2 stdout-capture idiom (28)
   "tests/integration/test_a0_env_pin_cli.nim",
@@ -149,6 +174,10 @@ const B3a = [
   "tests/fixtures/overlap_probe.nim",
   # RFC-mandated explicit inclusion — the harness itself (1)
   "tests/conformance/test_conformance.nim",
+  # R15-S6 (Lows pass 3): the wake/detach race test watches the POSIX wake
+  # pipe directly (`posix.pipe`/`read`/`close`). Category-C FD plumbing
+  # behind `when defined(posix)`, so B3a.
+  "tests/unit/test_r15_wake_detach.nim",
 ]
 
 # --- B3b: rlimit → when defined(posix) gate (1) ----------------------------
@@ -194,10 +223,10 @@ suite "RFC-0009 B-inventory — posix-bucket work order":
       for f in uniq:
         if seen.count(f) > 1: echo "  DUPLICATE across buckets: " & f
 
-  test "bucket sizes match the audited inventory (13 / 34 / 38 / 1)":
+  test "bucket sizes match the audited inventory (13 / 41 / 39 / 1)":
     check B1.len == 13
-    check B2.len == 34
-    check B3a.len == 38
+    check B2.len == 41
+    check B3a.len == 39
     check B3b.len == 1
 
   test "every file in the LIVE std/posix sweep is bucketed (completeness)":
@@ -227,8 +256,8 @@ suite "RFC-0009 B-inventory — posix-bucket work order":
     # (tests/support/ is kept posix-free by test_conformance_import_purity.nim,
     # RFC-0009 B-inventory's extension of the existing import-purity meta-test.)
 
-  test "the audited inventory total is frozen at 86 (13 + 34 + 38 + 1)":
-    check allBucketed().len == 86
+  test "the audited inventory total is frozen at 94 (13 + 41 + 39 + 1)":
+    check allBucketed().len == 94
 
 when isMainModule:
   echo "test_rfc9_bucket_inventory done"

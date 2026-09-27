@@ -39,8 +39,9 @@ import std/[options, os, strutils]
 import std/terminal as stdterm  # isatty(File) — cross-platform TTY check, no
                                 # std/posix needed (RFC-0007 A3); distinct
                                 # from crisol/terminal (color rendering) below
-import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccidentity, nimprobe, render, ioutils, paths]
+import crisol/[clean, terminal, api, config, lock, junit, shard, order, workerplan, measureworker, ccidentity, nimprobe, render, ioutils, paths, pipeline]
 import crisol/process  # rfc-0007 A7: capabilities() -- the real substrate node for run/v2 + plan/v1
+import crisol/process/tooltrees  # the CLI's interrupt scope around runMain (R11-L4, R12-D3)
 
 # `_exit(2)`: skips Nim's exitprocs/GC-finalize cleanup on the int8-overflow
 # exit-code bypass below. A raw single-symbol libc import (not a
@@ -577,12 +578,40 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
     defer: releaseLock(lockHandle)
 
     try:
-      # RFC-0006 nimcache-persistence GC: real toolchain probe so cache/
+      # RFC-0006 nimcache-persistence GC: real toolchain probes so cache/
       # pruning correctly orphans dirs left over from an old cc/nim
-      # fingerprint (see cleanOrphans' doc). nimVersion uses the RUNTIME
-      # nim fingerprint (nimprobe.cachedNimFingerprint), not crisolNimVersion —
-      # same soundness rule as api.nim's cache-identity feeds.
-      let r = cleanOrphans(cfg, nimVersion = cachedNimFingerprint(), ccVersion = cachedCcVersion())
+      # fingerprint (see cleanOrphans' doc). The Nim half is the RUNTIME
+      # nim probe (nimprobe.cachedNimProbe), not crisolNimVersion — same
+      # soundness rule as api.nim's cache-identity feeds.
+      #
+      # R14-D4: a probe that could not identify its half -- nim or the C
+      # compiler missing from PATH, or an unresolvable cl -- is an UNKNOWN
+      # toolchain: cleanOrphans skips only the toolchain-fingerprinted cache/
+      # prune by it; bin/, the depgraph, the result-cache and the ledgers are
+      # still pruned/GC'd/compacted as usual (nothing about THAT depends on
+      # the toolchain).
+      #
+      # R15-D5 / R15-L2: an interrupt (SIGINT/SIGTERM, refusing every tool
+      # per R13-L3, possibly INCLUDING the probe above) is a SEPARATE, wider
+      # signal: `cleanOrphans` checks it independently of the toolchain and,
+      # once observed, performs no further destructive phase at all --
+      # `r.interrupted` says so. `runMain` still exits 128+n either way (the
+      # scope's own leave answers that, below), so this is purely about
+      # reporting the true cause instead of `toolchainPruneSkipped`'s `why`,
+      # which names the probe's OWN failure (e.g. "nim --version did not
+      # answer") and would misreport an interrupt as a missing toolchain.
+      let toolchain = cleanToolchainOf(cachedNimProbe(),
+                                       cachedToolchainProbe(ccProbeContextOf(cfg)))
+      let r = cleanOrphans(cfg, toolchain)
+      if r.interrupted:
+        writeStderr("crisol: clean: interrupted before finishing; no " &
+                    "further cache/bin pruning, depgraph GC, result-cache " &
+                    "GC, or ledger compaction ran past the point of the signal")
+      elif r.toolchainPruneSkipped.len > 0:
+        writeStderr("crisol: warning: no nimcache directory was pruned: " &
+                    r.toolchainPruneSkipped & ". They are named after the " &
+                    "toolchain that built them, and pruning resumes once " &
+                    "the toolchain can be identified.")
       stdout.write("crisol clean: pruned " & $r.cacheDeleted &
                    " cache dir(s), " & $r.binDeleted &
                    " bin dir(s), " & $r.graphEntriesDropped &
@@ -1230,9 +1259,13 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
 
   if isList or dryRun:
     var pr: PlanReport
+    # R12-D3: an interrupt while planning (the binary's own scope, below)
+    # killed the tool it was running; report neither the plan nor the
+    # failure it caused, only the interrupt.
     try:
       pr = planTests(opts)
     except CrisolError as e:
+      if shutdownRequested().isSome: return 128 + shutdownRequested().get.signum
       case e.kind
       of cekEnvironment:
         writeStderr("crisol: environment error: " & e.msg)
@@ -1243,6 +1276,7 @@ proc runMain*(args: seq[string]; selfWorkerBinary: string = ""): int =
       of cekInternal:
         writeStderr("crisol: internal error: " & e.msg)
         return ExitInternal
+    if shutdownRequested().isSome: return 128 + shutdownRequested().get.signum
 
     # Emit config warnings.
     writeWarnings(pr.warnings)
@@ -1414,7 +1448,26 @@ when isMainModule:
   # self-reexec target for RFC-0006's measurement compile-slot worker. This
   # is the ONLY call site allowed to pass a non-empty selfWorkerBinary — see
   # runMain's doc.
-  let code = runMain(commandLineParams(), selfWorkerBinary = getAppFilename())
+  # R11-L4 / R12-D3: crisol's one SIGINT/SIGTERM (console Ctrl-C/Ctrl-Break)
+  # handler owns the signals for the whole invocation, before anything is
+  # planned: it kills every live bounded tool -- each runs in a process group
+  # or Job Object of its own, out of the terminal's reach -- and, while a run
+  # executes, drives its Supervisor's graceful shutdown. `run` goes through
+  # `runTests` with `installSignals` (a nested scope) and comes back
+  # `rsInterrupted` with exit code 128+n, planning included; `list`, `run
+  # --dry-run`, `clean` and `closure` plan or probe outside `runTests`, so
+  # the scope is opened here, around all of them, and an interrupt anywhere
+  # in the invocation ends it with 128+n below. The verdict is the scope's
+  # own leave (R14-S1): it answers the signal it swaps out as it puts the
+  # default dispositions back, so no signal falls between a last read and
+  # the clear. A second signal in the scope (a third while a run's
+  # Supervisor is attached) does not wait for any of this: the handler ends
+  # the process at once, 128+n (R13-D5).
+  enterInterruptScope()
+  var code = runMain(commandLineParams(), selfWorkerBinary = getAppFilename())
+  let interruptedBy = leaveInterruptScope()
+  if interruptedBy.isSome and code <= high(int8).int:
+    code = 128 + interruptedBy.get.signum
   # rfc-0007 A1e-ii: system.quit() SATURATES its argument to signed int8
   # range (-128..127) on POSIX before it ever reaches the real exit()
   # syscall (system.nim's own doc comment: "quit(int(0x100000000)) is equal

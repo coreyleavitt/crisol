@@ -1,26 +1,23 @@
-## test_fallback.nim — TDD tests for D4: conservative fallback taxonomy.
+## test_fallback.nim — TDD tests for D4: the conservative fallback rules.
 ##
-## Tests the `selectByDiff` detailed selector and the `fallbackNotes` helper.
-## All reason-taxonomy rules are exercised; D3's `narrowByDiff` green tests
-## are kept in test_narrow.nim (which still passes unchanged).
+## Every rule of `narrowByDiff` that includes an entrypoint without a
+## closure hit is exercised, each set up so that no other rule could
+## include it; D3's closure-hit tests are in test_narrow.nim.
 ##
 ## Coverage:
-##   graph_absent_all     — empty graph → ALL eps included with srGraphAbsent.
-##   own_file_beats_miss  — ep.path in changed → srOwnFileChanged even when
-##                          its known closure does NOT intersect changed.
-##   own_file_beats_stale — ep.path in changed AND entry is stale → srOwnFileChanged
-##                          (own-file rule has higher priority than stale rule).
-##   unknown_closure      — graph non-empty, no entry for this key → srUnknownClosure.
-##   stale_entry          — closure references a now-missing file → srStaleEntry
+##   graph_absent_all     — empty graph → ALL eps included.
+##   own_file_beats_miss  — ep.path in changed → included even when its known,
+##                          fresh closure does NOT intersect changed.
+##   own_file_and_stale   — ep.path in changed AND entry is stale → included.
+##   unknown_closure      — graph non-empty, no entry for this key → included.
+##   stale_entry          — closure references a now-missing file → included
 ##                          even when changed is disjoint.
-##   known_hit            — known fresh closure ∩ changed ≠ ∅ → srClosureHit.
+##   known_hit            — known fresh closure ∩ changed ≠ ∅ → included.
 ##   known_miss_excluded  — known fresh closure ∩ changed = ∅ → excluded (sole exclusion).
-##   priority_own_vs_stale — ep is both own-file-changed AND stale → srOwnFileChanged.
-##   summary_graph_absent — fallbackNotes yields "dep graph absent — full run".
-##   summary_mixed        — fallbackNotes reports conservative-inclusion count.
+##   mixed                — hit, unknown and stale included; a miss is not.
 ##   order_preserved      — input order preserved in output.
 
-import std/[os, sets, strutils, tempfiles]
+import std/[options, os, sets, tables]
 import crisol/types
 import crisol/depgraph
 import crisol/narrow
@@ -49,21 +46,18 @@ proc toSet(roots: TrackedRoots; paths: varargs[string]): HashSet[TrackedPath] =
     doAssert pc.kind == pcTracked, "test path failed to classify: " & p
     result.incl pc.tp
 
-proc reasonsOf(results: seq[SelectionResult]): seq[SelectionReason] =
-  for r in results: result.add r.reason
-
-proc pathsOf(results: seq[SelectionResult]): seq[string] =
-  for r in results: result.add string(r.ep.tp.display())
+proc pathsOf(eps: seq[Entrypoint]): seq[string] =
+  for e in eps: result.add string(e.tp.display())
 
 # roots for the TrackedPath-typed `changed` parameter (RFC-0009 A3b-ii).
-# Most blocks below pass projectRoot == "" to selectByDiff (as before this
-# migration) and only ever put project-root-RELATIVE strings in `changed` —
+# Most blocks below use a bogus project root and only ever put
+# project-root-RELATIVE strings in `changed` —
 # `fromCanonical` never touches the filesystem or `roots.project.abs`, so a
 # bogus/empty root is safe here (see rfc9_narrow_support.nim's doc comment).
 let roots = mkRoots("")
 
 # ---------------------------------------------------------------------------
-# Graph absent → ALL eps included with srGraphAbsent
+# Graph absent → ALL eps included
 # ---------------------------------------------------------------------------
 
 block test_graph_absent_all:
@@ -71,102 +65,84 @@ block test_graph_absent_all:
   let e1 = ep("tests/unit/test_a.nim")
   let e2 = ep("tests/unit/test_b.nim")
   let changed = changedTp(roots)  # even empty changed
-  let result = selectByDiff(@[e1, e2], changed, g, roots, "")
-  assert result.len == 2, "graph absent: expected both eps selected, got " & $result.len
-  for item in result:
-    assert item.reason == srGraphAbsent,
-      "graph absent: expected srGraphAbsent, got " & $item.reason
+  let result = narrowByDiff(@[e1, e2], changed, g, roots)
+  assert pathsOf(result) == @["tests/unit/test_a.nim", "tests/unit/test_b.nim"],
+    "graph absent: expected both eps selected, got " & $pathsOf(result)
 
 block test_graph_absent_nonempty_changed:
   let g = emptyGraph()
   let e = ep("tests/unit/test_c.nim")
   let changed = changedTp(roots, "src/crisol/something.nim")
-  let result = selectByDiff(@[e], changed, g, roots, "")
+  let result = narrowByDiff(@[e], changed, g, roots)
   assert result.len == 1
-  assert result[0].reason == srGraphAbsent
 
 # ---------------------------------------------------------------------------
-# Own-file-changed → srOwnFileChanged even when closure does NOT intersect changed
+# Own file changed → included even when the fresh closure does NOT intersect
 # ---------------------------------------------------------------------------
 
 block test_own_file_beats_miss:
-  # ep has a known closure that does NOT contain any changed file —
-  # but ep.path itself is in changed.  Should still include with srOwnFileChanged.
-  # The own-file rule fires at priority 2, before staleness is even checked.
-  # We use a non-existent dep in the closure to also verify that even if the
-  # closure is stale (missing file), own-file rule still fires first.
-  var g = emptyGraph()
-  let e = ep("tests/unit/test_self.nim")
-  # Closure has a non-existent file; would be stale if we got that far.
-  # RFC-0009 B4a: nonExistent is a REAL absolute OS path (under tmpDir) --
-  # classify() needs a root that actually anchors it (a vacuous "/" root
-  # only ever worked for POSIX-shaped absolutes), so anchor at tmpDir
-  # itself, same as the tmpRoots vectors below.
+  # ep has a known, FRESH closure (its member exists) that does not contain
+  # any changed file, so rules 3-5 would all exclude it: only ep.path being
+  # in changed (rule 2) can include it.
   let tmpDir = getTempDir()
   let tmpRoots = mkRoots(tmpDir)
-  let nonExistent = tmpDir / "crisol_d4_self_unrel_" & $getCurrentProcessId() & ".nim"
-  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, nonExistent))
-  # changed only contains ep.path — the own-file rule fires (priority 2).
+  let depName = "crisol_d4_self_dep_" & $getCurrentProcessId() & ".nim"
+  writeFile(tmpDir / depName, "# dep\n")
+  defer:
+    try: removeFile(tmpDir / depName) except: discard
+  var g = emptyGraph()
+  let e = ep("tests/unit/test_self.nim")
+  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, depName), @[])
+  let control = narrowByDiff(@[e], changedTp(tmpRoots, "crisol_d4_other.nim"),
+                             g, tmpRoots)
+  assert control.len == 0, "CONTROL: a fresh closure miss must be excluded"
   let changed = changedTp(tmpRoots, "tests/unit/test_self.nim")
-  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
+  let result = narrowByDiff(@[e], changed, g, tmpRoots)
   assert result.len == 1, "own-file-changed must be included even on closure miss"
-  assert result[0].reason == srOwnFileChanged,
-    "expected srOwnFileChanged, got " & $result[0].reason
 
 # ---------------------------------------------------------------------------
-# Own-file-changed beats stale (priority rule)
+# Own file changed and stale → included
 # ---------------------------------------------------------------------------
 
-block test_own_file_beats_stale:
-  # ep.path is in changed AND the entry is stale (closure has a missing file).
-  # Priority: srOwnFileChanged comes before srStaleEntry.
+block test_own_file_and_stale:
   let tmpDir = getTempDir()
   let tmpRoots = mkRoots(tmpDir)
   let missingFile = tmpDir / "crisol_d4_test_missing_" & $getCurrentProcessId() & ".nim"
   # Do NOT create missingFile — it must not exist.
-
   var g = emptyGraph()
   let e = ep("tests/unit/test_priority.nim")
-  # Closure includes a file that does not exist → isEntryStale would return true.
-  # RFC-0009 B4a: missingFile is a real absolute OS path; anchor at tmpDir
-  # (see test_own_file_beats_miss above).
-  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, missingFile))
-  # ep.path is also in changed → own-file rule fires first.
+  # RFC-0009 B4a: missingFile is a real absolute OS path; anchor at tmpDir.
+  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, missingFile), @[])
   let changed = changedTp(tmpRoots, "tests/unit/test_priority.nim")
-  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
+  let result = narrowByDiff(@[e], changed, g, tmpRoots)
   assert result.len == 1
-  assert result[0].reason == srOwnFileChanged,
-    "own-file must beat stale; got " & $result[0].reason
 
 # ---------------------------------------------------------------------------
-# Unknown closure → srUnknownClosure (graph non-empty, key absent)
+# Unknown closure → included (graph non-empty, key absent)
 # ---------------------------------------------------------------------------
 
 block test_unknown_closure:
   # Graph has entries for OTHER eps but NOT for this ep's key.
   var g = emptyGraph()
   let eOther = ep("tests/unit/test_other.nim")
-  g.updateEntry(string(eOther.tp.display()), flagHash(eOther.flags), toSet(roots, "src/crisol/other.nim"))
+  g.updateEntry(string(eOther.tp.display()), flagHash(eOther.flags), toSet(roots, "src/crisol/other.nim"), @[])
   let e = ep("tests/unit/test_unknown.nim")
   let changed = changedTp(roots)
-  let result = selectByDiff(@[e], changed, g, roots, "")
+  let result = narrowByDiff(@[e], changed, g, roots)
   assert result.len == 1,
     "unknown-closure ep must be included even with empty changed"
-  assert result[0].reason == srUnknownClosure,
-    "expected srUnknownClosure, got " & $result[0].reason
 
 block test_unknown_closure_nonempty_changed:
   var g = emptyGraph()
   let eOther2 = ep("tests/unit/test_other2.nim")
-  g.updateEntry(string(eOther2.tp.display()), flagHash(eOther2.flags), toSet(roots, "src/crisol/x.nim"))
+  g.updateEntry(string(eOther2.tp.display()), flagHash(eOther2.flags), toSet(roots, "src/crisol/x.nim"), @[])
   let e = ep("tests/unit/test_unknown2.nim")
   let changed = changedTp(roots, "src/crisol/something_else.nim")
-  let result = selectByDiff(@[e], changed, g, roots, "")
+  let result = narrowByDiff(@[e], changed, g, roots)
   assert result.len == 1
-  assert result[0].reason == srUnknownClosure
 
 # ---------------------------------------------------------------------------
-# Stale entry → srStaleEntry (closure references a now-missing file)
+# Stale entry → included (closure references a now-missing file)
 # ---------------------------------------------------------------------------
 
 block test_stale_entry:
@@ -179,25 +155,22 @@ block test_stale_entry:
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_stale.nim")
-  # Closure references the temp file (which exists right now).
   # RFC-0009 B4a: tmpFile is a real absolute OS path; anchor at tmpDir so
-  # isEntryStale's toNative(roots) round-trips it to the real path (not a
-  # POSIX-only "/" vacuous root) — see test_own_file_beats_miss above.
-  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, tmpFile))
+  # isEntryStale's toNative(roots) round-trips it to the real path.
+  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, tmpFile), @[])
+  # changed is disjoint — a miss while the entry is fresh.
+  let changed = changedTp(tmpRoots, "src/crisol/unrelated.nim")
+  assert narrowByDiff(@[e], changed, g, tmpRoots).len == 0,
+    "CONTROL: a fresh closure miss must be excluded"
 
   # Now delete the file to simulate a missing closure dependency.
   removeFile(tmpFile)
-
-  # changed is disjoint — would be a miss if fresh — but entry is stale.
-  let changed = changedTp(tmpRoots, "src/crisol/unrelated.nim")
-  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
+  let result = narrowByDiff(@[e], changed, g, tmpRoots)
   assert result.len == 1,
     "stale entry must be included even when changed is disjoint"
-  assert result[0].reason == srStaleEntry,
-    "expected srStaleEntry, got " & $result[0].reason
 
 # ---------------------------------------------------------------------------
-# Known hit → srClosureHit
+# Known hit → included
 # ---------------------------------------------------------------------------
 
 block test_known_hit:
@@ -205,8 +178,7 @@ block test_known_hit:
   # RFC-0009 A3b-ii: closure/changed members must be reducible to
   # TrackedPath, so the temp dir itself is the "project root" here and the
   # closure carries names RELATIVE to it (fromCanonical rejects absolute
-  # input) -- same isolation/uniqueness guarantee as before, just addressed
-  # relative to tmpDir instead of as bare absolute strings.
+  # input).
   let tmpDir = getTempDir()
   let tmpRoots = mkRoots(tmpDir)
   let pid = $getCurrentProcessId()
@@ -220,13 +192,17 @@ block test_known_hit:
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_hit.nim")
-  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, tmpAName, tmpBName))
+  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, tmpAName, tmpBName), @[])
   # changed contains one of the closure files → hit.
   let changed = changedTp(tmpRoots, tmpBName)
-  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
+  let result = narrowByDiff(@[e], changed, g, tmpRoots)
   assert result.len == 1, "expected 1 hit, got " & $result.len
-  assert result[0].reason == srClosureHit,
-    "expected srClosureHit, got " & $result[0].reason
+  # Rule 5, not a fallback: the entry is known and fresh, and diffReach
+  # finds the member.
+  let key = entryKey(e.tp, e.flags)
+  assert not isEntryStale(g, key, tmpRoots)
+  let hit = diffReach(g.entries[key], changed, tmpRoots)
+  assert hit.isSome and hit.get.kind == hkMember
 
 # ---------------------------------------------------------------------------
 # Known miss → EXCLUDED (the sole exclusion path)
@@ -234,8 +210,6 @@ block test_known_hit:
 
 block test_known_miss_excluded:
   # Closure files must exist on disk so isEntryStale does not fire.
-  # See test_known_hit: tmpDir is the "project root" so the closure/changed
-  # members reduce to TrackedPath (fromCanonical rejects absolute input).
   let tmpDir = getTempDir()
   let tmpRoots = mkRoots(tmpDir)
   let pid = $getCurrentProcessId()
@@ -249,93 +223,48 @@ block test_known_miss_excluded:
 
   var g = emptyGraph()
   let e = ep("tests/unit/test_miss.nim")
-  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, tmpCName, tmpDName))
+  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, tmpCName, tmpDName), @[])
   # changed does NOT contain any closure file → miss → excluded.
   let changed = changedTp(tmpRoots, "crisol_d4_unrelated.nim")
-  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
+  let result = narrowByDiff(@[e], changed, g, tmpRoots)
   assert result.len == 0,
     "known-fresh closure miss must be excluded; got " & $result.len
 
 # ---------------------------------------------------------------------------
-# Priority documented: own-file > stale (already tested above in own_file_beats_stale)
-# Confirm via the reasons list when both conditions could apply.
+# Mixed: a hit, an unknown and a stale entry are included; a miss is not
 # ---------------------------------------------------------------------------
 
-block test_priority_own_file_vs_stale:
-  let tmpDir = getTempDir()
-  let tmpRoots = mkRoots(tmpDir)
-  let missingFile2 = tmpDir / "crisol_d4_prio_" & $getCurrentProcessId() & ".nim"
-  # missingFile2 does NOT exist — closure will be stale.
-  # RFC-0009 B4a: missingFile2 is a real absolute OS path; anchor at tmpDir
-  # (see test_own_file_beats_miss above).
-
-  var g = emptyGraph()
-  let e = ep("tests/unit/test_prio.nim")
-  g.updateEntry(string(e.tp.display()), flagHash(e.flags), toSet(tmpRoots, missingFile2))
-  # Both conditions: own-file in changed AND entry is stale.
-  let changed = changedTp(tmpRoots, "tests/unit/test_prio.nim")
-  let result = selectByDiff(@[e], changed, g, tmpRoots, tmpDir)
-  assert result.len == 1
-  # Own-file rule (priority 2) fires before stale rule (priority 4).
-  assert result[0].reason == srOwnFileChanged,
-    "priority: own-file must beat stale; got " & $result[0].reason
-
-# ---------------------------------------------------------------------------
-# Summary message: graph-absent run → "dep graph absent — full run"
-# ---------------------------------------------------------------------------
-
-block test_summary_graph_absent:
-  let g = emptyGraph()
-  let e1 = ep("tests/unit/test_sa.nim")
-  let e2 = ep("tests/unit/test_sb.nim")
-  let detailed = selectByDiff(@[e1, e2], changedTp(roots), g, roots, "")
-  let msg = fallbackNotes(detailed, 2)
-  assert "dep graph absent — full run" in msg,
-    "expected 'dep graph absent — full run' in msg, got: " & msg
-
-# ---------------------------------------------------------------------------
-# Summary message: mixed run → reports conservative-inclusion count
-# ---------------------------------------------------------------------------
-
-block test_summary_mixed:
-  # One ep with a known closure hit, one unknown closure, one stale.
-  # See test_known_hit: tmpDir is the "project root" so the closure/changed
-  # members reduce to TrackedPath (fromCanonical rejects absolute input).
+block test_mixed:
   let tmpDir = getTempDir()
   let tmpRoots = mkRoots(tmpDir)
   let pid = $getCurrentProcessId()
-  # Real existing file for eHit's closure (so it's fresh, not stale).
+  # Real existing files for eHit's and eMiss's closures (so they are fresh).
   let hitDepName = "crisol_d4_mix_hit_" & pid & ".nim"
+  let missDepName = "crisol_d4_mix_other_" & pid & ".nim"
   writeFile(tmpDir / hitDepName, "# hit dep\n")
+  writeFile(tmpDir / missDepName, "# other dep\n")
   # Non-existing file for eStale's closure.
   let missingFile3Name = "crisol_d4_mix_miss_" & pid & ".nim"
   defer:
     try: removeFile(tmpDir / hitDepName) except: discard
+    try: removeFile(tmpDir / missDepName) except: discard
 
   var g = emptyGraph()
   let eHit     = ep("tests/unit/test_mhit.nim")
   let eUnknown = ep("tests/unit/test_munk.nim")
   let eStale   = ep("tests/unit/test_mstale.nim")
-
-  # eHit: known fresh closure (existing file) that intersects changed.
-  g.updateEntry(string(eHit.tp.display()), flagHash(eHit.flags), toSet(tmpRoots, hitDepName))
+  let eMiss    = ep("tests/unit/test_mmiss.nim")
+  g.updateEntry(string(eHit.tp.display()), flagHash(eHit.flags), toSet(tmpRoots, hitDepName), @[])
   # eUnknown: no entry → unknown closure.
-  # eStale: entry with a missing file → stale.
-  g.updateEntry(string(eStale.tp.display()), flagHash(eStale.flags), toSet(tmpRoots, missingFile3Name))
+  g.updateEntry(string(eStale.tp.display()), flagHash(eStale.flags), toSet(tmpRoots, missingFile3Name), @[])
+  g.updateEntry(string(eMiss.tp.display()), flagHash(eMiss.flags), toSet(tmpRoots, missDepName), @[])
 
   let changed = changedTp(tmpRoots, hitDepName)
-  let detailed = selectByDiff(@[eHit, eUnknown, eStale], changed, g, tmpRoots, tmpDir)
-
-  # Verify reasons.
-  let reasons = reasonsOf(detailed)
-  assert srClosureHit    in reasons, "expected srClosureHit in mixed run"
-  assert srUnknownClosure in reasons, "expected srUnknownClosure in mixed run"
-  assert srStaleEntry    in reasons, "expected srStaleEntry in mixed run"
-
-  let msg = fallbackNotes(detailed, 3)
-  # 2 force-included (unknown + stale).
-  assert "2 entrypoint(s) force-included" in msg,
-    "expected '2 entrypoint(s) force-included' in msg, got: " & msg
+  let result = narrowByDiff(@[eHit, eUnknown, eStale, eMiss], changed, g, tmpRoots)
+  assert pathsOf(result) == @["tests/unit/test_mhit.nim",
+                              "tests/unit/test_munk.nim",
+                              "tests/unit/test_mstale.nim"],
+    "mixed: got " & $pathsOf(result)
 
 # ---------------------------------------------------------------------------
 # Input order preserved
@@ -343,8 +272,6 @@ block test_summary_mixed:
 
 block test_order_preserved:
   # All closure files must exist for fresh (non-stale) entries.
-  # See test_known_hit: tmpDir is the "project root" so the closure/changed
-  # members reduce to TrackedPath (fromCanonical rejects absolute input).
   let tmpDir = getTempDir()
   let tmpRoots = mkRoots(tmpDir)
   let pid = $getCurrentProcessId()
@@ -364,46 +291,12 @@ block test_order_preserved:
   let e2 = ep("tests/unit/test_ord2.nim")
   let e3 = ep("tests/unit/test_ord3.nim")
   # e1: hit, e2: miss (excluded), e3: hit
-  g.updateEntry(string(e1.tp.display()), flagHash(e1.flags), toSet(tmpRoots, dep1Name))
-  g.updateEntry(string(e2.tp.display()), flagHash(e2.flags), toSet(tmpRoots, dep2Name))
-  g.updateEntry(string(e3.tp.display()), flagHash(e3.flags), toSet(tmpRoots, dep3Name))
+  g.updateEntry(string(e1.tp.display()), flagHash(e1.flags), toSet(tmpRoots, dep1Name), @[])
+  g.updateEntry(string(e2.tp.display()), flagHash(e2.flags), toSet(tmpRoots, dep2Name), @[])
+  g.updateEntry(string(e3.tp.display()), flagHash(e3.flags), toSet(tmpRoots, dep3Name), @[])
   let changed = changedTp(tmpRoots, dep1Name, dep3Name)
-  let result = selectByDiff(@[e1, e2, e3], changed, g, tmpRoots, tmpDir)
-  assert result.len == 2, "expected 2 hits (e1, e3), got " & $result.len
-  assert result[0].ep.tp.display() == e1.tp.display(), "first must be e1"
-  assert result[1].ep.tp.display() == e3.tp.display(), "second must be e3"
-
-# ---------------------------------------------------------------------------
-# narrowByDiff delegates to selectByDiff (RFC pipeline API still works)
-# ---------------------------------------------------------------------------
-
-block test_narrowByDiff_delegates:
-  # Closure files must exist so fresh entries are not tagged stale.
-  # See test_known_hit: tmpDir is the "project root" so the closure/changed
-  # members reduce to TrackedPath (fromCanonical rejects absolute input).
-  let tmpDir = getTempDir()
-  let tmpRoots = mkRoots(tmpDir)
-  let pid = $getCurrentProcessId()
-  let ndDepName   = "crisol_d4_nd_dep_"   & pid & ".nim"
-  let ndOtherName = "crisol_d4_nd_other_" & pid & ".nim"
-  writeFile(tmpDir / ndDepName,   "# nd dep\n")
-  writeFile(tmpDir / ndOtherName, "# nd other\n")
-  defer:
-    try: removeFile(tmpDir / ndDepName)   except: discard
-    try: removeFile(tmpDir / ndOtherName) except: discard
-
-  var g = emptyGraph()
-  let eHit  = ep("tests/unit/test_nd_hit.nim")
-  let eMiss = ep("tests/unit/test_nd_miss.nim")
-  let eUnk  = ep("tests/unit/test_nd_unk.nim")
-  g.updateEntry(string(eHit.tp.display()),  flagHash(eHit.flags),  toSet(tmpRoots, ndDepName))
-  g.updateEntry(string(eMiss.tp.display()), flagHash(eMiss.flags), toSet(tmpRoots, ndOtherName))
-  # eUnk has no entry.
-  let changed = changedTp(tmpRoots, ndDepName)
-  let result = narrowByDiff(@[eHit, eMiss, eUnk], changed, g, tmpRoots, tmpDir)
-  assert result.len == 2,
-    "narrowByDiff: expected hit + unknown, got " & $result.len
-  assert result[0].tp.display() == eHit.tp.display()
-  assert result[1].tp.display() == eUnk.tp.display()
+  let result = narrowByDiff(@[e1, e2, e3], changed, g, tmpRoots)
+  assert pathsOf(result) == @["tests/unit/test_ord1.nim", "tests/unit/test_ord3.nim"],
+    "expected e1, e3 in order, got " & $pathsOf(result)
 
 echo "PASS test_fallback"

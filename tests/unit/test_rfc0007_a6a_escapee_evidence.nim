@@ -21,6 +21,7 @@ when defined(posix):
   import crisol/process
   import crisol/process/types as ptypes
   import "../support/testep"
+  import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
   proc escapeeMechanismsAvailable(): bool =
     ## rfc-0007 C1a: escapee discovery (`discoverAndReapEscapees`) and the
@@ -80,7 +81,7 @@ when defined(posix):
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheDisabled(isoSpec)).results
+      cache = cacheDisabled(isoSpec), toolchain = unprobedToolchain()).results
     check results.len == 1
     results[0]
 

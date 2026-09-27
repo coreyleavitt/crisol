@@ -229,7 +229,7 @@ block test_cleanorphans_compacts_artifact_stream:
     "{\"rowVersion\":1,\"identity\":\"" & $execIdent & "\",\"timestamp\":1500," &
     "\"inputHash\":\"abc\",\"outcome\":\"passed\",\"attempt\":1,\"durationUs\":1000,\"rssBytes\":4096}\n")
 
-  let r = cleanOrphans(cfg)
+  let r = cleanOrphans(cfg, knownToolchain("", ""))
 
   # Artifact stream compacted: 2 shards merged into 1, 2 rows kept.
   assert r.artifactReport.shardsRemoved == 2,

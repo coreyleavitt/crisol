@@ -41,7 +41,7 @@ suite "cacheregistry.configuredCache — https-capability guard is inert under -
     let sd = freshStateDir("configured_cache")
     let cfg = CacheConfig(remotes: @[
       RemoteTier(name: "mirror", url: "https://cache.example.com/crisol")
-    ])
+    ], trust: TrustConfig(policy: "none"))
     let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                              secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
     check rt.cache.tiers.len == 2

@@ -91,7 +91,7 @@ proc recordEntry(graph: var DepGraph; ep: Entrypoint; config: Config;
   # suite exists to pin.
   let contentHash = closureContentHash(closureHashInputs(closureSet, config.trackedRoots))
   let fHash = flagHash(ep.flags)
-  graph.updateEntry(string(ep.tp.display()), fHash, closureSet, contentHash, protocolMajor)
+  graph.updateEntry(string(ep.tp.display()), fHash, closureSet, @[], contentHash, protocolMajor)
 
 # ---------------------------------------------------------------------------
 # Suite: closureContentHash
@@ -227,7 +227,7 @@ suite "decideCompile — binary freshness logic":
   # header re-stamp -- which is the invariant this file's deleted cases were
   # unknowingly asserting the redundant shadow of. Rationale and the mutation
   # proof are at R3-8 in docs/handoff/msvc-selection-layer.md; the end-to-end
-  # leg is tests/integration/test_w3_cc_liveness.nim.
+  # leg is tests/integration/test_cc_depgraph_liveness.nim.
 
   test "binary present, closure file missing → cdStale":
     let root = getTempDir() / "crisol_decide6"
@@ -247,7 +247,7 @@ suite "decideCompile — binary freshness logic":
       doAssert pc.kind == pcTracked, "test closure file failed to classify: " & p
       closureSet.incl pc.tp
     let fHash = flagHash(ep.flags)
-    g.updateEntry(string(ep.tp.display()), fHash, closureSet, "aaaaaaaaaaaaaaaa", CrisolProtocolMajor)
+    g.updateEntry(string(ep.tp.display()), fHash, closureSet, @[], "aaaaaaaaaaaaaaaa", CrisolProtocolMajor)
 
     let (decision, reason) = decideCompile(ep, g, cfg, false, CrisolProtocolMajor)
     check decision == cdStale
@@ -307,7 +307,7 @@ suite "decideCompile — binary freshness logic":
     check decision == cdStale
     check "force" in reason
 
-  test "empty graph (nimVersion='') → cdNeverBuilt regardless of binary existence":
+  test "empty graph (nimVersion='') + binary present → cdStale (no closure record), never cdSkipFresh":
     let root = getTempDir() / "crisol_decide10"
     createDir(root)
     defer: removeDir(root)
@@ -315,9 +315,11 @@ suite "decideCompile — binary freshness logic":
     let ep  = makeEp("tests/unit/test_x.nim")
     discard makeBin(cfg, ep)
     let g = emptyDepGraph()  # nimVersion = ""
-    # Even with binary present, no closure record → cdStale, not cdSkipFresh
-    let (decision, _) = decideCompile(ep, g, cfg, false, CrisolProtocolMajor)
-    # No entry in graph → cdStale
+    # The binary is present, so this is not cdNeverBuilt (that is binary
+    # absence, the first case above); the graph holds no closure record for
+    # it, so decideCompile's step 2 answers cdStale -- never cdSkipFresh.
+    let (decision, reason) = decideCompile(ep, g, cfg, false, CrisolProtocolMajor)
     check decision == cdStale
+    check "no closure record" in reason
 
 echo "PASS test_freshness"

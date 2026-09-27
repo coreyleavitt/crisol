@@ -41,6 +41,7 @@ suite "RFC-0009 A1 — probeFoldPolicy real-volume runtime evidence":
     if not isCaseInsensitiveVolume(root):
       echo "FOLD-PROBE SKIPPED: case-sensitive volume — probeFoldPolicy's " &
            "fpAsciiLower answer is only meaningful on a case-insensitive one"
+      echo "CRISOL-SKIP-TEST: tests/conformance/test_fold_probe.nim#fold_probe_needs_case_insensitive_volume"
       skip()
     else:
       let stateDir = root / ".crisol-state"

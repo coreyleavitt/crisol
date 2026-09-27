@@ -6,6 +6,204 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### BREAKING CHANGE — dependency graph format 10: a repointed symlink on an import path now invalidates the compile skip; one-time full recompile (issue #25)
+
+**Prior behaviour:** Nim records every module it opens by its realpath, so
+a test importing `vend/m` with `vend -> libs/a` had `libs/a/m.nim` in its
+closure and `vend` nowhere. Repointing `vend` to `libs/b` left every
+recorded member unchanged: `decideCompile` skipped the compile, a plain
+`crisol run` served the cached PASS, and `--no-cache` ran the stale binary.
+Only `--force-compile` showed the real result.
+
+**New behaviour:** each dependency-graph entry records `links`, every
+symlink (or Windows junction) under a tracked root that a closure member
+may have been reached through, with its resolved target
+(`closure.crossedLinks`; links behind other links included).
+`decideCompile` and `isEntryStale` re-resolve each one and treat any
+difference as stale. A directory on a member's path that has become a link
+since the record (a directory or a submodule checkout replaced by a link, a
+junction made in place of a directory) is stale too, so the recompile
+records the link even when its target holds the same bytes. A repoint of a
+link the entrypoint never crossed changes nothing. Under `--changed`, a
+link the diff names (or a name above or under one) selects every
+entrypoint whose closure was reached through it, even when the graph was
+recorded after a committed repoint, and a changed name that is a directory
+above a closure member selects that entrypoint (a submodule replaced by a
+link is named by its own path alone); a changed link no entrypoint crosses
+selects nothing and no longer refuses the run. A changed submodule
+contributes only the names its own diff reports, not every file under it
+and not its own path. `DepGraphFormatVersion` 9 → 10: an existing graph is
+discarded once, so budget one full recompile. The result-cache key is
+unchanged (it is derived from the closure a compile actually records).
+
+Links inside dot-directories and `nimcache` directories are recorded too
+(the walk visits them for links only). Not covered: links inside crisol's
+own state dir, and links outside every tracked root (declare such a
+directory as a `dep-roots` entry to track it).
+
+### Fixed — a run cut short before promotion no longer leaves the old binary to be served for the new source (issue #26)
+
+**Prior behaviour:** a freshly compiled entrypoint's dependency-graph entry
+is persisted when its compile finishes, before the test runs, but its
+binary replaced the stable one only after the run. A run that ended in
+between (Ctrl-C, `kill -9`, a crash, a run-phase spawn failure) left the
+new entry beside the previous stable binary. The next run skipped the
+compile, ran the old binary and reported its verdict, a PASS for a test
+that now fails, and could store that PASS in the result cache under the
+new key.
+
+**New behaviour:** the previous stable binary is removed before the new
+entry is persisted, so a run cut short at any point leaves either the old
+entry with the old binary, or an entry with no binary (the next run
+recompiles). If the old binary cannot be removed, the entry is dropped
+instead and the entrypoint is recompiled next run. Promotion copies the
+binary beside the stable path and renames it into place, so a kill during
+the copy cannot leave a truncated binary there either.
+
+### Added — an unrecorded closure is reported in the `--json` `warnings` array, however the run ends (review R18-D1, R19-D3, R20-S1)
+
+**Prior behaviour:** when a freshly compiled entrypoint's closure could not
+be recorded (the previous stable binary could not be removed, or closure
+extraction or recording failed), its entry was dropped and its binary
+discarded, but the only report of it was one stderr line, printed after
+the test ran. With the result cache off, a `--json` consumer or a library
+host whose stderr was swallowed could not see it, and a run that ended
+before that point (Ctrl-C, a run-phase spawn failure) did not report it
+at all.
+
+**New behaviour:** it is reported when the recording fails, before the
+test runs, so every run that gets that far reports it, including one
+interrupted afterwards. It reaches stderr once and the structured
+warnings channel as a `ConfigWarning` with `context: "closure-record"`
+and `key` naming the entrypoint: `ExecuteReport.warnings` from `execute`,
+then the run document's `warnings` array (`--json`, `lastrun.json`,
+`RunReport.doc.warnings`). With retries configured, it describes how the
+run ended for that entrypoint (review R20-S1): an attempt that fails to
+record while a retry is still possible holds the warning; if a later
+attempt records the closure, nothing is reported (its binary is
+promoted), and otherwise it is reported once, with the last attempt's
+error, when the entrypoint's final attempt is decided or when the run
+stops before the retry (Ctrl-C, fail-fast). Only a crisol process killed
+outright (SIGKILL) cannot report a held warning. The message now reads
+"... dependency record invalidated and this build's binary will not be
+kept — it will be recompiled and force-selected next run" (previously
+"... and its binary was discarded — ..."). The `--json` schema is
+unchanged; this is a new `context` value.
+
+### Fixed — a blocked stable binary path prints one warning, not two, and a failed promotion is in the `--json` `warnings` array (review R19-D1, R19-L1)
+
+**Prior behaviour:** a binary whose closure could not be recorded was
+still copied to the stable path after the run and then removed again. When
+the retire had failed because the stable path was blocked (a directory, or
+on Windows a binary held open), that copy failed too, so stderr carried two
+warnings: the unrecorded closure, and "could not promote its compiled
+binary ...; the previous binary was discarded", which was false (the
+previous binary was still there). A promotion that failed for any other
+reason was reported on stderr only.
+
+**New behaviour:** a binary whose closure was not recorded is never
+promoted, so the blocked-path case prints exactly one warning. A promotion
+that fails with the closure recorded is reported once on stderr and as a
+`ConfigWarning` with `context: "promote-binary"` and `key` naming the
+entrypoint, through the same channel as above. Its message says what is
+left at the stable path and what the next run does: nothing (it
+recompiles), something that is not a file and could not be removed (it
+recompiles, and warns again until that is removed), or a file that could
+not be removed (remove it by hand). The `--json` schema is unchanged; this
+is a new `context` value.
+
+### Fixed — interrupted `crisol clean`, orphaned compile children, and the measure-compile warning relay (review Lows pass 3: R15-D3, R15-D5, R15-L2, R15-S2, R15-S4, R15-S5, R15-S6, R16-D2)
+
+- **An interrupted `crisol clean` stops.** Prior behaviour: after the
+  signal it still pruned `bin/`, garbage-collected the dependency graph and
+  result cache, and compacted the ledgers. It then printed a warning that
+  blamed the toolchain probe. New behaviour: clean stops before the next
+  destructive phase, keeps what it already committed, and reports that it
+  was interrupted.
+- **`crisol clean` removes a stale `<binary>.promoting` file** left in
+  `bin/` when a run is killed between staging a promotion and renaming it
+  into place. Clean does this only while it holds the state-directory lock
+  that a run holds for its whole compile-and-promote phase.
+- **The repeated-signal escape leaves no child behind (POSIX).** Prior
+  behaviour: compile and test children run in their own process groups, so
+  they outlived crisol's immediate exit and the lock it released. New
+  behaviour: every registered child process group is killed first.
+- **Detaching the interrupt wake waits for any handler still using it**, so
+  a signal handler never signals an event (Windows) or writes to an fd
+  that was just closed.
+- **A failed toolchain probe no longer spreads across state directories.**
+  Prior behaviour: a probe that failed because of its state directory (a
+  noexec `/tmp`, for example) was remembered and applied to every other
+  state directory, which refused a working toolchain. New behaviour: a
+  failed answer is kept only for the state directory it was probed in; an
+  identified toolchain is still shared.
+- **`--measure-compile-reuse` keeps its warnings on a large compile.** Prior
+  behaviour: the worker's warnings were read from the display-capped head
+  of the compile log, so a log larger than `max-output-bytes` lost them.
+  New behaviour: the whole log is scanned. Only lines with the worker's own
+  `crisol: warning: measure-compile: ` prefix are relayed, and control and
+  escape bytes in them are replaced with `?`. The compiler's merged output
+  can no longer inject terminal escapes through the relay.
+- **A header reported with no tracked roots refuses** (`hpfRootsUnpopulated`)
+  and is never hashed unclassified. `closure` and `artifactid` now handle
+  that case identically (review R15-D6).
+
+### Fixed — `--changed` sees a submodule whose `.git` entry was removed, and no longer refuses an uninitialised one (review R13-S3, R15-D1)
+
+**Prior behaviour:** git treats a submodule directory with no repository in
+it as unchanged, and `git ls-files --others` lists nothing under a
+submodule path. After `rm vendor/lib/.git`, an edit to `vendor/lib/dep.nim`
+left the changed set empty, and `--changed` planned nothing.
+
+**New behaviour:** `--changed` reads the index's submodule entries
+(`git ls-files --stage`, in the project and in each checked-out submodule).
+A submodule directory that holds files but no `.git` entry counts as
+changed as a whole, and selects every test that reads a file under it,
+whether or not the diff names the submodule. An uninitialised submodule (an
+empty directory) contributes nothing, and it no longer refuses `--changed`
+when its recorded commit moved since `--base`: a test that read a file
+there is selected anyway, because that file is now missing. The only
+submodule that still refuses is a checked-out one whose recorded commit is
+not available locally. A directory that changed as a whole (a new submodule, an untracked nested
+repository) is no longer listed file by file, so an unreadable
+subdirectory in one no longer refuses `--changed`; the selection is the
+same.
+
+### Changed — interrupts: a repeated Ctrl-C always ends crisol, and a library run reports every signal it received
+
+**A repeated signal.** While tests run, the second SIGINT/SIGTERM (or
+console Ctrl-C) still force-kills every live test, as before. A signal
+after that one ends crisol at once: live tools are killed and the process
+exits with 128+n. With no test running, the second signal does this. A
+wait that never checks for shutdown can no longer leave Ctrl-C with no
+effect. In a library host that passes `installSignals`, "the process" is
+the host: a repeated signal ends it with 128+n. A host that must never
+exit this way leaves `installSignals` off.
+
+**Library hosts (`crisol/api.runTests`).** A signal delivered at any
+point in the call, including the end-of-run cache drain and the
+`--verify-cache` sub-run, now returns `rsInterrupted` with exit 128+n, and
+the plan and results gathered so far are kept. The signal is not
+re-raised to the host's own handler: the report is how it is delivered.
+The interrupt record is scoped to one call, so a later `runTests` in the
+same process is unaffected: its cache lookups, remote writes and toolchain
+probes behave as if the earlier interrupt never happened. A toolchain
+probe cut short by an interrupt is never memoised.
+
+`leaveInterruptScope` (in `crisol/process/tooltrees`, not supported
+surface) now returns the signal the scope recorded.
+
+### Fixed — `crisol clean` no longer prunes every compile cache when the toolchain cannot be identified (review R14-L1)
+
+**Prior behaviour:** with `nim` or the C compiler missing from `PATH`,
+the probes returned a placeholder fingerprint that matched no recorded
+toolchain, so `clean` treated every `cache/` directory as an orphan and
+deleted it. The next run recompiled everything.
+
+**New behaviour:** when either toolchain identity is unknown, `clean`
+skips the toolchain-keyed prune and warns; the dependency-graph GC, the
+result cache, the ledgers and `bin/` are still cleaned.
+
 ### BREAKING CHANGE — result-cache format 4: the soundness key now folds cwd posture; one-time cache discard (r57 code-review, CONFIRMED High)
 
 **Prior behaviour:** `SandboxSpec.chdirIntoScratch` (rfc-0007 code-review

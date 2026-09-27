@@ -170,11 +170,9 @@
 # default the same parameter name get their own line, so a NEW overload that adds
 # another defaulted parameter of an existing name still trips the gate instead of
 # collapsing into an existing record. `sort | uniq -d` over `--list` output names
-# the repeats; today they are `cachedispatch.cacheEnabled`'s three knobs and
-# `shouldStore`'s `cacheable` (each proc has a full-arity form plus its R4-4
-# `{.deprecated.}` companion), `paths.classify`'s `expandCandidate` (the
+# the repeats; today they are `paths.classify`'s `expandCandidate` (the
 # `string` and `ReportedPath` overloads) and `pipeline.buildRunPlan`'s nine (its
-# own full-arity form plus its R4-4 companion). That is why some records below
+# own full-arity form plus its R4-4 `{.deprecated.}` companion). That is why some records below
 # appear twice; the repeat is the point, not a copy-paste slip.
 #
 # ## WHAT TO DO WHEN THIS GATE FAILS
@@ -184,7 +182,7 @@
 #   (a) it is under-invalidating => remove the default, add a `{.deprecated.}`
 #       companion overload with the old signature, and annotate the full-arity
 #       proc with a `SOUNDNESS-PARAMETER WARNING` block (see
-#       `cachedispatch.cacheEnabled` for the canonical shape); or
+#       `pipeline.buildRunPlan` for the canonical shape); or
 #   (b) it fails safe => add the record to ALLOWLIST below with a one-line
 #       reason naming WHY omitting it is safe.
 # Never add a record without a reason. The reason is the classification; the
@@ -978,8 +976,6 @@ ALLOWLIST="$(cat <<'EOF'
 # --- it; a forgotten override can only make a test less realistic, never
 # --- make production less sound.
 src/crisol/admission.nim:initAdmission:probe = nil                                        # nil selects the real memory probe (memprobe); tests inject a synthetic one
-src/crisol/api.nim:planImpl:ccProbe = cachedCcFingerprint                                 # = cachedCcFingerprint, the real cc-identity probe
-src/crisol/api.nim:runTestsWith:ccProbe = cachedCcFingerprint                             # = cachedCcFingerprint, the real cc-identity probe
 src/crisol/artifactid.nim:ccIncludeClosure:expandCandidate = safeExpandFilename           # = safeExpandFilename, the real on-disk case probe
 src/crisol/artifactid.nim:ccIncludeClosure:readFile = realFileReader                      # = realFileReader
 src/crisol/artifactid.nim:ccIncludeClosure:run = realRun                                  # = realRun, the real process-execution seam
@@ -988,15 +984,6 @@ src/crisol/artifactid.nim:normalize:readFile = realFileReader                   
 src/crisol/cacheregistry.nim:configuredCache:foldProbe = probeFoldPolicy                  # = probeFoldPolicy
 src/crisol/cacheregistry.nim:productionRegistry:fetcher = rawHttpFetcher()                # = rawHttpFetcher(), the real HTTP transport
 src/crisol/cacheregistry.nim:rootInsideStateDir:probe = probeFoldPolicy                   # = probeFoldPolicy, the real on-disk fold probe
-src/crisol/ccidentity.nim:ccFingerprint:hashFile = realFileHash                           # = realFileHash, the real content hasher
-src/crisol/ccidentity.nim:ccFingerprint:linkProbe = realLinkVerbose                       # = realLinkVerbose, the real linker probe
-src/crisol/ccidentity.nim:ccFingerprint:profile = hostCcProfile()                         # = hostCcProfile(), the REAL host cc profile
-src/crisol/ccidentity.nim:ccFingerprint:run = realRunMerged                               # = realRunMerged, the real cc-probe runner
-src/crisol/ccidentity.nim:ccVersion:hashFile = realFileHash                               # = realFileHash
-src/crisol/ccidentity.nim:ccVersion:linkProbe = realLinkVerbose                           # = realLinkVerbose
-src/crisol/ccidentity.nim:ccVersion:profile = hostCcProfile()                             # = hostCcProfile()
-src/crisol/ccidentity.nim:ccVersion:run = realRunMerged                                   # = realRunMerged
-src/crisol/ccidentity.nim:runtimeIdentity:linkProbe = realLinkVerbose                     # = realLinkVerbose
 src/crisol/closure.nim:extractCompileInputs:ccRun = realRunIn(config.projectRoot.absolutePath.normalizedPath)  # = realRunIn(projectRoot), the real cc dependency probe
 src/crisol/compiledriver.nim:defaultRunCc:concurrency = countProcessors()                 # = countProcessors(), the real host answer
 src/crisol/config.nim:conventionConfig:probe = probeFoldPolicy                            # = probeFoldPolicy
@@ -1016,6 +1003,7 @@ src/crisol/paths.nim:initTrackedRoots:probe = probeFoldPolicy                   
 src/crisol/process/windows.nim:probeCapabilities:nesting = probeJobObjectNesting()        # = probeJobObjectNesting(), the real capability probe
 src/crisol/runner.nim:execute:onResult = noopResult                                       # = noopResult: no observer installed, an observation-only seam
 src/crisol/runner.nim:execute:recordClosureFn = recordClosure                             # = recordClosure, the real one; tests inject a synthetic failure
+src/crisol/runner.nim:execute:retireFn = retireStableBinary                               # = retireStableBinary, the real removeFile; tests inject a failing retire (issue #26)
 # --- B. FAIL-SAFE: omitting the default drives the decision toward stale /
 # --- miss / untrusted / recompute / widest-selection -- OVER-invalidation,
 # --- which costs at most a cache miss or a longer run.
@@ -1041,9 +1029,7 @@ src/crisol/pipeline.nim:buildRunPlan:useChanged = false                         
 src/crisol/pipeline.nim:buildRunPlan:useChanged = false                                   # false = no --changed filter = run EVERYTHING (widest selection)
 src/crisol/pipeline.nim:buildRunPlan:useFailed = false                                    # false = no --failed filter = run EVERYTHING (widest selection)
 src/crisol/pipeline.nim:buildRunPlan:useFailed = false                                    # false = no --failed filter = run EVERYTHING (widest selection)
-src/crisol/planner.nim:plan:ccVersion = ""                                                # as plan's nimVersion: VESTIGIAL, not merely inert -- see that record and R5-24
 src/crisol/planner.nim:plan:forceCompile = false                                          # false = honour the graph's verdict; true only ADDS recompiles
-src/crisol/planner.nim:plan:nimVersion = ""                                               # VESTIGIAL after R3-8: `plan`'s body reads neither version ANYWHERE (decideCompile was its only reader and no longer takes them; plan never calls toolchainFingerprint), so the default cannot be unsound because the parameter cannot be used. R5-24 recommends deleting both, which deletes these two records -- do not read this reason as a justification for keeping them
 src/crisol/runner.nim:appendAttemptRow:roots = TrackedRoots()                             # ledger/history rows only; a mismatched identity loses history (order/perf-check degrade), it cannot serve a result
 src/crisol/runner.nim:execute:cache = cacheDisabled(resolveSandbox())                     # = cacheDisabled(resolveSandbox()): caching OFF neither reads nor publishes -- the fail-safe direction
 src/crisol/runner.nim:execute:config = Config()                                           # = Config(): the zero config. Its one identity-bearing field (trackedRoots) unpopulated falls back to plain ABSOLUTE-path identity, which is location-sensitive, i.e. over-invalidating
@@ -1053,7 +1039,6 @@ src/crisol/sandbox.nim:resolveSandbox:passthroughs = @[]                        
 src/crisol/shard.nim:balancedShardOf:roots = TrackedRoots()                               # as shardOf: tag-0-inert, and partition-complete within one invocation
 src/crisol/shard.nim:shardOf:roots = TrackedRoots()                                       # RFC-0009 A5b-ii: inert for production entrypoints (always tag-0; keyBytes' tag-0 branch never reads roots), and one invocation shards every entrypoint under the SAME value, so the partition stays complete
 src/crisol/shard.nim:shardWithHistory:roots = TrackedRoots()                              # as shardOf: tag-0-inert, and partition-complete within one invocation
-src/crisol/toolrun.nim:runViaOsproc:mergeStderr = false                                   # false keeps the child stderr OUT of the returned (usually PARSED) output -- the correct default for a probe; stderr is still DRAINED and kept in the lastProbeStderr side channel (issue #22 / W9a), so nothing is lost
 # --- C. CAPACITY / POLICY / TELEMETRY / REPORTING KNOBS: a wrong value
 # --- costs performance, retention or reporting detail. None of these is a
 # --- cache key, a staleness comparison or a trust gate input.
@@ -1061,21 +1046,18 @@ src/crisol.nim:runMain:selfWorkerBinary = ""                                    
 src/crisol/admission.nim:initAdmission:estJobPeakMb = 0                                   # memory-admission capacity knob
 src/crisol/admission.nim:initAdmission:memPerRunMb = 0                                    # memory-admission capacity knob
 src/crisol/admission.nim:initAdmission:safetyMb = 0                                       # memory-admission capacity knob
-src/crisol/api.nim:closureReport:opts = RunOptions()                                      # = RunOptions(): the documented default option set
-src/crisol/api.nim:failureLine:policy = ptypes.DefaultPolicy                              # reporting strictness for one rendered line
-src/crisol/api.nim:planTests:opts = RunOptions()                                          # = RunOptions(): the documented default option set
-src/crisol/api.nim:planToJsonString:substrate = ptypes.Capabilities()                     # reported capability block only
+src/crisol/runcore.nim:closureReport:opts = RunOptions()                                      # = RunOptions(): the documented default option set
+src/crisol/runcore.nim:failureLine:policy = ptypes.DefaultPolicy                              # reporting strictness for one rendered line
+src/crisol/runcore.nim:planTests:opts = RunOptions()                                          # = RunOptions(): the documented default option set
+src/crisol/runcore.nim:planToJsonString:substrate = ptypes.Capabilities()                     # reported capability block only
 src/crisol/api.nim:runTests:opts = RunOptions()                                           # = RunOptions(): the documented default option set
-src/crisol/api.nim:verifyCachePass:installSignals = false                                 # false = do not touch the caller's signal disposition (library-safe)
-src/crisol/api.nim:verifyCachePass:sink = NilSink[TelemetryEvent]()                       # = NilSink: telemetry off, observation only
-src/crisol/api.nim:verifySample:pct = -1                                                  # --verify-cache sampling knob (-1 = unset)
-src/crisol/api.nim:verifySample:seed = none(int64)                                        # --verify-cache sampling knob
-src/crisol/api.nim:verifySample:strict = false                                            # --verify-cache reporting knob
-src/crisol/cachedispatch.nim:cacheEnabled:outcomePolicy = ptypes.DefaultPolicy            # = DefaultPolicy: REPORTING strictness, applied identically on read and store, so it cannot make the two disagree
+src/crisol/runcore.nim:verifyCachePass:installSignals = false                                 # false = do not touch the caller's signal disposition (library-safe)
+src/crisol/runcore.nim:verifyCachePass:sink = NilSink[TelemetryEvent]()                       # = NilSink: telemetry off, observation only
+src/crisol/runcore.nim:verifySample:pct = -1                                                  # --verify-cache sampling knob (-1 = unset)
+src/crisol/runcore.nim:verifySample:seed = none(int64)                                        # --verify-cache sampling knob
+src/crisol/runcore.nim:verifySample:strict = false                                            # --verify-cache reporting knob
 src/crisol/cachedispatch.nim:cacheEnabled:outcomePolicy = ptypes.DefaultPolicy            # = DefaultPolicy: REPORTING strictness, applied identically on read and store, so it cannot make the two disagree
 src/crisol/cachedispatch.nim:cacheEnabled:prefetch = noopPrefetch                         # = noopPrefetch: prefetch is an optimisation, never a correctness input
-src/crisol/cachedispatch.nim:cacheEnabled:prefetch = noopPrefetch                         # = noopPrefetch: prefetch is an optimisation, never a correctness input
-src/crisol/cachedispatch.nim:cacheEnabled:sink = NilSink[TelemetryEvent]()                # = NilSink: telemetry off, observation only
 src/crisol/cachedispatch.nim:cacheEnabled:sink = NilSink[TelemetryEvent]()                # = NilSink: telemetry off, observation only
 src/crisol/cachedispatch.nim:consultPostCompile:sink = NilSink[TelemetryEvent]()          # = NilSink: telemetry off
 src/crisol/cachedispatch.nim:lookupAtPlan:explainDiag = false                             # --explain-miss diagnostic seam consult only
@@ -1092,7 +1074,7 @@ src/crisol/cachetier.nim:resolveProbes:abandoned = proc(): bool = false         
 src/crisol/cachewire.nim:upsertSidecarRecord:maxRecords = DefaultMaxSidecarRecords        # sidecar retention cap
 src/crisol/compiledriver.nim:newMeasureDriver:concurrency = countProcessors()             # = countProcessors(): capacity
 src/crisol/compiledriver.nim:newMeasureDriver:workingDir = ""                             # "" = inherit; the measure worker passes the real one
-src/crisol/compiledriver.nim:nimCompileArgs:compileOnly = false                           # selects --compileOnly for the measure driver; a build-shape knob
+src/crisol/nimargv.nim:nimCompileArgs:compileOnly = false                               # selects --compileOnly for the measure driver; a build-shape knob
 src/crisol/compilereport.nim:buildCompileBlock:ambientCcacheDetected = false              # reported compile block field
 src/crisol/compilereport.nim:buildCompileBlock:compileRegressions = nil                   # reported compile block field
 src/crisol/compilereport.nim:buildCompileBlock:currentRunStartUs = 0                      # reported compile block field
@@ -1165,14 +1147,12 @@ src/crisol/runner.nim:toProcessResult:hermetic = ptypes.hlNone                  
 src/crisol/sandbox.nim:resolveSandbox:chdirIntoScratch = false                            # scratch-dir cwd knob
 src/crisol/sandbox.nim:resolveSandbox:memoryLimit = none(int64)                           # memory cap; capacity
 src/crisol/sandbox.nim:resolveSandbox:rlimits = RlimitOverrides()                         # rlimit overrides; capacity
-src/crisol/toolexec.nim:waitForExitDeadline:pollMs = 10                                   # poll granularity
 src/crisol/types.nim:exitCode:failOnFlaky = false                                         # exit-code policy knob; the CLI passes the resolved value
 src/crisol/types.nim:flaky:policy = ptypes.DefaultPolicy                                  # reporting strictness; see `outcome`
 src/crisol/types.nim:outcome:policy = ptypes.DefaultPolicy                                # reporting strictness; the SAME policy is applied on read and store (SO1), so it cannot make the two disagree
 # --- D. DOCUMENTED SOUNDNESS EXCEPTION: a genuine soundness default that
 # --- survives by an explicit, argued, in-file exception. Each of these HAS a
 # --- SOUNDNESS-PARAMETER WARNING block; read it before touching the call.
-src/crisol/runner.nim:execute:ccVersion = ""                                              # same exception; 14 parameters with EXPRESSION defaults make a companion overload a worse drift hazard than the default
 src/crisol/runner.nim:execute:nimVersion = ""                                             # the R2-7/R3-7/R4-7/R5-8 exception, argued at length in this file's SOUNDNESS-PARAMETER WARNING above `execute`
 # --- E. DIRECTION NAMED, NOT A CACHE-KEY / STALENESS / TRUST DEFAULT. These
 # --- are the census's narrowest-margin entries: the default does select the
@@ -1180,11 +1160,9 @@ src/crisol/runner.nim:execute:nimVersion = ""                                   
 # --- policy opt-out, a shorter test list, or a followed symlink -- never a
 # --- stale or foreign artifact served under a weakened key. Re-examine each
 # --- if it ever becomes an input to identity material.
-src/crisol/api.nim:changedOnly:baseRef = ""                                               # as gitdiff.changedFiles's base: "" diffs the working tree against HEAD; a narrower changed set under-SELECTS, and narrowByDiff force-includes any entrypoint with no closure record
-src/crisol/api.nim:failedOrChanged:baseRef = ""                                           # as changedOnly's baseRef
+src/crisol/runcore.nim:changedOnly:baseRef = ""                                               # as gitdiff.changedFiles's base: "" diffs the working tree against HEAD; a narrower changed set under-SELECTS, and narrowByDiff force-includes any entrypoint with no closure record
+src/crisol/runcore.nim:failedOrChanged:baseRef = ""                                           # as changedOnly's baseRef
 src/crisol/cachedispatch.nim:shouldStore:cacheable = csDefault                            # csDefault == csTrue for this gate; only csFalse (a group's config opt-out) differs, so omitting PUBLISHES a correctly-keyed entry the config asked to skip -- an eligibility miss, never a wrong artifact served. The production store gate passes the group's real state
-src/crisol/cachedispatch.nim:shouldStore:cacheable = csDefault                            # csDefault == csTrue for this gate; only csFalse (a group's config opt-out) differs, so omitting PUBLISHES a correctly-keyed entry the config asked to skip -- an eligibility miss, never a wrong artifact served. The production store gate passes the group's real state
-src/crisol/ccidentity.nim:ccKnown:digest = CcDigest(kind: cdkNone)                        # module-PRIVATE constructor (no `*`); cdkNone is a first-class modelled state ("no digest attempted/applicable" -- deliberate for the Windows driver half under cdVersionOnly), not an absence. A cdkNone half IS identified by version text alone, i.e. less identity material, so re-examine this entry first if ccKnown ever stops being private
 src/crisol/discover.nim:matchGlob:fold = fpNone                                           # fpNone is BYTE-EXACT matching, so omitting can only match FEWER paths -- it under-selects a test into a visibly shorter plan, it never widens a cache key's equivalence class
 src/crisol/gitdiff.nim:changedFiles:base = ""                                             # "" diffs the working tree against HEAD; a caller meaning "since <ref>" must say so. A narrower changed set under-SELECTS (shorter plan), and narrowByDiff force-includes any entrypoint with no closure record
 src/crisol/ioutils.nim:createOverwrite:noFollow = false                                   # as exclusiveCreate: false follows symlinks; the refusing call sites pass true explicitly and are test-pinned
@@ -1200,40 +1178,39 @@ src/crisol/ioutils.nim:exclusiveCreate:noFollow = false                         
 # --- definition of that marker). Classified
 # --- 2026-09-25 (round-7 finding S2, shape M7) from each field's doc comment
 # --- and its consumers.
-src/crisol/api.nim:RunOptions.cacheStats = false                   # C: --cache-stats; gates a telemetry sink only (planImpl merges it opt-in-only into cfg.cacheStats)
-src/crisol/api.nim:RunOptions.chdirIntoScratch = false             # C: child cwd stays projectRoot (the A2c contract); a behavioral toggle its own doc calls "not a safety property"
-src/crisol/api.nim:RunOptions.configPath = ""                      # C: "" = discover crisol.kdl by convention, the documented default
-src/crisol/api.nim:RunOptions.envPassthroughs = @[]                # B: empty = no env var added to DefaultEnvAllowlist = strictest env, as resolveSandbox's passthroughs
-src/crisol/api.nim:RunOptions.envPins = @[]                        # B: empty = nothing pinned beyond Config.envPins, as resolveSandbox's envPins
-src/crisol/api.nim:RunOptions.explainMiss = false                  # C: --explain-miss gates RENDERING of keyDiff only; the producer runs regardless
-src/crisol/api.nim:RunOptions.explainMissVerbose = false           # C: as explainMiss; verbose only adds detail to an already-shown block
-src/crisol/api.nim:RunOptions.failFast = false                     # C: false = continue-on-failure, crisol's documented default
-src/crisol/api.nim:RunOptions.failOnFlaky = false                  # C: exit-code policy for flaky passes; the CLI passes the resolved value
-src/crisol/api.nim:RunOptions.foldProbe = nil                      # A: nil selects the real probeFoldPolicy; tests inject a forced probe
-src/crisol/api.nim:RunOptions.forceCompile = false                 # B: false = honour the graph's staleness verdict; true only ADDS recompiles
-src/crisol/api.nim:RunOptions.hermeticLevel = hlIsolated           # B: hlIsolated, the STRICTEST level that runs cached (hlNetwork degrades and is never cached); omitting cannot loosen the sandbox
-src/crisol/api.nim:RunOptions.installSignals = false               # C: false = do not replace the host's signal handlers (library-safe)
-src/crisol/api.nim:RunOptions.jobs = 0                             # C: <= 0 defers to config/built-in concurrency; capacity
-src/crisol/api.nim:RunOptions.limitMemory = none(int64)            # C: none defers to Config.limitMemory; a memory ceiling, capacity
-src/crisol/api.nim:RunOptions.manageLock = true                    # B: true TAKES the advisory inter-process lock; omitting keeps concurrent runs serialised
-src/crisol/api.nim:RunOptions.measureCompileReuse = false          # C: false = plain `nim c`, byte-for-byte the pre-RFC-0006 build; opt-in measurement only
-src/crisol/api.nim:RunOptions.noCache = false                      # C: caching ON is the documented product default (CLI and library alike); soundness lives in the cache KEY and trust gates, which this does not touch
-src/crisol/api.nim:RunOptions.noRemoteCache = false                # C: configured remote tiers stay in use; each already passed configuredCache's trust/transport gates
-src/crisol/api.nim:RunOptions.onResult = nil                       # A: nil = no observer (noop), an observation-only seam, as runner.execute's onResult
-src/crisol/api.nim:RunOptions.order = omNone                       # C: execution ORDER only; every selected entrypoint still runs
-src/crisol/api.nim:RunOptions.perfCheckForce = false               # C: perf-regression detection override; telemetry
-src/crisol/api.nim:RunOptions.persist = true                       # C: writes lastrun.json (history for --failed/order); reporting
-src/crisol/api.nim:RunOptions.progressIntervalMs = 30_000          # C: progress reporting only
-src/crisol/api.nim:RunOptions.retries = -1                         # C: -1 = use the config's retry count
-src/crisol/api.nim:RunOptions.shardK = 0                           # B: 0 = no sharding = the whole suite runs
-src/crisol/api.nim:RunOptions.shardN = 1                           # B: 1 = one shard = the whole suite runs
-src/crisol/api.nim:RunOptions.showProgress = false                 # C: stderr progress line only
-src/crisol/api.nim:RunOptions.startDir = ""                        # C: "" = walk up from cwd, the documented default
-src/crisol/api.nim:RunOptions.strictHygiene = false                # C: reporting strictness (OutcomePolicy.strictHygiene); applied by the SAME resolved policy at report and serve (SO1), and it can only strengthen a config-file true
-src/crisol/api.nim:RunOptions.timeoutSecs = 0                      # C: <= 0 defers to config/built-in timeout; capacity
-src/crisol/api.nim:RunOptions.workerBinary = ""                    # C: "" = no self-reexec worker, which its doc calls always safe (degrades to monolithic compile)
+src/crisol/runcore.nim:RunOptions.cacheStats = false                   # C: --cache-stats; gates a telemetry sink only (planImpl merges it opt-in-only into cfg.cacheStats)
+src/crisol/runcore.nim:RunOptions.chdirIntoScratch = false             # C: child cwd stays projectRoot (the A2c contract); a behavioral toggle its own doc calls "not a safety property"
+src/crisol/runcore.nim:RunOptions.configPath = ""                      # C: "" = discover crisol.kdl by convention, the documented default
+src/crisol/runcore.nim:RunOptions.envPassthroughs = @[]                # B: empty = no env var added to DefaultEnvAllowlist = strictest env, as resolveSandbox's passthroughs
+src/crisol/runcore.nim:RunOptions.envPins = @[]                        # B: empty = nothing pinned beyond Config.envPins, as resolveSandbox's envPins
+src/crisol/runcore.nim:RunOptions.explainMiss = false                  # C: --explain-miss gates RENDERING of keyDiff only; the producer runs regardless
+src/crisol/runcore.nim:RunOptions.explainMissVerbose = false           # C: as explainMiss; verbose only adds detail to an already-shown block
+src/crisol/runcore.nim:RunOptions.failFast = false                     # C: false = continue-on-failure, crisol's documented default
+src/crisol/runcore.nim:RunOptions.failOnFlaky = false                  # C: exit-code policy for flaky passes; the CLI passes the resolved value
+src/crisol/runcore.nim:RunOptions.foldProbe = nil                      # A: nil selects the real probeFoldPolicy; tests inject a forced probe
+src/crisol/runcore.nim:RunOptions.forceCompile = false                 # B: false = honour the graph's staleness verdict; true only ADDS recompiles
+src/crisol/runcore.nim:RunOptions.hermeticLevel = hlIsolated           # B: hlIsolated, the STRICTEST level that runs cached (hlNetwork degrades and is never cached); omitting cannot loosen the sandbox
+src/crisol/runcore.nim:RunOptions.installSignals = false               # C: false = do not replace the host's signal handlers (library-safe)
+src/crisol/runcore.nim:RunOptions.jobs = 0                             # C: <= 0 defers to config/built-in concurrency; capacity
+src/crisol/runcore.nim:RunOptions.limitMemory = none(int64)            # C: none defers to Config.limitMemory; a memory ceiling, capacity
+src/crisol/runcore.nim:RunOptions.manageLock = true                    # B: true TAKES the advisory inter-process lock; omitting keeps concurrent runs serialised
+src/crisol/runcore.nim:RunOptions.measureCompileReuse = false          # C: false = plain `nim c`, byte-for-byte the pre-RFC-0006 build; opt-in measurement only
+src/crisol/runcore.nim:RunOptions.noCache = false                      # C: caching ON is the documented product default (CLI and library alike); soundness lives in the cache KEY and trust gates, which this does not touch
+src/crisol/runcore.nim:RunOptions.noRemoteCache = false                # C: configured remote tiers stay in use; each already passed configuredCache's trust/transport gates
+src/crisol/runcore.nim:RunOptions.onResult = nil                       # A: nil = no observer (noop), an observation-only seam, as runner.execute's onResult
+src/crisol/runcore.nim:RunOptions.order = omNone                       # C: execution ORDER only; every selected entrypoint still runs
+src/crisol/runcore.nim:RunOptions.perfCheckForce = false               # C: perf-regression detection override; telemetry
+src/crisol/runcore.nim:RunOptions.persist = true                       # C: writes lastrun.json (history for --failed/order); reporting
+src/crisol/runcore.nim:RunOptions.progressIntervalMs = 30_000          # C: progress reporting only
+src/crisol/runcore.nim:RunOptions.retries = -1                         # C: -1 = use the config's retry count
+src/crisol/runcore.nim:RunOptions.shardK = 0                           # B: 0 = no sharding = the whole suite runs
+src/crisol/runcore.nim:RunOptions.shardN = 1                           # B: 1 = one shard = the whole suite runs
+src/crisol/runcore.nim:RunOptions.showProgress = false                 # C: stderr progress line only
+src/crisol/runcore.nim:RunOptions.startDir = ""                        # C: "" = walk up from cwd, the documented default
+src/crisol/runcore.nim:RunOptions.strictHygiene = false                # C: reporting strictness (OutcomePolicy.strictHygiene); applied by the SAME resolved policy at report and serve (SO1), and it can only strengthen a config-file true
+src/crisol/runcore.nim:RunOptions.timeoutSecs = 0                      # C: <= 0 defers to config/built-in timeout; capacity
+src/crisol/runcore.nim:RunOptions.workerBinary = ""                    # C: "" = no self-reexec worker, which its doc calls always safe (degrades to monolithic compile)
 src/crisol/process/types.nim:ChildSpec.claimOrphans = true         # B: true = the STRICT containment claim (reparented orphans are reaped as this child's escapees); only the runner's compile spawns opt out, explicitly
-src/crisol/types.nim:TrustConfig.policy = "none"                   # PENDING COREY (R7-S7): NOT classified -- bucket E excludes a foreign artifact served, and this reason names one. "none" is the NON-verifying trust policy (the RFC-0005 KDL default). Inert with no remote tier; with one, configuredCache hard-errors unsigned s3:// and http:// under it, but a file:// or https:// remote built programmatically without `policy` is read UNVERIFIED. The one config.nim literal and api.nim's no-remote CacheConfig are explicit or inert. Re-read first if a new TrustConfig/CacheConfig literal appears
 EOF
 )"
 
@@ -1314,7 +1291,7 @@ echo "         carrying the old signature (zero call-site churn; the compiler" >
 echo "         reports each omission at the CALLER's own file:line, and" >&2
 echo "         --warningAsError:Deprecated:on makes it a hard error in src/)," >&2
 echo "         and annotate the full-arity proc with a SOUNDNESS-PARAMETER" >&2
-echo "         WARNING block. Canonical shape: cachedispatch.cacheEnabled." >&2
+echo "         WARNING block. Canonical shape: pipeline.buildRunPlan." >&2
 echo >&2
 echo "    * Or does omitting it fail SAFE -- forcing stale/miss/untrusted/" >&2
 echo "      recompute, naming a real production seam, or moving only capacity," >&2

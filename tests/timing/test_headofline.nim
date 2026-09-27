@@ -40,6 +40,7 @@ let overlapSpec = resolveSandbox(passthroughs = @["CRISOL_TEST_OVERLAP_FILE"])
 import crisol/config
 import "../support/testep"
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -161,7 +162,7 @@ suite "H1 — head-of-line blocking regression":
     putEnv("CRISOL_TEST_OVERLAP_FILE", path1)
     let p1 = plan(cfg, eps, emptyDepGraph())
     var g1 = emptyDepGraph()
-    discard execute(p1, config = cfg, graph = g1, showProgress = false, cache = cacheDisabled(overlapSpec))
+    discard execute(p1, config = cfg, graph = g1, showProgress = false, cache = cacheDisabled(overlapSpec), toolchain = unprobedToolchain())
     delEnv("CRISOL_TEST_OVERLAP_FILE")
 
     let warm = parseOverlapFile(path1)
@@ -176,7 +177,7 @@ suite "H1 — head-of-line blocking regression":
     let p2 = plan(cfg, eps, g1)   # all cdSkipFresh now
     var g2 = g1
     let t0 = epochTime()
-    discard execute(p2, config = cfg, graph = g2, showProgress = false, cache = cacheDisabled(overlapSpec))
+    discard execute(p2, config = cfg, graph = g2, showProgress = false, cache = cacheDisabled(overlapSpec), toolchain = unprobedToolchain())
     let elapsedMs = int64((epochTime() - t0) * 1000)
     delEnv("CRISOL_TEST_OVERLAP_FILE")
 

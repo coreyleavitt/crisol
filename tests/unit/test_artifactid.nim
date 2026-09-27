@@ -15,7 +15,15 @@
 
 import std/[options, sequtils, strutils, tables, unittest]
 import crisol/artifactid   # re-exports toolrun.RunProc/realRun
+import crisol/toolrun       # RunResult
+import ../support/fakerun   # fakeReply
 import crisol/paths         # CR3/CR10: TrackedRoots/classify's ReportedPath overload
+
+proc located(cmd: string): DriverResolver =
+  ## Every driver token resolves to the file it names: these suites are not
+  ## about driver resolution (R10-S6).
+  discard cmd
+  asNamed()
 
 # ===========================================================================
 # Behavior 1 — normalize(): 4-line header strip + known-string erasure
@@ -133,6 +141,19 @@ suite "normalize — @response-file content inlining":
 
 suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content hash":
 
+  proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): Option[FoldPolicy] =
+    result = proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(policy)
+
+  proc noResolutionRoots(): TrackedRoots =
+    ## R15-D6: `probeReportedHeaders` now refuses a reported header against
+    ## an unpopulated `TrackedRoots` (`hpfRootsUnpopulated`) instead of
+    ## hashing it unresolved -- these tests are about parsing/hashing, not
+    ## classification, so they use a real, populated `TrackedRoots` whose
+    ## project simply matches none of the fixture's headers (the "real
+    ## classification path", `headerprobe.HeaderProbe`'s own doc), rather
+    ## than the removed unpopulated-roots bypass.
+    initTrackedRoots("/fake/proj-behavior3", @[], "", fixedProbe(fpNone))
+
   proc syntheticReader(mapping: Table[string, string]): FileReaderProc =
     result = proc(path: string): tuple[content: string; ok: bool] =
       if mapping.hasKey(path):
@@ -236,7 +257,7 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
     let ccMOutput = "@pfoo.nim.c.o: /cache/@pfoo.nim.c \\\n" &
                     " /inc/foo.h \\\n" &
                     " /usr/include/stdio.h\n"
-    let headers = depIncludeHeaders(ccfGnuMake, ccMOutput,
+    let headers = depIncludeHeaders(ccfGnu, ccMOutput,
                                     "/cache/@pfoo.nim.c").headers.mapIt(string(it))
     check headers.len == 2
     check "/inc/foo.h" in headers
@@ -246,11 +267,11 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
   test "ccIncludeClosure via an injected synthetic run seam returns headers + a content hash":
     let ccCmd = "gcc -c -I/inc -o out.o /src/mod.c"
     let ccMOutput = "out.o: /src/mod.c /inc/foo.h\n"
-    let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
       check cmd == "gcc"
-      (output: ccMOutput, ok: true)
+      fakeReply(ccMOutput, true)
     let reader = syntheticReader({"/inc/foo.h": "int x;"}.toTable)
-    let res = ccIncludeClosure(ccCmd, run, reader, TrackedRoots())
+    let res = ccIncludeClosure(ccCmd, noResolutionRoots(), located(ccCmd), run, reader)
     check res.ok
     check res.headers == @["/inc/foo.h"]
     check res.contentHash.len > 0
@@ -258,28 +279,28 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
   test "a header's CONTENT change (backport, no path/version change) changes the closure hash":
     let ccCmd = "gcc -c -I/inc -o out.o /src/mod.c"
     let ccMOutput = "out.o: /src/mod.c /inc/foo.h\n"
-    let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-      (output: ccMOutput, ok: true)
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(ccMOutput, true)
     let readerOld = syntheticReader({"/inc/foo.h": "struct S { int a; };"}.toTable)
     let readerNew = syntheticReader({"/inc/foo.h": "struct S { int a; int b; };"}.toTable)
-    let resOld = ccIncludeClosure(ccCmd, run, readerOld, TrackedRoots())
-    let resNew = ccIncludeClosure(ccCmd, run, readerNew, TrackedRoots())
+    let resOld = ccIncludeClosure(ccCmd, noResolutionRoots(), located(ccCmd), run, readerOld)
+    let resNew = ccIncludeClosure(ccCmd, noResolutionRoots(), located(ccCmd), run, readerNew)
     check resOld.contentHash != resNew.contentHash
 
   test "a failed cc -M invocation surfaces ok=false, never raises":
     let ccCmd = "gcc -c -I/inc -o out.o /src/mod.c"
-    let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-      (output: "", ok: false)
-    let res = ccIncludeClosure(ccCmd, run, realFileReader, TrackedRoots())
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply("", false)
+    let res = ccIncludeClosure(ccCmd, TrackedRoots(), located(ccCmd), run, realFileReader)
     check not res.ok
     check res.headers.len == 0
 
   test "R1b/R4: an undeivable cc -M invocation (too short / unterminated quote) surfaces ok=false, never raises, and never even calls run":
     var runCalled = false
-    let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
       runCalled = true
-      (output: "should never be reached", ok: true)
-    let res = ccIncludeClosure("gcc", run, realFileReader, TrackedRoots())   # too short — no source file
+      fakeReply("should never be reached", true)
+    let res = ccIncludeClosure("gcc", TrackedRoots(), located("gcc"), run, realFileReader)   # too short — no source file
     check not res.ok
     check res.headers.len == 0
     check res.contentHash == ""
@@ -287,8 +308,9 @@ suite "ccIncludeClosure — synthetic cc -M Make-output parsing + header content
 
   test "includeClosureContentHash is order-independent (same set, different input order)":
     let reader = syntheticReader({"/a.h": "AAA", "/b.h": "BBB"}.toTable)
-    check includeClosureContentHash(@["/a.h", "/b.h"], reader) ==
-          includeClosureContentHash(@["/b.h", "/a.h"], reader)
+    let ab = includeClosureContentHash(@["/a.h", "/b.h"], reader)
+    check ab.ok
+    check ab.contentHash == includeClosureContentHash(@["/b.h", "/a.h"], reader).contentHash
 
 # ===========================================================================
 # Behavior 4 — artifactKeyHash(): normalized-.c ⊕ closure hash
@@ -444,39 +466,49 @@ suite "ccIncludeClosure — CR3: a mis-cased reported header must not desync the
 
   proc makeRun(reportedHeader: string): RunProc =
     let ccMOutput = "out.o: " & sourceFile & " " & reportedHeader & "\n"
-    result = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-      (output: ccMOutput, ok: true)
+    result = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(ccMOutput, true)
 
   proc caseInsensitiveReader(path: string): tuple[content: string; ok: bool] =
     ## A real case-insensitive disk read: BOTH spellings of the same file
     ## answer with IDENTICAL content, exactly as a real folding filesystem
     ## would — isolating the bug to the PATH STRING folded into the hash,
-    ## never the content.
-    if path.toLowerAscii == lowerCaseHeader:
+    ## never the content. A tracked header is read at its native spelling
+    ## (`toNative`), which on Windows carries backslashes and may carry a
+    ## drive, so the fake compares the separator-normalized, drive-stripped
+    ## spelling, exactly as the host volume would resolve it.
+    var n = path.replace('\\', '/')
+    if n.len >= 2 and n[1] == ':': n = n[2 .. ^1]
+    if n.toLowerAscii == lowerCaseHeader:
       (content: "struct S { int a; };", ok: true)
     else:
       (content: "", ok: false)
 
-  test "RED (documents the pre-fix defect): with an explicitly EMPTY TrackedRoots, a real-case report and a lowercased report of the SAME file still hash differently":
+  test "R15-D6: with an explicitly EMPTY TrackedRoots, a reported header refuses instead of hashing unresolved":
     ## CR10: `roots` no longer DEFAULTS to the unpopulated zero value — every
-    ## call site must now name it. This test pins the documented residual of
-    ## an EXPLICITLY-empty `TrackedRoots()` (never resolves case — see this
-    ## module's doc for why), so it doesn't silently regress into "always
-    ## fixed" without anyone noticing the behavior changed.
-    let resGcc  = ccIncludeClosure(ccCmd, makeRun(realCaseHeader), caseInsensitiveReader,
-                                   TrackedRoots())
-    let resMsvc = ccIncludeClosure(ccCmd, makeRun(lowerCaseHeader), caseInsensitiveReader,
-                                   TrackedRoots())
-    check resGcc.ok
-    check resMsvc.ok
-    check resGcc.contentHash != resMsvc.contentHash   # same file, different hash: the bug
+    ## call site must now name it. Pre-R15-D6, an EXPLICITLY-empty
+    ## `TrackedRoots()` here documented a real residual: the closure still
+    ## succeeded, but never resolved case, so a real-case and a lowercased
+    ## report of the SAME file hashed differently (the bug the "FIXED" test
+    ## below demonstrates the fix for). R15-D6 removed that silent
+    ## unresolved-success path from the shared pipeline entirely
+    ## (`headerprobe.HeaderProbe` no longer carries an "unclassified" state):
+    ## `closure.extractCompileInputs` always treated it as unreachable and
+    ## fatal, and it is exactly the soundness-weak state a caller should
+    ## never get quietly. Both reports now refuse identically.
+    let resGcc  = ccIncludeClosure(ccCmd, TrackedRoots(), located(ccCmd), makeRun(realCaseHeader), caseInsensitiveReader)
+    let resMsvc = ccIncludeClosure(ccCmd, TrackedRoots(), located(ccCmd), makeRun(lowerCaseHeader), caseInsensitiveReader)
+    check not resGcc.ok
+    check not resMsvc.ok
+    check resGcc.probeErr.kind == cpeProbe
+    check resGcc.probeErr.failure == hpfRootsUnpopulated
+    check resMsvc.probeErr.kind == cpeProbe
+    check resMsvc.probeErr.failure == hpfRootsUnpopulated
 
   test "FIXED: with TrackedRoots supplied, the two reports resolve to the SAME real spelling and hash identically":
     let roots = rootsWith("/fake/proj-cr3", fpAsciiLower)
-    let resGcc  = ccIncludeClosure(ccCmd, makeRun(realCaseHeader), caseInsensitiveReader,
-                                   roots, fakeExpand)
-    let resMsvc = ccIncludeClosure(ccCmd, makeRun(lowerCaseHeader), caseInsensitiveReader,
-                                   roots, fakeExpand)
+    let resGcc  = ccIncludeClosure(ccCmd, roots, located(ccCmd), makeRun(realCaseHeader), caseInsensitiveReader, fakeExpand)
+    let resMsvc = ccIncludeClosure(ccCmd, roots, located(ccCmd), makeRun(lowerCaseHeader), caseInsensitiveReader, fakeExpand)
     check resGcc.ok
     check resMsvc.ok
     check resGcc.headers == resMsvc.headers           # resolved to the same real spelling
@@ -497,36 +529,32 @@ suite "ccIncludeClosure — CR3: a mis-cased reported header must not desync the
     ## unified behind one drop-outside-roots helper.
     let roots = rootsWith("/fake/proj-cr3", fpAsciiLower)
     let ccMOutput = "out.o: " & sourceFile & " /usr/include/stdint.h\n"
-    let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-      (output: ccMOutput, ok: true)
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(ccMOutput, true)
     let reader = proc(path: string): tuple[content: string; ok: bool] =
       (content: "typedef long intptr_t;", ok: true)
-    let res = ccIncludeClosure(ccCmd, run, reader, roots, fakeExpand)
+    let res = ccIncludeClosure(ccCmd, roots, located(ccCmd), run, reader, fakeExpand)
     check res.ok
     check res.headers == @["/usr/include/stdint.h"]
 
 # ===========================================================================
 # Behavior 7 — round-2 review (MEDIUM): a /sourceDependencies document whose
 # own Data.Source names a DIFFERENT translation unit than the one just
-# probed (W9j's `dscMismatch`) must fail as loudly as a `DepProbeError` --
-# never fall through as an empty-but-successful closure. Pre-fix,
-# `ccIncludeClosure` checked only `probed.err != dpeNone` and never read
-# `probed.sourceCheck`, so this exact case returned `ok: true,
-# probeErr: cpeNone` with an empty header set indistinguishable from a
-# genuine empty closure. Mirrors closure.extractCompileInputs's raise on the
-# identical signal.
+# probed (`dpeSourceMismatch`) must fail as loudly as every other
+# `DepProbeError` -- never fall through as an empty-but-successful closure.
+# Mirrors closure.extractCompileInputs's raise on the identical signal.
 # ===========================================================================
 
 suite "ccIncludeClosure — round-2 review: a Data.Source mismatch must fail loudly, not as an empty successful closure":
 
-  test "a stale/misattributed /sourceDependencies document surfaces ok=false, probeErr=cpeSourceMismatch, and a message naming the mismatch":
+  test "a stale/misattributed /sourceDependencies document surfaces ok=false, probeErr carries dpeSourceMismatch, and a message naming the mismatch":
     ## `cl` is on `MsvcDrivers`, so `deriveDepInvocation` classifies this
     ## `ccCmd` as `ccfMsvc` and `depIncludeHeaders` parses the run's output
     ## with the `/sourceDependencies` JSON parser. The document below is
     ## well-formed and its Includes are real, but `Data.Source` names
     ## "OTHER.c" -- a different translation unit than `add.c`, the one this
-    ## probe was actually for (mirrors test_ccprobe.nim's own dscMismatch
-    ## fixture).
+    ## probe was actually for (mirrors test_ccprobe.nim's own
+    ## dpeSourceMismatch fixture).
     let ccCmd = "cl /c /Foout.obj c:/p/native/add.c"
     let staleDoc = "unit.c\n" & """{
     "Version": "1.2",
@@ -536,15 +564,125 @@ suite "ccIncludeClosure — round-2 review: a Data.Source mismatch must fail lou
     }
 }
 """
-    let run: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-      (output: staleDoc, ok: true)
-    let res = ccIncludeClosure(ccCmd, run, realFileReader, TrackedRoots())
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(staleDoc, true)
+    let res = ccIncludeClosure(ccCmd, TrackedRoots(), located(ccCmd), run, realFileReader)
     check not res.ok
-    check res.probeErr == cpeSourceMismatch
+    check res.probeErr.kind == cpeProbe
+    check res.probeErr.failure == hpfReport
+    check res.probeErr.depErr == dpeSourceMismatch
     check res.headers.len == 0
     check res.contentHash == ""
     check "DIFFERENT translation unit" in res.errMsg
     check "/sourceDependencies" in res.errMsg   # names the ACTUAL probe family, not a hard-coded GNU spelling
+
+# ===========================================================================
+# Behavior 8 — a header whose identity or content cannot be established fails
+# the closure (ok=false); it is never hashed as a constant stand-in.
+# ===========================================================================
+
+suite "ccIncludeClosure — an unresolvable or unreadable header fails the closure":
+
+  proc fixedProbe(policy: FoldPolicy): proc (rootAbs, stateDir: string): Option[FoldPolicy] =
+    result = proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(policy)
+
+  const clCmd = "cl /c /Foout.obj /I/fake/Proj-R9/Inc /fake/Proj-R9/src/mod.c"
+
+  proc lowercasedClReport(header: string): string =
+    ## cl 19.44's measured behaviour: every reported path lowercased.
+    "mod.c\n" & """{
+    "Version": "1.2",
+    "Data": {
+        "Source": "/fake/proj-r9/src/mod.c",
+        "Includes": [ """" & header.toLowerAscii & """" ]
+    }
+}
+"""
+
+  proc caseSensitiveReader(path: string): tuple[content: string; ok: bool] =
+    ## A case-sensitive directory: only the real spelling opens.
+    if path == "/fake/Proj-R9/Inc/MyHeader.h": (content: "#define V 1", ok: true)
+    else: (content: "", ok: false)
+
+  proc noExpand(p: string): string = p   # the resolver cannot find a real spelling
+
+  test "a case-sensitive root: a lowercased cl report of a tracked header is refused":
+    let roots = initTrackedRoots("/fake/Proj-R9", @[], "", fixedProbe(fpNone))
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(lowercasedClReport("/fake/Proj-R9/Inc/MyHeader.h"), true)
+    let res = ccIncludeClosure(clCmd, roots, located(clCmd), run, caseSensitiveReader, noExpand)
+    check not res.ok
+    check res.probeErr.kind == cpeProbe
+    check res.probeErr.failure == hpfUnresolvedHeader
+    check res.contentHash == ""
+    check "myheader.h" in res.errMsg
+
+  test "a case-folding root whose resolver cannot find the header: refused, not hashed":
+    let roots = initTrackedRoots("/fake/Proj-R9", @[], "", fixedProbe(fpAsciiLower))
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(lowercasedClReport("/fake/Proj-R9/Inc/MyHeader.h"), true)
+    let res = ccIncludeClosure(clCmd, roots, located(clCmd), run, caseSensitiveReader, noExpand)
+    check not res.ok
+    check res.probeErr.kind == cpeProbe
+    check res.probeErr.failure == hpfUnresolvedHeader
+
+  test "an unreadable reported header fails the closure instead of hashing a constant":
+    ## R15-D6: a populated (if unrelated) `TrackedRoots` -- `/inc/gone.h` is
+    ## outside it either way -- since `probeReportedHeaders` now refuses a
+    ## reported header against an unpopulated one before this test's own
+    ## `cpeUnreadableHeader` signal is ever reached.
+    let roots = initTrackedRoots("/fake/Proj-R9", @[], "", fixedProbe(fpNone))
+    let ccCmd = "gcc -c -I/inc -o out.o /src/mod.c"
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply("out.o: /src/mod.c /inc/gone.h\n", true)
+    let unreadable = proc(path: string): tuple[content: string; ok: bool] = (content: "", ok: false)
+    let res = ccIncludeClosure(ccCmd, roots, located(ccCmd), run, unreadable)
+    check not res.ok
+    check res.probeErr.kind == cpeUnreadableHeader
+    check res.contentHash == ""
+    check "/inc/gone.h" in res.errMsg
+
+  test "includeClosureContentHash reports the first unreadable header instead of hashing it":
+    let reader = proc(path: string): tuple[content: string; ok: bool] =
+      if path == "/a.h": (content: "AAA", ok: true) else: (content: "", ok: false)
+    let h = includeClosureContentHash(@["/a.h", "/missing.h"], reader)
+    check not h.ok
+    check h.unreadable == "/missing.h"
+    check h.contentHash == ""
+
+  test "empty GNU probe stdout fails the closure (dpeNoMakeRule)":
+    let ccCmd = "gcc -c -I/inc -o out.o /src/mod.c"
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply("", true)
+    let res = ccIncludeClosure(ccCmd, TrackedRoots(), located(ccCmd), run, realFileReader)
+    check not res.ok
+    check res.probeErr.kind == cpeProbe
+    check res.probeErr.failure == hpfReport
+    check res.probeErr.depErr == dpeNoMakeRule
+
+  test "the probe runs the driver the build resolved; an unresolved one refuses (R10-S6)":
+    let ccCmd = "gcc -c -I/inc -o out.o /src/mod.c"
+    var ran: seq[string]
+    let run: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      ran.add cmd
+      fakeReply("out.o: /src/mod.c\n", true)
+    let ok = ccIncludeClosure(ccCmd, TrackedRoots(), locatedIn("/opt/tc/bin"),
+                              run, realFileReader)
+    check ok.ok
+    check ran == @["/opt/tc/bin/gcc"]
+    # A `.cpp` unit's own C++ driver token is what is resolved and run.
+    let cpp = ccIncludeClosure("g++ -c -I/inc -o out.o /src/mod.c", TrackedRoots(),
+                               locatedIn("/opt/tc/bin"), run, realFileReader)
+    check cpp.ok
+    check ran == @["/opt/tc/bin/gcc", "/opt/tc/bin/g++"]
+    let res = ccIncludeClosure(ccCmd, TrackedRoots(),
+                               unresolved("no gcc where nim looks"),
+                               run, realFileReader)
+    check not res.ok
+    check res.probeErr.kind == cpeProbe
+    check res.probeErr.failure == hpfDriverUnresolved
+    check "no gcc where nim looks" in res.errMsg
+    check ran.len == 2
 
 when isMainModule:
   echo "All artifactid tests passed."

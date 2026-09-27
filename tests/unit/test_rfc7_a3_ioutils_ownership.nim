@@ -11,8 +11,8 @@
 ##      `AllowedPosixFiles` below (`ioutils.nim`, `lock/posix.nim`,
 ##      `httpraw.nim`, `toolexec.nim`, `paths.nim`) is zero — the A3 bullet's own
 ##      acceptance test (A4 drops
-##      `signals.nim` from this allow-list: it delegates onto
-##      `crisol/process.globalShutdownSignal()` instead of installing its own
+##      `signals.nim` from this allow-list: it re-exports
+##      `crisol/process/tooltrees.shutdownRequested()` instead of installing its own
 ##      handler, so it no longer needs `std/posix` directly — see A4's
 ##      handler↔Supervisor unification in `process/posixcore.nim`).
 ##      `crisol.nim`, `depgraph.nim`, `jsonout.nim`, `ledger.nim`, and
@@ -56,14 +56,17 @@ const AllowedPosixFiles = [
     # SO_SNDTIMEO timeval-vs-DWORD split) — one proc's worth of direct
     # posix use, same rationale as the other allow-listed files here.
   "crisol/toolexec.nim",
-    # issue #22: `drainBoth` must consume a child's stdout and stderr pipes
+    # issue #22: `runTool` must consume a child's stdout and stderr pipes
     # CONCURRENTLY or a tool that fills either one deadlocks. The direct
     # `std/posix` use is `poll(2)` on the two subprocess pipe fds -- a
     # READINESS query, not raw file I/O, so it is outside `ioutils`'s remit
     # (open/write/close/atomic publish), the same rationale as
     # `lock/posix.nim`'s `flock` and `paths.nim`'s `pathconf` below. The
     # reads themselves are the only way to drain a pipe without threads,
-    # which `src/` deliberately does not use.
+    # which `src/` deliberately does not use. R3-12 adds process CONTROL of
+    # the tool it spawned, again not file I/O: `waitid(WNOWAIT)` to see the
+    # child exit without reaping it, `getpgid`/`killpg` to end its process
+    # group.
   "crisol/paths.nim",
     # RFC-0009 A1: `probeFoldPolicy`'s OS-query step (macOS `pathconf`
     # _PC_CASE_SENSITIVE) is a CAPABILITY QUERY, not raw file I/O — outside
@@ -122,7 +125,7 @@ proc importsStdOsprocLine(line: string): bool =
 
 suite "rfc-0007 A3 — ioutils sole owner of raw file I/O":
 
-  test "std/posix import count outside process/, ioutils, lock, signals is zero":
+  test "std/posix import count outside process/ and AllowedPosixFiles is zero":
     var offenders: seq[string]
     for path in allNimFiles():
       let rel = relSlash(path)

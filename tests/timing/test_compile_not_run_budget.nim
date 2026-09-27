@@ -47,6 +47,7 @@ import crisol/types
 import crisol/runner
 import "../support/testep"
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -83,7 +84,7 @@ proc runWithTimeouts(ep: Entrypoint;
   )
   let p = plan(cfg, @[ep], emptyDepGraph())
   var g = emptyDepGraph()
-  let results = execute(p, config = cfg, graph = g, showProgress = false).results
+  let results = execute(p, config = cfg, graph = g, showProgress = false, toolchain = unprobedToolchain()).results
   if results.len > 0: results[0]
   else: EntrypointResult(ep: ep)
 

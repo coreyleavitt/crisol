@@ -41,6 +41,11 @@ import crisol/types
 import crisol/paths
 import crisol/closure
 import crisol/depgraph
+import crisol/toolrun      # RunResult
+import ../support/fakerun  # fakeReply, locatedAt
+
+let GccLoc = locatedIn("/opt/tc/bin")
+  ## The driver file the build resolved for the fixtures' `gcc` (R10-S6).
 
 type
   Fixture = object
@@ -109,10 +114,10 @@ proc extractExternals(f: Fixture): seq[ExternalSource] =
   ## fixture happens to live).
   let index = buildSourceIndex(f.cfg)
   writeManifest(f)
-  let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+  let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
     let output = f.objAbs & ": " & f.srcAbs & " native/add.h " & f.vendorH & "\n"
-    (output: output, ok: true)
-  let inputs = extractCompileInputs(f.nc, "main", f.epPath, f.cfg, index, @[], ccRun)
+    fakeReply(output, true)
+  let inputs = extractCompileInputs(f.nc, "main", f.epPath, f.cfg, index, @[], GccLoc, ccRun)
   inputs.externals
 
 suite "RFC-0009 F13 — externals source/header spellings survive a relocated checkout":
@@ -172,17 +177,17 @@ suite "RFC-0009 F13 — externals source/header spellings survive a relocated ch
     writeManifest(a)
     writeManifest(b)
     proc ccRunFor(f: Fixture): RunProc =
-      proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+      proc(cmd: string, args: openArray[string]): RunResult =
         let output = f.objAbs & ": " & f.srcAbs & " native/add.h " & f.vendorH & "\n"
-        (output: output, ok: true)
-    let inputsA = extractCompileInputs(a.nc, "main", a.epPath, a.cfg, index, @[], ccRunFor(a))
-    let inputsB = extractCompileInputs(b.nc, "main", b.epPath, b.cfg, indexB, @[], ccRunFor(b))
+        fakeReply(output, true)
+    let inputsA = extractCompileInputs(a.nc, "main", a.epPath, a.cfg, index, @[], GccLoc, ccRunFor(a))
+    let inputsB = extractCompileInputs(b.nc, "main", b.epPath, b.cfg, indexB, @[], GccLoc, ccRunFor(b))
 
     var gA = initDepGraph("2.2.10")
     var gB = initDepGraph("2.2.10")
     let fh = flagHash(@[])
-    updateEntry(gA, "main.nim", fh, inputsA.files, "chA", 1, inputsA.externals)
-    updateEntry(gB, "main.nim", fh, inputsB.files, "chB", 1, inputsB.externals)
+    updateEntry(gA, "main.nim", fh, inputsA.files, @[], "chA", 1, inputsA.externals)
+    updateEntry(gB, "main.nim", fh, inputsB.files, @[], "chB", 1, inputsB.externals)
     check saveDepGraph(gA, a.cfg)
     check saveDepGraph(gB, b.cfg)
 

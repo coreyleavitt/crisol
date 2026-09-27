@@ -16,7 +16,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/unit/test_issue16_unit.nim
 
-import std/[algorithm, json, options, os, sets, strutils, tables, unittest]
+import std/[algorithm, json, options, os, sets, strutils, tables, tempfiles, unittest]
 import crisol/types
 import crisol/paths
 import crisol/closure    # ExternalSource, CompileInputs, extractCompileInputs,
@@ -26,6 +26,17 @@ import crisol/depgraph    # DepGraph, updateEntry, saveDepGraph,
                           # loadStoredDepGraph, staleExternalObjects,
                           # DepGraphFormatVersion, depgraphPath, flagHash
 import crisol/fnv         # chainedContentHash
+import crisol/toolrun     # RunResult
+import ../support/fakerun # fakeReply, locatedAt, locatedIn, unresolved
+import crisol/ccprobe     # DriverLocation, DriverSite, locateDriver
+import crisol/headerprobe # siteResolver
+
+let
+  GccLoc = locatedIn("/opt/tc/bin")
+    ## Where the build's nim finds each driver (R10-S6): a `gcc` manifest
+    ## command's probe runs `/opt/tc/bin/gcc`, not the bare `gcc`.
+  VccLoc = locatedIn(r"C:\Nim\bin")
+    ## Likewise for a `vccexe.exe` manifest command.
 
 proc headerPairs(headers: seq[string]; roots: TrackedRoots): seq[tuple[key: string; nativePath: string]] =
   ## RFC-0009 A5a/F13: `chainedContentHash` takes (key, nativePath) pairs.
@@ -78,9 +89,10 @@ proc tpSet(paths: varargs[string]): HashSet[TrackedPath] =
 # ---------------------------------------------------------------------------
 
 proc freshRoot(tag: string): string =
-  result = getTempDir() / ("crisol_issue16_unit_" & tag & "_" & $getCurrentProcessId())
-  removeDir(result)
-  createDir(result)
+  ## A fresh, uniquely named directory (R3-13): a predictable name in the
+  ## shared temp dir could already be a symlink someone planted, which
+  ## `removeDir`/`createDir` would follow.
+  createTempDir("crisol_issue16_unit_" & tag & "_", "")
 
 proc writeManifest(dir, bname: string;
                    compile: seq[tuple[cPath, ccCmd: string]];
@@ -160,7 +172,7 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
     var callCount = 0
     var capturedCmd = ""
     var capturedArgs: seq[string] = @[]
-    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
       inc callCount
       capturedCmd = cmd
       capturedArgs = @args
@@ -169,16 +181,16 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
       # header (outside projectRoot entirely), and a system header.
       let output = p.objAbs & ": " & p.srcAbs & " native/add.h " &
                    p.otherH & " " & p.vendorH & " /usr/include/stdint.h\n"
-      (output: output, ok: true)
+      fakeReply(output, true)
 
     let savedCwd = getCurrentDir()
     setCurrentDir(p.root)   # so the relative "native/add.h" resolves against projectRoot
     defer: setCurrentDir(savedCwd)
 
-    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun)
 
     check callCount == 1
-    check capturedCmd == "gcc"
+    check capturedCmd == "/opt/tc/bin/gcc"   # the located driver (R10-S6)
     check "-M" in capturedArgs
     check "-o" notin capturedArgs
     check "-c" notin capturedArgs
@@ -217,15 +229,15 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
                  compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
                  link    = @[p.objAbs])
 
-    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
       let output = p.objAbs & ": " & p.srcAbs & " native/add.h " & p.addH & "\n"
-      (output: output, ok: true)
+      fakeReply(output, true)
 
     let savedCwd = getCurrentDir()
     setCurrentDir(p.root)
     defer: setCurrentDir(savedCwd)
 
-    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun)
     check inputs.externals.len == 1
     check inputs.externals[0].headers == @["native/add.h"]
 
@@ -247,15 +259,15 @@ suite "extractCompileInputs — cold external (cc -M probe derivation)":
                  compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
                  link    = @[p.objAbs])
 
-    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
       let output = p.objAbs & ": " & p.srcAbs & " native/add.h\n"
-      (output: output, ok: true)
+      fakeReply(output, true)
 
     let savedCwd = getCurrentDir()
     setCurrentDir(elsewhere)   # deliberately NOT p.root — the bug's exact trigger
     defer: setCurrentDir(savedCwd)
 
-    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun)
     check inputs.externals.len == 1
     check inputs.externals[0].headers == @["native/add.h"]
     check tpOf("native/add.h", cfg.trackedRoots) in inputs.files
@@ -270,13 +282,13 @@ suite "extractCompileInputs — cached external (carried-forward headers)":
     writeManifest(p.nc, "main", compile = @[], link = @[p.objAbs])
 
     var callCount = 0
-    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
       inc callCount
-      (output: "should never be reached", ok: true)
+      fakeReply("should never be reached", true)
 
     let carried = @[ExternalSource(source: "native/add.c", obj: "@mnative@sadd.c.o",
                                    headers: @["native/add.h"], headersHash: "stale-hash-from-last-run")]
-    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, carried, ccRun)
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, carried, GccLoc, ccRun)
 
     check callCount == 0
     check inputs.externals.len == 1
@@ -293,7 +305,7 @@ suite "extractCompileInputs — cached external (carried-forward headers)":
 
     var raised = false
     try:
-      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], realRun)
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, realRun)
     except CrisolError as e:
       raised = true
       check e.kind == cekEnvironment
@@ -310,16 +322,103 @@ suite "extractCompileInputs — cc -M probe failure":
                  compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
                  link    = @[p.objAbs])
 
-    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-      (output: "", ok: false)
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply("", false)
 
     var raised = false
     try:
-      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun)
     except CrisolError as e:
       raised = true
       check e.kind == cekEnvironment
     check raised
+
+suite "extractCompileInputs — the probe runs the driver the build resolved (R10-S6)":
+
+  proc refusedWith(driver: DriverResolver; needle: string) =
+    let p = setupExtProject("driver_" & $needle.len)
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
+                 link    = @[p.objAbs])
+    var ran = false
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      ran = true
+      fakeReply(p.objAbs & ": " & p.srcAbs & "\n", true)
+    var raised = false
+    try:
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], driver, ccRun)
+    except CrisolError as e:
+      raised = true
+      check e.kind == cekEnvironment
+      check needle in e.msg
+      check "native/add.c" in e.msg
+    check raised
+    check not ran
+
+  test "an unresolved driver refuses the closure; nothing runs":
+    refusedWith(unresolved("nim's gcc is nowhere"), "nim's gcc is nowhere")
+
+  test "a driver the build's site does not hold refuses the closure; nothing runs":
+    # The site the discovery learned holds only gcc; the manifest command
+    # names gcc too, but the resolution is the build's search, so an empty
+    # toolchain directory is a refusal whatever the C driver resolved to.
+    let site = DriverSite(known: true, nimCwd: "/proj", search: dsPosix,
+                          pathVar: "/opt/empty")
+    refusedWith(siteResolver(site, proc(p: string): bool = false), "not on the search path nim uses")
+
+  test "a .cpp external compiled with g++ beside a gcc C compiler is probed with g++":
+    # Nim compiles a `{.compile: "x.cpp".}` external with the C++ driver
+    # (`g++` under the gcc toolchain) while the discovery compile resolved
+    # `gcc`: the external's own token is resolved against the one site, and
+    # the closure is not refused.
+    let p = setupExtProject("cpp_driver")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    let cppCmd = "g++ -c -I" & (p.root / "native") & " -o " & p.objAbs & " " & p.srcAbs
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: cppCmd)],
+                 link    = @[p.objAbs])
+    let site = DriverSite(known: true, nimCwd: p.root, search: dsPosix,
+                          pathVar: "/opt/tc/bin")
+    let exists = proc(path: string): bool =
+      path in ["/opt/tc/bin/gcc", "/opt/tc/bin/g++"]
+    check locateDriver("gcc", site, exists).path == "/opt/tc/bin/gcc"
+    var ranWith: seq[string]
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      ranWith.add cmd
+      fakeReply(p.objAbs & ": " & p.srcAbs & "\n", true)
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[],
+                                      siteResolver(site, exists), ccRun)
+    check ranWith == @["/opt/tc/bin/g++"]
+    check inputs.externals.len == 1
+
+  test "a .cpp external whose g++ the build's nim would not find still refuses":
+    let p = setupExtProject("cpp_nodriver")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    let cppCmd = "g++ -c -I" & (p.root / "native") & " -o " & p.objAbs & " " & p.srcAbs
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: cppCmd)],
+                 link    = @[p.objAbs])
+    let site = DriverSite(known: true, nimCwd: p.root, search: dsPosix,
+                          pathVar: "/opt/tc/bin")
+    var ran = false
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      ran = true
+      fakeReply("", true)
+    var raised = false
+    try:
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[],
+        siteResolver(site, proc(path: string): bool = path == "/opt/tc/bin/gcc"), ccRun)
+    except CrisolError as e:
+      raised = true
+      check e.kind == cekEnvironment
+      check "'g++'" in e.msg
+      check "native/add.c" in e.msg
+    check raised
+    check not ran
 
 # ---------------------------------------------------------------------------
 # 6-7: depgraph externals — round-trip + M10 load guard
@@ -346,7 +445,7 @@ suite "depgraph — externals round-trip (issue #16)":
       ExternalSource(source: "native/add.c", obj: "@mnative@sadd.c.o",
                      headers: @["native/add.h"], headersHash: "hashA"),
     ]
-    updateEntry(g, path, fh, closure, "closurehash123", 1, externals)
+    updateEntry(g, path, fh, closure, @[], "closurehash123", 1, externals)
     doAssert saveDepGraph(g, cfg)
 
     let raw = readFile(depgraphPath(cfg))
@@ -434,7 +533,7 @@ suite "staleExternalObjects (issue #16 slice 1b)":
       ExternalSource(source: "native/other.c", obj: "objOther.o",
                      headers: @["native/other.h"], headersHash: hashOther),
     ]
-    updateEntry(g, path, fh, tpSet("tests/t.nim"), "ch", 1, externals)
+    updateEntry(g, path, fh, tpSet("tests/t.nim"), @[], "ch", 1, externals)
 
     check staleExternalObjects(g, path, @[], roots).len == 0
 
@@ -466,7 +565,7 @@ suite "staleExternalObjects (issue #16 slice 1b)":
       ExternalSource(source: "native/other.c", obj: "objOther.o",
                      headers: @["native/other.h"], headersHash: hashOther),
     ]
-    updateEntry(g, path, fh, tpSet("tests/t.nim"), "ch", 1, externals)
+    updateEntry(g, path, fh, tpSet("tests/t.nim"), @[], "ch", 1, externals)
 
     let stale = staleExternalObjects(g, path, @[], roots)
     check "objAdd.o" in stale
@@ -477,6 +576,15 @@ suite "staleExternalObjects (issue #16 slice 1b)":
 # ---------------------------------------------------------------------------
 # 8b: extractCompileInputs under MSVC (issue #21 slice 1b)
 # ---------------------------------------------------------------------------
+
+proc fixedPolicyCfg(p: ExtProject; policy: FoldPolicy): Config =
+  ## `extCfg` with every root's fold policy pinned instead of probed, so the
+  ## case-sensitivity of the tracked root is a property of the test rather
+  ## than of the volume the test happens to run on.
+  let probe = proc (rootAbs, stateDir: string): Option[FoldPolicy] = some(policy)
+  result = Config(projectRoot: p.root, stateDir: ".crisol", depRoots: @[p.depRoot])
+  result.trackedRoots = initTrackedRoots(p.root, @[(name: "dep", native: p.depRoot)],
+                                         ".crisol", probe)
 
 proc vccObjAbs(p: ExtProject): string =
   ## What vccexe/cl actually name the external's object: `.obj`, not `.o`.
@@ -497,7 +605,7 @@ suite "extractCompileInputs — MSVC external (issue #21 slice 1b)":
 
   test "a vcc manifest yields the real header set: family-classified, /Zs-prepended, JSON-parsed":
     let p = setupExtProject("msvc")
-    let cfg = extCfg(p)
+    let cfg = fixedPolicyCfg(p, fpAsciiLower)   # cl's hosts: a case-folding volume
     let index = buildSourceIndex(cfg)
     writeManifest(p.nc, "main",
                  compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
@@ -505,7 +613,7 @@ suite "extractCompileInputs — MSVC external (issue #21 slice 1b)":
 
     var capturedCmd = ""
     var capturedArgs: seq[string] = @[]
-    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
       capturedCmd = cmd
       capturedArgs = @args
       # Real `/sourceDependencies-` stdout: cl's one-line source-name banner,
@@ -521,17 +629,20 @@ suite "extractCompileInputs — MSVC external (issue #21 slice 1b)":
                        "/usr/include/stdint.h", p.srcAbs]
         }
       }
-      (output: "add.c\n" & doc.pretty & "\n", ok: true)
+      fakeReply("add.c\n" & doc.pretty & "\n", true)
 
-    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, ccRun)
 
-    # Derivation: the driver is replayed verbatim with two flags prepended.
-    check capturedCmd == "vccexe.exe"
+    # Derivation: the driver is replayed with the probe flags prepended and
+    # the compile action and object output removed (`/Zs` writes nothing
+    # either way; see test_ccprobe's MSVC derivation test for the
+    # measurement).
+    check capturedCmd == r"C:\Nim\bin\vccexe.exe"   # the located driver (R10-S6)
     check capturedArgs.len >= 2
     check capturedArgs[0] == "/Zs"
     check capturedArgs[1] == "/sourceDependencies-"
-    check "/c" in capturedArgs                      # NOT stripped
-    check ("/Fo" & vccObjAbs(p)) in capturedArgs    # NOT stripped
+    check "/c" notin capturedArgs
+    check ("/Fo" & vccObjAbs(p)) notin capturedArgs
     check "-M" notin capturedArgs                   # never the GNU flag
 
     check inputs.externals.len == 1
@@ -555,13 +666,13 @@ suite "extractCompileInputs — MSVC external (issue #21 slice 1b)":
     ## included, since a real capture would not switch terminators
     ## mid-stream.
     let p = setupExtProject("msvc_crlf")
-    let cfg = extCfg(p)
+    let cfg = fixedPolicyCfg(p, fpAsciiLower)   # cl's hosts: a case-folding volume
     let index = buildSourceIndex(cfg)
     writeManifest(p.nc, "main",
                  compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
                  link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
 
-    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
       let doc = %*{
         "Version": "1.2",
         "Data": {
@@ -573,9 +684,9 @@ suite "extractCompileInputs — MSVC external (issue #21 slice 1b)":
       }
       let banner = "add.c\n".replace("\n", "\r\n")
       let body = (doc.pretty & "\n").replace("\n", "\r\n")
-      (output: banner & body, ok: true)
+      fakeReply(banner & body, true)
 
-    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, ccRun)
 
     check inputs.externals.len == 1
     let ext = inputs.externals[0]
@@ -611,13 +722,13 @@ suite "extractCompileInputs — MSVC external (issue #21 slice 1b)":
                  compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
                  link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
 
-    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): tuple[output: string, ok: bool] =
-      (output: "add.c\n", ok: true)      # banner only, exit 0 -- no document
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply("add.c\n", true)      # banner only, exit 0 -- no document
 
     var raised = false
     var msg = ""
     try:
-      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], ccRun)
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, ccRun)
     except CrisolError as e:
       raised = true
       msg = e.msg
@@ -625,6 +736,299 @@ suite "extractCompileInputs — MSVC external (issue #21 slice 1b)":
     check raised
     check "native/add.c" in msg     # names the source that could not be probed
     check "dpeNoJson" in msg        # and says precisely what went wrong
+
+  test "a /sourceDependencies document naming a DIFFERENT translation unit fails LOUDLY":
+    ## A well-formed document whose `Data.Source` is some other unit (a stale
+    ## or misattributed report) must never be accepted as this external's
+    ## header set -- not even as an empty one.
+    let p = setupExtProject("msvc_srcmismatch")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                 link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      let doc = %*{
+        "Version": "1.2",
+        "Data": {
+          "Source": p.root / "native" / "other.c",
+          "ProvidedModule": "",
+          "Includes": [p.addH]
+        }
+      }
+      fakeReply("other.c\n" & doc.pretty & "\n", true)
+
+    var raised = false
+    var msg = ""
+    try:
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, ccRun)
+    except CrisolError as e:
+      raised = true
+      msg = e.msg
+      check e.kind == cekEnvironment
+    check raised
+    check "native/add.c" in msg
+    check "different translation unit" in msg.toLowerAscii
+
+# ---------------------------------------------------------------------------
+# 8c: a /sourceDependencies path is LOWERCASED by cl (measured, cl 19.44:
+# `Inc\MyHeader.h` is reported as `...\inc\myheader.h`). When that spelling
+# cannot be resolved to the real on-disk file, the header's identity is
+# unknown: extraction must refuse, never drop the header and never record
+# the lowercased spelling.
+# ---------------------------------------------------------------------------
+
+proc lowercasedMsvcRun(p: ExtProject; reportedHeaders: seq[string]): RunProc =
+  ## cl's own report shape: every path lowercased, source included.
+  result = proc(cmd: string, args: openArray[string]): RunResult =
+    var incs = newJArray()
+    for h in reportedHeaders: incs.add newJString(h.toLowerAscii)
+    let doc = %*{
+      "Version": "1.2",
+      "Data": {"Source": p.srcAbs.toLowerAscii, "ProvidedModule": "",
+               "Includes": incs}
+    }
+    fakeReply("add.c\n" & doc.pretty & "\n", true)
+
+proc expectEnvironmentRaise(body: proc ()): string =
+  ## Runs `body`; returns the CrisolError(cekEnvironment) message, or "" when
+  ## nothing (or something else) was raised.
+  try:
+    body()
+  except CrisolError as e:
+    if e.kind == cekEnvironment: return e.msg
+  ""
+
+suite "extractCompileInputs — MSVC lowercased header spellings fail closed":
+
+  test "a case-sensitive tracked root: a lowercased report of a mixed-case header is refused, not dropped":
+    let p = setupExtProject("R9S1_CaseSensitive")
+    createDir(p.root / "native" / "Inc")
+    let realHeader = p.root / "native" / "Inc" / "MyHeader.h"
+    writeFile(realHeader, "// MyHeader.h v1\n")
+    let cfg = fixedPolicyCfg(p, fpNone)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                 link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+    let run = lowercasedMsvcRun(p, @[realHeader])
+    let msg = expectEnvironmentRaise(proc () =
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, run))
+    check msg.len > 0
+    check "myheader.h" in msg
+
+  test "a case-sensitive tracked root spelled in lowercase: a lowercased TAIL is refused, not recorded":
+    ## The root prefix matches cl's lowercased spelling byte for byte, so
+    ## lexical classification succeeds -- with a `rel` naming a file that
+    ## does not exist on a case-sensitive volume.
+    let p = setupExtProject("r9s1_lowerroot")
+    createDir(p.root / "native" / "Inc")
+    let realHeader = p.root / "native" / "Inc" / "MyHeader.h"
+    writeFile(realHeader, "// MyHeader.h v1\n")
+    let cfg = fixedPolicyCfg(p, fpNone)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                 link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+    let run = lowercasedMsvcRun(p, @[realHeader])
+    let msg = expectEnvironmentRaise(proc () =
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, run))
+    check msg.len > 0
+    check "myheader.h" in msg
+
+  test "a case-folding tracked root: a lowercased report that cannot be resolved on disk is refused":
+    ## The folding root's resolution step (`winRealPath` on Windows) cannot
+    ## produce a real spelling for a path it cannot open -- modelled here by a
+    ## header the report names but the disk no longer has.
+    let p = setupExtProject("R9S1_Folding")
+    let cfg = fixedPolicyCfg(p, fpAsciiLower)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                 link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+    let run = lowercasedMsvcRun(p, @[p.root / "native" / "Gone.h"])
+    let msg = expectEnvironmentRaise(proc () =
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, run))
+    check msg.len > 0
+    check "gone.h" in msg
+
+  test "CONTROL a lowercased SYSTEM header outside every root is still excluded silently":
+    let p = setupExtProject("R9S1_Control")
+    let cfg = fixedPolicyCfg(p, fpNone)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                 link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+    let run = lowercasedMsvcRun(p, @["/usr/include/stdint.h"])
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, run)
+    check inputs.externals.len == 1
+    check inputs.externals[0].headers.len == 0
+
+# R10-S1: cl lowercases non-ASCII letters too (measured, cl 19.44: root
+# `C:\poc\Ärger` reported as `c:\poc\ärger\...`). A root whose name carries
+# one must still resolve or refuse the lowercased report, never drop it.
+
+proc clLowered(s: string): string =
+  ## cl's lowering of the one non-ASCII letter this fixture uses, plus ASCII.
+  s.toLowerAscii.replace("Ä", "ä")
+
+proc clLoweredMsvcRun(p: ExtProject; reportedHeaders: seq[string]): RunProc =
+  result = proc(cmd: string, args: openArray[string]): RunResult =
+    var incs = newJArray()
+    for h in reportedHeaders: incs.add newJString(clLowered(h))
+    let doc = %*{
+      "Version": "1.2",
+      "Data": {"Source": clLowered(p.srcAbs), "ProvidedModule": "",
+               "Includes": incs}
+    }
+    fakeReply("add.c\n" & doc.pretty & "\n", true)
+
+suite "extractCompileInputs — R10-S1: a non-ASCII root lowercased by cl":
+
+  for policy in [fpNone, fpAsciiLower]:
+    test "policy " & $policy & ": the header is resolved or refused, never dropped":
+      let p = setupExtProject("r10s1_Ärger_" & $policy)
+      createDir(p.root / "native" / "Inc")
+      let realHeader = p.root / "native" / "Inc" / "MyHeader.h"
+      writeFile(realHeader, "// MyHeader.h v1\n")
+      let cfg = fixedPolicyCfg(p, policy)
+      let index = buildSourceIndex(cfg)
+      writeManifest(p.nc, "main",
+                   compile = @[(cPath: p.srcAbs, ccCmd: vccCcCmd(p))],
+                   link    = @[p.nc / "@mmain.nim.c.obj", vccObjAbs(p)])
+      let run = clLoweredMsvcRun(p, @[realHeader])
+      # Two sound answers, chosen by what the host's volume can do. Where
+      # the lowercased spelling names no file (a case-sensitive volume, the
+      # Linux leg), the resolver cannot recover the real case, so refusal
+      # is the only sound answer under either policy. Where it does name
+      # the file (NTFS folds the non-ASCII letter too, the Windows leg), a
+      # FOLDING root resolves it to the real spelling and records it; a
+      # root probed as case-sensitive still refuses. Dropping it is wrong
+      # on every host.
+      if policy.folds and fileExists(clLowered(realHeader)):
+        let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index,
+                                          @[], VccLoc, run)
+        check inputs.externals.len == 1
+        check inputs.externals[0].headers == @["native/Inc/MyHeader.h"]
+      else:
+        let msg = expectEnvironmentRaise(proc () =
+          discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], VccLoc, run))
+        check msg.len > 0
+        check "myheader.h" in msg
+
+# R10-L5: a header a GNU driver reported, classified tracked, that is not a
+# file at its resolved spelling. Only the file-exists guard in the header
+# loop sees this: it must raise the closure's own environment error rather
+# than record the header or let a later read fail with a bare IOError.
+
+suite "extractCompileInputs — a reported tracked header that is not a file":
+
+  test "a GNU report naming a missing tracked header is refused":
+    let p = setupExtProject("r10l5_missing")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
+                 link    = @[p.objAbs])
+    let missing = p.root / "native" / "Missing.h"
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(p.objAbs & ": " & p.srcAbs & " " & missing & "\n", true)
+    let msg = expectEnvironmentRaise(proc () =
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun))
+    check "not a file" in msg
+    check "Missing.h" in msg
+
+  test "a GNU report naming a tracked DIRECTORY is refused":
+    let p = setupExtProject("r10l5_dir")
+    createDir(p.root / "native" / "sub")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
+                 link    = @[p.objAbs])
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(p.objAbs & ": " & p.srcAbs & " " & (p.root / "native" / "sub") & "\n", true)
+    let msg = expectEnvironmentRaise(proc () =
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun))
+    check "not a file" in msg
+
+# ---------------------------------------------------------------------------
+# 8d: the GNU probe's stdout must be a make rule for the probed source. A
+# dependency-output flag left in the replay (`-MD`/`-MMD`/`-MF`) sends the
+# rule to a file and leaves stdout EMPTY (gcc, measured) or fills it with
+# preprocessed source (clang, measured) -- neither is a header set.
+# ---------------------------------------------------------------------------
+
+const ClangMMdStdout = "# 1 \"native/add.c\"\n# 1 \"<built-in>\" 1\n" &
+  "# 1 \"<built-in>\" 3\n# 412 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n" &
+  "# 1 \"<built-in>\" 2\n# 1 \"native/add.c\" 2\n# 1 \"native/add.h\" 1\n" &
+  "int add(int a, int b);\n# 2 \"native/add.c\" 2\n" &
+  "int add(int a, int b) { return a + b; }\n"
+  ## Recorded: clang 18 `clang -M -MMD -Inative native/add.c` stdout, exit 0.
+
+proc gnuCcCmdWith(p: ExtProject; extra: string): string =
+  "gcc -c " & extra & " -I" & (p.root / "native") & " -o " & p.objAbs & " " & p.srcAbs
+
+suite "extractCompileInputs — GNU probe output must be a make rule for the probed source":
+
+  test "a ccCmd carrying -MMD still yields the real header set (the flag is not replayed)":
+    let p = setupExtProject("gnu_mmd")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: gnuCcCmdWith(p, "-MMD -MF " & (p.nc / "add.d")))],
+                 link    = @[p.objAbs])
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      # gcc's measured behaviour: with -MD/-MMD or -MF present the rule goes
+      # to a file and stdout is empty, exit 0.
+      for a in args:
+        if a in ["-MD", "-MMD", "-MF"] or a.startsWith("-MF"):
+          return fakeReply("", true)
+      fakeReply(p.objAbs & ": " & p.srcAbs & " " & p.addH & "\n", true)
+    let inputs = extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun)
+    check inputs.externals.len == 1
+    check inputs.externals[0].headers == @["native/add.h"]
+
+  test "EMPTY stdout with exit 0 fails loudly, never as an empty header set":
+    let p = setupExtProject("gnu_empty")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
+                 link    = @[p.objAbs])
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply("", true)
+    let msg = expectEnvironmentRaise(proc () =
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun))
+    check msg.len > 0
+    check "native/add.c" in msg
+
+  test "preprocessed source on stdout (clang -M -MMD) fails loudly, never as a header set":
+    let p = setupExtProject("gnu_preproc")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
+                 link    = @[p.objAbs])
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply(ClangMMdStdout, true)
+    let msg = expectEnvironmentRaise(proc () =
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun))
+    check msg.len > 0
+
+  test "a rule whose first prerequisite is a DIFFERENT source fails loudly":
+    let p = setupExtProject("gnu_othersrc")
+    let cfg = extCfg(p)
+    let index = buildSourceIndex(cfg)
+    writeManifest(p.nc, "main",
+                 compile = @[(cPath: p.srcAbs, ccCmd: coldCcCmd(p))],
+                 link    = @[p.objAbs])
+    let ccRun: RunProc = proc(cmd: string, args: openArray[string]): RunResult =
+      fakeReply("other.o: " & (p.root / "native" / "other.c") & " " & p.addH & "\n", true)
+    let msg = expectEnvironmentRaise(proc () =
+      discard extractCompileInputs(p.nc, "main", p.epPath, cfg, index, @[], GccLoc, ccRun))
+    check msg.len > 0
 
 # ---------------------------------------------------------------------------
 # 9: isModuleObjectName

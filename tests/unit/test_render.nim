@@ -603,16 +603,16 @@ suite "render — renderClosure":
 
 suite "render — isCacheMissDecision":
 
-  test "the seven miss variants are true":
-    ## W4 full fix: cdmToolchainUnidentified added -- a consulted, refused-
-    ## to-store decision, same as cdmHermeticityDeg; explain-miss rendering
-    ## must cover it or the refusal is silent from the operator's chair.
+  test "the six miss variants are true":
     for cd in [cdmStored, cdmKeyMiss, cdmHermeticityDeg, cdmFlaky,
-               cdmClosureUnrecorded, cdmRecomputeMiss, cdmToolchainUnidentified]:
+               cdmClosureUnrecorded, cdmRecomputeMiss]:
       check isCacheMissDecision(cd)
 
   test "cdmHit and every not-consulted variant are false":
-    for cd in [cdmHit, cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled]:
+    ## cdmToolchainUnidentified: the run was cache-disabled (R9-D3); its
+    ## stderr warning explains it once, not per entrypoint.
+    for cd in [cdmHit, cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled,
+               cdmToolchainUnidentified]:
       check not isCacheMissDecision(cd)
 
 suite "render — explainMissLines (degraded case)":
@@ -681,19 +681,10 @@ suite "render — renderKeyDiffLines: kcNimVersion":
           @["kcNimVersion: changed (no-pipe-… → also-no-…)"]
 
 suite "render — renderKeyDiffLines: kcCcVersion (structured CcFingerprint, `#`-digest aware)":
-  ## CR11/W7: post-#23 the value is `ccidentity.ccVersion()`'s serialized
-  ## `CcFingerprint` — each half is "<legible text> #<16-hex content digest>"
-  ## (POSIX driver / any runtime half), or plain text with no digest at all
-  ## (the Windows driver half, `cdVersionOnly` — see `WindowsCcProfile`'s
-  ## doc). This suite REPLACES "kcCcVersion (accurate two-segment shape, NOT
-  ## a binary hash)": that title and its `check "compiler binary differs"
-  ## notin l` pin (old :696) were written against the PRE-#23 shape and
-  ## actively asserted that the digest-only arm stays missing — exactly the
-  ## gap W7 named. Removing that pin is correct: post-#23 fixtures carry a
-  ## real content hash in both segments, "compiler binary differs"/"runtime
-  ## library differs" is the behaviour `docs/rfc/0005-distributed-cache-and-
-  ## trust.md:389`'s amendment already declared, and pinning its absence was
-  ## pinning a documented-as-fixed defect shut.
+  ## The value is `$ccidentity.CcFingerprint`: each half is
+  ## "<legible text> #<content digest>" or its sentinel. When only a half's
+  ## digest moved, the line says so ("compiler configuration differs" /
+  ## "runtime library differs") instead of repeating two identical texts.
 
   test "only cc TEXT differs (driver hash moves with it): names cc, full raw segments, no truncation":
     let d = KeyDiff(component: kcCcVersion,
@@ -703,12 +694,12 @@ suite "render — renderKeyDiffLines: kcCcVersion (structured CcFingerprint, `#`
           @["kcCcVersion: cc: cc (GCC) 12.2.0 #aaaa1111aaaa1111 → " &
                               "cc (GCC) 13.1.0 #cccc3333cccc3333"]
 
-  test "W7: only the driver hash differs (banner unchanged) — 'compiler binary differs', terse":
+  test "W7: only the compiler digest differs (text unchanged) — 'compiler configuration differs', terse":
     let d = KeyDiff(component: kcCcVersion,
       prev: "cc (GCC) 12.2.0 #aaaa1111aaaa1111|ldd (GNU libc) 2.36 #bbbb2222bbbb2222",
       curr: "cc (GCC) 12.2.0 #dddd4444dddd4444|ldd (GNU libc) 2.36 #bbbb2222bbbb2222")
     check renderKeyDiffLines(d, verbose = false) ==
-          @["kcCcVersion: cc: compiler binary differs (hash aaaa1111… → dddd4444…)"]
+          @["kcCcVersion: cc: compiler configuration differs (hash aaaa1111… → dddd4444…)"]
 
   test "W7 (the headline fix): only the runtime content hash differs (banner unchanged) — 'runtime library differs', terse":
     ## This is the exact gap W7 named: a distro gcc/glibc rebuild at an
@@ -721,7 +712,7 @@ suite "render — renderKeyDiffLines: kcCcVersion (structured CcFingerprint, `#`
     let lines = renderKeyDiffLines(d, verbose = false)
     check lines == @["kcCcVersion: runtime: runtime library differs (hash bbbb2222… → eeee5555…)"]
     for l in lines:
-      check "compiler binary differs" notin l
+      check "compiler configuration differs" notin l
 
   test "W7 verbose vs terse ARE now distinguishable on the digest-only arm (full hash vs truncated)":
     ## Before this fix terse/verbose were indistinguishable on kcCcVersion
@@ -756,15 +747,17 @@ suite "render — renderKeyDiffLines: kcCcVersion (structured CcFingerprint, `#`
             "kcCcVersion: runtime: ldd (GNU libc) 2.36 #bbbb2222bbbb2222 → " &
                                   "ldd (GNU libc) 2.38 #ffff6666ffff6666"]
 
-  test "Windows shape: driver half carries NO digest (cdVersionOnly) — plain text diff, no hash":
+  test "a value written before the digest was mandatory (a digest-less half) renders opaque":
+    ## The pre-v2 Windows shape. It no longer parses, so it is never
+    ## mis-rendered as a structured diff.
     let d = KeyDiff(component: kcCcVersion,
       prev: "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64|" &
             "kernel32+libcmt+libucrt+libvcruntime+oldnames+uuid #0d8cab78a8b5d998",
-      curr: "Microsoft (R) C/C++ Optimizing Compiler Version 19.45.00000 for x64|" &
+      curr: "msvc 19.44.35228.0 x64 #1111222233334444|" &
             "kernel32+libcmt+libucrt+libvcruntime+oldnames+uuid #0d8cab78a8b5d998")
-    check renderKeyDiffLines(d, verbose = false) ==
-          @["kcCcVersion: cc: Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64 → " &
-                              "Microsoft (R) C/C++ Optimizing Compiler Version 19.45.00000 for x64"]
+    let lines = renderKeyDiffLines(d, verbose = false)
+    check lines.len == 1
+    check "kcCcVersion: changed (" in lines[0]
 
   test "a half transitioning to/from fully unavailable renders the raw sentinel, not a digest diff":
     let d = KeyDiff(component: kcCcVersion,
@@ -772,6 +765,13 @@ suite "render — renderKeyDiffLines: kcCcVersion (structured CcFingerprint, `#`
       curr: "cc (GCC) 13.1.0 #cccc3333cccc3333|ldd (GNU libc) 2.36 #bbbb2222bbbb2222")
     check renderKeyDiffLines(d, verbose = false) ==
           @["kcCcVersion: cc: <cc-unavailable> → cc (GCC) 13.1.0 #cccc3333cccc3333"]
+
+  test "the runtime half renders its own sentinel (R10-D10: no caller-chosen sentinel)":
+    let d = KeyDiff(component: kcCcVersion,
+      prev: "cc (GCC) 13.1.0 #cccc3333cccc3333|<runtime-unidentified>",
+      curr: "cc (GCC) 13.1.0 #cccc3333cccc3333|ldd (GNU libc) 2.36 #bbbb2222bbbb2222")
+    check renderKeyDiffLines(d, verbose = false) ==
+          @["kcCcVersion: runtime: <runtime-unidentified> → ldd (GNU libc) 2.36 #bbbb2222bbbb2222"]
 
   test "verbose makes no difference on the non-digest-only arms (already single lines, per coordinator ruling)":
     let d = KeyDiff(component: kcCcVersion,

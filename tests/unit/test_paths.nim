@@ -21,7 +21,7 @@
 ## two different policies for one root can no longer collide; the fake roots
 ## below nonetheless stay unique per test, which is clearer regardless.
 
-import std/[unittest, options, os, osproc, strutils, json]
+import std/[unittest, options, os, osproc, strutils, json, tempfiles]
 import crisol/paths
 import crisol/narrow
 import ../support/symlinkprobe
@@ -291,8 +291,9 @@ suite "classify — symlinked dep root (NativeRoot.realAbs)":
       echo "CRISOL-SKIP-TEST: tests/unit/test_paths.nim#classify_symlinked_deproot_realabs_windows_known_divergence"
       skip()
     else:
-      let rawBase = getTempDir() / ("crisol_test_paths_symlink_" & $getCurrentProcessId())
-      createDir(rawBase)
+      # A fresh, uniquely named directory (R3-13), never a predictable name
+      # a planted symlink could already occupy.
+      let rawBase = createTempDir("crisol_test_paths_symlink_", "")
       # Resolve the base up front so the fixture's own paths are internally
       # consistent. On macOS getTempDir() lives under /var/folders, itself a
       # symlink to /private/var/folders; without this, the candidate below
@@ -625,6 +626,11 @@ suite "cmpKeyBytes — total order over unfolded keyBytes":
     let a = tracked("/fake/proj-nolt/a.nim", roots).get
     let b = tracked("/fake/proj-nolt/b.nim", roots).get
     check (not compiles(a < b))
+    # Positive controls (R2-10): the same operands and the same `<` shape DO
+    # compile once an order exists, so the seal above fails for want of `<`
+    # over TrackedPath, not because `a`/`b` or the expression are malformed.
+    check compiles(cmpKeyBytes(a, b, roots) < 0)
+    check compiles(string(keyBytes(a, roots)) < string(keyBytes(b, roots)))
 
 # ===========================================================================
 # fromCanonical — shape validation (never raises, returns Option).

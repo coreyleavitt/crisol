@@ -5,6 +5,9 @@
 
 import std/[options, unittest]
 import crisol/api
+from crisol/types import nil   # qualified-only: the positive controls below
+                               # name `types.Config`/`types.RunPlan`, while
+                               # the bare names stay out of scope
 
 suite "api boundary — positive: contracted symbols reachable":
   test "request/selection types":
@@ -89,10 +92,27 @@ suite "api boundary — negative: internal types not in public surface":
     check not compiles((block:
       var c: Config
       discard c))
+    # Positive controls (R3-14): the same block compiles for a type that is
+    # exported, and for `Config` itself when named through its own module, so
+    # the seal fails because `crisol/api` does not export `Config` -- not
+    # because the block is malformed or `Config` was renamed.
+    check compiles((block:
+      var c: RunOptions
+      discard c))
+    check compiles((block:
+      var c: types.Config
+      discard c))
 
   test "RunPlan not reachable via crisol/api":
     # RunPlan is internal; facade overloads (H2) accept PlanReport instead.
     # If someone adds `export types.RunPlan` to api.nim, this test will FAIL.
     check not compiles((block:
       var p: RunPlan
+      discard p))
+    # Positive controls (R3-14), as for `Config` above.
+    check compiles((block:
+      var p: PlanReport
+      discard p))
+    check compiles((block:
+      var p: types.RunPlan
       discard p))

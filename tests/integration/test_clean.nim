@@ -96,7 +96,7 @@ when defined(posix):
       createDir(cacheDir / "orphan_deadbeef0000dead")
       createDir(binDir   / "orphan_cafebabe0000cafe")
 
-      let r = cleanOrphans(cfg)
+      let r = cleanOrphans(cfg, knownToolchain("", ""))
 
       # Current dirs must remain.
       check dirExists(cacheDir / expectedSlug)
@@ -131,7 +131,7 @@ when defined(posix):
       # Per-slot dir for a non-existent (orphan) entrypoint → should be pruned.
       createDir(cacheDir / "orphan_aabbccdd1234abcd_3")
 
-      let r = cleanOrphans(cfg)
+      let r = cleanOrphans(cfg, knownToolchain("", ""))
 
       check dirExists(cacheDir / (expectedSlug & "_0"))
       check not dirExists(cacheDir / "orphan_aabbccdd1234abcd_3")
@@ -167,7 +167,7 @@ when defined(posix):
       createDir(currentDir)
       createDir(staleDir)
 
-      let r = cleanOrphans(cfg, nimVersion = "2.2.10", ccVersion = "gcc-current|ldd-current")
+      let r = cleanOrphans(cfg, knownToolchain("2.2.10", "gcc-current|ldd-current"))
 
       # The dir matching the CURRENT toolchain fingerprint survives.
       check dirExists(currentDir)
@@ -178,10 +178,10 @@ when defined(posix):
       check r.cacheDeleted >= 1
 
     test "no toolchain probe supplied (defaults) ⇒ falls back to bare-slug expected set":
-      ## Back-compat: cleanOrphans(cfg) with no nimVersion/ccVersion (as called
-      ## by every OTHER test in this file, and by any pre-fingerprint caller)
-      ## must behave exactly as before — retaining the bare `<slug>` dir with
-      ## no toolchain suffix.
+      ## Back-compat: cleanOrphans(cfg, knownToolchain("", "")) -- the bare
+      ## pre-fingerprint sentinel (as passed by every OTHER test in this
+      ## file, and by any pre-fingerprint caller) -- must behave exactly as
+      ## before: retaining the bare `<slug>` dir with no toolchain suffix.
       let root = makeTempRoot()
       defer: removeDir(root)
 
@@ -198,7 +198,7 @@ when defined(posix):
       let baseSlug = slugFor(relPath, cfg.trackedRoots, @[])
       createDir(cacheDir / baseSlug)  ## bare, no toolchain suffix
 
-      let r = cleanOrphans(cfg)  ## no nimVersion/ccVersion — the "" default
+      let r = cleanOrphans(cfg, knownToolchain("", ""))  ## no nimVersion/ccVersion — the "" default
 
       check dirExists(cacheDir / baseSlug)
       check r.cacheDeleted == 0
@@ -244,12 +244,76 @@ when defined(posix):
       createDir(cacheDir / (slugB & "-" & staleFp))
       createDir(binDir / slugB)
 
-      let r = cleanOrphans(cfg, nimVersion = "2.2.10", ccVersion = "gcc-current|ldd-current")
+      let r = cleanOrphans(cfg, knownToolchain("2.2.10", "gcc-current|ldd-current"))
 
       check dirExists(binDir / slugA)      ## kept: current-toolchain cache dir backs it
       check not dirExists(binDir / slugB)  ## pruned: only a stale-toolchain cache dir backed it
       check not dirExists(cacheDir / (slugB & "-" & staleFp))  ## the stale cache dir itself is gone too
       check r.binDeleted >= 1
+
+  # ---------------------------------------------------------------------------
+  # R14-D4 / R14-L1 — an UNKNOWN toolchain identity prunes nothing by it
+  # ---------------------------------------------------------------------------
+
+  suite "crisol clean — unknown toolchain identity (R14-D4, R14-L1)":
+
+    test "unknown identity: no cache dir is pruned by fingerprint, live binaries are kept, the rest still runs":
+      ## A placeholder fingerprint (nim or the C compiler missing from PATH,
+      ## an unresolvable cl, an interrupted probe) matches no recorded
+      ## toolchain, so pruning by it deleted every nimcache and bin dir.
+      ## An unknown identity must skip the toolchain-suffixed prune and say
+      ## why, and still do what does not depend on the fingerprint: a
+      ## deleted entrypoint's binary and depgraph entry go.
+      let root = makeTempRoot()
+      defer: removeDir(root)
+
+      let unitDir = root / "tests" / "unit"
+      createDir(unitDir)
+      writeFile(unitDir / "test_u1.nim", "# stub\n")
+
+      let cfg      = makeConfig(root)
+      let stateDir = root / ".crisol"
+      let cacheDir = stateDir / "cache"
+      let binDir   = stateDir / "bin"
+      createDir(cacheDir)
+      createDir(binDir)
+
+      let slugA = slugFor("tests/unit/test_u1.nim", cfg.trackedRoots, @[])
+      let fpA   = toolchainFingerprint("2.2.10", "gcc-a|ldd-a")
+      let fpB   = toolchainFingerprint("2.2.10", "gcc-b|ldd-b")
+      createDir(cacheDir / (slugA & "-" & fpA))
+      createDir(cacheDir / (slugA & "-" & fpB))
+      createDir(binDir / slugA)
+      createDir(binDir / "tests_unit_test_gone_deadbeef")   # no such entrypoint
+
+      let r = cleanOrphans(cfg, unknownToolchain("nim is not on PATH"))
+
+      check dirExists(cacheDir / (slugA & "-" & fpA))
+      check dirExists(cacheDir / (slugA & "-" & fpB))
+      check r.cacheDeleted == 0
+      check dirExists(binDir / slugA)                                   ## live: kept
+      check not dirExists(binDir / "tests_unit_test_gone_deadbeef")     ## deleted entrypoint: pruned
+      check r.binDeleted == 1
+      check r.toolchainPruneSkipped == "nim is not on PATH"
+
+    test "known identity: the toolchain-suffixed prune runs and reports no skip":
+      let root = makeTempRoot()
+      defer: removeDir(root)
+      let unitDir = root / "tests" / "unit"
+      createDir(unitDir)
+      writeFile(unitDir / "test_u2.nim", "# stub\n")
+      let cfg      = makeConfig(root)
+      let cacheDir = root / ".crisol" / "cache"
+      createDir(cacheDir)
+      let slugA = slugFor("tests/unit/test_u2.nim", cfg.trackedRoots, @[])
+      let cur   = toolchainFingerprint("2.2.10", "gcc-a|ldd-a")
+      let old   = toolchainFingerprint("2.2.10", "gcc-b|ldd-b")
+      createDir(cacheDir / (slugA & "-" & cur))
+      createDir(cacheDir / (slugA & "-" & old))
+      let r = cleanOrphans(cfg, knownToolchain("2.2.10", "gcc-a|ldd-a"))
+      check dirExists(cacheDir / (slugA & "-" & cur))
+      check not dirExists(cacheDir / (slugA & "-" & old))
+      check r.toolchainPruneSkipped == ""
 
   # ---------------------------------------------------------------------------
   # Suite 2 — clean ignores gates (gated-group caches are KEPT)
@@ -278,7 +342,7 @@ when defined(posix):
 
       createDir(cacheDir / gatedSlug)
 
-      let r = cleanOrphans(cfg)
+      let r = cleanOrphans(cfg, knownToolchain("", ""))
 
       # Gate is closed but clean discovers all groups → slug is in expected set.
       check dirExists(cacheDir / gatedSlug)
@@ -345,12 +409,12 @@ when defined(posix):
       # (zero-value) `TrackedRoots` round-trips them exactly -- this test
       # never touches closure content beyond non-emptiness.
       graph.updateEntry(keptPath,  fHash,
-                        [fromCanonical(keptPath,  default(TrackedRoots)).get].toHashSet, "", 1)
+                        [fromCanonical(keptPath,  default(TrackedRoots)).get].toHashSet, @[], "", 1)
       graph.updateEntry(stalePath, fHash,
-                        [fromCanonical(stalePath, default(TrackedRoots)).get].toHashSet, "", 1)
+                        [fromCanonical(stalePath, default(TrackedRoots)).get].toHashSet, @[], "", 1)
       doAssert saveDepGraph(graph, cfg)
 
-      discard cleanOrphans(cfg)
+      discard cleanOrphans(cfg, knownToolchain("", ""))
 
       # Reload and verify.
       let g2 = loadDepGraph(cfg, "")

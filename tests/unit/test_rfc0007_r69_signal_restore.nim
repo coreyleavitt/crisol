@@ -46,7 +46,8 @@
 ## destroy ORDER that makes both cores' non-LIFO AND LIFO cases correct
 ## at once. r80's fix is structural instead: `initPosixCore` now RAISES
 ## `OSError` when `installSignals` is requested while another live core
-## already owns signal delivery (`gShutdownWriteFd != -1`) — refusing the
+## already owns signal delivery (then `gShutdownWriteFd != -1`; since R13-D4,
+## `tooltrees.attachInterruptWake` refusing a second wake) — refusing the
 ## SECOND concurrent install outright, mirroring `initSupervisor`'s
 ## (windows.nim) `jobObjectNesting` precedent (a fatal, no-half-loop
 ## `OSError` at init time). The old r73 non-LIFO test below is REPLACED
@@ -151,8 +152,9 @@ when defined(posix):
     test "r80: a concurrent second signal-installing core is REFUSED -- initPosixCore raises OSError while another live core still owns signal delivery":
       ## rfc-0007 code-review r80 (THE fix this row pins, RED against
       ## pre-r80 code): `initPosixCore(installSignals = true)` must raise
-      ## `OSError` when `gShutdownWriteFd != -1` -- i.e. another live core
-      ## already owns signal delivery. Pre-fix, this silently SUCCEEDED
+      ## `OSError` when another live core already owns signal delivery (its
+      ## self-pipe is the scope's attached wake, which
+      ## `tooltrees.attachInterruptWake` refuses to replace: R13-D4). Pre-fix, this silently SUCCEEDED
       ## (coreB installed over coreA without complaint); see this file's
       ## header comment for why that silent success is the root of the
       ## r73/r80 LIFO-vs-non-LIFO bind that no destroy-order fix can
@@ -181,8 +183,8 @@ when defined(posix):
       ## verify-sub-run flow: one core installs, tears down completely,
       ## THEN a later core installs) never has two live installers at
       ## once, so r80's concurrency refusal never engages -- each
-      ## `initPosixCore` call here sees `gShutdownWriteFd == -1` (the
-      ## prior core's `destroyPosixCore` cleared it) and proceeds
+      ## `initPosixCore` call here finds no wake attached (the prior
+      ## core's `destroyPosixCore` detached it) and proceeds
       ## normally, exactly as before r80.
       installDisposition(SIGINT, cast[proc (x: cint) {.noconv.}](SIG_DFL))
       installDisposition(SIGTERM, cast[proc (x: cint) {.noconv.}](SIG_DFL))

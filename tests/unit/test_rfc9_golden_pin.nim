@@ -83,6 +83,7 @@ import crisol/config
 import crisol/runner
 import crisol/process/types as ptypes
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Fixture locations
@@ -180,6 +181,10 @@ suite "rfc9_golden_pin — fnv.chainedContentHash literal byte-pins":
 #    `KeyInputs` grew its 10th component, `cwdPosture` — a deliberate
 #    fold-input shape change (see resultcache.nim's 3 -> 4 version-history
 #    bullet), not drift.
+#
+#    Round 9 (issue #23): recomputed again when `keys.SoundnessKeyVersion`
+#    (v2) was chained in as the seed -- a deliberate re-partition of every
+#    key, not drift.
 # ===========================================================================
 
 suite "rfc9_golden_pin — soundnessKey literal byte-pin (synthetic inputs)":
@@ -197,7 +202,7 @@ suite "rfc9_golden_pin — soundnessKey literal byte-pin (synthetic inputs)":
       protocolMajor:       1,
       cwdPosture:          false,
     )
-    check $soundnessKey(inp) == "f7375e661f1a272e"
+    check $soundnessKey(inp) == "ca9d2ea90aa39afa"
 
 # ===========================================================================
 # 6. depRoot vector — literal byte-pins (RFC-0009 A5a flipped this from the
@@ -329,9 +334,9 @@ suite "rfc9_golden_pin — one fixture run's actual on-disk cache slugs":
     let ep = testEp(simplePath, group = "default", flags = @[])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph, nimVersion = "",
-                          showProgress = false).results
+                          showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:

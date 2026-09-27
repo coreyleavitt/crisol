@@ -36,6 +36,7 @@ import crisol/config
 import crisol/sandbox
 import "../support/testep"
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -166,7 +167,7 @@ proc testCapAndMemoryCompose() =
   let pSerial = plan(cfgSerial, epsSerial, emptyDepGraph())
   var gSerial = emptyDepGraph()
   discard execute(pSerial, config = cfgSerial, graph = gSerial, showProgress = false,
-                  cache = cacheDisabled(overlapSpec))
+                  cache = cacheDisabled(overlapSpec), toolchain = unprobedToolchain())
   delEnv("CRISOL_TEST_OVERLAP_FILE")
 
   let serialIntervals = parseOverlapFile(serialPath)
@@ -201,7 +202,7 @@ proc testCapAndMemoryCompose() =
   let pMem = plan(cfgMem, epsMem, emptyDepGraph())
   var gMem = emptyDepGraph()
   discard execute(pMem, config = cfgMem, graph = gMem, showProgress = false,
-                  cache = cacheDisabled(overlapSpec))
+                  cache = cacheDisabled(overlapSpec), toolchain = unprobedToolchain())
   delEnv("CRISOL_TEST_OVERLAP_FILE")
 
   let memIntervals = parseOverlapFile(memPath)
@@ -281,7 +282,7 @@ proc testFailFastDrains() =
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
   let results = execute(p, config = cfg, graph = g,
-                        failFast = true, showProgress = false, cache = cacheDisabled(overlapSpec)).results
+                        failFast = true, showProgress = false, cache = cacheDisabled(overlapSpec), toolchain = unprobedToolchain()).results
   let elapsed = epochTime() - t0
   delEnv("CRISOL_TEST_OVERLAP_FILE")
 
@@ -351,7 +352,7 @@ proc testPerGroupTimeoutInComposedRun() =
   let t0 = epochTime()
   let p = plan(cfg, eps, emptyDepGraph())
   var g = emptyDepGraph()
-  let results = execute(p, config = cfg, graph = g, showProgress = false).results
+  let results = execute(p, config = cfg, graph = g, showProgress = false, toolchain = unprobedToolchain()).results
   let elapsed = epochTime() - t0
 
   check results.len == 2

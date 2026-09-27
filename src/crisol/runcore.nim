@@ -1,0 +1,2299 @@
+## crisol/runcore.nim -- the engine behind the `crisol/api` facade.
+##
+## INTERNAL / uncontracted. `crisol/api` is the library surface; it imports
+## this module and re-exports the contracted part of it (the request/report
+## types, the selection/narrowing/verify constructors, `planTests`,
+## `closureReport`), and defines `runTests` over `runTestsWith` below.
+##
+## What lives here and is NOT re-exported by `crisol/api`:
+##
+##   RunDeps / productionRunDeps / runTestsWith
+##     The test-injection seam (RFC-0005 A3b): `runTestsWith(opts, deps)` is
+##     `runTests` with the cache runtime builder and the C toolchain probe
+##     supplied by the caller. Its types (`CacheConfig`, `CacheSecrets`,
+##     `CacheRuntime`, `CcProbeContext`, `CcFingerprint`, `TrackedRoots`)
+##     belong to internal modules, which is why the seam cannot sit on the
+##     contracted surface. Tests import this module to drive a real run
+##     under an injected toolchain or cache.
+##
+## The contracted types are defined here, rather than in `crisol/api`,
+## because `runTestsWith` needs them and `crisol/api` needs `runTestsWith`.
+
+import std/[algorithm, json, monotimes, options, os, sequtils, sets, strutils, sysrand, tables, times]
+import crisol/[types, config, pipeline, jsonout, render, planview, gitdiff, runner, lock,
+               sandbox, cachedispatch, cacheregistry, cachetier, cacheport, cachetelemetry,
+               resultcache, ccidentity, nimprobe, planner, order, ledger, keys, depgraph, stats,
+               compilereport, toolchainwarn, cachesecrets]
+# RFC-0009 A2: `RunReport.trackedRoots`'s type (below) is a `paths.TrackedRoots`
+# -- types.nim imports paths.nim itself but does not export it, so this
+# module needs its own import to name the type in RunReport's field.
+import crisol/paths
+# rfc-0007 W3: `process.capabilities()` -- the real substrate node, so
+# `persistLastRun` below can thread the SAME value the CLI's stdout run/v2
+# emission already carries (crisol.nim:43 imports this identically).
+import crisol/process
+# rfc-0007 A2b: `crisol/signals` (the process-global gotSignal flag) is no
+# longer needed to drive `interrupted` — `runner.execute`'s OWN Supervisor
+# now owns SIGINT/SIGTERM installation for the duration of the call
+# (`installSignals` param, threaded from `opts.installSignals` below) and
+# reports the real signum it observed via the returned ExecuteReport's
+# `.shutdownSignal` field (code-review r7), superseding
+# `installSignalHandlers`/`clearSignal`/`pendingSignal`. RFC-0005 code-
+# review SO2 reintroduces ONE narrow use: `shutdownRequested()` as the
+# `abandoned` predicate for the end-of-run deferred-put drain below, the
+# SAME "abandon more I/O on a pending shutdown" query the plan-time
+# prefetch/consult loops already use (cachetier.nim/runner.nim).
+import crisol/signals
+# R12-D3: with `opts.installSignals`, `runTestsWith` owns SIGINT/SIGTERM for
+# the whole call through an interrupt scope — planning as well as execution —
+# and reads the scope's signal to end a run interrupted while planning.
+import crisol/process/tooltrees
+# rfc-0007 A1c: the §2 result-model facade (Phase/ProcessResult/Exit/Cause/
+# Evidence/Rusage/OutcomePolicy) plus the runResult/failureLine digest
+# helpers below. `import nil` so nothing unqualified leaks into this
+# module's own namespace; the enumerated set is re-exported explicitly.
+from crisol/process/types as ptypes import nil
+
+
+# ---------------------------------------------------------------------------
+# Nim-version fingerprint (High finding — soundness seam)
+# ---------------------------------------------------------------------------
+#
+# crisol must fingerprint the Nim compiler so that (1) the depgraph staleness
+# check invalidates stale binaries after a compiler upgrade and (2) the
+# soundness key invalidates cached test RESULTS after a compiler upgrade.
+#
+# CACHE IDENTITY now uses `nimprobe.cachedNimFingerprint()` — a RUNTIME probe
+# of the nim binary crisol's own compile invocations resolve via PATH (mirrors
+# `ccidentity.cachedToolchainProbe()` for the C compiler) — NOT `crisolNimVersion`
+# below. `crisolNimVersion` (= `system.NimVersion`, crisol's OWN compile-time
+# Nim version, e.g. "2.2.10") is just a version STRING: two builds of Nim can
+# share it while differing in codegen (a stock vs. a locally-patched build),
+# which a cache/staleness check keyed on the string alone cannot detect. This
+# value is threaded into buildRunPlan → loadDepGraph / plan → execute →
+# realSeams so BOTH the staleness check (depgraph.loadDepGraph's discard arms
+# -- planner.decideCompile carried a matching one until R3-8 removed it as
+# unreachable) AND the soundness key (keys.soundnessKey) observe the
+# binary-distinguishing fingerprint instead of the compile-time string.
+
+const crisolNimVersion* = NimVersion
+  ## The Nim compiler version crisol was built with (e.g. "2.2.0").
+  ## DISPLAY/METADATA ONLY — kept for consumers wanting the human-readable
+  ## version string (e.g. logs). NOT fed into cache identity; see
+  ## `nimprobe.cachedNimFingerprint()` for the runtime, binary-distinguishing
+  ## fingerprint used by depgraph staleness / SoundnessKey / toolchainFingerprint.
+
+# ---------------------------------------------------------------------------
+# Public types (F1 — api-owned)
+# ---------------------------------------------------------------------------
+
+type
+  RunStatus* = enum
+    rsOk          ## run completed; inspect `summary` for pass/fail
+    rsStructural  ## config/env problem (bad config/globs, lock held,
+                  ## --failed with no prior run, --changed outside a git repo,
+                  ## unknown group); see `error`
+    rsInterrupted ## SIGINT/SIGTERM during the run; exitCode = 128 + signum
+
+  NarrowingKind* = enum
+    nkNone            ## run all (no narrowing)
+    nkFailed          ## re-run only entrypoints that failed in the last run
+    nkChanged         ## run only entrypoints whose closure ∩ diff ≠ ∅
+    nkFailedOrChanged ## UNION of nkFailed and nkChanged (wider, not narrower)
+
+  RunNarrowing* = object
+    ## Describes how to narrow the set of entrypoints that will run.
+    ## Constructed via the narrowing constructors (noNarrowing, failedOnly, …)
+    ## — do NOT construct directly: base-ref-without-narrowing is structurally
+    ## unconstructable via the library API.
+    kind*:    NarrowingKind  ## nkNone / nkFailed / nkChanged / nkFailedOrChanged
+    baseRef*: string          ## "" → working tree vs HEAD; only meaningful when
+                              ## kind includes nkChanged
+
+  VerifyCache* = object
+    ## RFC-0005 Stage B `--verify-cache` facade ("Facade (round 3)"): the
+    ## determinism backstop re-executes a sample of this run's `cdmHit`
+    ## entries and compares fresh observations against the stored ones.
+    ## Constructed via `noVerify()` / `verifySample(pct, seed, strict)` — do
+    ## NOT construct directly: "strict without enabled" is structurally
+    ## unconstructable via the library API, mirroring `RunNarrowing` above.
+    ## B3a ships only this data shape + the pure sampler/synthetic-plan
+    ## pieces that will consume it; the post-run pass itself is B3b, the CLI
+    ## is B3c.
+    enabled*: bool         ## false (default, via noVerify()) = no verify pass
+    pct*:     int          ## sample percentage of the hit set; see
+                           ## types.sampleHitIndices (max(1, pct*hits/100)).
+                           ## -1 (verifySample()'s own default) = no override;
+                           ## planImpl's merge chain (r29) resolves it against
+                           ## Config.verifyCachePct before the post-run pass
+                           ## ever sees it — vc.pct itself is always concrete
+                           ## by the time verifyCachePass reads it.
+    seed*:    Option[int64] ## none() = a per-run default seed (the CALLER
+                            ## reports it in the summary line, B3c); some(n)
+                            ## reproduces a specific sample (--verify-cache-seed)
+    strict*:  bool         ## a divergence set exits 1 (CI gate); meaningless
+                           ## when enabled == false — verifySample() is the
+                           ## only way to set it true, and it always implies
+                           ## enabled == true
+
+  RunOptions* = object
+    ## All options accepted by planTests / runTests.
+    ##
+    ## Tier 1 — everyday selection
+    configPath*:   string = ""
+    startDir*:     string = ""   ## walk-up origin when configPath==""; "" → cwd
+    foldProbe*:    FoldProbe = nil
+                                 ## RFC-0009 §3 test-injection seam: overrides the
+                                 ## fold-policy probe `loadConfig` uses to build this
+                                 ## run's `trackedRoots`. `nil` (production/CLI default)
+                                 ## → the real `probeFoldPolicy`. A forced probe here
+                                 ## governs the WHOLE run — including the fold policy
+                                 ## stamped into any dep graph this run persists — so a
+                                 ## later `--changed` load validates that graph's header
+                                 ## against the SAME policy (A3c-i) instead of tripping a
+                                 ## spurious `dgdFoldMismatch`. Not settable from KDL/CLI.
+    selection*:    GroupSelection ## default-constructed = gskDefault
+    narrowing*:    RunNarrowing   ## default-constructed = noNarrowing()
+    forceCompile*: bool = false
+    failFast*:     bool = false
+    noCache*:      bool = false  ## RFC-0004 F3: --no-cache → do NOT read and do NOT
+                                 ## write the result cache (full bypass).  Caching is
+                                 ## ON by default. RFC-0005 code-review D5: `true`
+                                 ## ALSO skips `resolveCacheSecrets`'s env scan +
+                                 ## `delEnv` scrub of the `CRISOL_CACHE_*` namespace
+                                 ## (a deliberate defense-in-depth measure, `runTests`'s
+                                 ## own doc comment below) — a library embedder that
+                                 ## opts out of caching entirely sees no host-process
+                                 ## environment mutation from this call at all.
+    retries*:      int  = -1     ## B1: global retry count override.  -1 = use config.
+                                 ## 0 = no retry (override to no-retry regardless of config).
+                                 ## N >= 1 = retry up to N times (maxAttempts = N+1).
+    failOnFlaky*:  bool = false  ## B1: when true, a flaky-pass (passed after attempt > 1)
+                                 ## contributes to exit 1 instead of exit 0.
+    strictHygiene*: bool = false ## rfc-0007 A6b: OutcomePolicy.strictHygiene. When true, a
+                                 ## would-be pass with an observed escapee (leaked same-pgroup
+                                 ## descendant, A6a) derives oFailed instead of oPassed at every
+                                 ## reporting boundary (exit code, render, JSON/junit wire,
+                                 ## lastrun.json) — r36 (code-review): ALSO at the cache's SERVE
+                                 ## side (cachedispatch.lookupAtPlan/consultPostCompile, via
+                                 ## consultReal), which re-derives the outcome under this SAME
+                                 ## resolved policy (RFC-0005 SO1 fix) so a strict-hygiene run
+                                 ## never serves an entry it would itself report as failed (an
+                                 ## unstrict run may still hit that same entry -- see
+                                 ## types.Config.strictHygiene's doc for the full story). The
+                                 ## STORE gate (cachedispatch.shouldStore) stays policy-
+                                 ## UNCONDITIONAL always -- publication, not serving, is what
+                                 ## stays unstrict. Can only strengthen a config-file
+                                 ## `strict-hygiene #true` (true wins), mirroring
+                                 ## measureCompileReuse/perfCheckForce below.
+    ## Tier 2 — tuning
+    jobs*:         int = 0        ## <= 0 → config/built-in default (no error,
+                                  ## unlike CLI which rejects --jobs < 1)
+    timeoutSecs*:  int = 0        ## <= 0 → config/built-in default
+    onResult*:     ResultCallback = nil ## per-entrypoint callback; nil = noop
+    ## C2: Shard selection (last step of selection, after narrowing).
+    ## shardK == 0 means no sharding.  When > 0, must satisfy 1 <= shardK <= shardN.
+    shardK*:       int = 0   ## shard index (1-indexed); 0 = no sharding
+    shardN*:       int = 1   ## total shard count; only used when shardK > 0
+    ## C4: History-based execution order (applied after shard, before plan).
+    ## omNone (default) = no reorder; pipeline parity with pre-C4 behavior.
+    order*:        OrderMode = omNone
+    ## Tier 3 — host-lifecycle
+    manageLock*:         bool = true   ## advisory inter-process lock
+    installSignals*:     bool = false  ## LIBRARY DEFAULT OFF; true replaces host handlers
+    persist*:            bool = true   ## write lastrun.json
+    showProgress*:       bool = false  ## stderr-only progress line
+    progressIntervalMs*: int  = 30_000
+    ## C6: --perf-check CLI override.
+    ## Precedence (highest wins):
+    ##   1. perfCheckForce=true → force perf-check ON (use config policy or moderate preset).
+    ##   2. Config block present with sensitivity≠none → enabled (parsed into cfg.perfCheck).
+    ##   3. perfCheckForce=false AND no config block (or sensitivity=none) → disabled.
+    perfCheckForce*:     bool = false  ## CLI --perf-check: force perf-check ON
+    ## RFC-0004 hermeticity-level control (--hermetic none|isolated|network).
+    ## Default hlIsolated preserves prior behavior (env allowlist + isolated tmpdir
+    ## + config-declared rlimits, no net isolation).  hlNone disables the hermetic
+    ## scrub/rlimits entirely; hlNetwork requests net-ns isolation (currently
+    ## DEGRADES — net-ns unshare is not wired — so such runs are not cached).
+    hermeticLevel*:      HermeticLevel = hlIsolated
+    ## Fix 1 / rfc-0007 wiring-audit W2 / code-review r30: per-run overrides
+    ## for the RLIMIT_NOFILE/CPU/AS/FSIZE/CORE family in the hermetic
+    ## sandbox, as ONE `RlimitOverrides` bundle (mirrors Config.rlimits).
+    ## Per field: none (default) = defer to the matching Config.rlimits
+    ## field if set, else the sandbox built-in default (DefaultRlimitNofile/
+    ## Fsize/Core; Cpu/As have no built-in, opt-in only). A `some` field here
+    ## can only strengthen a config-file value (wins when some), mirroring
+    ## jobs/timeoutSecs/retries precedence below in planImpl — lets a
+    ## library caller raise a ceiling for one run without editing crisol.kdl.
+    rlimits*:            RlimitOverrides
+    ## rfc-0007 wiring-audit W2: the (non-rlimit) memory ceiling. Kept
+    ## outside the bundle above -- not an rlimit (no RLIMIT_* syscall backs
+    ## it), same reasoning as Config.limitMemory.
+    limitMemory*:        Option[int64] = none(int64)
+    ## RFC-0005 A0: per-run NAME=VALUE pins (CLI `--env-pin`, repeatable).
+    ## Merged with `Config.envPins` (KDL `env-pin "NAME" "VALUE"`) in
+    ## planImpl via `envPinsFrom` -- a pin here overrides a same-named
+    ## config pin (CLI wins), mirroring rlimits' per-field override precedence.
+    ## Empty by default: nothing pinned unless an operator opts in.
+    envPins*:            seq[(string, string)] = @[]
+    ## rfc-0007 code-review r20: per-run opt-in for `SandboxSpec.
+    ## chdirIntoScratch` (CLI `--chdir-into-scratch`). false (default) =
+    ## the run child's cwd stays `projectRoot` (the A2c contract). Merged
+    ## with `Config.chdirIntoScratch` (KDL `chdir-into-scratch #true`) in
+    ## planImpl -- CLI/library wins when true, same override precedence as
+    ## the rlimit-* family (NOT strict-hygiene's strengthen-only framing --
+    ## this is a plain behavioral toggle, not a safety property).
+    chdirIntoScratch*:   bool = false
+    ## rfc-0007 code-review r21: per-run env-var NAMEs to extend
+    ## `sandbox.DefaultEnvAllowlist` with (CLI `--env-passthrough NAME`,
+    ## repeatable). Merged with `Config.envPassthroughs` (KDL
+    ## `env-passthrough "NAME"`) in planImpl via `envPassthroughsFrom` --
+    ## union of both sets, deduplicated (mirroring envPins' merge shape,
+    ## but additive rather than override since a NAME here carries no
+    ## value to collide on). Empty by default: nothing added unless an
+    ## operator opts in.
+    envPassthroughs*:    seq[string] = @[]
+    ## RFC-0006 M-artifact-identity PASS (b2): --measure-compile-reuse.
+    ## false (default) → compile slots run plain `nim c`, byte-for-byte
+    ## unchanged from before this pass. true → compile slots run the
+    ## `--internal-measure-compile` measurement worker instead (same
+    ## runnable binary produced; additionally writes ArtifactRows). This
+    ## can only strengthen (opt IN), never override a config-file `false`
+    ## with `false` — see planImpl.
+    measureCompileReuse*: bool = false
+    ## Absolute path to a binary whose `main()` dispatches the
+    ## `--internal-measure-compile` token — required for measureCompileReuse's
+    ## self-reexec worker to be sound (see Config.workerBinary in types.nim
+    ## for the full rationale). "" (default) = no sound worker; the CLI sets
+    ## this to its own getAppFilename(); a library consumer embedding crisol
+    ## (e.g. calling runTests()/planTests() from its own binary) MUST set
+    ## this explicitly to get measurement — leaving it unset is always safe
+    ## (degrades to monolithic compile, never fork-bombs).
+    workerBinary*:        string = ""
+    ## RFC-0005 B3a: the --verify-cache facade. Default-constructed =
+    ## noVerify() (VerifyCache's zero value: enabled=false, strict=false —
+    ## same "zero value IS the disabled state" convention as narrowing*
+    ## above). Nothing consumes this yet; B3b wires the post-run pass.
+    verifyCache*:         VerifyCache
+    ## RFC-0005 B1c: --explain-miss / --explain-miss-verbose (KDL
+    ## `explain-miss`; config < CLI). false by default (identical behavior
+    ## to RFC-0004). NEITHER field gates the PRODUCER: `EntrypointResult.
+    ## keyDiff` is always populated on a genuine cache-miss decision when a
+    ## prior sidecar record exists to diff against (B1b's seam, threaded
+    ## through runner.nim unconditionally) -- these two fields gate only
+    ## the CLI's RENDERING (render.RenderOpts.explainMiss/-Verbose) and the
+    ## run/v2 JSON `keyDiff` field's PRESENCE (jsonout.toJson's
+    ## `explainMiss` param), both downstream of RunReport, never the
+    ## runner/cachedispatch seam itself. explainMissVerbose implies
+    ## explainMiss=true (enforced by the CLI when resolving flags into
+    ## this struct; a library caller that sets verbose=true without
+    ## explain=true gets no output either way — verbose only ever adds
+    ## detail to an already-shown block).
+    explainMiss*:         bool = false
+    explainMissVerbose*:  bool = false
+    ## RFC-0005 B2b: --cache-stats (KDL `cache-stats`; config < CLI). false
+    ## by default (identical behavior to before this slice: NilSink,
+    ## RunReport.cacheStats a zero value). Gates installing a real
+    ## InMemorySink for the run's `CacheContext.sink`/`CacheRuntime.sink`
+    ## (see `runTests`) -- a run that never opts in collects no telemetry
+    ## events and pays for none of the bookkeeping. api.planImpl merges this
+    ## into `cfg.cacheStats` (opt-in-only-strengthen, same shape as
+    ## explainMiss); `runTests` reads `cfg.cacheStats`, never this raw field
+    ## directly, so a config-file-only opt-in is honored identically.
+    cacheStats*:          bool = false
+    ## RFC-0005 A3c-ii: --no-remote-cache. Drops every configured
+    ## `remote-cache` tier for THIS run -- the local ("l1") cache stays
+    ## active, so this is strictly weaker than `noCache` (which disables
+    ## caching entirely). No KDL equivalent (the RFC's own "Configuration"
+    ## flags list carries this as CLI-only; a config-file remote-cache
+    ## block describes what a fleet SHOULD use, not a one-run override).
+    ## false by default -- identical behavior to before this slice.
+    noRemoteCache*:       bool = false
+
+  ResolvedSettings* = object
+    ## Slim projection of the resolved Config (NOT the full Config).
+    ## Exposed so a consumer can see what configuration was actually used.
+    projectRoot*: string
+    stateDir*:    string  ## pre-joined to an ABSOLUTE path (projectRoot/stateDir
+                          ## resolved); consumers never need to re-join, unlike
+                          ## Config.stateDir which is project-root-relative.
+    jobs*:        int     ## resolved (never 0)
+    timeoutSecs*: int     ## resolved
+    strictHygiene*: bool  ## rfc-0007 A6b: resolved OutcomePolicy.strictHygiene (CLI-flag OR
+                          ## config-file, opt-in-only-strengthen) — the CLI layer builds the
+                          ## real OutcomePolicy for render/JSON/junit from this, so it never
+                          ## has to re-run the merge itself.
+    explainMiss*: bool    ## RFC-0005 B1c: resolved --explain-miss (CLI flag OR config-file
+                          ## `explain-miss #true`, opt-in-only-strengthen — same shape as
+                          ## strictHygiene above). The CLI reads THIS, not its own raw flag
+                          ## var, when deciding whether to render the miss-explanation block
+                          ## or set the run/v2 `keyDiff` field's presence, so a config-file-only
+                          ## `--explain-miss` (no CLI flag passed) is honored identically.
+    cacheStats*: bool     ## RFC-0005 B2b: resolved --cache-stats (CLI flag OR config-file
+                          ## `cache-stats #true`, opt-in-only-strengthen — same shape as
+                          ## explainMiss above). The CLI reads THIS when deciding whether to
+                          ## render the cache-stats summary line or set the run/v2
+                          ## `cacheStats` field's presence.
+
+  PlanReport* = object
+    ## Output of planTests().  plan-phase result; no DepGraph or full Config.
+    ## PlanReport inlines the RunPlan fields directly (entrypoints, jobs) to
+    ## kill the rr.plan.plan stutter that a nested RunPlan would produce.
+    entrypoints*: seq[PlannedEntrypoint]  ## inlined from RunPlan
+    jobs*:        int                     ## resolved (never 0); from RunPlan
+    gatedOut*:    seq[GatedEntry]
+    warnings*:    seq[ConfigWarning]
+    settings*:    ResolvedSettings
+    adHocPaths*:     seq[string]   ## Issue #3 / RFC-0001:409: gskFiles paths that
+                                   ## matched no candidate group (ran ad-hoc, global flags).
+
+  ZeroRunnableReason* = enum
+    zrkNone           ## not a zero-runnable outcome (normal run)
+    zrkChangedClean   ## changed-narrowing, nothing in diff
+    zrkFailedNone     ## failed-narrowing, nothing previously failed
+    zrkAllGated       ## all discovered entrypoints gated out
+
+  RunReport* = object
+    ## Output of runTests().  Encodes ALL outcomes; never raises for expected
+    ## conditions — structural problems are on .status / .error / .exitCode.
+    ##
+    ## r64 (code-review): `summary`/`results`/`memThrottledSlots`/
+    ## `lateOrphansReaped`/`interrupted`/`compileBlock`/`reuseAlerts`/
+    ## `cacheStats`/`trackedRoots` are NOT fields here. Before this they
+    ## were hand-duplicated at EVERY construction site — once as a flat
+    ## field, once inside `doc` (jsonout.RunDocument, below) — with
+    ## agreement between the two defended only by a comment ("the shape
+    ## that shipped the W3 defect"). Each now lives at exactly ONE storage
+    ## address, `doc.<field>`, and is exposed below as a read-only accessor
+    ## proc of the SAME name: Nim's dot-call syntax makes `rr.results` and
+    ## `results(rr)` identical, so every existing read site — this module's
+    ## own remaining construction sites, crisol.nim, every test — compiles
+    ## unchanged. There is nothing left to keep in sync by hand.
+    ##
+    ## `plan`/`status`/`exitCode`/`error`/`zeroRunnableReason`/
+    ## `verifyDivergences`/`verifyCouldNotReexec` stay real fields below.
+    ## r78 (code-review): `verifyDivergences` is the ONE exception to "doc
+    ## carries none of them" — `doc.verifyFails` (jsonout.RunDocument) is
+    ## `verifyDivergences.len`, a derived int, not a second copy of the
+    ## `seq[VerifyDivergence]` itself. The single sync point is the
+    ## `doc.verifyFails = verifyDivergences.len` assignment below, in this
+    ## proc, once `verifyDivergences` is known (see the comment there) —
+    ## there is nothing else to keep in sync by hand. `verifyCouldNotReexec`
+    ## has no doc counterpart at all, so it alone is genuinely unduplicated.
+    plan*:              PlanReport
+    status*:            RunStatus
+    exitCode*:          int   ## ALWAYS set: 0/1 (rsOk), 3 (rsStructural; 2 internal), 128+n (rsInterrupted)
+    error*:             string ## non-empty iff status == rsStructural
+    zeroRunnableReason*: ZeroRunnableReason
+    verifyDivergences*: seq[VerifyDivergence]  ## RFC-0005 B3b: the --verify-cache
+                                  ## post-run pass's findings. ALWAYS empty when
+                                  ## opts.verifyCache.enabled is false. Deliberately
+                                  ## separate from `results` (guard 3, "execute()
+                                  ## re-entrancy... three guards") — a verify
+                                  ## re-execution is diagnostic, never a substitute
+                                  ## observation for the entrypoint's reported outcome.
+    verifyCouldNotReexec*: seq[Entrypoint]  ## RFC-0005 code-review SO4: sampled
+                                  ## --verify-cache entries whose fresh
+                                  ## re-execution produced NO observation at all
+                                  ## (fresh run phase pkSkipped/pkSpawnFailed —
+                                  ## e.g. the promoted stable binary vanished
+                                  ## between the main run and the verify pass).
+                                  ## A verify-INFRASTRUCTURE failure, NOT
+                                  ## evidence of cache nondeterminism — never
+                                  ## included in `verifyDivergences` (so
+                                  ## --verify-cache-strict, which gates on
+                                  ## `verifyDivergences.len`, never exits 1 for
+                                  ## it), never silent (a stderr warning still
+                                  ## names each entry — see verifyCachePass).
+                                  ## ALWAYS empty when opts.verifyCache.enabled
+                                  ## is false, same convention as
+                                  ## verifyDivergences above.
+    doc*: jsonout.RunDocument     ## rfc-0007 code-review r8: the SAME shared run-level
+                                  ## record `runTestsWith` already assembled once to call
+                                  ## `jsonout.persistLastRun` with -- carried here, by that
+                                  ## point fully populated (verifyFails/cacheStats filled in
+                                  ## after the verify-cache pass and telemetry aggregation
+                                  ## below, which both run after the persist call), so the
+                                  ## CLI's stdout `jsonout.toJsonString` call site can pass
+                                  ## `rr.doc` straight through instead of re-deriving the
+                                  ## same ~10 facts from other RunReport fields by hand (the
+                                  ## shape that shipped the W3 defect -- see jsonout.nim's own
+                                  ## rev-history note). r64: this is now also the SOLE storage
+                                  ## address the accessor procs below read from — a
+                                  ## structural-early-exit RunReport (structuralResult/
+                                  ## structuralResultWithPlan below) leaves this at its zero
+                                  ## value (no Config was ever built on that path), so every
+                                  ## accessor below reads its own type's honest zero value on
+                                  ## those paths too — same "always-present, zero-value-is-
+                                  ## honest" convention `cacheStats`/`trackedRoots` documented
+                                  ## individually before this refactor.
+
+  VerifyDivergence* = object
+    ## RFC-0005 B3b: one --verify-cache mismatch between the observation the
+    ## main run SERVED from the cache (a `cdmHit`) and the observation a
+    ## fresh, forced-live re-execution of the SAME sampled entry actually
+    ## produced. Comparison is structural — `Exit` (`==` over the variant,
+    ## `process/types`) and parsed `records` (name/status/msg/tags; per-
+    ## record `durationUs` excluded) — and NEVER outcome strings: `outcome`
+    ## is a derived, policy-dependent projection, and two distinct
+    ## observations can legitimately derive the same verdict, which is
+    ## exactly the nondeterminism this pass exists to catch.
+    ##
+    ## `Cause`/`Evidence`/`rusage`/durations are excluded from the
+    ## COMPARISON (authorship, tier and accounting of the fresh attempt
+    ## legitimately differ from the stored one) but are carried here in full
+    ## — via the complete `Phase` on both sides — for diagnosis.
+    ep*:              Entrypoint
+    exitDiverged*:    bool
+    recordsDiverged*: bool
+    storedRun*:       ptypes.Phase       ## the Phase served by the main run (pkCached)
+    freshRun*:        ptypes.Phase       ## the Phase the verify pass observed (pkRan)
+    storedRecords*:   seq[TestRecord]
+    freshRecords*:    seq[TestRecord]
+
+# ---------------------------------------------------------------------------
+# r64 (code-review) — RunReport's doc-derived accessors. Each reads its
+# field straight from `rr.doc` (jsonout.RunDocument) — the SOLE storage
+# address (see RunReport's own doc comment above) — and is named identically
+# to the flat field it replaces, so `rr.results`/`rr.summary`/etc. compile
+# unchanged at every existing call site (Nim's dot-call syntax treats
+# `rr.results` and `results(rr)` identically).
+# ---------------------------------------------------------------------------
+
+proc results*(rr: RunReport): seq[EntrypointResult] = rr.doc.results
+  ## r64: derived accessor — the SOLE storage address is `rr.doc.results`.
+proc summary*(rr: RunReport): Summary = rr.doc.summary
+  ## r64: derived accessor — the SOLE storage address is `rr.doc.summary`.
+proc memThrottledSlots*(rr: RunReport): int = rr.doc.memThrottledSlots
+  ## r64: derived accessor. # entrypoints delayed >=once by mem-aware
+  ## scheduling; 0 if inactive (same zero-value convention as before).
+proc lateOrphansReaped*(rr: RunReport): int = rr.doc.lateOrphansReaped
+  ## r64: derived accessor. rfc-0007 B1 (§3): count of adopted orphans
+  ## (reparented via PR_SET_CHILD_SUBREAPER) reaped via the async
+  ## waitid(P_ALL, WNOWAIT) sweep whose owning slot had already been
+  ## reaped/emitted, or that were unattributable (e.g. a setsid escape).
+  ## 0 when nothing of the kind occurred this run.
+proc interrupted*(rr: RunReport): bool = rr.doc.interrupted
+  ## r64: derived accessor. rfc-0007 A1e-ii: true iff a SIGINT/SIGTERM cut
+  ## this run short. CrisolInterrupted is retired — this bool
+  ## (status == rsInterrupted, in lockstep) is the replacement signal;
+  ## results/summary are populated with §2's emission set rather than left
+  ## empty, and lastrun.json is deliberately never persisted for this run
+  ## (an entrypoint never observed must not silently leave the --failed
+  ## selection).
+proc compileBlock*(rr: RunReport): JsonNode = rr.doc.compileBlock
+  ## r64: derived accessor. The SAME `compile` block persisted to
+  ## lastrun.json (compilereport.readCompileBlock) — nil when opts.persist
+  ## is false, or when measureCompileReuse is not enabled (no telemetry).
+proc reuseAlerts*(rr: RunReport): JsonNode = rr.doc.reuseAlerts
+  ## r64: derived accessor. rfc-0007 W3: the SAME reuse-check alert array
+  ## persisted to lastrun.json (compilereport.buildReuseAlerts) — same
+  ## nilability convention as `compileBlock` above.
+proc cacheStats*(rr: RunReport): CacheStats = rr.doc.cacheStats
+  ## r64: derived accessor. RFC-0005 B2b: `aggregateCacheStats(events,
+  ## decisions)` over the run's real telemetry (hit/miss/publish/remote-
+  ## error/verifyFail) and per-result cacheDecisions. A ZERO-VALUE
+  ## `CacheStats()` when `cfg.cacheStats` is false — no InMemorySink was
+  ## ever installed, so there is nothing real to report; the CLI reads
+  ## `rr.plan.settings.cacheStats` (not this accessor's "is it all zero?")
+  ## to decide whether to show it at all.
+proc trackedRoots*(rr: RunReport): TrackedRoots = rr.doc.trackedRoots
+  ## r64: derived accessor. RFC-0009 A2: the run's real `cfg.trackedRoots`
+  ## (project root + every configured dep root, each root-tagged and
+  ## fold-probed by config.loadConfig — see types.Config).
+
+# ---------------------------------------------------------------------------
+# rfc-0007 A1c: result-model digest helpers — so a library consumer doesn't
+# hand-roll the same Phase-variant case expression render.nim/junit.nim do.
+# ---------------------------------------------------------------------------
+
+proc runResult*(r: EntrypointResult): Option[ptypes.ProcessResult] =
+  ## Absorbs the Phase variant check: `some()` iff the run phase carries a
+  ## real ProcessResult observation — `pkRan` (a live run this invocation)
+  ## OR `pkCached` (rfc-0007 A1d-ii: a cache hit now replays the REAL stored
+  ## observation, not a fabricated stand-in — see cachedispatch.synthesize).
+  ## `none()` for pkSkipped/pkSpawnFailed — no observation to hand back.
+  if r.run.kind in {ptypes.pkRan, ptypes.pkCached}: some(r.run.res)
+  else: none(ptypes.ProcessResult)
+
+proc failureLine*(r: EntrypointResult;
+                  policy: ptypes.OutcomePolicy = ptypes.DefaultPolicy): string =
+  ## Render-grade one-liner for a failing/non-passed result — the digest a
+  ## caller building its own UI needs without re-deriving cause/exit detail.
+  ## "" for a passing result (outcome(r, policy) == oPassed).
+  ## policy: rfc-0007 A6b — a library caller building custom UI under
+  ## --strict-hygiene passes the same resolved policy it used elsewhere
+  ## (e.g. RunOptions.strictHygiene) so this digest agrees with exitCode.
+  ## Defaults to DefaultPolicy so existing callers are unchanged.
+  case outcome(r, policy)
+  of oPassed:
+    ""
+  of oFailed:
+    let rr = runResult(r)
+    let code = if rr.isSome and rr.get.exit.kind == ptypes.ekExited: rr.get.exit.code else: 0
+    "exit " & $code
+  of oCompileFailed:
+    "compile failed"
+  of oSpawnError:
+    "spawn error"
+  of oKilled:
+    let rr = runResult(r)
+    if rr.isSome: "killed: " & ptypes.causeLabel(rr.get.cause)
+    else: "killed"
+  of oCrashed:
+    let rr = runResult(r)
+    if rr.isSome: "crashed: " & ptypes.symbol(rr.get.exit)
+    else: "crashed"
+
+# ---------------------------------------------------------------------------
+# Selection constructors — hide the GroupSelection discriminated-union syntax
+# ---------------------------------------------------------------------------
+
+proc defaultGroups*(): GroupSelection =
+  ## Return a GroupSelection that runs all non-opt-in groups.
+  GroupSelection(kind: gskDefault)
+
+proc namedGroups*(names: varargs[string]): GroupSelection =
+  ## Return a GroupSelection for exactly the named groups.
+  var ns: seq[string]
+  for n in names: ns.add n
+  GroupSelection(kind: gskNamed, names: ns)
+
+proc allGroups*(): GroupSelection =
+  ## Return a GroupSelection that includes opt-in groups (gates still apply).
+  GroupSelection(kind: gskAll)
+
+proc filesSelection*(paths: varargs[string]): GroupSelection =
+  ## Return a GroupSelection restricted to the given paths/globs.
+  var ps: seq[string]
+  for p in paths: ps.add p
+  GroupSelection(kind: gskFiles, paths: ps)
+
+# ---------------------------------------------------------------------------
+# Narrowing constructors
+# ---------------------------------------------------------------------------
+
+proc noNarrowing*(): RunNarrowing =
+  ## No narrowing — all selected entrypoints run.
+  RunNarrowing(kind: nkNone, baseRef: "")
+
+proc failedOnly*(): RunNarrowing =
+  ## Re-run only entrypoints that failed in the last run (reads lastrun.json).
+  RunNarrowing(kind: nkFailed, baseRef: "")
+
+proc changedOnly*(baseRef: string = ""): RunNarrowing =
+  ## Run only entrypoints whose dependency closure intersects the git diff.
+  ## baseRef="" → working tree vs HEAD (staged + unstaged).
+  RunNarrowing(kind: nkChanged, baseRef: baseRef)
+
+proc failedOrChanged*(baseRef: string = ""): RunNarrowing =
+  ## UNION of failedOnly and changedOnly — wider, not narrower.
+  ## An entrypoint runs if EITHER criterion selects it.
+  RunNarrowing(kind: nkFailedOrChanged, baseRef: baseRef)
+
+# ---------------------------------------------------------------------------
+# VerifyCache constructors — RFC-0005 B3a
+# ---------------------------------------------------------------------------
+
+proc noVerify*(): VerifyCache =
+  ## No --verify-cache pass (the default).
+  VerifyCache(enabled: false, pct: 0, seed: none(int64), strict: false)
+
+proc verifySample*(pct: int = -1; seed: Option[int64] = none(int64);
+                   strict: bool = false): VerifyCache =
+  ## Enable the --verify-cache pass. `pct` is the sample percentage of the
+  ## hit set; default -1 = no override, so planImpl's merge chain (r29)
+  ## resolves it against Config.verifyCachePct (itself defaulting to
+  ## config.DefaultVerifyCachePct, 5, when the KDL node is absent) — a bare
+  ## `verifySample()` therefore honors a config-file `verify-cache-pct`
+  ## setting exactly like the CLI's bare `--verify-cache` does. An explicit
+  ## `pct >= 0` here always wins over the config file. `pct == 0` disables
+  ## sampling outright (see types.sampleHitIndices); this is a legitimate,
+  ## deliberate value, distinct from -1's "unset". `seed` none() = a per-run
+  ## default (the caller reports it in the summary line); some(n)
+  ## reproduces one specific sample. `strict` = a divergence set exits 1 —
+  ## always paired with enabled == true here, so "strict without enabled"
+  ## never arises.
+  VerifyCache(enabled: true, pct: pct, seed: seed, strict: strict)
+
+# ---------------------------------------------------------------------------
+# --verify-cache post-run pass — RFC-0005 B3b
+# ---------------------------------------------------------------------------
+
+proc defaultVerifySeed(): int64 =
+  ## RFC-0005 §Stage B: "the seed defaults to a per-run value ... so
+  ## coverage broadens across runs in expectation." Reporting the resolved
+  ## seed in the summary line is B3c's CLI/config concern; this is only the
+  ## resolution `verifyCachePass` needs when the caller hasn't pinned one
+  ## via `verifySample(seed = some(n))`.
+  int64(epochTime() * 1_000_000.0)
+
+proc phaseExit(p: ptypes.Phase): Option[ptypes.Exit] =
+  if p.kind in {ptypes.pkRan, ptypes.pkCached}: some(p.res.exit)
+  else: none(ptypes.Exit)
+
+proc exitsDiverge(a, b: Option[ptypes.Exit]): bool =
+  ## `ptypes.Exit` is imported `import nil` (see the module-doc note on
+  ## `ptypes` above) so its custom structural `==` (process/types.nim,
+  ## "==(Exit) in process/types" — the RFC's own anchor) is never in scope
+  ## unqualified; a plain `a != b` on `Option[Exit]` would silently fall
+  ## back to the compiler's builtin case-object comparison (which cannot
+  ## even compile for a case object — the `fields` iterator rejects it), so
+  ## this calls the qualified `ptypes.`==`` explicitly.
+  if a.isSome != b.isSome: return true
+  if a.isNone: return false   # both none
+  not ptypes.`==`(a.get, b.get)
+
+proc recordsDiverge(a, b: seq[TestRecord]): bool =
+  ## RFC-0005 §Stage B: name/status/msg/tags compared; per-record
+  ## `durationUs` deliberately excluded (legitimately differs run to run).
+  if a.len != b.len: return true
+  for i in 0 ..< a.len:
+    if a[i].name != b[i].name or a[i].status != b[i].status or
+       a[i].msg != b[i].msg or a[i].tags != b[i].tags:
+      return true
+  false
+
+proc pairVerifySamples*(entrypoints: seq[PlannedEntrypoint]; indices: seq[int];
+                        verifyResults: seq[EntrypointResult]):
+    seq[tuple[storedIdx: int; fresh: EntrypointResult]] =
+  ## r63 (code-review): pure — pairs each verify sub-run RESULT back to the
+  ## STORED index it verifies (an index into the CALLER's `results`/
+  ## `entrypoints`, i.e. some `indices[j]`) by ENTRYPOINT IDENTITY
+  ## (`depgraph.entryKey`: `(display(tp), flagHash(flags))` — see
+  ## `Entrypoint`'s own doc comment, "(tp, flags) is the entrypoint's
+  ## identity"), never by POSITION.
+  ##
+  ## `execute()`'s trimmed-emission contract (rfc-0007 A1e-ii/r7 —
+  ## runner.execute's own comment, "trim `results` to the §2 emission set")
+  ## means the returned `verifyResults` is a COMPACTED subsequence of the
+  ## synthetic verify plan built from `indices`: an entry never claimed by a
+  ## slot (an interrupted, or failFast-early-exited, verify sub-run) is
+  ## OMITTED, and that omission can land in the MIDDLE of the sequence, not
+  ## only the tail. A positional zip (the OLD shape here: `indices[j]`
+  ## against `verifyResults[j]`, `break`ing once `j >= verifyResults.len`)
+  ## silently mispairs every entry AFTER the first such gap — the `break`
+  ## only ever caught a gap at the very END. Latent in production only
+  ## because `verifyCachePass`'s own sub-run always passes
+  ## `installSignals = false` and `failFast = false`, so no call has ever
+  ## actually hit a mid-sequence gap; the CONTRACT does not guarantee that,
+  ## so the pairing must not lean on it either.
+  ##
+  ## Multiple sampled entries sharing the same identity (distinct only by
+  ## GROUP — identity is `(tp, flags)`, group is not part of it) are
+  ## matched in `indices` order (first pending index in FIFO order per
+  ## identity), so a duplicate identity never double-consumes or silently
+  ## drops a pairing. An entry in `indices` with no corresponding result in
+  ## `verifyResults` at all (never finalized, e.g. an interrupted sub-run)
+  ## simply produces no pair — the caller distinguishes that case via the
+  ## sub-run's own `ExecuteReport.interrupted`, not by inferring it from a
+  ## length mismatch here.
+  var pending = initTable[tuple[path, flagHash: string], seq[int]]()
+  for i in indices:
+    let key = entryKey(entrypoints[i].ep.tp, entrypoints[i].ep.flags)
+    pending.mgetOrPut(key, @[]).add i
+  for fresh in verifyResults:
+    let key = entryKey(fresh.ep.tp, fresh.ep.flags)
+    var ids = pending.getOrDefault(key, @[])
+    if ids.len == 0: continue   # defensive: no pending stored index for this identity
+    let i = ids[0]
+    ids.delete(0)
+    pending[key] = ids
+    result.add (storedIdx: i, fresh: fresh)
+
+proc warnStderr(msg: string) =
+  ## r62 (code-review): `runTestsWith`'s documented contract is "never
+  ## raises for expected conditions" -- but a bare `stderr.write` for an
+  ## expected-condition warning is ITSELF an unguarded raise site (e.g.
+  ## `crisol run 2>&-` closes stderr; any write to it then raises IOError).
+  ## r16 already fixed the ONE call site that mattered most at the time
+  ## (persistLastRun's own warning, inside `runTestsWith`'s outer try/finally)
+  ## with this exact discard-on-CatchableError idiom; r62 found two MORE
+  ## sites in `runTestsWith` itself reached while the advisory lock is held
+  ## with no enclosing guard:
+  ##   1. the MinSafeRlimitAs warning (r18) -- BEFORE `runTestsWith`'s first
+  ##      `try`, so an unguarded raise there both escapes `runTestsWith` AND
+  ##      leaks the advisory lock for the rest of the host process's
+  ##      lifetime (no `finally` covers that span at all).
+  ##   2. the unconditional per-tier error warning (the `erroredTiers` loop)
+  ##      -- inside the try/finally, so `releaseLock` still runs, but the
+  ##      raise still escapes `runTestsWith`, the same "never raises for
+  ##      expected conditions" contract violation.
+  ## r74 (code-review): hoisted from just above `runTestsWith` (its original
+  ## home) to HERE, above `verifyCachePass` -- that proc's own four warning
+  ## sites (below) run with the advisory lock held for exactly the same
+  ## reason r62's two sites did (verifyCachePass is called strictly between
+  ## `persistLastRun` and `releaseLock` -- see its own doc comment), but
+  ## until now they were bare `stderr.write` calls because `warnStderr`
+  ## textually followed `verifyCachePass` in this file and so was not yet in
+  ## scope at its call sites. Named once here (6+ call sites total across
+  ## this module now) rather than repeating the try/except at each.
+  try:
+    stderr.write(msg)
+  except CatchableError:
+    discard
+
+type
+  VerifyPassResult* = tuple
+    divergences:    seq[VerifyDivergence]
+    couldNotReexec: seq[Entrypoint]
+    ## RFC-0005 code-review SO4: entries sampled for --verify-cache whose
+    ## fresh re-execution never produced an observation at all (fresh run
+    ## phase `pkSkipped`/`pkSpawnFailed` — e.g. the promoted stable binary
+    ## vanished between the main run and this verify sub-run, or the verify
+    ## sub-run itself got killed). A verify-INFRASTRUCTURE failure, NOT
+    ## evidence of cache nondeterminism — never counted in `divergences`
+    ## (so --verify-cache-strict, which gates on `divergences.len`, must
+    ## never exit 1 for it), never silent (verifyCachePass still warns
+    ## on stderr for every entry landing here).
+    ##
+    ## r63 (code-review) widened this category one step further: an entry
+    ## the verify sub-run never reported a result for AT ALL (as opposed to
+    ## landing but with an unusable phase, above) — the sub-run's own
+    ## `ExecuteReport.interrupted` is what distinguishes this from ordinary
+    ## completion — lands here too, same "infrastructure gap, not a
+    ## divergence" treatment.
+    ##
+    ## r74 (code-review): this branch was DEAD from r63 until now —
+    ## `verifyCachePass`'s sub-run always called `execute()` with
+    ## `installSignals` omitted (`false` by default), so `execReport.
+    ## interrupted` could never actually become true and a Ctrl-C during a
+    ## verify pass killed the process outright instead of landing here.
+    ## r74 threads `installSignals` into the sub-run (see `verifyCachePass`'s
+    ## own doc comment) so this is now a genuinely reachable outcome.
+
+proc verifyCachePass*(results: seq[EntrypointResult];
+                     entrypoints: seq[PlannedEntrypoint];
+                     vc: VerifyCache; config: Config; graph: var DepGraph;
+                     nimVersion: string; toolchain: RunToolchain;
+                     sandboxSpec: SandboxSpec;
+                     sink: TelemetrySink[TelemetryEvent] = NilSink[TelemetryEvent]();
+                     installSignals: bool = false
+                     ): VerifyPassResult =
+  ## The --verify-cache determinism backstop (RFC-0005 §Stage B). Samples
+  ## this run's `cdmHit` entries (seeded sampler, B3a `sampleHitIndices`),
+  ## builds a SYNTHETIC plan from them (B3a `buildVerifyPlan` — never a
+  ## re-`plan()`), and re-executes that plan with the cache forced OFF (a
+  ## verify run must genuinely execute, never re-hit) to compare each fresh
+  ## observation against the one served during the main run.
+  ##
+  ## `execute()` re-entrancy — three guards:
+  ##   1. `onResult = noopResult` — no caller callback fires for verify attempts.
+  ##   2. `recordLedger = false` — verify re-runs never pollute
+  ##      --order/perf-check/--shard ledger history.
+  ##   3. Verify results are returned HERE, never merged into the caller's
+  ##      `results` / `RunReport.results`.
+  ##
+  ## `installSignals` (r74, code-review): threaded straight into this
+  ## sub-run's OWN `execute()` call, same as `runTestsWith`'s call to
+  ## `execute()` for the main run threads `opts.installSignals` (rfc-0007
+  ## A2b: each `execute()` call owns its own per-call `Supervisor`). Before
+  ## this fix it was always omitted (`execute`'s own `installSignals: bool =
+  ## false` default), so `execReport.interrupted` below was CONSTANT false
+  ## and its whole handling branch was dead code -- by the time this pass
+  ## runs, the MAIN run's `Supervisor` has already been torn down (its
+  ## signal handlers restored), so a Ctrl-C arriving during a verify sub-run
+  ## used to kill the process outright with no report at all, rather than
+  ## landing as a graceful interrupt attributed to `couldNotReexec` like any
+  ## other verify-infrastructure gap. `runTestsWith`'s call site passes
+  ## `opts.installSignals` here -- the SAME source its own main-run `execute`
+  ## call already uses -- so a verify pass installs signals iff the run that
+  ## contains it does.
+  ##
+  ## `toolchain` (R12-D4, R11-D1): the main run's probe and identity as one
+  ## value; the sub-run keys its nimcache on the identity, and its header
+  ## probes resolve drivers against the probe's site.
+  ##
+  ## Caller contract: must be invoked AFTER `persistLastRun` and BEFORE
+  ## `releaseLock` — the binary precondition (`cdmHit` this run implies
+  ## `edRunFresh` at plan time, i.e. the binary exists) holds only while the
+  ## stateDir lock is held, and lastrun.json must reflect the main run only.
+  ##
+  ## Exported* (RFC-0005 B2a) so a test can drive this pass directly — with
+  ## its own `results`/`entrypoints` built via `runner.execute` + a real
+  ## `CacheRuntime`/`InMemorySink` — without needing the `--cache-stats`
+  ## surface `runTests*` doesn't install until Stage B2b. `runTests*` also
+  ## calls THIS proc directly (not a wrapper) so it can thread
+  ## `couldNotReexec` onto `RunReport` alongside `divergences`.
+  ##
+  ## **RFC-0005 code-review R2-D2:** the `verifyCachePass*` back-compat
+  ## FACADE that used to sit here (returning only `.divergences`, this
+  ## proc's pre-SO4 return shape) is deleted — the feature was unreleased
+  ## when that wrapper was added, so "back-compat" named an obligation that
+  ## never existed, and it had zero production callers (`runTests*` always
+  ## called this proc, never the wrapper). Both of its test callers
+  ## (`test_api.nim`, `test_cachedispatch.nim`) now call THIS proc directly
+  ## and project `.divergences` themselves.
+  if not vc.enabled: return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
+
+  # r67 (code-review): `vc.pct` may still carry `verifySample()`'s own
+  # default -1 "no override" sentinel — this proc is the ONE resolution
+  # point for it now (it already has `config` in scope). Before this fix,
+  # a BARE `verifySample()` handed straight to this PUBLIC proc (e.g. a
+  # library caller composing `verifyCachePass` directly, bypassing
+  # `runTestsWith` entirely) fell through to `sampleHitIndices`'s `pct<=0`
+  # arm unresolved — `enabled: true` but an ALWAYS-EMPTY sample: no
+  # re-execution, no warning, no error, just a silently inert verify pass.
+  # Resolving -1 here against `config.verifyCachePct` (loadConfig's plain
+  # config-file default — r76 (code-review) deleted the second, dead
+  # resolution point `planImpl` used to write into that same field, so this
+  # is now genuinely the ONLY place --verify-cache-pct is resolved) means
+  # `verifyCachePass(vc = verifySample())` and `runTests(opts.verifyCache =
+  # verifySample())` now behave IDENTICALLY — covering the "unset" meaning
+  # wherever a caller asks for it, with exactly one resolution point
+  # (`runTestsWith`'s own call site passes `opts.verifyCache` straight
+  # through unmodified — see the comment there).
+  let effectivePct = if vc.pct < 0: config.verifyCachePct else: vc.pct
+
+  let decisions = results.mapIt(it.cacheDecision)
+  let seed = vc.seed.get(defaultVerifySeed())
+  let indices = sampleHitIndices(decisions, effectivePct, seed)
+  if indices.len == 0: return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
+
+  let verifyPlan = buildVerifyPlan(entrypoints, indices)
+  var execReport: ExecuteReport
+  try:
+    execReport = execute(
+      verifyPlan,
+      config       = config,
+      graph        = graph,
+      nimVersion   = nimVersion,
+      onResult     = noopResult,
+      failFast     = false,
+      showProgress = false,
+      installSignals = installSignals,  # r74
+      cache        = cacheDisabled(sandboxSpec),
+      recordLedger = false,
+      toolchain    = toolchain,  # R12-D4: the main run's probe and identity
+    )
+  except Exception as e:
+    # Matches runTests' own defensive posture around the main execute() call
+    # (CrisolError is-a Exception — one branch covers both): an unrelated
+    # verify-pass failure must never take down an otherwise-successful main
+    # run's real results.
+    warnStderr("crisol: warning: --verify-cache pass failed: " & e.msg & "\n")
+    return (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
+
+  # r63 (code-review): pair by IDENTITY (pairVerifySamples), never by
+  # position — see that proc's own doc comment for why a positional zip is
+  # unsound against execute()'s trimmed-emission contract.
+  let pairs = pairVerifySamples(entrypoints, indices, execReport.results)
+
+  # r63: a sampled index with NO pairing at all (as opposed to a pairing
+  # whose fresh phase carries no observation — handled per-pair below) means
+  # the verify sub-run never reported a result for it. `execReport.
+  # interrupted` — consumed here EXPLICITLY, never inferred from a
+  # results-length mismatch (the old shape's `if j >= verifyResults.len:
+  # break`) — is the ONLY way that legitimately happens (the sub-run always
+  # passes `failFast = false`, so nothing here is ever omitted for that
+  # reason). Filed in the SAME `couldNotReexec` category as a landed-but-
+  # unobserved fresh phase (below): a verify-INFRASTRUCTURE gap, never
+  # evidence of cache nondeterminism.
+  if execReport.interrupted:
+    var pairedIdx = initHashSet[int]()
+    for p in pairs: pairedIdx.incl p.storedIdx
+    for i in indices:
+      if i notin pairedIdx:
+        result.couldNotReexec.add results[i].ep
+        warnStderr("crisol: warning: --verify-cache could not re-execute " &
+                     string(results[i].ep.tp.display()) &
+                     " (verify sub-run was interrupted before reporting a " &
+                     "result); not counted as a divergence\n")
+        try: stderr.flushFile() except CatchableError: discard
+
+  for pairEntry in pairs:
+    let stored = results[pairEntry.storedIdx]
+    let fresh  = pairEntry.fresh
+    let freshExit = phaseExit(fresh.run)
+
+    # RFC-0005 code-review SO4 fix: a stored `cdmHit` always has a real
+    # observation (`stored.run.kind` is `pkCached` — `phaseExit` is always
+    # `some` for it), so it is ONLY the fresh side that can come back with
+    # no observation at all: `fresh.run.kind` in `{pkSkipped,
+    # pkSpawnFailed}` (e.g. `spawnRunDirect` failed because the sampled
+    # entry's promoted stable binary was missing/unreadable when this
+    # verify sub-run tried to reuse it — see buildVerifyPlan's SO5 fix).
+    # Before this fix, `exitsDiverge`'s `a.isSome != b.isSome` branch
+    # counted that as an EXIT divergence — a verify-INFRASTRUCTURE failure
+    # misfiled as evidence of cache nondeterminism, tripping
+    # --verify-cache-strict for a reason that has nothing to do with the
+    # cache. This never happened at all if the comparison itself never
+    # ran, so it is reported in its own category instead.
+    if freshExit.isNone:
+      result.couldNotReexec.add stored.ep
+      warnStderr("crisol: warning: --verify-cache could not re-execute " &
+                   string(stored.ep.tp.display()) & " (verify sub-run phase: " &
+                   $fresh.run.kind & "); not counted as a divergence\n")
+      try: stderr.flushFile() except CatchableError: discard
+      continue
+
+    let exitDiverged = exitsDiverge(phaseExit(stored.run), freshExit)
+    let recDiverged  = recordsDiverge(stored.records, fresh.records)
+    if not (exitDiverged or recDiverged): continue
+
+    result.divergences.add VerifyDivergence(
+      ep:              stored.ep,
+      exitDiverged:    exitDiverged,
+      recordsDiverged: recDiverged,
+      storedRun:       stored.run,
+      freshRun:        fresh.run,
+      storedRecords:   stored.records,
+      freshRecords:    fresh.records,
+    )
+    # RFC-0005 B2a: the landed B3c divergence path's telemetry event.
+    sink.emit(TelemetryEvent(kind: tekVerifyFail, path: string(stored.ep.tp.display())))
+
+    var what: seq[string]
+    if exitDiverged: what.add "exit"
+    if recDiverged:  what.add "records"
+    warnStderr("crisol: warning: --verify-cache divergence for " &
+                 string(stored.ep.tp.display()) & " (" & what.join(", ") &
+                 " diverged from the cached result)\n")
+    try: stderr.flushFile() except CatchableError: discard
+
+# ---------------------------------------------------------------------------
+# H2 — PlanReport-typed facade overloads for planview procs
+# ---------------------------------------------------------------------------
+
+proc toRunPlan(report: PlanReport): RunPlan =
+  ## Private helper: reconstruct a RunPlan from the inlined PlanReport fields.
+  RunPlan(entrypoints: report.entrypoints, jobs: report.jobs)
+
+proc planToJsonString*(report: PlanReport; substrate: ptypes.Capabilities = ptypes.Capabilities()): string =
+  ## Facade: serialize the plan to crisol/plan/v1 JSON from a PlanReport.
+  ## PlanReport carries its own warnings; no separate warnings param needed.
+  ## substrate: rfc-0007 A7 — threads through to planview.planToJsonString
+  ## unchanged; defaults to an all-false Capabilities() for callers that
+  ## never populate it for real (see planview.planToJson's doc comment).
+  planview.planToJsonString(report.toRunPlan, report.gatedOut, report.warnings, substrate)
+
+proc renderPlan*(report: PlanReport; opts: RenderOpts): string =
+  ## Facade: human-readable plan rendering from a PlanReport.
+  planview.renderPlan(report.toRunPlan, report.gatedOut, opts)
+
+# ---------------------------------------------------------------------------
+# planImpl — internal shared plan phase (raises CrisolError on structural problems)
+# ---------------------------------------------------------------------------
+
+type
+  PlanImplResult = object
+    pr:          PlanReport      ## public projection (returned to callers of planTests)
+    cfg:         Config          ## full config (used by runTests to pass to execute)
+    pv:          RunPlanView     ## full view (used by runTests for graph + runnable count)
+    useFailed:   bool            ## surfaced to avoid recomputation in runTests
+    useChanged:  bool
+    toolchain:   RunToolchain    ## R12-D4: the one C toolchain probe this plan was
+                                 ## keyed on (its fingerprint, and the driver site the
+                                 ## run's header probes resolve against, R11-D1) and
+                                 ## its identity, what the depgraph was loaded against
+                                 ## and what execute() keys the persistent nimcache on
+                                 ## -- one value, so the two cannot come apart
+
+proc shouldReportCompileBlock*(measureCompileReuse: bool): bool =
+  ## R14-T6 (code review): the pure predicate gating whether runTests() even
+  ## ATTEMPTS to read/report the `compile` block at all (extracted so the
+  ## exact boolean expression is independently unit-testable without a real
+  ## compile). Even when this returns true, the actual `compile` field can
+  ## still end up absent if no telemetry was ever written this run (see
+  ## compilereport.buildCompileBlock's own nil-when-empty contract) — this
+  ## predicate only answers "should we even look", not "is there data".
+  measureCompileReuse
+
+proc rlimitOverridesFrom*(cfg: Config): RlimitOverrides =
+  ## Fix 1 / rfc-0007 wiring-audit W2 / code-review r30: the RlimitOverrides
+  ## bundle resolveSandbox expects. `Config.rlimits` IS that bundle now (r30
+  ## collapsed the five separate `Config.rlimitNofile`/`rlimitCpu`/`rlimitAs`/
+  ## `rlimitFsize`/`rlimitCore` fields this used to project into ONE field of
+  ## this exact type), so this is a named accessor, kept for call-site
+  ## stability (like shouldReportCompileBlock above, independently
+  ## unit-testable without a real run) rather than a projection.
+  cfg.rlimits
+
+proc envPinsFrom*(cfg: Config; opts: RunOptions): seq[(string, string)] =
+  ## RFC-0005 A0: pure projection merging `Config.envPins` (KDL) with
+  ## `RunOptions.envPins` (CLI/library `--env-pin`) into the final pin set
+  ## `resolveSandbox` receives.  A CLI pin overrides a same-named config pin
+  ## (`sandbox.overrideByName`'s override side); a config-only pin passes
+  ## through unchanged. Extracted (like `rlimitOverridesFrom` above) so the
+  ## merge is independently unit-testable without a real run.
+  overrideByName(cfg.envPins, opts.envPins)
+
+proc envPassthroughsFrom*(cfg: Config; opts: RunOptions): seq[string] =
+  ## rfc-0007 code-review r21: pure projection merging `Config.
+  ## envPassthroughs` (KDL `env-passthrough "NAME"`) with `RunOptions.
+  ## envPassthroughs` (CLI/library `--env-passthrough NAME`) into the final
+  ## NAME set `resolveSandbox`'s `passthroughs` param receives. Unlike
+  ## `envPinsFrom` above, a NAME carries no value to collide on, so this is
+  ## a plain UNION (deduplicated), not an override-by-name merge. Extracted
+  ## (like `envPinsFrom`/`rlimitOverridesFrom`) so the merge is
+  ## independently unit-testable without a real run.
+  ##
+  ## CRITICAL: when both sets are empty this returns `@[]` -- byte-identical
+  ## to `resolveSandbox`'s own `passthroughs = @[]` default, so a run with
+  ## no passthroughs configured is completely unaffected (the allowlist
+  ## `resolveSandbox` builds, and therefore `hermeticEnvHash`/the soundness
+  ## key, are unchanged from before this slice -- see sandbox.
+  ## DefaultEnvAllowlist's doc and resolveSandbox's `passthroughs` param).
+  deduplicate(cfg.envPassthroughs & opts.envPassthroughs, isSorted = false)
+
+var runNonceCounter = 0
+
+proc freshRunNonce(): string =
+  ## A value no earlier run drew: 8 bytes from the OS random source, this
+  ## process's id, and a per-process counter (so two runs in one process
+  ## differ even if the random source fails).
+  inc runNonceCounter
+  var bytes: array[8, byte]
+  var r = ""
+  if urandom(bytes):
+    for b in bytes: r.add toHex(b)
+  else:
+    r = toHex(getMonoTime().ticks)
+  r & "-" & $getCurrentProcessId() & "-" & $runNonceCounter
+
+proc planImpl(opts: RunOptions;
+              ccProbe: proc(ctx: CcProbeContext): ToolchainProbe {.closure.}): PlanImplResult =
+  ## Internal plan phase shared by planTests and runTests.
+  ## Raises CrisolError on any structural problem.
+  ##
+  ## `ccProbe` is this host's C toolchain identity: `cachedToolchainProbe` from
+  ## `planTests`/`closureReport`, `RunDeps.ccProbe` from `runTestsWith`.
+  ## Called exactly once; the result and its `toolchainIdentity` are
+  ## returned as one `RunToolchain` (R12-D4), so the run keys everything on
+  ## the same value the plan loaded the depgraph with.
+
+  # rfc-0007 code-review r19: `--hermetic network` (RunOptions.hermeticLevel
+  # == hlNetwork) is a live arm for a mechanism that has never been
+  # implemented -- no network isolation exists anywhere (types.nim documents
+  # netIso as unenforced). Two silent consequences follow from accepting it:
+  # (a) evidence.hermetic serializes "network" on the run/v2 wire -- an
+  # unenforced vouch an external reader cannot detect; (b) evidenceSatisfies
+  # silently disables ALL cache store/serve for the run, with no warning.
+  # RFC-0007 §6 sanctions REFUSING TO CACHE an hlNetwork run until RFC-0008's
+  # observer exists -- it never sanctions silently ACCEPTING the level as a
+  # live no-op. Reject loudly and structurally here instead: this is the ONE
+  # point every CLI invocation and every library caller of planTests()/
+  # runTests() flows through (there is no separate KDL config key for
+  # hermetic level today -- RunOptions.hermeticLevel is the only producer),
+  # so one check covers every entry point. The hlNetwork enum value itself
+  # stays (the wire/type is for RFC-0008's future producer) -- this only
+  # makes it unreachable.
+  if opts.hermeticLevel == hlNetwork:
+    raise newCrisolError(cekConfig,
+      "hermetic level 'network' is not implemented; network isolation is " &
+      "a future mechanism (RFC-0008) and crisol will not record an " &
+      "unenforced vouch")
+
+  # 1. Load config. A test-injected fold probe (RFC-0009 §3 seam) governs the
+  #    whole run's trackedRoots — including the fold policy persisted into the
+  #    dep graph header — so `nil` falls back to the real `probeFoldPolicy`.
+  let effProbe = if opts.foldProbe != nil: opts.foldProbe else: probeFoldPolicy
+  var (cfg, cfgWarnings) = loadConfig(configPath = opts.configPath,
+                                      startDir   = opts.startDir,
+                                      probe      = effProbe)
+
+  # 2. Apply jobs / timeout / retries overrides.
+  if opts.jobs > 0:        cfg.jobs        = opts.jobs
+  if opts.timeoutSecs > 0: cfg.timeoutSecs = opts.timeoutSecs
+  if opts.retries >= 0:    cfg.retries     = opts.retries  # B1: -1 = use config
+  # RFC-0005 B3c code-review r29 (superseded by r76): this arm used to write
+  # opts.verifyCache.pct into cfg.verifyCachePct here as a SECOND resolution
+  # point for --verify-cache-pct. r76 (code-review) deleted it: grep-verified
+  # dead on arrival -- cfg.verifyCachePct's only reader is verifyCachePass's
+  # `effectivePct` (below in this module), which ignores cfg.verifyCachePct
+  # entirely whenever `vc.pct >= 0`, exactly the condition this write
+  # required to fire before it could matter. cfg.verifyCachePct now carries
+  # only loadConfig's plain config-file default all the way through; see
+  # verifyCachePass's own `effectivePct` comment for the (now genuinely
+  # single) resolution point.
+  # RFC-0006 M-artifact-identity PASS (b2): CLI/library --measure-compile-reuse
+  # can only strengthen a config-file setting (true wins), mirroring perfCheckForce.
+  if opts.measureCompileReuse: cfg.measureCompileReuse = true
+  # rfc-0007 A6b: CLI/library --strict-hygiene can only strengthen a
+  # config-file setting (true wins), mirroring measureCompileReuse above.
+  if opts.strictHygiene: cfg.strictHygiene = true
+  # RFC-0005 B1c: CLI/library --explain-miss (or --explain-miss-verbose,
+  # which the CLI resolves into opts.explainMiss too) can only strengthen a
+  # config-file `explain-miss #true` setting (true wins), mirroring
+  # strictHygiene/measureCompileReuse above.
+  if opts.explainMiss: cfg.explainMiss = true
+  # RFC-0005 B2b: CLI/library --cache-stats can only strengthen a
+  # config-file `cache-stats #true` setting, same shape as explainMiss above.
+  if opts.cacheStats: cfg.cacheStats = true
+  if opts.workerBinary.len > 0: cfg.workerBinary = opts.workerBinary
+  # Fix 1 / rfc-0007 wiring-audit W2 / code-review r30: RunOptions.rlimits,
+  # per field when set, overrides the matching Config.rlimits field (CLI/
+  # library wins) -- collapsed from five parallel `if .isSome:` lines into
+  # one bundle merge; a new rlimit kind added to RlimitOverrides needs no
+  # new line here (see types.mergeRlimitOverrides).
+  cfg.rlimits = mergeRlimitOverrides(cfg.rlimits, opts.rlimits)
+  if opts.limitMemory.isSome:  cfg.limitMemory  = opts.limitMemory
+  # RFC-0005 A0: merge CLI/library --env-pin into the config-declared pins
+  # (CLI wins on a name collision); resolveSandbox reads cfg.envPins below.
+  cfg.envPins = envPinsFrom(cfg, opts)
+  # rfc-0007 code-review r20: CLI/library --chdir-into-scratch can only
+  # strengthen a config-file `chdir-into-scratch #true` setting to true --
+  # same override precedence as the rlimit-* family above (a bare CLI flag
+  # can only ever request true, never explicitly request false).
+  if opts.chdirIntoScratch: cfg.chdirIntoScratch = true
+  # rfc-0007 code-review r21: merge CLI/library --env-passthrough into the
+  # config-declared passthrough NAMEs (union, deduplicated); resolveSandbox
+  # reads cfg.envPassthroughs below.
+  cfg.envPassthroughs = envPassthroughsFrom(cfg, opts)
+
+  # 3. Assemble narrowing inputs.
+  let useFailed  = opts.narrowing.kind in {nkFailed, nkFailedOrChanged}
+  let useChanged = opts.narrowing.kind in {nkChanged, nkFailedOrChanged}
+
+  var failedKeys = initHashSet[tuple[tp: TrackedPath, group: string]]()
+  # RFC-0009 A3b-i: changedFiles reduces every git-emitted name through
+  # cfg.trackedRoots, so this seam now carries a HashSet[TrackedPath].
+  var changedSet = initHashSet[TrackedPath]()
+
+  if useFailed:
+    let lr = loadLastRun(cfg)
+    if not lr.found:
+      raise newCrisolError(cekConfig,
+        "--failed: no previous run found; run crisol first to record results")
+    failedKeys = lr.failed
+
+  if useChanged:
+    changedSet = changedFiles(cfg.projectRoot, cfg.trackedRoots, opts.narrowing.baseRef)
+
+  # 4. Build the run plan.
+  # `toolchain.identity` is the value that both loads the dep graph below (via
+  # buildRunPlan -> loadDepGraph) and, returned in `PlanImplResult.toolchain`,
+  # is what runTestsWith keys execute()'s compile decisions and the persistent
+  # nimcache on and persists in the graph header on save -- write and check
+  # sides always agree. pipeline.buildRunPlan's ccVersion parameter has no
+  # default, so omitting it is a compile error, not a silent "".
+  #
+  # An identified toolchain's identity is its serialized fingerprint. An
+  # unidentified one's is drawn fresh for this run, so a depgraph or nimcache
+  # recorded under an earlier unidentified toolchain -- a different one, for
+  # all anyone can tell -- is never taken for this run's. Whether to draw is
+  # the identity's own decision (`toolchainwarn.toolchainIdentity`, R11-D5):
+  # this call hands it the drawer and never reads the verdict itself.
+  let toolchain = runToolchain(ccProbe(ccProbeContextOf(cfg)), freshRunNonce)
+  let ccVer = toolchain.identity
+  let pv = buildRunPlan(
+    cfg          = cfg,
+    selection    = opts.selection,
+    failedKeys   = failedKeys,
+    useFailed    = useFailed,
+    useChanged   = useChanged,
+    changed      = changedSet,
+    nimVersion   = cachedNimFingerprint(),
+    ccVersion    = ccVer,
+
+    forceCompile = opts.forceCompile,
+    warnings     = cfgWarnings,
+    shardK       = opts.shardK,
+    shardN       = opts.shardN,
+    order        = opts.order,   # C4: history-based prioritization
+  )
+
+  # Code-review R13: an explicit --measure-compile-reuse request
+  # that will silently degrade to the monolithic compile path (no
+  # workerBinary configured) must be visible in the STRUCTURED warnings
+  # channel, not merely runner.nim's one-shot stderr write
+  # (warnMeasureCompileReuseNoWorkerOnce) — a CI
+  # consumer whose stderr is swallowed sees a completely silent no-op of a
+  # feature it explicitly asked for (compileBlock simply absent from the
+  # report, indistinguishable from "nobody asked"). Reuses the EXISTING
+  # ConfigWarning shape (no types.nim change): its fields (source/context/
+  # key/message) are generic enough to carry a resolved-config runtime
+  # warning, not only a config-file-parse warning.
+  var warnings = pv.warnings
+  if cfg.workerBinary.len == 0:
+    if cfg.measureCompileReuse:
+      warnings.add ConfigWarning(
+        source:  "",
+        context: "measure-compile-reuse",
+        key:     "workerBinary",
+        message: "measure-compile-reuse requested but no worker binary is " &
+                 "configured; not honored this run -- compiling " &
+                 "monolithically (measurement skipped). Set " &
+                 "RunOptions.workerBinary to a binary that dispatches " &
+                 "--internal-measure-compile to get measurement.",
+      )
+
+  # 5. Project into PlanReport.
+  let resolvedStateDir = stateDirOf(cfg)
+  let settings = ResolvedSettings(
+    projectRoot: cfg.projectRoot,
+    stateDir:    resolvedStateDir,
+    jobs:        pv.plan.jobs,
+    timeoutSecs: cfg.timeoutSecs,
+    strictHygiene: cfg.strictHygiene,  # rfc-0007 A6b
+    explainMiss:   cfg.explainMiss,    # RFC-0005 B1c
+    cacheStats:    cfg.cacheStats,     # RFC-0005 B2b
+  )
+  let pr = PlanReport(
+    entrypoints: pv.plan.entrypoints,
+    jobs:        pv.plan.jobs,
+    gatedOut:    pv.gatedOut,
+    warnings:    warnings,
+    settings:    settings,
+    adHocPaths:     pv.adHocPaths,
+  )
+  PlanImplResult(pr: pr, cfg: cfg, pv: pv, useFailed: useFailed, useChanged: useChanged,
+                 toolchain: toolchain)
+
+# ---------------------------------------------------------------------------
+# planTests — pure plan phase; raises CrisolError on structural problems
+# ---------------------------------------------------------------------------
+
+proc planTests*(opts: RunOptions = RunOptions()): PlanReport =
+  ## Load config, apply overrides, assemble narrowing inputs, call buildRunPlan.
+  ##
+  ## This is the inspect/dry-run path: structural problems (bad config, unknown
+  ## group, --failed with no prior run, --changed outside a git repo) are
+  ## exceptional here and RAISE CrisolError.  No lock, no subprocess execution.
+  planImpl(opts, cachedToolchainProbe).pr
+
+# ---------------------------------------------------------------------------
+# closureReport — issue #9 slice A: read-only depgraph projection
+# ---------------------------------------------------------------------------
+
+proc closureReport*(opts: RunOptions = RunOptions()): ClosureReport =
+  ## Read-only depgraph lookup for every entrypoint planImpl(opts) plans.
+  ##
+  ## Built on the EXISTING plan phase (planImpl) so this does NOT duplicate
+  ## discovery/config/group-resolution or the DepGraph loader (which is keyed
+  ## on crisol's real Nim compiler fingerprint — a downstream consumer that
+  ## hand-rolled this probe would silently see an empty graph on a mismatch).
+  ##
+  ## Raises CrisolError like planTests (structural problems: bad config,
+  ## unknown group, etc.).  No lock, no compile, no test execution; the only
+  ## subprocess is the Nim compiler version/fingerprint probe shared with
+  ## run/list (needed to key the depgraph lookup — see depgraph.loadDepGraph).
+  let impl = planImpl(opts, cachedToolchainProbe)
+  var entries: seq[ClosureEntry]
+  for pep in impl.pr.entrypoints:
+    let ep    = pep.ep
+    let key   = entryKey(ep.tp, ep.flags)
+    let fHash = key.flagHash
+    if impl.pv.graph.entries.hasKey(key):
+      let ge = impl.pv.graph.entries[key]
+      # RFC-0009 A3c-ii/A3d-iv: `ge.closure` is `HashSet[TrackedPath]`; sort by
+      # the sole ordering (`cmpKeyBytes`) and emit each member in its portable
+      # `keyBytes` spelling (crisol/closure/v1 rev 3). For a project (tag-0)
+      # member keyBytes is byte-identical to `display` (project-root-relative),
+      # so the wire is unchanged there; a dep-root member is spelled
+      # `dep:<name>/rel` (the §4 escape) instead of a machine-local absolute
+      # path — the closure wire carries no absolute host paths.
+      var closureTp = toSeq(ge.closure)
+      closureTp.sort(proc(a, b: TrackedPath): int = cmpKeyBytes(a, b, impl.cfg.trackedRoots))
+      let closureSeq = closureTp.mapIt(string(keyBytes(it, impl.cfg.trackedRoots)))
+      entries.add ClosureEntry(
+        path:        string(ep.tp.display()),
+        group:       ep.group,
+        flagHash:    fHash,
+        recorded:    true,
+        closure:     closureSeq,
+        closureHash: ge.closureHash,
+      )
+    else:
+      entries.add ClosureEntry(
+        path:        string(ep.tp.display()),
+        group:       ep.group,
+        flagHash:    fHash,
+        recorded:    false,
+        closure:     @[],
+        closureHash: "",
+      )
+  ClosureReport(
+    entries:        entries,
+    warnings:       impl.pr.warnings,
+    adHocPaths:     impl.pr.adHocPaths,
+    gatedOut:       impl.pr.gatedOut,
+  )
+
+# ---------------------------------------------------------------------------
+# RunDeps — the test-injection seam for runTestsWith (RFC-0005 A3b)
+# ---------------------------------------------------------------------------
+
+type
+  RunDeps* = object
+    ## RFC-0005 "Test injection without a facade leak": `RunOptions.
+    ## cacheRuntime: Option[CacheRuntime]` was rejected (round 3) because it
+    ## would leak `cacheport`'s whole type graph into the CONTRACTED
+    ## `crisol/api` facade. Instead `runTestsWith*(opts, deps: RunDeps)`
+    ## is an internal, documented-uncontracted entry point, in this module
+    ## and not re-exported by `crisol/api`; `api.runTests` is the public
+    ## facade and always builds `productionRunDeps()`. Named `CacheDeps`
+    ## until round 11 (R11-D1): it also carries the run's toolchain probe,
+    ## which is identity, not cache.
+    ##
+    ## **A3b interim shape (judgment call, recorded):** the RFC's inline
+    ## sketch gives `CacheDeps`'s END-STATE shape as `{registry:
+    ## BackendRegistry, secrets: CacheSecrets, sink: TelemetrySink}`, fed
+    ## into `configuredCache(cfg, stateDir, reg, secrets, sink)`. Neither
+    ## `configuredCache` nor `CacheSecrets` exist yet — both are A3c/C-dep
+    ## (the KDL remote-tier parse + trust-secret env resolution), and A3b's
+    ## own bullet scope names only types.nim/cachedispatch.nim/runner.nim/
+    ## jsonout.nim/api.nim — `cacheregistry.nim` (where `configuredCache`
+    ## would live) is out of scope this slice. A3b's actual need — E2E-A-
+    ## trust's "two `memory` tiers + a mock `TrustPolicy` through
+    ## `runTestsWith`" — only requires a seam that can hand back an
+    ## arbitrary, fully-built `CacheRuntime` once `stateDir`/`maxEntries`
+    ## are known (post-plan; `runTests` cannot resolve them any earlier
+    ## today either — see the `localOnlyCache` call site this replaces).
+    ## `buildRuntime` is that narrowest seam: a test closes over pre-built
+    ## `memory://` backends + a mock policy and returns the SAME
+    ## `CacheRuntime` value on every call, so a warm second `runTestsWith`
+    ## call sees what the first one stored (the backends' own `Table`
+    ## state — not `rt` identity — is what persists; see `cachememory.nim`).
+    ##
+    ## **A3c-ii reshape (recorded):** `buildRuntime` now takes `cfg:
+    ## CacheConfig` (the run's resolved `Config.cache`, i.e. the parsed
+    ## `remote-cache "<name>" { }` blocks) as its first argument, so
+    ## `productionRunDeps` (below) can wire the REAL `configuredCache`
+    ## into the production path. The RFC's end-state sketch also threads a
+    ## `registry: BackendRegistry` field on `RunDeps` itself; that is NOT
+    ## added here — `productionRunDeps`'s closure captures
+    ## `productionRegistry()` directly (a fresh, cheap-to-build value; no
+    ## state to share across calls), and a test wanting a different
+    ## registry (e.g. one more scheme than `productionRegistry` ships)
+    ## overrides `buildRuntime` wholesale, exactly as A3b's mock-policy test
+    ## already does — a `registry` field with a single caller (this same
+    ## closure) would be indirection with no consumer. `secrets:
+    ## CacheSecrets` is likewise NOT added as a `RunDeps` FIELD: a test
+    ## wanting different secrets overrides `buildRuntime` wholesale (as
+    ## A3b's mock-policy test already does), so a `secrets` field on
+    ## `RunDeps` itself would be a second way to reach the same one call
+    ## site. `http`/`s3` credentials (`httpTokens`) arrive in C3b the same
+    ## way.
+    ##
+    ## **RFC-0005 code-review R2-D5a reshape:** `buildRuntime` now takes a
+    ## fourth argument, `resolvedSecrets: CacheSecrets`, handed to it by
+    ## `runTestsWith` at the call site rather than resolved inside the
+    ## closure. Round-1's D5 fix made `productionRunDeps`'s closure call
+    ## `resolveCacheSecrets()` itself, lazily, so a `noCache: true` run paid
+    ## no env-scan/scrub cost — but that closure only runs AFTER
+    ## `planImpl`, which unconditionally spawns the Nim fingerprint-probe
+    ## child (`buildRunPlan`'s `cachedNimFingerprint()` argument, evaluated
+    ## before `buildRunPlan` itself, let alone before `buildRuntime`) — so
+    ## every cache-enabled run's probe child inherited the UNSCRUBBED
+    ## `CRISOL_CACHE_*` namespace regardless. `runTestsWith` now resolves
+    ## and scrubs ONCE, at its own top, still gated on `not opts.noCache`
+    ## (the D5 guarantee is unchanged — see its own comment there), and
+    ## passes the result down through this parameter. `productionRunDeps`
+    ## (below) no longer calls `resolveCacheSecrets` at all — it just wires
+    ## whatever it is handed into `configuredCache`. A test double that
+    ## wants its OWN fixed secrets (the C3b/C6 http/s3 suites, the trust
+    ## E2E suites) names this parameter `resolvedSecrets` too but never
+    ## reads it — it closes over its own `secrets` local instead, exactly
+    ## as before this reshape.
+    ##
+    ## **RFC-0009 A5c:** gained a fifth argument, `trackedRoots:
+    ## TrackedRoots`, threaded down from `runTestsWith`'s own `cfg.
+    ## trackedRoots` (RFC-0009 A2 — populated once by `config.loadConfig`)
+    ## at its `deps.buildRuntime` call site, below. `productionRunDeps`
+    ## passes it straight into `configuredCache`'s fold-routed
+    ## `rootInsideStateDir` guard; a test double that builds its own
+    ## `CacheRuntime` directly (never calling `configuredCache`) accepts
+    ## and discards it, same as the other unused params.
+    buildRuntime*: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                        resolvedSecrets: CacheSecrets;
+                        trackedRoots: TrackedRoots): CacheRuntime {.closure.}
+    ccProbe*: proc(ctx: CcProbeContext): ToolchainProbe {.closure.}
+      ## The identity of the C toolchain the configuration selects
+      ## (`ccProbeContextOf(cfg)`), probed once per run, and where the
+      ## build's nim finds its drivers, as one value from one discovery
+      ## (R11-D1). The fingerprint is used for both the plan (depgraph
+      ## header check) and the execute (header write, result-cache key, and
+      ## whether the cache can be used at all); the site is what every
+      ## header probe of the run's `execute` and verify pass resolves its
+      ## command's driver against. `productionRunDeps` installs the
+      ## memoised real probe (`ccidentity.cachedToolchainProbe`); a test
+      ## installs a closure that returns a fixed value, which is how a
+      ## degraded or a second, different toolchain is driven through an
+      ## otherwise real run. Must be non-nil: `runTestsWith` asserts it, so
+      ## a hand-built `RunDeps` states its toolchain rather than inheriting
+      ## the host's silently.
+
+const CrisolCacheTierTokenPrefix = "CRISOL_CACHE_TOKEN_"
+  ## RFC-0005 C3b: `$CRISOL_CACHE_TOKEN_<TIER>`, compared against a name's
+  ## `cacheSecretKey` (the bare `$CRISOL_CACHE_TOKEN` is read by its own
+  ## name).
+
+proc resolveCacheSecrets*(): CacheSecrets =
+  ## RFC-0005 C4/C5a/C3b "resolved once from env, then delEnv'd" (the RFC
+  ## says api.nim; the run engine moved here):
+  ## reads every secret this slice knows about ($CRISOL_CACHE_HMAC_KEY,
+  ## $CRISOL_CACHE_SIGN_KEY, $CRISOL_CACHE_TOKEN[_<TIER>]), THEN scrubs the
+  ## WHOLE `CRISOL_CACHE_*` namespace from the process environment — not
+  ## merely the vars just read — so a var this slice does not yet consume
+  ## can never reach a `--hermetic none` child's full-parent-env
+  ## passthrough either (`sandbox.filterEnv`'s own tail strips the SAME
+  ## prefix a second time, unconditionally, at every hermeticity level —
+  ## belt and suspenders: this proc's scrub means there is nothing left to
+  ## strip by the time a child spawns; `filterEnv`'s own scrub covers any
+  ## process that reads the environment before this proc ever runs).
+  ## Secrets live only in the `CacheSecrets` value returned here (and
+  ## whatever closure captures it) from this point on — no cache module
+  ## ever calls `getEnv`.
+  ##
+  ## **`$CRISOL_CACHE_TOKEN[_<TIER>]` capture (RFC-0005 C3b), a genuine
+  ## ordering constraint, not a style choice:** this proc runs BEFORE the
+  ## KDL config is even parsed (the resolve is the first act of
+  ## `runTestsWith` (R2-D5a), ahead of `planImpl` ->
+  ## `loadConfig`), so the configured remote-cache tier NAMES do not exist
+  ## yet — there is no `tierName -> token` lookup to build. Every
+  ## `CRISOL_CACHE_TOKEN*` var is instead captured HERE, keyed by its own
+  ## raw env-var SUFFIX (`""` for the bare name, `"MIRROR"` for `_MIRROR`),
+  ## before the unconditional scrub below deletes it from the process env.
+  ## `cacheregistry.httpTokenFor` re-derives a configured tier's expected
+  ## suffix from its NAME (upper-cased, `-`->`_`) once `configuredCache`
+  ## actually has one, and looks it up in this already-captured table —
+  ## so the value survives the scrub even though the name it will
+  ## eventually be requested under is not known here.
+  ##
+  ## **One snapshot, one name test:** the namespace is read from a single
+  ## `envPairs` snapshot, each name keyed by `cachesecrets.cacheSecretKey`
+  ## and selected by `isCacheSecretName`, and the scrub deletes exactly the
+  ## names that snapshot selected. On Windows, where the environment folds
+  ## case, a `crisol_cache_token` is therefore both the credential `getEnv`
+  ## would have returned and a name the scrub removes, and a per-tier
+  ## `crisol_cache_token_mirror` is keyed `MIRROR`, the suffix
+  ## `httpTokenFor` derives from the tier name.
+  var found: Table[string, string]    # cacheSecretKey -> value
+  var names: seq[string] = @[]        # as spelled in the environment
+  for name, value in envPairs():
+    if isCacheSecretName(name):
+      found[cacheSecretKey(name)] = value
+      names.add name
+  let hmacKey = found.getOrDefault("CRISOL_CACHE_HMAC_KEY")
+  # RFC-0005 C5a: $CRISOL_CACHE_SIGN_KEY (base64 of the 32-byte ed25519
+  # seed) is captured here as the RAW STRING (not yet decoded to a
+  # `sello.Seed`) -- see `CacheSecrets.signSeedB64`'s doc comment
+  # (`cacheregistry.nim`) for why: the actual base64 -> `Seed` decode
+  # happens fresh, on demand, inside `buildTrustPolicy`'s "ed25519" branch.
+  let signSeedB64 = found.getOrDefault("CRISOL_CACHE_SIGN_KEY")
+  let bareToken = found.getOrDefault("CRISOL_CACHE_TOKEN")
+  var httpTokens: Table[string, string]
+  for key, value in found:
+    if key.startsWith(CrisolCacheTierTokenPrefix):
+      httpTokens[key[CrisolCacheTierTokenPrefix.len .. ^1]] = value
+  result = CacheSecrets(
+    hmacKey:          if hmacKey.len > 0: some(hmacKey) else: none(string),
+    signSeedB64:      signSeedB64,
+    defaultHttpToken: if bareToken.len > 0: some(bareToken) else: none(string),
+    httpTokens:       httpTokens,
+  )
+  for name in names:
+    delEnv(name)
+
+proc productionRunDeps*(): RunDeps =
+  ## The real dependency: RFC-0005 A3c-ii/C4/C3b's `configuredCache`, via
+  ## `productionRegistry()` (RFC-0005 C3b: `file`/`http`/`https`/`s3`, the
+  ## latter three over `httpraw.rawHttpFetcher()`, `productionRegistry`'s
+  ## own default), and a `NilSink` (the run's real sink, when
+  ## `--cache-stats` is on, is installed by `runTestsWith` AFTER
+  ## `buildRuntime` returns, exactly as it already did for `localOnlyCache`
+  ## before this slice).
+  ##
+  ## **RFC-0005 code-review R2-D5a: no longer resolves `CacheSecrets`
+  ## itself, eagerly OR lazily.** Round-1's D5 fix deferred
+  ## `resolveCacheSecrets()` into this closure so a `noCache: true` run
+  ## never paid its env-scan/scrub cost — correct in isolation, but it left
+  ## the scrub running AFTER `planImpl`, which unconditionally spawns the
+  ## Nim fingerprint-probe child (`cachedNimFingerprint()`, evaluated as a
+  ## `buildRunPlan` argument before `buildRunPlan` itself runs, let alone
+  ## before this closure) — so that child inherited the unscrubbed
+  ## `CRISOL_CACHE_*` namespace on every cache-enabled run regardless. The
+  ## resolve+scrub now happens ONCE, at the very top of `runTestsWith`
+  ## (still gated on `not opts.noCache` — the D5 guarantee is unchanged),
+  ## strictly before `planImpl`/any child ever spawns; the resolved
+  ## `CacheSecrets` value is threaded down through `buildRuntime`'s new
+  ## `resolvedSecrets` parameter instead of being re-derived here.
+  RunDeps(
+    buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+                       resolvedSecrets: CacheSecrets;
+                       trackedRoots: TrackedRoots): CacheRuntime =
+      configuredCache(cfg, stateDir, maxEntries, productionRegistry(), resolvedSecrets,
+                      NilSink[TelemetryEvent](), trackedRoots),
+    ccProbe: cachedToolchainProbe)
+
+# ---------------------------------------------------------------------------
+# annotatePerfRegressions — C6 perf-check annotation phase, extracted from
+# runTestsWith's body (code-review r52: that proc was a ~500-line god-proc;
+# this phase was the extractable chunk).
+#
+# NOT moved to `crisol/stats` (a new module was judged disproportionate
+# here): `stats.nim` is a deliberately PURE leaf -- median/mad/isRegression,
+# no I/O, no crisol types beyond plain seq[int64]/float -- shared by FOUR
+# other callers (order.nim, shard.nim, render.nim, compilereport.nim) that
+# want ONLY that math. This phase needs `EntrypointResult`/`PerfCheckConfig`
+# plumbing AND ledger I/O (`scanLedger`) on top of the pure predicate --
+# entangling `stats.nim` with that machinery would drag it along for all
+# four of its other, unrelated consumers. `order.nim`/`shard.nim` already
+# establish the house pattern for this exact shape: pair `crisol/ledger`'s
+# I/O with `crisol/stats`'s pure math AT THE CALL SITE, not inside
+# `stats.nim` itself. This proc follows that same pattern, homed in
+# this module where its caller (and `scanLedger`/`identityKey`/`isRegression`,
+# all already imported here) live.
+# ---------------------------------------------------------------------------
+
+proc annotatePerfRegressions(results: var seq[EntrypointResult];
+                             perfCheck: PerfCheckConfig; stateDir: string;
+                             trackedRoots: TrackedRoots; runStartUs: int64) =
+  ## C6: annotate each FRESH result with regression info, when perf-check is
+  ## enabled. `edCached` results are excluded (no fresh measurement; never
+  ## flag a cache hit). For each fresh result, `historyUs` = prior
+  ## `durationUs` rows from the ledger, filtering out compileFailed rows and
+  ## rows from the current run (`timestamp >= runStartUs`).
+  ##
+  ## MUTATES `results` IN PLACE. r64 (code-review): `runTestsWith`'s caller
+  ## assembles `doc` (the shared `RunDocument`) from this SAME `results`
+  ## local immediately after this call returns — ORDER MATTERS: this call
+  ## must run BEFORE that doc assembly, or `rr.results`/the doc-driven
+  ## stdout JSON would silently disagree on `regressed`. See the r64
+  ## regression test that pins this exact ordering: test_api.nim, suite
+  ## "r64 — RunReport.results and the doc-driven stdout JSON agree on a
+  ## regression-annotated run", test "rr.results[0].regressed and
+  ## toJsonString(rr.doc)'s regressions entry agree" — still green after
+  ## this extraction since the call site below preserves the same
+  ## call-then-assemble-doc order the inline loop used to have.
+  if not perfCheck.enabled:
+    return
+  for i in 0 ..< results.len:
+    let r = results[i]
+    # Skip cached results — no fresh measurement, never flag.
+    if cached(r):
+      continue
+    # Skip compile-failed — no run duration to compare.
+    if outcome(r) == oCompileFailed:
+      continue
+    # Build identity key for this entrypoint. RFC-0009 A5b-ii: routed
+    # through the Entrypoint-keyed overload (ep.tp when populated).
+    let ikey = identityKey(r.ep, trackedRoots)
+    # Scan the ledger for PRIOR rows (exclude current run by timestamp).
+    let allRows = scanLedger(stateDir, ikey)
+    var historyUs: seq[int64]
+    for row in allRows:
+      # Exclude current-run rows (appended during execute()).
+      if row.timestamp >= runStartUs:
+        continue
+      # Exclude compileFailed rows (their durationUs reflects the compiler, not the run).
+      if row.outcome.startsWith("compileFailed"):
+        continue
+      historyUs.add row.durationUs
+    # Run the pure predicate.
+    let verdict = isRegression(
+      currentUs   = r.durationMs * 1000,  # convert ms → µs for comparison
+      historyUs   = historyUs,
+      k           = perfCheck.k,
+      sampleFloor = perfCheck.sampleFloor,
+      absFloorMs  = perfCheck.absFloorMs,
+    )
+    results[i].regressed       = verdict.regressed
+    results[i].perfBaselineUs  = verdict.baselineUs
+    results[i].perfThresholdUs = verdict.thresholdUs
+
+# ---------------------------------------------------------------------------
+# runTestsWith — full run facade; catches-and-encodes structural failures.
+# INTERNAL / documented-uncontracted (RFC-0005 A3b) — `deps` reaches into
+# cache-module internals a `crisol/api` consumer should never need to import;
+# `api.runTests` is the public, opts-only facade.
+# ---------------------------------------------------------------------------
+
+proc markInterrupted(rr: RunReport; sig: int): RunReport =
+  ## R13-D1: `rr` as the report of a run interrupted by `sig`: `rsInterrupted`,
+  ## `interrupted` true, exit code 128 + `sig` (or the one execute() already
+  ## derived from the signal its Supervisor observed), no structural error
+  ## (the interrupt, not a failure it caused, is what the run reports). Its
+  ## plan, results and everything else it carries are kept. Idempotent.
+  result = rr
+  if result.status != rsInterrupted:
+    result.status = rsInterrupted
+    result.exitCode = 128 + sig
+  result.error = ""
+  result.doc.interrupted = true
+
+proc runTestsBody(opts: RunOptions; deps: RunDeps): RunReport =
+  ## `runTestsWith`'s body, run inside its interrupt scope when
+  ## `opts.installSignals`; see there. Its interrupt checks are early exits
+  ## only: `runTestsWith` decides the interrupted verdict once, at the end.
+
+  # Helper: build a structural RunReport without raising (pre-plan, no pr available).
+  template structuralResult(msg: string; code: int): RunReport =
+    RunReport(
+      status:   rsStructural,
+      exitCode: code,
+      error:    msg,
+    )
+
+  # Helper: build a structural RunReport with plan populated (post-plan).
+  template structuralResultWithPlan(msg: string; code: int; planReport: PlanReport): RunReport =
+    RunReport(
+      plan:     planReport,
+      status:   rsStructural,
+      exitCode: code,
+      error:    msg,
+    )
+
+  # R12-D3: an interrupt ended planning: the run stops here, reported as
+  # interrupted. `planReport` is whatever planning produced.
+  template interruptedInPlan(planReport: PlanReport; sig: int): RunReport =
+    markInterrupted(RunReport(plan: planReport), sig)
+
+  # RFC-0005 code-review R2-D5a: resolve + scrub `CRISOL_CACHE_*` FIRST —
+  # strictly before `planImpl` (and therefore before ITS unconditional Nim
+  # fingerprint-probe child spawn, `buildRunPlan`'s `cachedNimFingerprint()`
+  # argument) and before ANY other child this call could ever spawn. The
+  # round-1 D5 fix deferred the resolve+scrub into `productionRunDeps`'s
+  # `buildRuntime` closure, which only runs below, AFTER `planImpl` returns
+  # successfully — so the probe child inherited the unscrubbed namespace on
+  # every cache-enabled run. Gated on `not opts.noCache`, exactly as D5
+  # requires: a `noCache: true` caller performs ZERO env mutation (see the
+  # "noCache: true -> CRISOL_CACHE_* env is left untouched" test) — env is
+  # resolved and scrubbed before planTests or any child ever spawns.
+  var secrets: CacheSecrets
+  if not opts.noCache:
+    secrets = resolveCacheSecrets()
+
+  # Plan phase: catch CrisolError and encode into RunReport.
+  var impl: PlanImplResult
+  # R12-D3: a planning step whose tool an interrupt killed may fail
+  # structurally; the interrupt, not that failure, is what the run reports
+  # (`runTestsWith`'s end-of-call check turns the structural report into an
+  # interrupted one).
+  try:
+    impl = planImpl(opts, deps.ccProbe)
+  except CrisolError as e:
+    let code = if e.kind == cekInternal: 2 else: 3
+    return structuralResult(e.msg, code)
+  except Exception as e:
+    return structuralResult("unexpected error during plan: " & e.msg, 2)
+  if opts.installSignals and shutdownRequested().isSome:
+    return interruptedInPlan(impl.pr, shutdownRequested().get.signum)
+
+  let pr  = impl.pr   # public projection
+  let cfg = impl.cfg  # full config (needed by execute)
+  let pv  = impl.pv   # full view (needed for graph + runnable count)
+
+  # This host's C toolchain identity: the one probe result `planImpl` loaded
+  # the depgraph with, and its `toolchainIdentity` (`ccVer`), which folds into
+  # the result-cache key, the depgraph header and execute()'s toolchain
+  # fingerprint -- one `RunToolchain` (R12-D4).
+  let ccFp  = impl.toolchain.probe.fp
+  let ccVer = impl.toolchain.identity
+  # The single gate for the whole cache pipeline (`toolchainwarn.cacheGate`
+  # decides and explains; this proc only applies it): `rt` construction, the
+  # `cacheCtx` choice and the end-of-run `drainPending` flush all read
+  # `cacheOn`, so `rt` is dereferenced only when this same condition
+  # constructed it.
+  let gate    = cacheGate(opts.noCache, cfg.trackedRoots.degraded, ccFp)
+  let cacheOn = gate.kind == cgOn
+
+  # RFC-0005 A3c-ii: build the run's CacheRuntime (configuredCache, or
+  # localOnlyCache when no remote tier is configured) HERE — still inside
+  # the plan's structural-failure boundary, BEFORE acquireLock — so a
+  # rejected remote-cache config (an "l1"-named remote, a file:// root
+  # inside stateDir, an unresolvable scheme) is a plan-time exit 3, exactly
+  # like a bad group/glob, never a lock-then-fail (RFC: configuredCache "is
+  # invoked INSIDE the plan try, BEFORE acquireLock"). `rt` stays nil
+  # (`CacheRuntime`'s ref zero value) when `opts.noCache` is set — nothing
+  # below ever dereferences it on that path. `maxCacheEntries` mirrors
+  # clean.nim's own resolution of the SAME config field (0 = use
+  # DefaultMaxCacheEntries) so the live store path's soft cap and `clean`'s
+  # GC target agree — one knob, one resolution rule, both readers of it.
+  var rt: CacheRuntime
+  # A run with `cacheOn` false bypasses the cache pipeline ENTIRELY: no
+  # CacheRuntime is constructed, so nothing below can store to or read from it.
+  if cacheOn:
+    let maxCacheEntries =
+      if cfg.maxCacheEntries > 0: cfg.maxCacheEntries
+      else: DefaultMaxCacheEntries
+    # RFC-0005 A3c-ii: --no-remote-cache drops every configured remote tier
+    # for this run — the local ("l1") cache stays active (configuredCache
+    # degrades to its localOnlyCache-equivalent path when `remotes` is empty).
+    let effectiveCacheCfg =
+      if opts.noRemoteCache: CacheConfig(remotes: @[])
+      else: cfg.cache
+    try:
+      # R2-D5a: `secrets` was already resolved (+ scrubbed) above, before
+      # `planImpl` — this is a plain pass-through, not a new resolution.
+      rt = deps.buildRuntime(effectiveCacheCfg, pr.settings.stateDir, maxCacheEntries, secrets,
+                             cfg.trackedRoots)
+    except CrisolError as e:
+      let code = if e.kind == cekInternal: 2 else: 3
+      return structuralResultWithPlan(e.msg, code, pr)
+
+  # Acquire advisory lock if requested.
+  var lockHandle: LockHandle   # fd = -1 (default) = not held
+  if opts.manageLock:
+    try:
+      lockHandle = acquireLock(pr.settings.stateDir)
+    except CrisolError as e:
+      return structuralResultWithPlan(e.msg, 3, pr)
+
+  # Zero-runnable mapping (RFC-0003 error table):
+  #   changed-clean-tree / failed-none-matched / all-gated-out → rsOk, exit 0
+  #   no-entrypoints-matched (empty discovery, bad globs) → rsStructural, exit 3
+  let runnableCount = pv.runnable
+  let useFailed     = impl.useFailed
+  let useChanged    = impl.useChanged
+
+  if runnableCount == 0:
+    if useChanged:
+      releaseLock(lockHandle)
+      return RunReport(plan: pr, status: rsOk, exitCode: 0,
+                       zeroRunnableReason: zrkChangedClean)
+    elif useFailed:
+      releaseLock(lockHandle)
+      return RunReport(plan: pr, status: rsOk, exitCode: 0,
+                       zeroRunnableReason: zrkFailedNone)
+    elif pr.gatedOut.len > 0:
+      releaseLock(lockHandle)
+      return RunReport(plan: pr, status: rsOk, exitCode: 0,
+                       zeroRunnableReason: zrkAllGated)
+    else:
+      releaseLock(lockHandle)
+      return structuralResultWithPlan(
+        "no entrypoints matched — check config/globs", 3, pr)
+
+  var graph = pv.graph   # mutable copy for depgraph recording
+  let cb    = if opts.onResult != nil: opts.onResult
+              else: (proc(r: EntrypointResult) {.closure.} = discard)
+
+  var results: seq[EntrypointResult]
+  var memThrottled = 0
+
+  # C6: Resolve the effective PerfCheckConfig.
+  #   Precedence: perfCheckForce > config block > absent/disabled.
+  #   If perfCheckForce is set AND the config block has no enabled policy,
+  #   fall back to the "moderate" preset so the CLI flag is never a no-op.
+  let effectivePerfCheck: PerfCheckConfig =
+    if cfg.perfCheck.enabled:
+      # Config block says enabled (sensitivity ≠ none): use it.
+      # perfCheckForce can only strengthen, not weaken, so this wins too.
+      cfg.perfCheck
+    elif opts.perfCheckForce:
+      # CLI --perf-check forces ON; config block absent/none → moderate preset.
+      PerfCheckConfig(enabled: true, k: 3.0, sampleFloor: 10, absFloorMs: 5)
+    else:
+      PerfCheckConfig(enabled: false)
+
+  # C6: Capture run-start timestamp (unix epoch µs) BEFORE execute() appends
+  # current-run rows to the ledger.  The detection step will exclude any ledger
+  # row whose timestamp >= runStart, ensuring we compare against PRIOR history only.
+  let runStartUs: int64 = int64(epochTime() * 1_000_000.0)
+
+  # F2/F3 (A6): resolve hermeticity once (default hlIsolated) and build the
+  # result-cache policy + seams.  The seams read the LIVE graph (ptr) so a
+  # store-key derived after a compile reflects the fresh closureHash.
+  # M4: bundle spec+policy+seams into a CacheContext so the invariant
+  # (active iff keyOf!=nil AND policy.enabled) is enforced structurally.
+  let spec  = resolveSandbox(level = opts.hermeticLevel,
+                              passthroughs = cfg.envPassthroughs,  # r21
+                              chdirIntoScratch = cfg.chdirIntoScratch,  # r20
+                              rlimits = rlimitOverridesFrom(cfg),
+                              envPins = cfg.envPins,
+                              memoryLimit = cfg.limitMemory)
+  # rfc-0007 code-review r18: sandbox.MinSafeRlimitAs's doc comment has long
+  # promised "crisol logs a warning when limitAs < MinSafeRlimitAs at
+  # spec-resolution time" -- no such warning existed anywhere, so a small
+  # --rlimit-as/rlimit-as silently made every child SIGSEGV before main()
+  # even returned, reported as a bare crash with zero guidance. This is the
+  # ONE production call site of resolveSandbox -- every CLI `run` invocation
+  # and every library caller of runTests()/runTestsWith() flows through it --
+  # so the check belongs here rather than duplicated at each entry point.
+  # Reads the RESOLVED value (spec.limits, post CLI/config merge) rather than
+  # cfg.rlimits.limitAs directly, so hlNone (rlimits inactive; resolveSandbox
+  # returns a zero Limits) never warns about a ceiling that is never applied.
+  # r62: `warnStderr`, not a bare `stderr.write` -- this fires BEFORE this
+  # proc's first `try`, with the advisory lock already held (acquireLock,
+  # above); a bare write raising here (closed stderr) used to both escape
+  # this proc AND leak the lock for the rest of the host process's lifetime.
+  let resolvedRlimitAs = spec.limits.req[ptypes.lkAddressSpace]
+  if resolvedRlimitAs.isSome and resolvedRlimitAs.get < MinSafeRlimitAs:
+    warnStderr("crisol: warning: rlimit-as " & $resolvedRlimitAs.get &
+               " is below the safe minimum for Nim/ORC test binaries (" &
+               $MinSafeRlimitAs & " bytes / 3 GiB) -- the child may " &
+               "SIGSEGV before main() returns, reported as a bare crash " &
+               "with no further guidance (see sandbox.MinSafeRlimitAs)\n")
+  # r34 (code-review): sandbox.resolveSandbox's `hlNone` early-return
+  # (`if level == hlNone: return SandboxSpec(level: hlNone, envPins: envPins)`)
+  # is BEFORE the block that consumes `rlimits`/`memoryLimit` at all -- every
+  # --rlimit-*/--limit-memory override an operator sets is silently dropped
+  # on the floor under `--hermetic none`, with zero feedback. This does NOT
+  # change hlNone's semantics (that would be a spec change, applying limits
+  # at a hermeticity level that promises none) -- it only makes the no-op
+  # LOUD, same warnStderr precedent as the MinSafeRlimitAs check just above,
+  # at the SAME one production call site. Reads the pre-resolution inputs
+  # (`cfg.rlimits`/`cfg.limitMemory`, the exact values just passed into
+  # `resolveSandbox` above) rather than `spec.limits` -- hlNone's SandboxSpec
+  # carries a zero-value `limits` unconditionally, so there is nothing left
+  # to inspect there; `spec.level` is what tells us hlNone actually won.
+  if spec.level == hlNone and
+     (cfg.rlimits.hasAnyOverride or cfg.limitMemory.isSome):
+    warnStderr("crisol: warning: --rlimit-*/--limit-memory overrides are " &
+               "set but --hermetic none disables all resource limits -- " &
+               "these flags are inert at this hermeticity level (see " &
+               "sandbox.resolveSandbox)\n")
+  # nimcache-persistence (RFC-0006): the SAME ccVersion/nimVersion probes
+  # already used by RFC-0004's SoundnessKey (via realSeams below) are reused
+  # here — folded into execute()'s toolchain fingerprint, which keys the
+  # persistent nimcache path. One probe each, two consumers; never diverge.
+  # nimVer is the RUNTIME fingerprint (nimprobe.cachedNimFingerprint) — not
+  # crisolNimVersion — so a stock->patched compiler swap at the same version
+  # STRING is soundly distinguished; see the module-doc note above.
+  # `ccVer` was derived from `ccFp` right after the plan phase.
+  let nimVer = cachedNimFingerprint()
+  # Explains an unidentified toolchain's run to a human at the terminal, same
+  # `warnStderr` precedent as the `--rlimit-*` warning above.
+  if gate.warning.isSome:
+    warnStderr("crisol: " & gate.warning.get & "\n")
+  # RFC-0005 B2b: --cache-stats installs a REAL InMemorySink in place of the
+  # default NilSink so the run's hit/miss/publish/remote-error/verifyFail
+  # events are actually collected. `cfg.cacheStats` is the RESOLVED value
+  # (CLI flag OR config-file `cache-stats #true`, already merged above) —
+  # reading it here, not opts.cacheStats directly, matches explainMiss's own
+  # precedent. `nil` (not installed) when the run never asked for telemetry:
+  # NilSink stays free, exactly as before this slice. `RunReport.cacheStats`
+  # stays the documented zero value on this path — see the `cacheStats`
+  # local built from `statsSink` (not `warnSink` below) further down.
+  let statsSink = if cfg.cacheStats: newInMemorySink() else: nil
+  # RFC-0005 code-review L2: the RFC-pinned per-tier 100%-error/breaker
+  # stderr warning ("Hit-rate telemetry") is UNCONDITIONAL — it must fire on
+  # a default run too, not only under --cache-stats. `erroredTiers` folds
+  # over collected events, so it needs a REAL sink even when `statsSink`
+  # above is `nil`. `warnSink` reuses `statsSink`'s own collector when
+  # `--cache-stats` already installed one (same events, no double
+  # collection, no double warning) and falls back to a fresh, cheap
+  # `InMemorySink` dedicated ONLY to this fold otherwise -- `RunReport.
+  # cacheStats`/the run/v2 `cacheStats` object stay wired to `statsSink`
+  # specifically (see the `cacheStats` local below), so this does not
+  # disturb their documented "zero value / absent when --cache-stats is
+  # off" contract.
+  let warnSink = if statsSink != nil: statsSink else: newInMemorySink()
+  let cacheCtx =
+    # `cacheOn` is the `rt` construction gate above: the `else` branch below
+    # dereferences `rt`, which is nil whenever `cacheOn` is false.
+    if gate.kind == cgOff:
+      # Fully off; spec still governs sandbox hermeticity. The gate's reason
+      # stamps each result's CacheDecision (`cachedispatch.inactiveDecision`).
+      var ctx = cacheDisabledBecause(spec, gate.reason)
+      ctx.sink = warnSink.sink()
+      ctx
+    else:
+      # RFC-0005 A2b: keyContext built once (the key-derivation closure's
+      # captured state). `rt` (RFC-0005 A3c-ii: `configuredCache`/
+      # `localOnlyCache` via `deps.buildRuntime` — production: a single-tier
+      # "l1" TieredCache over the local-fs backend when no remote is
+      # configured, behaviorally identical to RFC-0004's direct
+      # loadCached/storeCached; tests: an injected multi-tier double, see
+      # RunDeps's doc comment) was already built above, BEFORE the lock.
+      let keyCtx = keyContext(
+        nimVersion    = nimVer,
+        ccVersion     = ccVer,
+        spec          = spec,
+        parentEnv     = toSeq(envPairs()),
+        protocolMajor = CrisolProtocolMajor,
+        roots         = cfg.trackedRoots,  # RFC-0009 A5b-ii
+      )
+      # RFC-0005 B2b/L2: override BEFORE realSeams closes over `rt` —
+      # realSeams' own store closure reads `rt.sink` (its embedded copy),
+      # so the swap must happen here, not on the CacheContext built below
+      # (that sink only reaches lookupAtPlan's hit/miss emission, the READ
+      # side). Unconditional (`warnSink`, not `if statsSink != nil`) since
+      # L2: the per-tier error warning needs real events collected on
+      # every run, not only under --cache-stats.
+      rt.sink = warnSink.sink()
+      cacheEnabled(spec,
+        CachePolicy(enabled: true),
+        realSeams(keyCtx, addr graph, rt),
+        rt.sink,          # RFC-0005 B2a/L2: always `warnSink` now (statsSink's own
+                          # collector when --cache-stats is on, else a dedicated one)
+        realPrefetch(rt), # RFC-0005 C3c: resolves each canProbe tier's key-existence set once
+        # RFC-0005 SO1 fix: the run's resolved reporting policy, threaded to
+        # the cache's serve-side recompute (lookupAtPlan/consultPostCompile)
+        # so a strict-hygiene run never serves what it would itself report
+        # as failed — see CacheContext.outcomePolicy's own doc comment
+        # (cachedispatch.nim) and the `let policy = ...` comment further
+        # down this proc for why this is built here too, ahead of execute().
+        outcomePolicy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene))
+
+  # rfc-0007 A1e-ii: CrisolInterrupted is retired — `interrupted`/`notStartedCount`
+  # come off execute()'s returned ExecuteReport (code-review r7: no longer
+  # ptr out-params) rather than being caught as an exception; a SIGINT/
+  # SIGTERM no longer unwinds this call at all.
+  var interrupted     = false
+  var notStartedCount = 0
+  var shutdownSignum  = 0  # rfc-0007 A2b: the real signum execute()'s own Supervisor observed
+  var lateOrphansReaped = 0  # rfc-0007 B1: from execute()'s ExecuteReport
+  var runWarnings: seq[ConfigWarning]  # R18-D1: execute()'s run-time advisories
+
+  # R12-D3: the last planning-side check. A signal after it, before
+  # execute()'s Supervisor is attached, is replayed to that Supervisor
+  # (`tooltrees.attachInterruptWake`), so execute() reports it.
+  if opts.installSignals and shutdownRequested().isSome:
+    releaseLock(lockHandle)
+    return interruptedInPlan(pr, shutdownRequested().get.signum)
+
+  try:
+    # rfc-0007 code-review r7: ONE `execute()` call, ONE local (`execReport`)
+    # holding every fact it reported — `results`/`memThrottled`/`interrupted`/
+    # `notStartedCount`/`shutdownSignum`/`lateOrphansReaped` are all read off
+    # it right below, in one place, rather than pre-declaring a local per
+    # fact and passing `addr` of each (the old shape r7 flags: a caller that
+    # forgot one silently lost it — see r33, fixed on the `execute()` side).
+    let execReport = execute(
+      pv.plan,
+      config             = cfg,
+      graph              = graph,
+      nimVersion         = nimVer,
+      onResult           = cb,
+      failFast           = opts.failFast,
+      showProgress       = opts.showProgress,
+      progressIntervalMs = opts.progressIntervalMs,
+      installSignals     = opts.installSignals,
+      cache              = cacheCtx,
+      explainMiss        = cfg.explainMiss,  # RFC-0005 B1c: resolved (CLI OR config,
+                                              # already merged by planImpl above)
+      toolchain          = impl.toolchain,  # R12-D4: the plan's probe and identity
+    )
+    results           = execReport.results
+    memThrottled      = execReport.memThrottled
+    interrupted       = execReport.interrupted
+    notStartedCount   = execReport.notStarted
+    shutdownSignum    = execReport.shutdownSignal
+    lateOrphansReaped = execReport.lateOrphansReaped
+    runWarnings       = execReport.warnings
+  except CrisolError as e:
+    releaseLock(lockHandle)
+    let code = if e.kind == cekInternal: 2 else: 3
+    return structuralResultWithPlan(e.msg, code, pr)
+  except Exception as e:
+    releaseLock(lockHandle)
+    return structuralResultWithPlan("unexpected error during execute: " & e.msg, 2, pr)
+
+  try:
+    # RFC-0005 B0/A3c-ii: flush queued remote puts at the end-of-run join
+    # point — after the poll loop drains (execute() just returned), before
+    # persistLastRun (RFC "Deferred remote puts"). `rt.pending` is empty for
+    # the common single-tier (no remote configured) run — `realSeams.store`
+    # only ever queues an entry when a remote tier actually exists — so this
+    # is a no-op there, never touching `drainPending` at all. `rt` is nil
+    # whenever `cacheOn` is false, so `cacheOn` guards the dereference.
+    #
+    # RFC-0005 code-review SO2: `not interrupted` mirrors the `persistLastRun`
+    # gate further down this proc verbatim — an interrupted run's `results`
+    # is an honest PARTIAL set (§2), so queuing MORE network I/O for entries
+    # this run never even finished observing is the wrong thing to do on the
+    # way out, exactly like persisting would be. `abandoned` covers the
+    # OTHER half of SO2: a shutdown signal that arrives DURING this drain
+    # itself, on an otherwise-uninterrupted run (`interrupted == false` —
+    # execute() already returned normally) — `signals.shutdownRequested()` is
+    # the SAME level-triggered query the plan-time prefetch/consult loops
+    # already use for exactly this "abandon more I/O on a pending shutdown"
+    # purpose (cachetier.nim's own doc comment). It reads this call's own
+    # interrupt scope (open here whenever `opts.installSignals`), never a
+    # signal left over from an earlier run (R13-D2).
+    if cacheOn and not interrupted and rt.pending.len > 0:
+      let flushVerdicts = rt.cache.drainPending(rt.pending, DefaultDeferredPutBudget,
+        abandoned = proc(): bool = signals.shutdownRequested().isSome)
+      for v in flushVerdicts:
+        # Tier "l1" was already accounted for synchronously at finalize
+        # (cachedispatch.realSeams.store's own tekPublish/tekRemoteErr) —
+        # drainPending's full fan-out re-puts to it too (idempotent — last-
+        # writer-wins among validly-attested entries is sound, RFC
+        # "Integrity") but must not be double-counted in telemetry here.
+        if v.tier == "l1": continue
+        if v.verdict == cvOk:
+          rt.sink.emit(TelemetryEvent(kind: tekPublish, publishedTo: v.tier))
+        elif v.verdict in transportVerdicts:
+          rt.sink.emit(TelemetryEvent(kind: tekRemoteErr, putTier: v.tier,
+                                      putVerdict: v.verdict))
+      rt.pending.setLen(0)
+
+    # rfc-0007 A6b: the ONE resolved OutcomePolicy for this run, built from
+    # cfg.strictHygiene (CLI flag OR config-file, already merged by planImpl
+    # above) — recomputed at every REPORTING trust boundary from here on
+    # (summarize -> exit code; render/JSON/junit/lastrun.json below via
+    # rr.plan.settings.strictHygiene). RFC-0005 SO1 fix: the cache's SERVE-side
+    # recompute (cachedispatch.lookupAtPlan/consultPostCompile) ALSO reads this
+    # same resolved value now — see the `cacheEnabled(..., outcomePolicy = ...)`
+    # call further up this proc, which builds an equal `OutcomePolicy` from the
+    # same `cfg.strictHygiene` BEFORE `execute()` runs (this `policy` local is
+    # built too late for that call site, hence the duplicate construction, not
+    # a second independent resolution). The STORE gate
+    # (cachedispatch.shouldStore) and live scheduling decisions (retry
+    # eligibility, quarantine matching, ledger rows) still deliberately never
+    # see it — they stay DefaultPolicy (unstrict), matching the cache's
+    # "publishes unstrict" rule (RFC-0007 §2).
+    let policy = ptypes.OutcomePolicy(strictHygiene: cfg.strictHygiene)
+    var s = summarize(results, policy)
+    # rfc-0007 A1e-ii §2: notStarted is bookkeeping about entries OMITTED from
+    # `results` (never a fold over `results` itself), so it is stamped on here
+    # rather than inside summarize().
+    s.notStarted = notStartedCount
+
+    # C6: Annotate results with regression info (if perf-check is enabled).
+    # r52 (code-review): extracted to `annotatePerfRegressions` above --
+    # see its own doc comment for scope, the r64 ordering guarantee (this
+    # call must precede `doc` assembly below), and why a new module wasn't
+    # warranted.
+    annotatePerfRegressions(results, effectivePerfCheck, pr.settings.stateDir,
+                            cfg.trackedRoots, runStartUs)
+
+    # Persist lastrun.json if requested.
+    # rfc-0007 A1e-ii §2: NEVER on an interrupted run, regardless of
+    # opts.persist (the CLI always passes persist:true) — an entrypoint that
+    # was never observed this run must not silently leave the --failed
+    # selection, so the last COMPLETE run stays the anchor.
+    var compileBlock: JsonNode = nil
+    var reuseAlerts: JsonNode = nil
+    # rfc-0007 code-review r8: the ONE shared run-level record (jsonout.
+    # RunDocument) -- assembled here, where every fact this proc has
+    # computed so far is in scope, and reused for BOTH `persistLastRun`
+    # below (verifyFails/cacheStats not filled in yet -- not known this
+    # early, see RunDocument's and persistLastRun's own doc comments) and
+    # the final `RunReport.doc` further down (verifyFails/cacheStats filled
+    # in once the verify-cache pass and telemetry aggregation below produce
+    # them) -- so the CLI's stdout emission (crisol.nim) needs only
+    # `rr.doc`, not a second hand-threaded argument list duplicating this one.
+    var doc = RunDocument(
+      results:           results,
+      summary:           s,
+      # R18-D1: the plan's warnings, then execute()'s run-time ones (an
+      # unrecorded closure or a failed binary promotion, raised through
+      # `runner.raiseWarning`) -- the
+      # latter reach the `--json` `warnings` array and a library host's
+      # `rr.doc.warnings` here, but not `rr.plan.warnings`, which the CLI
+      # writes to stderr (execute() already wrote each of them there once).
+      warnings:          pr.warnings & runWarnings,
+      memThrottledSlots: memThrottled,
+      lateOrphansReaped: lateOrphansReaped,
+      interrupted:       interrupted,
+      policy:            policy,
+      substrate:         process.capabilities(),  # rfc-0007 W3
+      trackedRoots:      cfg.trackedRoots,         # rfc-0007 W3
+    )
+    if opts.persist and not interrupted:
+      # RFC-0006 M-report pass (a): the segmented `compile` block
+      # only carries data when the telemetry stream was actually written
+      # this run -- avoids a needless ledger disk scan on every ordinary
+      # (measurement-off) run.
+      compileBlock =
+        if shouldReportCompileBlock(cfg.measureCompileReuse):
+          # M-report PASS (b2): thread the SAME runStartUs perf-check captured
+          # above (before execute() appended this run's rows) into the
+          # compile-cost stream's own current/history split.
+          compilereport.readCompileBlock(pr.settings.stateDir, runStartUs)
+        else: nil
+      # M-report pass (b1): reuse-check alerting is a SEPARATE, default-OFF
+      # surface from the (unconditional) `compile` measurement block itself --
+      # buildReuseAlerts naturally yields an empty array when cfg.reuseCheck is
+      # disabled or compileBlock is nil (measurement off / no telemetry yet).
+      # rfc-0007 W3: hoisted to the outer `reuseAlerts` local (rather than a
+      # block-scoped `let`) so it also reaches RunReport below -- the CLI's
+      # stdout emission needs the exact same value persistLastRun gets.
+      reuseAlerts = compilereport.buildReuseAlerts(compileBlock, cfg.reuseCheck)
+      doc.compileBlock = compileBlock
+      doc.reuseAlerts  = reuseAlerts
+      # rfc-0007 code-review r16: persistLastRun's own documented contract
+      # (jsonout.nim) is "on any failure: prints a warning to stderr and
+      # returns -- never raises" -- but that contract has exactly one gap:
+      # its OWN warning-write can itself raise (e.g. a closed/broken stderr)
+      # at the moment it tries to report an unwritable persist target (full
+      # disk, read-only state dir, a file sitting where lastrun.json's
+      # directory is expected). This proc's own contract ("never raises for
+      # expected conditions... structural problems are encoded in
+      # RunReport.status/.error") means an environmental persist failure
+      # must not escape as a raw exception and blow up an otherwise-complete
+      # run report -- the lock-release half of that guarantee is the outer
+      # `finally` below; this is the "don't raise" half. Best-effort,
+      # matching the discard-on-CatchableError idiom already used for
+      # stderr writes elsewhere in this module (verifyCachePass's own
+      # warnings, above) -- the run still finishes and reports rsOk with
+      # whatever it produced; only the lastrun.json ARTIFACT is missing,
+      # never the run itself.
+      try:
+        persistLastRun(doc, cfg)
+      except CatchableError as e:
+        try:
+          stderr.write("crisol: warning: could not persist lastrun.json: " & e.msg & "\n")
+        except CatchableError:
+          discard
+
+    # RFC-0005 B3b: the --verify-cache post-run pass. Placement is load-
+    # bearing (RFC "Binary precondition... the pass runs before releaseLock,
+    # after persistLastRun") — strictly AFTER persistLastRun above (so
+    # lastrun.json reflects the main run only; --failed narrowing reads it)
+    # and strictly BEFORE releaseLock below (the stateDir lock is still held,
+    # so `clean` cannot remove the stable binary a sampled `cdmHit` entry's
+    # synthetic plan depends on). Never runs on an interrupted run: a partial
+    # `results`/`pr.entrypoints` pairing would break the index alignment
+    # `buildVerifyPlan`/sampling relies on.
+    # RFC-0005 code-review SO4/R2-D2: calls `verifyCachePass` for its FULL
+    # `VerifyPassResult` (not just `.divergences`) so `couldNotReexec` is
+    # available to thread onto `RunReport` below, alongside `divergences` —
+    # the round-1 `verifyCachePass*` back-compat wrapper that hid this tuple
+    # behind a `seq[VerifyDivergence]`-only return is deleted (R2-D2: it had
+    # no compat obligation and zero production callers).
+    # r29/r67 (r76: comment corrected -- planImpl no longer touches
+    # cfg.verifyCachePct at all, see that arm's own deletion comment):
+    # `opts.verifyCache.pct` may still be the -1 "no override" sentinel
+    # here — `verifyCachePass` resolves it ITSELF against
+    # `cfg.verifyCachePct` (the ONE resolution point, r67/r76 — see that
+    # proc's own doc comment), so this call site passes `opts.verifyCache`
+    # straight through unmodified rather than pre-resolving a second copy.
+    # `cfg.verifyCachePct` carries only loadConfig's plain config-file
+    # default by the time `verifyCachePass` sees it.
+    # r74: `installSignals = opts.installSignals` -- the SAME source the
+    # main run's own `execute()` call above already threads, so a verify
+    # sub-run installs signals (and can therefore be genuinely interrupted)
+    # iff the run containing it does. See verifyCachePass's own doc comment.
+    let verifyPassResult =
+      if opts.verifyCache.enabled and not interrupted:
+        verifyCachePass(results, pr.entrypoints, opts.verifyCache, cfg, graph,
+                        nimVer, impl.toolchain, spec, cacheCtx.sink,
+                        installSignals = opts.installSignals)
+      else: (divergences: newSeq[VerifyDivergence](), couldNotReexec: newSeq[Entrypoint]())
+    let verifyDivergences    = verifyPassResult.divergences
+    let verifyCouldNotReexec = verifyPassResult.couldNotReexec
+
+    # RFC-0005 B2b: aggregate the run's real telemetry (hit/miss/publish/
+    # remote-error events, PLUS verifyCachePass's tekVerifyFail above, since
+    # both were emitted through the SAME statsSink) against this run's actual
+    # per-result cacheDecisions. A zero-value CacheStats() when statsSink was
+    # never installed (`cfg.cacheStats == false`) -- nothing was collected.
+    # RFC-0005 C-dep rider: paired with cacheTier so the fold can be
+    # tier-granular (l1Hits vs remoteHits) instead of folding every hit into
+    # l1Hits -- see cachetelemetry.DecisionTier / aggregateCacheStats.
+    let cacheStats =
+      if statsSink != nil:
+        aggregateCacheStats(statsSink.events,
+                            results.mapIt((decision: it.cacheDecision, tier: it.cacheTier)))
+      else: CacheStats()
+
+    # RFC-0005 B2b/L2: "crisol additionally writes a stderr warning when a
+    # configured remote tier errored on every call in a run" (RFC "Hit-rate
+    # telemetry") is UNCONDITIONAL, per the RFC's own wording -- not gated on
+    # --cache-stats. `warnSink` (built above) always has real events
+    # regardless of `cfg.cacheStats`, so this loop is no longer conditional
+    # on `statsSink`. Unconditional stderr like every other warning in this
+    # codebase (no --quiet exists) — writes to stderr in BOTH --json and
+    # human modes (run/v2 owns stdout in --json mode). See
+    # cachetelemetry.erroredTiers's doc for the scope note on "remote" vs.
+    # today's single "l1" tier. When --cache-stats IS on, `warnSink` and
+    # `statsSink` are the SAME `InMemorySink` instance (see `warnSink`'s own
+    # doc comment above) — this fold sees the SAME event list `cacheStats`
+    # above was aggregated from, never a second, independently-collected
+    # copy, so a tripped tier is reported here exactly once.
+    # r62: `warnStderr`, not a bare `stderr.write` -- this proc's contract
+    # is "never raises for expected conditions"; a closed/broken stderr
+    # must not turn an expected per-tier warning into an escaping exception
+    # (this loop IS inside the outer try/finally, so `releaseLock` would
+    # still run on a bare write's raise, but the raise would still escape
+    # `runTestsWith` itself, same class of contract violation as the
+    # MinSafeRlimitAs site above).
+    for terr in erroredTiers(warnSink.events):
+      warnStderr("crisol: warning: " & tierErrorWarning(terr) & "\n")
+
+    # rfc-0007 code-review r8: `doc` (assembled above, before persistLastRun)
+    # only just now has everything it was missing at persist time -- fill in
+    # the two facts that were temporally unavailable until this point (see
+    # RunDocument's/persistLastRun's own doc comments for why) so `RunReport.
+    # doc` below is the COMPLETE record, not the partial one persistLastRun saw.
+    # r78 (code-review): this is the SOLE sync point between `verifyDivergences`
+    # (the real field, RunReport's own doc comment above) and `doc.verifyFails`
+    # (its derived int projection) -- see that comment for why this one
+    # assignment is not a second copy of the same fact.
+    doc.verifyFails = verifyDivergences.len
+    doc.cacheStats  = cacheStats
+
+    # rfc-0007 A1e-ii: an interrupted run still returns through this ONE
+    # normal-return path (no more early exception-driven return above) — only
+    # the status/exitCode/interrupted trio differ; results/summary already
+    # carry §2's honest partial emission set.
+    # r64 (code-review): summary/results/memThrottledSlots/
+    # lateOrphansReaped/compileBlock/reuseAlerts/interrupted/cacheStats/
+    # trackedRoots are no longer set here individually — `doc` (assembled
+    # above, and completed by the two assignments just above this comment)
+    # is their SOLE storage address now; the accessor procs on RunReport
+    # read straight through it. Setting them here too would just be a
+    # SECOND write to the same fact, exactly the duplication r64 removed.
+    return RunReport(
+      plan:              pr,
+      status:            if interrupted: rsInterrupted else: rsOk,
+      exitCode:          if interrupted: 128 + shutdownSignum
+                          else: exitCode(s, opts.failOnFlaky),  # B1: flaky-pass gating
+      verifyDivergences: verifyDivergences,
+      verifyCouldNotReexec: verifyCouldNotReexec,  # RFC-0005 code-review SO4
+      doc:               doc,  # rfc-0007 code-review r8
+    )
+  finally:
+    releaseLock(lockHandle)
+
+proc runTestsWith*(opts: RunOptions; deps: RunDeps): RunReport =
+  ## Full run facade.  Returns outcomes; never raises for expected conditions.
+  ## Structural problems are encoded in RunReport.status / .error / .exitCode.
+  ##
+  ## Flow on rsOk path:
+  ##   [acquireLock if opts.manageLock]
+  ##   → planTests(opts) (CATCHES CrisolError → rsStructural)
+  ##   → zero-runnable mapping (per RFC-0003 error table)
+  ##   → execute (installSignals = opts.installSignals) → summarize
+  ##   → [persistLastRun if opts.persist]
+  ##   → map exitCode (0 all-passed / 1 any-failure)
+  ##
+  ## Lock released explicitly on EVERY exit branch (success / structural / interrupt).
+  ## rfc-0007 A1e-ii: SIGINT/SIGTERM → rsInterrupted, `interrupted: true`,
+  ##   exitCode = 128 + signum. CrisolInterrupted is retired — execute()
+  ##   returns normally with §2's emission set: `results`/`summary` are
+  ##   populated (not empty), `onResult` already fired for every killed
+  ##   final, and an interrupt observed by the time execution ends skips
+  ##   `persistLastRun` (one that lands after it: R13-D1 below).
+  ## rfc-0007 A2b, R12-D3, R13-D2: the interrupt record is the interrupt
+  ## scope's (`tooltrees.shutdownRequested`), not a process-lifetime flag:
+  ## the outermost scope, which this call opens with `opts.installSignals`,
+  ## clears it when it opens and takes it out when it closes, so a call
+  ## never starts with an earlier call's signal pending. execute()'s per-call Supervisor
+  ## attaches its wake to this scope and starts with an empty
+  ## pending-shutdown queue.
+  ##
+  ## R12-D3: with `opts.installSignals`, this call owns SIGINT/SIGTERM from
+  ## its first act to its return (`tooltrees.enterInterruptScope`): one
+  ## handler, for planning and execution alike. It kills every live bounded
+  ## tool (each runs in a process group or Job Object of its own, out of
+  ## reach of the signal the host received) and, once execute()'s Supervisor
+  ## is attached, drives its graceful shutdown as before. An interrupt while
+  ## planning (nim discovery, the cc probe, git) returns promptly as
+  ## `rsInterrupted` (`interrupted` true, exitCode 128 + signum, no lock
+  ## taken, nothing persisted, nothing run); the host process is never
+  ## exited. The host's prior handlers are restored when this returns.
+  ##
+  ## R13-D1, R14-S1: the interrupt verdict is taken ONCE, at the end, from
+  ## the scope's own leave (`tooltrees.leaveInterruptScope` answers the
+  ## signal it swaps out, so none can land between a last read and the
+  ## clear): whatever the body reports, a signal the scope observed at any
+  ## point of the call
+  ## (planning, execution, the zero-runnable returns, the cache drain,
+  ## persistence, reporting, the verify sub-run) turns the report into
+  ## `rsInterrupted` with exit code 128 + the signal, keeping its plan and
+  ## results (`markInterrupted`). The body's own checks are early exits only.
+  ## A signal that lands after `persistLastRun` leaves that run's
+  ## lastrun.json in place: every result in it was observed. The signal is
+  ## not re-raised to the host's disposition: the report is its delivery (a
+  ## library must not kill its host). Without `opts.installSignals` this call
+  ## owns no signal and never reports one.
+  doAssert deps.ccProbe != nil,
+    "runTestsWith: RunDeps.ccProbe must be set (productionRunDeps installs the real probe)"
+  # R12-D3: own the signals from the first act, before anything is resolved,
+  # planned or spawned; the matching leave (on every return path, including
+  # an exception's unwind) restores the host's handlers.
+  if not opts.installSignals:
+    return runTestsBody(opts, deps)
+  enterInterruptScope()
+  var sig: Option[ShutdownSignal]
+  try:
+    result = runTestsBody(opts, deps)
+  finally:
+    sig = leaveInterruptScope()
+  if sig.isSome: result = markInterrupted(result, sig.get.signum)

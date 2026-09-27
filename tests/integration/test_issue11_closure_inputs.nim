@@ -7,7 +7,7 @@
 ## is textually merged into its includer) was therefore invisible: editing it
 ## neither triggered a recompile (planner.decideCompile's closure content
 ## hash only covers closure files) nor got selected under `--changed`
-## (narrow.selectByDiff intersects the git diff with the closure).
+## (`narrow.narrowByDiff` selected an entry only through its closure).
 ##
 ## Fix: compile with `-d:nimBetterRun` (compiledriver.nimCompileArgs), which
 ## makes Nim write a `depfiles` array into the manifest naming EVERY file it

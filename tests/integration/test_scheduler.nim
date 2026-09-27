@@ -18,6 +18,7 @@ import crisol/types
 import crisol/runner
 import "../support/testep"
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -58,7 +59,7 @@ proc runPlan(eps: seq[Entrypoint]; jobs: int;
   )
   let p   = plan(cfg, eps, emptyDepGraph())
   var g   = emptyDepGraph()
-  execute(p, config = cfg, graph = g).results
+  execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
 
 # ---------------------------------------------------------------------------
 # Suites

@@ -30,6 +30,7 @@
 import std/[options, os, sets, strutils, tables, times, unittest]
 import crisol/[types, runner, depgraph, closure]
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -91,21 +92,21 @@ suite "nimcache-persistence — REUSE (real compile)":
     let cfg = makeCfg(root)
     let ep  = stageEp(root)
 
-    let toolchainFp = toolchainFingerprint("nim-test-v1", "cc-test-v1")
+    let toolchainFp = toolchainFingerprint("nim-test-v1", fakeToolchain("cc-test-v1").identity)
     let expectedCacheDir = cachePath(ep, cfg, toolchainFp)
     let key = (string(ep.tp.display()), flagHash(ep.flags))
 
     # initDepGraph (not emptyDepGraph, which stamps header.nimVersion = "")
-    # so the graph's header matches the nimVersion given to plan()/execute()
+    # so the graph's header matches the nimVersion given to execute()
     # below — mirrors real callers, who construct the initial graph via
     # loadDepGraph(cfg, actualNimVersion) — and lets loadDepGraph(cfg,
     # "nim-test-v1") below see the persisted entries.
     var graph = initDepGraph("nim-test-v1")
-    let plan1 = plan(cfg, @[ep], graph, nimVersion = "nim-test-v1")
+    let plan1 = plan(cfg, @[ep], graph)
     check plan1.entrypoints[0].edecision == edNeverBuilt
 
     let results1 = execute(plan1, config = cfg, graph = graph,
-                           nimVersion = "nim-test-v1", ccVersion = "cc-test-v1",
+                           nimVersion = "nim-test-v1", toolchain = fakeToolchain("cc-test-v1"),
                            showProgress = false).results
     check results1.len == 1
     check results1[0].outcome == oPassed
@@ -141,12 +142,12 @@ suite "nimcache-persistence — REUSE (real compile)":
     # persistent nimcache, marks everything Cached, and emits an empty
     # `compile` array in the nimcache's `<name>.json` — extractClosure must
     # still recover the full closure (falling back to the `link` array).
-    let plan2 = plan(cfg, @[ep], graph, nimVersion = "nim-test-v1",
+    let plan2 = plan(cfg, @[ep], graph,
                      forceCompile = true)
     check plan2.entrypoints[0].edecision == edStale
 
     let results2 = execute(plan2, config = cfg, graph = graph,
-                           nimVersion = "nim-test-v1", ccVersion = "cc-test-v1",
+                           nimVersion = "nim-test-v1", toolchain = fakeToolchain("cc-test-v1"),
                            showProgress = false).results
     check results2.len == 1
     check results2[0].outcome == oPassed
@@ -185,8 +186,8 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     let cfg = makeCfg(root)
     let ep  = stageEp(root)
 
-    let oldCacheDir = cachePath(ep, cfg, toolchainFingerprint("nim-v1", "cc-OLD"))
-    let newCacheDir = cachePath(ep, cfg, toolchainFingerprint("nim-v1", "cc-NEW"))
+    let oldCacheDir = cachePath(ep, cfg, toolchainFingerprint("nim-v1", fakeToolchain("cc-OLD").identity))
+    let newCacheDir = cachePath(ep, cfg, toolchainFingerprint("nim-v1", fakeToolchain("cc-NEW").identity))
     check oldCacheDir != newCacheDir  ## precondition: the fingerprint really changes the path
 
     # LINEAGE (cite by grep anchor -- line numbers in this repo rot within a
@@ -207,10 +208,10 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     # loadDepGraph-sourced graph would) -- not `emptyDepGraph()`'s "" -- so
     # the reload below observes a genuine ccVersion mismatch rather than a
     # coincidental nimVersion one.
-    var graph = initDepGraph("nim-v1", "cc-OLD")
-    let plan1 = plan(cfg, @[ep], graph, nimVersion = "nim-v1", ccVersion = "cc-OLD")
+    var graph = initDepGraph("nim-v1", fakeToolchain("cc-OLD").identity)
+    let plan1 = plan(cfg, @[ep], graph)
     let results1 = execute(plan1, config = cfg, graph = graph,
-                           nimVersion = "nim-v1", ccVersion = "cc-OLD",
+                           nimVersion = "nim-v1", toolchain = fakeToolchain("cc-OLD"),
                            showProgress = false).results
     check results1[0].outcome == oPassed
     check dirExists(oldCacheDir)
@@ -221,7 +222,7 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     # below can only be the cc change.
     let key = (string(ep.tp.display()), flagHash(ep.flags))
     var sameToolchainDiscard: DepGraphDiscard
-    let sameToolchain = loadDepGraph(cfg, "nim-v1", sameToolchainDiscard, "cc-OLD")
+    let sameToolchain = loadDepGraph(cfg, "nim-v1", sameToolchainDiscard, fakeToolchain("cc-OLD").identity)
     check sameToolchainDiscard.kind == dgdNone
     check key in sameToolchain.entries
 
@@ -238,13 +239,13 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     # dgdCcVersion and hand back an empty graph stamped with the REQUESTED
     # toolchain (cc-NEW).
     var upgradeDiscard: DepGraphDiscard
-    var graph2 = loadDepGraph(cfg, "nim-v1", upgradeDiscard, "cc-NEW")
+    var graph2 = loadDepGraph(cfg, "nim-v1", upgradeDiscard, fakeToolchain("cc-NEW").identity)
     check upgradeDiscard.kind == dgdCcVersion      ## not dgdNimVersion, not dgdNone
-    check upgradeDiscard.stored == "cc-OLD"
-    check upgradeDiscard.current == "cc-NEW"
+    check upgradeDiscard.stored == fakeToolchain("cc-OLD").identity
+    check upgradeDiscard.current == fakeToolchain("cc-NEW").identity
     check graph2.entries.len == 0                  ## discarded, not merely re-stamped
     check key notin graph2.entries
-    check graph2.header.ccVersion == "cc-NEW"      ## stamped with the LIVE toolchain
+    check graph2.header.ccVersion == fakeToolchain("cc-NEW").identity      ## stamped with the LIVE toolchain
     check graph2.header.nimVersion == "nim-v1"
 
     # ...and planning against that emptied graph is a REBUILD. The value is
@@ -253,10 +254,10 @@ suite "nimcache-persistence — SOUNDNESS (toolchain change ⇒ cold, no stale r
     # `grep -n "proc binPath\*" src/crisol/planner.nim` -- so run 1's stable
     # binary is still there; it is step 2, "no closure record in dep graph"
     # (cdStale -> edStale), that the emptied graph lands on.
-    let plan2 = plan(cfg, @[ep], graph2, nimVersion = "nim-v1", ccVersion = "cc-NEW")
+    let plan2 = plan(cfg, @[ep], graph2)
     check plan2.entrypoints[0].edecision == edStale
     let results2 = execute(plan2, config = cfg, graph = graph2,
-                           nimVersion = "nim-v1", ccVersion = "cc-NEW",
+                           nimVersion = "nim-v1", toolchain = fakeToolchain("cc-NEW"),
                            showProgress = false).results
     check results2[0].outcome == oPassed
 
@@ -280,16 +281,16 @@ suite "nimcache-persistence — STABLE ACROSS PLAN POSITION (the --changed fix)"
     let ep     = stageEp(root)
     let decoy  = stageEp(root, "env_probe.nim")
 
-    let toolchainFp = toolchainFingerprint("nim-v1", "cc-v1")
+    let toolchainFp = toolchainFingerprint("nim-v1", fakeToolchain("cc-v1").identity)
     let expectedCacheDir = cachePath(ep, cfg, toolchainFp)
 
     var graph = emptyDepGraph()
 
     # Run 1: `ep` alone — position 0 of a 1-entry plan (mimics a `--changed`
     # run that narrows to just this entrypoint).
-    let planA = plan(cfg, @[ep], graph, nimVersion = "nim-v1")
+    let planA = plan(cfg, @[ep], graph)
     let resultsA = execute(planA, config = cfg, graph = graph,
-                           nimVersion = "nim-v1", ccVersion = "cc-v1",
+                           nimVersion = "nim-v1", toolchain = fakeToolchain("cc-v1"),
                            showProgress = false).results
     check resultsA[0].outcome == oPassed
     check dirExists(expectedCacheDir)
@@ -301,11 +302,11 @@ suite "nimcache-persistence — STABLE ACROSS PLAN POSITION (the --changed fix)"
     # (mimics a full-suite run, or a differently-narrowed `--changed` set,
     # where this same entrypoint lands at a different index). Force the
     # recompile so spawnCompileStable actually runs again for `ep`.
-    let planB = plan(cfg, @[decoy, ep], graph, nimVersion = "nim-v1",
+    let planB = plan(cfg, @[decoy, ep], graph,
                      forceCompile = true)
     check planB.entrypoints[1].ep.tp.display() == ep.tp.display()
     let resultsB = execute(planB, config = cfg, graph = graph,
-                           nimVersion = "nim-v1", ccVersion = "cc-v1",
+                           nimVersion = "nim-v1", toolchain = fakeToolchain("cc-v1"),
                            showProgress = false).results
     check resultsB.len == 2
     check resultsB[1].outcome == oPassed  # ep's result, at its plan index (1)
@@ -332,13 +333,13 @@ suite "nimcache-persistence — a failed compile does not leave a corrupt persis
     let cfg = makeCfg(root)
     let ep  = stageEp(root, "fail_compile.nim")
 
-    let toolchainFp = toolchainFingerprint("nim-v1", "cc-v1")
+    let toolchainFp = toolchainFingerprint("nim-v1", fakeToolchain("cc-v1").identity)
     let expectedCacheDir = cachePath(ep, cfg, toolchainFp)
 
     var graph = emptyDepGraph()
-    let planA = plan(cfg, @[ep], graph, nimVersion = "nim-v1")
+    let planA = plan(cfg, @[ep], graph)
     let resultsA = execute(planA, config = cfg, graph = graph,
-                           nimVersion = "nim-v1", ccVersion = "cc-v1",
+                           nimVersion = "nim-v1", toolchain = fakeToolchain("cc-v1"),
                            showProgress = false).results
     check resultsA[0].outcome == oCompileFailed
     check not dirExists(expectedCacheDir)  ## M15: wiped on genuine compile failure
@@ -367,11 +368,11 @@ suite "nimcache-persistence — rare same-entrypoint-twice-in-plan duplicate":
     # Build the plan directly with two identical entries — bypassing
     # discover()'s within-group dedup to exercise the rare cross-group
     # duplicate shape end to end.
-    let planDup = plan(cfg2Jobs, @[ep, ep], graph, nimVersion = "nim-v1")
+    let planDup = plan(cfg2Jobs, @[ep, ep], graph)
     check planDup.entrypoints.len == 2
 
     let results = execute(planDup, config = cfg2Jobs, graph = graph,
-                          nimVersion = "nim-v1", ccVersion = "cc-v1",
+                          nimVersion = "nim-v1", toolchain = fakeToolchain("cc-v1"),
                           showProgress = false).results
     check results.len == 2
     check results[0].outcome == oPassed

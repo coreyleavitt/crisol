@@ -56,8 +56,10 @@
 ##    each, `normalize()` + `ccIncludeClosure()` + `artifactKeyHash()`, then
 ##    append one `ArtifactRow` to the artifact ledger under `plan.stateDir`.
 ##    ANY error in this step (manifest parse, cc -M failure, ledger I/O) is
-##    caught, logged to stderr, and does NOT change the exit code — a
-##    measurement-layer failure must never fail a compile that actually
+##    caught, warned on stderr for the parent to relay after a successful
+##    compile (`workerplan.measureWorkerWarnings`; a skipped unit also
+##    counts toward one closing summary line, R11-L6), and does NOT change
+##    the exit code — a measurement-layer failure must never fail a compile that actually
 ##    produced a runnable binary (RFC-0006's escape-hatch philosophy; this
 ##    describes the MEASURE-mode worker above).
 ## 5. Also on a successful compile, attempt to RECORD ONE compile-cost row
@@ -78,6 +80,7 @@
 
 import std/[options, os, tables, times]
 import crisol/types
+import crisol/toolrun   # realRunIn: the header probe's explicit cwd (R11-D6)
 import crisol/keys
 import crisol/paths   # RFC-0009 A5b-ii: TrackedRoots/fromCanonical/keyBytes
                        # to reconstruct this re-exec'd worker's entrypoint
@@ -89,6 +92,7 @@ import crisol/artifactid
 import crisol/artifactledger
 import crisol/compilecost
 import crisol/workerplan
+from crisol/headerprobe import siteResolver   # R10-S6: the plan's driver site, resolved per token
 
 # ---------------------------------------------------------------------------
 # planRoots — the wire plan's own project-only TrackedRoots, shared by every
@@ -102,7 +106,7 @@ proc planRoots(plan: MeasurePlan): TrackedRoots =
   ## (`workerplan.nim`) carries `projectRoot` but no configured dep-root
   ## specs at all, so a dep root can never be reconstructed here: a header
   ## reported under a dep root resolves `pcOutside` (CR3:
-  ## `artifactid.resolveReportedHeaderPath`'s untracked arm — kept, merely
+  ## `artifactid.hashSpelling`'s untracked arm — kept, merely
   ## canonicalized, never case-corrected) rather than `pcTracked`. This is a
   ## PRE-EXISTING wire-format gap, not something this proc papers over — see
   ## `measurePlanIdentity`'s own doc for why a dep-root spec was never needed
@@ -151,7 +155,17 @@ proc measurePlanIdentity(plan: MeasurePlan): IdentityKey =
 # recordArtifactRows — the measurement-recording step
 # ---------------------------------------------------------------------------
 
-proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
+type
+  WorkerWarn* = proc(line: string) {.closure.}
+    ## Where the worker says what it could not do: one line, starting with
+    ## `workerplan.MeasureWarningPrefix`. The real one is the worker's
+    ## stderr, which the parent captures; `workerplan.measureWorkerWarnings`
+    ## reads the lines back out for it to relay (R11-L6).
+
+proc stderrWarn(line: string) =
+  stderr.write(line & "\n")
+
+proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans; warn: WorkerWarn) =
   ## Compute + append one ArtifactRow per reusable unit (every generated
   ## unit in the manifest EXCEPT the entry unit — §Soundness invariant: the
   ## entry unit carries NimMain/whole-program init and stays private, never
@@ -164,6 +178,11 @@ proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
   ## warning) — the try/except here is defense-in-depth for
   ## `parseCompileManifest` (which DOES raise on a missing/malformed
   ## manifest) and any unexpected `readFile`/`getFileSize` failure.
+  ##
+  ## Every unit it cannot record is a `warn` line naming the unit and why,
+  ## and when any was skipped one closing line says how many of the
+  ## reusable units the ledger is missing (R11-L6): a skipped unit is
+  ## never dropped from the ledger silently.
   let manifestPath = plan.nimcacheDir / plan.outputBinPath.extractFilename & ".json"
   let manifest = parseCompileManifest(manifestPath)
   let entryBasename = entryUnitBasename(plan.entrypointAbsPath)
@@ -177,34 +196,50 @@ proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
     ## (this module's/artifactid's own unit tests) deliberately passes an
     ## explicit, unpopulated `TrackedRoots()` instead -- `roots` has had no
     ## default since CR10.
+  let driver = siteResolver(plan.driverSite)
+    ## R10-S6: every unit's own driver token (the C driver for a `.c` unit,
+    ## the C++ driver for a `.cpp` one) resolved against the site the
+    ## parent learned, once per token for this worker.
+  let probeRun = realRunIn(plan.projectRoot)
+    ## The header probe runs in the project root, named here rather than
+    ## inherited from this worker's own cwd (R11-D6): `roots` classifies a
+    ## relative reported header against `plan.projectRoot`, so the probe
+    ## must resolve it from there too (as `closure.extractCompileInputs`
+    ## does).
   let nowUs = int64(epochTime() * 1_000_000)
 
   var led = openArtifactLedger(plan.stateDir)
   defer: closeArtifactLedger(led)
 
+  var reusable, skipped = 0
+
   for pair in manifest.compile:
     let basename = pair.cPath.extractFilename
     if basename == entryBasename:
       continue  # entry unit stays private — never keyed (soundness invariant)
+    inc reusable
 
     var rawContent: string
     try:
       rawContent = readFile(pair.cPath)
     except CatchableError as e:
-      stderr.write("crisol: warning: measure-compile: could not read '" &
-                   pair.cPath & "' for artifact identity: " & e.msg & "; skipping\n")
+      warn(MeasureWarningPrefix & "could not read '" &
+           pair.cPath & "' for artifact identity: " & e.msg & "; skipping")
+      inc skipped
       continue
 
     let normalized = normalize(rawContent, knownStrings)
     let normalizedCcCmd = normalize(pair.ccCmd, knownStrings)
-    let closureRes = ccIncludeClosure(pair.ccCmd, roots = roots)
+    let closureRes = ccIncludeClosure(pair.ccCmd, roots = roots,
+                                      driver = driver, run = probeRun)
     if not closureRes.ok:
       # CR3/W9c: names the ACTUAL probe family and the specific
       # `ClosureProbeError` arm — never a hard-coded "cc -M" (wrong for an
       # MSVC unit) collapsing three distinct MSVC failure shapes into one
       # indistinguishable message.
-      stderr.write("crisol: warning: measure-compile: " & closureRes.errMsg &
-                   " for '" & basename & "'; skipping\n")
+      warn(MeasureWarningPrefix & closureRes.errMsg &
+           " for '" & basename & "'; skipping")
+      inc skipped
       continue
 
     var sizeBytes: int64 = 0
@@ -225,12 +260,17 @@ proc recordArtifactRows(plan: MeasurePlan; spans: CompileSpans) =
       ccTimeUs:           spans.ccUnitTimesUs.getOrDefault(basename, 0),
       # W9l: passed IN from the plan, never re-probed here -- see
       # workerplan.MeasurePlan.toolchainFp's doc for why this worker must
-      # not import ccidentity/call cachedCcVersion() itself.
+      # not import ccidentity or re-probe the toolchain itself.
       toolchainFp:        plan.toolchainFp,
       timestamp:          nowUs,
       rowVersion:         currentArtifactRowVersion,
     )
     append(led, row)
+
+  if skipped > 0:
+    warn(MeasureWarningPrefix & plan.entrypointPath & ": " & $skipped &
+         " of " & $reusable & " reusable units were not recorded in the " &
+         "artifact ledger (see the warnings above)")
 
 # ---------------------------------------------------------------------------
 # recordCompileCostRow — the RFC-0006 M-cost-split recording step
@@ -268,9 +308,12 @@ proc recordCompileCostRow(plan: MeasurePlan; spans: CompileSpans) =
 # runMeasureCompileWorker — the worker's main
 # ---------------------------------------------------------------------------
 
-proc runMeasureCompileWorker*(planPath: string): int =
+proc runMeasureCompileWorker*(planPath: string; warn: WorkerWarn): int =
   ## The `--internal-measure-compile <plan.json>` worker main. See module
-  ## doc for the full pipeline and exit-status contract.
+  ## doc for the full pipeline and exit-status contract. Every warning of
+  ## a successful compile goes to `warn` (the real worker's is its stderr,
+  ## `runMeasureCompileWorker(planPath)`); a failure that fails the worker
+  ## is written to stderr, where the parent shows the whole output.
   var plan: MeasurePlan
   try:
     plan = parseMeasurePlan(planPath)
@@ -295,15 +338,19 @@ proc runMeasureCompileWorker*(planPath: string): int =
     return 1
 
   try:
-    recordArtifactRows(plan, spans)
+    recordArtifactRows(plan, spans, warn)
   except CatchableError as e:
-    stderr.write("crisol: warning: measure-compile: artifact-identity " &
-                 "recording failed (binary still built): " & e.msg & "\n")
+    warn(MeasureWarningPrefix & "artifact-identity " &
+         "recording failed (binary still built): " & e.msg)
 
   try:
     recordCompileCostRow(plan, spans)
   except CatchableError as e:
-    stderr.write("crisol: warning: measure-compile: compile-cost " &
-                 "recording failed (binary still built): " & e.msg & "\n")
+    warn(MeasureWarningPrefix & "compile-cost " &
+         "recording failed (binary still built): " & e.msg)
 
   return 0
+
+proc runMeasureCompileWorker*(planPath: string): int =
+  ## The real worker: `runMeasureCompileWorker` warning on stderr.
+  runMeasureCompileWorker(planPath, stderrWarn)

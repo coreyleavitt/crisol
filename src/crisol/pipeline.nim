@@ -2,14 +2,14 @@
 ##
 ## This module is an internal module; the public library entry point is api.nim.
 ## Given a Config and a GroupSelection it runs the full pure plan phase and
-## returns a RunPlanView that api.nim can inspect and feed into execute().
+## returns a RunPlanView that runcore.nim can inspect and feed into execute().
 ##
 ## ## Pipeline invariant
 ##
 ##   discover(cfg, selection)
 ##     → applyGates(discovered, cfg, gateState)
 ##       → [optional narrowing: --failed ∩ failedKeys, --changed ∩ diff]
-##         → plan(cfg, runnable, graph, nimVersion, forceCompile, ccVersion)
+##         → plan(cfg, runnable, graph, forceCompile)
 ##
 ## All steps are pure (no I/O beyond the file-system reads in discover/plan).
 ## The effectful seams — loadGateState, loadDepGraph — are called here once
@@ -30,6 +30,20 @@
 
 import std/[sequtils, sets]
 import crisol/[types, config, discover, depgraph, planner, narrow, shard, order]
+import crisol/ccidentity  # CcProbeContext -- what the C toolchain probe reads
+
+# ---------------------------------------------------------------------------
+# ccProbeContextOf -- the C toolchain probe's view of a configuration
+# ---------------------------------------------------------------------------
+
+proc ccProbeContextOf*(cfg: Config): CcProbeContext =
+  ## What the C toolchain probe reads from a loaded configuration: the project
+  ## root (the discovery compile's cwd), the absolute state directory (its
+  ## scratch space) and the global crisol.kdl flags (which can change the
+  ## compiler Nim selects). The run's plan phase (`runcore.planImpl`) and the
+  ## CLI's `clean` both build the probe's context here.
+  CcProbeContext(projectRoot: cfg.projectRoot, stateDir: stateDirOf(cfg),
+                 flags: cfg.flags)
 
 # ---------------------------------------------------------------------------
 # Public result type
@@ -63,13 +77,14 @@ type
 # surface — that `nimVersion` "flows through `plan` into
 # `planner.toolchainFingerprint` and thence `planner.cachePath`". It does not,
 # and did not when that sentence was written (R4-4, round 4): `plan` has never
-# called either proc, and since R3-8 removed `decideCompile`'s toolchain arms
-# `plan` does not read `nimVersion`/`ccVersion` at all. The persistent-nimcache
+# called either proc, and since R5-24 it does not take `nimVersion`/`ccVersion`
+# at all. The persistent-nimcache
 # key is computed inside `runner.execute` (and `clean.cleanOrphans`) from the
 # `nimVersion`/`ccVersion` arguments THOSE procs are handed directly. The
-# reason to pass a real value here is nonetheless the same one: api.nim feeds
+# reason to pass a real value here is nonetheless the same one: runcore.nim feeds
 # this proc and `execute` the SAME probes (`nimprobe.cachedNimFingerprint()`
-# and `$ccProbe()`, default the memoised `ccidentity.cachedCcFingerprint`), so
+# and the `toolchainwarn.toolchainIdentity` of the `RunDeps.ccProbe`
+# result, in production the memoised `ccidentity.cachedToolchainProbe`), so
 # "" here means a caller is running a real toolchain's compiles against a
 # freshness view that checks no toolchain at all for a ""-stamped graph. A
 # real-stamped graph is discarded once -- `loadDepGraph`'s version-mismatch
@@ -150,7 +165,7 @@ proc buildRunPlan*(
   ##                  freshness checks; threaded to loadDepGraph/plan the
   ##                  same way. REQUIRED (no default) — this is the exact
   ##                  parameter whose "" default let the W3 fix ship dark:
-  ##                  api.nim's only production call site compiled cleanly
+  ##                  runcore.nim's only production call site compiled cleanly
   ##                  while silently never passing a real value, so every real
   ##                  run wrote AND read the dep-graph header with
   ##                  `ccVersion == ""` and depgraph.loadDepGraph's
@@ -159,7 +174,7 @@ proc buildRunPlan*(
   ##                  `depgraph.loadDepGraph`'s discard arms, the
   ##                  dgdNimVersion/dgdCcVersion blocks in
   ##                  tests/unit/test_depgraph.nim, and the end-to-end
-  ##                  tests/integration/test_w3_cc_liveness.nim. (This bullet
+  ##                  tests/integration/test_cc_depgraph_liveness.nim. (This bullet
   ##                  used to point at planner.decideCompile's own cc-version
   ##                  check; round 5's R3-8 removed that check as unreachable,
   ##                  so there is nothing to see there.) Pass "" explicitly
@@ -211,7 +226,7 @@ proc buildRunPlan*(
   # unreadable/malformed file) must be a visible, structured diagnostic —
   # not a silent empty-graph fallback that leaves `run`/`list`/`closure`
   # indistinguishable from "never ran". Reuses the existing ConfigWarning
-  # shape (see api.nim's measure-compile-reuse warning for the precedent of
+  # shape (see runcore.nim's measure-compile-reuse warning for the precedent of
   # a runtime, not config-parse, diagnostic). `key`/`message` are
   # depgraph.nim's single formatting authority for this fact — no case
   # statement here.
@@ -251,7 +266,7 @@ proc buildRunPlan*(
   # deliberately SEPARATE, narrower signal than `cfg.trackedRoots.degraded`:
   # every probe answered definitively this run (nothing genuinely failed),
   # so only the narrowing decision is distrusted — NOT the cache
-  # (api.nim's `not cfg.trackedRoots.degraded` cache gates), NOT dep-graph
+  # (runcore.nim's `not cfg.trackedRoots.degraded` cache gates), NOT dep-graph
   # persistence (RFC-0009 A-degraded D4/D5). fpNone-everywhere (Linux
   # default): `narrow.anyRootFolds` is always false, so this is always
   # false and costs one cheap scan of an (ordinarily empty) set.
@@ -282,7 +297,7 @@ proc buildRunPlan*(
         # RFC-0009 A3b-ii: narrow.nim compares TrackedPath directly (folded
         # membership, the selection-soundness axis) -- `changed` is handed
         # straight through, no adapter.
-        narrowByDiff(gated.run, changed, graph, cfg.trackedRoots, cfg.projectRoot)
+        narrowByDiff(gated.run, changed, graph, cfg.trackedRoots)
       else:
         newSeq[Entrypoint]()
 
@@ -313,7 +328,7 @@ proc buildRunPlan*(
     let resolvedStateDir = stateDirOf(cfg)
     runnable = orderByHistory(runnable, order, resolvedStateDir, cfg.trackedRoots)
 
-  let runPlan = plan(cfg, runnable, graph, nimVersion, forceCompile, ccVersion)
+  let runPlan = plan(cfg, runnable, graph, forceCompile)
   RunPlanView(
     plan:     runPlan,
     gatedOut: gatedEntries,

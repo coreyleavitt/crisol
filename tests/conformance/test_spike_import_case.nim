@@ -134,6 +134,7 @@ suite "RFC-0009 A0-spike — compiler import-case manifest observation":
     if not isCaseInsensitiveVolume(root):
       echo "SPIKE SKIPPED: case-sensitive volume — the `import Widget` " &
            "resolving to on-disk `widget.nim` premise does not hold here"
+      echo "CRISOL-SKIP-TEST: tests/conformance/test_spike_import_case.nim#spike_needs_case_insensitive_volume"
       skip()
     else:
       # S1 — mixed importers, lower module imported first.

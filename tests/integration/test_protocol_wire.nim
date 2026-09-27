@@ -21,6 +21,7 @@ import crisol/runner
 import crisol/depgraph
 import "../support/testep"
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -68,7 +69,7 @@ suite "R1 — protocol wired: OR-rule and records populated":
     let cfg = makeCfg()
     let p   = plan(cfg, @[ep], emptyDepGraph())
     var g   = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g).results
+    let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
     check results.len == 1
     let r = results[0]
     # OR-rule: rsFail record takes precedence over exit 0.
@@ -87,7 +88,7 @@ suite "R1 — protocol wired: OR-rule and records populated":
     let cfg = makeCfg()
     let p   = plan(cfg, @[ep], emptyDepGraph())
     var g   = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g).results
+    let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
     check results.len == 1
     check results[0].records.len > 0
 
@@ -101,7 +102,7 @@ suite "R1 — protocol wired: OR-rule and records populated":
     let cfg = makeCfg()
     let p   = plan(cfg, @[ep], emptyDepGraph())
     var g   = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g).results
+    let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
     check results.len == 1
     check results[0].outcome == oPassed
 
@@ -113,7 +114,7 @@ suite "R1 — protocol wired: OR-rule and records populated":
     let cfg = makeCfg()
     let p   = plan(cfg, @[ep], emptyDepGraph())
     var g   = emptyDepGraph()
-    let results = execute(p, config = cfg, graph = g).results
+    let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
     check results.len == 1
     check results[0].outcome == oFailed
     # No records for opaque fallback.

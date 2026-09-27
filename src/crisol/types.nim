@@ -11,7 +11,7 @@ import std/[algorithm, hashes, options, random, sets]
 # instead and re-exports exactly Outcome + HermeticLevel so every existing
 # `import crisol/types` consumer keeps compiling unchanged. A plain `import`
 # (not the house `from ... import nil` convention used elsewhere — runner.nim,
-# jsonout.nim, api.nim) is needed here: `Outcome`/`HermeticLevel` are used
+# jsonout.nim, runcore.nim) is needed here: `Outcome`/`HermeticLevel` are used
 # unqualified throughout the rest of THIS file, and `export` alone does not
 # bind a name into its own defining module, only into importers. Everything
 # else from process/types (Phase, ProcessResult, OutcomePolicy, ...) is used
@@ -116,7 +116,7 @@ type
                                          ## ``Config.envPins`` (KDL ``env-pin "NAME" "VALUE"``)
                                          ## merged with ``RunOptions.envPins`` (CLI
                                          ## ``--env-pin NAME=VALUE``, repeatable; overrides a
-                                         ## same-named config pin) — see ``api.envPinsFrom``.
+                                         ## same-named config pin) — see ``runcore.envPinsFrom``.
                                          ## Empty by default: NOTHING is pinned unless an
                                          ## operator opts in (RFC-0005 defers default pins).
 
@@ -137,7 +137,7 @@ proc hasAnyOverride*(r: RlimitOverrides): bool =
   ## every `RlimitOverrides` field via `fieldPairs`, same rationale as
   ## `mergeRlimitOverrides` above: a new rlimit kind added to the bundle
   ## needs no new line here. Used at `resolveSandbox`'s one production call
-  ## site (api.nim) to detect the "override requested but --hermetic none
+  ## site (runcore.nim) to detect the "override requested but --hermetic none
   ## drops it on the floor" case and warn loudly instead of silently
   ## no-op'ing.
   for _, v in fieldPairs(r):
@@ -318,11 +318,15 @@ type
     ## each into a `PublicKey` (a config error on a malformed entry) before
     ## handing the decoded `seq[PublicKey]` to `cachetrust.ed25519Policy`;
     ## `config.nim` itself never touches the cache/crypto modules.
-    policy*: string = "none"  ## Nim 2's object-construction default: any `CacheConfig(remotes: ...)`
-                              ## or `TrustConfig(...)` literal that omits `trust`/`policy` (every
-                              ## pre-C4 test fixture, and a KDL doc with no `cache-trust` block)
-                              ## gets the honest "none" default, not an empty string that
-                              ## `buildTrustPolicy` would otherwise have to special-case.
+    policy*: string  ## NO DEFAULT (R7-S7): "none" is the NON-verifying policy, and a
+                     ## trust-gate input must not reach it by omission. The zero value
+                     ## "" means UNSET: `cacheregistry.configuredCache` rejects it with a
+                     ## config error whenever a remote tier is configured (a `file://` or
+                     ## `https://` remote would otherwise be read unverified), and treats
+                     ## it as inert when there is none (the local tier verifies nothing).
+                     ## `config.nim` always sets it -- to "none" when the KDL has no
+                     ## `cache-trust` block, the RFC-0005 default -- so only a
+                     ## `TrustConfig`/`CacheConfig` built in code can leave it unset.
     keyId*:  string
     pinnedKeys*: seq[string]
 
@@ -338,13 +342,9 @@ type
     ## NOT duplicated here -- that would create two sources of truth for
     ## the same value.
     remotes*: seq[RemoteTier]
-    trust*:   TrustConfig   ## RFC-0005 C4: omitted from a `CacheConfig(...)` object-construction
-                            ## literal (every pre-C4 fixture; `config.nim`'s own `docToConfig` when
-                            ## no `cache-trust` block is present), this resolves to `TrustConfig`'s
-                            ## OWN field default (`policy: "none"`) via Nim's nested-default
-                            ## propagation -- NOT an empty string. A bare `var`/zero-initialized
-                            ## `CacheConfig` (never constructed via `CacheConfig(...)`) is the one
-                            ## case that does NOT get this propagation; no code path relies on that.
+    trust*:   TrustConfig   ## RFC-0005 C4. Omitted, its `policy` is "" (unset), which
+                            ## `configuredCache` refuses alongside any remote tier (R7-S7; see
+                            ## `TrustConfig.policy`). `config.nim` always sets it explicitly.
 
   Config* = object
     ## Top-level runtime configuration parsed from the project config file or
@@ -449,7 +449,7 @@ type
                                 ## lastrun.json). RFC-0005 SO1 fix: the cache's SERVE-time recompute
                                 ## (cachedispatch.lookupAtPlan/consultPostCompile, via consultReal)
                                 ## ALSO reads this SAME resolved value now (threaded through
-                                ## CacheContext.outcomePolicy from api.nim's single cacheEnabled call
+                                ## CacheContext.outcomePolicy from runcore.nim's single cacheEnabled call
                                 ## site) — a cache hit is judged by the run's OWN reporting policy,
                                 ## so a strict-hygiene run never serves an entry it would itself
                                 ## report as failed (an unstrict run may still hit that same entry;
@@ -467,7 +467,7 @@ type
                                 ## rfc-0007 wiring-audit W2 / code-review r30: config-declared
                                 ## overrides for the RLIMIT_NOFILE/CPU/AS/FSIZE/CORE family in the
                                 ## hermetic sandbox, carried as ONE `RlimitOverrides` bundle (the
-                                ## same type `resolveSandbox`/`api.rlimitOverridesFrom` already
+                                ## same type `resolveSandbox`/`runcore.rlimitOverridesFrom` already
                                 ## use) instead of five parallel `Option[int64]` fields -- a new
                                 ## rlimit kind is now a field added to `RlimitOverrides` (types.nim)
                                 ## plus its CLI flag / KDL key, not a new field threaded through
@@ -508,7 +508,7 @@ type
                                 ## RFC-0005 A0: NAME=VALUE pairs from repeatable top-level
                                 ## `env-pin "NAME" "VALUE"` KDL nodes. Merged with
                                 ## `RunOptions.envPins` in api.planImpl (CLI pin overrides a
-                                ## same-named config pin; see api.envPinsFrom) before reaching
+                                ## same-named config pin; see runcore.envPinsFrom) before reaching
                                 ## `resolveSandbox`. Empty by default -- nothing pinned unless an
                                 ## operator opts in (§Non-Goals: no default pins in RFC-0005).
     chdirIntoScratch*: bool    ## rfc-0007 code-review r20: config-declared opt-in for
@@ -534,7 +534,7 @@ type
                                 ## api.planImpl before reaching `resolveSandbox`. A passed-through
                                 ## variable's live host VALUE already enters the soundness key via
                                 ## the existing allowlist -> `filterEnv` -> `hermeticEnvHash` path
-                                ## (no separate fold needed -- see api.envPassthroughsFrom's doc).
+                                ## (no separate fold needed -- see runcore.envPassthroughsFrom's doc).
                                 ## Empty by default -- nothing added unless an operator opts in.
     explainMiss*: bool          ## RFC-0005 B1c: resolved --explain-miss / `explain-miss #true`
                                 ## KDL node (config < CLI: api.planImpl strengthens a config
@@ -683,27 +683,27 @@ type
                            ## oPassed — e.g. a derivation/policy change since the
                            ## entry was stored.  Treated as a MISS and rerun; distinct
                            ## from cdmKeyMiss (no entry was found at all).
-    cdmToolchainUnidentified  ## W4 (full fix, RFC-0005 §trust): a fresh pass on
-                           ## attempt 1, fully hermetic — but the host's
-                           ## `CcFingerprint` folds at least one half to a
-                           ## documented sentinel (`ccidentity.toolchainUnsound`),
-                           ## so the SoundnessKey's cc component does not
-                           ## actually distinguish this host's real toolchain
-                           ## from any other host in the same degraded state.
-                           ## Publishing under that key is cross-host cache
-                           ## poisoning by under-invalidation (a different host,
-                           ## a different real compiler/runtime, same folded
-                           ## constant, gets a HIT) — strictly worse than a
-                           ## miss, so the store gate refuses it outright.
-                           ## Distinct from a merely-missing content DIGEST
-                           ## (`ccidentity.CcDigestKind.cdkNone`, e.g. the
-                           ## Windows `cdVersionOnly` profile), which is a
-                           ## legitimate, already-accepted degradation and
-                           ## must NOT trip this decision. The READ path
-                           ## (lookupAtPlan / consultPostCompile) is
-                           ## unaffected — a degraded host may still LOOK UP
-                           ## and legitimately USE an existing entry; only
-                           ## the WRITE is gated. See `cachedispatch.shouldStore`.
+    cdmToolchainUnidentified  ## W4 (RFC-0005 §trust): the cache was OFF for this
+                           ## run because the host's `CcFingerprint` folds at
+                           ## least one half to a documented sentinel
+                           ## (`ccidentity.toolchainVerdict`), so the
+                           ## SoundnessKey's cc component does not distinguish
+                           ## this host's real toolchain from any other host in
+                           ## the same degraded state. Publishing under that key
+                           ## would be cross-host cache poisoning, and no host
+                           ## publishes under it, so a lookup could never hit:
+                           ## the run neither consults nor stores
+                           ## (`cachedispatch.cacheDisabledBecause`), like
+                           ## cdmPolicyDisabled but for a host-level cause.
+    cdmRootsDegraded      ## RFC-0009 §3 degraded mode: the cache was OFF for this
+                           ## run because the case-fold policy of at least one
+                           ## tracked root could not be probed
+                           ## (`TrackedRoots.degraded`), so path identity -- and
+                           ## with it the key's closure component -- is
+                           ## unresolved. The run neither consults nor stores
+                           ## (`toolchainwarn.cacheGate`); the top-level
+                           ## `degraded` object in `--json` carries the probe's
+                           ## reason. Run-level, like cdmToolchainUnidentified.
 
   KeyComponent* = enum
     ## RFC-0005 B1a/B1c: names WHICH of the 10 `KeyInputs` soundness
@@ -1003,16 +1003,6 @@ type
       ## `entries`; the CLI treats that the same as `run`'s zrkAllGated exit-0
       ## branch rather than as "no entrypoints matched".
 
-  SelectionReason* = enum
-    srClosureHit     ## Known fresh closure that intersects `changed` → run it.
-    srUnknownClosure ## Graph present but no entry for this (path, flagHash) key.
-    srStaleEntry     ## Entry exists but a closure file is missing on disk.
-    srOwnFileChanged ## The entrypoint's own source file appears in `changed`.
-    srGraphAbsent    ## The graph is entirely absent/empty — no information at all.
-
-  SelectionResult* = tuple[ep: Entrypoint; reason: SelectionReason]
-    ## A selected entrypoint annotated with why it was included.
-
   ConfigWarning* = object
     ## The structured, non-fatal run-advisory channel: a diagnostic worth
     ## surfacing (stderr AND the `--json` `warnings` array) without failing
@@ -1020,7 +1010,7 @@ type
     ## shared by several unrelated producers, all through this same shape
     ## because `source`/`context`/`key`/`message` are generic enough to carry
     ## any resolved-config-or-runtime fact, not only a config-file-parse one
-    ## (see api.nim's `measure-compile-reuse` comment for the precedent this
+    ## (see runcore.nim's `measure-compile-reuse` comment for the precedent this
     ## set). Current producers (grep `ConfigWarning(` / `makeConfigWarning(`
     ## for the exact call sites, which drift):
     ##   - **Unrecognized/invalid config keys** (`config.nim`, `makeConfigWarning`
@@ -1039,18 +1029,55 @@ type
     ##     set, on a config where some tracked root actively folds, distrusted
     ##     the ASCII-only fold and fell back to the full discovered set for
     ##     this run (RFC-0009 "Risks accepted", NFC/NFD bullet).
-    ##   - **Measure-compile-reuse with no worker binary** (`api.nim`'s
+    ##   - **Measure-compile-reuse with no worker binary** (`runcore.nim`'s
     ##     `planImpl`, `context: "measure-compile-reuse"`) — an explicit
     ##     `--measure-compile-reuse` request silently degrades to the
     ##     monolithic compile path when no worker binary is configured; this
     ##     makes that degradation visible to a `--json` consumer whose stderr
     ##     is swallowed, not only to `runner.nim`'s one-shot stderr write.
+    ##   - **Unrecorded closure** (`runner.nim`'s `finalizeSlot`, via
+    ##     `closureUnrecordedWarning`, `context: "closure-record"`, `key`: the
+    ##     entrypoint) — a freshly compiled entrypoint's closure was not
+    ##     recorded (`retireThenRecordClosure` not-ok: the previous stable
+    ##     binary could not be retired, or extraction/recording failed), so
+    ##     its entry is invalidated, its binary is never promoted, and the
+    ##     next run recompiles. It reports the run's outcome for that
+    ##     entrypoint: raised the moment the recording fails on its last
+    ##     possible attempt, so a run that ends early afterwards (interrupt,
+    ##     spawn failure) still reports it; on an earlier attempt it is held
+    ##     until the entrypoint's final attempt is decided, or the run stops
+    ##     (R20-S1), and a later attempt that records the closure drops it.
+    ##     Only a process killed outright (SIGKILL) loses a held one.
+    ##   - **Failed promotion** (`runner.nim`'s `promoteCompiledBinary`, via
+    ##     `promotionFailedWarning`, `context: "promote-binary"`, `key`: the
+    ##     entrypoint) — a binary whose closure DID record could not be
+    ##     installed at its stable path; the message says what, if anything,
+    ##     is left there and what the next run does.
+    ## The two runner producers go through `runner.raiseWarning`, which
+    ## writes the stderr line and appends to `ExecuteReport.warnings` in
+    ## one step (at most once per context and planned entrypoint; a held
+    ## warning reaches both only when raised);
+    ## `runcore.nim` appends those to the run's `RunDocument.warnings` (the
+    ## `--json` `warnings` array), not to the plan's, since `execute`
+    ## already wrote them to stderr.
     ## The human `message` is composed once at the warning site so neither
     ## the CLI (stderr) nor the JSON schema need to duplicate the formatting.
-    source*:  string   ## config file path; "" = convention fallback
-    context*: string   ## "top-level" or the group name
-    key*:     string   ## the unrecognized node name
-    message*: string   ## fully composed: "unknown config key '<key>' in <context> (ignored)"
+    ## The fields' meaning is per producer (the list above):
+    source*:  string   ## the file the warning is about: the config file
+                       ## (config keys; "" = convention fallback), the dep
+                       ## graph file ("depgraph"); "" for the others
+    context*: string   ## config keys: where the key sat ("top-level", a
+                       ## group name, "cache-trust", "remote-cache <name>",
+                       ## ...); every other producer: its fixed tag
+                       ## ("depgraph", "changed-set-fold",
+                       ## "measure-compile-reuse", "closure-record",
+                       ## "promote-binary")
+    key*:     string   ## what the warning is about: the config node name,
+                       ## the depgraph diagnostic key, "nonAsciiChangedName",
+                       ## "workerBinary", or the entrypoint's display name
+                       ## (the two runner producers)
+    message*: string   ## fully composed human text, e.g. "unknown config
+                       ## key '<key>' in <context> (ignored)"
 
   CrisolErrorKind* = enum
     cekConfig       ## bad config, unknown group, overlapping identical-flag globs
@@ -1063,7 +1090,7 @@ type
   # rfc-0007 A1e-ii: CrisolInterrupted is RETIRED — a SIGINT/SIGTERM is no
   # longer an exception, it is an honest partial result (§2). execute()
   # reports it via the `interruptedOut: ptr bool` out-param instead, and
-  # api.nim's RunReport gains `interrupted: bool` (see api.nim/runner.nim).
+  # runcore.nim's RunReport gains `interrupted: bool` (see runcore.nim/runner.nim).
 
   ResultCallback* = proc(r: EntrypointResult) {.closure.}
     ## Per-entrypoint progress callback.  Called by execute() with the result

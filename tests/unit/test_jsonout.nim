@@ -480,8 +480,8 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
     let node = toJson(@[r], summarize(@[r]))
     check node["entrypoints"][0]["cacheTier"].getStr == "l1"
 
-  test "RFC-0005 A3b: cacheLookup is ABSENT when not consulted (notEligible/groupOptOut/policyDisabled)":
-    for dec in [cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled]:
+  test "RFC-0005 A3b: cacheLookup is ABSENT when not consulted (notEligible/groupOptOut/policyDisabled/toolchainUnidentified)":
+    for dec in [cdmNotEligible, cdmGroupOptOut, cdmPolicyDisabled, cdmToolchainUnidentified]:
       var r = EntrypointResult(ep: makeEp("tests/unit/test_alpha.nim"),
                                compile: okPhase(), run: okPhase(), durationMs: 1,
                                cacheDecision: dec)
@@ -498,7 +498,6 @@ suite "jsonout rfc-0007 A1e-ii — interrupt emission":
       (cdmClosureUnrecorded, cvMiss, "miss"),
       (cdmRecomputeMiss, cvOk, "ok"),
       (cdmStored, cvTrustBadSignature, "trustBadSignature"),  # E2E-A-trust's own case
-      (cdmToolchainUnidentified, cvMiss, "miss"),  # W4 full fix: consulted, refused to store
     ]
     for (dec, verdict, expected) in cases:
       # r41: presence additionally requires the really-consulted signal
@@ -739,6 +738,7 @@ suite "jsonout A8 — cache reporting fields":
     check cacheDecisionString(cdmClosureUnrecorded)     == "closureUnrecorded"
     check cacheDecisionString(cdmRecomputeMiss)         == "recomputeMiss"
     check cacheDecisionString(cdmToolchainUnidentified) == "toolchainUnidentified"
+    check cacheDecisionString(cdmRootsDegraded)         == "rootsDegraded"
 
   test "default-constructed result reports notEligible cacheDecision":
     let node = toJson(syntheticResults(), syntheticSummary())
@@ -1790,8 +1790,8 @@ suite "jsonout M-report (b2) — compile.compileRegressions threading":
 
 suite "jsonout code-review R7 — compile.segments low-confidence-gate fields":
 
-  test "RunSchemaRevision is 26 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors; rev 23: rfc-0005 code-review R2-T8b cacheStats.trustRejects/corruptReads; rev 24: rfc-0007 B1 top-level lateOrphansReaped; rev 25: RFC-0009 A2 top-level trackedRoots array; rev 26: RFC-0009 A-degraded D6 top-level degraded object)":
-    check RunSchemaRevision == 26
+  test "RunSchemaRevision is 27 (rev 12: Stage R removal; rev 13: cacheDecision \"closureUnrecorded\"; rev 14: per-entrypoint flags; rev 15: rfc-0007 A1b advisory exit/cause; rev 16: rfc-0007 A1d-i run/v2 wire cutover; rev 17: rfc-0007 A1d-ii cache replay + cacheDecision \"recomputeMiss\"; rev 18: rfc-0007 A7 top-level substrate node; rev 19: rfc-0005 B3c top-level verifyFails; rev 20: rfc-0005 B1c per-entrypoint keyDiff under --explain-miss; rev 21: rfc-0005 B2b top-level cacheStats under --cache-stats; rev 22: rfc-0005 code-review D1 cacheStats.localErrors; rev 23: rfc-0005 code-review R2-T8b cacheStats.trustRejects/corruptReads; rev 24: rfc-0007 B1 top-level lateOrphansReaped; rev 25: RFC-0009 A2 top-level trackedRoots array; rev 26: RFC-0009 A-degraded D6 top-level degraded object; rev 27: R10-D5 cacheDecision \"rootsDegraded\")":
+    check RunSchemaRevision == 27
 
   test "rfc-0007 A1d-i: compile/run Phase nodes are 'skipped' (no exit/cause) when the result carries no captured phase (back-compat default)":
     ## A default-constructed EntrypointResult's `compile`/`run` Phase default

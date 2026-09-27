@@ -21,6 +21,7 @@ import crisol/types
 import crisol/runner
 import crisol/depgraph
 import "../support/statedir"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # R8-D3: this process's own crisol state dir -- never the repo root's shared
 # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -62,7 +63,7 @@ proc runFixture(fixturePath: string;
                        tp: classify(fixturePath, cfg.trackedRoots).tp)
   let p   = plan(cfg, @[ep], emptyDepGraph())
   var g   = emptyDepGraph()
-  execute(p, config = cfg, graph = g).results
+  execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
 
 const RecA = "known flaky test A"
 const RecB = "known flaky test B"

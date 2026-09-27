@@ -43,6 +43,7 @@ when defined(posix):
   import std/[os, strutils, unittest]
   import crisol/[types, runner, depgraph, sandbox]
   import "../support/testep"
+  import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
   # ---------------------------------------------------------------------------
   # Fixture path helper
@@ -127,7 +128,7 @@ when defined(posix):
       var exceptionCaught = false
       try:
         discard execute(p, config = cfg, graph = g, onResult = bombCb,
-                        showProgress = false, cache = cacheDisabled(spec))
+                        showProgress = false, cache = cacheDisabled(spec), toolchain = unprobedToolchain())
       except ValueError as e:
         if "injected exception" in e.msg:
           exceptionCaught = true
@@ -196,7 +197,7 @@ when defined(posix):
 
       try:
         discard execute(p, config = cfg, graph = g, onResult = exceptionCb,
-                        showProgress = false, cache = cacheDisabled(spec))
+                        showProgress = false, cache = cacheDisabled(spec), toolchain = unprobedToolchain())
       except IOError:
         discard  # expected
 
@@ -272,7 +273,7 @@ when defined(posix):
       var exCaught2 = false
       try:
         discard execute(p2, config = cfg2, graph = g2, onResult = bombCb2,
-                        showProgress = false, cache = cacheDisabled(spec))
+                        showProgress = false, cache = cacheDisabled(spec), toolchain = unprobedToolchain())
       except ValueError as e:
         if "R2-2 injected" in e.msg:
           exCaught2 = true

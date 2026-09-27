@@ -375,9 +375,10 @@ when defined(posix):
       ## false) in that SAME process. If the stale global leaked into the new
       ## call's interrupted-detection, this run would report rsInterrupted;
       ## it must not, because each execute() call owns its own fresh
-      ## Supervisor/pendingShutdown queue (A2b) — shutdownRequested()'s
-      ## global is a separate, sticky, read-only mirror, never consulted by
-      ## the poll loop.
+      ## Supervisor/pendingShutdown queue (A2b) — shutdownRequested() is a
+      ## read-only view of the open interrupt scope's signal (here the
+      ## still-live Supervisor's scope; R13-D2), never consulted by the poll
+      ## loop.
       withTempProject:
         writePassFixture(projectRoot / "tests" / "unit", "test_pass.nim")
         let resultFile = projectRoot / "a4_result.txt"

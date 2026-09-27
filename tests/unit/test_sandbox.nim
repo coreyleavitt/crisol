@@ -14,6 +14,7 @@
 import std/[sequtils, unittest, options]
 import crisol/[types, sandbox]
 import crisol/api
+import crisol/runcore  # rlimitOverridesFrom/envPinsFrom: Config projections, internal (not crisol/api)
 import crisol/process/types  ## unqualified Limits/LimitKind (rfc-0007 A2a-iii)
 
 # ---------------------------------------------------------------------------
@@ -231,7 +232,7 @@ suite "sandbox — Fix 1: RLIMIT_NOFILE default + Config override":
 
   test "Config.rlimitNofile override is honored by the sandbox spec":
     ## Proves the Config -> RlimitOverrides -> SandboxSpec wiring end to end
-    ## via the same rlimitOverridesFrom() helper production code (api.runTests)
+    ## via the same rlimitOverridesFrom() helper production code (runcore.runTestsWith)
     ## uses at its resolveSandbox call site.
     let cfg  = Config(rlimits: RlimitOverrides(limitNofile: some(4096'i64)))
     let spec = resolveSandbox(level = hlIsolated, rlimits = rlimitOverridesFrom(cfg))

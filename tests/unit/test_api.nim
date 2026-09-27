@@ -41,13 +41,16 @@
 import std/[base64, json, options, os, osproc, strutils, tables, times, unittest]
 import ../support/capture
 import crisol/api
+import crisol/runcore    # runTestsWith/RunDeps/productionRunDeps (uncontracted)
+import crisol/ccidentity # cachedToolchainProbe: RunDeps.ccProbe
 import crisol/render     # RFC-0005 code-review D1: renderCacheStats
 import crisol/types
 import crisol/process/types as ptypes
-# RFC-0005 A3b — E2E-A-trust: runTestsWith/CacheDeps injects a real
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
+# RFC-0005 A3b — E2E-A-trust: runTestsWith/RunDeps injects a real
 # CacheRuntime built directly from the cache-internal modules (memory
 # tiers + a controllable mock TrustPolicy) -- these are NOT part of the
-# contracted `crisol/api` facade (runTestsWith/CacheDeps are themselves
+# contracted `crisol/api` facade (runTestsWith/RunDeps are themselves
 # documented-uncontracted), so the test reaches past api.nim on purpose,
 # exactly as this slice's own design intends.
 import crisol/cacheport      # TrustPolicy, StoredEntry, Attestation, SigAlg, CacheVerdict
@@ -836,13 +839,13 @@ proc alwaysOfflineBackend(): CacheBackend =
     probe: nil,
   )
 
-proc offlineTierDeps(): CacheDeps =
+proc offlineTierDeps(): RunDeps =
   # RFC-0005 code-review R2-D5a: `buildRuntime` gained a fourth parameter,
   # `resolvedSecrets` (threaded in by runTestsWith, pre-resolved+scrubbed) --
   # this fixture builds its own fixed always-offline runtime and never
   # needs real secrets, so it is accepted and discarded like the other
   # three unused params.
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+  RunDeps(ccProbe: cachedToolchainProbe, buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
                               resolvedSecrets: CacheSecrets;
                               trackedRoots: TrackedRoots): CacheRuntime =
     discard cfg; discard stateDir; discard maxEntries; discard resolvedSecrets
@@ -880,7 +883,7 @@ suite "RFC-0005 code-review L2 — unconditional per-tier 100%-error warning":
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
       var rr: RunReport
-      let errText = captureStderr(proc() = rr = runTestsWith(opts, productionCacheDeps()))
+      let errText = captureStderr(proc() = rr = runTestsWith(opts, productionRunDeps()))
       checkRunOk(rr)
       check "errored on every consulted read" notin errText
 
@@ -970,7 +973,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     check pep1.ep.tp.display().len > 0   # sanity: a real tag-0 tp
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)), toolchain = unprobedToolchain()).results
     check results1.len == 1
     check results1[0].cacheDecision == cdmStored
 
@@ -981,7 +984,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)), toolchain = unprobedToolchain()).results
     check results2.len == 1
     check results2[0].cacheDecision == cdmHit
 
@@ -1015,7 +1018,7 @@ suite "RFC-0005 code-review SO4 — verify-cache could-not-reexec is never a div
     let errText = captureStderr(proc () =
       divergences = verifyCachePass(
         results2, @[pep2], verifySample(pct = 100), cfg, g,
-        "2.2.10", "gcc 13.2.0", spec).divergences)
+        "2.2.10", fakeToolchain("gcc 13.2.0"), spec).divergences)
 
     check divergences.len == 0   # SO4: never misfiled as a divergence
     check epRelPath in errText
@@ -1151,7 +1154,7 @@ quit(0)
                                  edecision: edNeverBuilt, runTimeoutMs: 60_000)
     let results1 = execute(
       RunPlan(entrypoints: @[pep1], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)), toolchain = unprobedToolchain()).results
     check results1.len == 1
     check results1[0].cacheDecision == cdmStored
     check readFile(dir / "r67_counter.txt").strip() == "1"
@@ -1162,7 +1165,7 @@ quit(0)
                                  edecision: edRunFresh, runTimeoutMs: 60_000)
     let results2 = execute(
       RunPlan(entrypoints: @[pep2], jobs: 1), config = cfg, graph = g, showProgress = false,
-      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt))).results
+      cache = cacheEnabled(spec, defaultCachePolicy(), realSeams(ctx, addr g, rt)), toolchain = unprobedToolchain()).results
     check results2.len == 1
     check results2[0].cacheDecision == cdmHit
 
@@ -1174,7 +1177,7 @@ quit(0)
     # `verifyCachePass` returned early, and the counter would have stayed
     # at "1".
     discard verifyCachePass(results2, @[pep2], verifySample(), cfg, g,
-                            "2.2.10", "gcc 13.2.0", spec)
+                            "2.2.10", fakeToolchain("gcc 13.2.0"), spec)
     check readFile(dir / "r67_counter.txt").strip() == "2"
 
 # ---------------------------------------------------------------------------
@@ -1191,7 +1194,7 @@ quit(0)
 suite "r74 — verifyCachePass never regresses to a bare stderr.write":
 
   test "every warning site inside verifyCachePass's own body calls warnStderr, not stderr.write":
-    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "api.nim"
+    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "runcore.nim"
     let src = readFile(apiPath)
     let startMarker = "proc verifyCachePass*("
     let startIdx = src.find(startMarker)
@@ -1242,7 +1245,7 @@ suite "r74 — verifyCachePass never regresses to a bare stderr.write":
 suite "r74 — installSignals wiring reaches the verify sub-run (grep pin)":
 
   test "verifyCachePass's own execute() call threads installSignals, not a hardcoded false":
-    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "api.nim"
+    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "runcore.nim"
     let src = readFile(apiPath)
     let startIdx = src.find("proc verifyCachePass*(")
     check startIdx >= 0
@@ -1253,7 +1256,7 @@ suite "r74 — installSignals wiring reaches the verify sub-run (grep pin)":
     check "installSignals     = opts.installSignals" notin body  # not the MAIN run's own call
 
   test "runTestsWith's verifyCachePass call site threads opts.installSignals":
-    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "api.nim"
+    let apiPath = currentSourcePath().parentDir.parentDir.parentDir / "src" / "crisol" / "runcore.nim"
     let src = readFile(apiPath)
     let callIdx = src.find("verifyCachePass(results, pr.entrypoints")
     check callIdx >= 0
@@ -1263,23 +1266,23 @@ suite "r74 — installSignals wiring reaches the verify sub-run (grep pin)":
     check "installSignals = opts.installSignals" in window
 
 # ---------------------------------------------------------------------------
-# RFC-0005 A3b — runTestsWith / CacheDeps: the internal injection seam.
+# RFC-0005 A3b — runTestsWith / RunDeps: the internal injection seam.
 # ---------------------------------------------------------------------------
 
-suite "runTestsWith / CacheDeps — production parity":
+suite "runTestsWith / RunDeps — production parity":
 
-  test "runTests(opts) == runTestsWith(opts, productionCacheDeps()) in observable outcome":
+  test "runTests(opts) == runTestsWith(opts, productionRunDeps()) in observable outcome":
     ## runTests is now a thin wrapper -- prove the delegation is real, not
     ## a second, silently-diverging code path.
     withTempProject:
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
-      let rr = runTestsWith(opts, productionCacheDeps())
+      let rr = runTestsWith(opts, productionRunDeps())
       checkRunOk(rr)
       check rr.results.len == 1
       check rr.results[0].cacheDecision == cdmStored
 
-  test "productionCacheDeps().buildRuntime performs NO env scrub of its own (RFC-0005 code-review R2-D5a)":
+  test "productionRunDeps().buildRuntime performs NO env scrub of its own (RFC-0005 code-review R2-D5a)":
     ## Round-1 D5 made `buildRuntime`'s own closure call `resolveCacheSecrets()`
     ## lazily; R2-D5a moves the resolve+scrub entirely OUT of this closure
     ## and into `runTestsWith`, before `planImpl` (see the R2-D5a suite
@@ -1290,14 +1293,14 @@ suite "runTestsWith / CacheDeps — production parity":
     ## even with `CRISOL_CACHE_*` vars present.
     putEnv("CRISOL_CACHE_TOKEN", "must-survive-buildRuntime-called-alone")
     defer: delEnv("CRISOL_CACHE_TOKEN")
-    let deps = productionCacheDeps()
+    let deps = productionRunDeps()
     discard deps.buildRuntime(CacheConfig(), getTempDir() / "crisol_d5_scrub_state", 0,
                               CacheSecrets(), TrackedRoots())
     check getEnv("CRISOL_CACHE_TOKEN") == "must-survive-buildRuntime-called-alone"
 
 # ---------------------------------------------------------------------------
 # RFC-0005 code-review D5 (round 1): `runTests()` eagerly called
-# `productionCacheDeps()` -> `resolveCacheSecrets()` (a scan + delEnv of the
+# `productionRunDeps()` -> `resolveCacheSecrets()` (a scan + delEnv of the
 # WHOLE CRISOL_CACHE_* namespace) even under `noCache: true` -- an
 # undocumented host-process mutation for a library embedder that asked for
 # NO caching at all. D5 fixed the SCOPE (gated on `not opts.noCache`); R2-D5a
@@ -1328,7 +1331,7 @@ suite "RFC-0005 code-review D5 — no env mutation under opts.noCache":
 
 # ---------------------------------------------------------------------------
 # RFC-0005 code-review R2-D5a: the round-1 D5 fix deferred the resolve+scrub
-# into `productionCacheDeps().buildRuntime`'s own closure -- correct in
+# into `productionRunDeps().buildRuntime`'s own closure -- correct in
 # SCOPE (skipped under `noCache: true`, pinned above) but wrong in TIMING:
 # that closure only runs AFTER `planImpl` returns successfully, and
 # `planImpl` unconditionally spawns the Nim fingerprint-probe child
@@ -1400,7 +1403,7 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
       writeFile(projectRoot / "tests" / "unit" / "test_a.nim", "quit(0)\n")
       let l1 = memory()
       let l2 = memory()
-      let deps = CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+      let deps = RunDeps(ccProbe: cachedToolchainProbe, buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
                                               resolvedSecrets: CacheSecrets;
                                               trackedRoots: TrackedRoots): CacheRuntime =
         discard cfg; discard stateDir; discard maxEntries; discard resolvedSecrets
@@ -1459,7 +1462,7 @@ suite "RFC-0005 A3b — E2E-A-trust: runTestsWith, two memory tiers + mock Trust
 # RFC-0005 A3c-ii — E2E-1: `configuredCache` wired live through the REAL
 # entry path (runTests -> planImpl -> configuredCache -> execute), driven by
 # a REAL crisol.kdl `remote-cache "<name>" { url "file://..." }` block —
-# not a hand-built CacheDeps override (E2E-A-trust's job, above).
+# not a hand-built RunDeps override (E2E-A-trust's job, above).
 #
 # Scoping (RFC's own FORK-2 note, "E2E-1 (two-tier file://; lands in A3c —
 # form depends on FORK-2)"): FORK-2 resolved (a) — the FULL cold-host
@@ -1605,8 +1608,8 @@ remote-cache "mirror" {
 # Through the REAL entry point (runTests -> planImpl -> configuredCache ->
 # execute), a REAL crisol.kdl `cache-trust` block, the REAL `hmacPolicy`
 # (`cachetrust.nim`), and the REAL `$CRISOL_CACHE_HMAC_KEY` env var (proving
-# api.nim's CacheSecrets resolution end to end) -- not a hand-built
-# CacheDeps override (test_cachetrust.nim's job is the policy in
+# runcore.nim's CacheSecrets resolution end to end) -- not a hand-built
+# RunDeps override (test_cachetrust.nim's job is the policy in
 # isolation; this is the load-bearing slice property).
 # ---------------------------------------------------------------------------
 
@@ -1648,7 +1651,7 @@ cache-trust {
 }
 """)
       putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")
-      defer: delEnv("CRISOL_CACHE_HMAC_KEY")  # safety net; api.nim scrubs it itself on the happy path
+      defer: delEnv("CRISOL_CACHE_HMAC_KEY")  # safety net; runcore.nim scrubs it itself on the happy path
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
 
       # Run 1: cold -> live -> publishes an ATTESTED entry to L2 (the
@@ -1660,7 +1663,7 @@ cache-trust {
       check remoteHasAnyEntry(remoteRoot)
 
       # $CRISOL_CACHE_HMAC_KEY must be gone from THIS process's env by now
-      # (api.nim's resolveCacheSecrets scrubs it immediately after
+      # (runcore.nim's resolveCacheSecrets scrubs it immediately after
       # resolving it) -- proves the delEnv half of C4's scope, not just
       # the sign/verify half.
       check getEnv("CRISOL_CACHE_HMAC_KEY") == ""
@@ -1685,7 +1688,7 @@ cache-trust {
       # only place a hit could come from.
       removeDir(projectRoot / ".crisol" / "cache")
 
-      # api.nim's resolveCacheSecrets delEnv's the var after run 1 already
+      # runcore.nim's resolveCacheSecrets delEnv's the var after run 1 already
       # resolved it (proven above) -- a SECOND in-process `runTests` call
       # needs it set again, exactly as a fresh CLI process would read it
       # fresh from its own environment.
@@ -1744,7 +1747,7 @@ cache-trust {
 }
 """)
       putEnv("CRISOL_CACHE_HMAC_KEY", "e2e2-secret")
-      defer: delEnv("CRISOL_CACHE_HMAC_KEY")  # safety net; api.nim scrubs it itself on the happy path
+      defer: delEnv("CRISOL_CACHE_HMAC_KEY")  # safety net; runcore.nim scrubs it itself on the happy path
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl", cacheStats: true)
 
       let rr1 = runTests(opts)
@@ -1790,7 +1793,7 @@ cache-trust {
 # point (runTests -> planImpl -> configuredCache -> execute), a REAL
 # crisol.kdl `cache-trust { policy "ed25519" }` block with a `pinned-key`,
 # the REAL `ed25519Policy` (`cachetrust.nim`), and the REAL
-# `$CRISOL_CACHE_SIGN_KEY` env var (proving `api.nim`'s `CacheSecrets`
+# `$CRISOL_CACHE_SIGN_KEY` env var (proving `runcore.nim`'s `CacheSecrets`
 # resolution for the ed25519 seed end to end). The full rejection matrix
 # (tamper / unpinned / signer-mismatch / unknown-alg) is C5b's job -- out
 # of scope here; this proves the HAPPY sign, then no-seed VERIFY-ONLY,
@@ -1832,7 +1835,7 @@ cache-trust {
 }
 """)
       putEnv("CRISOL_CACHE_SIGN_KEY", seedB64)
-      defer: delEnv("CRISOL_CACHE_SIGN_KEY")  # safety net; api.nim scrubs it itself on the happy path
+      defer: delEnv("CRISOL_CACHE_SIGN_KEY")  # safety net; runcore.nim scrubs it itself on the happy path
       let opts = RunOptions(configPath: projectRoot / "crisol.kdl")
 
       # Run 1 (signer): cold -> live -> publishes an ATTESTED entry to L2
@@ -1844,7 +1847,7 @@ cache-trust {
       check remoteHasAnyEntry(remoteRoot)
 
       # $CRISOL_CACHE_SIGN_KEY must be gone from THIS process's env by now
-      # (api.nim's resolveCacheSecrets scrubs it immediately after
+      # (runcore.nim's resolveCacheSecrets scrubs it immediately after
       # resolving it) -- proves the delEnv half of C5a's scope too.
       check getEnv("CRISOL_CACHE_SIGN_KEY") == ""
 
@@ -1970,7 +1973,7 @@ cache-trust {
       check rr1.results[0].cacheDecision == cdmStored
       check remoteHasAnyEntry(remoteRoot)
 
-      # api.nim's resolveCacheSecrets scrubs the var after run 1 resolves it.
+      # runcore.nim's resolveCacheSecrets scrubs the var after run 1 resolves it.
       check getEnv("CRISOL_CACHE_SIGN_KEY") == ""
 
       let entryPath = findStoredEntryJson(remoteRoot)
@@ -2387,7 +2390,7 @@ remote-cache "l1" {
 # test_cachehttp.nim/test_caches3.nim (21/36 fake-driven blocks); this
 # suite's job is proving the WIRING carries a real KDL-configured http/s3
 # remote through a real run, end to end -- one fake `HttpFetcher`, driven
-# through `CacheDeps.buildRuntime -> configuredCache(..., testRegistry(fake), ...)`.
+# through `RunDeps.buildRuntime -> configuredCache(..., testRegistry(fake), ...)`.
 # ---------------------------------------------------------------------------
 
 type
@@ -2457,13 +2460,13 @@ proc e2e3EncodedHitBody(): string =
   )
   jsonCacheSerializer().encode(entry)
 
-proc e2e3Deps(fs: E2E3Server; secrets = CacheSecrets()): CacheDeps =
+proc e2e3Deps(fs: E2E3Server; secrets = CacheSecrets()): RunDeps =
   # RFC-0005 code-review R2-D5a: `buildRuntime`'s new `resolvedSecrets`
   # param is deliberately named DIFFERENTLY from (and discarded, not used
   # instead of) this proc's own `secrets` closure-over param -- this
   # fixture wants ITS OWN fixed test secrets, never whatever runTestsWith
   # resolved from the (in this suite, unset) real environment.
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+  RunDeps(ccProbe: cachedToolchainProbe, buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
                               resolvedSecrets: CacheSecrets;
                               trackedRoots: TrackedRoots): CacheRuntime =
     discard resolvedSecrets
@@ -2603,10 +2606,10 @@ proc e2e3StoreFetcher(st: E2E3Store): HttpFetcher =
     else:
       HttpReply(transport: toOk, status: 400, headers: @[], body: "")
 
-proc e2e3StoreDeps(st: E2E3Store; secrets: CacheSecrets): CacheDeps =
+proc e2e3StoreDeps(st: E2E3Store; secrets: CacheSecrets): RunDeps =
   # RFC-0005 code-review R2-D5a: see e2e3Deps's own comment, above, for why
   # `resolvedSecrets` is named distinctly and discarded here.
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+  RunDeps(ccProbe: cachedToolchainProbe, buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
                               resolvedSecrets: CacheSecrets;
                               trackedRoots: TrackedRoots): CacheRuntime =
     discard resolvedSecrets
@@ -2714,11 +2717,11 @@ proc e2e3AuthFetcher(fs: E2E3AuthServer): HttpFetcher =
     else:
       e2e3OkReply(400)
 
-proc e2e3AuthDeps(fs: E2E3AuthServer; token: string): CacheDeps =
+proc e2e3AuthDeps(fs: E2E3AuthServer; token: string): RunDeps =
   let secrets = CacheSecrets(defaultHttpToken: some(token))
   # RFC-0005 code-review R2-D5a: see e2e3Deps's own comment, above, for why
   # `resolvedSecrets` is named distinctly and discarded here.
-  CacheDeps(buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
+  RunDeps(ccProbe: cachedToolchainProbe, buildRuntime: proc(cfg: CacheConfig; stateDir: string; maxEntries: int;
                               resolvedSecrets: CacheSecrets;
                               trackedRoots: TrackedRoots): CacheRuntime =
     discard resolvedSecrets
@@ -2788,7 +2791,7 @@ suite "RFC-0005 C6 -- secure-by-default credential scopes end to end (auth-valid
 
 # ---------------------------------------------------------------------------
 # R14-T6 (code review) — RunReport.compileBlock presence-gating expression.
-# api.nim gates the compile block on `measureCompileReuse` alone. A
+# runcore.nim gates the compile block on `measureCompileReuse` alone. A
 # regression that hardcoded this to `false` would silently drop the report
 # whenever measurement is requested -- covered here both as a cheap pure
 # predicate test and as a real end-to-end proof.

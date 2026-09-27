@@ -13,7 +13,7 @@
 ##   cachePath*(ep, config): string            — stable nimcache directory
 ##   emptyDepGraph*(): DepGraph                 — convenience empty graph
 ##   decideCompile*(...): (CompileDecision, string)
-##   plan*(config, eps, graph, nimVersion, forceCompile, ccVersion): RunPlan
+##   plan*(config, eps, graph, forceCompile): RunPlan
 
 import std/[algorithm, options, os, sets, strutils, tables]
 import std/cpuinfo
@@ -116,9 +116,7 @@ proc toolchainFingerprint*(nimVersion: string; ccVersion: string): string =
   ## path shape from `cachePath`/`cleanOrphans`; this is the same "" = "no
   ## toolchain probe available" convention these two values carry everywhere
   ## else in crisol — in `depgraph.loadDepGraph`, where a stored header that is
-  ## itself "" then never trips the nim/cc staleness arms, and in `plan`, where
-  ## since R3-8 (round 5) they select nothing at all: `decideCompile` was
-  ## `plan`'s only reader of them and no longer takes them).
+  ## itself "" then never trips the nim/cc staleness arms).
   if nimVersion.len == 0 and ccVersion.len == 0:
     return ""
   toHex16(fnv1a64(nimVersion & "\x00" & ccVersion))
@@ -245,8 +243,9 @@ proc decideCompile*(ep: Entrypoint;
   ##   3. Protocol major changed → cdStale.
   ##   4. Any closure file missing → cdStale.
   ##   5. Closure content hash changed → cdStale.
-  ##   6. forceCompile → cdStale (binary exists, force requested).
-  ##   7. → cdSkipFresh.
+  ##   6. A recorded link no longer leads where it did → cdStale (issue #25).
+  ##   7. forceCompile → cdStale (binary exists, force requested).
+  ##   8. → cdSkipFresh.
   ##
   ## TOOLCHAIN STALENESS IS NOT DECIDED HERE — do not come looking for it.
   ## "Nim compiler moved" and "C toolchain moved" (W3) are both decided by
@@ -256,9 +255,9 @@ proc decideCompile*(ep: Entrypoint;
   ## graph then lands on step 2 here and recompiles. `decideCompile`
   ## therefore sees only graphs whose header ALREADY matches the live
   ## toolchain, and took no `nimVersion`/`ccVersion` parameters as of round 5
-  ## (see the R3-8 note below the protocol check). `plan` still takes both --
-  ## they are the same values its caller hands `runner.execute`/`clean`, which
-  ## do call `toolchainFingerprint` for nimcache-path keying: a separate,
+  ## (see the R3-8 note below the protocol check); neither does `plan`
+  ## (R5-24). `runner.execute`/`clean` take both and call
+  ## `toolchainFingerprint` for nimcache-path keying: a separate,
   ## independently-correct half of the W3 fix that keeps a compile which
   ## actually HAPPENS from reusing an object file built by the old cc.
 
@@ -290,7 +289,7 @@ proc decideCompile*(ep: Entrypoint;
   # re-stamps `stored.header.nimVersion`/`.ccVersion` to the live values before
   # returning, so `graph.header.X == X` was a structural invariant at this point
   # and neither arm could fire (mutation-proved twice in round 3: disabling
-  # `loadDepGraph`'s discard turns tests/integration/test_w3_cc_liveness.nim
+  # `loadDepGraph`'s discard turns tests/integration/test_cc_depgraph_liveness.nim
   # RED, disabling the `ccVersion` arm here left it GREEN).
   #
   # Round 2 and round 3 kept them as defence in depth "for a graph built by
@@ -310,26 +309,31 @@ proc decideCompile*(ep: Entrypoint;
   #
   # The live enforcement point for "toolchain moved -> recompile" is
   # `loadDepGraph`'s discard, driven end-to-end by
-  # tests/integration/test_w3_cc_liveness.nim and at unit level by the
+  # tests/integration/test_cc_depgraph_liveness.nim and at unit level by the
   # dgdNimVersion/dgdCcVersion blocks in tests/unit/test_depgraph.nim (where
   # test_freshness.nim's two former "version changed -> cdStale" cases moved).
   # Full history at R3-8 in docs/handoff/msvc-selection-layer.md.
 
-  # Check that all closure files exist and compute content hash.
+  # Drift, then the content hash.
   #
-  # RFC-0009 A3c-ii: `entry.closure` is `HashSet[TrackedPath]`. Existence is
-  # checked via `toNative(tp, roots)` uniformly (project OR dep-root member
-  # alike -- mirrors `depgraph.isEntryStale`'s identical fix, D4). The
-  # content-hash INPUT is derived by the SHARED `depgraph.closureHashInputs`
-  # helper -- the SAME derivation, over the SAME classify-filtered set,
-  # `recordClosure` used at record time. Using any other derivation here
-  # would fail the `entry.closureHash` comparison on every warm load and
-  # spuriously recompile everything (the test_skipfresh regression).
+  # `depgraph.entryDrift` is the one file-system staleness predicate over the
+  # entry's watched set (its members and recorded links); `isEntryStale`
+  # reads the same one, so the two can never disagree (R14-D2). The content
+  # hash is this proc's own step and sits between the kinds: a missing
+  # member is reported before it (hashing would fail on it), a moved or
+  # unrecorded link after it, so each reason below is the one it always was.
+  #
+  # RFC-0009 A3c-ii: the content-hash INPUT is derived by the SHARED
+  # `depgraph.closureHashInputs` helper -- the SAME derivation, over the SAME
+  # classify-filtered set, `recordClosure` used at record time. Using any
+  # other derivation here would fail the `entry.closureHash` comparison on
+  # every warm load and spuriously recompile everything (the test_skipfresh
+  # regression).
   let roots = config.trackedRoots
 
-  for tp in entry.closure:
-    if not fileExists(toNative(tp, roots)):
-      return (cdStale, "closure file missing: " & string(display(tp)))
+  let drift = entryDrift(entry, roots)
+  if drift.isSome and drift.get.kind == dkMissing:
+    return (cdStale, "closure file missing: " & string(display(drift.get.path)))
 
   # Compute current content hash.
   var computedHash: string
@@ -342,6 +346,23 @@ proc decideCompile*(ep: Entrypoint;
   if computedHash != entry.closureHash:
     return (cdStale, "closure content changed")
 
+  if drift.isSome:
+    let at = string(display(drift.get.path))
+    case drift.get.kind
+    of dkMissing:
+      discard  # returned above
+    of dkMoved:
+      # Issue #25: a member reached through a link is recorded by its
+      # realpath, so repointing the link changes what a recompile would read
+      # while every recorded member (and so the hash above) stays the same.
+      return (cdStale, "symlink retargeted: " & at)
+    of dkUnrecorded:
+      # R13-S1: a directory on a member's path replaced by a link since the
+      # record reads the same bytes today, but the entry has no record of
+      # the link, so a later repoint would pass every check above.
+      # Recompiling now records it (`recordClosure` -> `closure.crossedLinks`).
+      return (cdStale, "symlink not on record: " & at)
+
   if forceCompile:
     return (cdStale, "forced recompile (--force-compile)")
 
@@ -351,112 +372,27 @@ proc decideCompile*(ep: Entrypoint;
 # plan — pure; fileExists allowed (no subprocess)
 # ---------------------------------------------------------------------------
 
-# SOUNDNESS-PARAMETER WARNING (round-3 review, R3-6): `nimVersion` and
-# `ccVersion` below are defaulted soundness parameters of the same shape R2-7
-# catalogued -- omitting one silently yields the unsound value, invisibly.
-# (`grep -rl "SOUNDNESS-PARAMETER WARNING" src/` lists the annotated modules --
-# `-l`, not `-n`, so this very sentence does not pad the answer; round 4, R4-7,
-# 2026-09-24 replaced a literal count of the annotated sites here with that
-# grep, because the count was already off by one when written and because
-# R3-10 had just deleted another asserted census, in `toolrun.nim`, for rotting
-# the same way.) This site was MISSED by R2-7's inventory even though it is the
-# proc `pipeline.buildRunPlan` (whose own default L1 removed) calls, i.e. the
-# instance one frame from the original defect. New callers must pass both
-# EXPLICITLY, including "" when they mean "no probe available". Full rationale
-# at `runner.execute`'s copy of this note and at R2-7/R3-6 in
-# docs/handoff/msvc-selection-layer.md.
-#
-# NARROWED round 5, 2026-09-24 (R3-8), and left standing rather than deleted:
-# `plan` itself no longer reads either value -- removing `decideCompile`'s two
-# unreachable toolchain arms removed `plan`'s only read of them -- so at THIS
-# site omitting one can no longer flip a decision. The warning stays because the
-# parameters stay (the call-shape census below is why), because the shape is
-# what a reader of `pipeline.buildRunPlan` -> `plan` -> `runner.execute` has to
-# recognise, and because the values a caller assembles here are the same ones
-# `execute` feeds to `toolchainFingerprint`, where omission IS still unsound.
-# The live toolchain-staleness gate is `depgraph.loadDepGraph`; see the R3-8
-# note in `decideCompile`.
-#
-# WHY `plan` STILL CARRIES ITS DEFAULTS while five sibling procs no longer do
-# (round-4 review, R4-4, 2026-09-24 -- recording a reason that was previously
-# absent here, so that the ledger's "five of six procs" line stops being the
-# only account of this exclusion). R3-7's remedy -- drop the default, add a
-# `{.deprecated.}` companion carrying the old signature -- is zero-churn only
-# where the removed defaults are TRAILING, which is how it worked on
-# `planner.cachePath`, `depgraph.initDepGraph`, both `depgraph.loadDepGraph`
-# arities and `clean.cleanOrphans`. Here `forceCompile` sits BETWEEN the two
-# defaulted parameters, so the call shapes that exist in the tree today do not
-# collapse onto one companion:
-# (each shape cited by a grep anchor, never a line number -- R4-7 found the
-# line numbers in this file had already rotted, and one of the three citations
-# that replaced them had rotted again by round 5):
-#   - `plan(cfg, @[ep], emptyDepGraph())` omits all three -- by far the most
-#     common shape in tests (`grep -rn "plan(cfg, @\[ep\], emptyDepGraph())"
-#     tests/` lists them; `grep -rn "plan(" tests/` has every shape);
-#   - `plan(cfg, @[ep], graph, nimVersion = "")` omits the last two
-#     (`grep -rn 'graph, nimVersion = "")' tests/`);
-#   - `plan(cfg, @[ep], graph, "", false)` omits only `ccVersion`
-#     (`grep -rn 'graph, "", false)' tests/`);
-#   - `plan(cfg, @[ep], graph, nimVersion = "nim-v1", ccVersion = "cc-OLD")`
-#     supplies BOTH versions while skipping `forceCompile` in the middle
-#     (`grep -rn 'ccVersion = "cc-OLD"' tests/`) -- that shape
-#     must bind to the full-arity proc, which therefore has to keep
-#     `forceCompile`'s own default; no companion overload can supply it.
-# Covering the rest would take three overloads of a six-parameter signature,
-# and hand-maintained copies of one signature are the same drift hazard that
-# kept `runner.execute` out of the treatment (see the note there, and
-# `clean.nim`'s R3-7 section, which chose an `auto` return for exactly this
-# reason). So the warning above is the whole mechanism at this site,
-# deliberately: a considered exception, not an oversight -- and not one to
-# reverse without re-measuring the call shapes listed above.
-
 proc plan*(config: Config; eps: seq[Entrypoint]; graph: DepGraph;
-           nimVersion: string = ""; forceCompile: bool = false;
-           ccVersion: string = ""): RunPlan =
+           forceCompile: bool = false): RunPlan =
   ## Pure — no subprocess.
   ##
-  ## Annotates every entrypoint with a CompileDecision via decideCompile.
-  ## With an empty graph, every entrypoint is cdNeverBuilt.  The api boundary
-  ## supplies the RUNTIME nim fingerprint (nimprobe.cachedNimFingerprint()),
-  ## not the compile-time api.crisolNimVersion string; the "" default here is
-  ## for tests / cold-start callers only.
-  ## `ccVersion` (W3) is nimVersion's cc sibling, and the same convention
-  ## applies (appended as a trailing default parameter, not placed next to
-  ## `nimVersion`, so every pre-W3 positional call site, e.g.
-  ## `plan(cfg, eps, graph, nimVersion, forceCompile)`, keeps compiling
-  ## unchanged).
+  ## Annotates every entrypoint with a CompileDecision via decideCompile: an
+  ## entrypoint whose binary is absent is cdNeverBuilt, and one whose binary
+  ## is present but has no closure record in `graph` (an empty graph
+  ## included) is cdStale.
   ##
-  ## NEITHER VALUE REACHES A STALENESS DECISION FROM HERE (R3-8, round 5,
-  ## 2026-09-24). `decideCompile` no longer takes them: "toolchain moved ->
+  ## `plan` takes no toolchain identity (R5-24). "The toolchain moved, so
   ## recompile" is decided once, by `depgraph.loadDepGraph`, which discards a
-  ## header-mismatched graph before `plan` ever sees it — so an empty graph is
-  ## how a toolchain change arrives here, and step 2 of `decideCompile` turns it
-  ## into a recompile. Pass both anyway, `""` included when you genuinely have
-  ## no probe: the parameters remain part of this signature (see the call-shape
-  ## census in the `#` comment above), a caller threading real probe values
-  ## documents its own soundness posture, and the values are what
-  ## `runner.execute`/`clean` feed to `toolchainFingerprint` for nimcache-path
-  ## keying. This sentence is in the `##` doc deliberately -- generated docs and
-  ## editor hover show only these lines, so a note that lives in a `#` comment
-  ## above the proc never reaches a consumer of crisol-as-a-library at all.
+  ## graph whose header names a different Nim or C toolchain before `plan`
+  ## ever sees it; the empty graph that replaces it is how a toolchain change
+  ## arrives here. The nimcache-path fingerprint is `runner.execute`'s and
+  ## `clean.cleanOrphans`'s, from their own `nimVersion`/`ccVersion`
+  ## arguments.
   ## The jobs field is resolved to at least 1; if config.jobs == 0 the A4
   ## default is max(1, cpuCount-2).
 
   var planned: seq[PlannedEntrypoint]
   for ep in eps:
-    # `nimVersion`/`ccVersion` are NOT threaded into `decideCompile`: as of
-    # R3-8 (round 5) it does not take them, because the graph's header already
-    # agrees with them by `loadDepGraph`'s invariant. `decideCompile` was
-    # `plan`'s ONLY reader of the two, so `plan` now reads NEITHER value
-    # anywhere in its body -- in particular it never calls
-    # `toolchainFingerprint`/`cachePath`, and never did. The nimcache-path
-    # fingerprint is computed by `runner.execute` and `clean.cleanOrphans`
-    # from their OWN `nimVersion`/`ccVersion` arguments (the same values api
-    # hands each of them separately: `nimprobe.cachedNimFingerprint()` and
-    # `$ccProbe()`, whose default is the memoised
-    # `ccidentity.cachedCcFingerprint`), so it is unaffected by what `plan`
-    # does with these two. Why they stay in the signature regardless: the
-    # call-shape census in the `#` block above this proc.
     let (decision, reason) = decideCompile(
       ep, graph, config, forceCompile, CrisolProtocolMajor)
     let groupMaxJobs = block:

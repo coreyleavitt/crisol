@@ -30,7 +30,7 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_measureworker_real.nim
 
-import std/[json, os, osproc, sets, tables, unittest]
+import std/[json, os, osproc, sets, strutils, tables, unittest]
 import crisol           # imports runMain
 import crisol/types
 import crisol/workerplan
@@ -40,6 +40,11 @@ import crisol/artifactid
 import crisol/closure
 import crisol/paths      # CR3: TrackedRoots, to recompute the same way the
                           # real worker's `measureworker.planRoots` does
+from crisol/ccidentity import CcProbeContext, cachedToolchainProbe
+                          # R10-S6: the plan's driver site, learned the way
+                          # the parent (`runner.execute`) learns it
+from crisol/headerprobe import siteResolver
+import crisol/measureworker   # runMeasureCompileWorker's warning seam (R11-L6)
 
 let projectRoot = currentSourcePath().parentDir.parentDir.parentDir
   # test is at tests/integration/; go up 2 -> project root (mirrors
@@ -69,6 +74,9 @@ proc buildPlan(workDir: string): MeasurePlan =
     # W9l / L1: a distinctive value the worker cannot produce on its own --
     # it must copy this through onto every row, never re-probe or blank it.
     toolchainFp:       "f00dfacecafebeef",
+    driverSite:        cachedToolchainProbe(CcProbeContext(projectRoot: projectRoot,
+                                                           stateDir: workDir / "state",
+                                                           flags: @[])).site,
   )
 
 proc writePlan(plan: MeasurePlan; workDir: string): string =
@@ -86,8 +94,8 @@ suite "crisol --internal-measure-compile — real worker end-to-end (pass_always
     check code == 0
 
     # The binary was actually built and runs.
-    check fileExists(plan.outputBinPath)
-    let (_, exitCode) = execCmdEx(plan.outputBinPath)
+    check fileExists(addFileExt(plan.outputBinPath, ExeExt))   # the link appends .exe on Windows
+    let (_, exitCode) = execCmdEx(addFileExt(plan.outputBinPath, ExeExt))
     check exitCode == 0   # pass_always.nim is literally `quit(0)`
 
     # Rows were written: one per reusable unit, entry unit excluded.
@@ -160,7 +168,8 @@ suite "crisol --internal-measure-compile — real worker end-to-end (pass_always
       let normalized = normalize(rawContent, knownStrings)
       let normalizedCcCmd = normalize(ccCmdByBasename[r.artifactBasename], knownStrings)
       let closureRes = ccIncludeClosure(ccCmdByBasename[r.artifactBasename],
-                                        roots = roots)
+                                        roots = roots,
+                                        driver = siteResolver(plan.driverSite))
       check closureRes.ok
       let expectedKeyHash = artifactKeyHash(normalized, closureRes.contentHash, normalizedCcCmd)
       check r.keyHash == expectedKeyHash
@@ -213,8 +222,8 @@ suite "crisol --internal-measure-compile — real worker end-to-end (pass_always
     let code = runMain(@[InternalMeasureCompileToken, planPath])
     check code == 0   # compile succeeded; measurement failure must not propagate
 
-    check fileExists(plan.outputBinPath)
-    let (_, exitCode) = execCmdEx(plan.outputBinPath)
+    check fileExists(addFileExt(plan.outputBinPath, ExeExt))   # the link appends .exe on Windows
+    let (_, exitCode) = execCmdEx(addFileExt(plan.outputBinPath, ExeExt))
     check exitCode == 0
 
     # No rows could have been written (the ledger dir could not be created).
@@ -225,6 +234,43 @@ suite "crisol --internal-measure-compile — real worker end-to-end (pass_always
     # same unwritable "ledger" file, so it fails identically and silently.
     let costRows = scanCompileCostLedger(plan.stateDir)
     check costRows.len == 0
+
+    removeDir(workDir)
+
+  test "an unresolved driver skips every unit AND says so on the warning channel the parent relays (R11-L6)":
+    let workDir = freshWorkDir("nodriver")
+    var plan = buildPlan(workDir)
+    plan.driverSite = DriverSite(known: false, why: "lowsC-sentinel: no driver site")
+    let planPath = writePlan(plan, workDir)
+
+    var said: seq[string]
+    let code = runMeasureCompileWorker(planPath,
+                                       proc(line: string) = said.add line)
+    check code == 0   # the compile itself succeeded
+    check fileExists(addFileExt(plan.outputBinPath, ExeExt))
+
+    # Nothing recorded, and not silently: every unit's refusal names the
+    # site's reason, and one summary line says how many units the ledger
+    # is missing.
+    check scanArtifactLedger(plan.stateDir).len == 0
+    let manifest = parseCompileManifest(
+      plan.nimcacheDir / plan.outputBinPath.extractFilename & ".json")
+    let reusable = manifest.compile.len - 1   # every unit but the entry unit
+    check reusable > 0
+    var perUnit = 0
+    var summary = 0
+    for line in said:
+      check line.startsWith(MeasureWarningPrefix)
+      if "lowsC-sentinel: no driver site" in line: inc perUnit
+      if $reusable & " of " & $reusable & " reusable units were not recorded" in line:
+        inc summary
+    check perUnit == reusable
+    check summary == 1
+
+    # What the parent reads back out of the worker's captured output is
+    # exactly those lines, and nothing of nim's own.
+    let captured = "Hint: some nim chatter\n" & said.join("\n") & "\nmore output\n"
+    check measureWorkerWarnings(captured) == said
 
     removeDir(workDir)
 

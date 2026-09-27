@@ -886,7 +886,7 @@ block test_configured_cache_wires_http_remote_with_per_tier_token:
   let rs = RecordingServer(calls: @[], reply: okReply())
   let cfg = CacheConfig(remotes: @[
     RemoteTier(name: "mirror", url: "https://cache.example.com/crisol", backfillOnHit: true)
-  ])
+  ], trust: TrustConfig(policy: "none"))
   let secrets = CacheSecrets(httpTokens: {"MIRROR": "abc123"}.toTable)
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(rs.recorder),
                            secrets = secrets, sink = NilSink[TelemetryEvent]())
@@ -899,7 +899,7 @@ block test_configured_cache_falls_back_to_bare_token_when_no_tier_suffix_set:
   let rs = RecordingServer(calls: @[], reply: okReply())
   let cfg = CacheConfig(remotes: @[
     RemoteTier(name: "mirror", url: "https://cache.example.com/crisol", backfillOnHit: true)
-  ])
+  ], trust: TrustConfig(policy: "none"))
   let secrets = CacheSecrets(defaultHttpToken: some("bare-tok"))
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(rs.recorder),
                            secrets = secrets, sink = NilSink[TelemetryEvent]())
@@ -912,7 +912,7 @@ block test_configured_cache_dash_tier_name_maps_to_underscore_env_suffix:
   let rs = RecordingServer(calls: @[], reply: okReply())
   let cfg = CacheConfig(remotes: @[
     RemoteTier(name: "team-mirror", url: "https://cache.example.com/crisol", backfillOnHit: true)
-  ])
+  ], trust: TrustConfig(policy: "none"))
   let secrets = CacheSecrets(httpTokens: {"TEAM_MIRROR": "dash-tok"}.toTable)
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(rs.recorder),
                            secrets = secrets, sink = NilSink[TelemetryEvent]())
@@ -1263,7 +1263,8 @@ block test_configured_cache_no_remotes_is_local_only:
 block test_configured_cache_rejects_l1_named_remote:
   let sd = freshStateDir14("l1name")
   let cfg = CacheConfig(remotes: @[RemoteTier(name: "l1",
-                                              url: "file://" & freshLocalFsRoot("l1name_remote"))])
+                                              url: "file://" & freshLocalFsRoot("l1name_remote"))],
+                        trust: TrustConfig(policy: "none"))
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
@@ -1276,7 +1277,8 @@ block test_configured_cache_rejects_l1_named_remote:
 block test_configured_cache_rejects_root_inside_state_dir:
   let sd = freshStateDir14("rootinside")
   let nested = sd / "cache" / "nested"
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)],
+                        trust: TrustConfig(policy: "none"))
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
@@ -1288,7 +1290,8 @@ block test_configured_cache_rejects_root_inside_state_dir:
 
 block test_configured_cache_rejects_root_equal_to_state_dir:
   let sd = freshStateDir14("rootequal")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & sd)])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & sd)],
+                        trust: TrustConfig(policy: "none"))
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
@@ -1316,7 +1319,8 @@ block test_configured_cache_rejects_case_variant_root_inside_state_dir_under_fol
   let sd = freshStateDir14("rootinside_casevariant")
   let flippedSd = sd.toUpperAscii()
   let nested = flippedSd / "cache" / "nested"
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpAsciiLowerProbe)
   var caught = false
   try:
@@ -1338,7 +1342,8 @@ block test_configured_cache_rejects_ordinary_root_inside_state_dir_under_folding
   # never masks an already-matching comparison).
   let sd = freshStateDir14("rootinside_folding")
   let nested = sd / "cache" / "nested"
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpAsciiLowerProbe)
   var caught = false
   try:
@@ -1356,7 +1361,8 @@ block test_configured_cache_allows_outside_root_under_folding_policy:
   # folding both sides never turns a distinct directory into a match.
   let sd = freshStateDir14("outside_folding")
   let remoteRoot = freshLocalFsRoot("configuredcache_outside_folding")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpAsciiLowerProbe)
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
@@ -1376,7 +1382,8 @@ block test_configured_cache_degraded_trackedroots_rejects_even_an_outside_root:
   # never a silent fpNone-and-hope fallback.
   let sd = freshStateDir14("degraded_outside")
   let remoteRoot = freshLocalFsRoot("configuredcache_degraded_outside")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+                        trust: TrustConfig(policy: "none"))
   var caught = false
   try:
     # `trackedRoots` omitted -- defaults to the zero value (unpopulated).
@@ -1420,7 +1427,8 @@ block test_configured_cache_rejects_drive_letter_case_mismatch_under_fpnone:
   # though both spellings denote the exact same root.
   let sd = "C:/state"
   let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror",
-                                              url: "file://c:/state/cache/nested")])
+                                              url: "file://c:/state/cache/nested")],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
   var caught = false
   try:
@@ -1441,7 +1449,8 @@ block test_configured_cache_rejects_long_path_prefixed_root_under_any_policy:
   # this isolates the prefix-stripping fix from the drive-case fix above.
   let sd = "C:/state"
   let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror",
-                                              url: "file://" & "\\\\?\\C:\\state\\cache\\nested")])
+                                              url: "file://" & "\\\\?\\C:\\state\\cache\\nested")],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
   var caught = false
   try:
@@ -1462,7 +1471,8 @@ block test_configured_cache_rejects_file_uri_three_slash_drive_form:
   # (without a url-aware extraction) would misclassify it as POSIX-rooted.
   let sd = "C:/state"
   let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror",
-                                              url: "file:///C:/state/cache/nested")])
+                                              url: "file:///C:/state/cache/nested")],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
   var caught = false
   try:
@@ -1488,7 +1498,8 @@ block test_configured_cache_accepts_pathological_posix_single_letter_colon_dir:
   # -- unrelated to `stateDir`, so `configuredCache` must accept it.
   let sd = freshStateDir14("f30_pathological_posix")
   let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror",
-                                              url: "file:///a:foo/x")])
+                                              url: "file:///a:foo/x")],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
   var caught = false
   var caughtMsg = ""
@@ -1517,7 +1528,8 @@ block test_configured_cache_uses_statedir_volume_policy_not_projects:
   let sd = freshStateDir14("bcacheguard_statedir_policy")
   let flippedSd = sd.toUpperAscii()
   let nested = flippedSd / "cache" / "nested"
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & nested)],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(projectRoot, @[], sd, probe = forcedFpNoneProbe)
   var caught = false
   try:
@@ -1540,7 +1552,8 @@ block test_configured_cache_fails_closed_on_statedir_probe_failure:
   # proven for this dedicated probe's own failure too.
   let sd = freshStateDir14("bcacheguard_probefail")
   let remoteRoot = freshLocalFsRoot("bcacheguard_probefail_remote")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+                        trust: TrustConfig(policy: "none"))
   let trackedRoots = initTrackedRoots(sd, @[], sd, probe = forcedFpNoneProbe)
   var caught = false
   try:
@@ -1558,7 +1571,8 @@ block test_configured_cache_rejects_unresolvable_scheme:
   # scheme genuinely unregistered by ANY registry (not merely "not yet
   # shipped") to still exercise `buildBackend`'s `none` path.
   let sd = freshStateDir14("unknownscheme")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "ftp://example.com/cache")])
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "ftp://example.com/cache")],
+                        trust: TrustConfig(policy: "none"))
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
@@ -1572,7 +1586,8 @@ block test_configured_cache_builds_a_real_second_tier:
   let sd = freshStateDir14("realtier")
   let remoteRoot = freshLocalFsRoot("configuredcache_remote")
   let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot,
-                                              backfillOnHit: true)])
+                                              backfillOnHit: true)],
+                        trust: TrustConfig(policy: "none"))
   let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
                            trackedRoots = initTrackedRoots(sd, @[], sd))
@@ -1613,7 +1628,7 @@ block test_configured_cache_rejects_verify_trust_true_under_policy_none:
   let remoteRoot = freshLocalFsRoot("configuredcache_verifytrue_nonepolicy")
   let cfg = CacheConfig(
     remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot, verifyTrust: some(true))],
-    # trust left at its default: policy "none"
+    trust:   TrustConfig(policy: "none"),
   )
   var caught = false
   try:
@@ -1639,6 +1654,48 @@ block test_configured_cache_rejects_hmac_policy_without_secret:
     caught = true
     assert e.kind == cekConfig
   assert caught, "policy 'hmac' with no $CRISOL_CACHE_HMAC_KEY must be a config error"
+
+block test_configured_cache_rejects_an_unset_trust_policy_with_a_remote_tier:
+  # R7-S7: `TrustConfig.policy` has no default. A `CacheConfig` built in code
+  # with a remote tier and no `trust` must not be read unverified: "none" is
+  # a choice the caller states, never one the zero value makes for it. A
+  # `file://` remote is the case that matters -- s3:// and http:// are
+  # already rejected under "none" -- so it is the fixture here.
+  let sd = freshStateDir14("trust_unset_remote")
+  let remoteRoot = freshLocalFsRoot("configuredcache_trust_unset")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)])
+  var caught = false
+  try:
+    discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                            secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                            trackedRoots = initTrackedRoots(sd, @[], sd))
+  except CrisolError as e:
+    caught = true
+    assert e.kind == cekConfig
+    assert "unset" in e.msg, "the error must name the unset policy, got: " & e.msg
+  assert caught, "a remote tier under an unset cache-trust policy must be a config error"
+
+block test_configured_cache_an_unset_trust_policy_without_remotes_is_local_only:
+  # R7-S7, control: with no remote tier there is nothing to verify, so an
+  # unset policy is inert and the run gets the plain local cache.
+  let sd = freshStateDir14("trust_unset_noremote")
+  let rt = configuredCache(CacheConfig(), sd, maxEntries = 0, reg = productionRegistry(),
+                           secrets = CacheSecrets(), sink = NilSink[TelemetryEvent]())
+  assert rt.cache.tiers.len == 1
+  assert rt.cache.tiers[0].name == "l1"
+
+block test_configured_cache_an_explicit_none_policy_reads_a_file_remote:
+  # R7-S7, control: saying "none" out loud still builds the remote tier,
+  # unverified, as before.
+  let sd = freshStateDir14("trust_none_remote")
+  let remoteRoot = freshLocalFsRoot("configuredcache_trust_none")
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "file://" & remoteRoot)],
+                        trust: TrustConfig(policy: "none"))
+  let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
+                           secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
+                           trackedRoots = initTrackedRoots(sd, @[], sd))
+  assert rt.cache.tiers.len == 2
+  assert rt.cache.tiers[1].verifyTrust == false
 
 block test_configured_cache_rejects_hmac_policy_without_secret_even_with_no_remotes:
   # RFC-0005 C4: the RFC's own "misconfiguration is a config error, not a
@@ -1767,8 +1824,8 @@ block test_configured_cache_wires_hmac_policy_end_to_end:
 
 block test_configured_cache_rejects_unsigned_s3_without_verifying_policy:
   let sd = freshStateDir14("sec5_s3_unsigned")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "team-s3", url: "s3://ci-cache/crisol")])
-    # trust left at its default: policy "none"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "team-s3", url: "s3://ci-cache/crisol")],
+                        trust: TrustConfig(policy: "none"))
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
@@ -1791,8 +1848,8 @@ block test_configured_cache_rejects_unsigned_s3_without_verifying_policy:
 
 block test_configured_cache_rejects_unsigned_http_without_verifying_policy:
   let sd = freshStateDir14("sec1_http_unsigned")
-  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "http://cache.example.com/crisol")])
-    # trust left at its default: policy "none"
+  let cfg = CacheConfig(remotes: @[RemoteTier(name: "mirror", url: "http://cache.example.com/crisol")],
+                        trust: TrustConfig(policy: "none"))
   var caught = false
   try:
     discard configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),

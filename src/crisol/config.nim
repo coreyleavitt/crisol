@@ -811,9 +811,10 @@ proc docToConfig(doc: KdlDoc; projectRoot: string; source: string;
     # reuseCheck). Order-preserving; empty = single-tier local.
     remoteCaches: seq[RemoteTier]
     # RFC-0005 C4: the CACHE-GLOBAL `cache-trust { }` block — parsed in the
-    # second pass (has children). Zero-value TrustConfig has policy == ""
-    # (Nim's default), so this starts at the KDL default "none" explicitly
-    # rather than relying on the zero value -- see below.
+    # second pass (has children). `TrustConfig.policy` has no default (its
+    # zero value "" means unset, which `configuredCache` refuses beside a
+    # remote tier -- R7-S7), so this starts at the KDL default "none"
+    # explicitly: a document with no `cache-trust` block chose "none".
     trustCfg: TrustConfig = TrustConfig(policy: "none")
 
   # First pass: collect all globals (so flag-merge is correct for groups).

@@ -230,7 +230,7 @@ type
     ## returns (`cachedispatch.nim`'s `var rt = rt`) — that copy is where the
     ## per-run circuit breaker actually accumulates state across a run's
     ## `load`/`store` calls, entirely inside `realSeams`'s own closure
-    ## environment. `api.runTestsWith`'s end-of-run deferred-put FLUSH
+    ## environment. `runcore.runTestsWith`'s end-of-run deferred-put FLUSH
     ## (RFC-0005 "Deferred remote puts") needs to observe THAT SAME
     ## accumulated state (the breaker, and the queue of remote-destined
     ## entries below) from ITS OWN copy of `rt`, built before `realSeams` is
@@ -254,7 +254,7 @@ type
       ## RFC-0005 B0/A3c-ii "Deferred remote puts": entries a live finalize
       ## wrote to tier 0 ("l1") synchronously via `TieredCache.putLocal` AND
       ## destined for at least one remote tier (`cache.tiers.len > 1`) —
-      ## queued here instead of fanning out inline. `api.runTestsWith`
+      ## queued here instead of fanning out inline. `runcore.runTestsWith`
       ## drains this ONCE, at the end-of-run join point (after the poll loop
       ## drains, before `persistLastRun`), via `cache.drainPending`, under
       ## the SAME circuit breaker the run's own lookups/puts already
@@ -270,7 +270,7 @@ type
     ## injected -- the cache modules never read env." `api.nim` builds
     ## this ONCE per `runTests`/`runTestsWith` call (via
     ## `resolveCacheSecrets`, at the top of `runTestsWith`, before any
-    ## child spawns -- R2-D5a) and passes it to `CacheDeps.buildRuntime`;
+    ## child spawns -- R2-D5a) and passes it to `RunDeps.buildRuntime`;
     ## `configuredCache` (below) is the ONLY consumer.
     ##
     ## `hmacKey` (`$CRISOL_CACHE_HMAC_KEY`) is C4's field. `signSeedB64` (RFC-
@@ -283,7 +283,7 @@ type
     ## `api.nim` decode straight to `Option[sello.Seed]` and move THAT into
     ## `CacheSecrets`/`ed25519Policy`. That does not typecheck through this
     ## codebase's ACTUAL plumbing: `runTestsWith` resolves `CacheSecrets` ONCE
-    ## (R2-D5a) and passes it to `CacheDeps.buildRuntime`, a `{.closure.}`
+    ## (R2-D5a) and passes it to `RunDeps.buildRuntime`, a `{.closure.}`
     ## whose type permits more than one call; Nim's move analysis (correctly)
     ## refuses to move a field out of a value shared by a closure's captured
     ## environment, since a second call would then observe an
@@ -512,6 +512,8 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
   ##
   ## Rejects (RFC "Misconfiguration is a config error, not a silent dead
   ## tier"):
+  ##   - **R7-S7:** an unset `cfg.trust.policy` ("") beside any remote tier
+  ##     (see `TrustConfig.policy`); with no remote tier it is inert.
   ##   - a remote named `"l1"` — reserved for the pinned local tier.
   ##   - a `file://` root that resolves inside `stateDir` (`clean` would
   ##     prune it out from under a live remote — see `rootInsideStateDir`).
@@ -569,6 +571,19 @@ proc configuredCache*(cfg: CacheConfig; stateDir: string; maxEntries: int;
   ## != "none"`.** An explicit `verify-trust #true`/`#false` on a remote
   ## tier always wins (`RemoteTier.verifyTrust.get(...)` below) except the
   ## `#true`-under-`none` combination above, which is rejected outright.
+  # R7-S7: an UNSET policy ("", the zero value -- `TrustConfig.policy` has no
+  # default) is refused beside a remote tier, before anything else: "none"
+  # reads every remote unverified, and that must be a stated choice, never
+  # one a `CacheConfig` built in code makes by omitting `trust`. With no
+  # remote tier nothing is ever verified, so it is inert: the plain local
+  # cache, exactly what "none" gives there.
+  if cfg.trust.policy.len == 0:
+    if cfg.remotes.len > 0:
+      raise newCrisolError(cekConfig,
+        "config: cache-trust policy is unset but a remote-cache tier is " &
+        "configured -- set TrustConfig.policy explicitly (\"none\" to read " &
+        "remote tiers unverified, \"hmac\" or \"ed25519\" to verify them)")
+    return localOnlyCache(stateDir, maxEntries)
   let trust = buildTrustPolicy(cfg.trust, secrets)
   let defaultVerifyTrust = cfg.trust.policy != "none"
 

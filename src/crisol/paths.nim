@@ -24,6 +24,7 @@
 # under `crisol/` — and `cachelocalfs.nim` already imports both modules side
 # by side.
 import std/[hashes, json, options, os, strutils, tables]
+from std/unicode import Rune, toLower, toUpper
 import crisol/ioutils
 
 # ---------------------------------------------------------------------------
@@ -594,38 +595,93 @@ type CandidateExpander* = proc (p: string): string
   ## expand -> re-match) without a real Windows short name to expand,
   ## mirroring `FoldProbe` above.
 
-proc underRootFolded(candidate, rootAbs: string; policy: FoldPolicy): bool =
-  ## `underRoot`'s membership question asked under `policy` — but as a
-  ## CHEAP FILTER only, never as an identity decision.
+proc nextFoldUnit(s: string; limit: int; i: var int): int32 =
+  ## The code point starting at byte `i` of `s[0 ..< limit]`, simple-case-
+  ## folded, with `i` advanced past it. A byte that does not begin a
+  ## well-formed UTF-8 sequence ending before `limit` is its own unit (its
+  ## byte value, negated so it can never equal a real code point), so
+  ## malformed text compares byte for byte and never swallows a following
+  ## separator.
+  let b0 = uint32(s[i])
+  if b0 < 0x80:
+    inc i
+    return int32(toLowerAscii(s[i - 1]))
+  let need = if (b0 shr 5) == 0b110: 1
+             elif (b0 shr 4) == 0b1110: 2
+             elif (b0 shr 3) == 0b11110: 3
+             else: 0
+  var ok = need > 0 and i + need < limit
+  var cp = b0 and (0x7F'u32 shr (need + 1))
+  if ok:
+    for k in 1 .. need:
+      if (uint32(s[i + k]) shr 6) != 0b10:
+        ok = false
+        break
+      cp = (cp shl 6) or (uint32(s[i + k]) and 0x3F)
+  if not ok:
+    inc i
+    return -int32(b0)
+  i += need + 1
+  int32(toLower(toUpper(Rune(cp))))
+
+proc underRootCaseBlind(candidate, rootAbs: string): bool =
+  ## `underRoot`'s membership question asked with CASE DISREGARDED — a
+  ## CHEAP FILTER only, never an identity decision (`classify`'s expansion
+  ## trigger and `caseBlindRootMembership`'s refusal test are its only
+  ## callers; identity stays with the case-sensitive `underRoot`).
   ##
-  ## Allocation-free on purpose. This runs on every `classify` MISS, and
-  ## misses are the common case on a real run (every system header, every
-  ## stdlib path, every out-of-tree file `SourceIndex` walks past). Folding
-  ## both operands into fresh strings would put two `toLowerAscii`
-  ## allocations on that path; comparing byte-by-byte instead short-circuits
-  ## at the first difference, which for a genuinely-foreign path is within
-  ## the first few characters (`c:/msvc/...` vs `c:/users/...` parts at
-  ## index 3).
+  ## Case is disregarded under Unicode SIMPLE case folding (each code point
+  ## mapped through `toUpper` then `toLower`, std/unicode's tables), not
+  ## ASCII alone: `cl /sourceDependencies` lowercases non-ASCII letters too
+  ## (measured, cl 19.44: a root `C:\poc\Ärger` is reported as
+  ## `c:\poc\ärger\...`), and an ASCII-only filter let such a report fall
+  ## outside every root, so it was neither resolved nor refused but dropped
+  ## (R10-S1). This widens only the FILTER; `FoldPolicy`'s own fold
+  ## (`fold`, `TrackedPath` `==`/`hash`) stays ASCII-only as RFC-0009's
+  ## "Risks accepted" records.
+  ##
+  ## Limits, stated rather than implied. Simple folding maps one code point
+  ## to one code point, so it does not equate multi-code-point foldings
+  ## (`ß` with `ss`, a ligature with its letters), applies no Turkic dotted
+  ## and dotless `i` rules, and performs no Unicode normalization (an NFC
+  ## `ä` is not an NFD `a` plus combining diaeresis). Its tables are the
+  ## Nim standard library's, which need not match the one a given
+  ## filesystem or compiler uses. A report whose root spelling differs only
+  ## in one of those ways is still missed by this filter.
+  ##
+  ## Allocation-free on purpose: this runs on every `classify` miss, which
+  ## is the common case on a real run (every system header, every stdlib
+  ## path). ASCII bytes are compared directly; only a non-ASCII byte pays
+  ## for a UTF-8 decode, and the comparison short-circuits at the first
+  ## difference, which for a genuinely-foreign path is within the first few
+  ## characters.
   ##
   ## Same component-boundary semantics as `underRoot`, including its
   ## treatment of the root itself: a candidate EQUAL to the root is not
-  ## under it (a root is a container, never a trackable file), so at least
-  ## one further component is required.
+  ## under it (a root is a container, never a trackable file), so a
+  ## separator must follow the matched root spelling.
   var rl = rootAbs.len
   while rl > 0 and rootAbs[rl - 1] == '/':
     dec rl                                   # ignore any trailing separator
   if rl == 0: return false
-  if candidate.len <= rl: return false
-  if candidate[rl] != '/': return false      # component boundary, not a prefix
-  for i in 0 ..< rl:
-    let c = case policy
-            of fpNone: candidate[i]
-            of fpAsciiLower: toLowerAscii(candidate[i])
-    let r = case policy
-            of fpNone: rootAbs[i]
-            of fpAsciiLower: toLowerAscii(rootAbs[i])
-    if c != r: return false
-  true
+  var i = 0                                  # into rootAbs[0 ..< rl]
+  var j = 0                                  # into candidate
+  while i < rl:
+    if j >= candidate.len: return false
+    if nextFoldUnit(rootAbs, rl, i) != nextFoldUnit(candidate, candidate.len, j):
+      return false
+  j < candidate.len and candidate[j] == '/'  # component boundary, not a prefix
+
+proc caseBlindEqual*(a, b: string): bool =
+  ## Whether `a` and `b` are the same text once case is disregarded under
+  ## Unicode simple case folding (`underRootCaseBlind` states the fold and
+  ## its limits). A FILTER for text a foreign tool re-cased, such as a
+  ## file name `cl` reports lowercased; never an identity decision.
+  var i = 0
+  var j = 0
+  while i < a.len and j < b.len:
+    if nextFoldUnit(a, a.len, i) != nextFoldUnit(b, b.len, j): return false
+  i == a.len and j == b.len
 
 proc foldMatchesSomeRoot(abs: string; roots: TrackedRoots): bool =
   ## True iff SOME root could claim `abs` once case is disregarded under
@@ -640,13 +696,13 @@ proc foldMatchesSomeRoot(abs: string; roots: TrackedRoots): bool =
   ## predicate (RFC-0009 wiring-audit W9m), not a re-derived condition of
   ## its own.
   if roots.project.foldPolicy.folds and
-     (underRootFolded(abs, roots.project.abs, fpAsciiLower) or
-      underRootFolded(abs, roots.project.realAbs, fpAsciiLower)):
+     (underRootCaseBlind(abs, roots.project.abs) or
+      underRootCaseBlind(abs, roots.project.realAbs)):
     return true
   for d in roots.fdeps:
     if d.foldPolicy.folds and
-       (underRootFolded(abs, d.abs, fpAsciiLower) or
-        underRootFolded(abs, d.realAbs, fpAsciiLower)):
+       (underRootCaseBlind(abs, d.abs) or
+        underRootCaseBlind(abs, d.realAbs)):
       return true
   false
 
@@ -827,6 +883,28 @@ proc classify*(reported: ReportedPath; roots: TrackedRoots;
   ## all — there is no `csTrusted`-shaped default to silently fall through.
   classifyCore(nativeCanonicalize(string(reported), roots.project.abs), roots,
               true, expandCandidate)
+
+proc caseBlindRootMembership*(reported: ReportedPath; roots: TrackedRoots):
+    tuple[underFoldingRoot, underCaseSensitiveRoot: bool] =
+  ## Which roots could contain `reported` if its CASE is disregarded, split
+  ## by whether that root folds case (its own probed policy). Pure text, no
+  ## I/O; canonicalized exactly as `classify`'s `ReportedPath` overload
+  ## canonicalizes it. Case is disregarded under Unicode simple case
+  ## folding, not ASCII alone (`underRootCaseBlind`, which also states the
+  ## fold's limits): cl lowercases `Ä` as readily as `A`.
+  ##
+  ## For a spelling whose case the reporting tool did not preserve (`cl
+  ## /sourceDependencies` lowercases every path), this is the question
+  ## `classify` deliberately does not answer: under a case-sensitive root
+  ## two casings are two files, so such a spelling names no file at all
+  ## until its real case is known, and a consumer must refuse it rather
+  ## than drop it or match it.
+  let abs = nativeCanonicalize(string(reported), roots.project.abs).abs
+  for r in @[roots.fproject] & roots.fdeps:
+    if underRootCaseBlind(abs, r.abs) or
+       underRootCaseBlind(abs, r.realAbs):
+      if r.foldPolicy.folds: result.underFoldingRoot = true
+      else: result.underCaseSensitiveRoot = true
 
 proc tracked*(native: string; roots: TrackedRoots): Option[TrackedPath] =
   ## Convenience over `classify` for the include-or-skip call sites that

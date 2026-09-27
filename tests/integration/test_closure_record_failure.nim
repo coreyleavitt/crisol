@@ -33,10 +33,11 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_closure_record_failure.nim
 
-import std/[options, os, sets, tables, times, unittest]
+import std/[options, os, sets, strutils, tables, times, unittest]
 import crisol/[types, runner, depgraph, planner, sandbox, cachedispatch, resultcache, closure, toolrun]
 import "../support/helpers"  # legacySeams
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 proc makeTempRoot(tag: string): string =
   result = getTempDir() / ("crisol_closure_record_" & tag & "_" &
@@ -54,6 +55,7 @@ proc makeCfg(root: string): Config =
 proc failingRecordClosure(graph: var DepGraph; config: Config; ep: Entrypoint;
                           nimcacheDir, binaryName: string;
                           protocolMajor: int; index: SourceIndex;
+                          driver: DriverResolver;
                           ccRun: RunProc): tuple[ok: bool, error: string] =
   ## R3a/R3b seam injection: the compile always succeeds (it's a real
   ## `pass_always.nim` compile+run under the tracked project root); this
@@ -65,15 +67,24 @@ proc failingRecordClosure(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## Mirrors the real `recordClosure`'s `except CatchableError` branch
   ## (invalidate + persist the graph on a recording failure) — that
   ## invalidation is `recordClosure`'s OWN responsibility, not the
-  ## runner's (the runner only reads `closureRecorded`/`closureError`
-  ## back off the slot to decide the stable-binary discard, issue #13.3
-  ## D5), so a substitute seam must replicate it to keep the "either the
+  ## runner's (the runner only reads `closureRecorded` back off the slot
+  ## to decide the stable-binary discard, issue #13.3 D5), so a substitute seam must replicate it to keep the "either the
   ## on-disk entry matches the stable binary, or there is no stable
   ## binary" invariant this test exercises.
   let fHash = flagHash(ep.flags)
   graph.invalidateEntry(string(ep.tp.display()), fHash)
   discard saveDepGraph(graph, config)
   (false, "injected recording failure")
+
+template checkClosureWarning(rep: ExecuteReport; ep: Entrypoint) =
+  ## R18-D1: the unrecorded closure reaches `ExecuteReport.warnings` (and
+  ## from there the `--json` `warnings` array), naming the entrypoint and
+  ## the recording error. A template: `check` must land in the calling test.
+  checkpoint("warnings: " & $rep.warnings)
+  require rep.warnings.len == 1
+  check rep.warnings[0].context == "closure-record"
+  check rep.warnings[0].key == string(ep.tp.display())
+  check "injected recording failure" in rep.warnings[0].message
 
 suite "closure recording failure after a successful compile (issue #5)":
 
@@ -100,19 +111,24 @@ suite "closure recording failure after a successful compile (issue #5)":
     # discard), never read back for content, so it just needs to be SOME
     # non-empty TrackedPath under the tracked project root.
     let seededClosure = [fromCanonical("bait.nim", cfg.trackedRoots).get].toHashSet
-    graph.updateEntry(string(ep.tp.display()), fHash, seededClosure,
+    graph.updateEntry(string(ep.tp.display()), fHash, seededClosure, @[],
                       closureContentHash(@[(key: string(ep.tp.display()), nativePath: epNative)]),
                       CrisolProtocolMajor)
     createDir(root / ".crisol")
     doAssert saveDepGraph(graph, cfg)
 
-    let plan1 = plan(cfg, @[ep], graph, nimVersion = "")
+    let plan1 = plan(cfg, @[ep], graph)
     check plan1.entrypoints[0].edecision == edNeverBuilt
-    let r1 = execute(plan1, config = cfg, graph = graph,
-                     nimVersion = "", showProgress = false,
-                     recordClosureFn = failingRecordClosure).results
+    let rep1 = execute(plan1, config = cfg, graph = graph,
+                       nimVersion = "", showProgress = false,
+                       recordClosureFn = failingRecordClosure, toolchain = unprobedToolchain())
+    let r1 = rep1.results
     check r1.len == 1
     check r1[0].outcome == oPassed            # compile + run succeeded
+
+    # R18-D1: with caching off no `cacheDecision` carries the fact, so the
+    # structured warning is the only channel besides stderr.
+    checkClosureWarning(rep1, ep)
 
     # Recording failed → the seeded entry must be GONE, in memory and on disk.
     check key notin graph.entries
@@ -124,7 +140,7 @@ suite "closure recording failure after a successful compile (issue #5)":
     # this run is discarded too, so no binary describes this key at all —
     # the next plan sees edNeverBuilt, not edStale ("no closure record" only
     # applies when a binary exists but no entry backs it).
-    let plan2 = plan(cfg, @[ep], graph, nimVersion = "")
+    let plan2 = plan(cfg, @[ep], graph)
     check plan2.entrypoints[0].edecision == edNeverBuilt
     check plan2.entrypoints[0].reason == "binary absent (first run or cache cleared)"
 
@@ -163,15 +179,16 @@ suite "closure recording failure blocks the result-cache store (issue #5, R9)":
     createDir(root / ".crisol")
     doAssert saveDepGraph(graph, cfg)
 
-    let plan1 = plan(cfg, @[ep], graph, nimVersion = "")
+    let plan1 = plan(cfg, @[ep], graph)
     check plan1.entrypoints[0].edecision == edNeverBuilt
 
     let ms = MockCacheState()
     let cache = cacheEnabled(resolveSandbox(hlIsolated), defaultCachePolicy(),
                              mockStoreOnlySeams(ms))
-    let r1 = execute(plan1, config = cfg, graph = graph,
-                     nimVersion = "", showProgress = false, cache = cache,
-                     recordClosureFn = failingRecordClosure).results
+    let rep1 = execute(plan1, config = cfg, graph = graph,
+                       nimVersion = "", showProgress = false, cache = cache,
+                       recordClosureFn = failingRecordClosure, toolchain = unprobedToolchain())
+    let r1 = rep1.results
 
     check r1.len == 1
     check r1[0].outcome == oPassed          # compile + run still succeeded
@@ -183,3 +200,5 @@ suite "closure recording failure blocks the result-cache store (issue #5, R9)":
     # `--json` reader can tell WHY the store didn't happen (R9).
     check r1[0].cacheDecision == cdmClosureUnrecorded
     check not r1[0].cached
+    # R18-D1: and the run-level warning, whether or not the cache is on.
+    checkClosureWarning(rep1, ep)

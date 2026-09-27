@@ -11,9 +11,10 @@
 ## {
 ##   "header": {
 ##     "nimVersion":     "<string>",   -- e.g. "2.2.10"
-##     "ccVersion":      "<string>",   -- W3: C toolchain fingerprint, e.g.
-##                                     -- "gcc 13.2.0|ldd 2.39" (ccidentity.
-##                                     -- ccVersion's shape). OPTIONAL on read
+##     "ccVersion":      "<string>",   -- W3: C toolchain identity, shaped
+##                                     -- "<cc text> #<hex>|<runtime text>
+##                                     -- #<hex>" (toolchainwarn.
+##                                     -- toolchainIdentity). OPTIONAL on read
 ##                                     -- (absent -> ""; see DepGraphHeader.
 ##                                     -- ccVersion's doc) -- always written.
 ##     "formatVersion":  <int>,        -- DepGraphFormatVersion
@@ -151,6 +152,9 @@ import crisol/toolrun   # for RunProc/realRunIn (recordClosure's ccRun param).
                         # symbols, so it imports the seam's own module
                         # directly rather than reaching through either half
                         # of the old ccprobe.nim.
+from crisol/ccprobe import DriverResolver
+                        # recordClosure's `driver` param (R10-S6): the types
+                        # alone; ccprobe is a pure leaf, no cycle.
 import crisol/ioutils  # sanitizeControlBytes (the shared control/ANSI-byte
                         # sanitization primitive — bottom of the dep graph, no
                         # cycle) and atomicPublish (saveDepGraph's writer,
@@ -166,7 +170,7 @@ export fnv
 # Constants
 # ---------------------------------------------------------------------------
 
-const DepGraphFormatVersion* = 9
+const DepGraphFormatVersion* = 10
   ## Increment this when the JSON schema changes in an incompatible way.
   ## A loaded file with a different formatVersion is treated as absent.
   ##
@@ -193,6 +197,23 @@ const DepGraphFormatVersion* = 9
   ## the first place, so there is nothing for a bump to protect.
   ##
   ## History:
+  ##   10 — issue #25: each entry gains `links` — every symlink its closure
+  ##       members may have been reached through (`closure.crossedLinks`),
+  ##       with the link's resolved target at record time. Nim records a
+  ##       module by its realpath, so a module imported through a link
+  ##       (`vend/m`, `vend -> libs/a`) entered the closure as
+  ##       `libs/a/m.nim` with `vend` nowhere; repointing `vend` left every
+  ##       recorded member unchanged, and `decideCompile` served the stale
+  ##       binary as fresh (and, through it, a stale cached result). `links`
+  ##       is re-resolved by `decideCompile` and `isEntryStale`
+  ##       (`entryDrift`, `dkMoved`). Bump direction: DISCARD. A v9 entry has no `links`
+  ##       field and would read back as "crossed no link", exempting exactly
+  ##       the entries this fixes from the new check; the bump discards the
+  ##       graph once (a one-time full recompile) instead, like every prior
+  ##       bump. The result-cache key is unchanged: it is derived from the
+  ##       closure a compile actually recorded, which already names the
+  ##       files the binary was built from; only the compile-skip decision
+  ##       trusted a closure it could not see was out of date.
   ##   9 — W3 (wiring-audit finding, re-verified 2026-09-21): `decideCompile`
   ##       was blind to the C toolchain while its `nimVersion` sibling was
   ##       fully wired -- upgrading cc without changing Nim left
@@ -306,9 +327,12 @@ type
     formatVersion*: int     ## DepGraphFormatVersion
     ccVersion*:     string
       ## W3: the depgraph-header sibling of `nimVersion` -- the C toolchain
-      ## fingerprint (`ccidentity.ccVersion`'s shape: "<cc version line>|
-      ## <runtime identity>") in effect the last time this graph's entries
-      ## were recorded. Compared by `loadDepGraph` against the caller's
+      ## identity (`toolchainwarn.toolchainIdentity`: `$CcFingerprint`,
+      ## "<cc text> #<hex>|<runtime text> #<hex>", for an identified
+      ## toolchain; that string plus a per-run nonce for an unidentified one,
+      ## so an unidentified toolchain never matches any stored header, its
+      ## own included) in effect the last time this graph's entries were
+      ## recorded. Compared by `loadDepGraph` against the caller's
       ## CURRENT cc fingerprint exactly like `nimVersion` (`dgdCcVersion` on
       ## mismatch). `planner.decideCompile` compared it too until round 5
       ## (R3-8) removed that arm as unreachable -- by the time a graph reaches
@@ -398,6 +422,60 @@ type
       ## `paths.keyBytes` spellings (never a machine-local absolute path,
       ## even for a dep-root source/header) — see that type's own doc in
       ## `crisol/closure`.
+    links*:         seq[ClosureLink]
+      ## Issue #25: every symlink a closure member may have been reached
+      ## through, with its resolved target at record time
+      ## (`closure.crossedLinks`). Empty for the common entry that crossed
+      ## none. With `closure`, it is the entry's WATCHED SET: `entryDrift`
+      ## re-resolves each link (`dkMoved`) for `planner.decideCompile` and
+      ## `isEntryStale`, and `diffReach` selects the entry under `--changed`
+      ## when a changed name reaches one (`narrow.narrowByDiff` rule 5).
+      ##
+      ## ABSENCE IS LOAD-BEARING. A directory on a member's path that is a
+      ## link NOT in this list is drift (`dkUnrecorded`, R13-S1): the entry
+      ## is stale until a recompile records it. So an entry recorded without
+      ## the links its members were reached through is stale on every run,
+      ## and one recorded with a link it never crossed would exempt that
+      ## link's subtree from the check. `updateEntry` therefore takes
+      ## `links` as a REQUIRED argument (R12-D6, R14-D2): `recordClosure`
+      ## passes `closure.crossedLinks` from the same run's `SourceIndex`, and
+      ## no record path can leave it out by forgetting a field assignment.
+
+  DriftKind* = enum
+    ## What moved on the file system under an entry's watched set since the
+    ## record (`entryDrift`). Checked in this order; the first found wins.
+    dkMissing     ## a closure member no longer exists
+    dkMoved       ## a recorded link no longer leads to its recorded target
+                  ## (repointed, deleted, or replaced by a file or directory)
+    dkUnrecorded  ## a directory on a member's path is now a link the entry
+                  ## did not record (R13-S1)
+
+  Drift* = object
+    ## Evidence that an entry is stale (`entryDrift`).
+    kind*: DriftKind
+    path*: TrackedPath
+      ## The missing member (`dkMissing`), the recorded link (`dkMoved`),
+      ## or the directory that is now a link (`dkUnrecorded`).
+
+  HitKind* = enum
+    ## How a changed set reaches an entry's watched set (`diffReach`).
+    ## Checked in this order; the first found wins.
+    hkMember      ## a changed name is a closure member
+    hkLink        ## a changed name is a recorded link, or a directory above one
+    hkUnderLink   ## a changed name lies under a recorded link (git names the
+                  ## files it sees through a Windows junction)
+    hkAncestor    ## a changed name is a directory above a closure member
+                  ## (a directory replaced as a whole, R13-S1)
+
+  Hit* = object
+    ## Evidence that a changed set selects an entry (`diffReach`).
+    kind*:    HitKind
+    name*:    TrackedPath
+      ## The changed name, spelled as the changed set holds it.
+    watched*: TrackedPath
+      ## What it reached, spelled as the entry records it: the member
+      ## (`hkMember`, `hkAncestor`) or the recorded link (`hkLink`,
+      ## `hkUnderLink`). Under a case fold the two spellings can differ.
 
   DepGraphDiscardKind* = enum
     ## Why `loadDepGraph` discarded a persisted graph.
@@ -486,7 +564,7 @@ proc sanitizeHeaderField(s: string; pipeAware: bool = false): string =
   ##
   ## It must NOT be used for the cc fingerprint. An earlier revision of this
   ## proc claimed the same rule was "a harmless no-op truncation" for
-  ## `ccidentity.ccVersion` — that was wrong, and observably so: ccVersion is
+  ## the cc identity — that was wrong, and observably so: ccVersion is
   ## "<cc text> #<digest>|<runtime text> #<digest>", so the text after the
   ## final '|' is the RUNTIME IDENTITY, not a hash. Truncating it to 12
   ## characters rendered a real discard as
@@ -546,11 +624,15 @@ proc abbreviateDigest(seg: string): string =
   text & " #" & digest[^12 .. ^1]
 
 proc sanitizeCcFingerprintField(s: string): string =
-  ## Render a `ccidentity.ccVersion` value for a discard diagnostic.
+  ## Render a cc identity (`toolchainwarn.toolchainIdentity`: the serialized
+  ## `ccidentity.CcFingerprint`, `$fp`, plus a run nonce when unidentified)
+  ## for a discard diagnostic.
   ##
   ## The shape is TWO halves split on the FIRST '|' — compiler and runtime —
-  ## each `<legible text> #<digest>` (the digest is absent on the Windows
-  ## profile, which is `cdVersionOnly` by decision). Both halves' text is
+  ## each as `serializeCompilerHalf` / `serializeRuntimeHalf` write it:
+  ## `<legible text> #<hex digest>`, or that half's sentinel (`CcSentinel` /
+  ## `RuntimeSentinel`), which has no ` #` digest and so passes through
+  ## `abbreviateDigest` unchanged. Both halves' text is
   ## load-bearing: the message's whole job is to say which half moved. So
   ## each half keeps its first line and abbreviates only its own digest,
   ## and each is capped independently so a long compiler banner cannot eat
@@ -642,7 +724,7 @@ proc flagHash*(flags: seq[string]): string =
 proc entryKey*(tp: TrackedPath; flags: seq[string]): tuple[path, flagHash: string] =
   ## The `DepGraph.entries` primary key — `(display(tp), flagHash(flags))`
   ## — factored to ONE place (RFC-0009 F24/F32). Before this, every one of
-  ## ~9 call sites across api.nim/cachedispatch.nim/clean.nim/depgraph.nim/
+  ## ~9 call sites across runcore.nim/cachedispatch.nim/clean.nim/depgraph.nim/
   ## narrow.nim/planner.nim/runner.nim hand-built the same tuple from the
   ## same two ingredients; ZERO behavior change here, just one named seam
   ## instead of nine copies re-deciding it. Named fields (`.path`/
@@ -751,10 +833,16 @@ proc updateEntry*(graph: var DepGraph;
                   path:          string;
                   fHash:         string;
                   closure:       HashSet[TrackedPath];
+                  links:         seq[ClosureLink];
                   closureHash:   string = "";
                   protocolMajor: int = 0;
                   externals:     seq[ExternalSource] = @[]) =
   ## Insert or replace the entry for (path, fHash).
+  ##
+  ## `links` is required, never defaulted: with `closure` it is the entry's
+  ## watched set, and its absence is load-bearing (see
+  ## `DepGraphEntry.links`). A caller whose members crossed no link passes
+  ## `@[]` explicitly.
   ##
   ## Refuses an EMPTY closure — see `DepGraphEntry.closure`, invariant
   ## NONEMPTY-CLOSURE.  Raises `CrisolError(cekInternal)` and leaves any
@@ -769,6 +857,7 @@ proc updateEntry*(graph: var DepGraph;
     closureHash:   closureHash,
     protocolMajor: protocolMajor,
     externals:     externals,
+    links:         links,
   )
 
 proc invalidateEntry*(graph: var DepGraph; path: string; fHash: string) =
@@ -776,37 +865,254 @@ proc invalidateEntry*(graph: var DepGraph; path: string; fHash: string) =
   ## record": decideCompile → cdStale (recompile) and narrowByDiff → unknown
   ## closure (force-included).  Idempotent; absent key is a no-op.
   ##
-  ## Used by `recordClosure` (below) when a compile SUCCEEDED but the
-  ## closure could not be recorded: the stable binary is already in place,
-  ## so without this the PREVIOUS entry (arbitrarily stale) would keep
-  ## being served as fresh.
+  ## Used whenever a compile SUCCEEDED but its closure is not recorded, so
+  ## the PREVIOUS entry (arbitrarily stale) must not survive to describe a
+  ## binary it was not built from: by `recordClosure` (below) when the
+  ## closure could not be extracted, and by `runner.retireThenRecordClosure`
+  ## when the previous stable binary could not be retired (issue #26) and
+  ## recording is therefore never attempted.
   graph.entries.del((path, fHash))
 
 # ---------------------------------------------------------------------------
-# Public: invalidation
+# Public: the watched set -- drift (the file system) and reach (a diff)
 # ---------------------------------------------------------------------------
+#
+# An entry watches a set W of tracked paths: its closure members
+# (`DepGraphEntry.closure`) and the links they were reached through
+# (`DepGraphEntry.links`). Two questions are asked of W, and each has exactly
+# one answer here:
+#
+#   * `entryDrift`: has the file system moved under W since the record? The
+#     one staleness predicate. `isEntryStale` (narrow rule 4) and
+#     `planner.decideCompile` both read it; the content hash stays the
+#     planner's.
+#   * `diffReach`: does a changed set reach W? The one diff-selection
+#     predicate, and pure. Narrow rule 5 reads only it.
+#
+# Both return typed evidence (a kind and the path), so a caller that wants a
+# reason formats it itself. A new link shape is a new kind on one of the two,
+# never a new predicate beside them (R14-D1).
+
+proc ancestorsOrSelf(tp: TrackedPath; roots: TrackedRoots): seq[TrackedPath] =
+  ## `tp`, then every directory above it on the same tracked root, nearest
+  ## first (`libs/a/m.nim`, `libs/a`, `libs`). Built from `keyBytes` and
+  ## read back through `fromKeyBytes`, so each one carries `tp`'s root and
+  ## folds as it does. The root itself is not a `TrackedPath` and is never
+  ## returned. Pure: no file-system access.
+  result.add tp
+  var kb = string(keyBytes(tp, roots))
+  while true:
+    let slash = kb.rfind('/')
+    if slash <= 0: break
+    kb.setLen(slash)
+    let up = fromKeyBytes(kb, roots)
+    if up.isNone: break
+    result.add up.get
+
+proc missingMember(entry: DepGraphEntry; roots: TrackedRoots): Option[TrackedPath] =
+  ## The first closure member that no longer exists. RFC-0009 A3c-ii: each
+  ## member's native path is `toNative(tp, roots)` (root-tag-aware), so the
+  ## answer does not depend on the caller's CWD, for any tracked root.
+  for tp in entry.closure:
+    if not fileExists(toNative(tp, roots)):
+      return some(tp)
+  none(TrackedPath)
+
+proc movedLink(entry: DepGraphEntry; roots: TrackedRoots): Option[TrackedPath] =
+  ## Issue #25: the first recorded link whose resolved target no longer
+  ## matches the one recorded (repointed, deleted, or replaced by a real file
+  ## or directory). A deleted link resolves to its own path
+  ## (`safeExpandFilename` returns its input unchanged), which never equals a
+  ## recorded target, since a recorded link resolved elsewhere.
+  for l in entry.links:
+    let now = linkTargetSpelling(safeExpandFilename(toNative(l.path, roots)), roots)
+    if now != l.target:
+      return some(l.path)
+  none(TrackedPath)
+
+proc unrecordedLink(entry: DepGraphEntry; roots: TrackedRoots): Option[TrackedPath] =
+  ## R13-S1: the first directory on a closure member's path that is now a
+  ## link (a symlink, or a Windows junction) the entry did not record. The
+  ## counterpart of `movedLink` for a link that did not exist at record time.
+  ##
+  ## A directory replaced by a link after the record (`rm -r vend; ln -s
+  ## libs/a vend`, a submodule checkout swapped for a link, a junction made
+  ## where a directory was) leaves every member readable at its recorded
+  ## path, so neither the existence probe nor the content hash moves when
+  ## the new target holds the same bytes, and `entry.links` has nothing to
+  ## re-resolve. The entry would then stay fresh with no link recorded, and
+  ## a later repoint of that link would change what the test reads with
+  ## nothing to notice it (a compile skip and a cached PASS; under
+  ## `--changed` the diff names only the link). Stale instead: the
+  ## recompile records the link, and `dkMoved`/`diffReach` watch it from
+  ## then on.
+  ##
+  ## Each member's directories are read from its tracked root downwards
+  ## (`ancestorsOrSelf`; the root itself is never tested). The first link
+  ## met decides: a recorded one covers everything under it (`movedLink`
+  ## re-resolves it; a member reached through it has a lexical path under
+  ## it, and the links nested behind it are recorded at their real
+  ## locations, never at a spelling through it, so looking further would
+  ## call every such entry stale forever); an unrecorded one is the answer.
+  ## Nothing a record produces is flagged: `closure.crossedLinks` records
+  ## every indexed link a member's path crosses, and a member Nim recorded
+  ## by its realpath crosses none.
+  ##
+  ## Cost: one `symlinkExists` (an lstat; on Windows a file-attribute read)
+  ## per distinct directory across the entry's members, memoized within the
+  ## call, so it is linear in distinct directories and never more than the
+  ## per-member existence probe already pays.
+  if entry.closure.len == 0: return none(TrackedPath)
+  var recorded = initHashSet[TrackedPath]()
+  for l in entry.links: recorded.incl l.path
+  type DirState = enum dsClean, dsCovered, dsUnrecorded
+  var memo = initTable[TrackedPath, DirState]()
+  for tp in entry.closure:
+    let up = ancestorsOrSelf(tp, roots)
+    # up[0] is the member itself; up[1 ..^ 1] its directories, nearest
+    # first. Find the nearest one already decided, then decide the rest
+    # from there downwards.
+    var i = 1
+    var state = dsClean
+    while i < up.len:
+      if up[i] in memo:
+        state = memo[up[i]]
+        break
+      inc i
+    var j = i - 1
+    while j >= 1:
+      let d = up[j]
+      if state == dsClean:
+        if d in recorded: state = dsCovered
+        elif symlinkExists(toNative(d, roots)): state = dsUnrecorded
+      memo[d] = state
+      if state == dsUnrecorded: return some(d)
+      dec j
+  none(TrackedPath)
+
+proc entryDrift*(entry: DepGraphEntry; roots: TrackedRoots): Option[Drift] =
+  ## The one file-system staleness predicate over the entry's watched set:
+  ## the first drift found, or none when every member exists, every recorded
+  ## link still leads where it did, and no directory on a member's path has
+  ## become a link the entry did not record. Checked in `DriftKind` order:
+  ##
+  ##   * `dkMissing`: a closure member no longer exists.
+  ##   * `dkMoved` (issue #25): a recorded link was repointed, deleted or
+  ##     replaced. Nim records a member reached through a link by its
+  ##     realpath, so the repoint changes what a recompile would read while
+  ##     every recorded member stays the same, and `git diff` never names an
+  ##     untracked link at all.
+  ##   * `dkUnrecorded` (R13-S1): a directory replaced by a link since the
+  ##     record. On Windows a junction made in place of a directory can be
+  ##     invisible to git as well.
+  ##
+  ## Read by `isEntryStale` (narrow rule 4) and `planner.decideCompile`,
+  ## which checks the closure content hash between `dkMissing` and the link
+  ## kinds and keeps its own reason strings.
+  let missing = missingMember(entry, roots)
+  if missing.isSome: return some(Drift(kind: dkMissing, path: missing.get))
+  let moved = movedLink(entry, roots)
+  if moved.isSome: return some(Drift(kind: dkMoved, path: moved.get))
+  let unrecorded = unrecordedLink(entry, roots)
+  if unrecorded.isSome: return some(Drift(kind: dkUnrecorded, path: unrecorded.get))
+  none(Drift)
+
+proc storedSpelling(s: HashSet[TrackedPath]; x: TrackedPath): TrackedPath =
+  ## The element of `s` that equals `x`, in the spelling `s` holds it. Under
+  ## a case fold two equal `TrackedPath`s can be spelled differently
+  ## (`Widget.nim` in a diff, `widget.nim` in a closure), and `Hit` reports
+  ## each side in its own spelling (R15-L1). `std/sets` has no keyed
+  ## lookup that returns the stored element, so this scans; `diffReach`
+  ## calls it only once, on the hit it returns.
+  for e in s:
+    if e == x: return e
+  x
+
+proc diffReach*(entry: DepGraphEntry; changed: HashSet[TrackedPath];
+                roots: TrackedRoots): Option[Hit] =
+  ## The one diff-selection predicate: how the changed set reaches the
+  ## entry's watched set, or none. Pure: set lookups over `ancestorsOrSelf`
+  ## chains, so fold-aware `TrackedPath` comparisons decide every kind. The
+  ## `--changed` counterpart of `entryDrift`, which compares the watched set
+  ## with the file system instead. Checked in `HitKind` order:
+  ##
+  ##   * `hkMember`: a changed name is a closure member.
+  ##   * `hkLink` (R12-D1): a changed name IS a recorded link, or a directory
+  ##     above one. A diff names a tracked symlink by its own path whether it
+  ##     was repointed, deleted, or replaced by a file or a real directory,
+  ##     and names a directory that was deleted, replaced or added as a whole
+  ##     by its own path (a submodule's gitlink that is gone or no longer a
+  ##     submodule, a new submodule, an untracked nested repository).
+  ##   * `hkUnderLink` (R12-D1): a changed name lies UNDER a recorded link.
+  ##     git treats a Windows junction as a plain directory and names the
+  ##     files it sees through it (`vend/dep.nim`), never the junction. On
+  ##     POSIX git never names a path through a symlink, so this adds nothing
+  ##     there.
+  ##   * `hkAncestor` (R13-S1): a changed name is a directory above a closure
+  ##     member. A submodule turned into a link or a file is named by its
+  ##     gitlink path alone (`:160000 120000 T vendor/lib`), and a member
+  ##     under it may still be readable at its recorded path, with nothing
+  ##     else in the changed set naming it.
+  ##
+  ## A submodule present on both sides is never named by its own path
+  ## (`gitdiff.addChanged`): its own diff names what changed inside it, so
+  ## neither `hkLink` nor `hkAncestor` turns an edit inside one into "every
+  ## test under it" (R13-L4).
+  ##
+  ## The link kinds catch a change the diff spans but the record does not:
+  ## with `--base HEAD~1` and the graph recorded AFTER a committed repoint,
+  ## the recorded target is the current one and `entryDrift` is none, yet the
+  ## test ran against the old target at the base.
+  ##
+  ## Cost: one set lookup per member, per ancestor of each recorded link and
+  ## of each changed name, and per distinct directory across the members.
+  if changed.len == 0: return none(Hit)
+  # hkMember: iterate the smaller set.
+  if changed.len <= entry.closure.len:
+    for c in changed:
+      if c in entry.closure:
+        return some(Hit(kind: hkMember, name: c,
+                        watched: storedSpelling(entry.closure, c)))
+  else:
+    for m in entry.closure:
+      if m in changed:
+        return some(Hit(kind: hkMember, name: storedSpelling(changed, m),
+                        watched: m))
+  if entry.links.len > 0:
+    # hkLink: the link or a directory above it is named.
+    for l in entry.links:
+      for a in ancestorsOrSelf(l.path, roots):
+        if a in changed:
+          return some(Hit(kind: hkLink, name: storedSpelling(changed, a),
+                          watched: l.path))
+    # hkUnderLink: a name below the link.
+    for c in changed:
+      let up = ancestorsOrSelf(c, roots)
+      for i in 1 ..< up.len:
+        for l in entry.links:
+          if l.path == up[i]:
+            return some(Hit(kind: hkUnderLink, name: c, watched: l.path))
+  # hkAncestor: a proper ancestor of a member is named.
+  var seen = initHashSet[TrackedPath]()
+  for tp in entry.closure:
+    let up = ancestorsOrSelf(tp, roots)
+    for i in 1 ..< up.len:
+      if seen.containsOrIncl(up[i]): break
+      if up[i] in changed:
+        return some(Hit(kind: hkAncestor, name: storedSpelling(changed, up[i]),
+                        watched: tp))
+  none(Hit)
 
 proc isEntryStale*(graph: DepGraph;
                    key:   (string, string);
-                   projectRoot: string;
                    roots: TrackedRoots): bool =
-  ## Returns true iff the entry should be re-scanned:
-  ##   - key is absent from the graph, OR
-  ##   - any file in the closure does not exist on disk.
-  ##
-  ## RFC-0009 A3c-ii: `entry.closure` is `HashSet[TrackedPath]` — each
-  ## member's native absolute path is derived via `toNative(tp, roots)`
-  ## (root-tag-aware; no longer a bare `projectRoot / f` join), so the
-  ## result stays independent of the caller's CWD across every tracked
-  ## root, not just the project root.
+  ## True iff the entry should be re-scanned: `key` is absent from the
+  ## graph, or its watched set has drifted (`entryDrift`: a member is gone,
+  ## a recorded link moved, or a directory on a member's path is now a link
+  ## the entry did not record).
   if key notin graph.entries:
     return true
-  let entry = graph.entries[key]
-  for tp in entry.closure:
-    let absPath = toNative(tp, roots)
-    if not fileExists(absPath):
-      return true
-  return false
+  entryDrift(graph.entries[key], roots).isSome
 
 proc staleExternalObjects*(graph: DepGraph; path: string; flags: seq[string];
                            roots: TrackedRoots): seq[string] =
@@ -958,6 +1264,18 @@ proc toJson(graph: DepGraph; roots: TrackedRoots): JsonNode =
     entryNode["closureHash"]   = newJString(entry.closureHash)
     entryNode["protocolMajor"] = newJInt(entry.protocolMajor)
     entryNode["externals"]     = externalsArr
+    # Issue #25: `path` is the link's `keyBytes` spelling (sorted by
+    # `cmpKeyBytes`, like `closure`); `target` is already a comparable
+    # spelling (`closure.linkTargetSpelling`).
+    var sortedLinks = entry.links
+    sortedLinks.sort(proc(a, b: ClosureLink): int = cmpKeyBytes(a.path, b.path, roots))
+    let linksArr = newJArray()
+    for l in sortedLinks:
+      let lNode = newJObject()
+      lNode["path"]   = newJString(string(keyBytes(l.path, roots)))
+      lNode["target"] = newJString(l.target)
+      linksArr.add lNode
+    entryNode["links"]         = linksArr
     entriesArr.add entryNode
 
   result = newJObject()
@@ -1158,11 +1476,39 @@ proc fromJson(node: JsonNode; roots: TrackedRoots; discarded: var DepGraphDiscar
         externals.add ExternalSource(source: src, obj: objVal, headers: headers,
                                      headersHash: hHash)
 
+    # Issue #25: `links`. Absent (a hand-built fixture) reads as none, like
+    # `externals`; every real v10 file writes it. Unlike a closure member,
+    # a link that cannot be read back must not be dropped on its own:
+    # dropping it would silently exempt the entry from the check that
+    # link exists for. The whole ENTRY is dropped instead, so the
+    # entrypoint sees "no closure record" and recompiles.
+    var links: seq[ClosureLink] = @[]
+    var linksOk = true
+    let linksNode = entryNode{"links"}
+    if linksNode != nil:
+      if linksNode.kind != JArray:
+        linksOk = false
+      else:
+        for lNode in linksNode:
+          let lp = if lNode.kind == JObject: lNode{"path"} else: nil
+          let lt = if lNode.kind == JObject: lNode{"target"} else: nil
+          if lp == nil or lt == nil or lp.kind != JString or lt.kind != JString or
+             lt.getStr("").len == 0:
+            linksOk = false
+            break
+          let tpOpt = fromKeyBytes(lp.getStr(""), roots)
+          if tpOpt.isNone:
+            linksOk = false
+            break
+          links.add ClosureLink(path: tpOpt.get, target: lt.getStr(""))
+    if not linksOk: continue
+
     result.entries[(path, fHash)] = DepGraphEntry(
       closure:       closure,
       closureHash:   closureHash,
       protocolMajor: protocolMajor,
       externals:     externals,
+      links:         links,
     )
 
 # ---------------------------------------------------------------------------
@@ -1275,6 +1621,7 @@ proc saveDepGraph*(graph: DepGraph; config: Config;
 proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
                     nimcacheDir, binaryName: string;
                     protocolMajor: int; index: SourceIndex;
+                    driver: DriverResolver;
                     ccRun: RunProc = realRunIn(config.projectRoot.absolutePath.normalizedPath)):  # canon-ok: real compile subprocess cwd
                     tuple[ok: bool, error: string] =
   ## Extract, hash, and persist one entrypoint's source closure after a
@@ -1285,6 +1632,14 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## (`runner.execute`) and passed through for every entrypoint — never
   ## rebuilt per entrypoint (it is a pure function of the source tree, not
   ## of any single compile).
+  ##
+  ## `driver` — the run's driver resolution (`headerprobe.siteResolver`
+  ## over `ccidentity.ToolchainProbe.site`): the file the build's nim runs for
+  ## each compile command's driver token, which that command's header
+  ## probe runs (R10-S6); threaded through to `closure.extractCompileInputs`,
+  ## which asks it only when a header probe is about to run. Required: a
+  ## caller with no resolution passes one answering `DriverLocation(found:
+  ## false, ...)`, and every probe refuses.
   ##
   ## `ccRun` — the `cc -M` header-probe seam (issue #16), threaded through to
   ## `closure.extractCompileInputs`; defaults to `toolrun.realRunIn(config.
@@ -1303,10 +1658,19 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## manifest carries no `cc` command to re-probe — carries the header set
   ## FORWARD instead of losing it (see `extractCompileInputs`'s doc comment).
   ##
+  ## When it runs: at the compile→run transition, BEFORE the fresh binary is
+  ## promoted to the stable path (that happens only after the run), and
+  ## only through `runner.retireThenRecordClosure`, which has already
+  ## retired the PREVIOUS stable binary. That operation is the issue #26
+  ## guard: the entry this persists never sits beside a binary built from
+  ## other sources, even when the run is cut short before promotion. The
+  ## runner reaches this (through its `recordClosureFn` seam) from that
+  ## operation only.
+  ##
   ## Policy: a compile whose closure cannot be recorded must not leave the
-  ## previous entry in place — the stable binary already exists, so nothing
-  ## would recompile and the stale record would be served as fresh.
-  ## Invalidating instead makes decideCompile see `cdStale` and
+  ## previous entry in place — a stable binary will be promoted after the
+  ## run, so nothing would recompile and the stale record would be served
+  ## as fresh. Invalidating instead makes decideCompile see `cdStale` and
   ## narrowByDiff force-include the entrypoint (unknown closure).
   ##
   ## On success: `updateEntry` + `saveDepGraph`, returns `(ok: true, "")` —
@@ -1315,7 +1679,8 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   ## graph already holds the new entry at that point (this run's own
   ## selection logic sees it correctly), but nothing describes it on disk;
   ## the caller (the runner) must treat this exactly like an extraction
-  ## failure — see below — and discard the binary it just promoted to the stable path, so the NEXT run starts
+  ## failure — see below — and never promote the binary this compile built
+  ## (`runner.decideExit`'s `bdDiscardUnrecorded`), so the NEXT run starts
   ## from `cdNeverBuilt` rather than trusting a stable binary the on-disk
   ## depgraph does not (yet, or ever) describe. Without that binary-discard
   ## step, a later revert of the source back to whatever the STALE on-disk
@@ -1340,7 +1705,7 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
   try:
     let carried = if key in graph.entries: graph.entries[key].externals else: @[]
     let inputs = extractCompileInputs(nimcacheDir, binaryName, epAbs, config,
-                                      index, carried, ccRun)
+                                      index, carried, driver, ccRun)
     # RFC-0009 A4b: `extractCompileInputs` now returns `files` as
     # `HashSet[TrackedPath]` directly — already filtered through
     # `index.tracked`/`classify`'s pcTracked gate inside `closure.nim`
@@ -1353,8 +1718,13 @@ proc recordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
     # the SAME classify-filtered set. See `closureHashInputs`.
     let contentHash = closureContentHash(
       closureHashInputs(inputs.files, config.trackedRoots))
-    graph.updateEntry(key.path, fHash, inputs.files, contentHash, protocolMajor,
-                      inputs.externals)
+    # Issue #25: the links these members may have been reached through,
+    # re-resolved by every later freshness check (`entryDrift`). Computed
+    # before `updateEntry` so a failure here invalidates like any other
+    # extraction failure instead of leaving an entry without its links.
+    let links = crossedLinks(index, inputs.files)
+    graph.updateEntry(key.path, fHash, inputs.files, links, contentHash,
+                      protocolMajor, inputs.externals)
     if saveDepGraph(graph, config):
       result = (ok: true, error: "")
     else:
@@ -1582,7 +1952,8 @@ proc loadDepGraph*(config: Config; nimVersion: string; discarded: var DepGraphDi
                    ccVersion: string): DepGraph =
   ## Load the graph and apply the FRESHNESS view for `nimVersion`/`ccVersion`
   ## (the caller's notion of "the current Nim compiler / C toolchain" —
-  ## normally `nimprobe.cachedNimFingerprint()`/`ccidentity.ccVersion()`): loads
+  ## normally `nimprobe.cachedNimFingerprint()` and
+  ## `toolchainwarn.toolchainIdentity` over the probed `CcFingerprint`): loads
   ## the graph as persisted via `loadStoredDepGraph`, then, if its header
   ## nimVersion OR ccVersion does not match, discards it as stale and
   ## returns an empty graph stamped with the REQUESTED `nimVersion`/

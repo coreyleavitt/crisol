@@ -68,6 +68,15 @@
 ##     `measureworker.runMeasureCompileWorker` before driving its
 ##     `CompileDriver`.
 ##
+##   `WorkerWarningPrefix` / `MeasureWarningPrefix` /
+##     `measureWorkerWarnings` — the worker's warning lines and how the
+##     parent reads them back out of its captured output to relay them
+##     (R11-L6). Matches only the narrower `MeasureWarningPrefix` and
+##     neutralises control/escape bytes in every matched line before
+##     returning it (R15-S5) -- the caller (`runner.nim`) must also scan the
+##     captured file WHOLE, never head-capped, or a large compile log drops
+##     the match entirely (R15-D3).
+##
 ##   `InternalMeasureCompileToken` — the internal re-exec dispatch token
 ##     crisol.nim's `runMain` special-cases before subcommand validation
 ##     (see crisol.nim's `runMain` doc). Deliberately NOT listed in
@@ -78,8 +87,11 @@
 ## crisol compile-worker child") and measureworker.nim's own doc for the
 ## pipeline this schema feeds.
 
-import std/[json, os]
+import std/[json, os, strutils]
 import crisol/types
+from crisol/ccprobe import DriverSite, DriverSearch
+  # `MeasurePlan.driverSite` (R10-S6); ccprobe is a pure leaf, no cycle.
+export DriverSite, DriverSearch
 
 # ---------------------------------------------------------------------------
 # The internal dispatch token (crisol.nim routes this before normal
@@ -89,6 +101,68 @@ import crisol/types
 # ---------------------------------------------------------------------------
 
 const InternalMeasureCompileToken* = "--internal-measure-compile"
+
+# ---------------------------------------------------------------------------
+# The worker's warnings, as the parent reads them back (R11-L6)
+# ---------------------------------------------------------------------------
+
+const
+  WorkerWarningPrefix* = "crisol: warning: "
+    ## The root string every real worker warning starts with. NOT itself the
+    ## match `measureWorkerWarnings` scans for (R15-S5, below): the worker's
+    ## own compile subprocess (`compiledriver.defaultRunCc`'s cc phase runs
+    ## with `poParentStreams` -- RFC's own §Concurrency doc -- so cc's raw
+    ## output is inherited straight into the SAME captured stream this scan
+    ## reads, unmediated by any crisol code) can put arbitrary attacker- or
+    ## dependency-controlled text in that stream, and this short, generic
+    ## string is cheap for such text to collide with by construction (a
+    ## `{.emit: "#warning \"crisol: warning: ...\"".}` or similar). Kept as
+    ## the shared root `MeasureWarningPrefix` is built from, and because it
+    ## is still what every real warning happens to start with -- just not a
+    ## safe-enough match on its own.
+  MeasureWarningPrefix* = WorkerWarningPrefix & "measure-compile: "
+    ## The worker's own warnings (`measureworker`) -- and, today, the ONLY
+    ## prefix any real `warn()` call site in `measureworker.nim` ever writes
+    ## (see that module's `WorkerWarn` doc). Longer and more specific than
+    ## `WorkerWarningPrefix` alone, so `measureWorkerWarnings` matches THIS,
+    ## narrowing (though, per the doc above, not eliminating) the surface a
+    ## merged compiler/linker stream can spoof.
+
+proc sanitizeRelayedLine(line: string): string =
+  ## R15-S5: neutralise every C0 control byte and DEL before a line this
+  ## module hands back is ever written to a real terminal. `line` was read
+  ## out of a captured compile-output file that is not exclusively crisol's
+  ## own writes (see `WorkerWarningPrefix`'s doc) -- ESC (0x1B) in particular
+  ## can smuggle an arbitrary terminal escape sequence through what looks
+  ## like an ordinary one-line warning relay (cursor moves, screen/scrollback
+  ## clears, title-bar or clipboard writes on terminals that honor OSC).
+  ## `splitLines` has already stripped the line's own trailing EOL, so this
+  ## never needs to preserve one.
+  result = newStringOfCap(line.len)
+  for ch in line:
+    if ch.ord < 0x20 or ch.ord == 0x7f:
+      result.add '?'
+    else:
+      result.add ch
+
+proc measureWorkerWarnings*(workerOutput: string): seq[string] =
+  ## The warning lines in a measurement worker's captured output, in order:
+  ## what the parent relays to its own stderr after a successful measure
+  ## compile, whose output is otherwise discarded, so a unit the worker
+  ## could not record (an unresolved driver, a failed header probe, an
+  ## unwritable ledger) is not dropped from the artifact ledger silently.
+  ## A failed compile's output is shown whole and needs no relay.
+  ##
+  ## R15-S5: matches `MeasureWarningPrefix`, not the shorter/generic
+  ## `WorkerWarningPrefix` -- see that constant's doc for why the shorter one
+  ## is not a safe-enough match on a stream that is not exclusively crisol's
+  ## own writes -- and every matched line is passed through
+  ## `sanitizeRelayedLine` before being returned, so a control/escape byte
+  ## that made it past the (narrower) prefix match still cannot reach a
+  ## terminal unneutralised.
+  for line in workerOutput.splitLines:
+    if line.startsWith(MeasureWarningPrefix):
+      result.add sanitizeRelayedLine(line)
 
 # ---------------------------------------------------------------------------
 # MeasurePlan — plan.json schema
@@ -111,7 +185,7 @@ type
                                       ## ccVersion), computed ONCE by the parent
                                       ## (runner.execute's ExecCtx.toolchainFp) and
                                       ## passed down — the worker must NEVER re-probe
-                                      ## ccVersion itself (ccidentity.cachedCcVersion() is
+                                      ## ccVersion itself (ccidentity.cachedToolchainProbe() is
                                       ## deliberately not imported/called here; see
                                       ## runner.buildCompileWorkerPlan's W9l doc: the
                                       ## value is the SAME one execute() already keys
@@ -122,6 +196,19 @@ type
                                       ## a toolchain upgrade apart from a code change.
                                       ## OPTIONAL on read (defaults to "") for the same
                                       ## back-compat reason `groupId`/`configHash` are.
+    driverSite*:         DriverSite
+                                      ## R10-S6: where the build's nim finds its
+                                      ## compilers (`ccidentity.ToolchainProbe.site`),
+                                      ## learned ONCE by the parent for the same W9l
+                                      ## reason as `toolchainFp`: the worker's header
+                                      ## probes (`artifactid.ccIncludeClosure`) resolve
+                                      ## each compile command's own driver token
+                                      ## against it (`headerprobe.siteResolver`),
+                                      ## never by the worker's own search, and the
+                                      ## worker never re-runs the discovery. Absent on
+                                      ## read, or malformed, parses as unknown: every
+                                      ## probe then refuses and no artifact row is
+                                      ## recorded (fail closed).
 
 proc toJson*(plan: MeasurePlan): JsonNode =
   ## Serialize a MeasurePlan to plan.json's JSON shape. Exported so the
@@ -141,6 +228,39 @@ proc toJson*(plan: MeasurePlan): JsonNode =
   result["stateDir"]      = newJString(plan.stateDir)
   result["projectRoot"]   = newJString(plan.projectRoot)
   result["toolchainFp"]   = newJString(plan.toolchainFp)
+  var site = newJObject()
+  site["known"] = newJBool(plan.driverSite.known)
+  if plan.driverSite.known:
+    site["nimExe"]     = newJString(plan.driverSite.nimExe)
+    site["nimCwd"]     = newJString(plan.driverSite.nimCwd)
+    site["search"]     = newJString($plan.driverSite.search)
+    site["pathVar"]    = newJString(plan.driverSite.pathVar)
+    site["systemRoot"] = newJString(plan.driverSite.systemRoot)
+  else:
+    site["why"] = newJString(plan.driverSite.why)
+  result["driverSite"] = site
+
+proc parseDriverSite(site: JsonNode): DriverSite =
+  ## `toJson`'s `driverSite` object back; unknown, with a reason, when it
+  ## is absent or malformed.
+  proc unknown(): DriverSite =
+    let why = if site != nil and site.kind == JObject: site{"why"}.getStr("") else: ""
+    DriverSite(known: false, why:
+      (if why.len > 0: why
+       else: "the measure-compile plan carries no usable C compiler driver site"))
+  if site == nil or site.kind != JObject or not site{"known"}.getBool(false):
+    return unknown()
+  for key in ["nimExe", "nimCwd", "search", "pathVar", "systemRoot"]:
+    if site{key} == nil or site{key}.kind != JString: return unknown()
+  var search: DriverSearch
+  case site{"search"}.getStr("")
+  of $dsPosix: search = dsPosix
+  of $dsWindows: search = dsWindows
+  else: return unknown()
+  DriverSite(known: true, nimExe: site{"nimExe"}.getStr(""),
+             nimCwd: site{"nimCwd"}.getStr(""), search: search,
+             pathVar: site{"pathVar"}.getStr(""),
+             systemRoot: site{"systemRoot"}.getStr(""))
 
 proc parseMeasurePlan*(jsonPath: string): MeasurePlan =
   ## Parse `jsonPath` into a MeasurePlan. Mirrors `closure.
@@ -184,6 +304,9 @@ proc parseMeasurePlan*(jsonPath: string): MeasurePlan =
   # hand-built test fixture) parses with toolchainFp == "" rather than
   # failing required-field validation.
   result.toolchainFp = node{"toolchainFp"}.getStr("")
+  # R10-S6: anything but a known site whose every field is a string and
+  # whose search rule is one this build knows is unknown.
+  result.driverSite = parseDriverSite(node{"driverSite"})
 
   result.flags = @[]
   let flagsNode = node{"flags"}

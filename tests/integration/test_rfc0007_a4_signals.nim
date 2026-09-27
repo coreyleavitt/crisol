@@ -7,15 +7,15 @@
 ## handler, which is what `runner.execute()`'s Supervisor actually uses (via
 ## `initSupervisor(installSignals = true)`, since A2b). A4 retires that
 ## second mechanism and reshapes `crisol/signals`'s public surface to one
-## proc, `shutdownRequested(): Option[ShutdownSignal]`, delegating onto
-## `crisol/process.globalShutdownSignal()` — a thin, process-global,
+## proc, `shutdownRequested(): Option[ShutdownSignal]` (since R14-D5,
+## `crisol/process/tooltrees`' own reader, re-exported) — a process-global,
 ## level-triggered view over the SAME state `next()`'s `weShutdown` event
-## reads, both stamped by the ONE handler `posixcore.initPosixCore`
-## installs.
+## reads, both stamped by the ONE handler an `installSignals` Supervisor's
+## interrupt scope installs.
 ##
 ## All real signal delivery happens inside a FORKED child so the
-## process-global flag this module reads is never mutated in the test
-## runner's own process (a stray `some` here would be silent, sticky, and
+## signal state this module reads is never mutated in the test runner's own
+## process (a stray `some` here, while a scope is open, would be silent and
 ## order-dependent across every other suite sharing this binary).
 
 when defined(posix):

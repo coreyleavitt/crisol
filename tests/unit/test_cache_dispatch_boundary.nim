@@ -23,6 +23,7 @@ import crisol/[types, runner, planner, depgraph, sandbox, cachedispatch, resultc
 import crisol/process/types as ptypes
 import "../support/helpers"  # legacySeams
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Mock seam construction
@@ -108,7 +109,7 @@ suite "execute — cache HIT served at plan time":
       p, config = Config(projectRoot: getTempDir(),
         trackedRoots: initTrackedRoots(getTempDir(), newSeq[tuple[name, native: string]](), "")), graph = g,
       onResult = cb, showProgress = false,
-      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms))).results
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].outcome == oPassed         # NOT oSpawnError → never spawned the bogus bin
@@ -151,7 +152,7 @@ suite "execute — cached entry bypasses admission":
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms))).results
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)), toolchain = unprobedToolchain()).results
 
     check results.len == 2
     check results[0].cached                        # index 0: served from cache
@@ -185,7 +186,7 @@ suite "execute — cache MISS stores on attempt-1 pass":
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms))).results
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -223,7 +224,7 @@ suite "execute — no-cache full bypass":
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheDisabled(isoSpec)).results
+      cache = cacheDisabled(isoSpec), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -257,7 +258,7 @@ suite "execute — degraded hermeticity blocks the store":
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheEnabled(netSpec, defaultCachePolicy(), mockSeams(ms))).results
+      cache = cacheEnabled(netSpec, defaultCachePolicy(), mockSeams(ms)), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -304,7 +305,7 @@ suite "R2-1 — no-cache cacheDecision discrimination":
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheDisabled(isoSpec)).results
+      cache = cacheDisabled(isoSpec), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].cacheDecision == cdmNotEligible
@@ -340,7 +341,7 @@ suite "R2-1 — no-cache cacheDecision discrimination":
     let p0 = RunPlan(entrypoints: @[pep0], jobs: 1)
     var g0 = emptyDepGraph()
     discard execute(p0, config = cfg, graph = g0,
-                    showProgress = false, cache = cacheDisabled(isoSpec))
+                    showProgress = false, cache = cacheDisabled(isoSpec), toolchain = unprobedToolchain())
 
     ## Step 2: re-plan with the same entrypoint; plan() will see the binary exists
     ## and emit edRunFresh (or edSkipFresh).  We manually force edRunFresh to be
@@ -351,7 +352,7 @@ suite "R2-1 — no-cache cacheDecision discrimination":
     let p1 = RunPlan(entrypoints: @[pep1], jobs: 1)
     var g1 = emptyDepGraph()
     let results = execute(p1, config = cfg, graph = g1,
-                          showProgress = false, cache = cacheDisabled(isoSpec)).results
+                          showProgress = false, cache = cacheDisabled(isoSpec), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -390,7 +391,7 @@ suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set
     let results = execute(
       p, config = Config(projectRoot: getTempDir(),
         trackedRoots: initTrackedRoots(getTempDir(), newSeq[tuple[name, native: string]](), "")), graph = g, showProgress = false,
-      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms), prefetch = spy)).results
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms), prefetch = spy), toolchain = unprobedToolchain()).results
 
     check results.len == 3
     for r in results: check r.cached   # every entry served from cache -- no live spawn attempted
@@ -415,7 +416,7 @@ suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set
     discard execute(
       p, config = Config(projectRoot: getTempDir(),
         trackedRoots: initTrackedRoots(getTempDir(), newSeq[tuple[name, native: string]](), "")), graph = g, showProgress = false,
-      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms), prefetch = spy))
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms), prefetch = spy), toolchain = unprobedToolchain())
 
     check prefetchedKeyCount == 1   # only the non-opted-out entry made it into the candidate set
 
@@ -439,7 +440,7 @@ suite "execute — RFC-0005 C3c: prefetch called once with the candidate key set
     discard execute(p, config = Config(projectRoot: dir, stateDir: ".crisol",
                                        compileTimeoutSecs: 120, timeoutSecs: 60,
                                        trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
-                    graph = g, showProgress = false, cache = ctx)
+                    graph = g, showProgress = false, cache = ctx, toolchain = unprobedToolchain())
     check prefetchCalls == 0
 
 # ---------------------------------------------------------------------------
@@ -477,7 +478,7 @@ suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real r
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms))).results
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check ms.loadCalls == 1                 # the post-compile consult WAS made
@@ -508,7 +509,7 @@ suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real r
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms),
-                           outcomePolicy = strictPolicy)).results
+                           outcomePolicy = strictPolicy), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check ms.loadCalls == 1
@@ -529,7 +530,7 @@ suite "execute — RFC-0005 SO1: escapee evidence forces recompute-miss + real r
       p, config = Config(projectRoot: getTempDir(),
         trackedRoots: initTrackedRoots(getTempDir(), newSeq[tuple[name, native: string]](), "")), graph = g, showProgress = false,
       cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms),
-                           outcomePolicy = strictPolicy)).results
+                           outcomePolicy = strictPolicy), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].cacheDecision == cdmHit
@@ -593,7 +594,7 @@ suite "execute — RFC-0005 SO3: post-compile consult attempt-gating":
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheEnabled(isoSpec, defaultCachePolicy(), raceSeams(rs, cachedPass(1)))).results
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), raceSeams(rs, cachedPass(1))), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].attempts == 2         # both attempts genuinely ran -- not masked as a cache hit
@@ -626,7 +627,7 @@ suite "execute — RFC-0005 SO3: post-compile consult attempt-gating":
                          compileTimeoutSecs: 120, timeoutSecs: 60,
                          trackedRoots: initTrackedRoots(dir, newSeq[tuple[name, native: string]](), ".crisol")),
       graph = g, showProgress = false,
-      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms))).results
+      cache = cacheEnabled(isoSpec, defaultCachePolicy(), mockSeams(ms)), toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].cacheDecision == cdmHit

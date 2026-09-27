@@ -136,14 +136,16 @@ suite "rfc-0007 A1e-i — legacy names gone from src/":
 
   test "no .outcome field access outside the allowed LedgerRow/module sites":
     ## Allowed:
-    ##   - ledger.nim / order.nim / shard.nim / api.nim: `row.outcome` /
+    ##   - ledger.nim / order.nim / shard.nim / api.nim / runcore.nim:
+    ##     `row.outcome` /
     ##     `r.outcome` on a LedgerRow — a persisted wire STRING field that
     ##     this slice never touched (it was never part of EntrypointResult).
     ##   - `types.outcome` / `api.outcome`: the module-qualifier spelling of
     ##     the derivation PROC, not field access — textually indistinguishable
     ##     from field access by a bare scan, so allowed by construction
     ##     rather than by filename.
-    let allowedBasenames = ["ledger.nim", "order.nim", "shard.nim", "api.nim"]
+    let allowedBasenames = ["ledger.nim", "order.nim", "shard.nim", "api.nim",
+                            "runcore.nim"]
     var violations: seq[string]
     for path in allNimFiles():
       let base = path.extractFilename

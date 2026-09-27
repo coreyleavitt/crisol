@@ -40,6 +40,7 @@ when defined(posix):
   import crisol         # imports runMain
   import "../support/testep"
   import "../support/statedir"
+  import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
   # R8-D3: this process's own crisol state dir for the execute() suite --
   # never the repo root's shared state, which a concurrent run in the same
@@ -151,7 +152,7 @@ when defined(posix):
       # RFC bullet's coreDumped claim is about; the expected VALUE is verified
       # against the live kernel core_pattern rather than assumed — see
       # expectCoreDumped()'s doc.
-      let results = execute(p, config = cfg, graph = g).results
+      let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
 
       require results.len == 1
       checkpoint phaseDiag(results[0])
@@ -170,7 +171,7 @@ when defined(posix):
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g).results
+      let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
 
       require results.len == 1
       checkpoint phaseDiag(results[0])
@@ -193,7 +194,7 @@ when defined(posix):
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))  # short: force the kill
       let p    = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g).results
+      let results = execute(p, config = cfg, graph = g, toolchain = unprobedToolchain()).results
 
       require results.len == 1
       checkpoint phaseDiag(results[0])
@@ -219,7 +220,7 @@ when defined(posix):
       var g = emptyDepGraph()
       let spec = resolveSandbox(level = hlIsolated,
         rlimits = RlimitOverrides(limitFsize: some(4096'i64)))
-      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec)).results
+      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec), toolchain = unprobedToolchain()).results
 
       require results.len == 1
       checkpoint phaseDiag(results[0])
@@ -262,7 +263,7 @@ when defined(posix):
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p   = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec)).results
+      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec), toolchain = unprobedToolchain()).results
 
       var ws: cint = 0
       discard waitpid(watcherPid, ws, 0)
@@ -304,7 +305,7 @@ when defined(posix):
                     trackedRoots: initTrackedRoots(getCurrentDir(), newSeq[tuple[name, native: string]](), ""))
       let p   = plan(cfg, eps, emptyDepGraph())
       var g = emptyDepGraph()
-      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec)).results
+      let results = execute(p, config = cfg, graph = g, cache = cacheDisabled(spec), toolchain = unprobedToolchain()).results
 
       var ws: cint = 0
       discard waitpid(watcherPid, ws, 0)

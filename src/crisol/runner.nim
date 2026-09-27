@@ -45,7 +45,7 @@
 ##   • Output captured to per-entrypoint temp files; read atomically after
 ##     completion; bounded by maxOutputBytes.
 
-import std/[envvars, json, monotimes, options, os, sequtils, sets, tables, tempfiles, times]
+import std/[algorithm, envvars, json, monotimes, options, os, sequtils, sets, strutils, tables, tempfiles, times]
 import crisol/[types, config, render, depgraph, protocol, planner, scheduler, admission, memprobe, sandbox, cachedispatch, ledger, keys, workerplan, closure, compiledriver, toolrun]
 # rfc-0007 A2b: the runner is supervised entirely through `crisol/process`'s
 # Supervisor contract now — `std/posix` and `crisol/spawn` (forkExec/
@@ -58,34 +58,38 @@ import crisol/[types, config, render, depgraph, protocol, planner, scheduler, ad
 # combinedSink/initSupervisor/spawn/next/requestStop/forceKill/reap/
 # groupRssBytes.
 import crisol/process
-# RFC-0005 C3c: `shutdownRequested()` -- the process-global, level-triggered
-# query the plan-time consult loop below checks per-iteration (B0(c)); the
-# SAME state `process`'s own Supervisor/`weShutdown` reads, just a query-only
-# view a caller with no Supervisor handle in scope (this loop runs before any
-# child is ever spawned) can still consult.
+# RFC-0005 C3c: `shutdownRequested()` -- the level-triggered query the
+# plan-time prefetch and consult loop below check (B0(c)); the SAME state
+# `process`'s own Supervisor/`weShutdown` reads, just a query-only view a
+# caller with no Supervisor handle in reach can consult. It reads the open
+# interrupt scope's signal (R13-D2), and both loops run after `execute`'s
+# `initSupervisor`, which, with `installSignals`, holds a scope open.
 import crisol/signals
 # `ptypes.X` stays the qualified spelling for the §2 result-model types
 # (Exit/Cause/Phase/…) — unchanged house convention from before A2b, kept so
 # this file's existing `ptypes.*` call sites need no renaming.
 from crisol/process/types as ptypes import nil
+# R10-S6: where the build's nim finds its compilers (the caller's
+# `ccidentity.ToolchainProbe.site`), against which every header probe
+# resolves its compile command's own driver (`ExecCtx.ccDriver`). Neither
+# module imports this one.
+from crisol/ccprobe import DriverLocation, DriverResolver, DriverSite
+from crisol/ccidentity import cachedToolchainProbe   # `runEntrypoint` only
+from crisol/pipeline import ccProbeContextOf
+from crisol/headerprobe import siteResolver
+# R12-D4: the run's toolchain, probe and identity as one value (`execute`).
+import crisol/toolchainwarn
+export DriverLocation, DriverResolver, DriverSite   # `RecordClosureProc`'s types
+export toolchainwarn.RunToolchain, toolchainwarn.runToolchain,
+       toolchainwarn.unkeyed, toolchainwarn.identity, toolchainwarn.site,
+       toolchainwarn.probe   # `execute`'s `toolchain`
 export planner   # re-export the pure plan API (slug/binPath/plan/decideCompile/…)
 # M4: re-export the CacheContext bundle + constructors so callers of execute()
 # don't need a separate `import crisol/cachedispatch`.
 export cachedispatch.CacheContext
 export cachedispatch.cacheDisabled
-# R4-4 (round-4 review, 2026-09-24): `cacheEnabled` now has a `{.deprecated.}`
-# compatibility overload (the arity without `toolchainUnidentified` — see
-# cachedispatch.nim's R4-4 section). Re-exporting the NAME re-exports both
-# arities, which is required: a consumer that imports crisol/runner must keep
-# compiling exactly as before, and the deprecation must reach it at ITS OWN
-# call site, not be spent here on the export line. Nim charges the warning to
-# whoever names a deprecated symbol, so an unguarded `export` would make this
-# line the only thing `--warningAsError:Deprecated:on` ever reports — masking
-# every real omission in `src/` behind one unfixable error. Suppressed for the
-# export statement alone; the warning is untouched at every call site.
-{.push warning[Deprecated]: off.}
+export cachedispatch.cacheDisabledBecause
 export cachedispatch.cacheEnabled
-{.pop.}
 export cachedispatch.isActive
                  # so consumers that `import crisol/runner` keep their symbols.
                  # ResultCallback was moved to types.nim; it is in scope here via
@@ -125,6 +129,27 @@ proc readCapped(path: string; maxBytes: int): string =
     result = newString(maxBytes)
     discard f.readBuffer(addr result[0], maxBytes)
     result.add "\n[...output truncated at " & $maxBytes & " bytes...]"
+
+proc readWholeForWarningScan(path: string): string =
+  ## R15-D3: read `path` WHOLE, never head-capped by `maxOutputBytes` the
+  ## way `readCapped` deliberately is for DISPLAY output. The measurement
+  ## worker's own warnings (`workerplan.measureWorkerWarnings`) are written
+  ## strictly after a successful `compileOnly`/`runCc`/`link` -- they are
+  ## never among a compile log's first bytes -- so a head-capped read drops
+  ## them outright on any compile whose own output exceeds the display cap,
+  ## silently losing exactly the warning this relay exists to surface (a
+  ## unit the worker could not record). Used ONLY for that scan: its result
+  ## is fed straight into `measureWorkerWarnings`, never shown to a person,
+  ## so there is no display-flood concern here to cap against. The file is
+  ## streamed and only the candidate lines are kept, so memory is bounded by
+  ## the warnings, not by the log. Never raises.
+  if not fileExists(path): return ""
+  try:
+    for line in lines(path):
+      if line.startsWith(MeasureWarningPrefix):
+        result.add line & "\n"
+  except CatchableError:
+    discard
 
 # ---------------------------------------------------------------------------
 # B3/B4: isQuarantined — pure quarantine-decision helper
@@ -193,6 +218,19 @@ proc isQuarantined*(ep: Entrypoint; res: EntrypointResult;
 # ---------------------------------------------------------------------------
 
 type
+  BinaryDisposition* = enum
+    ## R20-D1: what a finalizing attempt does with the binary its compile
+    ## produced. One value, so "promoted AND discarded" cannot be expressed.
+    bdNoBinary           ## nothing to act on: the attempt is being retried,
+                         ## compiled nothing this run (edRunFresh), or its
+                         ## compile/spawn failed before a binary existed.
+    bdPromote            ## copy it to the stable slug-keyed path: its
+                         ## closure recorded.
+    bdDiscardUnrecorded  ## its closure failed to record: never promoted
+                         ## (issue #13.3), it leaves with its per-slot
+                         ## directory. The warning is `finalizeSlot`'s
+                         ## (R19-D3, R20-S1), not this decision's.
+
   ExitDecision* = object
     ## code-review r23: `decideExit`'s pure output. `execute()`'s live-
     ## completion handler (part of the `handleChildExited` template) used to
@@ -208,14 +246,10 @@ type
     recordAsFailure*:           bool  ## failFast should latch anyFailed — only
                                        ## true on a genuine FINAL failure, never
                                        ## on an attempt still eligible for retry.
-    promoteBinary*:              bool  ## this attempt's compile produced a
-                                       ## binary worth copying to the stable
-                                       ## slug-keyed path.
-    discardOnUnrecordedClosure*: bool  ## promoteBinary AND the closure failed
-                                       ## to record — the stable binary just
-                                       ## promoted must be discarded right back
-                                       ## out (issue #13.3).
-    stampCacheKeyInfo*:          bool  ## cache is active and this attempt is
+    binary*:                     BinaryDisposition  ## what to do with the
+                                       ## binary this attempt compiled (see
+                                       ## `BinaryDisposition`).
+    stampCacheKeyInfo*:         bool  ## cache is active and this attempt is
                                        ## finalizing — the executor should
                                        ## stamp keyDiff/cacheLookup onto the
                                        ## live result.
@@ -237,6 +271,20 @@ type
                                        ## `attemptStore`/`retry` (simply
                                        ## unread by the executor when either
                                        ## is true, never wrong-but-unread).
+
+func maxAttempts(pep: PlannedEntrypoint): int =
+  ## B1: the attempts `pep.retries` allows (the first plus one per retry).
+  pep.retries + 1
+
+func attemptsLeft(attempt, maxAttempts: int): bool =
+  ## R21-D2: the ONE attempt-budget rule -- whether another attempt may
+  ## follow `attempt`. `decideExit`'s retry rule reads it (with the outcome
+  ## rule on top), and `finalizeSlot` reads it to decide whether an
+  ## unrecorded closure is already the run's outcome
+  ## (`noteClosureOutcome`'s `final`), so the two cannot drift. Where the
+  ## outcome rule alone ends the entrypoint (a pass, a compile failure),
+  ## `markFinal` settles what was held.
+  attempt < maxAttempts
 
 proc decideExit*(
   completedOutcome:      Outcome;
@@ -262,17 +310,25 @@ proc decideExit*(
   ## are attempts left.  oKilled/oCrashed ARE retried (transient
   ## infrastructure noise).
   result.retry = completedOutcome notin {oPassed, oCompileFailed, oSpawnError} and
-                 slotAttempt < maxAttempts
+                 attemptsLeft(slotAttempt, maxAttempts)
   result.recordAsFailure = not result.retry and failFast and completedOutcome.isFailure
 
   # R9: promotion (and therefore the closure-recorded reading) only applies
   # once an attempt is finalizing — a still-retryable attempt never reaches
   # this policy at all, matching the pre-extraction control flow where all
   # of this lived inside the `else: # Finalize` branch.
-  result.promoteBinary = not result.retry and compiledThisRun and hasCacheDir and
-                         completedOutcome notin {oCompileFailed, oSpawnError}
-  let closureRecorded = if result.promoteBinary: slotClosureRecorded else: true
-  result.discardOnUnrecordedClosure = result.promoteBinary and not closureRecorded
+  #
+  # R19-D1: an unrecorded closure's binary used to be promoted and then
+  # removed again, so a stable path that had blocked the retire failed the
+  # promotion too and printed a second, misleading warning; it is now never
+  # promoted at all (R20-D1: one disposition, so never both).
+  let producedBinary = not result.retry and compiledThisRun and hasCacheDir and
+                       completedOutcome notin {oCompileFailed, oSpawnError}
+  let closureRecorded = if producedBinary: slotClosureRecorded else: true
+  result.binary =
+    if not producedBinary: bdNoBinary
+    elif closureRecorded:  bdPromote
+    else:                  bdDiscardUnrecorded
 
   result.stampCacheKeyInfo = not result.retry and cacheActive
   result.attemptStore = result.stampCacheKeyInfo and verdict.store and closureRecorded
@@ -389,6 +445,13 @@ type
     ## no separate "exited, awaiting reap" state: `next`'s weChildExited is
     ## handled synchronously (reap happens the moment it is observed), so no
     ## slot is ever left holding a stale unreaped exit across iterations.
+    ## R22-D1/R23-D1: `ssLive`'s sole owner is `enterLive`, which sets it with
+    ## the new ChildId. `ssIdle` has two owners, not one: `finalizeSlot` sets
+    ## it on the normal reap that consumes a live slot's exit, and
+    ## `teardownDiscard` sets it on the interrupt or exception drain that
+    ## reaps one instead (before any other work, in both cases). A slot
+    ## reaches at most one of the two per occupancy — the drain is a no-op
+    ## once `finalizeSlot` already idled everything, and vice versa.
     ssIdle
     ssLive
 
@@ -472,8 +535,6 @@ type
                                    # which no longer calls `recordClosure` itself. Reset at
                                    # every slot claim so a reused slot never leaks a prior
                                    # occupant's outcome.
-    closureError:    string        # rfc-0005 A2c-i: `recordClosure`'s error message, paired
-                                   # with `closureRecorded` (meaningful only when it is false).
     postCompileConsulted: bool     # rfc-0005 A2c-ii: true iff finalizeSlot actually ran the
                                    # post-compile cache consult for THIS compile (cache active,
                                    # group eligible, closure recorded) AND it fell through to a
@@ -663,6 +724,7 @@ type
   RecordClosureProc* = proc(graph: var DepGraph; config: Config; ep: Entrypoint;
                             nimcacheDir, binaryName: string;
                             protocolMajor: int; index: SourceIndex;
+                            driver: DriverResolver;
                             ccRun: RunProc): tuple[ok: bool, error: string]
     ## R3a (RFC-0009 A-final-ii-a): injectable seam matching `depgraph.
     ## recordClosure`'s signature, so a test can substitute a synthetic
@@ -671,11 +733,82 @@ type
     ## `discover`). `execute*`'s `recordClosureFn` param defaults to the
     ## real `recordClosure` — zero production behavior change.
 
+  RetireBinaryProc* = proc(path: string): tuple[ok: bool, error: string]
+    ## Issue #26 seam: remove the previous stable binary at `path`. `ok`
+    ## once nothing is left there (removed, or never present), else `error`
+    ## says why it could not be removed -- the same shape as its sibling
+    ## `RecordClosureProc`. `execute*`'s `retireFn` param defaults to the
+    ## real `retireStableBinary`; a test injects a failing one to drive the
+    ## could-not-remove branch through a real run.
+
+proc retireStableBinary*(path: string): tuple[ok: bool, error: string] =
+  ## The real `RetireBinaryProc`: `removeFile` (a missing file is not an
+  ## error), its failure message returned rather than raised.
+  try:
+    removeFile(path)
+    (ok: true, error: "")
+  except CatchableError as e:
+    (ok: false, error: e.msg)
+
+proc retireThenRecordClosure*(graph: var DepGraph; config: Config; ep: Entrypoint;
+                              nimcacheDir: string;
+                              index: SourceIndex; driver: DriverResolver;
+                              ccRun: RunProc;
+                              recordClosureFn: RecordClosureProc;
+                              retireFn: RetireBinaryProc):
+                              tuple[ok: bool, error: string] =
+  ## Issue #26: the ONE operation that records a fresh compile's closure,
+  ## owning the order that keeps the depgraph entry and the stable binary
+  ## it describes consistent. Called at the compile→run transition
+  ## (`finalizeSlot`), before the run and before `promoteCompiledBinary`.
+  ##
+  ## The new entry and the binary it describes reach disk at different
+  ## times — the entry here, the binary only when `execute` promotes it
+  ## after the run, and never if the run is interrupted, killed outright,
+  ## crashes, or fails to spawn. `decideCompile` does not ask which compile
+  ## a stable binary came from, so the OLD binary beside the NEW entry
+  ## would be compile-skipped and run as if it were this source, reporting
+  ## (and caching) its verdict for code it was not built from. So:
+  ##
+  ##   1. retire the previous stable binary (`retireFn`; the fresh compile
+  ##      is still in its per-slot directory, never at the stable path);
+  ##   2. only if that succeeded, record the closure (`recordClosureFn`,
+  ##      which persists the new entry);
+  ##   3. otherwise drop the entry (`invalidateEntry` + `saveDepGraph`; an
+  ##      entry-less binary is edStale) and return not-ok, exactly as a
+  ##      failed recording does -- including its "dependency graph could
+  ##      not be persisted" suffix when that save fails.
+  ##
+  ## Every point a run can stop at then leaves either the old entry with
+  ## the old binary (before step 1), an entry with no stable binary
+  ## (edNeverBuilt: recompile), or the new entry with the binary built from
+  ## it (after promotion). If even step 3's save fails, the on-disk pair is
+  ## still the old entry with the old binary it describes. A not-ok result
+  ## makes the slot read as unrecorded: never served from the post-compile
+  ## cache, never stored, and its binary never promoted
+  ## (`bdDiscardUnrecorded`); `finalizeSlot` reports it
+  ## (`closureUnrecordedWarning`) as soon as this returns, or holds it while
+  ## another attempt could still record it (R20-S1, `noteClosureOutcome`).
+  let prevStableBin = stableBinPath(ep, config)
+  let retired = retireFn(prevStableBin)
+  if retired.ok:
+    return recordClosureFn(graph, config, ep, nimcacheDir, binName(ep),
+                           CrisolProtocolMajor, index, driver, ccRun)
+  let key = entryKey(ep.tp, ep.flags)
+  graph.invalidateEntry(key.path, key.flagHash)
+  let error = "could not remove the previous binary " & prevStableBin &
+              " (" & retired.error & ")"
+  if saveDepGraph(graph, config):
+    (ok: false, error: error)
+  else:
+    (ok: false, error: error & "; dependency graph could not be persisted")
+
+type
   ExecCtx* = object
     ## code-review r24: the run-lifetime invariants that finalizeSlot,
     ## spawnCompileStable, spawnRunDirect, and transitionToRun all need but
     ## none of them ever change WITHIN one execute() call — config, the
-    ## cache bundle, the injected recordClosure seam, the plan itself, the
+    ## cache bundle, the injected recordClosure and retire seams, the plan itself, the
     ## derived output-byte cap and compile timeout, the resolved project
     ## root, and the two nimcache-persistence invariants (RFC-0006)
     ## execute() computes once up front (toolchainFp/dupSlugs). Built ONCE
@@ -690,12 +823,22 @@ type
     config*:            Config
     cache*:              CacheContext
     recordClosureFn*:    RecordClosureProc
+    retireFn*:           RetireBinaryProc
+      ## Issue #26: `execute*`'s `retireFn` -- how `finalizeSlot` retires
+      ## the previous stable binary (`retireThenRecordClosure`).
     plan*:               RunPlan
     maxOutputBytes*:     int
     compileTimeoutMs*:   int
     projectRoot*:        string
     toolchainFp*:        string
     dupSlugs*:           HashSet[string]
+    ccDriver*:           DriverResolver
+      ## R10-S6: the run's driver resolution (`headerprobe.siteResolver`
+      ## over `driverSite`): each header probe resolves its own compile
+      ## command's driver token, once per token per execute() call.
+    driverSite*:         DriverSite
+      ## R10-S6: where the build's nim finds its compilers (`execute*`'s
+      ## `driverSite`), carried to each measure worker's plan.
 
 type
   FinalizeKind = enum
@@ -736,14 +879,16 @@ proc cleanupSlotTmp(slot: Slot)
   ## deliberately narrower than cleanupSlotOnTeardown (see that proc's doc
   ## comment) in that it never touches slotBinDir/cacheDir.
 
-proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string): bool
+proc promoteCompiledBinary(ep: Entrypoint; config: Config;
+                           binCompiled: string): Option[ConfigWarning]
   ## Forward-declared: defined below, alongside spawnCompileStable (the
   ## proc that lays out `binCompiled` in the first place) — copies a
   ## per-slot compiled binary to its stable slug-keyed path. Shared by the
   ## post-run promotion (the pre-existing site) and `finalizeSlot`'s
   ## post-compile cache-hit branch (RFC-0005 A2c-ii), which needs the SAME
   ## promotion to happen right after compile instead of after a run that
-  ## never spawns.
+  ## never spawns. `none` on success; on failure the warning describing it
+  ## (`promotionFailedWarning`), which the caller raises (`raiseWarning`).
 
 proc classifyRunResult(
   ep: Entrypoint; output: string; elapsed: int64; compileSkipped: bool;
@@ -793,6 +938,150 @@ type
                                 ## via the async waitid(P_ALL, WNOWAIT) sweep
                                 ## after their owning slot's result had
                                 ## already been emitted (or unattributable).
+    warnings*:           seq[ConfigWarning]
+      ## R18-D1: run-time advisories this call raised, in the structured
+      ## `ConfigWarning` shape (see its doc in types.nim), each written to
+      ## stderr once, by `raiseWarning`, when it was raised -- including
+      ## those raised before an interrupt, a spawn failure or a fail-fast
+      ## stop, which funnel through the same single construction point.
+      ## Today: at most one `closureUnrecordedWarning` ("closure-record") and
+      ## at most one `promotionFailedWarning` ("promote-binary") per planned
+      ## entrypoint. R20-S1: they describe the run's final outcome for that
+      ## entrypoint: an unrecorded closure that a later attempt of the same
+      ## run records is not reported at all. `runcore` appends these to the
+      ## run's `--json` `warnings` (`RunDocument.warnings`), never to the
+      ## plan's, so the CLI does not print them a second time.
+
+  RunWarnings = object
+    ## R19-D1: `execute`'s accumulator for `ExecuteReport.warnings`. Only
+    ## `raiseWarning` adds to it, so no producer can reach one channel
+    ## (stderr, the structured list) without the other.
+    ##
+    ## R20-S1: `held` is a warning that is not yet a fact of the run: an
+    ## unrecorded closure on an attempt after which another attempt is
+    ## still structurally possible (`noteClosureOutcome`). A later attempt
+    ## that records the closure withdraws it (`noteClosureOutcome` again);
+    ## otherwise it
+    ## is raised when the entrypoint's final attempt is decided
+    ## (`settleWarning`, through `execute`'s `markFinal`, the one operation
+    ## every finalize site uses, R21-D1) or, for an entrypoint
+    ## never finalized (an interrupt, a fail-fast stop before its retry, an
+    ## exception), when `execute` leaves its dispatch loop
+    ## (`settleAllWarnings`, in its `finally`). Only a process killed
+    ## outright (SIGKILL, TerminateProcess) loses a held warning -- as it
+    ## loses everything else it has not written, since none of its code
+    ## runs again.
+    items:  seq[ConfigWarning]
+    raised: HashSet[string]  ## "<context>\0<planned-entrypoint index>"
+    held:   Table[int, ConfigWarning]  ## planned-entrypoint index -> the
+                                       ## latest attempt's held warning
+
+proc raiseWarning(rw: var RunWarnings; pepIdx: int; w: ConfigWarning) =
+  ## R19-D1: the one way this module reports a run-time advisory: writes
+  ## "crisol: warning: <message>" to stderr once and records `w` for
+  ## `ExecuteReport.warnings`. At most once per (context, planned
+  ## entrypoint) per `execute` call: a retry recompiles and can fail the
+  ## same way again, which repeats a fact already reported, so only the
+  ## first is kept. (An unrecorded closure never repeats: it is held until
+  ## the entrypoint's last attempt settles it, R20-S1.)
+  ## Keyed by the planned index, not `w.key`: matrix legs share a display
+  ## name.
+  let tag = w.context & "\0" & $pepIdx
+  if tag in rw.raised: return
+  rw.raised.incl tag
+  rw.items.add w
+  # R21-S1: never raises. `settleAllWarnings` runs in `execute`'s
+  # `finally`, where an exception from a broken stderr would replace the
+  # one already unwinding; the structured copy above is kept either way.
+  try:
+    stderr.write("crisol: warning: " & w.message & "\n")
+    stderr.flushFile()
+  except CatchableError: discard
+
+proc settleWarning(rw: var RunWarnings; pepIdx: int) =
+  ## R20-S1: `pepIdx`'s outcome is final: raise what it still holds.
+  ## R21-D1: called only through `execute`'s `markFinal` (and
+  ## `noteClosureOutcome`/`settleAllWarnings` below), never by hand.
+  var w: ConfigWarning
+  if rw.held.pop(pepIdx, w):
+    raiseWarning(rw, pepIdx, w)
+
+proc noteClosureOutcome(rw: var RunWarnings; pepIdx: int;
+                        unrecorded: Option[ConfigWarning]; final: bool) =
+  ## R21-D2: the one caller-facing verb for an attempt's closure-record
+  ## outcome. `unrecorded` is `none` when this attempt recorded its
+  ## closure, else the warning describing why it did not; `final` is
+  ## `not attemptsLeft(...)` for this attempt (no further attempt is
+  ## possible). R20-S1: a recorded closure withdraws whatever an earlier
+  ## attempt held (it made that warning untrue); an unrecorded one is held,
+  ## replacing any earlier attempt's (the latest error describes the run's
+  ## outcome), and raised at once when `final`. A held warning that no
+  ## later attempt withdraws is otherwise raised by `markFinal` or, for an
+  ## entrypoint never finalized, `settleAllWarnings`.
+  if unrecorded.isNone:
+    rw.held.del(pepIdx)
+  else:
+    rw.held[pepIdx] = unrecorded.get
+    if final:
+      settleWarning(rw, pepIdx)
+
+proc settleAllWarnings(rw: var RunWarnings) =
+  ## R20-S1: `execute` is leaving its dispatch loop, however it ends: raise
+  ## every warning still held, in planned order, so none is lost.
+  var idxs: seq[int]
+  for i in rw.held.keys: idxs.add i
+  for i in sorted(idxs): settleWarning(rw, i)
+
+proc closureUnrecordedWarning*(ep: Entrypoint; error: string): ConfigWarning =
+  ## R18-D1: the one formatting authority for the unrecorded-closure fact
+  ## (`retireThenRecordClosure` returned not-ok: the previous stable binary
+  ## could not be retired, or extraction/recording failed). R19-D3: built
+  ## by `finalizeSlot` the moment that returns, so it is reported whatever
+  ## ends the run afterwards (an interrupt, a kill of the test, a spawn
+  ## failure). R20-S1: while another attempt could still record the
+  ## closure it is held, not raised, so it is only reported once it is the
+  ## run's outcome -- which is why the text carries no "unless a retry"
+  ## hedge. `message` follows the "crisol: warning: " prefix on stderr.
+  let name = string(ep.tp.display())
+  ConfigWarning(
+    source:  "",
+    context: "closure-record",
+    key:     name,
+    message: name & ": could not record its source closure (" & error &
+             "); dependency record invalidated and this build's binary will" &
+             " not be kept — it will be recompiled and force-selected next run")
+
+type StableLeftover = enum
+  slNone   ## nothing at the stable path
+  slFile   ## a file crisol could not remove
+  slOther  ## something that is not a file (a directory, say)
+
+proc promotionFailedWarning(ep: Entrypoint; error, stableBin: string;
+                            left: StableLeftover): ConfigWarning =
+  ## R19-D1: the one formatting authority for a failed promotion of a
+  ## binary whose closure DID record (an unrecorded one is never promoted):
+  ## the new entry is on disk, the binary it describes is not at its stable
+  ## path. `left` is what `promoteCompiledBinary` found there after its
+  ## cleanup, which decides what the next run does (`decideCompile` reads
+  ## only whether a file is there).
+  let name = string(ep.tp.display())
+  let tail =
+    case left
+    of slNone:
+      "no binary is installed at its stable path — it will be recompiled next run"
+    of slOther:
+      stableBin & " is occupied by something that is not a file and could not" &
+      " be removed — it will be recompiled next run, and warn again until that" &
+      " is removed"
+    of slFile:
+      "a file crisol could not remove is left at " & stableBin &
+      " — remove it by hand, or the next run may run it instead of recompiling"
+  ConfigWarning(
+    source:  "",
+    context: "promote-binary",
+    key:     name,
+    message: name & ": could not promote its compiled binary (" & error &
+             "); " & tail)
 
 proc finalizeSlot(
   sv:               var Supervisor;
@@ -803,6 +1092,7 @@ proc finalizeSlot(
   sourceIndex:      var SourceIndex;
   sourceIndexBuilt: var bool;
   pendingEscapees:  var Table[int32, seq[ptypes.ProcSnapshot]];
+  runWarnings:      var RunWarnings;
   ctx:              ExecCtx;
 ): FinalizeOutcome =
   ## Called once `next` has reported weChildExited for `slots[idx].id`.
@@ -820,7 +1110,10 @@ proc finalizeSlot(
   ## now arrive together as `ctx: ExecCtx` (see its type doc) instead of six
   ## separate params. Everything else below (`sv`/`slots`/`idx`/
   ## `allowTransition`/`graph`/`sourceIndex`/`sourceIndexBuilt`/
-  ## `pendingEscapees`) is per-call or mutated in place and stays explicit.
+  ## `pendingEscapees`/`runWarnings`) is per-call or mutated in place and
+  ## stays explicit. `runWarnings` is `execute`'s accumulator: an unrecorded
+  ## closure is held or raised here (R19-D3, R20-S1), a failed post-compile
+  ## promotion raised.
   ##
   ## rfc-0005 A2c-ii: `ctx.cache` is the SAME `CacheContext` `execute()`
   ## resolves once for the whole run — passed through so the post-compile
@@ -832,8 +1125,8 @@ proc finalizeSlot(
   ## exist solely so a successfully-compiled slot can have its closure
   ## extracted and its dependency-graph entry updated RIGHT HERE — before
   ## the run child is spawned — instead of after the entire run completes
-  ## (the pre-existing site, now just a reader of `slot.closureRecorded`/
-  ## `.closureError`). `sourceIndex`/`sourceIndexBuilt` are `execute`'s own
+  ## (the pre-existing site, now just a reader of `slot.closureRecorded`;
+  ## a failure's warning is held or raised here, R19-D3/R20-S1). `sourceIndex`/`sourceIndexBuilt` are `execute`'s own
   ## locals threaded through by `var` so the "built at most once per
   ## `execute` call, only when something actually compiles" invariant
   ## (see `execute`'s doc comment) survives the move unchanged. Pure
@@ -853,6 +1146,22 @@ proc finalizeSlot(
   # crisol's own compile toolchain, a false positive) — see reap*'s doc
   # comment (process/posix.nim).
   var report  = sv.reap(slots[idx].id)
+  # R22-D1: the reap consumed the ChildId, so the slot is idle from here on
+  # (SlotState's invariant: ssLive iff a ChildId is outstanding). Every arm
+  # below returns it idle except the compile->run handoff, which re-arms it
+  # through `enterLive` only once the run child has spawned. Set once, here,
+  # rather than per arm: the compile-success arm used to stay ssLive across
+  # `retireThenRecordClosure` and the post-compile consult, so anything
+  # raising there sent `teardownDiscard` to `requestStop` a consumed id and
+  # its AssertionDefect replaced the original exception.
+  #
+  # Such an exception propagates; it is not turned into an fkDone failure
+  # for this entrypoint. Every call in that window is documented never to
+  # raise a CatchableError (the seams report failure by value), so one that
+  # does is a broken contract, which a per-test failure verdict would
+  # disguise as the test's own. What this guarantees is that the caller
+  # sees that exception, unmasked.
+  slots[idx].state = ssIdle
   let pepIdx  = slots[idx].pepIdx
   let pep     = ctx.plan.entrypoints[pepIdx]
   let elapsed = int64((epochTime() - slots[idx].t0) * 1000)
@@ -883,7 +1192,6 @@ proc finalizeSlot(
       res.compile = ptypes.Phase(kind: ptypes.pkRan, res: killedRes)
       res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
       cleanupSlotOnTeardown(slots[idx])
-      slots[idx].state = ssIdle
       return FinalizeOutcome(kind: fkDone, res: res)
     elif not report.exit.isSuccess:
       # Compile failed on its own — not killed.
@@ -899,7 +1207,6 @@ proc finalizeSlot(
       let failedRes = toProcessResult(report, ptypes.Limits(), elapsed * 1000)
       res.compile = ptypes.Phase(kind: ptypes.pkRan, res: failedRes)
       res.run     = ptypes.Phase(kind: ptypes.pkSkipped)
-      slots[idx].state = ssIdle
       return FinalizeOutcome(kind: fkDone, res: res)
     else:
       # RFC-0009 B4a: on Windows the C linker appends `.exe` to crisol's
@@ -922,30 +1229,55 @@ proc finalizeSlot(
         slots[idx].binCompiled = addFileExt(slots[idx].binCompiled, ExeExt)
         slots[idx].binFull     = slots[idx].binCompiled
 
+      # R11-L6: a successful compile's output is discarded with the slot, so
+      # the measurement worker's warnings (a unit it could not record in the
+      # artifact ledger, a ledger it could not write) are relayed here, while
+      # the output file still exists. Only a worker compile prints them.
+      # R15-D3: scanned via `readWholeForWarningScan`, NOT `readCapped` --
+      # see that proc's doc for why the display cap must not apply here.
+      if ctx.config.measureCompileReuse and ctx.config.workerBinary.len > 0 and
+         slots[idx].compOut.len > 0:
+        for w in measureWorkerWarnings(readWholeForWarningScan(slots[idx].compOut)):
+          stderr.write(w & "\n")
+
       # Compile succeeded, no stop act — capture it onto the slot so the
       # eventual run-phase result (below, or a later kill) carries BOTH
       # phases.
       slots[idx].compileProcRes = some(toProcessResult(report, ptypes.Limits(), elapsed * 1000))
       if not allowTransition:
         cleanupSlotOnTeardown(slots[idx])
-        slots[idx].state = ssIdle
         return FinalizeOutcome(kind: fkOmitted)
 
       # rfc-0005 A2c-i: extract this compile's closure and update the
       # dependency graph entry NOW — right after compile finishes, before
       # the run child is spawned — instead of after the whole run
       # completes (the pre-existing site). The post-run promotion/
-      # cache-store gate (in `execute`) reads `closureRecorded`/
-      # `closureError` back off the slot rather than calling
-      # `recordClosure` itself; the WHAT is unchanged, only the WHEN moved.
+      # cache-store gate (in `execute`) reads `closureRecorded` back off
+      # the slot rather than calling `recordClosure` itself; the WHAT is unchanged, only the WHEN moved.
       if not sourceIndexBuilt:
         sourceIndex = buildSourceIndex(ctx.config)
         sourceIndexBuilt = true
-      let rec = ctx.recordClosureFn(graph, ctx.config, pep.ep, slots[idx].cacheDir,
-                              binName(pep.ep), CrisolProtocolMajor, sourceIndex,
-                              realRunIn(ctx.projectRoot))  # r65: real compile subprocess cwd — ctx.projectRoot, the one canonical value
+      # Issue #26: the previous stable binary is retired before the entry
+      # describing THIS compile is persisted — `retireThenRecordClosure`
+      # owns that order (see its doc comment).
+      let rec = retireThenRecordClosure(
+        graph, ctx.config, pep.ep, slots[idx].cacheDir,
+        sourceIndex, ctx.ccDriver,
+        realRunIn(ctx.projectRoot),  # r65: real compile subprocess cwd — ctx.projectRoot, the one canonical value
+        ctx.recordClosureFn, ctx.retireFn)
       slots[idx].closureRecorded = rec.ok
-      slots[idx].closureError    = rec.error
+      # R19-D3: settled here, where it becomes true, not when the binary
+      # would have been promoted: every way this slot can end from now on
+      # (a finished run, an interrupt, a kill, a run-phase spawn failure)
+      # has already passed this point. R20-S1: only when no other attempt
+      # is structurally possible (this is the last one `retries` allows);
+      # otherwise it is held, and a later attempt that records the closure
+      # withdraws it (see `RunWarnings`). R21-D2: `final` is the same
+      # attempt-budget rule `decideExit`'s retry decision reads.
+      runWarnings.noteClosureOutcome(pepIdx,
+        unrecorded = (if rec.ok: none(ConfigWarning)
+                      else: some(closureUnrecordedWarning(pep.ep, rec.error))),
+        final = not attemptsLeft(slots[idx].attempt, pep.maxAttempts))
 
       # rfc-0005 A2c-ii: post-compile cache consult. The closure/graph are
       # NOW fresh (just above) — derive this compile's key and consult the
@@ -973,7 +1305,11 @@ proc finalizeSlot(
         let look = consultPostCompile(pep, ctx.cache.policy, ctx.cache.seams, ctx.cache.sink,
                                       ctx.cache.spec, ctx.cache.outcomePolicy)
         if look.decision == edCached and look.synthesized.isSome:
-          if promoteCompiledBinary(pep.ep, ctx.config, slots[idx].binCompiled):
+          let promoteFailed = promoteCompiledBinary(pep.ep, ctx.config,
+                                                    slots[idx].binCompiled)
+          if promoteFailed.isSome:
+            raiseWarning(runWarnings, pepIdx, promoteFailed.get)
+          else:
             # Genuine post-compile hit: the compile really ran (compile =
             # pkRan, replacing synthesize's default pkSkipped — the compile
             # ProcessResult was captured just above onto the slot) while the
@@ -989,13 +1325,12 @@ proc finalizeSlot(
             cleanupSlotTmp(slots[idx])
             if slots[idx].slotBinDir.len > 0:
               try: removeDir(slots[idx].slotBinDir) except: discard
-            slots[idx].state = ssIdle
             return FinalizeOutcome(kind: fkCacheHit, res: res)
           # Promotion failed: no stable binary would back cdmHit's own
           # invariant (every cdmHit has a stable binary, B3 relies on it) —
           # cannot safely serve this as a hit. Fall through to the normal
-          # run path below, exactly like a miss (promoteCompiledBinary
-          # already warned to stderr).
+          # run path below, exactly like a miss (warned just above; the
+          # post-run promotion's own failure would not warn again).
         # Miss, recompute-invalidated, or a hit whose promotion failed:
         # stash the REAL post-compile key/lookup/explain so the eventual
         # live result (once the run below completes) reports them honestly
@@ -1019,7 +1354,6 @@ proc finalizeSlot(
         res.compile = ptypes.Phase(kind: ptypes.pkRan, res: slots[idx].compileProcRes.get)
         res.run     = ptypes.Phase(kind: ptypes.pkSpawnFailed,
                                    spawnError: "fork failed during run phase")
-        slots[idx].state = ssIdle
         return FinalizeOutcome(kind: fkDone, res: res)
       return FinalizeOutcome(kind: fkTransitioned)
 
@@ -1064,7 +1398,6 @@ proc finalizeSlot(
     cleanupSlotTmp(slots[idx])
     res.compile = compilePhase
     res.run     = ptypes.Phase(kind: ptypes.pkRan, res: runRes)
-    slots[idx].state = ssIdle
     return FinalizeOutcome(kind: fkDone, res: res)
 
 proc teardownDiscard(sv: var Supervisor; slots: var seq[Slot]) =
@@ -1141,7 +1474,8 @@ proc warnMeasureCompileReuseNoWorkerOnce() =
 
 proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string;
                              config: Config; projectRoot: string;
-                             toolchainFp: string): MeasurePlan =
+                             toolchainFp: string;
+                             driverSite: DriverSite): MeasurePlan =
   ## Plan construction for the compile-slot measurement worker
   ## (`config.measureCompileReuse`).
   ##
@@ -1164,6 +1498,11 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
   ## (that re-derivation is cwd-dependent and used to silently diverge from
   ## `ctx.projectRoot` whenever the invoking process's cwd differed from the
   ## resolve-time cwd).
+  ##
+  ## R10-S6: `driverSite` is `ctx.driverSite`, the run's one discovery of
+  ## where the build's nim finds its compilers, carried to the worker for
+  ## the W9l reason `toolchainFp` is: its header probes resolve each
+  ## command's driver against it, and it never runs a discovery itself.
   MeasurePlan(
     # Source the entrypoint's identity from its TrackedPath, serialized to
     # the worker via the display() accessor (a deliberate string wire — the
@@ -1180,6 +1519,7 @@ proc buildCompileWorkerPlan(ep: Entrypoint; epAbs, cacheDir, binCompiled: string
     stateDir:          stateDirOf(config),
     projectRoot:       projectRoot,
     toolchainFp:       toolchainFp,
+    driverSite:        driverSite,
   )
 
 proc dirHasEntries(dir: string): bool =
@@ -1249,44 +1589,61 @@ proc bustStaleExternalObjects(cacheDir: string; ep: Entrypoint; graph: DepGraph;
       if isModuleObjectName(base): continue
       removeFile(path)
 
-proc promoteCompiledBinary(ep: Entrypoint; config: Config; binCompiled: string): bool =
+proc promoteCompiledBinary(ep: Entrypoint; config: Config;
+                           binCompiled: string): Option[ConfigWarning] =
   ## Copy a per-slot compiled binary to its stable slug-keyed path (what
   ## `decideCompile` checks on future runs) and mark it executable. A no-op
-  ## (returns true) when there is nothing to promote — `binCompiled` empty,
-  ## or already the stable path itself. On any copy/chmod failure, warns to
-  ## stderr and removes whatever partial file landed at the stable path
-  ## (never leave a binary no depgraph entry describes, issue #13.3),
-  ## returning false so the caller can treat "no stable binary" as the
+  ## (returns `none`) when there is nothing to promote — `binCompiled` empty,
+  ## or already the stable path itself. On any copy/chmod/rename failure,
+  ## removes whatever partial file landed at the stable path (never leave a
+  ## binary no depgraph entry describes, issue #13.3) and returns the
+  ## warning describing what is left there (`promotionFailedWarning`); the
+  ## caller raises it (`raiseWarning`) and treats "no stable binary" as the
   ## honest outcome — this is exactly what a genuine post-compile cache hit
   ## (RFC-0005 A2c-ii) requires before it can be served: `cdmHit` relies on
-  ## a stable binary existing at rest.
+  ## a stable binary existing at rest. Writes nothing to stderr itself.
   let stableBinDir = binPath(ep, config)
   # RFC-0009 B4a: route through `stableBinPath` (not `stableBinDir / bname`)
   # so the promotion target agrees with decideCompile's freshness check and
   # spawnRunDirect's spawn target on every platform — see its doc comment.
   let stableBin    = stableBinPath(ep, config)
   if binCompiled.len == 0 or binCompiled == stableBin:
-    return true
+    return none(ConfigWarning)
+  # Issue #26: copied beside the stable path, then renamed onto it, so the
+  # stable path only ever holds a whole binary. `finalizeSlot` has already
+  # persisted the entry describing this compile; a copy straight onto the
+  # stable path that a kill cut short would leave that entry beside a
+  # truncated binary, which the next run would compile-skip and run.
+  let staged = stableBin & ".promoting"
   try:
     createDir(stableBinDir)
-    copyFile(binCompiled, stableBin)
-    setFilePermissions(stableBin, {fpUserRead, fpUserWrite, fpUserExec,
-                                   fpGroupRead, fpGroupExec,
-                                   fpOthersRead, fpOthersExec})
-    true
+    copyFile(binCompiled, staged)
+    setFilePermissions(staged, {fpUserRead, fpUserWrite, fpUserExec,
+                                fpGroupRead, fpGroupExec,
+                                fpOthersRead, fpOthersExec})
+    moveFile(staged, stableBin)
+    none(ConfigWarning)
   except CatchableError as e:
-    # Promotion failed partway (e.g. copyFile succeeded but
-    # setFilePermissions did not) — whatever landed at stableBin has
-    # unknown/partial content and no depgraph entry describes it either
-    # way; discard it so the next run starts from cdNeverBuilt instead of
-    # trusting it. Not exercisable under test as root (chmod-based faults
-    # do not fail for root); this is untested hardening.
-    stderr.write("crisol: warning: " & string(ep.tp.display()) &
-                 ": could not promote its compiled binary (" &
-                 e.msg & "); the previous binary was discarded\n")
-    try: stderr.flushFile() except CatchableError: discard
+    try: removeFile(staged) except CatchableError: discard
+    # Promotion failed partway — whatever landed at stableBin has unknown/
+    # partial content and no depgraph entry describes it either way;
+    # discard it so the next run starts from cdNeverBuilt instead of
+    # trusting it. The previous binary is already gone (a promotion runs
+    # only after a successful retire), so whatever survives this removal is
+    # what the warning names.
     try: removeFile(stableBin) except CatchableError: discard
-    false
+    let left = if fileExists(stableBin): slFile
+               elif dirExists(stableBin) or symlinkExists(stableBin): slOther
+               else: slNone
+    # The OS error's first line only: std/os appends an "Additional info"
+    # line naming both paths, which would split the warning's one stderr
+    # line (and the message already names the stable path).
+    var reason = e.msg
+    for i, c in e.msg:
+      if c in {'\r', '\n'}:
+        reason.setLen(i)
+        break
+    some(promotionFailedWarning(ep, reason, stableBin, left))
 
 proc enterLive(slot: var Slot; id: ChildId; phase: SlotPhase; deadline: MonoTime) =
   ## code-review r25: the "entering a live phase" bookkeeping every site
@@ -1302,6 +1659,9 @@ proc enterLive(slot: var Slot; id: ChildId; phase: SlotPhase; deadline: MonoTime
   ## compile-spawn instant (the bug this closed: `finalizeSlot`'s `elapsed`,
   ## derived from `t0`, was silently folding compile time into every
   ## recompiled run's reported duration before `transitionToRun` reset it).
+  ## R22-D1: the slot goes live HERE, with its ChildId, and nowhere else;
+  ## `finalizeSlot` idles it at the reap that consumes that id.
+  slot.state        = ssLive
   slot.id           = id
   slot.phase        = phase
   slot.deadline     = deadline
@@ -1341,7 +1701,6 @@ proc claimSlot(
   ## deliberately left at its zero value — S3's admission token is stamped by the
   ## dispatch loop only once the spawn this claim represents has actually
   ## succeeded (see execute()'s fill pass), same as before this refactor.
-  result.state           = ssLive
   result.pepIdx          = pepIdx
   result.attempt         = attempt
   result.peakRssBytes    = 0
@@ -1361,7 +1720,6 @@ proc claimSlot(
   result.spec            = spec
   result.compileProcRes  = none(ptypes.ProcessResult)
   result.closureRecorded = false
-  result.closureError    = ""
   result.postCompileConsulted = false
   result.postCompileInputHash = ""
   result.postCompileLookup    = cvOk
@@ -1515,7 +1873,8 @@ proc spawnCompileStable(
   # single home.
   template writeWorkerPlan(planFilename: string; token: string): seq[string] =
     let mplan = buildCompileWorkerPlan(ep, epAbs, cacheDir, binCompiled, config,
-                                       ctx.projectRoot, ctx.toolchainFp)
+                                       ctx.projectRoot, ctx.toolchainFp,
+                                       ctx.driverSite)
     let planPath = tmpDir / planFilename
     try:
       writeFile(planPath, $toJson(mplan))
@@ -1849,8 +2208,16 @@ proc buildVerifyPlan*(entrypoints: seq[PlannedEntrypoint];
 # execute — bounded-parallel continue-on-failure runner
 # ---------------------------------------------------------------------------
 
-# SOUNDNESS-PARAMETER WARNING (round-2 review, R2-7). The `ccVersion` default
-# below is an instance of the shape that produced defect L1: a parameter that
+# SOUNDNESS-PARAMETER WARNING (round-2 review, R2-7).
+#
+# R12-D4 (round 12, 2026-09-26): the `ccVersion` default this note was written
+# about is GONE. The C toolchain is now `toolchain: RunToolchain` -- required,
+# no default, built only by `runToolchain(probe, nonce)` or `unkeyed(site)` --
+# so neither the omission below nor a key paired with a foreign driver site
+# can be written. `nimVersion` is the parameter the rest of this note still
+# governs; read `ccVersion` below as the history that motivated it.
+#
+# The `ccVersion` default was an instance of the shape that produced defect L1: a parameter that
 # governs cache-key soundness while carrying a convenient default, so a caller
 # who omits it silently gets the unsound value AND the omission is invisible in
 # review. L1 was exactly that -- a fix whose scope excluded `api.nim` left
@@ -1953,24 +2320,13 @@ proc buildVerifyPlan*(entrypoints: seq[PlannedEntrypoint];
 # built, and inert" failure mode L1 was. (`clean.nim`'s R3-7 section records the
 # same trade-off from the other side: it could use an `auto` return precisely to
 # avoid a second copy of one long result tuple.) If that ever changes, the
-# `##` doc on `ccVersion` below is the contract to preserve. See R2-7/R3-7 in
+# `##` doc on `toolchain` below is the contract to preserve. See R2-7/R3-7 in
 # docs/handoff/msvc-selection-layer.md.
 proc execute*(
   p:                RunPlan;
   config:           Config = Config();
   graph:            var DepGraph;
   nimVersion:       string = "";
-  ccVersion:        string = "";  ## nimcache-persistence: folded with nimVersion into
-                                  ## the toolchain fingerprint (planner.toolchainFingerprint)
-                                  ## that keys the persistent nimcache path — see spawnCompileStable.
-                                  ## "" (default, same convention as nimVersion) disables the
-                                  ## fingerprint suffix — used by tests / cold-start callers.
-                                  ## PASS IT EXPLICITLY (R3-6), including "" when you have no
-                                  ## probe: the default is for source compatibility, not a
-                                  ## recommended calling convention. Stated in the `##` doc
-                                  ## because generated docs and editor hover show only these
-                                  ## lines, never the `#` warning above this proc — and the
-                                  ## five sibling projects consume crisol as a library.
   onResult:         ResultCallback = noopResult;
   failFast:         bool = false;
   showProgress:     bool = true;
@@ -2017,6 +2373,31 @@ proc execute*(
                                   ## without a genuinely-outside-every-root
                                   ## Entrypoint (production entrypoints are
                                   ## ALWAYS tag-0).
+  retireFn:         RetireBinaryProc = retireStableBinary;  ## Issue #26:
+                                  ## injectable retire-the-previous-stable-
+                                  ## binary seam (`retireThenRecordClosure`).
+                                  ## Defaults to the real `retireStableBinary`
+                                  ## -- ZERO production behavior change. Tests
+                                  ## inject a failing one to drive the
+                                  ## could-not-remove branch through a real
+                                  ## run.
+  toolchain:        RunToolchain; ## R12-D4 (R10-S6, R11-D1): the run's C
+                                  ## toolchain as ONE value, required and with
+                                  ## no default. `toolchain.identity` is folded
+                                  ## with nimVersion into the toolchain
+                                  ## fingerprint (planner.toolchainFingerprint)
+                                  ## that keys the persistent nimcache path
+                                  ## (see spawnCompileStable); "" (`unkeyed`)
+                                  ## disables the suffix -- tests and
+                                  ## cold-start callers. `toolchain.site` is
+                                  ## where the build's nim finds its
+                                  ## compilers, which every header probe of
+                                  ## this call resolves its command's driver
+                                  ## against; an unknown site (`known:
+                                  ## false`) makes each header probe refuse.
+                                  ## Built by `runToolchain(probe, nonce)` or
+                                  ## `unkeyed(site)` only, so a key is never
+                                  ## paired with another discovery's site.
 ): ExecuteReport =
   ## Effectful.  Runs each planned entrypoint with a bounded-parallel poll-loop
   ## scheduler honouring p.jobs (A4).  At most p.jobs child processes alive at
@@ -2088,12 +2469,12 @@ proc execute*(
   # nimcache-persistence (RFC-0006): computed ONCE per execute() call, not
   # per slot/compile — both are pure functions of the plan/toolchain, never
   # of a slot's runtime state.
-  #   toolchainFp — folds nimVersion+ccVersion into the persistent nimcache
+  #   toolchainFp — folds nimVersion+toolchain.identity into the persistent nimcache
   #     path (planner.cachePath) so a toolchain upgrade lands on a fresh dir.
   #   dupSlugs    — the rare set of slugs scheduled ≥2× in THIS plan; those
   #     fall back to the old volatile pepIdx-suffixed dir in spawnCompileStable
   #     to avoid two concurrent slots racing on one nimcache write.
-  let toolchainFp = toolchainFingerprint(nimVersion, ccVersion)
+  let toolchainFp = toolchainFingerprint(nimVersion, toolchain.identity)
   let dupSlugs    = duplicateSlugs(p, config.trackedRoots)
 
   # code-review r24: the run-lifetime invariants above (config, cache,
@@ -2107,16 +2488,24 @@ proc execute*(
   # per-spawn) is the actual invariant `ExecCtx.projectRoot`'s doc promises.
   # Every other site that needs it reads `ctx.projectRoot` back; none may
   # re-derive their own `config.projectRoot.absolutePath.normalizedPath`.
+  # R10-S6: each driver token is resolved against the caller's site once
+  # per execute() call.
+  let driverSite = toolchain.site
+  let ccDriver: DriverResolver = siteResolver(driverSite)
+
   let ctx = ExecCtx(
     config:            config,
     cache:              cache,
     recordClosureFn:    recordClosureFn,
+    retireFn:           retireFn,
     plan:               p,
     maxOutputBytes:     maxOutputBytes,
     compileTimeoutMs:   compileTimeoutMs,
     projectRoot:        config.projectRoot.absolutePath.normalizedPath,  # canon-ok: the run's SINGLE canonical derivation (r65) -- every other site reads ctx.projectRoot
     toolchainFp:        toolchainFp,
     dupSlugs:           dupSlugs,
+    ccDriver:           ccDriver,
+    driverSite:         driverSite,
   )
 
   # Pre-allocate result slots so we can fill them by index (plan order).
@@ -2169,6 +2558,22 @@ proc execute*(
   var finalized       = newSeq[bool](n)   # B1: true once done (pass/exhausted)
   var lwm             = 0   # low-water mark: start of undispatched scan
   var done            = 0   # count of completed entrypoints
+  var runWarnings: RunWarnings  # R18-D1/R19-D1: ExecuteReport.warnings
+
+  # R21-D1: the ONE operation by which an entrypoint becomes final (a
+  # plan-time or post-compile cache hit, an interrupted final, a normal
+  # final, a spawn failure): marks it finalized, counts it done, and
+  # settles any closure-record warning an earlier attempt held (R20-S1:
+  # this attempt is its last, so that warning is now the run's outcome).
+  # No finalize site sets `finalized` by hand, so a new one cannot forget
+  # the settle. `done` therefore always equals the number of finalized
+  # entrypoints (an interrupted final counts too; the loop reads `done`
+  # only while not shutting down). A template, not a proc: it mutates
+  # `execute`'s own locals (see `handleChildExited`).
+  template markFinal(pepIdx: int) =
+    finalized[pepIdx] = true
+    inc done
+    runWarnings.settleWarning(pepIdx)
 
   # For the lwm/H1 scan: advance lwm only past FINALIZED entries.
   # (An entry with attempts>0 but not finalized may need re-dispatch.)
@@ -2227,7 +2632,7 @@ proc execute*(
       # L15: delegate to the authoritative (isActive=false, edecision) → CacheDecision
       # mapping in cachedispatch.inactiveDecision.  The full decision table lives
       # there with rationale; this call site is the single consumer.
-      cacheDecisions[i] = inactiveDecision(pep.edecision)
+      cacheDecisions[i] = inactiveDecision(pep.edecision, cache.inactiveReason)
       continue
     if shutdownRequested().isSome:
       # RFC-0005 B0(c)/C3c: abandon the remaining plan-time consults on a
@@ -2260,8 +2665,7 @@ proc execute*(
       # rule naturally no-ops here; the B3 path rule still applies.
       synth.quarantined = isQuarantined(p.entrypoints[i].ep, synth, config.quarantine, config.quarantineTp)
       results[i] = synth
-      finalized[i] = true    # B1: mark finalized — edCached never retried
-      inc done
+      markFinal(i)    # B1: edCached is never retried
       onResult(synth)
   # Advance lwm past any leading run of plan-time-served (cached) entries so the
   # dispatch scan never re-walks them.  (Only finalized entries advance lwm;
@@ -2344,7 +2748,6 @@ proc execute*(
                                                           # compile→run transition, read by
                                                           # the post-run promotion/cache-
                                                           # store gate below.
-        let slotClosureError    = slots[idx].closureError
         let slotPostCompileConsulted = slots[idx].postCompileConsulted  # rfc-0005
                                                           # A2c-ii: capture before slot
                                                           # cleared — set at the compile→run
@@ -2371,6 +2774,7 @@ proc execute*(
                               sourceIndex = sourceIndex,
                               sourceIndexBuilt = sourceIndexBuilt,
                               pendingEscapees = pendingEscapees,
+                              runWarnings = runWarnings,
                               ctx = ctx)
 
         case fo.kind
@@ -2399,8 +2803,7 @@ proc execute*(
           res.quarantined = isQuarantined(p.entrypoints[completedIdx].ep, res,
                                           config.quarantine, config.quarantineTp)
           results[completedIdx] = res
-          finalized[completedIdx] = true
-          inc done
+          markFinal(completedIdx)  # R20-S1: nothing held (attempt 1, recorded)
           onResult(res)
         of fkDone:
           ac.onSlotFinish(slotToken, finishRss)  # S6b: feed real RSS so estJobPeak adapts
@@ -2419,7 +2822,6 @@ proc execute*(
             # already gone by the time fkDone reaches this handler.
             if slotBinDir.len > 0:
               try: removeDir(slotBinDir) except: discard
-            finalized[completedIdx] = true
 
             # r35: an interrupted final bypasses retry/ledger/cache/promotion
             # (above), but it must NOT bypass the facts the runner already
@@ -2461,12 +2863,13 @@ proc execute*(
               isQuarantined(p.entrypoints[completedIdx].ep, results[completedIdx],
                             config.quarantine, config.quarantineTp)
 
+            # R20-S1: interrupted, so this attempt is its last.
+            markFinal(completedIdx)
             onResult(results[completedIdx])
           else:
             # rfc-0007 §2: retry/flaky/quarantine decisions read the pure
             # derivation — there is no stored legacy field to read instead.
             let completedOutcome = outcome(results[completedIdx])
-            let maxAttempts = p.entrypoints[completedIdx].retries + 1  # B1
 
             # B2: append one ledger row per live attempt — including intermediate
             # failed attempts that will be retried.  inputHash for intermediate
@@ -2489,8 +2892,7 @@ proc execute*(
             let verdict =
               if cacheActive:
                 shouldStore(results[completedIdx], cache.spec, slotAttempt,
-                           cache.policy, p.entrypoints[completedIdx].cacheable,
-                           toolchainUnidentified = cache.toolchainUnidentified)
+                           cache.policy, p.entrypoints[completedIdx].cacheable)
               else:
                 StoreVerdict()
 
@@ -2501,7 +2903,7 @@ proc execute*(
             let decision = decideExit(
               completedOutcome      = completedOutcome,
               slotAttempt           = slotAttempt,
-              maxAttempts           = maxAttempts,
+              maxAttempts           = p.entrypoints[completedIdx].maxAttempts,  # B1
               failFast              = failFast,
               compiledThisRun       = compiledThisRun,
               hasCacheDir           = slotCacheDir.len > 0,
@@ -2517,9 +2919,11 @@ proc execute*(
               discard  # slot cleared above; fill scan will re-dispatch
 
             else:
-              # Finalize: pass or exhausted retries.
-              inc done
-              finalized[completedIdx] = true
+              # Finalize: pass or exhausted retries. R20-S1: this attempt is
+              # the entrypoint's last, so a closure-record warning an
+              # earlier attempt held (none if this attempt recorded it) is
+              # now the run's outcome; `markFinal` settles it.
+              markFinal(completedIdx)
 
               # B1: stamp attempts onto the final result; flaky is derived
               # from attempts (A1e-i: `flaky(r, policy)`, no field to stamp).
@@ -2536,52 +2940,36 @@ proc execute*(
               if decision.recordAsFailure:
                 anyFailed = true
 
-              # After run completes for a compiled-this-run slot: copy the binary
-              # to the stable slug-keyed path, then consult the closure-recording
-              # outcome captured back at the compile→run transition (rfc-0005
-              # A2c-i: `finalizeSlot` calls `recordClosure` itself, right after
-              # compile finishes and before the run child is spawned — this site
-              # only reads `slotClosureRecorded`/`slotClosureError` back).
-              if decision.promoteBinary:
+              # After run completes for a compiled-this-run slot whose closure
+              # recorded: copy the binary to the stable slug-keyed path (the
+              # closure-recording outcome was captured back at the
+              # compile→run transition — rfc-0005 A2c-i). R19-D1: an
+              # unrecorded closure's binary is never promoted
+              # (`bdDiscardUnrecorded`); its warning was settled by
+              # `finalizeSlot` or just above (R19-D3, R20-S1), so nothing
+              # is reported here.
+              #
+              # Invariant on exit from this block: either (the depgraph
+              # entry on disk matches the stable binary) or (no stable
+              # binary exists) — NEVER a binary whose provenance the on-disk
+              # depgraph does not describe (issue #13.3). A promotion failure
+              # resolves toward "no stable binary"; its warning says what,
+              # if anything, could not be cleared.
+              #
+              # `promoteCompiledBinary` (shared with finalizeSlot's
+              # post-compile cache-hit branch, RFC-0005 A2c-ii) no-ops when
+              # `slotBinCompiled` is empty or already the stable path. A
+              # promotion failure here does not, by itself, block a store.
+              case decision.binary
+              of bdPromote:
                 let ep = p.entrypoints[completedIdx].ep
-                # RFC-0009 B4a: `stableBinPath` (not `binPath / binName`)
-                # so this warning/discard path names the SAME file
-                # `promoteCompiledBinary` just wrote — see its doc comment.
-                let stableBin = stableBinPath(ep, config)
-                # Invariant on exit from this block: either (the depgraph
-                # entry on disk matches the stable binary at `stableBin`) or
-                # (no stable binary exists at `stableBin`) — NEVER a binary
-                # whose provenance the on-disk depgraph does not describe
-                # (issue #13.3). A promotion or persist failure below always
-                # resolves toward "no stable binary" rather than leaving a
-                # binary paired with a stale or absent depgraph entry.
-                #
-                # Copy per-slot binary to the stable slug-keyed location.
-                # The stable binary is what decideCompile checks on future
-                # runs. `promoteCompiledBinary` (shared with finalizeSlot's
-                # post-compile cache-hit branch, RFC-0005 A2c-ii) already
-                # no-ops when `slotBinCompiled` is empty or already equals
-                # `stableBin`, and already warns + discards any partial
-                # `stableBin` on failure — this site's return value is
-                # intentionally unused, matching the pre-extraction
-                # behavior exactly (a promotion failure here does not, by
-                # itself, block a store; only `discardOnUnrecordedClosure`
-                # below does).
-                discard promoteCompiledBinary(ep, config, slotBinCompiled)
-
-                if decision.discardOnUnrecordedClosure:
-                  # The depgraph entry for this compile is either invalidated
-                  # or (on a persist failure) not reliably reflected on disk
-                  # at all — either way, the stable binary just promoted
-                  # above must not survive to be served by a future run
-                  # whose decideCompile can no longer be trusted to agree
-                  # with it (issue #13.3).
-                  try: removeFile(stableBin) except CatchableError: discard
-                  stderr.write("crisol: warning: " & string(ep.tp.display()) & ": could not record its " &
-                               "source closure (" & slotClosureError & "); dependency record " &
-                               "invalidated and its binary was discarded — it will be " &
-                               "recompiled and force-selected next run\n")
-                  try: stderr.flushFile() except CatchableError: discard
+                let promoteFailed = promoteCompiledBinary(ep, config, slotBinCompiled)
+                if promoteFailed.isSome:
+                  raiseWarning(runWarnings, completedIdx, promoteFailed.get)
+              of bdDiscardUnrecorded:
+                discard  # the binary leaves with its per-slot dir, just below
+              of bdNoBinary:
+                discard
 
               # Clean up the per-slot bin dir after stable copy (M15).
               # finalizeSlot already cleaned this on compile-fail; only clean here on success.
@@ -2730,7 +3118,7 @@ proc execute*(
         let spawnFailDecision = decideExit(
           completedOutcome      = outcome(spawnFailRes),
           slotAttempt           = attemptNum,
-          maxAttempts           = p.entrypoints[pepIdx].retries + 1,
+          maxAttempts           = p.entrypoints[pepIdx].maxAttempts,
           failFast              = failFast,
           compiledThisRun       = false,
           hasCacheDir           = false,
@@ -2740,9 +3128,10 @@ proc execute*(
           planTimeCacheDecision = cacheDecisions[pepIdx],
         )
         results[pepIdx] = spawnFailRes
+        # R20-S1: a retry that could not spawn is the entrypoint's last
+        # attempt: an earlier attempt's held warning is its outcome.
+        markFinal(pepIdx)
         onResult(spawnFailRes)
-        finalized[pepIdx] = true
-        inc done
         if spawnFailDecision.recordAsFailure:
           anyFailed = true
 
@@ -3080,12 +3469,17 @@ proc execute*(
     # on the normal-return path, without needing the finally-time capture.
     teardownDiscard(sv, slots)
     closeLedger(led)
+    # R20-S1: an entrypoint never finalized (its retry not dispatched
+    # before an interrupt or a fail-fast stop, or an exception unwinding
+    # this loop) still reports a warning it holds. Last, so a failing
+    # stderr write cannot skip the teardown above.
+    settleAllWarnings(runWarnings)
 
   # rfc-0007 A1e-ii: trim `results` to the §2 emission set — entries whose
   # last-started phase is pkRan/pkCached/pkSpawnFailed, i.e. `finalized`.
   # On a normal (non-interrupted, non-failFast-early-exited) completion
   # `done == n` is the while loop's only exit condition, and `done` only
-  # ever advances alongside `finalized[i] = true`, so every index is
+  # ever advances alongside `finalized[i]` (both only in `markFinal`), so every index is
   # finalized here and this is a transparent reshuffle. On an interrupted
   # run, or a failFast run that broke out early (r33 — see the `break`
   # above), entries never claimed by a slot (queued, or the RFC's
@@ -3113,6 +3507,7 @@ proc execute*(
     notStarted:        notStarted,
     shutdownSignal:    shutdownSignum,
     lateOrphansReaped: lateOrphansReaped,
+    warnings:          runWarnings.items,
   )
 
 # ---------------------------------------------------------------------------
@@ -3156,24 +3551,27 @@ proc runEntrypoint*(
   if cfg.compileTimeoutSecs == 0: cfg.compileTimeoutSecs = 30
   if cfg.timeoutSecs == 0:        cfg.timeoutSecs = 30
   if cfg.maxOutputBytes == 0:     cfg.maxOutputBytes = 65_536
-  # R3-6 (round-3 review): `nimVersion`/`ccVersion` are threaded EXPLICITLY as
-  # "" rather than left to their defaults. Nothing about the behaviour changes
-  # -- "" is what the defaults already supplied -- but this is the one exported
-  # proc in the tree that omitted them, which falsified the SOUNDNESS-PARAMETER
-  # WARNING above `execute` ("every production caller threads a real value
-  # today") and is precisely the omission that note asks a reader to make
-  # visible in the diff. "" is correct and deliberate here: this wrapper
-  # disables the cache (`cacheDisabled`) and plans against `emptyDepGraph()`,
-  # so there is no key to be unsound and nothing to be stale against; it is a
-  # cold-start caller in the note's own sense, not a probe-less production run.
-  let p = plan(cfg, @[ep], emptyDepGraph(), nimVersion = "", ccVersion = "")
+  # R3-6 (round-3 review): `execute`'s `nimVersion` is threaded EXPLICITLY
+  # as "", and the toolchain as `unkeyed` (the SOUNDNESS-PARAMETER WARNING
+  # above `execute` asks a reader to make that choice visible in the diff).
+  # Keying nothing is correct and deliberate here: this wrapper disables the
+  # cache (`cacheDisabled`) and plans against `emptyDepGraph()`, so there is
+  # no key to be unsound and nothing to be stale against; it is a cold-start
+  # caller in the note's own sense, not a probe-less production run. (`plan`
+  # takes neither, R5-24.)
+  let p = plan(cfg, @[ep], emptyDepGraph())
   var g = emptyDepGraph()
   let results = execute(p, config = cfg, graph = g,
-                        nimVersion = "", ccVersion = "",
+                        nimVersion = "",
                         onResult = noopResult,
                         failFast = false, showProgress = false,
                         progressIntervalMs = 30_000,
-                        cache = cacheDisabled(resolveSandbox())).results
+                        cache = cacheDisabled(resolveSandbox()),
+                        # R11-D1: this caller keys nothing, but an entrypoint
+                        # with a C external still needs the site its header
+                        # probes resolve drivers against. The probe's memo
+                        # ignores the private state directory (R12-D5).
+                        toolchain = unkeyed(cachedToolchainProbe(ccProbeContextOf(cfg)).site)).results
   if results.len > 0:
     result = results[0]
   else:

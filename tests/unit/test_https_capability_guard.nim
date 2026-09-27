@@ -43,7 +43,7 @@ suite "cacheregistry.configuredCache — https-capability guard (non-ssl build)"
     let sd = freshStateDir("configured_cache")
     let cfg = CacheConfig(remotes: @[
       RemoteTier(name: "mirror", url: "https://cache.example.com/crisol")
-    ])
+    ], trust: TrustConfig(policy: "none"))
     var caught = false
     var kind: CrisolErrorKind
     var msg = ""
@@ -65,7 +65,7 @@ suite "cacheregistry.configuredCache — https-capability guard (non-ssl build)"
     let remoteRoot = freshStateDir("configured_cache_file_remote")
     let cfg = CacheConfig(remotes: @[
       RemoteTier(name: "mirror", url: "file://" & remoteRoot)
-    ])
+    ], trust: TrustConfig(policy: "none"))
     let rt = configuredCache(cfg, sd, maxEntries = 0, reg = productionRegistry(),
                              secrets = CacheSecrets(), sink = NilSink[TelemetryEvent](),
                              trackedRoots = initTrackedRoots(sd, @[], sd))

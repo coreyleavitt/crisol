@@ -25,6 +25,12 @@ let projectRoot = currentSourcePath().parentDir.parentDir.parentDir
   # test is at tests/integration/; go up 2 -> project root
 let fixture = projectRoot / "tests" / "fixtures" / "pass_always.nim"
 
+proc builtBinary(outputBinPath: string): string =
+  ## The file the link wrote for `-o:outputBinPath`: on Windows the linker
+  ## appends `.exe` to an extensionless `/Fe` name (`runner`'s own
+  ## `binCompiled` handling); elsewhere the path itself.
+  addFileExt(outputBinPath, ExeExt)
+
 suite "runMeasured — real live compile (pass_always fixture)":
 
   test "compileOnly -> cc -> link all run for real, in order, with positive spans":
@@ -65,8 +71,8 @@ suite "runMeasured — real live compile (pass_always fixture)":
       if sawObjectFile: break
     check sawObjectFile
 
-    check fileExists(outputBinPath)
-    let (_, exitCode) = execCmdEx(outputBinPath)
+    check fileExists(builtBinary(outputBinPath))
+    let (_, exitCode) = execCmdEx(builtBinary(outputBinPath))
     check exitCode == 0   # pass_always.nim is literally `quit(0)`
 
     removeDir(workDir)
@@ -142,7 +148,7 @@ suite "newMeasureDriver — workingDir resolves a root-relative --path:src flag 
                             nimcacheDir, outputBinPath)
     check spans.ok
     check spans.errorMsg == ""
-    check fileExists(outputBinPath)
+    check fileExists(builtBinary(outputBinPath))
 
 when isMainModule:
   echo "All compiledriver real-compile tests passed."

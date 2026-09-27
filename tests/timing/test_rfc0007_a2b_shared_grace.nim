@@ -36,6 +36,7 @@ when defined(posix):
   import crisol/process/types as ptypes
   import "../support/testep"
   import "../support/statedir"
+  import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
   # R8-D3: this process's own crisol state dir -- never the repo root's shared
   # .crisol (or, before R8-D3, cwd-relative bin/ and cache/), which a concurrent
@@ -91,7 +92,7 @@ when defined(posix):
       # rfc-0007 code-review r7: `interruptedOut` ptr param is gone — read
       # `.interrupted`/`.results` off the returned ExecuteReport instead.
       let execReport = execute(p, config = cfg, graph = g,
-                               installSignals = true)
+                               installSignals = true, toolchain = unprobedToolchain())
       let interrupted = execReport.interrupted
       let results     = execReport.results
       let elapsed = getMonoTime() - t0

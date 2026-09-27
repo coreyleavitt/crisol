@@ -177,8 +177,8 @@ proc buildFixtureAndGraph(root: string; roots: TrackedRoots):
   let helperExcluded = fromCanonical("tests/unit/helper_excluded.nim", roots).get
 
   var graph = initDepGraph("")
-  graph.updateEntry(string(includedEp.tp.display()), flagHash(includedEp.flags), [helperIncluded].toHashSet)
-  graph.updateEntry(string(excludedEp.tp.display()), flagHash(excludedEp.flags), [helperExcluded].toHashSet)
+  graph.updateEntry(string(includedEp.tp.display()), flagHash(includedEp.flags), [helperIncluded].toHashSet, @[])
+  graph.updateEntry(string(excludedEp.tp.display()), flagHash(excludedEp.flags), [helperExcluded].toHashSet, @[])
   check saveDepGraph(graph, cfg)
 
   (cfg: cfg, included: includedEp.tp, excluded: excludedEp.tp)

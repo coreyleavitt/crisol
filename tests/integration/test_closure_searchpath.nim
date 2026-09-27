@@ -12,19 +12,20 @@
 ## This test drives a REAL compile through execute() with EXACTLY that
 ## amoxtli mechanism (a `tests/config.nims` adding `tests/` to the Nim
 ## search path), then asserts the closure records the search-path-resolved
-## file, and that narrow.selectByDiff actually selects the entrypoint on a
+## file, and that narrow.narrowByDiff actually selects the entrypoint on a
 ## change to it.
 ##
 ## Run with:
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_closure_searchpath.nim
 
-import std/[os, sets, tables, times, unittest, json, strutils]
+import std/[options, os, sets, tables, times, unittest, json, strutils]
 import crisol/[types, runner, depgraph, narrow, planner]
 import crisol/closure
 import "../support/rfc9_narrow_support"
 import "../support/testep"
 import ../support/symlinkprobe
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 proc hasDepNimCObjectSuffix(base: string): bool =
   ## True iff `base` is a nimcache `link` entry basename for the
@@ -50,7 +51,7 @@ proc makeCfg(root: string): Config =
   ## (closure.nim's `extractCompileInputs` -> `index.tracked`/`classify`),
   ## and are hashed via `closureHashInputs(inputs.files,
   ## config.trackedRoots)`, and several tests below separately build a
-  ## `TrackedRoots` (e.g. for `selectByDiff`) that must fold-agree with this
+  ## `TrackedRoots` (e.g. for `narrowByDiff`) that must fold-agree with this
   ## one (`TrackedPath.==` asserts on a same-rootTag/different-fold
   ## comparison) -- a vacuous root here would only accidentally not crash
   ## because this container's real probe also happens to answer fpNone.
@@ -102,9 +103,9 @@ switch("path", thisDir())
     let ep = testEp("tests/sub/test_uses_helper.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -119,14 +120,17 @@ switch("path", thisDir())
     check tp1("tests/sub/test_uses_helper.nim", cfg) in closure
 
     # (2) load-bearing consequence: a change to the search-path dep must
-    # select the entrypoint via selectByDiff.
+    # select the entrypoint through its closure (narrow rule 5,
+    # `depgraph.diffReach`), not a fallback: the entry is known and fresh.
     let roots = cfg.trackedRoots
     let changed = changedTp(roots, "tests/support/helper.nim")
-    let selection = selectByDiff(@[ep], changed, loaded, roots, root)
+    let selection = narrowByDiff(@[ep], changed, loaded, roots)
     check selection.len == 1
     if selection.len == 1:
-      check selection[0].ep.tp.display() == ep.tp.display()
-      check selection[0].reason == srClosureHit
+      check selection[0].tp.display() == ep.tp.display()
+    check not isEntryStale(loaded, key, roots)
+    let hit = diffReach(loaded.entries[key], changed, roots)
+    check hit.isSome and hit.get.kind == hkMember
 
 suite "closure records @p bodies with leading '..' (shortest-relative-path / realpath-canonicalized)":
 
@@ -155,9 +159,9 @@ doAssert xValue() == 5
     let ep = testEp("tests/unit/deep/t.nim", group = "default", flags = @["--path:" & (root / "src")])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     check results[0].outcome == oPassed
@@ -215,9 +219,9 @@ doAssert depValue() == 7
     let ep = testEp(epPath, group = "default", flags = @["--path:" & (root / "_deps" / "dep" / "src")])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -276,9 +280,9 @@ doAssert depValue() == 7
     let ep = testEp(epPath, group = "default", flags = @["--path:" & (root / "_deps" / "dep" / "src")])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -351,9 +355,9 @@ doAssert libValue() == 9
     let ep = testEp("tests/t.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -406,9 +410,9 @@ doAssert helperValue() == 11
     let ep = testEp("tests/t.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -427,7 +431,7 @@ doAssert helperValue() == 11
     check tp1("tests/helper.nim", cfg) notin closure
 
     # A stable, un-invalidated entry must not force a recompile next run.
-    let p2 = plan(cfg, @[ep], graph, nimVersion = "")
+    let p2 = plan(cfg, @[ep], graph)
     check p2.entrypoints[0].edecision == edRunFresh
 
 suite "closure resolves @m bodies through a symlinked entrypoint DIRECTORY via a real compile (case 2)":
@@ -461,9 +465,9 @@ doAssert fooValue() == 42
     let ep = testEp("a/b/tests/t.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -514,9 +518,9 @@ doAssert sibValue() == 7
     let ep = testEp("tests/t.nim", group = "default", flags = @[])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -531,7 +535,7 @@ doAssert sibValue() == 7
     check closure == toHashSet([tp1("tests/t.nim", cfg), tp1("tests/sib.nim", cfg), tp1("src/foo.nim", cfg)])
 
     # A stable, un-invalidated entry must not force a recompile next run.
-    let p2 = plan(cfg, @[ep], graph, nimVersion = "")
+    let p2 = plan(cfg, @[ep], graph)
     check p2.entrypoints[0].edecision == edRunFresh
 
 suite "closure records a dep reached through a dep-root symlink whose target sits under a pruned dot-dir inside projectRoot":
@@ -581,9 +585,9 @@ doAssert depValue() == 7
     let ep = testEp(epPath, group = "default", flags = @["--path:" & (root / "_deps" / "dep" / "src")])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:
@@ -640,9 +644,9 @@ doAssert depValue() == 7
     let ep = testEp(epPath, group = "default", flags = @["--path:" & (root / "_deps" / "dep" / "src")])
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, nimVersion = "")
+    let p = plan(cfg, @[ep], graph)
     let results = execute(p, config = cfg, graph = graph,
-                          nimVersion = "", showProgress = false).results
+                          nimVersion = "", showProgress = false, toolchain = unprobedToolchain()).results
 
     check results.len == 1
     if results[0].outcome != oPassed:

@@ -8,8 +8,7 @@
 ## Not a `test_*.nim` file, so crisol.nimble's self-discovering test task never
 ## tries to run it directly.
 
-import std/[os, osproc, strutils]
-import crisol/toolexec
+import std/[os, osproc, streams, strutils]
 
 proc compileFixtureWithSrc*(fixtureDir, cacheDir, name, outBin, srcDir: string) =
   ## Build `tests/fixtures/<name>.nim` with the package path on `--path`, which
@@ -38,4 +37,14 @@ proc runWithDeadline*(bin: string; args: seq[string]; ms: int):
     p.terminate()
     discard p.waitForExit()
     return (finished: false, line: "")
-  (finished: true, line: drainToEof(p.outputStream).strip())
+  # The child has exited, so every write end is closed and a zero-length
+  # read is genuine EOF. A local loop rather than `crisol/toolexec`: this
+  # harness is the independent check on that module, so it must not share it.
+  var output = ""
+  var buf = newString(4096)
+  let s = p.outputStream
+  while true:
+    let n = s.readData(addr buf[0], buf.len)
+    if n <= 0: break
+    output.add buf[0 ..< n]
+  (finished: true, line: output.strip())

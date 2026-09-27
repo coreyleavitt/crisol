@@ -1,10 +1,10 @@
-## tests/integration/test_r3_terminate_escalation.nim — R3-3 (code review
+## tests/integration/test_tool_terminate_escalation.nim — R3-3 (code review
 ## round 3, 2026-09-24): the tool deadline must survive a child that ignores
 ## SIGTERM.
 ##
 ## CR4 put a deadline on the tool-invocation capture layer, and round 3 proved
 ## the drain loops themselves are live (mutating their four `if left <= 0`
-## guards turns `test_cr4_tool_deadline.nim` red 3/3). The GIVE-UP path was not
+## guards turns `test_tool_capture_deadline.nim` red 3/3). The GIVE-UP path was not
 ## live. `toolexec.terminateAndReap` did `p.terminate()` and then an UNBOUNDED
 ## `p.waitForExit()`; on POSIX `terminate()` is SIGTERM alone, so a tool that
 ## ignores TERM — or one wedged in D-state — was waited on for its entire
@@ -14,10 +14,12 @@
 ## was written for (a `git` blocked on a credential prompt, in the host process
 ## before the Supervisor exists) that wait is unbounded in principle.
 ##
-## `terminateAndReap` now escalates on the SAME process — bounded wait,
-## `kill()` (SIGKILL / `TerminateProcess`, unignorable on both platforms),
-## bounded wait — which is NOT the process-TREE broadening that proc's doc
-## deliberately rules out.
+## `terminateAndReap` now escalates — bounded wait, SIGKILL (unignorable),
+## bounded wait. Since R3-12 a bounded run owns its process tree, so on this
+## path TERM and KILL go to the tool's process group (`killpg`), with the
+## single-process `terminate()`/`kill()` pair kept as the fallback when the
+## group could not be set up; `test_tool_tree_termination.nim` pins the
+## tree half.
 ##
 ## WHAT THIS ASSERTS. The fix has TWO independent halves, and this file pins
 ## both, because round 4 (R4-2) showed it pinned only one:
@@ -32,7 +34,8 @@
 ##
 ##   2. THE CHILD IS GONE. Bounding the waits alone caps elapsed time at ~14 s
 ##      on this path (10 s drain deadline + 2×2 s grace), so the `kill()` was
-##      DARK to (1): two reviewers replaced `p.kill()` with a no-op and the
+##      DARK to (1): two reviewers replaced `p.kill()` (now the group
+##      `killpg(..., SIGKILL)`) with a no-op and the
 ##      time assertion stayed green while `ps` showed the TERM-ignoring child
 ##      still alive, reparented to PID 1, with ~31 s of its sleep left. That
 ##      is exactly the guarantee `terminateAndReap`'s doc sells ("so a
@@ -42,17 +45,16 @@
 ##      test in the tree asserted it. So after `realRunMerged` returns we go
 ##      looking for the fixture process and require it to be absent.
 ##
-## WHAT "GONE" MEANS HERE, precisely. `terminateAndReap`'s second
-## `waitForExitDeadline` returns the moment `peekExitCode()` (i.e.
-## `waitpid(WNOHANG)`) reports a code, which is the same moment the child is
-## REAPED — so on the fixed path the child's `/proc` entry is already gone when
-## the call returns. No sleep, no retry loop, no polling: the ordering is a
-## consequence of `waitpid` having returned, not of luck. A ZOMBIE is
-## deliberately NOT what this hunts: an unreaped-but-dead child is the
-## documented D-state give-up path (see `terminateAndReap`'s last paragraph),
-## not the leak that matters, and it holds no CPU and no 45 s sleep. The
-## regression we are guarding against produces a fully ALIVE child, which is
-## what `/proc/<pid>/cmdline` sees (a zombie's `cmdline` is empty).
+## WHAT "GONE" MEANS HERE, precisely. `terminateAndReap` ends with the reap
+## (`peekExitCode()`, i.e. `waitpid(WNOHANG)`) once its bounded waits have
+## seen the child exit, so on the fixed path the child's `/proc` entry is
+## already gone when the call returns. No sleep, no retry loop, no polling:
+## the ordering is a consequence of `waitpid` having returned, not of luck. A
+## ZOMBIE is deliberately NOT what this file hunts: the regression guarded
+## here produces a fully ALIVE child, which is what `/proc/<pid>/cmdline`
+## sees (a zombie's `cmdline` is empty). The reap itself is pinned separately
+## (R5-19, `test_tool_tree_termination.nim`), by the `/proc/<pid>/stat` state
+## letter of the tool's own pid.
 ##
 ## WHAT THIS DEPENDS ON: Linux `/proc`, enumerated directly — no `ps`, no
 ## `pgrep`, nothing outside the process's own PID namespace. That dependency is
@@ -91,28 +93,13 @@ when defined(posix):
       ## Duplicated from the fixture because Nim fixtures are separate
       ## programs; the `static: doAssert` below is what keeps the relationship
       ## between the two numbers honest.
-    WorstCaseMs = 2 * ToolProbeTimeoutMs + 2 * TerminateGraceMs
-      ## R4-L3: the TRUE composite worst case of one `runViaOsproc` probe, and
-      ## computed from the two production constants rather than restated as a
-      ## literal (R4-L2 — the old `25_000` carried its derivation only in a
-      ## comment, so either constant could move without the assertion
-      ## noticing). Derivation, which is NOT the "drain deadline plus two grace
-      ## periods" (~14 s) `TerminateGraceMs`'s doc used to claim:
-      ##   - `drainToEofDeadline` can burn the full `ToolProbeTimeoutMs` and
-      ##     then leave via an ERROR path with `timedOut = false` (`poll`
-      ##     returning < 0 with errno != EINTR on POSIX; `peekNamedPipe` == 0
-      ##     on Windows), so `runViaOsproc` does not give up there;         10 s
-      ##   - it then calls `waitForExitDeadline` with the FULL
-      ##     `ToolProbeTimeoutMs` again (`toolrun.nim`'s `waitTimedOut` arm);  10 s
-      ##   - which, on timing out, calls `terminateAndReap`:
-      ##     grace, `kill()`, grace.                                        2×2 s
-      ## THIS test drives the shorter of the two paths — the drain times out,
-      ## so `terminateAndReap` runs immediately (10 s + 2×2 s ≈ 12-14 s
-      ## observed) — but the ceiling is sized on the real bound anyway,
-      ## because asserting 22.5 s against a legitimate 24 s worst case is a
-      ## flake waiting for a slow runner (the old `ChildLifetimeMs div 2`
-      ## check, R4-L1: it was also strictly tighter than `CeilingMs`, which
-      ## made that bound dead and the diagnostic below unreachable).
+    WorstCaseMs = ToolProbeTimeoutMs + 2 * TerminateGraceMs
+      ## The worst case of one `toolrun` run, computed from the two production
+      ## constants rather than restated as a literal (R4-L2): the drain and
+      ## the exit wait share ONE `ToolProbeTimeoutMs` budget, and every
+      ## ending but a clean exit then runs `terminateAndReap` -- grace,
+      ## `kill()`, grace. A capture that fails part-way ends the run at once
+      ## (`reIoError`) instead of falling through to a second full wait.
     SlackMs = 6_000
       ## Headroom for a loaded CI runner on top of the derived bound. The
       ## signal this test carries is "~bound, not ~45 s", so the slack is
@@ -195,7 +182,7 @@ when defined(posix):
       ## ignored, then SIGKILL after the grace period.
       let before = procsRunning(ignoresTermBin)
       let t0 = getMonoTime()
-      let (output, ok) = realRunMerged(ignoresTermBin, [])
+      let r = realRunMerged(ignoresTermBin, [])
       let elapsedMs = (getMonoTime() - t0).inMilliseconds
       let survivors = procsRunning(ignoresTermBin)
 
@@ -205,7 +192,7 @@ when defined(posix):
              "ms slack) childLifetime=", ChildLifetimeMs,
              "ms — the wait is not bounded"
 
-      check not ok                     # the probe still fails honestly
+      check r.ending == reTimedOut    # the probe still fails honestly
       check elapsedMs < CeilingMs
 
       # R4-2: the OTHER half of the fix. `terminateAndReap` escalates to
@@ -225,16 +212,14 @@ when defined(posix):
                    "from this call).")
       check survivors.len == 0
 
-      # Output is EMPTY on the give-up path, even though the fixture printed a
-      # plausible banner before ignoring TERM — and that is deliberate, not a
-      # second defect. `drainToEofDeadline` does return what it captured (for
-      # diagnostics), but `runViaOsproc` drops it when `timedOut`, which
-      # `test_cr4_tool_deadline.nim` already pins as `outLen=0`. It matters for
-      # soundness: a partial banner from a tool that never finished answering
-      # must never reach `versionLine`, or a truncated line becomes a
-      # "compiler identity" — the exact class R3-1 closed on the fold path.
-      check output.len == 0
+      # No output reaches the caller on the give-up path, even though the
+      # fixture printed a plausible banner before ignoring TERM: a
+      # `reTimedOut` result has no `output` field at all. A partial banner
+      # from a tool that never finished answering must never reach
+      # `versionLine`, or a truncated line becomes a "compiler identity" --
+      # the class R3-1 closed on the fold path.
+      check not r.ok
 
 else:
-  echo "CRISOL-SKIP: tests/integration/test_r3_terminate_escalation.nim"
+  echo "CRISOL-SKIP: tests/integration/test_tool_terminate_escalation.nim"
   echo "  (R3-3 escalation is POSIX-only: TerminateProcess cannot be ignored)"

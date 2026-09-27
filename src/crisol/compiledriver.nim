@@ -1,7 +1,8 @@
 ## compiledriver.nim — RFC-0006 M-driver: split-compile MEASUREMENT driver.
 ##
 ## crisol compiles each entrypoint as one opaque `nim c ... -o:<bin> <ep>`
-## (runner.nim's `spawnCompileStable` builds it via `nimCompileArgs`, below,
+## (runner.nim's `spawnCompileStable` builds it via `nimCompileArgs`, from
+## `crisol/nimargv` and re-exported here,
 ## and hands it to the Supervisor as the slot's compile child).
 ## That hides the codegen/cc/link cost split RFC-0006's Stage M needs to
 ## report `cc%` and per-unit cc wall-time (the inputs to the whole
@@ -29,9 +30,10 @@
 ##
 ## ## The CompileDriver seam
 ##
-## Every effectful step is an injectable proc field, mirroring ccprobe.nim's
-## `RunProc` idiom: the seam never raises, failure surfaces via an `ok` flag,
-## and tests inject synthetic procs so the span-accounting/orchestration logic
+## Every effectful step is an injectable proc field, mirroring toolrun.nim's
+## `RunProc` idiom: the seam never raises, and the two captured steps return
+## `toolexec.RunResult` (the cc phase, whose output goes to the terminal,
+## reports per-unit `ok` flags); tests inject synthetic procs so the span-accounting/orchestration logic
 ## in `runMeasured` is exercised without a slow real `nim c` invocation.
 ## `newMeasureDriver` builds the real MEASURE-mode seam.
 ##
@@ -61,16 +63,11 @@
 ## failure still reports real codegen/cc spans).
 
 import std/[monotimes, os, osproc, sequtils, tables, times]  # process-contract-exempt: measure-mode realCompileOnly/cc/link, aligned at A2c — not the entrypoint compile/run children (RFC-0007 §Scope)
-# NOTE (R4-6): std/streams is deliberately NOT imported here. `p.outputStream`
-# is osproc's own accessor and the returned `Stream` is only ever handed
-# straight to `toolexec.drainToEof`, which is where the streams API is
-# actually called — this module names no `streams` symbol of its own, in any
-# branch (it has no `when defined(...)` code at all). Keeping the import made
-# `nim check --warningAsError:UnusedImport:on` fail, which is fatal for
-# consumers that build with that flag (amoxtli does); the gate that now
-# enforces this lives in `./dev check` and in ci.yml's src/ soundness step.
-import crisol/toolexec  # drainBoth/drainToEof -- the capture primitives (issue #22)
+import crisol/toolexec  # runTool and its RunResult -- spawn and capture (issue #22)
+export RunEnd, RunResult, ran, notRun, ok, describe
 import crisol/closure
+import crisol/nimargv  # nimCompileArgs -- the one `nim c` argv builder, shared with ccidentity
+export nimargv
 
 # ---------------------------------------------------------------------------
 # Seam types
@@ -79,7 +76,7 @@ import crisol/closure
 type
   CompileOnlyProc* = proc(entrypoint: string; flags: seq[string];
                           nimcacheDir, outputBinPath: string):
-                            tuple[ok: bool; output: string] {.closure.}
+                            RunResult {.closure.}
     ## Runs codegen only. Real impl (`realCompileOnly`): argv-array spawn, no
     ## shell — the same `nimCompileArgs` argv runner.nim's
     ## `spawnCompileStable` uses for the real compile, plus `--compileOnly`.
@@ -105,7 +102,7 @@ type
     ## Runs every unit's cc command. Real measure-mode impl (`defaultRunCc`,
     ## below): never caches.
 
-  LinkProc* = proc(linkCmd: string): tuple[ok: bool; output: string] {.closure.}
+  LinkProc* = proc(linkCmd: string): RunResult {.closure.}
     ## Runs the manifest's `linkcmd`. Real impl (`realLink`): shell-evaluates
     ## the string (matches Nim's own `execLinkCmd`, which also shell-invokes it).
 
@@ -129,82 +126,20 @@ type
 # Real (measure-mode) seam implementations
 # ---------------------------------------------------------------------------
 
-proc nimCompileArgs*(entrypoint: string; flags: seq[string];
-                     nimcacheDir, outputBinPath: string;
-                     compileOnly = false): seq[string] =
-  ## Assembles the argv AFTER the `nim` executable for one entrypoint
-  ## compile. This is the SINGLE place `nim c` argv is assembled across
-  ## BOTH of crisol's compile paths: `runner.nim`'s monolithic production
-  ## path (`monolithicCompArgs`) and this module's measure-mode
-  ## compile-only path (`realCompileOnly`, below).
-  ##
-  ## Always injects `-d:nimBetterRun`. That define makes the compiler write
-  ## a `depfiles` array into the nimcache manifest
-  ## (`<nimcacheDir>/<binaryName>.json`) — `[[absPath, hash], ...]` for
-  ## EVERY file `conf.m.fileInfos` records: the main module, every import,
-  ## every `include`d file, every `staticRead`/`slurp` target, and
-  ## `nim.cfg`/`config.nims` (`compiler/extccomp.nim`
-  ## `writeJsonBuildInstructions`, gated on `optRun in conf.globalOptions or
-  ## isDefined(conf, "nimBetterRun")`). `closure.extractClosure` unions
-  ## `depfiles` into the source closure (issue #11): without this define,
-  ## an `include`d file, a `staticRead`/`slurp` input, or a config file is
-  ## invisible to crisol — it neither triggers a recompile
-  ## (`planner.decideCompile`'s closure content hash only covers closure
-  ## files) nor gets selected under `--changed` (`narrow.selectByDiff`
-  ## intersects the git diff with the closure).
-  ##
-  ## The define has one other compiler effect: it also gates Nim's own
-  ## "nothing changed, skip the whole compile" short-circuit
-  ## (`compiler/main.nim` `commandCompileToC` ->
-  ## `changeDetectedViaJsonBuildInstructions`). That short-circuit cannot
-  ## fire in crisol's flow regardless of the define: it additionally
-  ## requires the `-o:` output binary to still exist at the same path, and
-  ## crisol's runner removes any pre-existing `-o:` target immediately
-  ## before spawning the compiler (`runner.spawnCompileStable`) and deletes
-  ## the per-slot scratch bin dir after copying the produced binary out to
-  ## its stable location — so the precondition is false by construction.
-  ## This matters: Nim's change detection covers `depfiles` but NOT
-  ## `{.compile.}`d C sources, so an accidental short-circuit after a C
-  ## edit would serve a stale binary. (`--compileOnly` never produces the
-  ## `-o:` target, so the measure path is unaffected either way.)
-  ##
-  ## Deliberately NOT folded into `Entrypoint.flags`: it is an
-  ## implementation-detail define crisol injects on every compile, not a
-  ## user- or config-supplied flag, so entrypoint identity
-  ## (`planner.slug`/`flagHash`) is unaffected by its presence.
-  result = @["c", "--mm:orc", "--hints:off"]
-  if compileOnly:
-    result.add "--compileOnly"
-  result.add "--nimcache:" & nimcacheDir
-  result.add "-o:" & outputBinPath
-  result.add "-d:nimBetterRun"
-  for f in flags:
-    result.add f
-  result.add entrypoint
-
 proc runCompileOnly(entrypoint: string; flags: seq[string];
-                    nimcacheDir, outputBinPath, workingDir: string):
-                      tuple[ok: bool; output: string] =
+                    nimcacheDir, outputBinPath, workingDir: string): RunResult =
   ## Shared body for `realCompileOnly`/`realCompileOnlyIn`. Spawns
   ## `nim <nimCompileArgs(..., compileOnly = true)>` via an argv array (no
   ## shell), with `workingDir` as the subprocess's cwd (`"" ` = inherit the
-  ## calling process's own cwd, osproc's own default). Never raises; failure
-  ## surfaces as `ok = false`.
+  ## calling process's own cwd, osproc's own default), stdout and stderr
+  ## merged. Never raises.
   let args = nimCompileArgs(entrypoint, flags, nimcacheDir, outputBinPath,
                             compileOnly = true)
-  try:
-    let p = startProcess("nim", workingDir = workingDir, args = args,
-                         options = {poUsePath, poStdErrToStdOut})
-    defer: p.close()
-    let output = drainToEof(p.outputStream)
-    let exitCode = p.waitForExit()
-    result = (ok: exitCode == 0, output: output)
-  except CatchableError as e:
-    result = (ok: false, output: "nim --compileOnly spawn failed: " & e.msg)
+  runTool("nim", args, workingDir, {poUsePath, poStdErrToStdOut}, "",
+          NoDeadline, MaxToolOutputBytes)
 
 proc realCompileOnly*(entrypoint: string; flags: seq[string];
-                      nimcacheDir, outputBinPath: string):
-                        tuple[ok: bool; output: string] =
+                      nimcacheDir, outputBinPath: string): RunResult =
   ## Spawns `nim <nimCompileArgs(..., compileOnly = true)>`, inheriting the
   ## calling process's own cwd. See `runCompileOnly` for the shared contract.
   runCompileOnly(entrypoint, flags, nimcacheDir, outputBinPath, "")
@@ -222,8 +157,7 @@ proc realCompileOnlyIn*(workingDir: string): CompileOnlyProc =
   ## `test_compiledriver_real.nim` does) with no chdir happening anywhere
   ## in its call chain.
   proc compileOnly(entrypoint: string; flags: seq[string];
-                   nimcacheDir, outputBinPath: string):
-                     tuple[ok: bool; output: string] =
+                   nimcacheDir, outputBinPath: string): RunResult =
     runCompileOnly(entrypoint, flags, nimcacheDir, outputBinPath, workingDir)
   compileOnly
 
@@ -287,18 +221,19 @@ proc defaultRunCc*(units: seq[CompileUnit];
   result.ok = allOk
   result.ccSpanUs = (spanEnd - spanStart).inMicroseconds
 
-proc realLink*(linkCmd: string): tuple[ok: bool; output: string] =
+proc realLink*(linkCmd: string): RunResult =
   ## Shell-evaluates the manifest's `linkcmd` string (matches Nim's own
-  ## `execLinkCmd` -> `execExternalProgram`, which also shell-invokes it).
-  ## Never raises; failure surfaces as `ok = false`.
-  try:
-    let p = startProcess(linkCmd, options = {poEvalCommand, poStdErrToStdOut, poUsePath})
-    defer: p.close()
-    let output = drainToEof(p.outputStream)
-    let exitCode = p.waitForExit()
-    result = (ok: exitCode == 0, output: output)
-  except CatchableError as e:
-    result = (ok: false, output: "link spawn failed: " & e.msg)
+  ## `execLinkCmd` -> `execExternalProgram`, which also shell-invokes it),
+  ## stdout and stderr merged. Never raises.
+  runTool(linkCmd, [], "", {poEvalCommand, poStdErrToStdOut, poUsePath}, "",
+          NoDeadline, MaxToolOutputBytes)
+
+proc failureText(r: RunResult): string =
+  ## What a failed captured step says: the tool's own output when it ran to
+  ## an exit, otherwise why there is none.
+  case r.ending
+  of reExited: r.output
+  of reNotStarted, reTimedOut, reIoError, reOverflow, reInterrupted: describe(r)
 
 proc newMeasureDriver*(concurrency: int = countProcessors();
                        workingDir: string = ""): CompileDriver =
@@ -330,10 +265,10 @@ proc runMeasured*(driver: CompileDriver; entrypoint: string; flags: seq[string];
   let binName = outputBinPath.extractFilename
 
   let t0 = getMonoTime()
-  let (coOk, coOut) = driver.compileOnly(entrypoint, flags, nimcacheDir, outputBinPath)
+  let co = driver.compileOnly(entrypoint, flags, nimcacheDir, outputBinPath)
   let t1 = getMonoTime()
-  if not coOk:
-    return CompileSpans(ok: false, errorMsg: "compileOnly failed: " & coOut)
+  if not co.ok:
+    return CompileSpans(ok: false, errorMsg: "compileOnly failed: " & failureText(co))
 
   let jsonPath = nimcacheDir / binName & ".json"
   let manifest = parseCompileManifest(jsonPath)   # raises CrisolError on bad JSON
@@ -349,14 +284,14 @@ proc runMeasured*(driver: CompileDriver; entrypoint: string; flags: seq[string];
     return result
 
   let t2 = getMonoTime()
-  let (linkOk, linkOut) = driver.link(manifest.linkcmd)
+  let linked = driver.link(manifest.linkcmd)
   let t3 = getMonoTime()
 
-  result = CompileSpans(ok: linkOk)
+  result = CompileSpans(ok: linked.ok)
   result.codegenSpanUs = (t1 - t0).inMicroseconds
   result.ccSpanUs      = ccResult.ccSpanUs
   for u in ccResult.units: result.ccUnitTimesUs[u.basename] = u.ccTimeUs
-  if not linkOk:
-    result.errorMsg = "link failed: " & linkOut
+  if not linked.ok:
+    result.errorMsg = "link failed: " & failureText(linked)
   else:
     result.linkSpanUs = (t3 - t2).inMicroseconds

@@ -22,6 +22,7 @@ import crisol/runner
 import crisol/ledger
 import crisol/keys
 import "../support/testep"
+import "../support/driversite"  # R12-D4: execute/verifyCachePass take a RunToolchain
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,10 +65,10 @@ suite "B3a — execute(recordLedger).results ledger knob":
     let sd  = stateDirOf(cfg)
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, "", false)
+    let p = plan(cfg, @[ep], graph, false)
 
     discard execute(p, config = cfg, graph = graph, nimVersion = "",
-                    showProgress = false)
+                    showProgress = false, toolchain = unprobedToolchain())
 
     let ident = identityKey(ep.tp, cfg.trackedRoots, flagHash(ep.flags))
     let rows = scanLedger(sd, ident)
@@ -83,10 +84,10 @@ suite "B3a — execute(recordLedger).results ledger knob":
     let sd  = stateDirOf(cfg)
 
     var graph = initDepGraph("")
-    let p = plan(cfg, @[ep], graph, "", false)
+    let p = plan(cfg, @[ep], graph, false)
 
     let results = execute(p, config = cfg, graph = graph, nimVersion = "",
-                          showProgress = false, recordLedger = false).results
+                          showProgress = false, recordLedger = false, toolchain = unprobedToolchain()).results
     check results.len == 1
     check results[0].outcome == oPassed  # the run itself is unaffected
 
@@ -108,15 +109,15 @@ suite "B3a — execute(recordLedger).results ledger knob":
     let ident = identityKey(ep.tp, cfg.trackedRoots, flagHash(ep.flags))
 
     var graph = initDepGraph("")
-    let p1 = plan(cfg, @[ep], graph, "", false)
+    let p1 = plan(cfg, @[ep], graph, false)
     discard execute(p1, config = cfg, graph = graph, nimVersion = "",
-                    showProgress = false)  # recordLedger default true → 1 row
+                    showProgress = false, toolchain = unprobedToolchain())  # recordLedger default true → 1 row
     check scanLedger(sd, ident).len == 1
 
     # Second call, same plan (now cdSkipFresh), recordLedger = false.
-    let p2 = plan(cfg, @[ep], graph, "", false)
+    let p2 = plan(cfg, @[ep], graph, false)
     discard execute(p2, config = cfg, graph = graph, nimVersion = "",
-                    showProgress = false, recordLedger = false)
+                    showProgress = false, recordLedger = false, toolchain = unprobedToolchain())
     check scanLedger(sd, ident).len == 1  # still just the first row
 
 echo "test_b3a_ledger_knob: OK"

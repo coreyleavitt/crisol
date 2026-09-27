@@ -297,7 +297,7 @@ Key types in `crisol/api`:
 
 `runTests` never raises for expected conditions (structural problems are encoded in `RunReport.status`/`.error`/`.exitCode`). `planTests` raises `CrisolError` on structural problems.
 
-**Interrupts (SIGINT/SIGTERM).** An interrupt never raises either — there is no `CrisolInterrupted` exception. Signal handling is opt-in: with `RunOptions(installSignals: true)` the run's own supervisor installs SIGINT/SIGTERM handlers for the duration of the call (the library default is `false`, so a host application's handlers are left alone). On an interrupt, `runTests` returns normally with `.status == rsInterrupted`, `.interrupted == true`, and `.exitCode == 128 + n` (RFC-0003); `.results`/`.summary` carry the honest partial set — every entrypoint that ran to completion plus those killed at shutdown (reported `oKilled`, cause "runner interrupt"); entrypoints that never started are omitted and counted in `.summary.notStarted` — and `lastrun.json` is not persisted for that run. `crisol/signals`' `shutdownRequested(): Option[ShutdownSignal]` lets code anywhere in the process observe whether some `installSignals: true` run has seen a shutdown signal (sticky; carries the real signum).
+**Interrupts (SIGINT/SIGTERM).** An interrupt never raises either — there is no `CrisolInterrupted` exception. Signal handling is opt-in: with `RunOptions(installSignals: true)` crisol installs SIGINT/SIGTERM handlers (a console Ctrl-C/Ctrl-Break on Windows) from the call's first act until it returns, then puts the host's own handlers back (the library default is `false`, so a host application's handlers are left alone). A signal that lands at any point of the call, planning through reporting, is reported as below; it is never re-raised to the host's handler. A repeated signal is the exception: with no test running the second signal (with tests running the third; the second force-kills them) kills crisol's live tools and ends the host process at once with exit code 128 + the signal, so a host that must never exit this way leaves `installSignals` off. On an interrupt, `runTests` returns normally with `.status == rsInterrupted`, `.interrupted == true`, and `.exitCode == 128 + n` (RFC-0003); `.results`/`.summary` carry the honest partial set — every entrypoint that ran to completion plus those killed at shutdown (reported `oKilled`, cause "runner interrupt"); entrypoints that never started are omitted and counted in `.summary.notStarted` — and `lastrun.json` is normally not persisted for that run (a signal that lands after it was written leaves it in place). The interrupt belongs to the call: a later `runTests` in the same process starts with no interrupt pending.
 
 The schema-version constants for the JSON documents are exported from `crisol/api`:
 
@@ -380,6 +380,20 @@ absolute (`--noAbsolutePaths`). Not tracked by design: `gorge` (a shell
 command, not a file) and headers outside every tracked root (system and
 toolchain headers — a toolchain change is keyed by the nimcache's toolchain
 fingerprint, not by the closure).
+
+Symlinks a closure member was reached through are part of its identity:
+repointing one recompiles the entrypoint, including a link inside a
+dot-directory or a `nimcache` directory, and so does replacing a directory
+on a member's path with a link. The compiler records only the
+resolved path, so crisol finds these links by walking the tracked roots.
+Under `--changed`, a link the diff names selects every entrypoint reached
+through it, as does a changed directory above a closure member (a
+submodule replaced by a link); a changed link no entrypoint crosses
+selects nothing. A
+link that lives outside every tracked root (an import through
+`../farm/vend -> proj/libs/a`, or a `--path` into such a directory) cannot be
+seen: repointing it is invisible, exactly like any other change outside the
+tracked roots. Declare that directory as a `dep-roots` entry to track it.
 
 ## Development
 

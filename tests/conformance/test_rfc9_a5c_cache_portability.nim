@@ -20,7 +20,7 @@
 ##
 ## Fixture:
 ##   D  — a real directory, NEVER nested under the project (`src/depmod.nim`).
-##   P1 — project v1. `P1/_deps/thedep` is a SYMLINK to `D` (R3-14: exercises
+##   P1 — project v1. `P1/_deps/thedep` is a DIR LINK to `D` (R3-14: exercises
 ##        `NativeRoot.realAbs`'s under-selection fix end to end, not just
 ##        unit-tested — negative control 2, below). `crisol.kdl` configures
 ##        `dep-roots "_deps/thedep" name="thedep"` and a matching
@@ -41,7 +41,7 @@
 ##
 ## RUN 1 (P1, cold): stores exactly one local cache entry.
 ## RELOCATE: P1 is torn down; P2 is built fresh at a DIFFERENT absolute
-##   path, with the SAME relative structure/content and a FRESH symlink at
+##   path, with the SAME relative structure/content and a FRESH dir link at
 ##   `P2/_deps/thedep` pointing at the SAME `D` — so the dep root's
 ##   CONFIGURED (lexical) absolute spelling genuinely differs between runs
 ##   (negative control 1), while its logical identity (name "thedep", rel
@@ -49,11 +49,24 @@
 ## RUN 2 (P2, same CRISOL_STATE_DIR): must show `l1Hits == 1`, `misses ==
 ##   0`, and the cache directory must still hold exactly ONE stored entry
 ##   (reused, not a second one appended).
+##
+## The dir link (tests/support/dirlink.nim) is a symlink on POSIX and a
+## directory JUNCTION on Windows (R10-L1, issue #21). A Windows directory
+## symlink needs SeCreateSymbolicLinkPrivilege, which neither windows-latest
+## nor the MSVC container's ContainerAdministrator holds, so a symlink
+## fixture could only ever self-skip there. A junction needs no privilege and
+## exercises the SAME property: the fixture needs an alias whose realpath
+## differs from its lexical spelling, and crisol's Windows realpath
+## (`safeExpandFilename` -> GetFinalPathNameByHandleW) resolves a junction
+## exactly as it resolves a symlink. So there is no self-skip: this test runs
+## its real body on every leg, and a link-creation failure is a FAILURE.
 
 import std/[os, strutils, unittest]
 import crisol/api
 import crisol/types
 import crisol/resultcache  # cacheVersionDirAt
+import crisol/paths        # safeExpandFilename — crisol's own realpath
+import "../support/dirlink"
 
 const DepModBody = "proc depVal*(): int = 7\n"
 
@@ -69,15 +82,28 @@ proc kdlFor(depRootRel: string): string =
   "    globs \"tests/unit/test_*.nim\"\n" &
   "}\n"
 
-proc buildProject(root, depRootAbs: string) =
-  ## Lays out a fresh project tree at `root`, with `_deps/thedep` symlinked
-  ## to `depRootAbs`.
+proc realOf(p: string): string =
+  ## crisol's realpath (the primitive `NativeRoot.realAbs` is built from),
+  ## forward-slash normalized. `expandFilename` would be wrong here: on
+  ## Windows it is GetFullPathNameW, purely lexical, and never follows a
+  ## reparse point.
+  safeExpandFilename(p).replace('\\', '/')
+
+proc teardownProject(root: string) =
+  ## Unlinks the dep-root dir link BEFORE removing the tree: `removeDir`
+  ## cannot unlink a Windows junction (see tests/support/dirlink.nim).
+  removeDirLink(root / "_deps" / "thedep")
   removeDir(root)
+
+proc buildProject(root, depRootAbs: string) =
+  ## Lays out a fresh project tree at `root`, with `_deps/thedep` a dir link
+  ## (symlink on POSIX, junction on Windows) to `depRootAbs`.
+  teardownProject(root)
   createDir(root / "tests" / "unit")
   writeFile(root / "crisol.kdl", kdlFor("_deps/thedep"))
   writeFile(root / "tests" / "unit" / "test_uses_dep.nim", EntrypointBody)
   createDir(root / "_deps")
-  createSymlink(depRootAbs, root / "_deps" / "thedep")
+  createDirLink(depRootAbs, root / "_deps" / "thedep")
 
 proc countStoredEntries(cacheRoot: string): int =
   ## Mirrors `cachelocalfs.countEntries`/`resultcache.countCacheEntries`
@@ -104,42 +130,31 @@ suite "RFC-0009 A5c — cache-portability E2E (depRoot member, relocated tree)":
     writeFile(d / "src" / "depmod.nim", DepModBody)
     createDir(sharedStateDir)
 
-    # Same convention as test_closure_a4a.nim: a symlink-privilege probe,
-    # not a volume/fold probe (this test is otherwise fold-independent — no
-    # CRISOL_EXPECT_FOLD, no volume-skip guard). Degrades gracefully only
-    # on an environment that cannot create symlinks at all (e.g. a locked-
-    # down Windows runner without SeCreateSymbolicLinkPrivilege) — never on
-    # case (in)sensitivity, which this test does not depend on.
-    let probeLink = base / "symlink_probe"
-    try:
-      createSymlink(d, probeLink)
-      removeFile(probeLink)
-    except OSError as e:
-      echo "SKIP test_rfc9_a5c_cache_portability: symlink creation failed " &
-           "in this environment: " & e.msg
-      # A failed createSymlink can leave a partial reparse-point stub that a
-      # privilege-less Windows runner cannot delete; the skip must not turn a
-      # tidy-up failure into a red leg, so cleanup here is best-effort.
-      try: removeDir(base)
-      except CatchableError: discard
-      quit(0)
-
     putEnv("CRISOL_STATE_DIR", sharedStateDir)
     defer:
       delEnv("CRISOL_STATE_DIR")
+      try: removeDirLink(p1 / "_deps" / "thedep")
+      except CatchableError: discard
+      try: removeDirLink(p2 / "_deps" / "thedep")
+      except CatchableError: discard
       removeDir(base)
 
-    # --- RUN 1: P1, symlinked dep root -> D -----------------------------
+    # --- RUN 1: P1, dir-linked dep root -> D ----------------------------
     buildProject(p1, d)
 
     let p1DepRootLexical = p1 / "_deps" / "thedep"
     # Negative control 2 (realAbs != lexical prefix): the configured dep
-    # root is a REAL symlink -- its realpath resolves to D, genuinely
+    # root is a REAL alias -- its realpath resolves to D, genuinely
     # different from its own lexical, configured spelling. Proves
     # `NativeRoot.realAbs`'s fix (RFC-0009 A4a) is exercised END TO END by
-    # this very fixture, not merely by a unit test.
-    check expandFilename(p1DepRootLexical) != p1DepRootLexical.absolutePath.normalizedPath
-    check expandFilename(p1DepRootLexical) == expandFilename(d)
+    # this very fixture, not merely by a unit test. The "differs" side is
+    # measured against the realpath of the link's PARENT plus its own leaf,
+    # so a realpath that merely rewrites the temp-dir prefix (macOS
+    # /var -> /private/var, a Windows 8.3 RUNNER~1 component, separator
+    # style) cannot satisfy it — only the link itself being resolved can.
+    check realOf(p1DepRootLexical) != realOf(p1DepRootLexical.parentDir) & "/thedep"
+    check realOf(p1DepRootLexical) == realOf(d)
+    echo "RFC9-A5C ALIAS " & (when defined(windows): "junction" else: "symlink")
 
     let rr1 = runTests(RunOptions(configPath: p1 / "crisol.kdl", jobs: 1,
                                   cacheStats: true))
@@ -154,7 +169,7 @@ suite "RFC-0009 A5c — cache-portability E2E (depRoot member, relocated tree)":
 
     # --- RELOCATE: tear down P1, build P2 elsewhere, SAME dep content ---
     let p2DepRootLexical = p2 / "_deps" / "thedep"
-    removeDir(p1)
+    teardownProject(p1)
     buildProject(p2, d)
 
     # Negative control 1: the two runs' raw native dep-root spellings
@@ -163,8 +178,8 @@ suite "RFC-0009 A5c — cache-portability E2E (depRoot member, relocated tree)":
     # key (RFC-0009 A5a) explains it.
     check p1DepRootLexical.absolutePath.normalizedPath !=
           p2DepRootLexical.absolutePath.normalizedPath
-    check expandFilename(p2DepRootLexical) != p2DepRootLexical.absolutePath.normalizedPath
-    check expandFilename(p2DepRootLexical) == expandFilename(d)
+    check realOf(p2DepRootLexical) != realOf(p2DepRootLexical.parentDir) & "/thedep"
+    check realOf(p2DepRootLexical) == realOf(d)
 
     # --- RUN 2: P2, same CRISOL_STATE_DIR --------------------------------
     let rr2 = runTests(RunOptions(configPath: p2 / "crisol.kdl", jobs: 1,
@@ -178,4 +193,4 @@ suite "RFC-0009 A5c — cache-portability E2E (depRoot member, relocated tree)":
     # Reused, not appended: still exactly one stored entry.
     check countStoredEntries(cacheRoot) == 1
 
-    removeDir(p2)
+    teardownProject(p2)

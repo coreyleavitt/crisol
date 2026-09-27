@@ -58,7 +58,6 @@ suite "aggregateCacheStats — decision-sourced counts":
     let decisions: seq[DecisionTier] = @[
       (cdmHit, "l1"), (cdmStored, ""), (cdmKeyMiss, ""), (cdmHermeticityDeg, ""),
       (cdmFlaky, ""), (cdmClosureUnrecorded, ""), (cdmRecomputeMiss, ""),
-      (cdmToolchainUnidentified, ""),  # W4 full fix: consulted, refused to store
     ]
     let s = aggregateCacheStats(@[], decisions)
     check s.total == decisions.len
@@ -67,11 +66,14 @@ suite "aggregateCacheStats — decision-sourced counts":
     check s.misses == decisions.len - 1   # everything but the one cdmHit
 
   test "every notConsulted decision variant is excluded from total":
+    ## cdmToolchainUnidentified / cdmRootsDegraded: a run-level cause turned
+    ## the cache off (R9-D3, R10-D5), so nothing was consulted.
     let decisions: seq[DecisionTier] =
-      @[(cdmNotEligible, ""), (cdmGroupOptOut, ""), (cdmPolicyDisabled, "")]
+      @[(cdmNotEligible, ""), (cdmGroupOptOut, ""), (cdmPolicyDisabled, ""),
+        (cdmToolchainUnidentified, ""), (cdmRootsDegraded, "")]
     let s = aggregateCacheStats(@[], decisions)
     check s.total == 0
-    check s.notConsulted == 3
+    check s.notConsulted == 5
     check s.hitPct == 0.0   # zero consulted -> 0, not NaN
 
 suite "aggregateCacheStats — RFC-0005 C-dep rider: tier-granular l1Hits/remoteHits":

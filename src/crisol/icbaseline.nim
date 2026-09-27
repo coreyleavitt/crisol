@@ -18,7 +18,7 @@
 ##
 ## The actual `nim` invocation is an injectable closure so unit tests never
 ## spawn a real compiler: they inject a fake `IcRunProc` that returns
-## canned `(exitCode, output)` pairs and assert on `probeIncremental`'s pure
+## canned `toolexec.RunResult`s and assert on `probeIncremental`'s pure
 ## classification logic. `realIcRun` is the real argv-spawn default, used
 ## only by the integration test that exercises the actual toolchain.
 ##
@@ -52,25 +52,19 @@
 ## `--mm:orc --incremental`, captured in `errorMsg`.
 
 import std/[monotimes, os, osproc, strutils, times]  # process-contract-exempt: icbaseline is a short-lived tool invocation, not a compile/run child (RFC-0007 §Scope)
-# R4-6 (round-4 review, 2026-09-24): `streams` was dropped here. The only
-# stream contact is `drainToEof(p.outputStream)` below, where `outputStream`
-# is osproc's own accessor and `toolexec.drainToEof` is what calls the streams
-# API -- so the import was dead on BOTH platforms (this file has no
-# `when defined` branch to hide a use in). It was the last unused import in
-# `src/` repo-wide, which is what let `icbaseline` join the source-soundness
-# gate in `dev` and `ci.yml` instead of being excluded from it.
-import crisol/toolexec  # drainBoth/drainToEof -- the capture primitives (issue #22)
+import crisol/toolexec  # runTool and its RunResult -- spawn and capture (issue #22)
+export RunEnd, RunResult, ran, notRun, ok, describe
 
 # ---------------------------------------------------------------------------
 # Seam types
 # ---------------------------------------------------------------------------
 
 type
-  IcRunProc* = proc(args: seq[string]): tuple[exitCode: int, output: string] {.closure.}
+  IcRunProc* = proc(args: seq[string]): RunResult {.closure.}
     ## Runs one compiler invocation given a full argv (args[0] is the
-    ## executable, e.g. "nim"). Real impl (`realIcRun`): argv-array spawn, no
-    ## shell. Never raises — a spawn failure surfaces as a nonzero exitCode
-    ## with a descriptive message in `output`.
+    ## executable, e.g. "nim"), stdout and stderr merged into `output`. Real
+    ## impl (`realIcRun`): argv-array spawn, no shell. Never raises; a run
+    ## that did not exit has no output to classify.
 
   IcTimeProc* = proc(): MonoTime {.closure.}
     ## Monotonic-clock read, injectable so unit tests can supply deterministic
@@ -88,18 +82,12 @@ type
 # Real seam implementations
 # ---------------------------------------------------------------------------
 
-proc realIcRun*(args: seq[string]): tuple[exitCode: int, output: string] =
+proc realIcRun*(args: seq[string]): RunResult =
   ## Spawns `args` as an argv array (args[0] = executable, no shell) and
-  ## captures combined stdout+stderr and the exit code. Never raises.
-  try:
-    let p = startProcess(args[0], args = args[1..^1],
-                         options = {poUsePath, poStdErrToStdOut})
-    defer: p.close()
-    let output = drainToEof(p.outputStream)
-    let exitCode = p.waitForExit()
-    result = (exitCode: exitCode, output: output)
-  except CatchableError as e:
-    result = (exitCode: -1, output: "icbaseline: spawn failed: " & e.msg)
+  ## captures combined stdout+stderr. No deadline: a cold compile takes as
+  ## long as it takes. Never raises.
+  runTool(args[0], args[1..^1], "", {poUsePath, poStdErrToStdOut}, "",
+          NoDeadline, MaxToolOutputBytes)
 
 proc realIcTimeNow*(): MonoTime =
   getMonoTime()
@@ -152,6 +140,13 @@ proc probeIncremental*(run: IcRunProc; entrypoint, nimcacheDir, outputBinPath: s
   let t1 = timeNow()
   let firstUs = (t1 - t0).inMicroseconds
 
+  if first.ending != reExited:
+    # Nothing to classify: the option was not visibly rejected, and the
+    # build did not visibly succeed.
+    return IcProbeResult(supported: true, orcCompatible: false,
+                         firstUs: firstUs, secondUs: 0, speedupPct: 0.0,
+                         errorMsg: describe(first))
+
   if looksLikeOptionRejection(first.output):
     return IcProbeResult(supported: false, orcCompatible: false,
                          firstUs: 0, secondUs: 0, speedupPct: 0.0,
@@ -167,10 +162,11 @@ proc probeIncremental*(run: IcRunProc; entrypoint, nimcacheDir, outputBinPath: s
   let t3 = timeNow()
   let secondUs = (t3 - t2).inMicroseconds
 
-  if second.exitCode != 0:
+  if not second.ok:
     return IcProbeResult(supported: true, orcCompatible: false,
                          firstUs: firstUs, secondUs: secondUs, speedupPct: 0.0,
-                         errorMsg: second.output)
+                         errorMsg: if second.ending == reExited: second.output
+                                   else: describe(second))
 
   IcProbeResult(supported: true, orcCompatible: true,
                firstUs: firstUs, secondUs: secondUs,

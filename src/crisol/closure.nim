@@ -101,7 +101,8 @@
 ##   rare basename-collision cases, over-select harmlessly (R7 policy).
 ##
 ##   The index walk itself prunes some directories for WALK COST — dot-dirs,
-##   `nimcache` dirs, the state dir (see `walkForIndex`'s doc comment) — a
+##   `nimcache` dirs, the state dir (see `walkForIndex`'s doc comment; the
+##   first two are still walked for their links) — a
 ##   file living under one of those is never indexed, so a plain index
 ##   lookup misses it even though it is tracked (it lives under a root by
 ##   construction).  That pruning is deliberately a walk-cost decision, not
@@ -190,17 +191,14 @@ import crisol/paths    # RFC-0009 A4a: classify/TrackedPath/PathClass/display/to
                         # nativePath conversion) — hence `std/options` above,
                         # for `Option[TrackedPath]`'s `isSome`/`isNone`/`get`.
 import crisol/config   # for stateDirOf — the source-index walk prunes it
-import crisol/ccprobe  # for deriveDepInvocation/depIncludeHeaders/classifyGnuOutputFlag
-                        # (issue #16) — a near-leaf module (its only crisol
-                        # import is crisol/paths, CR10), so this
-                        # creates no cycle. NOTE: this module deliberately does
-                        # NOT import crisol/depgraph (which imports THIS module
-                        # for extractClosure/SourceIndex) — importing it here
-                        # would close a cycle. CR7: RunProc/realRun/realRunIn/
-                        # lastProbeStderr moved to crisol/toolrun (below) — this
-                        # module needs ccprobe.nim ONLY for its dependency-
-                        # probing derivation procs now, never cc identity.
-import crisol/toolrun   # CR7: RunProc/realRun/realRunIn/lastProbeStderr — the
+import crisol/ccprobe  # for parseCompileCommand (ccCmdOutputObj)
+import crisol/headerprobe  # for probeReportedHeaders (extractCompileInputs)
+                        # (issue #16). Both are near-leaf modules (crisol
+                        # imports: paths and toolrun only), so neither closes
+                        # a cycle. NOTE: this module deliberately does NOT
+                        # import crisol/depgraph (which imports THIS module
+                        # for extractClosure/SourceIndex).
+import crisol/toolrun   # CR7: RunProc/RunResult/realRun/realRunIn — the
                         # process-execution seam, its own module now; a leaf
                         # (imports only crisol/toolexec), same no-cycle shape
                         # as the ccprobe import above.
@@ -225,6 +223,40 @@ type
     ## resolved) — see `lookup`'s doc comment for why both are needed.
     lexical: string
     real:    string
+
+  IndexedLink = object
+    ## One symlink (or Windows junction/reparse point) the index walk met
+    ## under a tracked root (issue #25). The walk never descends into a
+    ## linked directory, but it still SEES the link, and that is enough:
+    ## `crossedLinks` needs each link's own path and where it leads.
+    lexical: string
+      ## The link's own path as the walk spelled it (`recordRoot / name`).
+    loc:     string
+      ## The realpath of the link's LOCATION without following the link
+      ## itself: the real parent directory joined with the link's name,
+      ## forward-slash. A link nested behind another link (`vend -> libs/a`,
+      ## `libs/a/sub -> x/sub`) is found reachable through `vend` because
+      ## `vend`'s target is an ancestor of this location.
+    real:    string
+      ## Where the link leads, fully resolved (`safeExpandFilename`,
+      ## forward-slash); the link's own path when it cannot be resolved.
+
+  ClosureLink* = object
+    ## A link a closure member was reached through (issue #25), recorded on
+    ## the dependency-graph entry and re-resolved by every freshness check.
+    ##
+    ## Nim canonicalizes every file it opens to its realpath, so a module
+    ## imported as `vend/m` where `vend -> libs/a` enters the closure as
+    ## `libs/a/m.nim` and `vend` appears nowhere. Repointing `vend` changes
+    ## which file a recompile would read without changing any recorded
+    ## member, so the member hashes alone would call the stale binary fresh.
+    ## Recording the link and its resolved target makes the repoint visible.
+    path*:   TrackedPath
+      ## The link's own path. Always tracked: the index walk only meets
+      ## links under a tracked root.
+    target*: string
+      ## `linkTargetSpelling` of the link's resolved target at record time.
+      ## Compared by equality only, never parsed back.
 
   SourceIndex* = object
     ## basename (e.g. "foo.nim", "add.c") -> every indexed file under
@@ -265,6 +297,10 @@ type
       ## manifest/walk separator skew before `nativeCanonicalize` ran; a
       ## dep root reached via a symlink whose realpath-expanded candidate
       ## matched no root's LEXICAL form).
+    links: seq[IndexedLink]
+      ## Issue #25: every symlink the walk met (see `IndexedLink`), the
+      ## candidates `crossedLinks` filters down to the ones a closure's
+      ## members were reached through.
 
 proc tracked*(index: SourceIndex; native: string): PathClass =
   ## Classify a native candidate against the run's tracked roots — the
@@ -302,8 +338,32 @@ proc addToIndex(index: var SourceIndex; lexical: string; real: string) =
   let realNorm = pathnorm.normalizePath(real, '/')
   index.byReal.mgetOrPut(realNorm, @[]).add lexical
 
+type
+  DirRole* = enum
+    ## What `walkForIndex` does with one directory (`dirRole`).
+    drIndex      ## index its files and descend
+    drLinksOnly  ## descend, recording links only (R12-S1): no file is
+                 ## indexed here or anywhere below
+    drSkip       ## never visited: the state dir
+
+proc dirRole*(name, abs, stateDirAbs: string; parentRole: DirRole): DirRole =
+  ## The pruning rule table of `walkForIndex` (see its doc for why each rule
+  ## is sound), for a subdirectory `name` at absolute path `abs` inside a
+  ## directory walked as `parentRole`. Pure: `abs` and `stateDirAbs` are
+  ## compared as given. In order:
+  ##   • `abs` is the resolved state dir (`stateDirAbs`, when known): skipped
+  ##     outright, before the dot-dir rule, so the default `.crisol` is too;
+  ##   • inside a link-only directory, or named `.*` or `nimcache`: links only;
+  ##   • anything else: indexed.
+  ## `parentRole` is never `drSkip` in a walk (a skipped directory is not
+  ## visited); a child of one answers as a child of a link-only directory.
+  if stateDirAbs.len > 0 and abs == stateDirAbs: drSkip
+  elif parentRole != drIndex or name.startsWith(".") or name == "nimcache":
+    drLinksOnly
+  else: drIndex
+
 proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
-                  index: var SourceIndex) =
+                  index: var SourceIndex; role: DirRole) =
   ## Recursively index every regular file under `dir` — Nim modules,
   ## `{.compile.}`d C/C++/ObjC/asm sources, and anything else the compiler
   ## may consume, not only `.nim` files (D4, issue #11: `link`'s `@m`/`@p`/
@@ -326,16 +386,44 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
   ##     content (e.g. milpa's `_deps/*` -> CAS) stays opt-in via depRoots;
   ##     a depRoot itself CAN be a symlink (the caller walks into it
   ##     directly), only NESTED symlinked subdirectories are pruned here.
-  ##   • skip directories whose name starts with '.' (.git, .crisol, and
-  ##     any other dotdir — e.g. a vendored toolchain checkout living under
-  ##     projectRoot, such as this repo's `.docker-home/`).
-  ##   • skip directories named "nimcache" (generated, never source).
+  ##     The link itself (dir or file) is still recorded in `index.links`
+  ##     (issue #25 — see `crossedLinks`).
+  ##   • do not INDEX the files of a directory whose name starts with '.'
+  ##     (.git, .crisol, and any other dotdir — e.g. a vendored toolchain
+  ##     checkout living under projectRoot, such as this repo's
+  ##     `.docker-home/`) or is named "nimcache" (generated, never source),
+  ##     nor of anything below one. Such a directory is still DESCENDED
+  ##     as `drLinksOnly`: every link under it is recorded in
+  ##     `index.links`, and nothing else is (R12-S1). An import can be
+  ##     spelled through a link anywhere under a root
+  ##     (`import ../../.deps/vend/m`); skipping these directories outright
+  ##     left such a link unrecorded, so repointing it served a stale
+  ##     compile skip and a stale cached PASS. The link-only pass costs one
+  ##     directory listing per directory under it, plus a realpath only for
+  ##     a directory that holds a link: no file is indexed or hashed, and
+  ##     no link is followed. A real
+  ##     nimcache is flat (Nim writes every generated file into the one
+  ##     directory), so visiting one is a single listing.
   ##   • skip the resolved state dir (`stateDirOf`), by absolute-path
-  ##     comparison, in case it is ever configured outside the '.'-prefix
-  ##     convention.
+  ##     comparison, outright — not even the link-only pass. It is checked
+  ##     before the dot-dir rule, so the default `.crisol` is skipped too.
+  ##     This is sound, not only cheap: the state dir is crisol's private
+  ##     store (the dependency graph, the result cache, per-entrypoint
+  ##     nimcaches and binaries), crisol creates no link in it, and crisol
+  ##     rewrites and prunes it at will, so no source import can be spelled
+  ##     through it and stay valid. A link placed there by hand is tampering
+  ##     with that store, and whoever can write there can already rewrite
+  ##     the dependency graph and the cached results themselves: every cache
+  ##     decision already presumes the state dir is crisol's alone. It is
+  ##     also the one pruned directory that grows with the cache, so
+  ##     visiting it would scale every walk with cache size.
   ##
-  ## IMPORTANT: every rule above is a WALK-COST decision, not a TRACKING
-  ## decision. A file under a pruned directory is still "tracked" — it
+  ## The rules are one pure table, `dirRole`; this walk only switches on
+  ## its answer. `role` is this directory's own (`drIndex` or
+  ## `drLinksOnly`; a `drSkip` directory is never walked).
+  ##
+  ## IMPORTANT: every indexing rule above is a WALK-COST decision, not a
+  ## TRACKING decision. A file under a pruned directory is still "tracked" — it
   ## lives under `recordRoot`/a root by construction — it is simply never
   ## added to `index.byBasename`/`index.byReal`, so a `lookup` against it
   ## misses. `resolveMangledAll`'s `@p`/`@n` branch accounts for exactly
@@ -344,20 +432,31 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
   ## `index.roots` directly (bypassing the index, and hence this pruning)
   ## rather than treating a pruned-and-therefore-unindexed file as
   ## untracked.
-  let realDir = safeExpandFilename(dir)
+  # Resolved once per directory, and in a link-only directory only when it
+  # holds a link: nothing else there needs it.
+  let linksOnly = role != drIndex
+  var realDir = if linksOnly: "" else: safeExpandFilename(dir)
   for entry in walkDir(dir):
     let name = entry.path.lastPathPart
     case entry.kind
     of pcLinkToDir:
-      discard                          # never descend into symlinked dirs
+      # Never descend into a symlinked dir, but remember the link itself
+      # (issue #25 — see `crossedLinks`), in a link-only directory too.
+      if realDir.len == 0: realDir = safeExpandFilename(dir)
+      index.links.add IndexedLink(lexical: recordRoot / name,
+                                  loc: realDir & "/" & name,
+                                  real: safeExpandFilename(entry.path))
     of pcDir:
-      if name.startsWith("."): continue
-      if name == "nimcache": continue
       let entryAbs = entry.path.absolutePath.normalizedPath  # canon-ok: index walk dir-exclusion compare (filesystem-real, not identity)
-      if stateDirAbs.len > 0 and entryAbs == stateDirAbs: continue
-      walkForIndex(entry.path, recordRoot / name, stateDirAbs, index)
+      let childRole = dirRole(name, entryAbs, stateDirAbs, role)
+      case childRole
+      of drSkip: discard
+      of drIndex, drLinksOnly:
+        walkForIndex(entry.path, recordRoot / name, stateDirAbs, index,
+                     childRole)
     of pcFile:
-      index.addToIndex(recordRoot / name, realDir / name)
+      if not linksOnly:
+        index.addToIndex(recordRoot / name, realDir / name)
     of pcLinkToFile:
       # RFC-0009 B4a: safeExpandFilename returns `entry.path` unchanged on
       # failure (never raises), not `recordRoot / name` like the old
@@ -366,7 +465,11 @@ proc walkForIndex(dir: string; recordRoot: string; stateDirAbs: string;
       # `addToIndex`/`lookup` degrade the same as any other unresolvable
       # symlink target.
       let real = safeExpandFilename(entry.path)
-      index.addToIndex(recordRoot / name, real)
+      if not linksOnly:
+        index.addToIndex(recordRoot / name, real)
+      if realDir.len == 0: realDir = safeExpandFilename(dir)
+      index.links.add IndexedLink(lexical: recordRoot / name,
+                                  loc: realDir & "/" & name, real: real)
 
 proc buildSourceIndex*(config: Config): SourceIndex =
   ## Walk `config.projectRoot` and each `config.depRoots[i]` once, indexing
@@ -423,13 +526,112 @@ proc buildSourceIndex*(config: Config): SourceIndex =
     # canonical, so this is byte-identical to the old expression there.
     let prReal = safeExpandFilename(prAbs)
     if prReal != prAbs: result.roots.add prReal
-    walkForIndex(prAbs, prAbs, stateDirAbs, result)
+    walkForIndex(prAbs, prAbs, stateDirAbs, result, drIndex)
 
   for dr in config.depRoots:
-    let drAbs = dr.absolutePath.normalizedPath  # canon-ok: index dep-root real-path (walkForIndex traversal root, not identity)
+    # A relative dep root is relative to the project root, never to the
+    # working directory: the base `config.loadConfig` resolves the tracked
+    # roots against. Joined onto the working directory, a run from anywhere
+    # but the project root walked the wrong directory (usually none), so
+    # the dep root's files went unindexed and its links unrecorded (issue
+    # #25: a repointed link there was then served stale).
+    let drAbs = dr.absolutePath(prAbs).normalizedPath  # canon-ok: index dep-root real-path (walkForIndex traversal root, not identity)
     result.roots.add drAbs
     if dirExists(drAbs):
-      walkForIndex(drAbs, drAbs, stateDirAbs, result)
+      walkForIndex(drAbs, drAbs, stateDirAbs, result, drIndex)
+
+proc linkTargetSpelling*(real: string; roots: TrackedRoots): string =
+  ## Issue #25: the comparable spelling of a link's resolved target — the
+  ## portable `keyBytes` of the target when a tracked root claims it
+  ## (`"t:"` prefix), otherwise its absolute forward-slash path (`"a:"`
+  ## prefix; an untracked target is machine-local, so a graph moved to
+  ## another host simply sees it differ and recompiles). Written by
+  ## `crossedLinks` at record time and recomputed by
+  ## `depgraph.entryDrift` (`dkMoved`) at check time; the two only ever compare it
+  ## for equality.
+  let fwd = real.replace('\\', '/')
+  let pc = classify(fwd, roots)
+  case pc.kind
+  of pcTracked: "t:" & string(keyBytes(pc.tp, roots))
+  of pcOutside: "a:" & fwd
+
+proc crossedLinks*(index: SourceIndex;
+                   files: HashSet[TrackedPath]): seq[ClosureLink] =
+  ## Issue #25: every indexed link some closure member may have been
+  ## reached through, to be recorded on the entry and re-resolved at every
+  ## freshness check (`depgraph.entryDrift`, `dkMoved`).
+  ##
+  ## Nim reports each file it opened by its realpath, so the lexical import
+  ## spelling (and with it the links it crossed) is gone by the time the
+  ## manifest is read. What IS knowable is the converse: a lexical path
+  ## that resolves to realpath R crossed link Y only if Y's resolved target
+  ## is an ancestor of (or equal to) R — the LAST link crossed leads
+  ## straight into R's real ancestry, since nothing after it is a link — or
+  ## of the real location of a later link on the same path. So:
+  ##
+  ##   T := { realpath(member) }
+  ##   repeat: for each unselected link Y whose resolved target is an
+  ##           ancestor-or-self of some t in T, select Y and add Y's own
+  ##           real LOCATION to T
+  ##   until nothing new is selected.
+  ##
+  ## Every link actually crossed is selected (induction from the last one
+  ## backwards). A selected link that was NOT crossed only over-invalidates:
+  ## repointing it forces a recompile, never a stale skip.
+  ##
+  ## Coverage is the index walk's. It meets every link under the project
+  ## root and every dep root, including those inside dot-dirs and
+  ## `nimcache` dirs, whose files it does not index but whose links it
+  ## still records (R12-S1, see `walkForIndex`). It does not meet:
+  ##   • a link inside the state dir, which `walkForIndex` skips outright
+  ##     (its doc comment argues why that is sound);
+  ##   • a link outside every tracked root, even one whose target leads
+  ##     back under a root: an import spelled through one (a relative
+  ##     import that leaves the project, or a `--path` outside it) produces
+  ##     a manifest byte-identical to a direct import of the target, so
+  ##     nothing crisol reads shows the link was crossed, and repointing it
+  ##     is not detected. Declaring the link's directory as a dep root
+  ##     brings it into the walk.
+  ##
+  ## Cost: nothing when the index met no link (the common case). Otherwise
+  ## one realpath per member, then a scan of links against the target set.
+  if index.links.len == 0 or files.len == 0: return
+  let roots = index.trackedRoots
+  var targets: seq[string] = @[]
+  for tp in files:
+    targets.add safeExpandFilename(toNative(tp, roots)).replace('\\', '/')
+  var selected = newSeq[bool](index.links.len)
+  var changed = true
+  while changed:
+    changed = false
+    for i, l in index.links:
+      if selected[i]: continue
+      let lreal = l.real.replace('\\', '/')
+      var hit = false
+      for t in targets:
+        # Ancestor-or-self at a component boundary. Both operands are
+        # realpaths (`safeExpandFilename`), already in the filesystem's own
+        # case, so the non-folding `isUnderRoot` is the right comparison.
+        if isUnderRoot(t, lreal):
+          hit = true
+          break
+      if hit:
+        selected[i] = true
+        changed = true
+        targets.add l.loc.replace('\\', '/')
+  var seen = initHashSet[string]()
+  for i, l in index.links:
+    if not selected[i]: continue
+    let pc = classify(l.lexical, roots)
+    if pc.kind != pcTracked:
+      raise newCrisolError(cekInternal,
+        "symlink " & l.lexical & " met by the source-index walk is under no " &
+        "tracked root; cannot record it on the closure (issue #25)")
+    # A dep root nested inside the project is walked twice; its links then
+    # classify to the same tracked path both times.
+    if seen.containsOrIncl(string(keyBytes(pc.tp, roots))): continue
+    result.add ClosureLink(path: pc.tp,
+                           target: linkTargetSpelling(l.real, roots))
 
 proc strippedSuffix(body: string): string =
   ## Strip every LEADING `""`/`"."`/`".."` path component from a decoded
@@ -855,9 +1057,9 @@ proc resolveMangledAll(mangledName: string;
   ##              than persisted with a phantom member — it is never actually
   ##              recorded.  The real detection happens later, against the
   ##              PERSISTED closure from an earlier run when the file still
-  ##              existed: `narrow.isEntryStale` and the planner's own
-  ##              missing-closure-file check both test that persisted
-  ##              closure's files for existence.
+  ##              existed: `depgraph.entryDrift` (`dkMissing`), read by
+  ##              both `isEntryStale` and `planner.decideCompile`, tests
+  ##              that persisted closure's files for existence.
   ##
   ##              When that candidate is NOT under any of `index`'s
   ##              recorded roots, it is ALSO resolved via
@@ -1201,70 +1403,28 @@ proc parseCompileManifest*(jsonPath: string):
 proc ccCmdOutputObj*(ccCmd: string): tuple[obj: string; ok: bool] =
   ## Extract the output-object value from a manifest `ccCmd` string.
   ##
-  ## Spelled per family, classified from the command's own driver token
-  ## (`ccprobe.ccFamilyOfDriver`), never from `defined(vcc)`:
-  ##
-  ## - GNU: `-o <obj>` (separated) or `-o<obj>` (fused) — classified by
-  ##   `ccprobe.classifyGnuOutputFlag`, the SAME predicate
-  ##   `ccprobe.deriveDepInvocation`'s GNU arm uses to STRIP this flag
-  ##   (this proc CAPTURES its value instead, to match a `compile` array
-  ##   entry to its `link` object EXACTLY — see `analyzeManifest`'s
-  ##   external-matching comment below for why this must be exact-value
-  ##   matching, never a basename heuristic). One shared grammar, two
-  ##   consumers, so the two can no longer drift apart silently (CR9) —
-  ##   before the shared predicate existed, each proc hard-coded its own
-  ##   copy of the same `-o` recognition with no test exercising both
-  ##   against the same `ccCmd`.
-  ## - MSVC: `/Fo<obj>` — always fused; cl has no separated form. `-Fo<obj>`
-  ##   is accepted because cl takes `-` as a flag prefix interchangeably with
-  ##   `/`, and a leading `:` after the flag is stripped (`/Fo:<obj>`).
-  ##   This spelling is NOT shared with `deriveDepInvocation`: verified
-  ##   while fixing CR9, that proc's MSVC arm is a blanket verbatim replay
-  ##   of the whole command that never mentions `/Fo` at all (its MSVC arm
-  ##   strips nothing — `/Zs` dominates both `/c` and `/Fo<obj>`, so both
-  ##   survive the replay unmodified). `/Fo` recognition therefore stays
-  ##   here, the only place that needs it.
+  ## Read through `ccprobe.parseCompileCommand`, the one parser of a
+  ## manifest compile command, which classifies the family from the
+  ## command's own driver token (never from `defined(vcc)`) and recognises
+  ## the output in that family's spelling: GNU `-o <obj>` / `-o<obj>`, MSVC
+  ## `/Fo<obj>` / `-Fo<obj>` / `/Fo:<obj>`. The dependency probe
+  ## (`ccprobe.deriveDepInvocation`) strips the same token this proc
+  ## captures, so the two cannot disagree about which token is the object.
+  ## The value is matched EXACTLY against a `link` entry (see
+  ## `analyzeManifest`'s external-matching comment below), never by a
+  ## basename heuristic.
   ##
   ## Recognising only the GNU spelling is what silently broke MSVC impact
-  ## selection (issue #21): `/Fo<obj>` matched nothing, so NO `compile` entry
-  ## was ever paired with its `link` object, every external looked like one
-  ## Nim had served from its own object cache, and `extractCompileInputs`
-  ## fell through to the carried-forward branch and failed closed on every
-  ## cold compile.
+  ## selection (issue #21): `/Fo<obj>` matched nothing, so no `compile`
+  ## entry was paired with its `link` object and every cold compile failed
+  ## closed.
   ##
-  ## `ok = false` when the command cannot be cleanly tokenized or carries no
-  ## output flag in its family's spelling.
-  let (toks, splitOk) = shellSplit(ccCmd)
-  if not splitOk or toks.len < 2:
+  ## `ok = false` when the command does not parse (`parseCompileCommand`
+  ## is `none`) or names no output object.
+  let parsed = parseCompileCommand(ccCmd)
+  if parsed.isNone or parsed.get.output.len == 0:
     return (obj: "", ok: false)
-
-  case ccFamilyOfDriver(toks[0])
-  of ccfMsvc:
-    for idx in 1 ..< toks.len:
-      let t = toks[idx]
-      for prefix in ["/Fo", "-Fo"]:
-        if t.len > prefix.len and t.startsWith(prefix):
-          var value = t[prefix.len .. ^1]
-          if value.startsWith(":"):
-            value = value[1 .. ^1]
-          if value.len > 0:
-            return (obj: value, ok: true)
-    (obj: "", ok: false)
-  of ccfGnuMake:
-    var idx = 1
-    while idx < toks.len:
-      let t = toks[idx]
-      case classifyGnuOutputFlag(t)   # CR9: the one shared grammar
-      of gofSeparated:
-        if idx + 1 < toks.len:
-          return (obj: toks[idx + 1], ok: true)
-        return (obj: "", ok: false)
-      of gofFused:
-        return (obj: gnuFusedOutputValue(t), ok: true)
-      of gofNone:
-        discard
-      inc idx
-    (obj: "", ok: false)
+  (obj: parsed.get.output, ok: true)
 
 proc analyzeManifest(nimcacheDir: string;
                      binaryName: string;
@@ -1560,6 +1720,7 @@ proc extractCompileInputs*(nimcacheDir: string;
                            config: Config;
                            index: SourceIndex;
                            carried: openArray[ExternalSource];
+                           driver: DriverResolver;
                            ccRun: RunProc = realRunIn(config.projectRoot.absolutePath.normalizedPath)): CompileInputs =  # canon-ok: real compile subprocess cwd
   ## Extract the source-dependency closure AND, for every `{.compile.}`d
   ## single-path external (D3c) it names, the header set that external's
@@ -1569,17 +1730,24 @@ proc extractCompileInputs*(nimcacheDir: string;
   ## For each `AnalyzedExternal` `analyzeManifest` classifies:
   ##
   ## - `hasCcCmd` (the manifest's `compile` array has a matching entry — Nim
-  ##   actually compiled this unit THIS round): derive a `cc -M` invocation
-  ##   from its exact `ccCmd` (`ccprobe.deriveDepInvocation` — REPLICATES the
-  ##   real command, never an allow-list; see that proc's doc comment), run
-  ##   it through the injectable `ccRun` seam, and parse the header set
-  ##   (`ccprobe.depIncludeHeaders`). A derivation failure, a probe failure,
-  ##   an unusable dependency report, OR (W9j) an MSVC `/sourceDependencies`
-  ##   document whose own `Data.Source` names a DIFFERENT translation unit
-  ##   than the one probed (stale/misattributed) all raise
-  ##   `CrisolError(cekEnvironment)` — fail closed, exactly like every other
-  ##   closure-extraction failure (`recordClosure` invalidates the entry and
-  ##   discards the stable binary; see its doc comment).
+  ##   actually compiled this unit THIS round): run the shared header
+  ##   pipeline, `headerprobe.probeReportedHeaders`, over its exact `ccCmd`
+  ##   through the injectable `ccRun` seam (derive the dependency probe from
+  ##   the real command, run it, parse the report, classify every header).
+  ##   The probe runs the file `driver` answers for the command's own
+  ##   driver token, found where the build's nim finds it
+  ##   (`headerprobe.siteResolver`), never the bare token (R10-S6): the
+  ##   C++ driver of a `.cpp` external resolves as the C driver of a `.c`
+  ##   one does, and a token the build's nim would not find is a refusal
+  ##   like the others. `driver` is asked only here, so a closure with no
+  ##   external compiled this round never resolves one.
+  ##   Any refusal it returns -- an unresolved driver, no derivable probe, a failed run, no usable
+  ##   report, a report for a DIFFERENT translation unit, or a header under a
+  ##   tracked root whose real spelling is unknown -- raises
+  ##   `CrisolError(cekEnvironment)` with its message: fail closed, exactly
+  ##   like every other closure-extraction failure (`recordClosure`
+  ##   invalidates the entry and discards the stable binary; see its doc
+  ##   comment).
   ##
   ## - NOT `hasCcCmd` (Nim served the object from its OWN external-object
   ##   cache this round — `extccomp.footprint`/`addExternalFileToCompile`
@@ -1595,25 +1763,27 @@ proc extractCompileInputs*(nimcacheDir: string;
   ##   never silently record an unknown (and therefore possibly stale)
   ##   header set.
   ##
-  ## Each header path `cc -M` reports is normalized before being kept: a
-  ## relative path is resolved against `config.projectRoot` (rfc-0007 A2c,
-  ## issue #17) — NEVER `getCurrentDir()`, the crisol process's own cwd,
+  ## Each reported header is classified by that pipeline: a relative path
+  ## is resolved against the project root (rfc-0007 A2c, issue #17) —
+  ## NEVER `getCurrentDir()`, the crisol process's own cwd,
   ## which need not be projectRoot (a subdirectory reached via
   ## `--config ../crisol.kdl`, or an unrelated cwd through the library
   ## API). The default `ccRun` (`toolrun.realRunIn(config.projectRoot)`)
   ## actually RUNS `cc -M` from that same directory — the same directory
   ## the real `nim c`/`cc` invocation before it ran in (runner.nim's
   ## ChildSpec.cwd, also projectRoot) — so a relative header path means the
-  ## same thing on both sides of the replay. Once resolved, a header is
-  ## kept iff it resolves under a tracked root
-  ## (`index.tracked`/`classify` — the identical soundness gate
-  ## `analyzeManifest`'s closure paths pass through), else dropped
+  ## same thing on both sides of the replay. A header is kept iff it
+  ## classifies under a tracked root (`classify` — the identical soundness
+  ## gate `analyzeManifest`'s closure paths pass through), else dropped
   ## silently (a system header, e.g. `/usr/include/stdint.h`, is never
-  ## tracked). The kept set is sorted and deduplicated.
+  ## tracked). A kept header whose resolved spelling is not a file raises
+  ## `CrisolError(cekEnvironment)`, as does the pipeline's own refusal of a
+  ## spelling under a tracked root with its real case unknown: dropping or
+  ## recording either would leave its edits invisible to the closure. The
+  ## kept set is sorted and deduplicated.
   ##
   ## `result.files = analyzeManifest(...).files UNION every external's headers`.
   let analyzed = analyzeManifest(nimcacheDir, binaryName, entrypoint, config, index)
-  let prAbs = config.projectRoot.absolutePath.normalizedPath  # canon-ok: project-root real-path for header-join below, fold-routed via index.tracked
 
   var carriedBySource = initTable[string, ExternalSource]()
   for c in carried:
@@ -1631,72 +1801,41 @@ proc extractCompileInputs*(nimcacheDir: string;
     var headers: seq[string]
 
     if ext.hasCcCmd:
-      let inv = deriveDepInvocation(ext.ccCmd)
-      if not inv.ok:
+      # The shared pipeline (`headerprobe.probeReportedHeaders`): derive,
+      # run, parse, classify, and refuse a header whose real spelling is
+      # unknown. `ccRun` runs in the project root, the directory a relative
+      # reported header is classified against.
+      let hp = probeReportedHeaders(ext.ccCmd, driver, ccRun,
+                                    index.trackedRoots, safeExpandFilename)
+      if not hp.ok:
+        # R15-D6: this also covers what an unpopulated `index.trackedRoots`
+        # would mean (`hpfRootsUnpopulated`) -- unreachable in practice
+        # (`index.trackedRoots` comes from `initTrackedRoots`), but the
+        # shared pipeline itself now fails closed on it, one answer for
+        # every caller, rather than this module keeping a second, separate
+        # "unclassified" check of its own.
         raise newCrisolError(cekEnvironment,
-          "cannot derive a header probe for '" & ext.source &
-          "': its compile command in the nimcache manifest could not be " &
-          "cleanly tokenized")
-      let (output, ranOk) = ccRun(inv.cmd, inv.args)
-      # W9a: `lastProbeStderr()` is read IMMEDIATELY after `ccRun` on every
-      # failure path below -- it is a side channel keyed on "the most recent
-      # non-merged RunProc call", so it must be captured before any further
-      # `RunProc` call could overwrite it. `ccRun`'s default is
-      # `toolrun.realRunIn`, which populates it; a caller-injected fake
-      # `ccRun` (every test in this file) leaves it at "", so `diagSuffix`
-      # is silently "" there too -- these error paths degrade exactly as
-      # they did before W9a whenever the real driver's stderr isn't available.
-      let diagSuffix = block:
-        let diag = lastProbeStderr().strip()
-        if diag.len > 0: " -- driver said: " & diag else: ""
-      if not ranOk:
-        raise newCrisolError(cekEnvironment,
-          "header probe failed for '" & ext.source & "'" &
-          " (command: " & inv.cmd & ")" & diagSuffix)
-      let probed = depIncludeHeaders(inv.family, output, inv.sourceFile)
-      if probed.err != dpeNone:
-        raise newCrisolError(cekEnvironment,
-          "header probe for '" & ext.source & "' produced no usable " &
-          "dependency report (" & $probed.err & "; driver: " & inv.cmd &
-          ")" & diagSuffix)
-      if probed.sourceCheck == dscMismatch:
-        # W9j: `parseMsvcSourceDeps` has always extracted `Data.Source`;
-        # until this fix nothing compared it against the source actually
-        # probed, so a stale or misattributed `/sourceDependencies` document
-        # (left behind by an earlier, unrelated probe) would have passed
-        # silently as this external's header set. Fail exactly as loudly as
-        # `probed.err != dpeNone` above -- this is the same class of failure,
-        # just detected one check later.
-        raise newCrisolError(cekEnvironment,
-          "header probe for '" & ext.source & "' returned a " &
-          "/sourceDependencies document for a DIFFERENT translation unit " &
-          "than the one probed (stale or misattributed document; driver: " &
-          inv.cmd & ")" & diagSuffix)
+          "header probe for '" & ext.source & "' failed: " & hp.message)
 
       var keptTp: seq[TrackedPath] = @[]
       var seen = initHashSet[TrackedPath]()
         ## RFC-0009 A4a (D4): the header-dedup set, retyped to TrackedPath —
         ## same classify gate as every other soundness check in this module.
-      for h in probed.headers:
-        # `h` is a `paths.ReportedPath` (CR10): these paths came out of the
-        # C compiler's own dependency report, not out of crisol. `cl
-        # /sourceDependencies` lowercases every one of them and gcc `-M`
-        # echoes the `#include` directive's literal spelling, so their case
-        # must be resolved against the disk before `rel` — the cache-key
-        # material — is sliced out of them (wiring-audit W1). The
-        # `string(h)` unwrap below is ONLY to make the candidate absolute
-        # (joining against `prAbs`, or normalizing an already-absolute
-        # spelling) — the result is immediately rewrapped as a
-        # `ReportedPath` so it still reaches `index.tracked` through the
-        # REPORTED overload, never the trusted one, all the way to
-        # resolution.
-        let hs = string(h)
-        let habs =
-          if hs.isAbsolute: hs.normalizedPath  # canon-ok: header path branch, fold-routed via index.tracked below
-          else: (prAbs / hs).normalizedPath  # canon-ok: header path branch, fold-routed via index.tracked below
-        let pcH = index.tracked(ReportedPath(habs))
-        if pcH.kind != pcTracked: continue    # system header, etc. — excluded
+      for h in hp.headers:
+        # Impact selection keeps only tracked headers: a system header
+        # (`/usr/include/stdint.h`) is outside every root and never tracked.
+        let pcH = h.pc
+        if pcH.kind != pcTracked: continue
         let tpH = pcH.tp
+        # A tracked header must be a file at its resolved spelling: a
+        # reported directory, or a spelling classification matched by text
+        # but that no longer exists, would otherwise enter the closure as a
+        # member whose edits no key can see.
+        if not fileExists(toNative(tpH, index.trackedRoots)):
+          raise newCrisolError(cekEnvironment,
+            "header probe for '" & ext.source & "' reported '" &
+            string(h.reported) & "', which is not a file at its resolved " &
+            "spelling '" & toNative(tpH, index.trackedRoots) & "'")
         if tpH notin seen:
           seen.incl tpH
           keptTp.add tpH

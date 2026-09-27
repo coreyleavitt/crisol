@@ -18,7 +18,8 @@
 ##         tests/unit/test_c0_clean_stores.nim
 
 import std/[os, options, sets, tables, times, unittest]
-import crisol/[types, clean, resultcache]
+import crisol/[types, paths, clean, resultcache, depgraph, planner]
+import crisol/process/tooltrees
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,6 +52,10 @@ proc seedTestFile(root: string) =
   let unitDir = root / "tests" / "unit"
   createDir(unitDir)
   writeFile(unitDir / "test_seed.nim", "# stub\n")
+
+proc slugFor(relPath: string; roots: TrackedRoots; flags: seq[string] = @[]): string =
+  ## Compute the slug for a path+flags pair the same way discover would.
+  slug(fromCanonical(relPath, roots).get, roots, flags)
 
 # ---------------------------------------------------------------------------
 # Suite 1 — isResultCacheRootName predicate
@@ -110,7 +115,7 @@ suite "C0 — cleanOrphans preserves result-cache store":
     # Also plant an orphan compile dir to confirm normal pruning still works.
     createDir(cacheDir / "orphan_deadbeef00000000")
 
-    let r = cleanOrphans(cfg)
+    let r = cleanOrphans(cfg, knownToolchain("", ""))
 
     # Result-cache dir MUST survive.
     check dirExists(rcDir)
@@ -138,7 +143,7 @@ suite "C0 — cleanOrphans preserves result-cache store":
     createDir(rcDir)
     writeFile(rcDir / "aabbccddeeff0011.json", "{}")
 
-    let r = cleanOrphans(cfg)
+    let r = cleanOrphans(cfg, knownToolchain("", ""))
 
     check dirExists(rcDir)
     check r.cacheDeleted == 0
@@ -164,7 +169,7 @@ suite "C0 — cleanOrphans leaves ledger/ untouched":
     writeFile(ledgerDir / "12345-abcdef-1.ndjson",
               "{\"historyFormatVersion\":1}\n")
 
-    let r = cleanOrphans(cfg)
+    let r = cleanOrphans(cfg, knownToolchain("", ""))
 
     # The ledger/ dir must survive.
     check dirExists(ledgerDir)
@@ -188,7 +193,7 @@ suite "C0 — cleanOrphans leaves ledger/ untouched":
     # Plant an orphan so pruning actually runs.
     createDir(cacheDir / "orphan_cafecafe00000000")
 
-    let r = cleanOrphans(cfg)
+    let r = cleanOrphans(cfg, knownToolchain("", ""))
 
     # ledger/ dir must survive; compaction replaces original shards.
     check dirExists(ledgerDir)
@@ -250,3 +255,143 @@ suite "C0 — cleanAll removes both new stores":
     check not dirExists(rcDir)
     check not dirExists(ledgerDir)
     check not dirExists(stateDir)
+
+# ---------------------------------------------------------------------------
+# Suite 5 — R15-D5 / R15-L2: an interrupted clean stops at the next phase
+# boundary and reports the interruption truthfully.
+# ---------------------------------------------------------------------------
+
+suite "R15-D5 / R15-L2 — interrupted cleanOrphans performs no further destructive phase":
+
+  test "a signal observed before cleanOrphans starts: cache/, bin/, the depgraph and the ledger are all left untouched, and the result says interrupted":
+    ## Before the fix, cleanOrphans had no interrupt check at all: cache/bin
+    ## pruning, the depgraph GC, and every ledger compaction ran to
+    ## completion regardless of a pending signal. `deliverInterrupt` runs the
+    ## real handler body (the same one a SIGINT/SIGTERM would) without a real
+    ## signal reaching this process (see tests/unit/test_tooltrees.nim) --
+    ## `shutdownRequested()` then reads `some` for the rest of the open scope,
+    ## exactly as it would after a real Ctrl-C landed while the toolchain was
+    ## being probed, just before `cleanOrphans` was ever called.
+    let root = makeTempRoot("interrupt_boundary")
+    defer: removeDir(root)
+    seedTestFile(root)
+
+    let cfg      = makeConfig(root)
+    let stateDir = root / ".crisol"
+    let cacheDir = stateDir / "cache"
+    let binDir   = stateDir / "bin"
+    let ledgerDir = stateDir / "ledger"
+    createDir(cacheDir)
+    createDir(binDir)
+    createDir(ledgerDir)
+
+    # An orphan in cache/ and bin/ -- pruned on an uninterrupted clean.
+    createDir(cacheDir / "orphan_deadbeef00000000")
+    createDir(binDir / "orphan_deadbeef00000000")
+
+    # A ledger shard -- compacted on an uninterrupted clean.
+    let shardPath = ledgerDir / "12345-abcdef-1.ndjson"
+    writeFile(shardPath, "{\"historyFormatVersion\":1}\n")
+
+    # A stale depgraph entry -- dropped on an uninterrupted clean.
+    var graph = initDepGraph("")
+    let stalePath = "tests/unit/test_deleted_long_ago.nim"
+    let fHash     = flagHash(@[])
+    graph.updateEntry(stalePath, fHash,
+      [fromCanonical(stalePath, default(TrackedRoots)).get].toHashSet, @[], "", 1)
+    doAssert saveDepGraph(graph, cfg)
+
+    enterInterruptScope()
+    deliverInterrupt(2)  # SIGINT, played without a real signal (R14-D5)
+    let r = cleanOrphans(cfg, knownToolchain("", ""))
+    discard leaveInterruptScope()
+
+    check r.interrupted
+
+    # No destructive phase ran: every orphan and every stale record survives.
+    check dirExists(cacheDir / "orphan_deadbeef00000000")
+    check dirExists(binDir / "orphan_deadbeef00000000")
+    check fileExists(shardPath)
+    let g2 = loadDepGraph(cfg, "")
+    check g2.entries.hasKey((stalePath, fHash))
+
+    check r.cacheDeleted == 0
+    check r.binDeleted == 0
+    check r.graphEntriesDropped == 0
+    check r.shardsRemoved == 0
+    check r.cacheEvicted == 0
+
+# ---------------------------------------------------------------------------
+# Suite 6 — R15-D4: CleanToolchain's zero value is safe
+# ---------------------------------------------------------------------------
+
+suite "R15-D4 — CleanToolchain zero value":
+
+  test "the zero value is an unknown toolchain, not known(\"\")":
+    # R15-D4: `CleanToolchain()`'s zero value used to read as known(""), a
+    # real (if empty) toolchain identity `cleanOrphans` would prune cache/
+    # dirs by — unsafe, the same shape of bug as R14-L1. A default-
+    # constructed value must instead land on the branch that prunes nothing
+    # by the toolchain, mirroring `Registration()`'s own R15-D4 fix
+    # (tests/unit/test_tooltrees.nim).
+    check CleanToolchain().kind == ctkUnknown
+
+# ---------------------------------------------------------------------------
+# Suite 7 — R16-D2: stale `.promoting` files in bin/ are pruned
+# ---------------------------------------------------------------------------
+
+suite "R16-D2 — stale *.promoting files in bin/ are pruned":
+
+  test "a stale .promoting file inside a LIVE entrypoint's bin dir is removed":
+    ## `runner.promoteCompiledBinary` stages a copy at `<stableBin>.promoting`
+    ## beside the stable binary, then renames it into place; a kill between
+    ## the copy and the rename leaves the staged file behind. `pruneDir`
+    ## only decides whether to keep or remove a whole `<slug>` directory —
+    ## it never looks inside one it keeps — so this litter used to survive
+    ## forever once left next to a LIVE entrypoint's binary.
+    let root = makeTempRoot("promoting_live")
+    defer: removeDir(root)
+    seedTestFile(root)
+
+    let cfg      = makeConfig(root)
+    let stateDir = root / ".crisol"
+    let binDir   = stateDir / "bin"
+    createDir(binDir)
+
+    let relPath      = "tests/unit/test_seed.nim"
+    let expectedSlug = slugFor(relPath, cfg.trackedRoots, @[])
+    let liveBinDir   = binDir / expectedSlug
+    createDir(liveBinDir)
+
+    # The real stable binary, and the stale staged copy a kill left behind.
+    writeFile(liveBinDir / "test_seed", "#!/bin/sh\n")
+    let stalePromoting = liveBinDir / "test_seed.promoting"
+    writeFile(stalePromoting, "partial\n")
+
+    let r = cleanOrphans(cfg, knownToolchain("", ""))
+
+    # The live dir, and the real stable binary inside it, survive.
+    check dirExists(liveBinDir)
+    check fileExists(liveBinDir / "test_seed")
+    # The stale `.promoting` file does NOT.
+    check not fileExists(stalePromoting)
+    check r.binDeleted >= 1
+
+  test "a stale .promoting file inside an ORPHAN entrypoint's bin dir is removed with the whole dir":
+    let root = makeTempRoot("promoting_orphan")
+    defer: removeDir(root)
+    seedTestFile(root)
+
+    let cfg      = makeConfig(root)
+    let stateDir = root / ".crisol"
+    let binDir   = stateDir / "bin"
+    createDir(binDir)
+
+    # No entrypoint maps to this slug — clean must drop the whole directory.
+    let orphanBinDir = binDir / "orphan_deadbeef00000000"
+    createDir(orphanBinDir)
+    writeFile(orphanBinDir / "gone.promoting", "partial\n")
+
+    discard cleanOrphans(cfg, knownToolchain("", ""))
+
+    check not dirExists(orphanBinDir)

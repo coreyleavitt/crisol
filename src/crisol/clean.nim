@@ -18,6 +18,21 @@
 ##      how spawnCompileStable names its per-slot dirs.)
 ##   5. Load dep graph, run `gcDeletedEntrypoints(graph, currentKeys)`, save.
 ##
+## R15-D5 / R15-L2: a signal observed at any phase boundary from step 3
+## onward (`crisol/signals.shutdownRequested`, level-triggered for the whole
+## interrupt scope -- so a signal that landed during the toolchain probe,
+## BEFORE `cleanOrphans` was even called, is caught at the very first check)
+## stops every remaining destructive phase: no further cache/bin pruning,
+## depgraph GC, result-cache GC, or ledger compaction runs. `cleanOrphans`
+## reports this truthfully via its `interrupted` field rather than the
+## unrelated (and, under a signal, misleading) `toolchainPruneSkipped` cause.
+##
+## R16-D2: step 3 also removes a stale `<stable>.promoting` file left inside
+## a SURVIVING `bin/<slug>/` dir by a kill between `runner.
+## promoteCompiledBinary`'s copy and its rename (`pruneStalePromoting`); an
+## orphaned `<slug>/` dir, and any such file inside it, is already gone via
+## `pruneDir`'s whole-directory removal.
+##
 ## `crisol clean --all`:
 ##   - Remove the entire `<stateDir>/` directory recursively.
 ##   - No lock needed (no other state to read/write after deletion).
@@ -27,9 +42,12 @@
 ##   shared state (cache, bin, depgraph).  A clean racing a run would corrupt
 ##   that state.  `--all` does not need the lock (it just nukes the dir).
 
-import std/[os, sets, strutils, tables, times]
+import std/[options, os, sets, strutils, tables, times]
 import crisol/[types, config, discover, planner, runner, depgraph, resultcache, ledger,
                artifactledger, compilecost, shardedledger]
+from crisol/nimprobe import NimProbe
+from crisol/ccidentity import ToolchainProbe, toolchainVerdict, ToolchainVerdictKind, why, `$`
+from crisol/signals import shutdownRequested
   # `planner` imported explicitly for `epSlug` (forward-computed expected-slug
   # set below; RFC-0009 A5b-ii) rather than leaning on runner's re-export —
   # keeps the dependency visible in the import list.
@@ -95,6 +113,39 @@ proc pruneDir(parentDir: string; expectedSlugs: HashSet[string]): int =
         discard  # best-effort; next run will retry
   deleted
 
+proc pruneStalePromoting(binParent: string): int =
+  ## R16-D2: `runner.promoteCompiledBinary` stages a copy at
+  ## `<stableBin>.promoting` beside the stable binary before renaming it
+  ## into place; a kill between the copy and the rename leaves that file
+  ## behind. Nothing else ever reads it — pure disk litter — but `pruneDir`
+  ## above only decides whether to keep or remove a whole `<slug>`
+  ## DIRECTORY; it never looks inside one it keeps. This walks every
+  ## SURVIVING `bin/<slug>/` dir (an orphaned one, and any `.promoting`
+  ## file inside it, is already gone via `pruneDir`'s `removeDir`) and
+  ## removes a stray `.promoting` file found directly inside it.
+  ##
+  ## Never races a concurrent `run` mid-rename: the caller (`cleanOrphans`)
+  ## only runs here while `crisol clean` already holds the advisory
+  ## stateDir lock (this module's Lock doc), the SAME lock `run`'s whole
+  ## compile+promote phase holds for its entire `execute()` call
+  ## (`runcore.RunOptions.manageLock`) -- so no promote can be between its
+  ## copy and its rename while this walks.
+  ##
+  ## Returns the count of `.promoting` files removed.
+  var removed = 0
+  if not dirExists(binParent):
+    return 0
+  for kind, slugDir in walkDir(binParent):
+    if kind != pcDir: continue
+    for k2, f in walkDir(slugDir):
+      if k2 == pcFile and f.endsWith(".promoting"):
+        try:
+          removeFile(f)
+          inc removed
+        except CatchableError:
+          discard  # best-effort; next clean will retry
+  removed
+
 # ---------------------------------------------------------------------------
 # Public: cleanAll
 # ---------------------------------------------------------------------------
@@ -110,9 +161,72 @@ proc cleanAll*(config: Config) =
 # Public: cleanOrphans
 # ---------------------------------------------------------------------------
 
+type
+  CleanToolchainKind* = enum
+    ctkUnknown  ## a probe could not identify the toolchain (R14-D4). FIRST
+                ## (ordinal 0, R15-D4): the zero value `CleanToolchain()`
+                ## must land here, not on a known("") that would prune
+                ## cache/ dirs by an empty-but-"identified" toolchain — the
+                ## same shape of bug R14-L1 was.
+    ctkKnown    ## both probes identified the toolchain
+
+  CleanToolchain* = object
+    ## The toolchain `cleanOrphans` judges persistent nimcache directories
+    ## by. Every nimcache directory is named after the toolchain that built
+    ## it (`planner.toolchainFingerprint`), so a directory named after
+    ## another toolchain is an orphan -- but only when the current one is
+    ## KNOWN. A probe that could not identify the toolchain (nim or the C
+    ## compiler not on PATH, a `cl` that cannot be resolved, a probe an
+    ## interrupt refused) answers a placeholder that names no directory any
+    ## run wrote; pruning by it deleted every nimcache and binary (R14-L1).
+    ##
+    ## R15-D4: `ctkUnknown` is `CleanToolchainKind`'s FIRST member so the
+    ## zero value `CleanToolchain()` (why: "") reads as an unidentified
+    ## toolchain -- unconstructible into a false known(""). Construct
+    ## through `knownToolchain`/`unknownToolchain`/`cleanToolchainOf`, never
+    ## the bare object literal.
+    case kind*: CleanToolchainKind
+    of ctkKnown:
+      nimVersion*: string  ## `nimprobe.NimProbe.fingerprint`
+      ccVersion*:  string  ## the C toolchain's identity: `$fp` of an
+                           ## identified `ccidentity.CcFingerprint`, which is
+                           ## what `toolchainwarn.toolchainIdentity` keys a
+                           ## run's nimcache on
+    of ctkUnknown:
+      why*: string         ## which probe failed, and how, for the warning
+
+proc knownToolchain*(nimVersion, ccVersion: string): CleanToolchain =
+  ## Prune by this toolchain. `("", "")` is the pre-fingerprint shape: the
+  ## expected cache directory is the bare `<slug>` (tests, cold start).
+  CleanToolchain(kind: ctkKnown, nimVersion: nimVersion, ccVersion: ccVersion)
+
+proc unknownToolchain*(why: string): CleanToolchain =
+  ## Prune nothing by the toolchain; `why` is reported back.
+  CleanToolchain(kind: ctkUnknown, why: why)
+
+proc cleanToolchainOf*(nim: NimProbe; cc: ToolchainProbe): CleanToolchain =
+  ## What the two probes say about the toolchain, as the one typed value
+  ## `cleanOrphans` prunes by: known only when BOTH identified it. Their
+  ## placeholders are strings like any other, so this is the one place the
+  ## difference is read (`NimProbe.known`, `toolchainVerdict`).
+  if not nim.known:
+    return unknownToolchain("the Nim compiler could not be identified: " &
+                            "`nim --version` did not answer, or the `nim` " &
+                            "binary on PATH could not be read")
+  let v = toolchainVerdict(cc.fp)
+  case v.kind
+  of tvUnidentified:
+    let w = if cc.fp.compiler.why.len > 0: cc.fp.compiler.why else: cc.fp.runtime.why
+    unknownToolchain("the C toolchain could not be identified" &
+                     (if w.len > 0: ": " & w else: ""))
+  of tvIdentified:
+    # An identified toolchain's run identity is its serialized fingerprint
+    # (`toolchainwarn.toolchainIdentity`), which names its nimcache.
+    knownToolchain(nim.fingerprint, $cc.fp)
+
 # SOUNDNESS-PARAMETER WARNING (round-2 review R2-7; ENFORCED round 3, R3-7;
-# text corrected round 4, R4-5, 2026-09-24): `nimVersion`/`ccVersion` below are
-# soundness parameters of the shape that produced defect L1 -- the value they
+# text corrected round 4, R4-5, 2026-09-24): `toolchain` below, and the
+# `nimVersion`/`ccVersion` of its string overload, are soundness parameters of the shape that produced defect L1 -- the value they
 # carry decides WHICH persistent nimcache directories this proc counts as
 # orphans and deletes, so the wrong one either spares a dir built by a dead
 # toolchain or deletes a live one. Neither carries a default any more: an
@@ -123,32 +237,47 @@ proc cleanAll*(config: Config) =
 # "" when you mean "no probe available". Full rationale on those overloads,
 # on `planner.cachePath`'s, and at R2-7/R3-7 in
 # docs/handoff/msvc-selection-layer.md.
-proc cleanOrphans*(config: Config; nimVersion: string; ccVersion: string): tuple[
+proc cleanOrphans*(config: Config; toolchain: CleanToolchain): tuple[
     cacheDeleted, binDeleted, graphEntriesDropped,
     cacheEvicted, shardsRemoved, ledgerRowsKept: int,
-    artifactReport, compileCostReport: CompactReport] =
+    artifactReport, compileCostReport: CompactReport,
+    toolchainPruneSkipped: string,
+    interrupted: bool] =
   ## Prune orphan cache/bin dirs, stale depgraph entries, and GC the
   ## result-cache + ledger stores (the exec RunLedger, the
   ## RFC-0006 artifact-identity stream, and the RFC-0006 M-cost-split
   ## compile-cost stream).
   ##
-  ## `nimVersion`/`ccVersion` (RFC-0006 nimcache-persistence GC): when both
-  ## are supplied (the real `crisol clean` CLI path), cache/ pruning expects
-  ## the CURRENT-toolchain-fingerprinted dir name for each live entrypoint —
+  ## `toolchain` unknown (R14-D4, R14-L1): cache/ is not pruned at all, and
+  ## bin/ keeps every live entrypoint's binary (the bare slug set), so only a
+  ## deleted entrypoint's binary goes; every later step runs as usual, none
+  ## of them depends on the toolchain. `toolchainPruneSkipped` is then the
+  ## unknown toolchain's `why` (never ""), for the caller's warning; "" when
+  ## the toolchain was known.
+  ##
+  ## `toolchain` known, `nimVersion`/`ccVersion` (RFC-0006 nimcache-persistence
+  ## GC): cache/ pruning expects the CURRENT-toolchain-fingerprinted dir name
+  ## for each live entrypoint —
   ## `<slug>-<toolchainFingerprint(nimVersion,ccVersion)>` — so a dir left
   ## over from an OLD toolchain fingerprint (a cc/nim upgrade) is pruned as
   ## an orphan, same as a dir for a deleted entrypoint. Passing `""` for both
   ## instead makes the expected set fall back to the bare `<slug>` shape with
   ## no toolchain suffix, preserving pre-fingerprint behavior exactly.
   ##
-  ## NEITHER PARAMETER HAS A DEFAULT (R3-7; this paragraph corrected in round 4,
-  ## R4-5, 2026-09-24 — it previously described a `""` default that no longer
-  ## exists). A caller with no toolchain probe — a test, a cold start, `crisol
-  ## clean` before the probes have run — writes the sentinel out loud:
-  ## `cleanOrphans(config, "", "")`. The two shorter arities still compile, but
-  ## they are `{.deprecated.}` (see the bottom of this file) precisely so that
-  ## the choice appears in the diff that makes it: which directories this proc
-  ## deletes depends on it.
+  ## `toolchain` HAS NO DEFAULT (R3-7). A caller with no toolchain probe — a
+  ## test, a cold start — writes the sentinel out loud: `knownToolchain("",
+  ## "")`. R15-D8: the string-argument overloads that used to let a caller
+  ## write `cleanOrphans(config, "", "")` (or omit one or both strings
+  ## entirely) are gone — every one of them built its `CleanToolchain`
+  ## through `knownToolchain`, so ANY string, including "no probe
+  ## available"'s own "" sentinel, read as an IDENTIFIED toolchain. That is
+  ## sound only for the one caller who really means "the bare pre-
+  ## fingerprint shape" (a test, a cold start); it is never sound for a
+  ## caller that meant "unknown" and reached for the nearest short overload.
+  ## Construct the toolchain explicitly instead: `knownToolchain(nimVersion,
+  ## ccVersion)` when a probe answered, `unknownToolchain(why)` when it did
+  ## not, or `cleanToolchainOf(nimProbe, ccProbe)` to let the two probes'
+  ## own verdicts decide which.
   ##
   ## Steps:
   ##   1. Discover ALL entrypoints (gskAll, gates ignored — no applyGates call).
@@ -166,6 +295,19 @@ proc cleanOrphans*(config: Config; nimVersion: string; ccVersion: string): tuple
   ##      directory, own report; mirrors steps 6/7 but never touches the
   ##      exec-row or artifact-stream paths).
   ##
+  ## Interrupt (R15-D5 / R15-L2): steps 3-8 are each guarded by a
+  ## `shutdownRequested()` check immediately before they start. The check is
+  ## level-triggered for the whole open interrupt scope, so a signal that
+  ## landed during the toolchain probe -- BEFORE this call even started -- is
+  ## caught at the very first guard, same as one landing between two of this
+  ## call's own steps. The FIRST guard that trips stops every step from there
+  ## on; nothing already committed by an earlier step is undone (that would
+  ## be its own destructive phase). `interrupted` is then `true`, and the
+  ## caller must report the interruption itself rather than lean on
+  ## `toolchainPruneSkipped`, whose `why` names the toolchain probe's own
+  ## failure mode and would misreport an interrupt's cause as a missing
+  ## compiler.
+  ##
   ## Lock:
   ##   The caller (crisol clean in crisol.nim) acquires the stateDir lock
   ##   BEFORE calling cleanOrphans, and holds it for the entire call.  This
@@ -175,7 +317,8 @@ proc cleanOrphans*(config: Config; nimVersion: string; ccVersion: string): tuple
   ##   (size-bound eviction) or a shard that compaction then absorbs
   ##   mid-write (which would produce a partial shard).
   ##
-  ## Returns counts of what was pruned/evicted/compacted.
+  ## Returns counts of what was pruned/evicted/compacted, and whether a
+  ## signal cut the pass short before every step ran (R15-D5 / R15-L2).
 
   let stateDir = stateDirOf(config)
 
@@ -200,7 +343,10 @@ proc cleanOrphans*(config: Config; nimVersion: string; ccVersion: string): tuple
   # fingerprint (or no fingerprint at all, pre-fix) is correctly excluded
   # from this set and pruned as an orphan by the existing pruneDir logic —
   # no new deletion mechanism needed, just a toolchain-aware expected set.
-  let toolchainFp = toolchainFingerprint(nimVersion, ccVersion)
+  let known = toolchain.kind == ctkKnown
+  let toolchainFp =
+    if known: toolchainFingerprint(toolchain.nimVersion, toolchain.ccVersion)
+    else: ""
   var expectedCacheSlugs = initHashSet[string]()
   for ep in eps:
     let baseSlug = epSlug(ep, config.trackedRoots)
@@ -209,10 +355,24 @@ proc cleanOrphans*(config: Config; nimVersion: string; ccVersion: string): tuple
     else:
       expectedCacheSlugs.incl(baseSlug)
 
-  # Step 3: Prune cache/ and bin/.
+  # R15-D5 / R15-L2: level-triggered for the whole open interrupt scope, so
+  # this also catches a signal that landed during the toolchain probe,
+  # BEFORE this call even started -- the guard below is the first check.
+  var interrupted = shutdownRequested().isSome
+  var cacheDeleted = 0
+  var binDeleted   = 0
+  var dropped      = 0
+  var gcReport: GcResultCacheReport
+  var compactReport, artifactCompactReport, compileCostCompactReport: CompactReport
+
+  # Step 3: Prune cache/ and bin/. Skipped once interrupted (R15-D5): the
+  # deletions below are the first destructive phase, so a signal recorded
+  # before this point must stop them, not just the phases after them.
   let cacheParent = stateDir / "cache"
   let binParent   = stateDir / "bin"
-  let cacheDeleted = pruneDir(cacheParent, expectedCacheSlugs)
+  # An unknown toolchain names no directory: every one would be an orphan.
+  if not interrupted:
+    cacheDeleted = if known: pruneDir(cacheParent, expectedCacheSlugs) else: 0
 
   # bin/ toolchain-awareness (W3 wiring-audit finding): `bin/<slug>` is
   # architecturally NOT toolchain-fingerprinted -- `planner.binPath` is
@@ -249,91 +409,117 @@ proc cleanOrphans*(config: Config; nimVersion: string; ccVersion: string): tuple
   # caller), this degrades to exactly the bare `expectedSlugs` set, byte-
   # identical to pre-fix behavior (see the "no toolchain probe supplied"
   # back-compat test in test_clean.nim).
-  var expectedBinSlugs = expectedSlugs
-  if toolchainFp.len > 0:
-    expectedBinSlugs = initHashSet[string]()
+  if not interrupted:
+    var expectedBinSlugs = expectedSlugs
+    if toolchainFp.len > 0:
+      expectedBinSlugs = initHashSet[string]()
+      for ep in eps:
+        let baseSlug = epSlug(ep, config.trackedRoots)
+        if dirExists(cacheParent / (baseSlug & "-" & toolchainFp)):
+          expectedBinSlugs.incl baseSlug
+
+    # R16-D2: a stale `.promoting` file inside a dir this pruneDir call just
+    # decided to KEEP is not itself an orphaned dir, so it survives pruneDir
+    # untouched; fold its removal into the same count/phase.
+    binDeleted = pruneDir(binParent, expectedBinSlugs) + pruneStalePromoting(binParent)
+
+  # R15-D5: re-check at the next phase boundary — a signal delivered while
+  # step 3 was still deleting must stop step 4 onward.
+  if not interrupted: interrupted = shutdownRequested().isSome
+
+  # Step 4: GC depgraph entries. Skipped once interrupted.
+  if not interrupted:
+    # Build the currentKeys set as entryKey(ep.tp, ep.flags) — the same key
+    # shape used by the depgraph (Table[(string, string), DepGraphEntry]).
+    var currentKeys = initHashSet[(string, string)]()
     for ep in eps:
-      let baseSlug = epSlug(ep, config.trackedRoots)
-      if dirExists(cacheParent / (baseSlug & "-" & toolchainFp)):
-        expectedBinSlugs.incl baseSlug
+      currentKeys.incl entryKey(ep.tp, ep.flags)
 
-  let binDeleted   = pruneDir(binParent,   expectedBinSlugs)
+    # Load the graph AS PERSISTED (issue #12): `loadDepGraph`'s freshness view
+    # compares the stored header's nimVersion against a caller-supplied
+    # "current" version and discards the WHOLE graph on any mismatch. A graph
+    # written by the real pipeline is always stamped with the real probed Nim
+    # fingerprint (never ""), so a clean has no correct "current" version to
+    # pass — the freshness view would (and, before this fix, did) load a real
+    # graph as empty, GC nothing, and report 0 dropped no matter what was
+    # actually orphaned. `loadStoredDepGraph` never compares versions, so it
+    # cannot misfire this way.
+    var discarded: DepGraphDiscard
+    var graph = loadStoredDepGraph(config, discarded)
+    let beforeCount = graph.entries.len
+    gcDeletedEntrypoints(graph, currentKeys)
+    let afterCount = graph.entries.len
+    let gcCount = beforeCount - afterCount
+    # Save iff something was actually dropped. A clean with nothing to GC must
+    # not rewrite the depgraph file at all — in particular it must NEVER
+    # rewrite the header, which would silently replace the real recorded Nim
+    # fingerprint with whatever `loadStoredDepGraph` stamped an empty/discarded
+    # load with, corrupting the freshness check the next `run` performs.
+    #
+    # When a save DOES happen (gcCount > 0): `preserveHeaderRoots: true`
+    # (RFC-0009 wiring-audit fix) keeps `header.roots` exactly as loaded
+    # (STORED), never re-derived from `config.trackedRoots`. This GC pass
+    # never recomputed or validated any entry's closure against the current
+    # roots (that is the whole point of using `loadStoredDepGraph`, above),
+    # so re-stamping the header here would silently launder a renamed or
+    # removed dep root past the next `loadDepGraph`'s dgdRootUnknown/
+    # dgdFoldMismatch check — the same class of bug the nimVersion-freshness
+    # comment above already guards against, just for the `roots` field
+    # instead of `nimVersion`.
+    #
+    # `dropped` (what the report claims) must reflect disk, not memory
+    # (issue #13.3, D4): if the save itself fails, the on-disk graph is
+    # unchanged, so the report must say 0 dropped rather than claim entries
+    # were GC'd that are still sitting on disk.
+    dropped =
+      if gcCount > 0:
+        (if saveDepGraph(graph, config, preserveHeaderRoots = true): gcCount else: 0)
+      else:
+        0
 
-  # Step 4: GC depgraph entries.
-  # Build the currentKeys set as entryKey(ep.tp, ep.flags) — the same key
-  # shape used by the depgraph (Table[(string, string), DepGraphEntry]).
-  var currentKeys = initHashSet[(string, string)]()
-  for ep in eps:
-    currentKeys.incl entryKey(ep.tp, ep.flags)
+  if not interrupted: interrupted = shutdownRequested().isSome
 
-  # Load the graph AS PERSISTED (issue #12): `loadDepGraph`'s freshness view
-  # compares the stored header's nimVersion against a caller-supplied
-  # "current" version and discards the WHOLE graph on any mismatch. A graph
-  # written by the real pipeline is always stamped with the real probed Nim
-  # fingerprint (never ""), so a clean has no correct "current" version to
-  # pass — the freshness view would (and, before this fix, did) load a real
-  # graph as empty, GC nothing, and report 0 dropped no matter what was
-  # actually orphaned. `loadStoredDepGraph` never compares versions, so it
-  # cannot misfire this way.
-  var discarded: DepGraphDiscard
-  var graph = loadStoredDepGraph(config, discarded)
-  let beforeCount = graph.entries.len
-  gcDeletedEntrypoints(graph, currentKeys)
-  let afterCount = graph.entries.len
-  let gcCount = beforeCount - afterCount
-  # Save iff something was actually dropped. A clean with nothing to GC must
-  # not rewrite the depgraph file at all — in particular it must NEVER
-  # rewrite the header, which would silently replace the real recorded Nim
-  # fingerprint with whatever `loadStoredDepGraph` stamped an empty/discarded
-  # load with, corrupting the freshness check the next `run` performs.
-  #
-  # When a save DOES happen (gcCount > 0): `preserveHeaderRoots: true`
-  # (RFC-0009 wiring-audit fix) keeps `header.roots` exactly as loaded
-  # (STORED), never re-derived from `config.trackedRoots`. This GC pass
-  # never recomputed or validated any entry's closure against the current
-  # roots (that is the whole point of using `loadStoredDepGraph`, above),
-  # so re-stamping the header here would silently launder a renamed or
-  # removed dep root past the next `loadDepGraph`'s dgdRootUnknown/
-  # dgdFoldMismatch check — the same class of bug the nimVersion-freshness
-  # comment above already guards against, just for the `roots` field
-  # instead of `nimVersion`.
-  #
-  # `dropped` (what the report claims) must reflect disk, not memory
-  # (issue #13.3, D4): if the save itself fails, the on-disk graph is
-  # unchanged, so the report must say 0 dropped rather than claim entries
-  # were GC'd that are still sitting on disk.
-  let dropped =
-    if gcCount > 0:
-      (if saveDepGraph(graph, config, preserveHeaderRoots = true): gcCount else: 0)
-    else:
-      0
+  # Step 5: GC result-cache (size + age LRU). Skipped once interrupted.
+  if not interrupted:
+    let maxEntries = if config.maxCacheEntries > 0: config.maxCacheEntries
+                     else: DefaultMaxCacheEntries
+    let maxAgeSecs: int64 =
+      if config.cacheMaxAgeDays > 0: int64(config.cacheMaxAgeDays) * 86_400
+      else: 0
+    gcReport = gcResultCache(stateDir, maxEntries, maxAgeSecs, int64(epochTime()))
 
-  # Step 5: GC result-cache (size + age LRU).
-  let maxEntries = if config.maxCacheEntries > 0: config.maxCacheEntries
-                   else: DefaultMaxCacheEntries
-  let maxAgeSecs: int64 =
-    if config.cacheMaxAgeDays > 0: int64(config.cacheMaxAgeDays) * 86_400
-    else: 0
-  let nowSecs = int64(epochTime())
-  let gcReport = gcResultCache(stateDir, maxEntries, maxAgeSecs, nowSecs)
+  if not interrupted: interrupted = shutdownRequested().isSome
 
-  # Step 6: Compact the ledger.
+  # ledgerMaxAgeSecs/nowSecs feed steps 6-8; computing them is a pure read of
+  # config/the clock, not a destructive phase of its own, so it is shared
+  # across whichever of those three still run.
   let ledgerMaxAgeSecs: int64 =
     if config.ledgerMaxAgeDays > 0: int64(config.ledgerMaxAgeDays) * 86_400
     else: 0
-  let compactReport = compactLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
+  let nowSecs = int64(epochTime())
 
-  # Step 7: Compact the artifact-identity stream (RFC-0006 M0).  Reuses the
+  # Step 6: Compact the ledger. Skipped once interrupted.
+  if not interrupted:
+    compactReport = compactLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
+
+  if not interrupted: interrupted = shutdownRequested().isSome
+
+  # Step 7: Compact the artifact-identity stream (RFC-0006 M0). Reuses the
   # same `ledgerMaxAgeSecs`/`nowSecs` as step 6 — the artifact stream has no
   # separate retention knob; it is part of the same "ledger" retention
-  # surface conceptually, just a different shard directory/schema.
-  let artifactCompactReport = compactArtifactLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
+  # surface conceptually, just a different shard directory/schema. Skipped
+  # once interrupted.
+  if not interrupted:
+    artifactCompactReport = compactArtifactLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
 
-  # Step 8: Compact the compile-cost stream (RFC-0006 M-cost-split).  Reuses
+  if not interrupted: interrupted = shutdownRequested().isSome
+
+  # Step 8: Compact the compile-cost stream (RFC-0006 M-cost-split). Reuses
   # the same `ledgerMaxAgeSecs`/`nowSecs` as steps 6/7 — no separate
   # retention knob; same "ledger" retention surface, different shard
-  # directory/schema.
-  let compileCostCompactReport = compactCompileCostLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
+  # directory/schema. Skipped once interrupted.
+  if not interrupted:
+    compileCostCompactReport = compactCompileCostLedger(stateDir, ledgerMaxAgeSecs, nowSecs)
 
   result = (
     cacheDeleted:        cacheDeleted,
@@ -349,29 +535,18 @@ proc cleanOrphans*(config: Config; nimVersion: string; ccVersion: string): tuple
     # see shardedledger.nim's module doc).
     artifactReport:       artifactCompactReport,
     compileCostReport:    compileCostCompactReport,
+    toolchainPruneSkipped:
+      (if known: "" else: toolchain.why),
+    interrupted: interrupted,
   )
 
-# ---------------------------------------------------------------------------
-# R3-7 — deprecated compatibility overloads
-# ---------------------------------------------------------------------------
-##
-## `nimVersion`/`ccVersion` above no longer carry defaults. They select the
-## toolchain fingerprint that decides WHICH persistent nimcache directories
-## count as orphans (`planner.toolchainFingerprint` → `planner.cachePath`), so
-## omitting one silently changes what this proc deletes — a soundness parameter
-## of the shape R2-7 catalogued and L1 was caused by. These overloads keep every
-## existing call compiling while the compiler reports the omission at the
-## caller's own file:line. Full rationale on `planner.cachePath`'s deprecated
-## overload (R3-7).
-##
-## `auto` return rather than a second copy of the (long) result tuple: two
-## hand-maintained copies of one signature is precisely the drift hazard that
-## kept `runner.execute` out of this treatment.
-
-proc cleanOrphans*(config: Config): auto
-    {.deprecated: "R3-7: pass nimVersion and ccVersion explicitly (\"\" when no probe is available) — omitting them changes which nimcache directories count as orphans".} =
-  cleanOrphans(config, "", "")
-
-proc cleanOrphans*(config: Config; nimVersion: string): auto
-    {.deprecated: "R3-7: pass ccVersion explicitly (\"\" when no probe is available) — omitting it changes which nimcache directories count as orphans".} =
-  cleanOrphans(config, nimVersion, "")
+# R15-D8: the string-argument overloads that used to live here
+# (`cleanOrphans(config)`, `cleanOrphans(config, nimVersion)`,
+# `cleanOrphans(config, nimVersion, ccVersion)`) are removed. Every one of
+# them built its `CleanToolchain` through `knownToolchain`, so it marked ANY
+# string — including "" ("no probe available") — as an IDENTIFIED toolchain.
+# That was test-only in practice (the one production caller,
+# crisol.nim's `clean` dispatch, always passed the typed `CleanToolchain`
+# from `cleanToolchainOf`) and unsound for any caller that meant "unknown".
+# Call `cleanOrphans(config, knownToolchain(nimVersion, ccVersion))` or
+# `cleanOrphans(config, unknownToolchain(why))` explicitly instead.

@@ -21,11 +21,12 @@
 ##   ./dev run nim r --hints:off --warnings:off --path:src \
 ##         tests/integration/test_issue16_headers.nim
 
-import std/[json, os, osproc, strutils, times, unittest]
+import std/[json, os, osproc, random, strutils, tempfiles, times, unittest]
 import crisol
-import crisol/[types, planner, nimprobe, ccidentity, closure]
+import crisol/[api, types, planner, nimprobe, ccidentity, closure, pipeline]
 import "../support/testep"
 import ../support/capture
+import "../support/ccprobes"
 
 # ---------------------------------------------------------------------------
 # Helpers (shapes copied from tests/integration/test_issue11_externals.nim —
@@ -33,8 +34,23 @@ import ../support/capture
 # ---------------------------------------------------------------------------
 
 proc newProject(tag: string): string =
-  result = getTempDir() / ("crisol_issue16_" & tag & "_" & $getCurrentProcessId())
-  removeDir(result)
+  ## A fresh directory this run created itself (R3-13). A predictable name
+  ## in the shared temp dir could already be a symlink someone planted,
+  ## which `removeDir`/`createDir` would follow; `existsOrCreateDir` is one
+  ## `mkdir`, which never follows a link at the final component, and a name
+  ## that already exists is skipped, never reused.
+  ##
+  ## Not `createTempDir`: its random part is mixed case, and the W1 test
+  ## addresses the project through a LOWERCASED path, which must name the
+  ## same directory on a case-sensitive volume. Everything here but `tag` is
+  ## lowercase, and every `tag` that test uses is too.
+  var r = initRand()
+  while true:
+    let candidate = getTempDir() /
+      ("crisol_issue16_" & tag & "_" & toHex(r.next).toLowerAscii)
+    if not existsOrCreateDir(candidate):
+      result = candidate
+      break
   createDir(result / "tests")
   createDir(result / "native")
   createDir(result / ".crisol")
@@ -176,9 +192,7 @@ proc gccCaseVolumeIsInsensitive(): bool =
   ## test_rfc9_a4b_determinism.nim's `isCaseInsensitiveVolume`: write a
   ## lowercase temp file, then check whether its uppercase spelling also
   ## resolves.
-  let dir = getTempDir() / ("crisol_issue16_gcccase_volprobe_" & $getCurrentProcessId())
-  removeDir(dir)
-  createDir(dir)
+  let dir = createTempDir("crisol_issue16_gcccase_volprobe_", "")   # R3-13
   defer: removeDir(dir)
   let lowerPath = dir / "volprobe.tmp"
   let upperPath = dir / "VOLPROBE.tmp"
@@ -261,6 +275,36 @@ suite "issue #16 slice 1a — a {.compile.}d source's #include'd header is track
     for c in clJson["entries"][0]["closure"]:
       closureSet.add c.getStr
 
+    check "native/AddMixed.h" in closureSet
+    check "native/addmixed.h" notin closureSet
+
+  test "R10-S1: a project root with a NON-ASCII letter keeps its headers, in their real case":
+    ## `cl /sourceDependencies` lowercases non-ASCII letters too (measured,
+    ## cl 19.44: root `C:\poc\Ärger` reported as `c:\poc\ärger\...`). An
+    ## ASCII-only root filter saw that report as lying outside every root,
+    ## so the header was neither resolved nor refused: it was dropped, and a
+    ## header-only edit selected nothing. Under gcc/clang the report keeps
+    ## the directive's spelling, so this is a plain regression check there.
+    let (root, _) = setupProject("R10S1_Ärger")
+    defer: removeDir(root)
+
+    var fullCode = 0
+    discard captureStdout(proc() = fullCode = runMain(
+      @["run", "--config", root / "crisol.kdl", "--json"]))
+    check fullCode == 0
+
+    var clCode = 0
+    let clOutput = captureStdout(proc() = clCode = runMain(
+      @["closure", "--json", "--config", root / "crisol.kdl",
+        root / "tests" / "test_cadd.nim"]))
+    check clCode == 0
+    let clJson = parseJson(clOutput.strip())
+    check clJson["entries"].len == 1
+    var closureSet: seq[string]
+    for c in clJson["entries"][0]["closure"]:
+      closureSet.add c.getStr
+
+    check "native/add.h" in closureSet
     check "native/AddMixed.h" in closureSet
     check "native/addmixed.h" notin closureSet
 
@@ -401,7 +445,7 @@ suite "issue #16 slice 1b — a header-only edit reaches the test binary":
     for f in epNode["flags"]: flags.add f.getStr
     let ep = testEp(epNode["path"].getStr, group = epNode["group"].getStr, flags = flags)
     let cfg = Config(projectRoot: root, stateDir: ".crisol")
-    let toolchainFp = toolchainFingerprint(cachedNimFingerprint(), cachedCcVersion())
+    let toolchainFp = toolchainFingerprint(cachedNimFingerprint(), cachedCcVersion(ccProbeContextOf(cfg)))
     let cacheDir = cachePath(ep, cfg, toolchainFp)
     check dirExists(cacheDir)
     var foundExternalObj = false

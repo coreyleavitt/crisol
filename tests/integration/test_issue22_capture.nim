@@ -74,14 +74,44 @@ suite "issue #22 — child output is captured in full":
 
   test "realRun returns the payload a two-burst child writes after its banner":
     withBurstEnv(PayloadBytes, 0, 150):
-      let (output, ok) = realRun(burstBin, [])
-      check ok
-      # The load-bearing assertion: the SECOND burst survived. A truncating
-      # capture returns the banner alone and still reports ok.
-      check output.endsWith(burstPayload(PayloadBytes))
-      # Ordering and exactness: banner first, payload entire, nothing extra.
-      check output.startsWith(BurstBanner)
-      check output.len == BurstBanner.len + PayloadBytes
+      let r = realRun(burstBin, [])
+      check r.ok
+      if r.ending == reExited:
+        # The load-bearing assertion: the SECOND burst survived. A truncating
+        # capture returns the banner alone and still reports ok.
+        check r.output.endsWith(burstPayload(PayloadBytes))
+        # Ordering and exactness: banner first, payload entire, nothing extra.
+        check r.output.startsWith(BurstBanner)
+        check r.output.len == BurstBanner.len + PayloadBytes
+
+  test "realRunMerged returns both bursts of both streams, in write order":
+    # The merged path (`poStdErrToStdOut`, one pipe): the version-banner probe
+    # and the MSVC runtime probe run through it. Sized under the pipe budget
+    # so a truncating capture FAILS here rather than wedging the fixture.
+    const OutBytes = 1024
+    const ErrBytes = 512
+    withBurstEnv(OutBytes, ErrBytes, 150):
+      let r = realRunMerged(burstBin, [])
+      check r.ok
+      if r.ending == reExited:
+        check r.output == BurstBanner & BurstBanner &
+                          burstPayload(OutBytes) & burstPayload(ErrBytes)
+        check r.errOutput == ""
+
+  test "realRunMerged captures a two-burst child whose output overruns the pipe buffer":
+    # Far past the ~4 KB pipe budget: the child blocks in `write` until the
+    # capture drains it. A capture that stops early leaves it wedged, and the
+    # run ends as a timeout rather than a complete answer.
+    const OutBytes = 192 * 1024
+    const ErrBytes = 64 * 1024
+    withBurstEnv(OutBytes, ErrBytes, 150):
+      let r = realRunMerged(burstBin, [])
+      check r.ending == reExited
+      if r.ending == reExited:
+        check r.exitCode == 0
+        check r.output.len == 2 * BurstBanner.len + OutBytes + ErrBytes
+        check r.output == BurstBanner & BurstBanner &
+                          burstPayload(OutBytes) & burstPayload(ErrBytes)
 
   test "realIcRun returns both bursts when the child's streams are merged":
     # icbaseline spawns with poStdErrToStdOut, so stdout and stderr share one
@@ -91,17 +121,19 @@ suite "issue #22 — child output is captured in full":
     const OutBytes = 1024
     const ErrBytes = 512
     withBurstEnv(OutBytes, ErrBytes, 150):
-      let (exitCode, output) = realIcRun(@[burstBin])
-      check exitCode == 0
-      check output == BurstBanner & BurstBanner &
-                      burstPayload(OutBytes) & burstPayload(ErrBytes)
+      let r = realIcRun(@[burstBin])
+      check r.ending == reExited
+      if r.ending == reExited:
+        check r.exitCode == 0
+        check r.output == BurstBanner & BurstBanner &
+                          burstPayload(OutBytes) & burstPayload(ErrBytes)
 
   test "a child whose stderr overruns the pipe buffer neither wedges the probe nor loses its stdout":
     # `realRun` spawns with SEPARATE stderr and returns only stdout. Dropping
     # those bytes is a choice; not READING them is a bug — the pipe fills, the
     # child blocks inside its own `write`, never finishes stdout, never exits,
     # and the stdout read never returns. Same defect `gitdiff` had, same fix
-    # (`toolexec.drainBoth`), asserted here at the seam issue #21's MSVC
+    # (`toolexec.runTool`), asserted here at the seam issue #21's MSVC
     # dependency probe will run through.
     const OutBytes = 64
     const ErrBytes = 256 * 1024
@@ -109,4 +141,4 @@ suite "issue #22 — child output is captured in full":
       let (finished, line) = runWithDeadline(captureProbeBin, @[burstBin], 60_000)
       check finished                    # RED: the probe wedges and is killed
       if finished:
-        check line.contains("outLen=" & $(BurstBanner.len + OutBytes))
+        check line.contains("ending=reExited exit=0 outLen=" & $(BurstBanner.len + OutBytes))
