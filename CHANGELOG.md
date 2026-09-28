@@ -6,6 +6,27 @@ All notable changes to crisol are documented here.
 
 ## Unreleased
 
+### Changed — sello dependency moved to the v0.5.0 release; Nim toolchain artifacts pinned by digest
+
+`milpa.kdl` pinned sello to `ref="vcc-ct-barrier-v0.4"`, an interim branch
+that ported one of sello's three constant-time asm sites to MSVC. It now
+pins the tagged `v0.5.0` release, which ports all three (both secret-wipe
+barriers and the value barrier) and runs a required MSVC leg in sello's own
+CI. The sello APIs crisol uses (`Seed`, `PublicKey`, `toSeed`,
+`toPublicKey`, `toSignature`, `keypair`, `sign`, `verify`) are unchanged.
+sello no longer depends on `nimcrypto`; crisol's own direct `nimcrypto`
+dependency is unaffected. sello records that no constant-time instrument
+runs on MSVC output yet (its `docs/ct-results.md`), so its constant-time
+evidence under `cc = vcc` is weaker than under gcc/clang.
+
+`ci/fetch-nim-toolchain.sh` takes an optional expected manifest digest; the
+Windows and macOS legs now pass one. With a digest, the manifest is fetched
+by digest and its bytes are hashed and compared locally, the payload blob is
+hashed against the manifest's layer digest before unpacking, and the payload
+must name the tag's platform (so a digest copied from another platform
+fails instead of installing). Previously the mutable tag was trusted
+outright and nothing was hashed.
+
 ### BREAKING CHANGE — dependency graph format 10: a repointed symlink on an import path now invalidates the compile skip; one-time full recompile (issue #25)
 
 **Prior behaviour:** Nim records every module it opens by its realpath, so

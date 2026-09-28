@@ -467,7 +467,7 @@ jobs:
       - name: Install patched Nim toolchain (MSVC)
         id: toolchain
         run: |
-          BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-windows-x64 "$RUNNER_TEMP/nimtc" | tail -1)
+          BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-windows-x64 "$RUNNER_TEMP/nimtc" sha256:eddee4f56d9ab2c0003b5b3739e05930af5897f43fe93d05c3452d9e8c6e28cd | tail -1)
           CFG="$(dirname "$BIN")/config/nim.cfg"
           printf '\n@if windows:\n  cc = vcc\n@end\n' >> "$CFG"
           # wiring-audit W2: prove the append actually landed where nim will
@@ -1102,7 +1102,7 @@ jobs:
       - name: Install patched Nim toolchain
         id: toolchain
         run: |
-          BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-macos-arm64 "$RUNNER_TEMP/nimtc" | tail -1)
+          BIN=$(bash ci/fetch-nim-toolchain.sh 2.2.10-macos-arm64 "$RUNNER_TEMP/nimtc" sha256:db3ea697cf10232761b46d4c008f46cd6e9956296c627e73cc0118f73e80ca23 | tail -1)
           echo "$BIN" >> "$GITHUB_PATH"
 
       # Default success() gate: runs only once the toolchain installed, so

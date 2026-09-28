@@ -46,18 +46,18 @@ dep "sello" {
     source {
         kind "git"
         url (url)"https://github.com/coreyleavitt/sello"
-        ref "vcc-ct-barrier-v0.4"
+        ref "v0.5.0"
     }
-    identity "dag-sha256:32407313e6d158a6c2e011eb1cd5dbcefa073db0d2281361c36afcf839446388"
-    version "0.4.0"
+    identity "dag-sha256:7901cb24b63cedb0794c194ad4ebc0ce7207f7d84c200c82b8e13987e22dd3fc"
+    version "0.5.0"
     declared_version_source "manifest"
     src_dir "src"
-    requires "nimcrypto"
+    requires
     provenance {
         origin "observed"
         kind "git"
         url "https://github.com/coreyleavitt/sello.git"
-        ref "vcc-ct-barrier-v0.4"
-        commit_sha "af44c7b41f565301f9596b057030f6685a991718"
+        ref "v0.5.0"
+        commit_sha "b535889ad291ce084bd70b33eb4f1d2861ae986f"
     }
 }
